@@ -233,6 +233,10 @@ impl TerminalApp {
             self.apply(Function::Settings);
             ui.close();
         }
+        if ui.button("Brokerage Accounts…").on_hover_text("Connect brokers through SnapTrade (read-only)").clicked() {
+            self.open_brokerage_settings();
+            ui.close();
+        }
         if ui.button("Commands & Hotkeys").clicked() {
             self.apply(Function::Help);
             ui.close();
@@ -604,8 +608,9 @@ impl TerminalApp {
             let open_orders = pf.map_or(0, |p| p.orders.iter().filter(|o| o.is_open()).count());
             let orders_badge = (open_orders > 0).then(|| format!("{open_orders} open"));
             use crate::command::PortView as V;
+            let setup = self.broker.mode() == super::broker::BrokerMode::Setup;
             let rows: [(Icon, &str, V, Option<String>); 4] = [
-                (Icon::Grid, "Portfolio", V::Summary, value_badge),
+                (Icon::Grid, "Portfolio", V::Summary, if setup { Some("Set up".into()) } else { value_badge }),
                 (Icon::List, "Positions", V::Positions, None),
                 (Icon::Chart, "Orders", V::Orders, orders_badge),
                 (Icon::People, "Accounts", V::Accounts, None),
@@ -616,6 +621,13 @@ impl TerminalApp {
                 if resp.clicked() {
                     out.push(SidebarCmd::Function(Function::Portfolio(view, String::new())));
                 }
+            }
+            let settings_open = self.idx(self.focus).is_some_and(|i| matches!(self.panes[i].kind, PaneKind::Settings))
+                && self.settings_tab == super::settings_view::SettingsTab::Brokerage;
+            let resp = nav_row(ui, Icon::Gear, "Brokerage Settings", None, settings_open)
+                .on_hover_text("Connect brokers through SnapTrade: keys, connections, test");
+            if resp.clicked() {
+                out.push(SidebarCmd::Function(Function::Portfolio(V::Summary, "SETUP".into())));
             }
 
             section(ui, "Congress");

@@ -3,10 +3,12 @@
 
 use chrono::{Duration, TimeZone, Utc};
 
-use crate::model::{Account, Activity, InstrumentKind, Order, Portfolio, Position};
+use crate::model::{Account, Activity, Connection, InstrumentKind, Order, Portfolio, Position};
 
 fn account(id: &str, name: &str, number: &str, institution: &str, kind: &str, cash: f64, bp: f64) -> Account {
+    let connection_id = if institution.contains("Exchange") { "sim-conn-exchange" } else { "sim-conn-broker" }.into();
     Account {
+        connection_id,
         id: id.into(),
         name: name.into(),
         number: number.into(),
@@ -190,7 +192,30 @@ pub fn portfolio() -> Portfolio {
         act("sim-brokerage", "sim-a-6", "INTEREST", None, "Cash sweep interest", None, None, 31.27, 14),
         act("sim-crypto", "sim-a-7", "BUY", Some("BTC"), "Bought 0.05 BTC", Some(0.05), Some(79_840.0), -3_992.00, 21),
     ];
-    Portfolio { accounts, positions, orders, activities, fetched: Some(now), warnings: Vec::new(), simulated: true }
+    let connection = |id: &str, brokerage: &str, slug: &str, days: i64| Connection {
+        id: id.into(),
+        brokerage: brokerage.into(),
+        slug: slug.into(),
+        name: "Connection-1".into(),
+        disabled: false,
+        created: Some(now - Duration::days(days)),
+        updated: Some(now - Duration::minutes(4)),
+        trading: false,
+    };
+    let connections = vec![
+        connection("sim-conn-broker", "Simulated Broker", "SIMULATED-BROKER", 240),
+        connection("sim-conn-exchange", "Simulated Exchange", "SIMULATED-EXCHANGE", 90),
+    ];
+    Portfolio {
+        accounts,
+        positions,
+        orders,
+        activities,
+        connections,
+        fetched: Some(now),
+        warnings: Vec::new(),
+        simulated: true,
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +233,8 @@ mod tests {
         assert!((t.value - sum).abs() < 1e-6);
         assert!(t.pnl > 0.0);
         assert!(pf.orders.iter().any(|o| o.is_open()));
+        for c in &pf.connections {
+            assert!(pf.accounts_of(&c.id).count() > 0, "{} holds accounts", c.brokerage);
+        }
     }
 }

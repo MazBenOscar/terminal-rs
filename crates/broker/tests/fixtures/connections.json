@@ -1,0 +1,22 @@
+[
+  {
+    "id": "87b24961-b51e-4db8-9226-f198f6518a89",
+    "created_date": "2026-07-23T22:50:22.761Z",
+    "updated_date": "2026-10-12T14:05:11.000Z",
+    "brokerage": {"id": "b1", "slug": "ROBINHOOD", "name": "Robinhood", "display_name": "Robinhood", "allows_trading": true},
+    "name": "Connection-1",
+    "type": "read",
+    "disabled": false,
+    "disabled_date": null,
+    "meta": {}
+  },
+  {
+    "id": "c9d1a0f2-0c9e-4a51-8b7e-5d1c2f0a9b11",
+    "created_date": "2026-05-01T12:00:00.000Z",
+    "brokerage": {"id": "b2", "slug": "QUESTRADE", "name": "Questrade"},
+    "name": "Connection-2",
+    "type": "trade",
+    "disabled": true,
+    "disabled_date": "2026-09-30T08:00:00.000Z"
+  }
+]

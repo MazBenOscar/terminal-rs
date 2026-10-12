@@ -7,8 +7,9 @@
 //! (omitted for personal API keys). Requests use the canonical root paths on
 //! `https://api.snaptrade.com` (the `/api/v1` prefix is deprecated).
 //!
-//! Only reads are implemented, plus registering a user and generating a read-only Connection
-//! Portal link; nothing here can place, change or cancel orders.
+//! Only reads are implemented, plus registering a user, generating a read-only Connection
+//! Portal link and deleting a connection on explicit request; nothing here can place, change
+//! or cancel orders.
 
 use std::time::Duration;
 
@@ -218,15 +219,32 @@ impl SnapTrade {
         Ok((id, secret))
     }
 
-    /// A read-only Connection Portal link (valid for five minutes) for the user to connect
-    /// or reconnect brokerages in their browser.
-    pub async fn connection_portal_url(&self, dark: bool) -> Result<String> {
-        let body = json!({ "connectionType": "read", "darkMode": dark });
+    /// A read-only Connection Portal link (valid for five minutes) for the user to connect a
+    /// brokerage in their browser, or to re-authenticate the disabled connection `reconnect`.
+    pub async fn connection_portal_url(&self, dark: bool, reconnect: Option<&str>) -> Result<String> {
+        let mut body = json!({ "connectionType": "read", "darkMode": dark });
+        if let Some(id) = reconnect {
+            body["reconnect"] = json!(id);
+        }
         let v = self.call(Method::POST, "/snapTrade/login", &[], Some(body), true).await?;
         if v.get("encryptedSharedKey").is_some() {
             bail!("SnapTrade returned an encrypted login response; disable response encryption for this key");
         }
         v["redirectURI"].as_str().map(str::to_string).context("SnapTrade did not return a Connection Portal URL")
+    }
+
+    /// The user's brokerage connections.
+    pub async fn connections(&self) -> Result<Vec<model::Connection>> {
+        Ok(model::parse_connections(&self.get("/authorizations", &[]).await?))
+    }
+
+    /// Remove a brokerage connection and its accounts from SnapTrade (irreversible; the user
+    /// can connect the broker again through the portal).
+    pub async fn delete_connection(&self, id: &str) -> Result<()> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            bail!("invalid connection id");
+        }
+        self.call(Method::DELETE, &format!("/connection/{id}"), &[], None, true).await.map(|_| ())
     }
 
     pub async fn accounts(&self) -> Result<Value> {
@@ -263,13 +281,18 @@ impl SnapTrade {
     /// Accounts with balances, positions, recent orders and activity. A failure on one
     /// account's sub-request becomes a warning; failing to list accounts is an error.
     pub async fn portfolio(&self) -> Result<Portfolio> {
-        let mut accounts = model::parse_accounts(&self.accounts().await?);
+        let (accounts, connections) = futures::join!(self.accounts(), self.connections());
+        let mut accounts = model::parse_accounts(&accounts?);
         let per_account = futures::future::join_all(accounts.iter().map(|a| async move {
             let id = a.id.as_str();
             futures::join!(self.balances(id), self.positions(id), self.orders(id), self.activities(id))
         }))
         .await;
         let mut pf = Portfolio { fetched: Some(chrono::Utc::now()), ..Default::default() };
+        match connections {
+            Ok(c) => pf.connections = c,
+            Err(e) => pf.warnings.push(format!("connections: {e:#}")),
+        }
         for (acct, (bal, pos, ord, act)) in accounts.iter_mut().zip(per_account) {
             let label = acct.label();
             let mut warn = |what: &str, e: anyhow::Error| pf.warnings.push(format!("{label}: {what}: {e:#}"));

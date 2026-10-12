@@ -34,10 +34,16 @@ pub enum Request {
         creds: tr_broker::Credentials,
         user_id: String,
     },
-    /// Generate a read-only Connection Portal link.
+    /// Generate a read-only Connection Portal link (optionally to reconnect a connection).
     BrokerPortal {
         creds: tr_broker::Credentials,
         dark: bool,
+        reconnect: Option<String>,
+    },
+    /// Remove a brokerage connection at the user's explicit request.
+    BrokerDisconnect {
+        creds: tr_broker::Credentials,
+        id: String,
     },
     /// Option chain for one expiration (`None` = nearest).
     Options {
@@ -135,6 +141,8 @@ pub enum Response {
     /// `(userId, userSecret)` for a newly registered SnapTrade user.
     BrokerRegistered(Result<(String, String), String>),
     BrokerPortal(Result<String, String>),
+    /// The connection id removed, or why not.
+    BrokerDisconnected(Result<String, String>),
     Options {
         pane: PaneId,
         symbol: String,
@@ -604,12 +612,19 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             };
             s.send(Response::BrokerRegistered(result.map_err(|e| format!("{e:#}"))));
         }
-        Request::BrokerPortal { creds, dark } => {
+        Request::BrokerPortal { creds, dark, reconnect } => {
             let result = match tr_broker::SnapTrade::new(creds) {
-                Ok(client) => client.connection_portal_url(dark).await,
+                Ok(client) => client.connection_portal_url(dark, reconnect.as_deref()).await,
                 Err(e) => Err(e),
             };
             s.send(Response::BrokerPortal(result.map_err(|e| format!("{e:#}"))));
+        }
+        Request::BrokerDisconnect { creds, id } => {
+            let result = match tr_broker::SnapTrade::new(creds) {
+                Ok(client) => client.delete_connection(&id).await,
+                Err(e) => Err(e),
+            };
+            s.send(Response::BrokerDisconnected(result.map(|()| id).map_err(|e| format!("{e:#}"))));
         }
         Request::Options { pane, symbol, expiration } => {
             let chain = s.provider.options(&symbol, expiration).await.map(Box::new).map_err(|e| format!("{e:#}"));

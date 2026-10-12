@@ -88,7 +88,10 @@ async fn mock(seen: Arc<Mutex<Vec<Seen>>>, failures: Arc<Mutex<Vec<String>>>) ->
                 if (chrono::Utc::now().timestamp() - ts).abs() > 60 {
                     fail(format!("stale timestamp {ts}"));
                 }
-                let user_scoped = path.starts_with("/accounts") || path == "/snapTrade/login";
+                let user_scoped = path.starts_with("/accounts")
+                    || path.starts_with("/authorizations")
+                    || path.starts_with("/connection/")
+                    || path == "/snapTrade/login";
                 if user_scoped
                     && (param("userId").as_deref() != Some("terminal-rs-test")
                         || param("userSecret").as_deref() != Some("s3cr3t/+="))
@@ -114,6 +117,10 @@ async fn mock(seen: Arc<Mutex<Vec<Seen>>>, failures: Arc<Mutex<Vec<String>>>) ->
                         (200, r#"{"redirectURI":"https://app.snaptrade.com/snapTrade/redeemToken?token=abc","sessionId":"s1"}"#.into())
                     }
                     ("GET", "/accounts") => (200, fixture("accounts.json")),
+                    ("GET", "/authorizations") => (200, fixture("connections.json")),
+                    ("DELETE", p) if p.starts_with("/connection/") => {
+                        (200, r#"{"detail":"Connection deletion queued","status":"queued"}"#.into())
+                    }
                     ("GET", p) if p == format!("/accounts/{ACCT_B}/positions/all") => {
                         (403, r#"{"detail":"Holdings are unavailable for this account","status_code":403,"code":"1063"}"#.into())
                     }
@@ -176,6 +183,13 @@ async fn loads_a_signed_portfolio() {
     assert_eq!(b.label(), "Questrade ••••77Q2", "unnamed accounts use institution and masked number");
     assert_eq!(b.total, None);
 
+    // Connections, linked to their accounts.
+    assert_eq!(pf.connections.len(), 2);
+    let rh = &pf.connections[0];
+    assert_eq!((rh.brokerage.as_str(), rh.disabled, rh.trading), ("Robinhood", false, false));
+    assert_eq!(pf.accounts_of(&rh.id).map(|a| a.id.as_str()).collect::<Vec<_>>(), [ACCT_A]);
+    assert!(pf.connections[1].disabled && pf.connections[1].trading);
+
     // One account's positions failed: a warning, not an error.
     assert_eq!(pf.warnings.len(), 1, "{:?}", pf.warnings);
     assert!(pf.warnings[0].contains("Holdings are unavailable"), "{}", pf.warnings[0]);
@@ -222,7 +236,7 @@ async fn loads_a_signed_portfolio() {
 }
 
 #[tokio::test]
-async fn registers_a_user_and_opens_a_read_only_portal() {
+async fn registers_a_user_opens_the_portal_and_disconnects() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let failures = Arc::new(Mutex::new(Vec::new()));
     let base = mock(seen.clone(), failures.clone()).await;
@@ -234,13 +248,21 @@ async fn registers_a_user_and_opens_a_read_only_portal() {
     assert_eq!((id.as_str(), secret.as_str()), ("terminal-rs-test", "fresh-secret"));
 
     let client = SnapTrade::with_base(creds(), &base).unwrap();
-    let url = client.connection_portal_url(true).await.unwrap();
+    let url = client.connection_portal_url(true, None).await.unwrap();
+    client.connection_portal_url(false, Some("c9d1a0f2-0c9e-4a51-8b7e-5d1c2f0a9b11")).await.unwrap();
+    client.delete_connection("c9d1a0f2-0c9e-4a51-8b7e-5d1c2f0a9b11").await.unwrap();
+    assert!(client.delete_connection("../accounts").await.is_err(), "ids are validated before use in a path");
     assert!(url.starts_with("https://app.snaptrade.com/"));
     assert_eq!(*failures.lock().unwrap(), Vec::<String>::new());
 
     let seen = seen.lock().unwrap().clone();
-    let login = seen.iter().find(|s| s.path == "/snapTrade/login").unwrap();
-    assert_eq!(login.body.as_ref().unwrap()["connectionType"], "read", "the portal asks for read-only access");
+    let logins: Vec<_> = seen.iter().filter(|s| s.path == "/snapTrade/login").collect();
+    assert_eq!(logins[0].body.as_ref().unwrap()["connectionType"], "read", "the portal asks for read-only access");
+    assert!(logins[0].body.as_ref().unwrap().get("reconnect").is_none());
+    assert_eq!(logins[1].body.as_ref().unwrap()["reconnect"], "c9d1a0f2-0c9e-4a51-8b7e-5d1c2f0a9b11");
+    let del = seen.iter().find(|s| s.method == "DELETE").unwrap();
+    assert_eq!(del.path, "/connection/c9d1a0f2-0c9e-4a51-8b7e-5d1c2f0a9b11");
+    assert!(del.body.is_none(), "a bodyless DELETE signs content as null");
 }
 
 #[tokio::test]

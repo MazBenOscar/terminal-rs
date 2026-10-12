@@ -27,6 +27,27 @@ pub struct Account {
     pub is_paper: bool,
     /// Last successful holdings sync.
     pub synced: Option<DateTime<Utc>>,
+    /// The brokerage connection (SnapTrade authorization) this account belongs to.
+    #[serde(default)]
+    pub connection_id: String,
+}
+
+/// A brokerage connection (SnapTrade "brokerage authorization"): one login at one broker,
+/// usually holding one or more accounts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Connection {
+    pub id: String,
+    /// Brokerage display name, e.g. `Robinhood`.
+    pub brokerage: String,
+    pub slug: String,
+    /// Connection label, e.g. `Connection-1`.
+    pub name: String,
+    /// The broker revoked access or the login expired: it needs reconnecting.
+    pub disabled: bool,
+    pub created: Option<DateTime<Utc>>,
+    pub updated: Option<DateTime<Utc>>,
+    /// Whether the connection allows trading (terminal-rs never trades either way).
+    pub trading: bool,
 }
 
 impl Account {
@@ -302,6 +323,9 @@ pub struct Portfolio {
     pub positions: Vec<Position>,
     pub orders: Vec<Order>,
     pub activities: Vec<Activity>,
+    /// Brokerage connections (for Settings › Brokerage).
+    #[serde(default)]
+    pub connections: Vec<Connection>,
     pub fetched: Option<DateTime<Utc>>,
     /// Per-account problems that did not stop the rest from loading.
     pub warnings: Vec<String>,
@@ -329,6 +353,11 @@ impl Totals {
 impl Portfolio {
     pub fn account(&self, id: &str) -> Option<&Account> {
         self.accounts.iter().find(|a| a.id == id)
+    }
+
+    /// Accounts held through connection `id`.
+    pub fn accounts_of(&self, connection: &str) -> impl Iterator<Item = &Account> {
+        self.accounts.iter().filter(move |a| a.connection_id == connection)
     }
 
     /// Totals over the accounts selected by `filter` (`None` = all), repricing positions with
@@ -424,6 +453,33 @@ pub fn parse_accounts(v: &Value) -> Vec<Account> {
                 status: text(&a["status"]),
                 is_paper: a["is_paper"].as_bool().unwrap_or(false),
                 synced: time(&a["sync_status"]["holdings"]["last_successful_sync"]),
+                connection_id: text(&a["brokerage_authorization"]),
+            })
+        })
+        .collect()
+}
+
+/// `/authorizations`: the user's brokerage connections.
+pub fn parse_connections(v: &Value) -> Vec<Connection> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let id = text(&c["id"]);
+            let b = &c["brokerage"];
+            let brokerage = Some(text(&b["display_name"]))
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(text(&b["name"])).filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| "Brokerage".into());
+            (!id.is_empty()).then(|| Connection {
+                id,
+                brokerage,
+                slug: text(&b["slug"]),
+                name: text(&c["name"]),
+                disabled: c["disabled"].as_bool().unwrap_or(false),
+                created: time(&c["created_date"]),
+                updated: time(&c["updated_date"]),
+                trading: c["type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("trade")),
             })
         })
         .collect()
@@ -643,6 +699,7 @@ mod tests {
                 status: "open".into(),
                 is_paper: false,
                 synced: None,
+                connection_id: "c1".into(),
             }],
             positions: vec![
                 pos(InstrumentKind::Stock, "AAPL", 10.0, 120.0, 100.0),

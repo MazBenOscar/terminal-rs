@@ -334,6 +334,11 @@ fn toolbar(ui: &mut Ui, pane: &mut PortfolioPane, b: &BrokerState, out: &mut Vec
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::icon_button(ui, widgets::Icon::Gear, "Brokerage settings: keys, connections, test", false)
+                .clicked()
+            {
+                out.push(PortAction::Setup);
+            }
             if b.mode() == BrokerMode::Setup {
                 return;
             }
@@ -409,20 +414,20 @@ fn setup_screen(ui: &mut Ui, b: &BrokerState, out: &mut Vec<PortAction>) {
     step(
         ui,
         "2",
-        "Enter them in Settings › Brokerage",
+        "Enter them in Brokerage Settings and Save",
         "Stored in the macOS Keychain (or an owner-only file on Linux), never in the repository.",
         c.has_keys(),
     );
     step(
         ui,
         "3",
-        "Register a user and connect a brokerage",
-        "Opens SnapTrade's Connection Portal in your browser; sign in to your broker there.",
+        "Register User, then Connect Brokerage…",
+        "Both buttons are in Brokerage Settings; the second opens SnapTrade's Connection Portal in your browser.",
         c.has_user(),
     );
     ui.add_space(dp(6.0));
     ui.horizontal(|ui| {
-        if ui.button(RichText::new("Set Up SnapTrade…").strong()).clicked() {
+        if ui.button(RichText::new("Open Brokerage Settings…").strong()).clicked() {
             out.push(PortAction::Setup);
         }
         if ui.button("Get API Keys").on_hover_text(tr_broker::snaptrade::DASHBOARD_URL).clicked() {
@@ -460,9 +465,14 @@ fn empty_state(ui: &mut Ui, out: &mut Vec<PortAction>) {
         "Connect a broker through SnapTrade's Connection Portal; accounts appear here a few moments after you finish.",
     );
     ui.add_space(dp(4.0));
-    if ui.button(RichText::new("Connect Brokerage…").strong()).clicked() {
-        out.push(PortAction::Connect);
-    }
+    ui.horizontal(|ui| {
+        if ui.button(RichText::new("Connect Brokerage…").strong()).clicked() {
+            out.push(PortAction::Connect);
+        }
+        if ui.button("Brokerage Settings…").clicked() {
+            out.push(PortAction::Setup);
+        }
+    });
 }
 
 /// Account filter of a pane, detached from it so the pane can still be changed.

@@ -166,14 +166,25 @@ aarch64-apple-darwin from Linux (zig as the C cross-compiler; linking needs the 
 
 ## Brokerage setup (SnapTrade)
 
+Everything happens in **Settings › Brokerage**, with no commands needed. Open it from the sidebar
+(Portfolio › **Brokerage Settings**), the toolbar's View menu (**Brokerage Accounts…**), the gear
+button on any portfolio pane, or the setup screen; `PORT SETUP` still works too.
+
 1. Create API keys (a client ID and consumer key) in the
    [SnapTrade dashboard](https://dashboard.snaptrade.com). Personal keys work too.
-2. In the terminal, type `PORT SETUP` (or open Settings › Brokerage) and enter the keys.
+2. Enter the **Client ID** and **Consumer Key** (masked; **Show secrets** reveals them) and click
+   **Save**.
 3. Click **Register User**. This creates a SnapTrade user for this installation and saves its user
    secret, which SnapTrade only returns once. With personal keys, leave the user fields empty.
-4. Click **Connect Brokerage…** (or type `PORT CONNECT`). SnapTrade's Connection Portal opens in
-   your browser with read-only access; sign in to your broker there. New accounts appear within
-   a minute, and **Test Connection** confirms what is linked.
+4. Click **Connect Brokerage…**. SnapTrade's Connection Portal opens in your browser with
+   read-only access; sign in to your broker there. New accounts appear within a minute.
+
+The status card at the top always says where you are and what to do next ("Not set up",
+"Connected · 3 accounts at 2 brokerages · synced 14:32", or the API's error). **Test Connection**
+reloads accounts and connections on demand. **Connected brokerages** lists every connection with
+its accounts; a connection the broker has expired shows **Reconnect…**, which re-authenticates it in
+the portal, and **Disconnect** removes a connection and its accounts from SnapTrade after an
+explicit confirmation.
 
 **Where credentials live.** On macOS the client ID, consumer key, user ID and user secret are
 stored together in the **Keychain** (generic password, service `terminal-rs`, account

@@ -93,6 +93,9 @@ pub struct BrokerState {
     pub last_quotes: Option<Instant>,
     /// "Test Connection" is waiting for a portfolio load.
     pub testing: bool,
+    /// Connection awaiting "Disconnect" confirmation, and the one being removed.
+    pub confirm_disconnect: Option<String>,
+    pub disconnecting: Option<String>,
 }
 
 impl BrokerState {
@@ -128,6 +131,8 @@ impl BrokerState {
             simulate,
             last_quotes: None,
             testing: false,
+            confirm_disconnect: None,
+            disconnecting: None,
         }
     }
 
@@ -346,6 +351,58 @@ impl TerminalApp {
     }
 
     pub(super) fn connect_brokerage(&mut self) {
+        self.open_connection_portal(None);
+    }
+
+    /// Re-authenticate a disabled connection in the Connection Portal.
+    pub(super) fn reconnect_brokerage(&mut self, id: String) {
+        self.open_connection_portal(Some(id));
+    }
+
+    /// Open Settings › Brokerage (from `PORT SETUP`, the sidebar, menus and empty states).
+    pub(super) fn open_brokerage_settings(&mut self) {
+        self.settings_tab = super::settings_view::SettingsTab::Brokerage;
+        self.open_panel(PaneKind::Settings);
+    }
+
+    pub(super) fn disconnect_brokerage(&mut self, id: String) {
+        self.broker.confirm_disconnect = None;
+        if !self.broker.creds.is_ready() {
+            return;
+        }
+        self.broker.disconnecting = Some(id.clone());
+        self.broker.message = None;
+        self.worker.send(Request::BrokerDisconnect { creds: self.broker.creds.clone(), id });
+    }
+
+    pub(super) fn on_broker_disconnected(&mut self, result: Result<String, String>) {
+        self.broker.disconnecting = None;
+        match result {
+            Ok(id) => {
+                let name = self
+                    .broker
+                    .portfolio
+                    .as_ref()
+                    .and_then(|pf| pf.connections.iter().find(|c| c.id == id))
+                    .map_or("The brokerage".to_string(), |c| c.brokerage.clone());
+                // Hide it right away; SnapTrade removes it in the background.
+                if let Some(pf) = self.broker.portfolio.as_mut() {
+                    pf.connections.retain(|c| c.id != id);
+                    let gone: Vec<String> = pf.accounts_of(&id).map(|a| a.id.clone()).collect();
+                    pf.accounts.retain(|a| a.connection_id != id);
+                    pf.positions.retain(|p| !gone.contains(&p.account_id));
+                    pf.orders.retain(|o| !gone.contains(&o.account_id));
+                    pf.activities.retain(|a| !gone.contains(&a.account_id));
+                }
+                self.broker.message =
+                    Some((format!("{name} disconnected. Its accounts were removed from SnapTrade."), false));
+                self.status = format!("{name} disconnected");
+            }
+            Err(e) => self.broker.message = Some((format!("Could not disconnect: {e}"), true)),
+        }
+    }
+
+    fn open_connection_portal(&mut self, reconnect: Option<String>) {
         if !self.broker.creds.is_ready() {
             self.broker.message =
                 Some(("Save your SnapTrade keys and register a user before connecting a brokerage.".into(), true));
@@ -356,7 +413,7 @@ impl TerminalApp {
         let dark = self.applied_theme.as_ref().is_none_or(|t| t.dark);
         self.broker.busy = Some("Opening the Connection Portal…");
         self.broker.message = None;
-        self.worker.send(Request::BrokerPortal { creds: self.broker.creds.clone(), dark });
+        self.worker.send(Request::BrokerPortal { creds: self.broker.creds.clone(), dark, reconnect });
     }
 
     /// `PORT`, `ACCT`, `POS`, `ORD`, `ACTV` with an optional subcommand, optionally for a
@@ -373,10 +430,7 @@ impl TerminalApp {
                 return;
             }
             "CONNECT" | "LINK" | "ADD" => return self.connect_brokerage(),
-            "SETUP" | "SETTINGS" | "KEYS" | "CONFIG" => {
-                self.settings_tab = super::settings_view::SettingsTab::Brokerage;
-                return self.open_panel(PaneKind::Settings);
-            }
+            "SETUP" | "SETTINGS" | "KEYS" | "CONFIG" => return self.open_brokerage_settings(),
             _ => {}
         }
         // Like other panels, this replaces the targeted portfolio pane or opens one.
@@ -390,61 +444,132 @@ impl TerminalApp {
 }
 
 impl TerminalApp {
-    /// Settings › Brokerage: SnapTrade keys, user registration, the Connection Portal and
-    /// where credentials are kept.
+    /// Settings › Brokerage: the whole SnapTrade setup without terminal commands — status,
+    /// keys, user registration, connected brokerages (connect, reconnect, disconnect) and a
+    /// connection test.
     pub(super) fn brokerage_tab(&mut self, ui: &mut egui::Ui) {
         use egui::RichText;
 
         use crate::theme::{self, dp, mono, muted, text, ui_font};
         let section = |ui: &mut egui::Ui, title: &str| {
-            ui.add_space(dp(10.0));
+            ui.add_space(dp(12.0));
             ui.label(RichText::new(title).font(ui_font(13.5)).color(text()));
             ui.separator();
         };
         let note = |ui: &mut egui::Ui, s: &str| {
             ui.label(RichText::new(s).font(ui_font(11.5)).color(muted()));
         };
+        let mode = self.broker.mode();
+        // Load accounts and connections the first time the tab is shown with working keys.
+        if mode == BrokerMode::Live
+            && self.broker.portfolio.as_ref().is_none_or(|p| p.simulated)
+            && !self.broker.loading
+            && self.broker.error.is_none()
+        {
+            self.refresh_portfolio();
+        }
+        let busy = self.broker.busy.is_some() || self.broker.disconnecting.is_some();
 
-        section(ui, "Brokerage accounts (SnapTrade)");
-        let status = match self.broker.mode() {
-            BrokerMode::Live => match self.broker.portfolio.as_deref() {
-                Some(pf) if !pf.simulated => format!(
-                    "Connected · {} account{}{}",
-                    pf.accounts.len(),
-                    if pf.accounts.len() == 1 { "" } else { "s" },
-                    pf.fetched.map_or(String::new(), |t| format!(
-                        " · synced {}",
-                        t.with_timezone(&chrono::Local).format("%H:%M")
-                    ))
-                ),
-                _ if self.broker.loading => "Connecting…".into(),
-                _ => "Keys saved".into(),
-            },
-            BrokerMode::Simulated => "Not configured · showing the simulated sample portfolio".into(),
-            BrokerMode::Setup => "Not configured".into(),
-        };
-        ui.label(RichText::new(status).font(ui_font(12.5)).color(theme::accent()));
-        note(
-            ui,
-            "Read-only: terminal-rs reads accounts, balances, positions, orders and activity. It cannot place, \
-             change or cancel orders, and the Connection Portal requests read-only access.",
-        );
-        note(
-            ui,
-            &format!(
-                "Credentials are stored in {}; never in the repository or in layouts.",
-                self.broker.store.describe()
+        // ---- status card ----
+        ui.add_space(dp(4.0));
+        // A snapshot (small, and only while this tab is open) so the UI below can mutate state.
+        let live_pf = self.broker.portfolio.clone().filter(|p| !p.simulated);
+        let live_pf = live_pf.as_deref();
+        let (dot, headline, next) = match mode {
+            BrokerMode::Setup | BrokerMode::Simulated if !self.broker.creds.has_keys() => (
+                theme::amber(),
+                "Not set up".to_string(),
+                "Enter your SnapTrade client ID and consumer key below, then Save.",
             ),
-        );
-        if self.broker.from_env {
-            ui.label(
-                RichText::new("SNAPTRADE_* environment variables are set and override the saved values below.")
-                    .font(ui_font(11.5))
-                    .color(theme::amber()),
+            BrokerMode::Setup | BrokerMode::Simulated => (
+                theme::amber(),
+                "Keys saved, no SnapTrade user yet".to_string(),
+                "Click Register User (commercial keys), or clear both user fields for personal keys.",
+            ),
+            BrokerMode::Live => match (&self.broker.error, live_pf) {
+                _ if self.broker.loading && live_pf.is_none() => {
+                    (theme::cyan(), "Checking the connection…".to_string(), "")
+                }
+                (Some(e), _) if !self.broker.creds.has_user() => (
+                    theme::down(),
+                    format!("Connection problem: {e}"),
+                    "Commercial keys need a SnapTrade user: click Register User. Otherwise check the keys.",
+                ),
+                (Some(e), _) => {
+                    (theme::down(), format!("Connection problem: {e}"), "Check the keys, then Test Connection.")
+                }
+                (None, Some(pf)) if pf.accounts.is_empty() => (
+                    theme::up(),
+                    "Credentials work · no brokerage connected yet".to_string(),
+                    "Click Connect Brokerage… to sign in to your broker in the browser.",
+                ),
+                (None, Some(pf)) => {
+                    let brokers = pf.connections.len().max(1);
+                    let synced = pf.fetched.map_or(String::new(), |t| {
+                        format!(" · synced {}", t.with_timezone(&chrono::Local).format("%H:%M"))
+                    });
+                    (
+                        theme::up(),
+                        format!(
+                            "Connected · {} account{} at {} brokerage{}{synced}",
+                            pf.accounts.len(),
+                            if pf.accounts.len() == 1 { "" } else { "s" },
+                            brokers,
+                            if brokers == 1 { "" } else { "s" }
+                        ),
+                        "",
+                    )
+                }
+                (None, None) => (theme::cyan(), "Keys saved".to_string(), "Click Test Connection."),
+            },
+        };
+        egui::Frame::group(ui.style()).corner_radius(theme::CARD_RADIUS).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 4.5, dot);
+                ui.label(RichText::new(&headline).font(ui_font(13.5)).color(text()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can_test = self.broker.creds.is_ready() && !busy && !self.broker.loading;
+                    if ui
+                        .add_enabled(can_test, egui::Button::new("Test Connection"))
+                        .on_hover_text("Load accounts and connections now")
+                        .clicked()
+                    {
+                        self.broker.testing = true;
+                        self.broker.message = None;
+                        self.refresh_portfolio();
+                    }
+                    if self.broker.loading || busy {
+                        ui.add(egui::Spinner::new().size(12.0));
+                    }
+                });
+            });
+            if !next.is_empty() {
+                ui.label(RichText::new(format!("Next: {next}")).font(ui_font(12.0)).color(theme::accent()));
+            }
+            if mode == BrokerMode::Simulated {
+                note(ui, "Until then the portfolio panes show a simulated sample portfolio.");
+            }
+            note(
+                ui,
+                "Read-only: terminal-rs reads accounts, balances, positions, orders and activity through SnapTrade. \
+                 It cannot place, change or cancel orders.",
             );
+        });
+        if let Some((m, err)) = &self.broker.message {
+            ui.label(RichText::new(m).font(ui_font(12.0)).color(if *err { theme::down() } else { theme::up() }));
+        }
+        if let Some(what) = self.broker.busy {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(12.0));
+                note(ui, what);
+            });
         }
 
-        section(ui, "1 · API keys");
+        // ---- credentials ----
+        section(ui, "SnapTrade API keys");
+        note(ui, "Create a client ID and consumer key in the SnapTrade dashboard (personal keys work too).");
         let reveal = self.broker.reveal;
         let field = |ui: &mut egui::Ui, label: &str, value: &mut String, secret: bool, hint: &str| {
             ui.horizontal(|ui| {
@@ -464,91 +589,187 @@ impl TerminalApp {
         ui.horizontal(|ui| {
             ui.add_space(134.0);
             ui.checkbox(&mut self.broker.reveal, "Show secrets");
-            if ui.link("Get keys from the SnapTrade dashboard").clicked()
+            if ui.link("Open the SnapTrade dashboard").clicked()
                 && let Err(e) = open_external(tr_broker::snaptrade::DASHBOARD_URL)
             {
                 self.status = format!("Could not open the browser: {e}");
             }
         });
 
-        section(ui, "2 · SnapTrade user");
+        section(ui, "SnapTrade user");
         note(
             ui,
-            "Commercial keys: register a user once (the secret is shown only at registration and is saved automatically). Personal keys: leave both empty.",
+            "Commercial keys need one SnapTrade user for this computer: Register User creates it and saves its \
+             secret (SnapTrade shows it only once). Personal keys: leave both fields empty.",
         );
         let form = &mut self.broker.form;
-        field(ui, "User ID", &mut form.user_id, false, "registered automatically");
+        field(ui, "User ID", &mut form.user_id, false, "created by Register User");
         field(ui, "User secret", &mut form.user_secret, true, "secret");
-        let busy = self.broker.busy.is_some();
-        ui.horizontal(|ui| {
+
+        let dirty = self.broker.form != self.broker.saved;
+        ui.add_space(dp(4.0));
+        let can_save = dirty && self.broker.form.is_ready() && !busy;
+        let can_register = self.broker.form.has_keys() && self.broker.form.user_secret.trim().is_empty() && !busy;
+        ui.horizontal_wrapped(|ui| {
             ui.add_space(134.0);
-            let can_register = self.broker.form.has_keys() && self.broker.form.user_secret.trim().is_empty() && !busy;
+            let save = ui
+                .add_enabled(can_save, egui::Button::new(RichText::new("Save").strong()))
+                .on_hover_text(format!("Store in {}", self.broker.store.describe()))
+                .on_disabled_hover_text(if !dirty {
+                    "Nothing changed"
+                } else {
+                    "Enter both keys, and either both user fields or neither"
+                });
+            if save.clicked() {
+                self.save_broker_form("Saved.");
+                self.refresh_portfolio();
+            }
             if ui
                 .add_enabled(can_register, egui::Button::new("Register User"))
                 .on_hover_text("Create a SnapTrade user for these keys and save its secret")
+                .on_disabled_hover_text("Enter the keys first (and leave the user secret empty)")
                 .clicked()
             {
                 self.register_snaptrade_user();
             }
+            if dirty && !busy && ui.button("Revert").on_hover_text("Discard unsaved changes").clicked() {
+                self.broker.form = self.broker.creds.clone();
+            }
         });
+        note(
+            ui,
+            &format!("Stored in {}. Never written to the repository, layouts or logs.", self.broker.store.describe()),
+        );
+        if self.broker.from_env {
+            ui.label(
+                RichText::new("SNAPTRADE_* environment variables are set and override the saved values.")
+                    .font(ui_font(11.5))
+                    .color(theme::amber()),
+            );
+        }
 
-        section(ui, "3 · Save and connect");
-        let dirty = self.broker.form != self.broker.saved;
-        ui.horizontal_wrapped(|ui| {
-            let ready = self.broker.form.is_ready();
-            if ui.add_enabled(ready && dirty && !busy, egui::Button::new("Save")).clicked() {
-                self.save_broker_form("Credentials saved.");
-                self.refresh_portfolio();
+        // ---- connected brokerages ----
+        section(ui, "Connected brokerages");
+        let ready = self.broker.creds.is_ready();
+        let connections: Vec<tr_broker::Connection> = live_pf.map(|p| p.connections.clone()).unwrap_or_default();
+        if !ready {
+            note(ui, "Save your keys and register a user to connect a brokerage.");
+        } else if live_pf.is_none() {
+            note(ui, if self.broker.loading { "Loading…" } else { "Click Test Connection to load your connections." });
+        } else if connections.is_empty() {
+            note(ui, "No brokerages connected yet.");
+        }
+        let mut action: Option<(&'static str, String)> = None;
+        for c in &connections {
+            let accounts: Vec<String> =
+                live_pf.map(|p| p.accounts_of(&c.id).map(|a| a.label()).collect()).unwrap_or_default();
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 4.0, if c.disabled { theme::down() } else { theme::up() });
+                ui.label(RichText::new(&c.brokerage).font(ui_font(13.0)).color(text()));
+                let mut detail = Vec::new();
+                detail.push(if c.disabled { "needs reconnecting".to_string() } else { "active".to_string() });
+                detail.push(match accounts.len() {
+                    0 => "no accounts".into(),
+                    1 => accounts[0].clone(),
+                    n => format!("{n} accounts"),
+                });
+                if let Some(t) = c.created {
+                    detail.push(format!("since {}", t.format("%b %Y")));
+                }
+                note(ui, &detail.join(" · "));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.broker.disconnecting.as_deref() == Some(&c.id) {
+                        ui.add(egui::Spinner::new().size(12.0));
+                        note(ui, "Disconnecting…");
+                    } else if self.broker.confirm_disconnect.as_deref() == Some(&c.id) {
+                        if ui.button("Cancel").clicked() {
+                            action = Some(("cancel", c.id.clone()));
+                        }
+                        if ui
+                            .button(RichText::new("Disconnect").color(theme::down()))
+                            .on_hover_text("Removes this connection and its accounts from SnapTrade")
+                            .clicked()
+                        {
+                            action = Some(("disconnect", c.id.clone()));
+                        }
+                    } else {
+                        if ui.add_enabled(!busy, egui::Button::new("Disconnect")).clicked() {
+                            action = Some(("confirm", c.id.clone()));
+                        }
+                        if c.disabled
+                            && ui
+                                .add_enabled(!busy, egui::Button::new("Reconnect…"))
+                                .on_hover_text("Sign in to this broker again in the browser")
+                                .clicked()
+                        {
+                            action = Some(("reconnect", c.id.clone()));
+                        }
+                    }
+                });
+            });
+            if self.broker.confirm_disconnect.as_deref() == Some(&c.id) {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Disconnect {}? Its accounts are removed from SnapTrade and this can't be undone \
+                             (you can connect it again later).",
+                            c.brokerage
+                        ))
+                        .font(ui_font(11.5))
+                        .color(theme::down()),
+                    );
+                });
             }
-            let live = self.broker.creds.is_ready();
-            if ui.add_enabled(live && !busy && !self.broker.loading, egui::Button::new("Test Connection")).clicked() {
-                self.broker.testing = true;
-                self.broker.message = None;
-                self.refresh_portfolio();
-            }
+        }
+        match action {
+            Some(("confirm", id)) => self.broker.confirm_disconnect = Some(id),
+            Some(("cancel", _)) => self.broker.confirm_disconnect = None,
+            Some(("disconnect", id)) => self.disconnect_brokerage(id),
+            Some(("reconnect", id)) => self.reconnect_brokerage(id),
+            _ => {}
+        }
+        ui.add_space(dp(4.0));
+        ui.horizontal(|ui| {
             if ui
-                .add_enabled(live && !busy, egui::Button::new(RichText::new("Connect Brokerage…").strong()))
-                .on_hover_text("Open SnapTrade's Connection Portal in your browser (read-only)")
+                .add_enabled(ready && !busy, egui::Button::new(RichText::new("Connect Brokerage…").strong()))
+                .on_hover_text("Opens SnapTrade's Connection Portal in your browser (read-only access)")
+                .on_disabled_hover_text("Save your keys and register a user first")
                 .clicked()
             {
                 self.connect_brokerage();
             }
-            if ui
-                .add_enabled(!busy, egui::Button::new("Forget Credentials"))
-                .on_hover_text("Remove the saved keys and user from this computer")
-                .clicked()
-            {
-                self.forget_broker_credentials();
-            }
-            if let Some(what) = self.broker.busy {
-                ui.add(egui::Spinner::new().size(12.0));
-                ui.label(RichText::new(what).font(ui_font(11.5)).color(muted()));
-            }
-        });
-        if let Some((m, err)) = &self.broker.message {
-            ui.label(RichText::new(m).font(ui_font(12.0)).color(if *err { theme::down() } else { theme::up() }));
-        }
-        if let Some(url) = self.broker.portal_url.clone() {
-            ui.horizontal(|ui| {
-                note(ui, "Portal link (expires in 5 minutes):");
+            if let Some(url) = self.broker.portal_url.clone() {
+                note(ui, "Portal link (5 minutes):");
                 if ui.small_button("Copy").clicked() {
                     ui.ctx().copy_text(url.clone());
                 }
                 if ui.small_button("Open").clicked() {
                     let _ = open_external(&url);
                 }
-            });
-        }
+            }
+        });
+        note(
+            ui,
+            "After you finish in the browser, new accounts appear here and in the portfolio panes within a minute.",
+        );
 
-        section(ui, "Using it");
-        note(
-            ui,
-            "PORT summary · ACCT accounts and balances · POS positions · ORD orders · ACTV activity · AAPL POS one security · PORT REFRESH · PORT CONNECT",
-        );
-        note(
-            ui,
-            "Click a position to chart it; prices in cyan are live terminal quotes. Data comes from your broker through SnapTrade and may be delayed.",
-        );
+        // ---- remove ----
+        section(ui, "Remove from this computer");
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !busy && (self.broker.saved != tr_broker::Credentials::default()),
+                    egui::Button::new("Forget Credentials"),
+                )
+                .on_hover_text("Delete the saved keys and user secret (your brokerage connections stay at SnapTrade)")
+                .clicked()
+            {
+                self.forget_broker_credentials();
+            }
+            note(ui, "Portfolio panes: PORT, ACCT, POS, ORD, ACTV (F7–F9) or the sidebar's Portfolio section.");
+        });
     }
 }
 

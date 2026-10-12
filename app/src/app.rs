@@ -1010,6 +1010,7 @@ impl TerminalApp {
                 Response::Portfolio(result) => self.on_portfolio(result),
                 Response::BrokerRegistered(result) => self.on_broker_registered(result),
                 Response::BrokerPortal(result) => self.on_broker_portal(result),
+                Response::BrokerDisconnected(result) => self.on_broker_disconnected(result),
                 Response::Politicians(list) => self.politicians = list,
                 Response::Alerts(a) => self.alerts = a,
                 Response::NewAlerts(new) => {
