@@ -1,0 +1,25 @@
+[package]
+name = "tr-broker"
+description = "Read-only brokerage accounts through SnapTrade: signed API client, portfolio model and credential storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tr-core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+futures = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.23"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "net"] }
+reqwest.workspace = true

@@ -19,6 +19,8 @@ pub enum Action {
     AddToWatchlist(String),
     /// Load a security into every pane of a colour link group.
     LinkedSymbol(crate::layouts::Link, String),
+    /// Run a command line (`AAPL OMON`, `PORT REFRESH`) without adding it to the history.
+    Command(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

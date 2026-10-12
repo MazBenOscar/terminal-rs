@@ -20,12 +20,13 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 13] = [
+pub const PANELS: [(&str, &str); 14] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
     ("Order Book", "BOOK"),
     ("Options", "OMON"),
+    ("Portfolio", "PORT"),
     ("World Markets", "WEI"),
     ("Yield Curve", "GC"),
     ("Congress Feed", "CONG"),
@@ -562,6 +563,16 @@ impl TerminalApp {
             "OMON" | "OPT" | "OPTIONS" | "CHAIN" => {
                 let sym = given.unwrap_or_else(|| self.optionable_symbol());
                 PaneKind::Options(Box::new(super::OptionsPane::new(&sym, 12, true)))
+            }
+            "PORT" | "PORTFOLIO" | "ACCT" | "POS" | "POSITIONS" | "ORD" | "ORDERS" | "ACTV" | "ACTIVITY" => {
+                let view = match head.as_str() {
+                    "ACCT" => crate::command::PortView::Accounts,
+                    "POS" | "POSITIONS" => crate::command::PortView::Positions,
+                    "ORD" | "ORDERS" => crate::command::PortView::Orders,
+                    "ACTV" | "ACTIVITY" => crate::command::PortView::Activity,
+                    _ => crate::command::PortView::Summary,
+                };
+                PaneKind::Portfolio(Box::new(super::broker::PortfolioPane::new(view)))
             }
             "WEI" | "MARKETS" => PaneKind::Wei,
             "GC" | "CURVE" | "YC" => PaneKind::Curve,

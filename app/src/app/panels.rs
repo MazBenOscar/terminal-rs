@@ -80,6 +80,24 @@ impl TerminalApp {
                     actions.push(a);
                 }
             }
+            PaneKind::Portfolio(pp) => {
+                for a in super::portfolio_view::portfolio(ui, pp, &self.broker, &self.quotes) {
+                    use super::portfolio_view::PortAction as P;
+                    match a {
+                        P::Core(a) => actions.push(a),
+                        P::Refresh => actions.push(Action::Command("PORT REFRESH".into())),
+                        P::Connect => actions.push(Action::Command("PORT CONNECT".into())),
+                        P::Setup => actions.push(Action::Command("PORT SETUP".into())),
+                        P::Options(k) => actions.push(Action::Command(format!("{k} OMON"))),
+                        P::News(k) => actions.push(Action::Command(format!("{k} CN"))),
+                        P::Open(url) => {
+                            if let Err(e) = super::broker::open_external(url) {
+                                self.status = format!("Could not open {url}: {e}");
+                            }
+                        }
+                    }
+                }
+            }
             PaneKind::Watchlist | PaneKind::Settings | PaneKind::Help | PaneKind::Chart(_) => {}
         }
         match self.panes[i].kind {

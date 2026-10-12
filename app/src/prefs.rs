@@ -204,6 +204,9 @@ pub enum Action {
     Watchlist,
     Refresh,
     FrameTiming,
+    Portfolio,
+    Positions,
+    Orders,
     NextPane,
     PrevPane,
     ToggleSidebar,
@@ -246,7 +249,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 46] = [
+    pub const ALL: [Action; 49] = [
         Action::Help,
         Action::Congress,
         Action::Politicians,
@@ -254,6 +257,9 @@ impl Action {
         Action::Watchlist,
         Action::Refresh,
         Action::FrameTiming,
+        Action::Portfolio,
+        Action::Positions,
+        Action::Orders,
         Action::NextPane,
         Action::PrevPane,
         Action::ToggleSidebar,
@@ -304,6 +310,9 @@ impl Action {
             Action::Watchlist => "Watchlist".into(),
             Action::Refresh => "Refresh Congress filings".into(),
             Action::FrameTiming => "Frame timing readout".into(),
+            Action::Portfolio => "Brokerage portfolio".into(),
+            Action::Positions => "Brokerage positions".into(),
+            Action::Orders => "Brokerage orders".into(),
             Action::NextPane => "Next pane".into(),
             Action::PrevPane => "Previous pane".into(),
             Action::ToggleSidebar => "Toggle sidebar".into(),
@@ -534,6 +543,9 @@ impl Default for Keymap {
         bind(Action::Watchlist, "F5");
         bind(Action::Refresh, "F6");
         bind(Action::FrameTiming, "F12");
+        bind(Action::Portfolio, "F7");
+        bind(Action::Positions, "F8");
+        bind(Action::Orders, "F9");
         bind(Action::NextPane, "Tab");
         bind(Action::PrevPane, "Shift+Tab");
         bind(Action::ToggleSidebar, if mac { "Ctrl+Cmd+S" } else { "Ctrl+Shift+S" });
@@ -787,7 +799,10 @@ mod tests {
     fn v1_prefs_migrate_layout_bindings_to_alt() {
         // A v1 file: layouts on ⌘1…, one customised, no panel actions yet.
         let mut v1 = Keymap::default();
-        v1.0.retain(|a, _| a.panel_spec().is_none());
+        // (Brokerage actions arrived later; a v1 file cannot contain them.)
+        v1.0.retain(|a, _| {
+            a.panel_spec().is_none() && !matches!(a, Action::Portfolio | Action::Positions | Action::Orders)
+        });
         for (i, a) in Action::ALL.iter().filter(|a| a.layout_slot().is_some()).enumerate() {
             v1.0.insert(*a, format!("Cmd+{}", i + 1));
         }
@@ -801,6 +816,8 @@ mod tests {
         assert_eq!(p.hotkeys.action_for(Key::Num1, Modifiers::COMMAND), Some(Action::NewChart));
         assert_eq!(p.hotkeys.action_for(Key::Num1, Modifiers::ALT), Some(Action::Layout1));
         assert_eq!(p.hotkeys.action_for(Key::F9, Modifiers::NONE), Some(Action::Layout9), "customised binding kept");
+        assert_eq!(p.hotkeys.chord(Action::Orders), None, "a new default never steals a user's key");
+        assert_eq!(p.hotkeys.action_for(Key::F7, Modifiers::NONE), Some(Action::Portfolio), "free defaults are added");
     }
 
     #[test]

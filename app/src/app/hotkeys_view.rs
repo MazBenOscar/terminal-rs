@@ -259,6 +259,23 @@ impl TerminalApp {
                 ],
             );
 
+            section(ui, "Brokerage (SnapTrade, read-only)");
+            command_table(
+                ui,
+                "help-broker",
+                &[
+                    (&["PORT", "F7"], "Portfolio: total value, cash, unrealised P&L, allocation, top holdings"),
+                    (&["ACCT"], "Accounts and balances (cash, buying power, sync time)"),
+                    (&["POS", "F8", "AAPL POS"], "Positions with live P&L (for one security)"),
+                    (&["ORD", "F9", "AAPL ORD"], "Orders from the last 30 days (open or all)"),
+                    (&["ACTV"], "Activity: trades, dividends, interest, transfers"),
+                    (
+                        &["PORT REFRESH", "PORT CONNECT", "PORT SETUP"],
+                        "Reload · connect a broker in the browser · keys",
+                    ),
+                ],
+            );
+
             section(ui, "Charts");
             command_table(
                 ui,

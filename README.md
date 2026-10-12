@@ -4,7 +4,8 @@ A fast, keyboard-driven market terminal in pure Rust: TradingView-class GPU char
 Bloomberg Terminal look (dense tiled panes, monospace numbers, a command line like `AAPL <GO>`)
 across **stocks, ETFs, indices, FX, crypto, US Treasuries, futures/commodities and options**,
 plus **congressional trade tracking ingested directly from the official STOCK Act disclosure
-systems**. Native compact UI, themes from Bloomberg amber to Solarized, and a fully dockable
+systems** and **your own brokerage accounts through [SnapTrade](https://snaptrade.com)**
+(read-only). Native compact UI, themes from Bloomberg amber to Solarized, and a fully dockable
 workspace with saved layouts.
 
 ![terminal-rs: AAPL chart with congress trade markers and RSI, the Congress trades feed, world markets and a multi-asset watchlist](docs/img/overview.png)
@@ -27,6 +28,8 @@ workspace with saved layouts.
 | **Terminal Light** — the latest STOCK Act filings with party, chamber, owner and amount filters | **Docking** (Nord theme, sidebar on the right) — drag a tab onto the compass to tab or split |
 | ![Live theme editor: Monokai applied to the chart while its colours are shown in Settings](docs/img/theme-editor.png) | ![Theme gallery in Settings › Appearance](docs/img/theme-gallery.png) ![Congress marker hover card with disclosure lag](docs/img/hover-card.png) |
 | **Theme editor** — edit any colour, font or density live; save, duplicate, import/export TOML or JSON | **Theme gallery** and the **marker hover card** (politician, amount, traded/filed, disclosure lag) |
+| ![Portfolio summary: total value, unrealised P&L, cash, buying power, allocation bar, top holdings and accounts beside an AAPL chart](docs/img/portfolio.png) | ![Positions table with quantity, live last price, average cost, value and unrealised P&L](docs/img/positions.png) |
+| **Portfolio** — `PORT`: value, unrealised P&L, cash and buying power, allocation, top holdings, accounts (simulated sample shown) | **Positions** — `POS`: live terminal quotes (cyan) reprice holdings; click a row to chart it |
 
 Screenshots are from the Linux build under Xvfb with live data (October 2026); on macOS the same UI
 gets the native title bar with traffic lights, window vibrancy behind the sidebar and SF fonts.
@@ -126,6 +129,18 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   numbers, segmented controls, spring animations, hover states and context menus. The System
   theme follows the OS appearance and accent colour; charts render at native retina scale with
   4x MSAA.
+- **Brokerage accounts (SnapTrade, read-only)** — connect your brokers once through SnapTrade's
+  Connection Portal (opened in your browser) and the terminal shows real accounts and balances
+  (`ACCT`), positions with unrealised P&L (`POS`), orders from the last 30 days (`ORD`), activity
+  such as trades, dividends, interest and transfers (`ACTV`) and a portfolio summary with
+  allocation (`PORT`). Holdings are repriced with the terminal's own live quotes; clicking a
+  position, order or activity row charts it, and right-click offers the option chain, news,
+  Congress trades and watchlist. `AAPL POS` / `AAPL ORD` filter to one security, the account picker
+  to one account. Stocks, ETFs, funds, crypto and options (OCC symbols shown as `AAPL 350C`) are
+  supported. Nothing can place, change or cancel orders, and the portal requests read-only
+  access. Without credentials the panes show a setup screen; offline (`TR_PROVIDER=sample` or
+  `TR_BROKER=sample`) they show a clearly labelled simulated portfolio. See
+  [Brokerage setup](#brokerage-setup-snaptrade).
 - **Hotkeys and preferences** — every hotkey is rebindable from a native shortcut table in
   Settings › Hotkeys and Help (click a binding, press the new keys); defaults for new charts and
   order books; everything persists in `prefs.json`.
@@ -149,6 +164,35 @@ chart anti-aliasing (default 4 on macOS), `TR_VIBRANCY=0` disables the transluce
 `terminal-rs.app`; `scripts/check-macos-cross.sh` compiles and lints the whole workspace for
 aarch64-apple-darwin from Linux (zig as the C cross-compiler; linking needs the macOS SDK).
 
+## Brokerage setup (SnapTrade)
+
+1. Create API keys (a client ID and consumer key) in the
+   [SnapTrade dashboard](https://dashboard.snaptrade.com). Personal keys work too.
+2. In the terminal, type `PORT SETUP` (or open Settings › Brokerage) and enter the keys.
+3. Click **Register User**. This creates a SnapTrade user for this installation and saves its user
+   secret, which SnapTrade only returns once. With personal keys, leave the user fields empty.
+4. Click **Connect Brokerage…** (or type `PORT CONNECT`). SnapTrade's Connection Portal opens in
+   your browser with read-only access; sign in to your broker there. New accounts appear within
+   a minute, and **Test Connection** confirms what is linked.
+
+**Where credentials live.** On macOS the client ID, consumer key, user ID and user secret are
+stored together in the **Keychain** (generic password, service `terminal-rs`, account
+`snaptrade`). Elsewhere they go in `<data dir>/secrets/snaptrade.json` with owner-only permissions
+(0600 in a 0700 directory). They are never written to the repository, layouts, prefs or logs;
+request errors are scrubbed of the URL (which carries the user secret), and the settings screen
+masks secrets. **Forget Credentials** removes them. `SNAPTRADE_CLIENT_ID`,
+`SNAPTRADE_CONSUMER_KEY`, `SNAPTRADE_USER_ID` and `SNAPTRADE_USER_SECRET` override the saved
+values field by field (useful for CI or a shell profile), and `TR_SECRET_STORE=file` uses the
+file store on macOS.
+
+**How it talks to SnapTrade.** Requests go to `https://api.snaptrade.com` and are signed as the
+SnapTrade docs specify: `clientId` and a Unix `timestamp` in the query, and a `Signature` header
+holding a base64 HMAC-SHA256 (keyed with the consumer key) of the canonical JSON
+`{"content","path","query"}`. Portfolios refresh every two minutes while a portfolio pane is
+visible (every 20 s for five minutes after opening the portal); `PORT REFRESH` reloads on demand.
+Brokerage data can be delayed or cached by SnapTrade depending on your plan, which is why holdings
+are repriced with the terminal's live quotes where a market key exists.
+
 ## Keyboard shortcuts and commands
 
 Press **F1** (or type `HELP`) for the full, searchable list; every hotkey can be rebound in
@@ -157,6 +201,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | Keys | Action |
 |---|---|
 | F1 · F2 · F3 · F4 · F5 · F6 · F12 | help · Congress feed · politicians · alerts · watchlist · refresh filings · frame timing |
+| F7 · F8 · F9 | brokerage portfolio · positions · orders |
 | Tab · ⇧Tab | next · previous pane |
 | ⌘1 … ⌘0 · ⌘⇧O | new chart, watchlist, news, order book, world markets, yield curve, Congress, politicians, alerts, search pane · options chain |
 | ⌘D · ⌘⇧D · ⌘T · ⌘W · ⌘⇧P | split right · split down · new tab · close pane · pop out |
@@ -179,6 +224,8 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `NEW BOOK` · `SPLIT DOWN NEWS` · `POP` · `LINK GREEN` · `TITLE Desk` · `CLOSE` | add, split, pop out, link, rename, close panes |
 | `LAYOUT 4` · `LAYOUT SAVE Macro` · `LAYOUT Macro` · `LAYOUT RENAME Rates` · `LAYOUT DUP` · `LAYOUT DEL` · `LAYOUT EXPORT` | grid preset · saved layouts |
 | `THEME BLOOMBERG` · `THEME NEXT` · `THEME SYSTEM` · `THEME EDIT` · `THEME COMPACT` · `LAYOUT THEME ON` | themes |
+| `PORT` · `ACCT` · `POS` · `ORD` · `ACTV` · `AAPL POS` · `AAPL ORD` | brokerage portfolio · accounts and balances · positions · orders · activity · one security |
+| `PORT REFRESH` · `PORT CONNECT` · `PORT SETUP` (`BROKER`) | reload accounts · connect a broker in the browser · SnapTrade keys |
 | `SIDEBAR RIGHT` · `SIDEBAR` · `PREFS` · `HELP` | sidebar side or visibility · settings · help |
 | right-click chart / watchlist / feed row / sidebar toggle | context menu (chart type, indicators, draw, add to watchlist, who traded it, View menu) |
 
@@ -197,6 +244,8 @@ crates/data     MarketData trait; per-class router (Binance/Coinbase, Treasury.g
                 Alpaca), websocket live feeds, sample provider with simulated ticks; bar cache
 crates/chart    wgpu renderer, LOD pyramids, viewport math, axes, drawings, egui paint callback
 crates/congress Senate eFD + House Clerk parsers, rosters, SQLite store, refresh, alerts, performance
+crates/broker   SnapTrade client (request signing, accounts, balances, positions, orders, activity),
+                portfolio model and P&L, Keychain / owner-only credential store, simulated sample
 docs/analysis   REA research notes on TradingView chart UX
 ```
 
@@ -268,6 +317,13 @@ cargo bench -p tr-core && cargo bench -p tr-chart
 - Themes: every built-in round-trips through TOML and JSON, partial theme files inherit from the
   dark/light base, the themes folder store (save, rename, delete, name collisions), copy-on-write
   names and migration of older appearance preferences.
+- Brokerage: request signatures match values computed independently with Python's `hmac` over the
+  documented canonical JSON; an end-to-end test runs the client against a local mock SnapTrade
+  server that verifies every request's signature, timestamp and auth parameters and serves
+  fixtures shaped like the API's responses (stocks, ETFs, crypto, options, cash equivalents,
+  string and numeric decimals, a failing account); P&L for longs, shorts and option multipliers;
+  market-key mapping; OCC symbols; credential storage permissions and redaction; errors never
+  echo the user secret; every portfolio view renders.
 - The chart renders real frames offscreen on whatever adapter is present and checks pixels.
 
 ## Platform notes and limitations

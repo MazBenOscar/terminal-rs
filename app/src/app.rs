@@ -4,13 +4,17 @@
 //! drag and drop, pop-out windows, link groups, saved layouts), `panels` (per-kind pane
 //! content) and `settings_view` (preferences UI).
 
+mod broker;
 mod chrome;
 mod hotkeys_view;
 mod options_view;
 mod panels;
+mod portfolio_view;
 mod settings_view;
 mod theming;
 mod workspace;
+
+pub use broker::PosSort;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -39,19 +43,33 @@ use settings_view::SettingsTab;
 
 pub enum PaneKind {
     Chart(Box<ChartState>),
-    Feed { filter: FeedFilter },
-    Ticker { symbol: String, trades: Vec<Trade>, loading: bool },
-    Profile { query: String, data: Option<Box<Profile>>, loading: bool },
+    Feed {
+        filter: FeedFilter,
+    },
+    Ticker {
+        symbol: String,
+        trades: Vec<Trade>,
+        loading: bool,
+    },
+    Profile {
+        query: String,
+        data: Option<Box<Profile>>,
+        loading: bool,
+    },
     Politicians,
     Alerts,
     Watchlist,
     Help,
     Wei,
     Curve,
-    Search { query: String },
+    Search {
+        query: String,
+    },
     News(Box<NewsPane>),
     OrderBook(Box<BookPane>),
     Options(Box<OptionsPane>),
+    /// Brokerage accounts through SnapTrade (`PORT`, `ACCT`, `POS`, `ORD`, `ACTV`).
+    Portfolio(Box<broker::PortfolioPane>),
     Settings,
 }
 
@@ -166,6 +184,7 @@ impl PaneKind {
             },
             PaneKind::OrderBook(b) => format!("{} Depth", short(&b.symbol)),
             PaneKind::Options(o) => format!("{} Options", short(&o.symbol)),
+            PaneKind::Portfolio(p) => p.title(),
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -185,6 +204,7 @@ impl PaneKind {
             PaneKind::News(_) => "CN",
             PaneKind::OrderBook(_) => "OB",
             PaneKind::Options(_) => "OMON",
+            PaneKind::Portfolio(p) => p.view.code(),
             PaneKind::Settings => "PDF",
         }
     }
@@ -246,6 +266,13 @@ impl PaneKind {
             PaneKind::Options(o) => {
                 PaneSettings::Options { symbol: o.symbol.clone(), strikes: o.strikes, greeks: o.show_greeks }
             }
+            PaneKind::Portfolio(p) => PaneSettings::Portfolio {
+                view: p.view,
+                account: p.account.clone(),
+                symbol: p.symbol.clone(),
+                sort: p.sort,
+                open_only: p.open_only,
+            },
         }
     }
 
@@ -291,6 +318,9 @@ impl PaneKind {
             PaneSettings::Settings => PaneKind::Settings,
             PaneSettings::Options { symbol, strikes, greeks } => {
                 PaneKind::Options(Box::new(OptionsPane::new(&symbol, strikes, greeks)))
+            }
+            PaneSettings::Portfolio { view, account, symbol, sort, open_only } => {
+                PaneKind::Portfolio(Box::new(broker::PortfolioPane { view, account, symbol, sort, open_only }))
             }
         }
     }
@@ -469,6 +499,8 @@ pub struct TerminalApp {
     /// Measured macOS title bar geometry (polled; changes with full screen).
     chrome: Option<tr_macos::Chrome>,
     last_chrome_poll: Option<Instant>,
+    /// Brokerage integration (SnapTrade credentials and the loaded portfolio).
+    broker: broker::BrokerState,
 }
 
 /// Resolve a run of words (`BTCUSD CRNCY AAPL US EQUITY MSFT`) into market keys.
@@ -523,7 +555,9 @@ impl TerminalApp {
         }
         let settings: Option<Settings> =
             std::fs::read(settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let broker = broker::BrokerState::load(provider.eq_ignore_ascii_case("sample"));
         let mut app = Self {
+            broker,
             worker,
             provider,
             panes: Vec::new(),
@@ -662,6 +696,10 @@ impl TerminalApp {
                     }
                 }
                 Action::LinkedSymbol(link, s) => self.broadcast(link, &s, None),
+                Action::Command(line) => match command::parse(&line) {
+                    Some(cmd) => self.dispatch(cmd),
+                    None => tracing::warn!("internal command did not parse: {line}"),
+                },
                 Action::Track(q, on) => {
                     self.worker.send(Request::Track { query: q.clone(), on });
                     // Refresh any open profile so the star updates.
@@ -681,6 +719,10 @@ impl TerminalApp {
             return;
         };
         self.cmd_history.push(input.trim().to_string());
+        self.dispatch(cmd);
+    }
+
+    fn dispatch(&mut self, cmd: Command) {
         match cmd {
             Command::Symbol(s) => self.open_security(&s),
             Command::SymbolFunction(s, Function::Congress) => {
@@ -700,6 +742,7 @@ impl TerminalApp {
                 self.open_panel(PaneKind::Options(Box::new(OptionsPane::new(&s, 12, true))));
                 self.status = format!("{s}: option chain");
             }
+            Command::SymbolFunction(s, Function::Portfolio(view, arg)) => self.portfolio_command(view, &arg, Some(s)),
             Command::SymbolFunction(s, f @ (Function::NewPanel(_) | Function::Split { .. })) => {
                 self.apply_with_symbol(f, Some(s));
             }
@@ -831,6 +874,7 @@ impl TerminalApp {
                 }
                 self.open_panel(PaneKind::Search { query: q });
             }
+            Function::Portfolio(view, arg) => self.portfolio_command(view, &arg, None),
         }
     }
 
@@ -963,6 +1007,9 @@ impl TerminalApp {
                         }
                     }
                 }
+                Response::Portfolio(result) => self.on_portfolio(result),
+                Response::BrokerRegistered(result) => self.on_broker_registered(result),
+                Response::BrokerPortal(result) => self.on_broker_portal(result),
                 Response::Politicians(list) => self.politicians = list,
                 Response::Alerts(a) => self.alerts = a,
                 Response::NewAlerts(new) => {
@@ -1163,6 +1210,9 @@ impl TerminalApp {
             A::Watchlist => self.apply(Function::Watchlist),
             A::Refresh => self.apply(Function::Refresh),
             A::FrameTiming => self.show_perf = !self.show_perf,
+            A::Portfolio => self.apply(Function::Portfolio(command::PortView::Summary, String::new())),
+            A::Positions => self.apply(Function::Portfolio(command::PortView::Positions, String::new())),
+            A::Orders => self.apply(Function::Portfolio(command::PortView::Orders, String::new())),
             A::NextPane => self.cycle_focus(1),
             A::PrevPane => self.cycle_focus(-1),
             A::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
@@ -1242,6 +1292,7 @@ impl TerminalApp {
                 _ => {}
             }
         }
+        self.broker_periodic(&visible);
         if let Some((q, at)) = &self.search_pending
             && at.elapsed() > Duration::from_millis(300)
         {

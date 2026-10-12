@@ -1,0 +1,33 @@
+{
+  "results": [
+    {
+      "instrument": {"kind": "stock", "id": "a1", "symbol": "AAPL", "raw_symbol": "AAPL", "description": "Apple Inc.", "currency": "USD", "exchange": "XNAS"},
+      "units": "50", "price": "339.51", "cost_basis": "190.25", "currency": "USD", "cash_equivalent": false
+    },
+    {
+      "instrument": {"kind": "etf", "id": "a2", "symbol": "SPY", "raw_symbol": "SPY", "description": "SPDR S&P 500 ETF Trust", "currency": "USD"},
+      "units": 12.5, "price": 777.58, "cost_basis": 701.2, "currency": "USD", "cash_equivalent": false
+    },
+    {
+      "instrument": {"kind": "crypto", "id": "a3", "symbol": "BTC", "raw_symbol": "BTC", "currency": "USD"},
+      "units": "0.105", "price": "82527.99", "cost_basis": "90100", "currency": "USD", "cash_equivalent": false
+    },
+    {
+      "instrument": {
+        "kind": "option", "id": "a4", "symbol": "NVDA  261218C00250000", "option_type": "CALL",
+        "strike_price": "250", "expiration_date": "2026-12-18", "multiplier": "100",
+        "underlying": {"kind": "stock", "id": "u1", "symbol": "NVDA", "raw_symbol": "NVDA"}
+      },
+      "units": "-1", "price": "6.40", "cost_basis": "8.15", "currency": "USD", "cash_equivalent": false
+    },
+    {
+      "instrument": {"kind": "mutualfund", "id": "a5", "symbol": "SWVXX", "raw_symbol": "SWVXX", "description": "Schwab Value Advantage Money Fund"},
+      "units": "250", "price": "1", "cost_basis": "1", "currency": "USD", "cash_equivalent": true
+    },
+    {
+      "instrument": {"kind": "stock", "id": "a6", "symbol": "", "raw_symbol": ""},
+      "units": "1", "price": null, "cost_basis": null
+    }
+  ],
+  "data_freshness": {"as_of": "2026-10-12T14:30:00.000Z"}
+}

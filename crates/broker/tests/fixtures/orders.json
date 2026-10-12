@@ -1,0 +1,27 @@
+[
+  {
+    "brokerage_order_id": "66a033fa-da74-4fcf-b527-feefdec9257e",
+    "status": "EXECUTED",
+    "universal_symbol": {"id": "u-aapl", "symbol": "AAPL", "raw_symbol": "AAPL", "description": "Apple Inc.", "type": {"code": "cs", "description": "Common Stock"}},
+    "option_symbol": null,
+    "action": "BUY",
+    "total_quantity": "10", "open_quantity": "0", "canceled_quantity": "0", "filled_quantity": "10",
+    "execution_price": "331.20", "limit_price": "332.00", "stop_price": null,
+    "order_type": "Limit", "time_in_force": "Day",
+    "time_placed": "2026-10-08T14:31:02.000Z", "time_updated": "2026-10-08T14:31:05.000Z", "time_executed": "2026-10-08T14:31:05.000Z"
+  },
+  {
+    "brokerage_order_id": "b2c51f0e-61f4-4f0d-9c3b-1f7c7e2a9d40",
+    "status": "PENDING",
+    "universal_symbol": null,
+    "option_symbol": {
+      "id": "o1", "ticker": "NVDA  261218C00250000", "option_type": "CALL", "strike_price": 250,
+      "expiration_date": "2026-12-18", "is_mini_option": false,
+      "underlying_symbol": {"id": "u-nvda", "symbol": "NVDA", "raw_symbol": "NVDA", "description": "NVIDIA Corporation"}
+    },
+    "action": "BUY_CLOSE",
+    "total_quantity": "1", "filled_quantity": "0",
+    "limit_price": "5.00", "order_type": "Limit", "time_in_force": "GTC",
+    "time_placed": "2026-10-11T15:00:00.000Z", "time_updated": null
+  }
+]

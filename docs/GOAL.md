@@ -27,4 +27,5 @@ Tests for the parsers and indicators, frame-time benchmarks, and a README noting
 - [x] Congress ingest from Senate eFD and House Clerk (PDF/XML), feed, politician profiles, per-ticker panel, chart markers with hover card, tracking alerts, freshness indicator.
 - [x] Native macOS look (unified toolbar, vibrancy sidebar on either side, SF fonts), options chains (OMON) with greeks.
 - [x] Theme system: built-in themes (Terminal Dark/Light, Bloomberg, High Contrast, Solarized, Nord, Monokai), live editor in Settings, custom themes as TOML files with TOML/JSON import/export, `THEME` command, ⌘⌥T cycling, optional theme per layout.
-- [x] Tests for parsers, indicators, layouts, prefs and themes; frame-time benchmarks; README.
+- [x] Brokerage accounts through SnapTrade (read-only): setup screen, Keychain credential storage, Connection Portal, `PORT`/`ACCT`/`POS`/`ORD`/`ACTV` panes with live-repriced P&L.
+- [x] Tests for parsers, indicators, layouts, prefs, themes and the SnapTrade client; frame-time benchmarks; README.

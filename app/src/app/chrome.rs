@@ -591,6 +591,33 @@ impl TerminalApp {
                 }
             }
 
+            section(ui, "Portfolio");
+            let focused_view = self.idx(self.focus).and_then(|i| match &self.panes[i].kind {
+                PaneKind::Portfolio(pp) => Some(pp.view),
+                _ => None,
+            });
+            let pf = self.broker.portfolio.as_deref();
+            let value_badge = pf.filter(|p| !p.accounts.is_empty()).map(|p| {
+                let t = p.totals(None, |pos| self.broker.live_price(&self.quotes, pos));
+                compact_money(t.value)
+            });
+            let open_orders = pf.map_or(0, |p| p.orders.iter().filter(|o| o.is_open()).count());
+            let orders_badge = (open_orders > 0).then(|| format!("{open_orders} open"));
+            use crate::command::PortView as V;
+            let rows: [(Icon, &str, V, Option<String>); 4] = [
+                (Icon::Grid, "Portfolio", V::Summary, value_badge),
+                (Icon::List, "Positions", V::Positions, None),
+                (Icon::Chart, "Orders", V::Orders, orders_badge),
+                (Icon::People, "Accounts", V::Accounts, None),
+            ];
+            for (icon, label, view, badge) in rows {
+                let trailing = badge.unwrap_or_else(|| view.code().to_string());
+                let resp = nav_row(ui, icon, label, Some(&trailing), focused_view == Some(view));
+                if resp.clicked() {
+                    out.push(SidebarCmd::Function(Function::Portfolio(view, String::new())));
+                }
+            }
+
             section(ui, "Congress");
             let unread = self.alerts.iter().filter(|a| !a.seen).count();
             if nav_row(
@@ -822,6 +849,21 @@ fn row_frame(ui: &mut Ui, selected: bool) -> egui::Response {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     resp
+}
+
+/// `$214.3K`, `$1.25M` for sidebar badges.
+fn compact_money(x: f64) -> String {
+    let a = x.abs();
+    let s = if a >= 1e9 {
+        format!("{:.2}B", a / 1e9)
+    } else if a >= 1e6 {
+        format!("{:.2}M", a / 1e6)
+    } else if a >= 1e4 {
+        format!("{:.1}K", a / 1e3)
+    } else {
+        format!("{a:.0}")
+    };
+    if x < 0.0 { format!("-${s}") } else { format!("${s}") }
 }
 
 fn nav_row(ui: &mut Ui, icon: Icon, label: &str, trailing: Option<&str>, selected: bool) -> egui::Response {

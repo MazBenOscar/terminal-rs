@@ -27,6 +27,18 @@ pub type PaneId = u64;
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
 
 pub enum Request {
+    /// Load the brokerage portfolio through SnapTrade (`None` = the simulated sample).
+    Portfolio(Option<tr_broker::Credentials>),
+    /// Register a SnapTrade user under the partner keys.
+    BrokerRegister {
+        creds: tr_broker::Credentials,
+        user_id: String,
+    },
+    /// Generate a read-only Connection Portal link.
+    BrokerPortal {
+        creds: tr_broker::Credentials,
+        dark: bool,
+    },
     /// Option chain for one expiration (`None` = nearest).
     Options {
         pane: PaneId,
@@ -119,6 +131,10 @@ pub struct Profile {
 }
 
 pub enum Response {
+    Portfolio(Result<Box<tr_broker::Portfolio>, String>),
+    /// `(userId, userSecret)` for a newly registered SnapTrade user.
+    BrokerRegistered(Result<(String, String), String>),
+    BrokerPortal(Result<String, String>),
     Options {
         pane: PaneId,
         symbol: String,
@@ -571,6 +587,30 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             Ok(c) => s.send(Response::Curves(Box::new(c))),
             Err(e) => s.send(Response::Status(format!("yield curve: {e:#}"))),
         },
+        Request::Portfolio(creds) => {
+            let result = match creds {
+                None => Ok(tr_broker::sample::portfolio()),
+                Some(c) => match tr_broker::SnapTrade::new(c) {
+                    Ok(client) => client.portfolio().await,
+                    Err(e) => Err(e),
+                },
+            };
+            s.send(Response::Portfolio(result.map(Box::new).map_err(|e| format!("{e:#}"))));
+        }
+        Request::BrokerRegister { creds, user_id } => {
+            let result = match tr_broker::SnapTrade::new(creds) {
+                Ok(client) => client.register_user(&user_id).await,
+                Err(e) => Err(e),
+            };
+            s.send(Response::BrokerRegistered(result.map_err(|e| format!("{e:#}"))));
+        }
+        Request::BrokerPortal { creds, dark } => {
+            let result = match tr_broker::SnapTrade::new(creds) {
+                Ok(client) => client.connection_portal_url(dark).await,
+                Err(e) => Err(e),
+            };
+            s.send(Response::BrokerPortal(result.map_err(|e| format!("{e:#}"))));
+        }
         Request::Options { pane, symbol, expiration } => {
             let chain = s.provider.options(&symbol, expiration).await.map(Box::new).map_err(|e| format!("{e:#}"));
             s.send(Response::Options { pane, symbol, chain });

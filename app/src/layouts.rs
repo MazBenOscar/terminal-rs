@@ -101,6 +101,19 @@ pub enum PaneSettings {
         #[serde(default = "yes")]
         greeks: bool,
     },
+    /// Brokerage portfolio view (credentials are never stored in layouts).
+    Portfolio {
+        #[serde(default)]
+        view: crate::command::PortView,
+        #[serde(default)]
+        account: Option<String>,
+        #[serde(default)]
+        symbol: Option<String>,
+        #[serde(default)]
+        sort: crate::app::PosSort,
+        #[serde(default)]
+        open_only: bool,
+    },
 }
 
 fn yes() -> bool {

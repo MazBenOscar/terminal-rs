@@ -1,0 +1,25 @@
+{
+  "data": [
+    {
+      "id": "2f7dc9b3-5c33-4668-3440-2b31e056ebe6",
+      "account": {"id": "917c8734-8470-4a3e-a18f-57c3f2ee6631", "name": "Individual Margin", "number": "Q6542138443"},
+      "symbol": {"id": "u-aapl", "symbol": "AAPL", "raw_symbol": "AAPL", "description": "Apple Inc."},
+      "option_symbol": null,
+      "price": 331.2, "units": 10, "amount": -3312.0,
+      "currency": {"id": "c-usd", "code": "USD", "name": "US Dollar"},
+      "type": "BUY", "option_type": "", "description": "Bought 10 AAPL",
+      "trade_date": "2026-10-08T14:31:05.000Z", "settlement_date": "2026-10-09T00:00:00.000Z",
+      "fee": 0, "fx_rate": null, "institution": "Robinhood"
+    },
+    {
+      "id": "8d1e7a52-3b0f-4c2a-9e6d-6a0b7c5d4e31",
+      "symbol": {"id": "u-spy", "symbol": "SPY", "raw_symbol": "SPY", "description": "SPDR S&P 500 ETF Trust"},
+      "price": 0, "units": 0, "amount": 22.41,
+      "currency": {"code": "USD"},
+      "type": "DIVIDEND", "description": "SPY dividend",
+      "trade_date": "2026-09-30T00:00:00.000Z", "settlement_date": "2026-09-30T00:00:00.000Z",
+      "fee": 0, "institution": "Robinhood"
+    }
+  ],
+  "pagination": {"offset": 0, "limit": 100, "total": 2}
+}

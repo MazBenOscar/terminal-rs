@@ -46,6 +46,43 @@ impl IndicatorSpec {
     }
 }
 
+/// Views of the brokerage portfolio pane (`PORT`, `ACCT`, `POS`, `ORD`, `ACTV`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum PortView {
+    #[default]
+    Summary,
+    Accounts,
+    Positions,
+    Orders,
+    Activity,
+}
+
+impl PortView {
+    pub const ALL: [PortView; 5] =
+        [PortView::Summary, PortView::Accounts, PortView::Positions, PortView::Orders, PortView::Activity];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PortView::Summary => "Summary",
+            PortView::Accounts => "Accounts",
+            PortView::Positions => "Positions",
+            PortView::Orders => "Orders",
+            PortView::Activity => "Activity",
+        }
+    }
+
+    /// The function code shown on the tab and typed on the command line.
+    pub fn code(self) -> &'static str {
+        match self {
+            PortView::Summary => "PORT",
+            PortView::Accounts => "ACCT",
+            PortView::Positions => "POS",
+            PortView::Orders => "ORD",
+            PortView::Activity => "ACTV",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// A market key, e.g. `BTCUSD Curncy`.
@@ -182,6 +219,8 @@ pub enum Function {
     Curve,
     /// Security search across asset classes.
     Search(String),
+    /// Brokerage portfolio view, with an optional subcommand (`REFRESH`, `CONNECT`, `SETUP`).
+    Portfolio(PortView, String),
 }
 
 fn num<T: std::str::FromStr>(t: Option<&&str>) -> Option<T> {
@@ -259,6 +298,14 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "WEI" | "MARKETS" | "WORLD" => Function::Wei,
         "GC" | "YCRV" | "CURVE" | "YC" => Function::Curve,
         "SECF" | "SEARCH" | "FIND" => Function::Search(joined()),
+        "PORT" | "PORTFOLIO" | "PRTU" => Function::Portfolio(PortView::Summary, words().join(" ")),
+        "ACCT" | "ACCOUNTS" | "ACCTS" | "BAL" | "BALANCES" => {
+            Function::Portfolio(PortView::Accounts, words().join(" "))
+        }
+        "POS" | "POSITIONS" | "HOLDINGS" => Function::Portfolio(PortView::Positions, words().join(" ")),
+        "ORD" | "ORDERS" | "BLTR" => Function::Portfolio(PortView::Orders, words().join(" ")),
+        "ACTV" | "ACTIVITY" | "TXNS" | "TRANSACTIONS" => Function::Portfolio(PortView::Activity, words().join(" ")),
+        "BROKER" | "BROKERAGE" | "SNAPTRADE" => Function::Portfolio(PortView::Summary, "SETUP".into()),
         "RANGE" => Function::Range(Range::parse(rest.first()?)?),
         // Timeframes win where spellings overlap (`1D`, `1M`); otherwise try a range (`5D`, `YTD`).
         _ => {
@@ -368,6 +415,18 @@ fn describe(f: &Function) -> String {
         Function::Wei => "World markets overview".into(),
         Function::Curve => "US Treasury yield curve".into(),
         Function::Search(q) => format!("Search securities: {q}"),
+        Function::Portfolio(v, a) if a.is_empty() => match v {
+            PortView::Summary => "Brokerage portfolio: value, cash, P&L and holdings (SnapTrade)".into(),
+            PortView::Accounts => "Brokerage accounts and balances".into(),
+            PortView::Positions => "Brokerage positions with unrealised P&L".into(),
+            PortView::Orders => "Brokerage orders (last 30 days)".into(),
+            PortView::Activity => "Brokerage activity: trades, dividends, transfers".into(),
+        },
+        Function::Portfolio(_, a) => match a.as_str() {
+            "REFRESH" | "SYNC" => "Reload brokerage accounts now".into(),
+            "CONNECT" | "LINK" => "Connect a brokerage in your browser (SnapTrade, read-only)".into(),
+            _ => "Brokerage connection settings".into(),
+        },
     }
 }
 
@@ -445,6 +504,32 @@ mod tests {
         assert_eq!(parse("SPX INDEX OMON"), Some(Command::SymbolFunction("SPX Index".into(), Function::Options)));
         assert_eq!(parse("OMON"), Some(Command::Function(Function::Options)));
         assert_eq!(parse("SIDEBAR RIGHT"), Some(Command::Function(Function::Sidebar("RIGHT".into()))));
+    }
+
+    #[test]
+    fn portfolio_commands() {
+        let f = |v, a: &str| Some(Command::Function(Function::Portfolio(v, a.into())));
+        assert_eq!(parse("PORT"), f(PortView::Summary, ""));
+        assert_eq!(parse("port refresh"), f(PortView::Summary, "REFRESH"));
+        assert_eq!(parse("ACCT"), f(PortView::Accounts, ""));
+        assert_eq!(parse("POS"), f(PortView::Positions, ""));
+        assert_eq!(parse("ORD"), f(PortView::Orders, ""));
+        assert_eq!(parse("ACTV"), f(PortView::Activity, ""));
+        assert_eq!(parse("PORT CONNECT"), f(PortView::Summary, "CONNECT"));
+        assert_eq!(parse("BROKER"), f(PortView::Summary, "SETUP"));
+        // After a security: positions (or orders) in that security.
+        assert_eq!(
+            parse("AAPL POS"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::Portfolio(PortView::Positions, String::new())
+            ))
+        );
+        // `ACT` stays a ticker (Enact Holdings), not the activity view.
+        assert_eq!(parse("ACT"), Some(Command::Symbol("ACT US Equity".into())));
+        for v in PortView::ALL {
+            assert_eq!(parse(v.code()), f(v, ""), "{} round-trips", v.code());
+        }
     }
 
     #[test]
