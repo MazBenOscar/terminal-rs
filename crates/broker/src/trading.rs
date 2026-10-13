@@ -427,10 +427,11 @@ impl Capability {
     }
 }
 
-/// Per-account capabilities from `/accounts` (each account names its `brokerage_authorization`)
-/// and `/authorizations` (each connection carries its brokerage and access type).
-pub fn parse_capabilities(accounts: &Value, authorizations: &Value) -> std::collections::HashMap<String, Capability> {
-    let conns: std::collections::HashMap<String, Capability> = authorizations
+/// Capabilities per brokerage connection (SnapTrade authorization id) from `/authorizations`,
+/// where each connection carries its brokerage and access type. Accounts map onto these
+/// through [`crate::Account::connection_id`], so one request covers every account.
+pub fn parse_connection_capabilities(authorizations: &Value) -> std::collections::HashMap<String, Capability> {
+    authorizations
         .as_array()
         .into_iter()
         .flatten()
@@ -452,7 +453,13 @@ pub fn parse_capabilities(accounts: &Value, authorizations: &Value) -> std::coll
                 },
             ))
         })
-        .collect();
+        .collect()
+}
+
+/// Per-account capabilities from `/accounts` (each account names its `brokerage_authorization`)
+/// and `/authorizations`.
+pub fn parse_capabilities(accounts: &Value, authorizations: &Value) -> std::collections::HashMap<String, Capability> {
+    let conns = parse_connection_capabilities(authorizations);
     accounts
         .as_array()
         .into_iter()
@@ -498,6 +505,9 @@ impl std::fmt::Display for PlaceError {
 /// Only a client error (4xx) is a definite "not placed"; everything else after sending is unknown.
 pub fn classify_place_error(e: anyhow::Error) -> PlaceError {
     let msg = format!("{e:#}");
+    if e.downcast_ref::<crate::snaptrade::NotSent>().is_some() {
+        return PlaceError::NotSent(msg);
+    }
     match e.downcast_ref::<crate::snaptrade::ApiError>() {
         Some(api) if (400..500).contains(&api.status) => PlaceError::Rejected(msg),
         _ => PlaceError::Unknown(msg),
@@ -549,10 +559,11 @@ impl SnapTrade {
             return Err(PlaceError::NotSent("the preview expired; preview the order again".into()));
         }
         let id = segment("trade id", &preview.trade_id).map_err(|e| PlaceError::NotSent(e.to_string()))?;
-        match self
-            .call(Method::POST, &format!("/trade/{id}"), &[], Some(json!({ "wait_to_confirm": true })), true)
-            .await
-        {
+        // Never sent once the preview has expired, however long a rate-limit pause lasts.
+        let left = (preview.expires() - Utc::now()).to_std().unwrap_or_default();
+        let deadline = Some(std::time::Instant::now() + left);
+        let body = Some(json!({ "wait_to_confirm": true }));
+        match self.call_by(Method::POST, &format!("/trade/{id}"), &[], body, true, deadline).await {
             Ok(v) => Ok(parse_placed(&preview.request.account_id, &v)),
             Err(e) => Err(classify_place_error(e)),
         }
@@ -564,6 +575,11 @@ impl SnapTrade {
         let order = segment("order id", brokerage_order_id)?;
         let body = json!({ "brokerage_order_id": order });
         self.call(Method::POST, &format!("/accounts/{acct}/trading/cancel"), &[], Some(body), true).await.map(|_| ())
+    }
+
+    /// What each brokerage connection can do, in one request however many accounts it holds.
+    pub async fn connection_capabilities(&self) -> Result<std::collections::HashMap<String, Capability>> {
+        Ok(parse_connection_capabilities(&self.call(Method::GET, "/authorizations", &[], None, true).await?))
     }
 
     /// What each account can do: brokerage support for trading and the connection's access.
