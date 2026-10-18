@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<style>
+			html,
+			body {
+				margin: 0;
+				width: 1200px;
+				height: 630px;
+				overflow: hidden;
+			}
+			body {
+				position: relative;
+				background: #0b0b0a;
+				color: #ecebe6;
+				font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+				background-image:
+					radial-gradient(ellipse 520px 380px at 18% 30%, rgba(255, 176, 0, 0.12), transparent 70%),
+					linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+					linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+				background-size:
+					auto,
+					40px 40px,
+					40px 40px;
+			}
+			.copy {
+				position: absolute;
+				left: 72px;
+				top: 76px;
+				width: 556px;
+			}
+			.brand {
+				display: flex;
+				align-items: center;
+				gap: 18px;
+				font-size: 30px;
+				font-weight: 600;
+				letter-spacing: -0.01em;
+			}
+			.brand img {
+				width: 92px;
+				height: 92px;
+				margin: -10px -6px -10px -10px;
+			}
+			h1 {
+				margin: 52px 0 22px;
+				font-size: 50px;
+				line-height: 1.08;
+				font-weight: 600;
+				letter-spacing: -0.035em;
+			}
+			p {
+				margin: 0;
+				font: 24px/1.4 -apple-system, BlinkMacSystemFont, sans-serif;
+				color: #a29e94;
+			}
+			.chip {
+				display: inline-block;
+				margin-top: 34px;
+				padding: 10px 18px;
+				border-radius: 10px;
+				background: #ffb000;
+				color: #1a1405;
+				font-size: 20px;
+				font-weight: 700;
+			}
+			.shot {
+				position: absolute;
+				left: 640px;
+				top: 92px;
+				width: 1180px;
+				border-radius: 12px;
+				box-shadow:
+					0 0 0 1px rgba(255, 255, 255, 0.1),
+					0 30px 80px rgba(0, 0, 0, 0.6);
+			}
+		</style>
+	</head>
+	<body>
+		<div class="copy">
+			<div class="brand"><img src="icon.svg" alt="" />terminal-rs</div>
+			<h1>The market,<br />one command away.</h1>
+			<p>A fast, keyboard-driven market terminal for the Mac, written in Rust.</p>
+			<span class="chip">Free for Mac</span>
+		</div>
+		<img class="shot" src="hero-dark.png" alt="" />
+	</body>
+</html>

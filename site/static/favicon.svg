@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 100 824 824">
+	<defs>
+		<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+			<stop offset="0" stop-color="#23211d" />
+			<stop offset="1" stop-color="#0c0b0a" />
+		</linearGradient>
+		<linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+			<stop offset="0" stop-color="#ffffff" stop-opacity=".16" />
+			<stop offset=".5" stop-color="#ffffff" stop-opacity=".03" />
+			<stop offset="1" stop-color="#ffffff" stop-opacity=".07" />
+		</linearGradient>
+		<clipPath id="tile">
+			<rect x="100" y="100" width="824" height="824" rx="185" />
+		</clipPath>
+	</defs>
+	<rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)" />
+	<g clip-path="url(#tile)" stroke="#ffffff" stroke-opacity=".05" stroke-width="4">
+		<path d="M100 330H924M100 470H924M100 610H924M100 750H924" />
+	</g>
+	<g stroke-linecap="round">
+		<path d="M612 262V398" stroke="#3ecf8e" stroke-width="12" />
+		<rect x="590" y="296" width="44" height="76" rx="6" fill="#3ecf8e" />
+		<path d="M690 300V430" stroke="#f0524f" stroke-width="12" />
+		<rect x="668" y="322" width="44" height="74" rx="6" fill="#f0524f" />
+		<path d="M768 214V372" stroke="#3ecf8e" stroke-width="12" />
+		<rect x="746" y="238" width="44" height="110" rx="6" fill="#3ecf8e" />
+	</g>
+	<path d="M262 520L414 642L262 764" fill="none" stroke="#ffb000" stroke-width="72" stroke-linecap="round" stroke-linejoin="round" />
+	<rect x="468" y="704" width="230" height="64" rx="12" fill="#ffb000" />
+	<rect x="102" y="102" width="820" height="820" rx="183" fill="none" stroke="url(#rim)" stroke-width="4" />
+</svg>

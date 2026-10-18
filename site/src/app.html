@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="text-scale" content="scale" />
+		<script>
+			(() => {
+				const root = document.documentElement;
+				const prefersLight = matchMedia('(prefers-color-scheme: light)');
+				const saved = () => {
+					try {
+						const t = localStorage.getItem('theme');
+						return t === 'light' || t === 'dark' ? t : null;
+					} catch {
+						return null;
+					}
+				};
+				const apply = (theme) => {
+					root.dataset.theme = theme;
+					const button = document.querySelector('[data-theme-toggle]');
+					if (button) {
+						const label = theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';
+						button.setAttribute('aria-label', label);
+						button.title = label;
+					}
+				};
+				const preferred = () => saved() ?? (prefersLight.matches ? 'light' : 'dark');
+
+				apply(preferred());
+				prefersLight.addEventListener('change', () => saved() || apply(preferred()));
+				document.addEventListener('DOMContentLoaded', () => apply(root.dataset.theme));
+				document.addEventListener('click', (event) => {
+					if (!(event.target instanceof Element) || !event.target.closest('[data-theme-toggle]')) return;
+					const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+					try {
+						localStorage.setItem('theme', next);
+					} catch {}
+					apply(next);
+				});
+			})();
+		</script>
+		<noscript><style>[data-theme-toggle] { display: none !important; }</style></noscript>
+		%sveltekit.head%
+	</head>
+	<body>
+		<div style="display: contents">%sveltekit.body%</div>
+	</body>
+</html>
