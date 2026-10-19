@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Wrap the release binary in a minimal macOS .app bundle (retina-capable, dark-mode aware).
+# Wrap a release binary in a minimal macOS .app bundle (retina-capable, dark-mode aware), written
+# next to the binary: target/release/terminal-rs unless another path is given.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-app=target/release/terminal-rs.app
+bin=${1:-target/release/terminal-rs}
+app=$(dirname "$bin")/terminal-rs.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/terminal-rs "$app/Contents/MacOS/terminal-rs"
+cp "$bin" "$app/Contents/MacOS/terminal-rs"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

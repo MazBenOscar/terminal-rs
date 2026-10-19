@@ -1,7 +1,7 @@
 export const VERSION = '0.1.0';
 
-/** `scripts/bundle-macos.sh` wraps the host-architecture binary; switch to "Apple Silicon and Intel" once releases are universal. */
-export const ARCH = 'Apple Silicon';
+/** `scripts/release-macos.sh` builds the release DMG as a universal binary. */
+export const ARCH = 'Apple Silicon and Intel';
 export const MIN_MACOS = '11';
 
 export const NAME = 'Terminal';

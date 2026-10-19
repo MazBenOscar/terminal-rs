@@ -177,8 +177,11 @@ current and previous year (a few minutes; it runs in the background while you wo
 Appearance: `TR_THEME=light|dark|<theme name>` overrides the saved theme, `TR_MSAA=1|2|4|8` sets
 chart anti-aliasing (default 4 on macOS), `TR_VIBRANCY=0` disables the translucent sidebar, and
 ⌃⌘S (Ctrl+Shift+S elsewhere) toggles the sidebar. `scripts/bundle-macos.sh` builds a retina-capable
-`terminal-rs.app`; `scripts/check-macos-cross.sh` compiles and lints the whole workspace for
-aarch64-apple-darwin from Linux (zig as the C cross-compiler; linking needs the macOS SDK).
+`terminal-rs.app`; `scripts/release-macos.sh` builds the universal (Apple Silicon + Intel) app,
+signs it with a Developer ID certificate, notarizes it and packages `terminal-rs-universal.dmg`
+(one-time credential setup is at the top of the script); `scripts/check-macos-cross.sh` compiles
+and lints the whole workspace for aarch64-apple-darwin from Linux (zig as the C cross-compiler;
+linking needs the macOS SDK).
 
 ## Brokerage setup (SnapTrade)
 
