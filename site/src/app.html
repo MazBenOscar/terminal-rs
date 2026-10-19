@@ -4,9 +4,12 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<meta name="text-scale" content="scale" />
+		<meta name="theme-color" content="#0b0b0a" />
 		<script>
 			(() => {
 				const root = document.documentElement;
+				const themeColor = document.querySelector('meta[name="theme-color"]');
+				const colors = { light: '#f6f5f1', dark: '#0b0b0a' };
 				const prefersLight = matchMedia('(prefers-color-scheme: light)');
 				const saved = () => {
 					try {
@@ -18,6 +21,7 @@
 				};
 				const apply = (theme) => {
 					root.dataset.theme = theme;
+					themeColor.content = colors[theme];
 					const button = document.querySelector('[data-theme-toggle]');
 					if (button) {
 						const label = theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';

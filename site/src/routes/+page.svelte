@@ -1,17 +1,44 @@
 <script lang="ts">
 	import { asset, resolve } from '$app/paths';
-	import { ARCH, DESCRIPTION, MIN_MACOS, SITE_URL, TITLE, VERSION } from '#lib/site.js';
+	import {
+		ARCH,
+		DESCRIPTION,
+		MIN_MACOS,
+		NAME,
+		OG_IMAGE_ALT,
+		SITE_URL,
+		TITLE,
+		VERSION
+	} from '#lib/site.js';
+
+	const url = `${SITE_URL}/`;
+	const image = `${SITE_URL}/og.jpg`;
+	const app = JSON.stringify({
+		'@context': 'https://schema.org',
+		'@type': 'SoftwareApplication',
+		name: NAME,
+		description: DESCRIPTION,
+		url,
+		image,
+		operatingSystem: 'macOS',
+		applicationCategory: 'FinanceApplication',
+		offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+		downloadUrl: `${SITE_URL}/download`,
+		softwareVersion: VERSION
+	}).replaceAll('<', '\\u003c');
+	// A literal closing tag here would end this <script> block.
+	const jsonLd = `<script type="application/ld+json">${app}<\/script>`;
 
 	const sizes = '(min-width: 1080px) 1032px, calc(100vw - 40px)';
 	const narrow = '(max-width: 640px)';
 	const shots = [
 		{
 			theme: 'dark',
-			alt: 'terminal-rs on macOS in the dark theme: a watchlist and an AAPL chart with congressional trade markers'
+			alt: `${NAME} in the dark theme on macOS: a watchlist and an AAPL chart with congressional trade markers`
 		},
 		{
 			theme: 'light',
-			alt: 'terminal-rs on macOS in the light theme: a watchlist and an AAPL chart with congressional trade markers'
+			alt: `${NAME} in the light theme on macOS: a watchlist and an AAPL chart with congressional trade markers`
 		}
 	] as const;
 </script>
@@ -19,19 +46,25 @@
 <svelte:head>
 	<title>{TITLE}</title>
 	<meta name="description" content={DESCRIPTION} />
-	<link rel="canonical" href={SITE_URL} />
+	<link rel="canonical" href={url} />
 	<meta property="og:type" content="website" />
-	<meta property="og:url" content={SITE_URL} />
+	<meta property="og:site_name" content={NAME} />
+	<meta property="og:locale" content="en_US" />
+	<meta property="og:url" content={url} />
 	<meta property="og:title" content={TITLE} />
 	<meta property="og:description" content={DESCRIPTION} />
-	<meta property="og:image" content="{SITE_URL}/og.jpg" />
+	<meta property="og:image" content={image} />
+	<meta property="og:image:type" content="image/jpeg" />
 	<meta property="og:image:width" content="1200" />
 	<meta property="og:image:height" content="630" />
-	<meta property="og:image:alt" content="terminal-rs: the market, one command away" />
+	<meta property="og:image:alt" content={OG_IMAGE_ALT} />
 	<meta name="twitter:card" content="summary_large_image" />
 	<meta name="twitter:title" content={TITLE} />
 	<meta name="twitter:description" content={DESCRIPTION} />
-	<meta name="twitter:image" content="{SITE_URL}/og.jpg" />
+	<meta name="twitter:image" content={image} />
+	<meta name="twitter:image:alt" content={OG_IMAGE_ALT} />
+	<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+	{@html jsonLd}
 </svelte:head>
 
 <div class="wrap">
@@ -48,7 +81,7 @@
 			</svg>
 		</button>
 
-		<img class="icon" src={asset('icon.png')} width="112" height="112" alt="terminal-rs app icon" />
+		<img class="icon" src={asset('icon.png')} width="112" height="112" alt="{NAME} app icon" />
 		<h1>The market,<br /> one command away.</h1>
 		<p class="lede">
 			A fast, keyboard-driven market terminal for the Mac, written in Rust. GPU charts, dense tiled

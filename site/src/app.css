@@ -1,3 +1,4 @@
+/* The theme script in app.html repeats both --bg colours for the theme-color tag. */
 :root {
 	--bg: #0b0b0a;
 	--fg: #ecebe6;

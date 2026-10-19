@@ -4,10 +4,13 @@ export const VERSION = '0.1.0';
 export const ARCH = 'Apple Silicon';
 export const MIN_MACOS = '11';
 
-export const SITE_URL = 'https://terminal-rs.vercel.app';
+export const NAME = 'Terminal';
+/** `static/robots.txt` and `static/sitemap.xml` repeat this origin. */
+export const SITE_URL = 'https://terminal.rasmic.xyz';
 export const DOWNLOAD_URL =
 	'https://github.com/michaelshimeles/terminal-rs/releases/latest/download/terminal-rs-universal.dmg';
 
-export const TITLE = 'terminal-rs: a fast market terminal for the Mac';
+export const TITLE = `${NAME}: a fast market terminal for the Mac`;
 export const DESCRIPTION =
-	'A fast, keyboard-driven market terminal for the Mac, written in Rust. GPU charts, dense tiled panes and a command line for stocks, crypto, FX, Treasuries, futures, options and congressional trades.';
+	'A fast, keyboard-driven market terminal for the Mac, written in Rust. GPU charts, tiled panes and a command line for stocks, crypto, FX, futures and options.';
+export const OG_IMAGE_ALT = `${NAME}: the market, one command away. The app icon beside a screenshot of a watchlist, an AAPL chart and world markets.`;
