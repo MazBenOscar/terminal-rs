@@ -5,6 +5,7 @@ use egui::{Color32, Id, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui, UiB
 
 use super::TerminalApp;
 use super::settings_view::SettingsTab;
+use crate::anim;
 use crate::command::{self, Function};
 use crate::layout::Layout;
 use crate::palette::{Item, Kind, Target};
@@ -357,13 +358,16 @@ impl TerminalApp {
         let screen = ctx.content_rect();
         let mut picked = None;
         let mut close = esc;
+        // Opening fades the dim in and floats the card up into place.
+        let shown = anim::ease_out(anim::appear(ctx, Id::new("command-palette-in"), 0.2));
         let results = egui::Area::new(Id::new("command-palette"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
+                ui.multiply_opacity(shown);
                 let (_, bg) = ui.allocate_exact_size(screen.size(), Sense::click());
                 let w = (screen.width() - dp(40.0)).clamp(320.0, 660.0);
-                let top = screen.top() + (screen.height() * 0.14).clamp(dp(16.0), dp(160.0));
+                let top = screen.top() + (screen.height() * 0.14).clamp(dp(16.0), dp(160.0)) + dp(10.0) * (1.0 - shown);
                 let left = screen.center().x - w / 2.0;
                 let pad = vec2(dp(10.0), dp(6.0));
                 let field_h = dp(46.0);
@@ -424,8 +428,9 @@ impl TerminalApp {
                 }
                 // Dim everything beneath, then the card, on a layer above the panes and
                 // below this one.
-                let under =
+                let mut under =
                     ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Middle, Id::new("command-palette-dim")));
+                under.multiply_opacity(shown);
                 let dark = theme::palette().dark;
                 under.rect_filled(screen, 0.0, Color32::from_black_alpha(if dark { 120 } else { 70 }));
                 widgets::card_on(&under, card, 1.0);
@@ -444,6 +449,7 @@ impl TerminalApp {
                 let mut list_ui = ui.new_child(UiBuilder::new().max_rect(list).id_salt("palette-list"));
                 egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, true]).show(&mut list_ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
+                    let glider = widgets::Glider::new(ui, Id::new("palette-selection"));
                     if results.is_empty() {
                         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), dp(ROW_H)), Sense::hover());
                         ui.painter().text(
@@ -458,7 +464,7 @@ impl TerminalApp {
                         if recents > 0 && (i == 0 || i == recents) {
                             section_header(ui, if i == 0 { "Recent" } else { "All" });
                         }
-                        if self.palette_row(ui, it, i == self.palette.selected, keyed) {
+                        if self.palette_row(ui, it, (i == self.palette.selected).then_some(&glider), keyed) {
                             picked = Some(i);
                         }
                     }
@@ -505,14 +511,17 @@ impl TerminalApp {
         }
     }
 
-    /// One result row: kind badge, title, subtitle and shortcut caps. Returns whether it
-    /// was clicked.
-    fn palette_row(&self, ui: &mut Ui, it: &Item, selected: bool, keyed: bool) -> bool {
+    /// One result row: kind badge, title, subtitle and shortcut caps. `selected` carries
+    /// the selection highlight when this row has it. Returns whether it was clicked.
+    fn palette_row(&self, ui: &mut Ui, it: &Item, selected: Option<&widgets::Glider>, keyed: bool) -> bool {
         let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), dp(ROW_H)), Sense::click());
-        if selected && keyed {
-            resp.scroll_to_me(None);
+        if let Some(glider) = selected {
+            if keyed {
+                resp.scroll_to_me(None);
+            }
+            glider.on(ui, r);
         }
-        widgets::hover_wash(ui, r, &resp, selected);
+        widgets::hover_wash(ui, r, &resp, false);
         let p = ui.painter();
         let cy = r.center().y;
 

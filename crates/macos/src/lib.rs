@@ -30,7 +30,7 @@ mod imp {
     use objc2_app_kit::{
         NSAutoresizingMaskOptions, NSColor, NSColorSpace, NSToolbar, NSView, NSVisualEffectBlendingMode,
         NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowButton, NSWindowOrderingMode,
-        NSWindowTitleVisibility, NSWindowToolbarStyle,
+        NSWindowTitleVisibility, NSWindowToolbarStyle, NSWorkspace,
     };
     use objc2_foundation::NSString;
 
@@ -105,6 +105,10 @@ mod imp {
         let to = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
         Some([to(srgb.redComponent()), to(srgb.greenComponent()), to(srgb.blueComponent())])
     }
+
+    pub fn reduce_motion() -> bool {
+        NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+    }
 }
 
 /// Apply native chrome to the window owning `ns_view`. Returns whether it was applied.
@@ -150,6 +154,18 @@ pub fn accent_color() -> Option<[u8; 3]> {
     #[cfg(not(target_os = "macos"))]
     {
         None
+    }
+}
+
+/// Whether the user turned on Reduce Motion in the system accessibility settings.
+pub fn reduce_motion() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        imp::reduce_motion()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 

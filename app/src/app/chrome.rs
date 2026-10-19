@@ -1,7 +1,7 @@
 //! Window chrome in the style of a SwiftUI macOS app: a unified toolbar holding the
 //! command line, a translucent (vibrancy) sidebar, rounded pane cards and a status bar.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, Id, Key, Modifiers, Rect, RichText, Sense, Shadow, Stroke, StrokeKind,
@@ -335,17 +335,25 @@ impl TerminalApp {
             Icon::Search,
             muted(),
         );
-        // A small "GO" key cap at the trailing edge, Bloomberg-style.
+        // A small "GO" key cap at the trailing edge, Bloomberg-style. It lights up once
+        // there is something to run and presses in on a click or Enter.
         let go = Rect::from_center_size(pos2(field.right() - 18.0, field.center().y), vec2(28.0, 15.0));
-        p.rect_filled(go, 4.0, if self.cmd.trim().is_empty() { theme::control_hover() } else { amber() });
+        let go_resp = ui.interact(go, id.with("go"), Sense::click()).on_hover_text("<GO> (Enter)");
+        let now = ui.input(|i| i.time);
+        let entered = ui.ctx().data(|d| d.get_temp::<f64>(id.with("go-entered"))).is_some_and(|t| now - t < 0.09);
+        let held = go_resp.is_pointer_button_down_on() || entered;
+        let press = anim::spring_with(ui.ctx(), id.with("go-press"), if held { 1.0 } else { 0.0 }, 0.3, 0.55);
+        let lit = anim::spring_bool(ui.ctx(), id.with("go-lit"), !self.cmd.trim().is_empty());
+        let cap = Rect::from_center_size(go.center(), go.size() * (1.0 - 0.14 * press));
+        p.rect_filled(cap, 4.0, widgets::lerp_color(theme::control_hover(), amber(), lit));
         p.text(
-            go.center(),
+            cap.center(),
             Align2::CENTER_CENTER,
             "GO",
             mono(10.5),
-            if self.cmd.trim().is_empty() { muted() } else { Color32::BLACK },
+            widgets::lerp_color(muted(), Color32::BLACK, lit),
         );
-        let go_clicked = ui.interact(go, id.with("go"), Sense::click()).on_hover_text("<GO> (Enter)").clicked();
+        let go_clicked = go_resp.clicked();
 
         let inner = Rect::from_min_max(pos2(field.left() + 28.0, field.top()), pos2(go.left() - 6.0, field.bottom()));
         let mut child = ui.new_child(UiBuilder::new().max_rect(inner));
@@ -390,6 +398,10 @@ impl TerminalApp {
             )
         });
         if (resp.lost_focus() && enter) || go_clicked {
+            if enter {
+                ui.ctx().data_mut(|d| d.insert_temp(id.with("go-entered"), now));
+                ui.ctx().request_repaint();
+            }
             let input = std::mem::take(&mut self.cmd);
             match self.suggestion.take().and_then(|i| suggestions.get(i)) {
                 Some(pick) => self.execute(&pick.key),
@@ -448,10 +460,12 @@ impl TerminalApp {
         }
         let mut clicked = None;
         let width = below.width().clamp(420.0, 680.0);
+        let shown = anim::ease_out(anim::appear(ctx, Id::new("cmd-suggestions-in"), 0.18));
         egui::Area::new(Id::new("cmd-suggestions"))
             .order(egui::Order::Foreground)
-            .fixed_pos(below.left_bottom() + vec2(0.0, 6.0))
+            .fixed_pos(below.left_bottom() + vec2(0.0, 6.0 - 6.0 * (1.0 - shown)))
             .show(ctx, |ui| {
+                ui.multiply_opacity(shown);
                 egui::Frame::new()
                     .fill(theme::card())
                     .stroke(Stroke::new(1.0, theme::border()))
@@ -460,10 +474,13 @@ impl TerminalApp {
                     .inner_margin(6.0)
                     .show(ui, |ui| {
                         ui.set_width(width);
+                        let glider = widgets::Glider::new(ui, Id::new("cmd-suggestions-sel"));
                         for (i, h) in hits.iter().enumerate() {
                             let (r, resp) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
-                            let selected = self.suggestion == Some(i);
-                            widgets::hover_wash(ui, r, &resp, selected);
+                            if self.suggestion == Some(i) {
+                                glider.on(ui, r);
+                            }
+                            widgets::hover_wash(ui, r, &resp, false);
                             let p = ui.painter();
                             let class_c = markets_view::class_color(h.class);
                             let pill = Rect::from_min_size(pos2(r.left() + 6.0, r.center().y - 8.0), vec2(52.0, 16.0));
@@ -852,15 +869,26 @@ impl TerminalApp {
         p.text(pos2(rect.right() - 10.0, cy), Align2::RIGHT_CENTER, status, ui_font(11.5), muted());
     }
 
+    /// Alerts stacked at the top right: each slides in from the edge with a slight
+    /// overshoot, the stack glides up as older ones leave, and they fade out at the end.
     pub(super) fn toasts(&self, ctx: &egui::Context) {
         let screen = ctx.content_rect();
-        let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("toasts")));
+        let layer = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("toasts")));
+        let life = super::TOAST_SECS as f32;
         for (k, (msg, at)) in self.toasts.iter().enumerate() {
-            let slide = anim::spring(ctx, Id::new(("toast", k, *at)), 0.0);
-            let r = Rect::from_min_size(
-                pos2(screen.right() - 432.0 + slide, screen.top() + self.toolbar_h() + 10.0 + k as f32 * 58.0),
-                vec2(420.0, 50.0),
-            );
+            let age = at.elapsed().as_secs_f32();
+            let enter = anim::ease_out_back(anim::since(ctx, age as f64, 0.55));
+            // Reduce Motion skips the fade: the toast stays until it is removed.
+            let fade = if anim::reduced() { 0.0 } else { 0.35 };
+            let leave = if fade > 0.0 { anim::span(age, life - fade, life) } else { 0.0 };
+            // Wake for the fade-out (and the removal at the end of it).
+            ctx.request_repaint_after(Duration::from_secs_f32((life - fade - age).max(0.0)));
+            let y =
+                anim::spring(ctx, Id::new(("toast-y", *at)), screen.top() + self.toolbar_h() + 10.0 + k as f32 * 58.0);
+            let x = screen.right() - 432.0 + (1.0 - enter) * 444.0;
+            let r = Rect::from_min_size(pos2(x, y), vec2(420.0, 50.0));
+            let mut p = layer.clone();
+            p.multiply_opacity(1.0 - leave);
             widgets::card_on(&p, r, 0.0);
             // Order entry prefixes its toasts (`+` filled/ok, `!` rejected); everything else
             // is a Congress alert.

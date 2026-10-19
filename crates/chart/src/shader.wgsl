@@ -14,6 +14,8 @@ struct Uniforms {
     params: vec4<f32>,
     // vol_frac, vol_max, hist_width_bars, baseline
     extra: vec4<f32>,
+    // reveal front, ramp (bars), line front (both relative to left_hi), pane opacity
+    anim: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -55,11 +57,24 @@ fn corner(vi: u32) -> vec2<f32> {
     return c[vi % 6u];
 }
 
+// Premultiplied colour with the pane opacity applied.
+fn shade(color: vec4<f32>) -> vec4<f32> {
+    let a = color.a * u.anim.w;
+    return vec4<f32>(color.rgb * a, a);
+}
+
+// How far the bar centred at `idx` has grown in (0..1, eased) behind the reveal front.
+fn grow(idx: f32) -> f32 {
+    let f = clamp((u.anim.x - (idx - u.rect.z)) / u.anim.y, 0.0, 1.0);
+    let r = 1.0 - f;
+    return 1.0 - r * r * r;
+}
+
 fn rect(vi: u32, x0: f32, x1: f32, y0: f32, y1: f32, color: vec4<f32>) -> VsOut {
     let c = corner(vi);
     var out: VsOut;
     out.pos = vec4<f32>(mix(x0, x1, c.x), mix(y0, y1, c.y), 0.0, 1.0);
-    out.color = vec4<f32>(color.rgb * color.a, color.a);
+    out.color = shade(color);
     return out;
 }
 
@@ -95,7 +110,16 @@ struct Bar {
 @vertex
 fn vs_candle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
     let b = bars[ii];
-    let color = select(u.down, u.up, b.close >= b.open);
+    let g = grow(b.x + b.w * 0.5);
+    if (g <= 0.0) {
+        return degenerate();
+    }
+    // Growing in: the bar opens out from its open price.
+    let high = mix(b.open, b.high, g);
+    let low = mix(b.open, b.low, g);
+    let close = mix(b.open, b.close, g);
+    var color = select(u.down, u.up, b.close >= b.open);
+    color.a = color.a * clamp(g * 3.0, 0.0, 1.0);
     let cx = x_ndc(b.x + b.w * 0.5);
     let half_body = max((b.w * u.params.x * 0.5) / u.view.x * 2.0, px_to_ndc_x(0.5));
     let half_wick = px_to_ndc_x(u.params.y * 0.5);
@@ -103,34 +127,38 @@ fn vs_candle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
     let one_px = px_to_ndc_y(1.0);
     if (u.params.w < 0.5) {
         if (r == 0u) {
-            return rect(vi, cx - half_wick, cx + half_wick, y_ndc(b.low), max(y_ndc(b.high), y_ndc(b.low) + one_px), color);
+            return rect(vi, cx - half_wick, cx + half_wick, y_ndc(low), max(y_ndc(high), y_ndc(low) + one_px), color);
         }
         if (r == 1u) {
-            let y0 = y_ndc(min(b.open, b.close));
-            let y1 = max(y_ndc(max(b.open, b.close)), y0 + one_px);
+            let y0 = y_ndc(min(b.open, close));
+            let y1 = max(y_ndc(max(b.open, close)), y0 + one_px);
             return rect(vi, cx - half_body, cx + half_body, y0, y1, color);
         }
         return degenerate();
     }
     let tick = px_to_ndc_y(max(u.params.y, 1.0) * 0.5);
     if (r == 0u) {
-        return rect(vi, cx - half_wick, cx + half_wick, y_ndc(b.low), max(y_ndc(b.high), y_ndc(b.low) + one_px), color);
+        return rect(vi, cx - half_wick, cx + half_wick, y_ndc(low), max(y_ndc(high), y_ndc(low) + one_px), color);
     }
     if (r == 1u) {
         let y = y_ndc(b.open);
         return rect(vi, cx - half_body, cx, y - tick, y + tick, color);
     }
-    let y = y_ndc(b.close);
+    let y = y_ndc(close);
     return rect(vi, cx, cx + half_body, y - tick, y + tick, color);
 }
 
 @vertex
 fn vs_volume(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
     let b = bars[ii];
+    let g = grow(b.x + b.w * 0.5);
+    if (g <= 0.0) {
+        return degenerate();
+    }
     var color = select(u.down, u.up, b.close >= b.open);
     color.a = color.a * u.color.a;
     let cx = x_ndc(b.x + b.w * 0.5);
     let half = max((b.w * u.params.x * 0.5) / u.view.x * 2.0, px_to_ndc_x(0.5));
-    let h = clamp(b.volume / max(u.extra.y, 1e-30), 0.0, 1.0) * u.extra.x * 2.0;
+    let h = clamp(b.volume / max(u.extra.y, 1e-30), 0.0, 1.0) * u.extra.x * 2.0 * g;
     return rect(vi, cx - half, cx + half, -1.0, -1.0 + h, color);
 }

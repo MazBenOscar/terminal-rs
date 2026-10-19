@@ -8,7 +8,7 @@ use egui::{
     vec2,
 };
 use tr_chart::drawings::{self, Anchor, Drawing, Shape, Tool};
-use tr_chart::gpu::{ChartCallback, Frame, LineKind, LineRef, Style};
+use tr_chart::gpu::{ChartCallback, Frame, LineKind, LineRef, Reveal, Style};
 use tr_chart::scale;
 use tr_chart::scene::{self, ChartType, Overlay, PricePane, SeriesGpu};
 use tr_chart::viewport::{PriceScale, Viewport};
@@ -29,6 +29,33 @@ const RANGE_H: f32 = 18.0;
 /// Height of the interval / chart-type segmented controls.
 pub const CONTROL_H: f32 = 20.0;
 const DEFAULT_VISIBLE: usize = 160;
+
+/// Length of the load-in sweep across the visible bars.
+const REVEAL_SECS: f32 = 0.7;
+/// Length of an eased jump (quick ranges, reset, keyboard zoom and pan).
+const GLIDE_SECS: f32 = 0.32;
+/// Time constant of the autoscale easing.
+const SCALE_TAU: f64 = 0.07;
+
+/// A programmatic viewport change in progress; `start` is set on the first frame shown.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    from: Viewport,
+    to: Viewport,
+    start: Option<f64>,
+}
+
+impl Glide {
+    /// Pans linearly and zooms geometrically, so a zoom feels even all the way.
+    fn at(&self, e: f64) -> Viewport {
+        let (a, b) = (self.from.bar_px.ln(), self.to.bar_px.ln());
+        Viewport {
+            right: self.from.right + (self.to.right - self.from.right) * e,
+            bar_px: (a + (b - a) * e).exp(),
+            ..self.to
+        }
+    }
+}
 
 #[derive(Default)]
 struct DrawState {
@@ -55,6 +82,13 @@ pub struct ChartState {
     generation: u64,
     viewport: Option<Viewport>,
     manual_scale: Option<PriceScale>,
+    glide: Option<Glide>,
+    /// Shown autoscale bounds (transformed) and whether they are log, easing to the target.
+    shown_scale: Option<(f64, f64, bool)>,
+    /// Renewed when a load's first bars arrive, which replays the load-in sweep.
+    reveal_key: u64,
+    /// Renewed when a load's first Congress markers arrive, which pops them in.
+    markers_key: u64,
     loading: bool,
     paging: bool,
     exhausted: bool,
@@ -102,6 +136,10 @@ impl ChartState {
             generation: 0,
             viewport: None,
             manual_scale: None,
+            glide: None,
+            shown_scale: None,
+            reveal_key: 0,
+            markers_key: 0,
             loading: false,
             paging: false,
             exhausted: false,
@@ -135,6 +173,7 @@ impl ChartState {
         self.error = None;
         self.viewport = None;
         self.manual_scale = None;
+        self.glide = None;
         self.compare_line = None;
         self.markers.clear();
         // Never show the previous symbol's bars under the new title.
@@ -180,7 +219,23 @@ impl ChartState {
             self.tf = r.timeframe();
             self.load(w);
         } else {
-            self.apply_range();
+            self.glide(Self::apply_range);
+        }
+    }
+
+    /// Apply `change` to the view (on top of any glide's destination) and ease to it.
+    fn glide(&mut self, change: impl FnOnce(&mut Self)) {
+        let shown = self.viewport;
+        if let Some(g) = self.glide.take() {
+            self.viewport = Some(g.to);
+        }
+        change(self);
+        if let (Some(from), Some(to)) = (shown, self.viewport)
+            && from != to
+            && !crate::anim::reduced()
+        {
+            self.viewport = Some(from);
+            self.glide = Some(Glide { from, to, start: None });
         }
     }
 
@@ -245,25 +300,54 @@ impl ChartState {
     }
 
     pub fn reset_view(&mut self) {
-        if let Some(v) = self.viewport.as_mut() {
-            *v = Viewport::fit_last(self.bars.len(), DEFAULT_VISIBLE, v.width_px);
-        }
-        self.manual_scale = None;
+        self.glide(|s| {
+            if let Some(v) = s.viewport.as_mut() {
+                *v = Viewport::fit_last(s.bars.len(), DEFAULT_VISIBLE, v.width_px);
+            }
+            s.manual_scale = None;
+        });
     }
 
     pub fn pan_bars(&mut self, n: f64) {
-        if let Some(v) = self.viewport.as_mut() {
-            v.pan_bars(n);
-            v.clamp(self.bars.len());
-        }
+        self.glide(|s| {
+            if let Some(v) = s.viewport.as_mut() {
+                v.pan_bars(n);
+                v.clamp(s.bars.len());
+            }
+        });
     }
 
     pub fn zoom(&mut self, factor: f64) {
-        if let Some(v) = self.viewport.as_mut() {
-            let anchor = v.width_px * 0.85;
-            v.zoom(factor, anchor);
-            v.clamp(self.bars.len());
-        }
+        self.glide(|s| {
+            if let Some(v) = s.viewport.as_mut() {
+                let anchor = v.width_px * 0.85;
+                v.zoom(factor, anchor);
+                v.clamp(s.bars.len());
+            }
+        });
+    }
+
+    /// Ease the shown autoscale range toward `target`, so the axis glides as bars scroll
+    /// in rather than jumping. Snaps on new data and when switching log scale.
+    fn ease_scale(&mut self, ctx: &egui::Context, target: PriceScale) -> PriceScale {
+        let (a, b) = target.bounds_t();
+        let (lo, hi) = match self.shown_scale {
+            Some((lo, hi, log)) if log == target.log && !crate::anim::reduced() => {
+                let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1) as f64;
+                let k = 1.0 - (-dt / SCALE_TAU).exp();
+                let (lo, hi) = (lo + (a - lo) * k, hi + (b - hi) * k);
+                if (lo - a).abs() + (hi - b).abs() < (b - a).abs() * 1e-4 {
+                    (a, b)
+                } else {
+                    ctx.request_repaint();
+                    (lo, hi)
+                }
+            }
+            _ => (a, b),
+        };
+        self.shown_scale = Some((lo, hi, target.log));
+        let inv = |x: f64| if target.log { x.exp() } else { x };
+        PriceScale { lo: inv(lo), hi: inv(hi), ..target }
     }
 
     fn request_indicators(&self, w: &Worker) {
@@ -313,6 +397,16 @@ impl ChartState {
         }
         let old_len = self.bars.len();
         let new_len = bars.len();
+        if old_len == 0 && new_len > 0 {
+            self.reveal_key = crate::anim::fresh_key();
+            self.shown_scale = None;
+        }
+        // Keep a glide in progress on the same bars as the data shifts under it.
+        if let Some(g) = self.glide.as_mut() {
+            let shift = if prepended > 0 { prepended as f64 } else { new_len as f64 - old_len as f64 };
+            g.from.right += shift;
+            g.to.right += shift;
+        }
         self.bars = bars;
         self.gpu = Some(gpu);
         self.paging = false;
@@ -370,6 +464,9 @@ impl ChartState {
 
     pub fn on_markers(&mut self, symbol: &str, trades: Vec<Trade>) {
         if symbol == self.symbol {
+            if self.markers.is_empty() && !trades.is_empty() {
+                self.markers_key = crate::anim::fresh_key();
+            }
             self.markers = trades;
         }
     }
@@ -544,6 +641,14 @@ impl ChartState {
             Rect::from_min_max(plot_all.min, pos2(plot_all.right(), plot_all.bottom() - sub_h * n_sub as f32));
 
         let len = self.bars.len();
+        if let Some(g) = self.glide.as_mut() {
+            let now = ui.input(|i| i.time);
+            let t = crate::anim::since(ui.ctx(), now - *g.start.get_or_insert(now), GLIDE_SECS);
+            self.viewport = Some(g.at(crate::anim::ease_out(t) as f64));
+            if t >= 1.0 {
+                self.glide = None;
+            }
+        }
         let v =
             self.viewport.get_or_insert_with(|| Viewport::fit_last(len, DEFAULT_VISIBLE, price_rect.width() as f64));
         v.set_width(price_rect.width() as f64);
@@ -566,6 +671,9 @@ impl ChartState {
 
         if plot_resp.hovered() || axis_resp.hovered() || time_resp.hovered() {
             let (scroll, zoom_delta) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
+            if scroll != egui::Vec2::ZERO || zoom_delta != 1.0 {
+                self.glide = None;
+            }
             let v = self.viewport.as_mut().expect("viewport");
             if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
                 let anchor = (p.x - price_rect.left()).clamp(0.0, price_rect.width()) as f64;
@@ -579,6 +687,9 @@ impl ChartState {
             if scroll.x != 0.0 {
                 v.pan_px(scroll.x as f64);
             }
+        }
+        if (self.draw.tool.is_none() && plot_resp.dragged()) || time_resp.dragged() {
+            self.glide = None;
         }
         if self.draw.tool.is_none() && plot_resp.dragged() {
             let d = plot_resp.drag_delta();
@@ -633,14 +744,18 @@ impl ChartState {
                 scale,
             });
         }
+        let reveal_t =
+            crate::anim::progress(ui.ctx(), egui::Id::new(("chart-reveal", self.id)), self.reveal_key, REVEAL_SECS);
+        let reveal = Reveal { opacity: ui.opacity(), ..Reveal::sweep(reveal_t, v.left(), v.visible_bars()) };
         let style = Style {
             up: theme::rgba(theme::candle_up()),
             down: theme::rgba(theme::candle_down()),
             color: theme::rgba(amber()),
             pixels_per_point: ui.ctx().pixels_per_point(),
+            reveal,
             ..Style::default()
         };
-        let out = scene::price_pane(&PricePane {
+        let mut pane = PricePane {
             series: &gpu,
             chart_type: self.chart_type,
             show_volume: self.show_volume,
@@ -653,7 +768,16 @@ impl ChartState {
                 s
             }),
             style,
+        };
+        pane.manual_scale = Some(match pane.manual_scale {
+            Some(s) => {
+                let (a, b) = s.bounds_t();
+                self.shown_scale = Some((a, b, s.log));
+                s
+            }
+            None => self.ease_scale(ui.ctx(), scene::autoscale(&pane)),
         });
+        let out = scene::price_pane(&pane);
         let mut scale = out.scale;
         scale.height_px = price_rect.height() as f64;
         if axis_resp.dragged() {
@@ -759,8 +883,11 @@ impl ChartState {
             }
         }
 
-        // Last price line + axis tag.
-        if let Some(last) = self.bars.last() {
+        // Last price line + axis tag, fading in as the sweep reaches the last bar.
+        let tag_fade = crate::anim::span(reveal_t, 0.8, 1.0);
+        if let Some(last) = self.bars.last()
+            && tag_fade > 0.0
+        {
             let y = price_rect.top() + scale.y_of(last.close) as f32;
             if price_rect.y_range().contains(y) {
                 let col = if last.is_up() { theme::up() } else { theme::down() };
@@ -769,18 +896,18 @@ impl ChartState {
                     price_painter.hline(
                         xx..=(xx + 3.0).min(price_rect.right()),
                         y,
-                        Stroke::new(1.0, col.gamma_multiply(0.6)),
+                        Stroke::new(1.0, col.gamma_multiply(0.6 * tag_fade)),
                     );
                     xx += 6.0;
                 }
                 let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
-                axis_painter.rect_filled(tag, 0.0, col);
+                axis_painter.rect_filled(tag, 0.0, col.gamma_multiply(tag_fade));
                 axis_painter.text(
                     tag.left_center() + vec2(5.0, 0.0),
                     Align2::LEFT_CENTER,
                     scale::format_price(last.close, self.sec.decimals(last.close)),
                     mono(11.0),
-                    Color32::BLACK,
+                    Color32::BLACK.gamma_multiply(tag_fade),
                 );
             }
         }
@@ -791,7 +918,7 @@ impl ChartState {
         // ---- congress markers ----
         self.hover_marker = None;
         if self.show_congress {
-            self.paint_markers(ui, price_rect, &v, &scale, hover);
+            self.paint_markers(ui, price_rect, &v, &scale, hover, &reveal);
         }
 
         // ---- crosshair + legend ----
@@ -1127,16 +1254,27 @@ impl ChartState {
         }
     }
 
-    fn paint_markers(&mut self, ui: &Ui, rect: Rect, v: &Viewport, s: &PriceScale, hover: Option<Pos2>) {
+    /// Congress trade markers. They pop in once the reveal sweep has passed their bar, and
+    /// left to right when they arrive after it.
+    fn paint_markers(
+        &mut self,
+        ui: &Ui,
+        rect: Rect,
+        v: &Viewport,
+        s: &PriceScale,
+        hover: Option<Pos2>,
+        reveal: &Reveal,
+    ) {
         if self.markers.is_empty() || self.bars.is_empty() {
             return;
         }
+        let arrive = crate::anim::progress(ui.ctx(), egui::Id::new(("chart-markers", self.id)), self.markers_key, 0.6);
         let p = ui.painter_at(rect);
         let len = self.bars.len();
         let (lo, hi) = v.visible_range(len);
         // Stack multiple trades on the same bar.
         let mut stack: std::collections::HashMap<(usize, bool), u32> = std::collections::HashMap::new();
-        let r = (v.bar_px as f32 * 0.45).clamp(4.0, 7.0);
+        let full_r = (v.bar_px as f32 * 0.45).clamp(4.0, 7.0);
         let mut best: Option<(f32, usize, Pos2)> = None;
         for (mi, t) in self.markers.iter().enumerate() {
             let Some(ts) = t.tx_date.and_hms_opt(12, 0, 0).map(|d| d.and_utc().timestamp()) else { continue };
@@ -1149,7 +1287,15 @@ impl ChartState {
             let sell = t.tx_type.is_sell();
             let n = stack.entry((i, sell)).or_insert(0);
             let x = rect.left() + v.x_center(i) as f32;
-            let off = 6.0 + r + *n as f32 * (2.0 * r + 1.0);
+            let off = 6.0 + full_r + *n as f32 * (2.0 * full_r + 1.0);
+            let swept = ((reveal.front - (i as f64 + 0.5)) / reveal.ramp as f64).clamp(0.0, 1.0) as f32;
+            let lead = 0.5 * (x - rect.left()) / rect.width().max(1.0);
+            let pop = crate::anim::ease_out_back(swept.min(crate::anim::span(arrive, lead, lead + 0.5)));
+            if pop <= 0.01 {
+                *n += 1;
+                continue;
+            }
+            let r = full_r * pop;
             let y = if sell {
                 rect.top() + s.y_of(bar.high) as f32 - off
             } else {
@@ -1159,13 +1305,14 @@ impl ChartState {
             let c = Pos2::new(x, y);
             let col = theme::party_color(t.party);
             p.circle_filled(c, r, col);
-            if r >= 5.0 {
+            if full_r >= 5.0 {
                 let letter = match t.tx_type {
                     TxType::Purchase => "B",
                     TxType::Sale | TxType::SalePartial => "S",
                     _ => "E",
                 };
-                p.text(c, Align2::CENTER_CENTER, letter, mono(r * 1.6), Color32::WHITE);
+                let fade = crate::anim::span(pop, 0.5, 1.0);
+                p.text(c, Align2::CENTER_CENTER, letter, mono(full_r * 1.6), Color32::WHITE.gamma_multiply(fade));
             } else {
                 p.circle_stroke(c, r, Stroke::new(1.0, Color32::WHITE));
             }
@@ -1247,5 +1394,41 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
     p.rect_stroke(card, 0.0, Stroke::new(1.0, amber_dim()), StrokeKind::Inside);
     for (k, (l, c)) in lines.iter().enumerate() {
         p.text(card.left_top() + vec2(7.0, 4.0 + k as f32 * 14.0), Align2::LEFT_TOP, l, mono(11.5), *c);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glide_pans_linearly_and_zooms_evenly() {
+        let from = Viewport { right: 100.0, bar_px: 2.0, width_px: 800.0 };
+        let to = Viewport { right: 200.0, bar_px: 8.0, width_px: 800.0 };
+        let g = Glide { from, to, start: None };
+        assert_eq!(g.at(0.0), from);
+        let end = g.at(1.0);
+        assert_eq!(end.right, to.right);
+        assert!((end.bar_px - to.bar_px).abs() < 1e-9);
+        let mid = g.at(0.5);
+        assert_eq!(mid.right, 150.0);
+        assert!((mid.bar_px - 4.0).abs() < 1e-9, "geometric midpoint");
+    }
+
+    #[test]
+    fn view_changes_glide_from_what_is_shown() {
+        let mut c = ChartState::new(1, "AAPL", Timeframe::D1);
+        c.bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 500, 1_790_000_000));
+        let shown = Viewport::fit_last(500, 100, 800.0);
+        c.viewport = Some(shown);
+        c.pan_bars(-20.0);
+        assert_eq!(c.viewport, Some(shown), "stays where it is shown until the glide runs");
+        assert_eq!(c.glide.map(|g| g.to.right), Some(shown.right - 20.0));
+        // A second press adds to the destination and keeps gliding from the shown view.
+        c.pan_bars(-20.0);
+        let g = c.glide.expect("gliding");
+        assert_eq!((g.from, g.to.right), (shown, shown.right - 40.0));
+        c.reset_view();
+        assert_eq!(c.glide.map(|g| g.to), Some(Viewport::fit_last(500, DEFAULT_VISIBLE, 800.0)));
     }
 }

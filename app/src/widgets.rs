@@ -265,6 +265,35 @@ pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()), l(a.a(), b.a()))
 }
 
+/// A selection highlight that glides between list rows. Create it before the rows (it
+/// keeps a place under them) and call [`Glider::on`] with the selected row.
+pub struct Glider {
+    id: egui::Id,
+    slot: egui::layers::ShapeIdx,
+    /// Top of the list; positions are kept relative to it so scrolling does not lag.
+    origin: f32,
+}
+
+impl Glider {
+    pub fn new(ui: &Ui, id: egui::Id) -> Self {
+        Self { id, slot: ui.painter().add(Shape::Noop), origin: ui.cursor().top() }
+    }
+
+    pub fn on(&self, ui: &Ui, row: Rect) {
+        let ctx = ui.ctx();
+        // A list that was just opened shows its selection in place.
+        let frame = ctx.cumulative_frame_nr();
+        let seen = self.id.with("frame");
+        if ctx.data(|d| d.get_temp::<u64>(seen)).is_none_or(|f| f + 1 < frame) {
+            ctx.data_mut(|d| d.remove::<anim::Spring>(self.id));
+        }
+        ctx.data_mut(|d| d.insert_temp(seen, frame));
+        let y = anim::spring_with(ctx, self.id, row.top() - self.origin, 0.22, 0.86);
+        let r = row.translate(vec2(0.0, self.origin + y - row.top()));
+        ui.painter().set(self.slot, RectShape::filled(r, theme::CONTROL_RADIUS, theme::accent_wash()));
+    }
+}
+
 /// Animated hover wash for list rows.
 pub fn hover_wash(ui: &Ui, rect: Rect, resp: &Response, selected: bool) {
     let t = anim::spring_bool(ui.ctx(), resp.id.with("wash"), resp.hovered());

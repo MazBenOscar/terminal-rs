@@ -6,6 +6,7 @@ use tr_core::options::Greeks;
 use tr_data::OptionContract;
 
 use super::OptionsPane;
+use crate::anim;
 use crate::congress_view::Action;
 use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
 use crate::widgets;
@@ -245,16 +246,24 @@ pub fn options_chain(ui: &mut Ui, o: &mut OptionsPane) -> (Option<Action>, bool)
 
     let spot = ch.spot;
     let itm_wash = theme::amber().gamma_multiply(0.07);
+    // Rows cascade in when the chain comes into view or a chain for another expiration
+    // arrives (not when one is requested: the old rows stay until then).
+    let cascade = anim::appear(ui.ctx(), ui.id().with(("omon-rows", &o.symbol, ch.expiration)), 0.9) * 0.9;
     egui::ScrollArea::vertical().id_salt(("omon", &o.symbol)).auto_shrink([false, false]).show_rows(
         ui,
         row_h,
         rows.len(),
         |ui, range| {
             let mut spot_line = None;
+            let first = range.start;
             for ri in range {
                 let row = &rows[ri];
                 let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
-                let p = ui.painter_at(r);
+                let delay = ((ri - first) as f32 * 0.03).min(0.45);
+                let e = anim::ease_out(anim::span(cascade, delay, delay + 0.35));
+                let r = r.translate(vec2(0.0, 6.0 * (1.0 - e)));
+                let mut p = ui.painter_at(r);
+                p.multiply_opacity(e);
                 let call_side = Rect::from_min_max(pos2(strike_x - side_w, r.top()), pos2(strike_x, r.bottom()));
                 let put_side = Rect::from_min_max(
                     pos2(strike_x + strike_w, r.top()),

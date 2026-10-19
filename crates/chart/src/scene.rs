@@ -153,6 +153,24 @@ pub fn visible_extent(
     Some((l, h, vmax))
 }
 
+/// The scale `price_pane` uses when `manual_scale` is `None`.
+pub fn autoscale(p: &PricePane<'_>) -> PriceScale {
+    autoscale_from(p, visible_extent(p.series, p.overlays, p.viewport, p.chart_type))
+}
+
+fn autoscale_from(p: &PricePane<'_>, ext: Option<(f64, f64, f64)>) -> PriceScale {
+    let (l, h) = ext.map(|e| (e.0, e.1)).unwrap_or((0.0, 1.0));
+    // Leave room at the bottom for the volume overlay.
+    let mut s = PriceScale::padded(l, h, 0.08, p.log, p.height_px);
+    if p.show_volume {
+        let (a, b) = s.bounds_t();
+        let extra = (b - a) * 0.12;
+        let lo_t = a - extra;
+        s.lo = if s.log { lo_t.exp() } else { lo_t };
+    }
+    s
+}
+
 pub fn price_pane(p: &PricePane<'_>) -> PaneOutput {
     let v = p.viewport;
     let pyr = &p.series.bars.pyramid;
@@ -160,18 +178,7 @@ pub fn price_pane(p: &PricePane<'_>) -> PaneOutput {
     let k = level_for(v.bar_px, pyr.levels());
     let ext = visible_extent(p.series, p.overlays, v, p.chart_type);
     let vol_max = ext.map(|e| e.2).unwrap_or(1.0);
-    let scale = p.manual_scale.unwrap_or_else(|| {
-        let (l, h) = ext.map(|e| (e.0, e.1)).unwrap_or((0.0, 1.0));
-        // Leave room at the bottom for the volume overlay.
-        let mut s = PriceScale::padded(l, h, 0.08, p.log, p.height_px);
-        if p.show_volume {
-            let (a, b) = s.bounds_t();
-            let extra = (b - a) * 0.12;
-            let lo_t = a - extra;
-            s.lo = if s.log { lo_t.exp() } else { lo_t };
-        }
-        s
-    });
+    let scale = p.manual_scale.unwrap_or_else(|| autoscale_from(p, ext));
     let t = transform(v, p.height_px, &scale, p.style.pixels_per_point);
     let mut style = p.style;
     style.ohlc_bars = p.chart_type == ChartType::Bars;
@@ -359,6 +366,68 @@ mod tests {
         assert_eq!(u(&two).params[1], 2.0 * u(&one).params[1]);
         // Price mapping (points) is unchanged.
         assert_eq!(one.scale, two.scale);
+    }
+
+    #[test]
+    fn autoscale_is_what_price_pane_uses() {
+        let s = SeriesGpu::build(&sample::generate("X", Timeframe::D1, 500, 1_790_000_000));
+        let v = Viewport::fit_last(500, 120, 600.0);
+        for (show_volume, log) in [(true, false), (false, true)] {
+            let p = PricePane {
+                series: &s,
+                chart_type: ChartType::Candles,
+                show_volume,
+                overlays: &[],
+                viewport: &v,
+                height_px: 300.0,
+                log,
+                manual_scale: None,
+                style: Style::default(),
+            };
+            assert_eq!(autoscale(&p), price_pane(&p).scale);
+        }
+    }
+
+    #[test]
+    fn reveal_sweeps_relative_to_the_left_edge() {
+        use crate::gpu::Reveal;
+        let s = SeriesGpu::build(&sample::generate("X", Timeframe::D1, 500, 1_790_000_000));
+        let v = Viewport::fit_last(500, 100, 400.0);
+        let anim = |reveal: Reveal| {
+            let out = price_pane(&PricePane {
+                series: &s,
+                chart_type: ChartType::Candles,
+                show_volume: true,
+                overlays: &[],
+                viewport: &v,
+                height_px: 300.0,
+                log: false,
+                manual_scale: None,
+                style: Style { reveal, ..Style::default() },
+            });
+            out.cmds
+                .iter()
+                .map(|c| match c {
+                    DrawCmd::Candles { uniforms, .. } | DrawCmd::Volume { uniforms, .. } => uniforms.anim,
+                    DrawCmd::Line { uniforms, .. } => uniforms.anim,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Done: everything drawn, nothing clipped.
+        for a in anim(Reveal::DONE) {
+            assert_eq!(a, [1e9, 1.0, 1e9, 1.0]);
+        }
+        assert_eq!(Reveal::sweep(1.0, v.left(), v.visible_bars()), Reveal::DONE);
+        // Start: the front sits on the left edge, so no bar has grown yet.
+        let start = Reveal::sweep(0.0, v.left(), v.visible_bars());
+        let left_lo = (v.left() - v.left().floor()) as f32;
+        for a in anim(start) {
+            assert!((a[0] - left_lo).abs() < 1e-3, "{a:?}");
+            assert!(a[2] < a[0] && a[1] >= 2.0);
+        }
+        // Midway the front is inside the visible range, lines trailing it.
+        let mid = Reveal::sweep(0.5, v.left(), v.visible_bars());
+        assert!(mid.front > v.left() && mid.front < v.right && mid.line_front < mid.front);
     }
 
     #[test]

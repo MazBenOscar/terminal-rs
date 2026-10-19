@@ -402,6 +402,9 @@ fn migrate_legacy(s: &Settings, defaults: &prefs::PanelDefaults) -> Option<Layou
     Some(LayoutDoc::preset("Default", s.layout.unwrap_or(Layout::Grid2x2), panes))
 }
 
+/// How long an alert toast stays up.
+const TOAST_SECS: u64 = 10;
+
 /// A pane drag from its tab or header: pending until the pointer moves past a small
 /// threshold (so clicks still select tabs), then active until release.
 #[derive(Debug, Clone, Copy)]
@@ -422,6 +425,7 @@ pub struct TerminalApp {
     /// Preset last applied, for the toolbar picker (cleared by manual rearranging).
     preset: Option<Layout>,
     drag: Option<Drag>,
+    dock_motion: workspace::DockMotion,
     /// Tab being renamed inline: pane and edit buffer.
     renaming_tab: Option<(PaneId, String)>,
 
@@ -579,6 +583,7 @@ impl TerminalApp {
             last_opened: None,
             preset: None,
             drag: None,
+            dock_motion: Default::default(),
             renaming_tab: None,
             store: Store::new(data_dir().join("layouts")),
             layout_name: "Default".into(),
@@ -1371,7 +1376,7 @@ impl TerminalApp {
             self.autosave();
             self.last_save = Instant::now();
         }
-        self.toasts.retain(|(_, t)| t.elapsed() < Duration::from_secs(10));
+        self.toasts.retain(|(_, t)| t.elapsed() < Duration::from_secs(TOAST_SECS));
     }
 
     /// Save the active layout (only when it changed) and app settings.
@@ -1447,6 +1452,7 @@ impl eframe::App for TerminalApp {
             if let Some([r, g, b]) = tr_macos::accent_color() {
                 self.system_accent = Color32::from_rgb(r, g, b);
             }
+            anim::set_reduced(tr_macos::reduce_motion());
             self.last_accent_poll = Some(Instant::now());
         }
         self.system_theme = ctx.system_theme();

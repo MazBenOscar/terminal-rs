@@ -28,6 +28,32 @@ pub struct Uniforms {
     pub color: [f32; 4],
     pub params: [f32; 4],
     pub extra: [f32; 4],
+    pub anim: [f32; 4],
+}
+
+/// Load-in sweep for a pane. Bars right of `front` (a fractional bar index) are hidden
+/// and the `ramp` bars behind it grow in from their open; lines are drawn up to
+/// `line_front`. `opacity` fades everything in the pane.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Reveal {
+    pub front: f64,
+    pub ramp: f32,
+    pub line_front: f64,
+    pub opacity: f32,
+}
+
+impl Reveal {
+    pub const DONE: Self = Self { front: f64::INFINITY, ramp: 1.0, line_front: f64::INFINITY, opacity: 1.0 };
+
+    /// The sweep at progress `t` (0..1) across `visible_bars` bars starting at `left`.
+    pub fn sweep(t: f32, left: f64, visible_bars: f64) -> Self {
+        if t >= 1.0 {
+            return Self::DONE;
+        }
+        let ramp = (visible_bars * 0.12).max(2.0);
+        let front = left + t as f64 * (visible_bars + ramp);
+        Self { front, ramp: ramp as f32, line_front: front - ramp * 0.5, opacity: 1.0 }
+    }
 }
 
 /// Pane-level transform shared by every draw in a pane.
@@ -60,6 +86,7 @@ pub struct Style {
     /// Physical pixels per logical point (2.0 on Retina). Pixel-sized strokes are given
     /// in points and scaled by this; pane sizes in [`PaneTransform`] are physical.
     pub pixels_per_point: f32,
+    pub reveal: Reveal,
 }
 
 impl Default for Style {
@@ -77,6 +104,7 @@ impl Default for Style {
             hist_width_bars: 0.7,
             baseline: 0.0,
             pixels_per_point: 1.0,
+            reveal: Reveal::DONE,
         }
     }
 }
@@ -84,6 +112,9 @@ impl Default for Style {
 impl Uniforms {
     pub fn new(t: &PaneTransform, s: &Style) -> Self {
         let left_hi = t.left.floor();
+        // Relative to `left_hi` for f32 precision on long series.
+        let rel = |x: f64| if x.is_finite() { (x - left_hi) as f32 } else { 1e9 };
+        let r = s.reveal;
         Self {
             rect: [t.width_px, t.height_px, left_hi as f32, (t.left - left_hi) as f32],
             view: [t.visible_bars as f32, t.y_lo as f32, t.y_hi as f32, if t.log { 1.0 } else { 0.0 }],
@@ -97,6 +128,7 @@ impl Uniforms {
                 if s.ohlc_bars { 1.0 } else { 0.0 },
             ],
             extra: [s.vol_frac, s.vol_max, s.hist_width_bars, s.baseline],
+            anim: [rel(r.front), r.ramp.max(1e-3), rel(r.line_front), r.opacity],
         }
     }
 }
