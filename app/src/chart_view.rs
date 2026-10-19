@@ -13,6 +13,7 @@ use tr_chart::scale;
 use tr_chart::scene::{self, ChartType, Overlay, PricePane, SeriesGpu};
 use tr_chart::viewport::{PriceScale, Viewport};
 use tr_congress::{Trade, TxType};
+use tr_core::indicators::registry::{self, Category};
 use tr_core::{AssetClass, Bar, Security, Timeframe};
 
 use crate::command::{IndicatorSpec, Range};
@@ -29,6 +30,9 @@ const RANGE_H: f32 = 18.0;
 /// Height of the interval / chart-type segmented controls.
 pub const CONTROL_H: f32 = 20.0;
 const DEFAULT_VISIBLE: usize = 160;
+/// Oscillator panes shown under the price pane. GPU frame ids are `id * 8 + 1 + k`, so a
+/// chart has room for at most seven.
+const MAX_SUB_PANES: usize = 6;
 
 /// Length of the load-in sweep across the visible bars.
 const REVEAL_SECS: f32 = 0.7;
@@ -128,7 +132,7 @@ impl ChartState {
             magnet: false,
             show_volume: true,
             show_congress: true,
-            indicators: vec![IndicatorSpec::Sma(20), IndicatorSpec::Sma(50)],
+            indicators: crate::command::default_indicators(),
             drawings: Vec::new(),
             compare: None,
             bars: Arc::new(Vec::new()),
@@ -260,6 +264,13 @@ impl ChartState {
         } else {
             self.indicators.push(spec);
         }
+        self.request_indicators(w);
+    }
+
+    /// Remove every instance of the indicator `code` (all moving averages of one kind).
+    fn remove_indicator(&mut self, code: &str, w: &Worker) {
+        self.indicators.retain(|s| s.code != code);
+        self.built.retain(|b| b.spec.code != code);
         self.request_indicators(w);
     }
 
@@ -635,8 +646,13 @@ impl ChartState {
 
         // Split plot height between the price pane and oscillator sub-panes.
         let pane_specs: Vec<usize> = (0..self.built.len()).filter(|&i| self.built[i].spec.is_pane()).collect();
-        let n_sub = pane_specs.len().min(3);
-        let sub_h = if n_sub > 0 { (plot_all.height() * 0.2).clamp(50.0, 160.0) } else { 0.0 };
+        let n_sub = pane_specs.len().min(MAX_SUB_PANES);
+        // Sub-panes share at most 60% of the plot so prices stay readable.
+        let sub_h = if n_sub > 0 {
+            (plot_all.height() * 0.2).clamp(50.0, 160.0).min(plot_all.height() * 0.6 / n_sub as f32)
+        } else {
+            0.0
+        };
         let price_rect =
             Rect::from_min_max(plot_all.min, pos2(plot_all.right(), plot_all.bottom() - sub_h * n_sub as f32));
 
@@ -810,20 +826,17 @@ impl ChartState {
             let b = &self.built[bi];
             let top = price_rect.bottom() + sub_h * k as f32;
             let r = Rect::from_min_max(pos2(plot_all.left(), top), pos2(plot_all.right(), top + sub_h));
-            let fixed = matches!(b.spec, IndicatorSpec::Rsi(_)).then_some((0.0, 100.0));
+            let def = b.spec.def();
             let ovs: Vec<Overlay> = b.overlays.iter().map(|o| o.1.clone()).collect();
             let mut s = style;
             s.thickness_px = 1.3;
-            let so = scene::sub_pane(&ovs, &v, r.height() as f64, fixed, s);
+            let so = scene::sub_pane(&ovs, &v, r.height() as f64, def.and_then(|d| d.range), s);
             let p = ui.painter_at(r);
             p.hline(r.x_range(), r.top(), Stroke::new(1.0, theme::border()));
-            if matches!(b.spec, IndicatorSpec::Rsi(_)) {
-                for lvl in [30.0, 70.0] {
-                    p.hline(
-                        r.x_range(),
-                        r.top() + so.scale.y_of(lvl) as f32,
-                        Stroke::new(1.0, Color32::from_rgb(60, 45, 80)),
-                    );
+            for &lvl in def.map_or(&[][..], |d| d.levels) {
+                let y = r.top() + so.scale.y_of(lvl) as f32;
+                if r.y_range().contains(y) {
+                    p.hline(r.x_range(), y, Stroke::new(1.0, muted().gamma_multiply(0.35)));
                 }
             }
             let frame = Frame { pane: self.id * 8 + 1 + k as u64, frame_no, cmds: so.cmds };
@@ -860,7 +873,7 @@ impl ChartState {
                     axis_painter.text(
                         pos2(plot_all.right() + 6.0, y),
                         Align2::LEFT_CENTER,
-                        format!("{t:.1}"),
+                        scale::format_value(t),
                         mono(10.5),
                         muted(),
                     );
@@ -1001,19 +1014,38 @@ impl ChartState {
             }
         });
         ui.menu_button("Indicators", |ui| {
-            for spec in [
-                IndicatorSpec::Sma(20),
-                IndicatorSpec::Sma(50),
-                IndicatorSpec::Ema(20),
-                IndicatorSpec::Vwap,
-                IndicatorSpec::Bollinger(20, 2.0),
-                IndicatorSpec::Rsi(14),
-                IndicatorSpec::Macd(12, 26, 9),
-            ] {
-                let on = self.indicators.contains(&spec);
-                if ui.checkbox(&mut on.clone(), spec.label()).clicked() {
-                    self.toggle_indicator(spec, w);
+            ui.set_min_width(220.0);
+            if ui.button("Search Indicators…").clicked() {
+                self.actions.push(Action::Command("IND".into()));
+                ui.close();
+            }
+            if !self.indicators.is_empty() {
+                ui.separator();
+                ui.label(RichText::new("On this chart").small().color(muted()));
+                for spec in self.indicators.clone() {
+                    if ui.checkbox(&mut true, spec.label()).on_hover_text(spec.name()).clicked() {
+                        self.toggle_indicator(spec, w);
+                    }
                 }
+            }
+            ui.separator();
+            for cat in Category::ALL {
+                ui.menu_button(cat.label(), |ui| {
+                    ui.set_min_width(260.0);
+                    egui::ScrollArea::vertical().max_height(440.0).show(ui, |ui| {
+                        for def in registry::all().iter().filter(|d| d.category == cat) {
+                            let on = self.indicators.iter().any(|s| s.code == def.code);
+                            let hover = IndicatorSpec::of(def).label();
+                            if ui.checkbox(&mut on.clone(), def.name).on_hover_text(hover).clicked() {
+                                if on {
+                                    self.remove_indicator(def.code, w);
+                                } else {
+                                    self.toggle_indicator(IndicatorSpec::of(def), w);
+                                }
+                            }
+                        }
+                    });
+                });
             }
             ui.separator();
             if ui.button("Remove All").clicked() {
@@ -1078,20 +1110,12 @@ impl ChartState {
         let mut ly = y + 16.0;
         let value_at = |l: &LineRef| l.pyramid.data.get(i).map(|p| p[1] as f64).filter(|v| v.is_finite());
         for bi in self.built.iter().filter(|b| !b.spec.is_pane()) {
-            let vals: Vec<String> =
-                bi.overlays.iter().filter_map(|(_, o)| value_at(&o.line).map(|v| format!("{v:.2}"))).collect();
-            let c = bi
+            let vals: Vec<String> = bi
                 .overlays
-                .get(bi.overlays.len() / 2)
-                .map(|o| {
-                    Color32::from_rgba_unmultiplied(
-                        (o.1.color[0] * 255.0) as u8,
-                        (o.1.color[1] * 255.0) as u8,
-                        (o.1.color[2] * 255.0) as u8,
-                        255,
-                    )
-                })
-                .unwrap_or(text());
+                .iter()
+                .filter_map(|(_, o)| value_at(&o.line).map(|v| format!("{v:.prec$}", prec = dec.min(4))))
+                .collect();
+            let c = bi.overlays.get(bi.overlays.len() / 2).map_or(text(), |o| opaque(&o.1));
             p.text(
                 pos2(price_rect.left() + 6.0, ly),
                 Align2::LEFT_TOP,
@@ -1099,6 +1123,13 @@ impl ChartState {
                 mono(11.0),
                 c,
             );
+            ly += 14.0;
+        }
+        let hidden = self.built.iter().filter(|b| b.spec.is_pane()).count().saturating_sub(sub_rects.len());
+        if hidden > 0 {
+            let note =
+                format!("+{hidden} more oscillator{} (max {MAX_SUB_PANES} panes)", if hidden == 1 { "" } else { "s" });
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, note, mono(11.0), muted());
             ly += 14.0;
         }
         if let (Some(sym), Some(line)) = (&self.compare, &self.compare_line) {
@@ -1128,15 +1159,17 @@ impl ChartState {
         }
         for (r, bi, _) in sub_rects {
             let b = &self.built[*bi];
-            let vals: Vec<String> =
-                b.overlays.iter().filter_map(|(n, o)| value_at(&o.line).map(|v| format!("{n} {v:.2}"))).collect();
-            ui.painter_at(*r).text(
-                r.left_top() + vec2(90.0, 3.0),
-                Align2::LEFT_TOP,
-                vals.join("  "),
-                mono(10.5),
-                text(),
-            );
+            let painter = ui.painter_at(*r);
+            // Values start after the pane's label (drawn with the axes).
+            let mut x = r.left() + 18.0 + painter.layout_no_wrap(b.spec.label(), mono(10.5), muted()).size().x;
+            for (name, o) in &b.overlays {
+                let Some(v) = value_at(&o.line) else { continue };
+                let color = if o.kind == LineKind::Hist { text() } else { opaque(o) };
+                let g = painter.layout_no_wrap(format!("{name} {}", scale::format_value(v)), mono(10.5), color);
+                let w = g.size().x;
+                painter.galley(pos2(x, r.top() + 3.0), g, color);
+                x += w + 10.0;
+            }
         }
     }
 
@@ -1329,6 +1362,11 @@ impl ChartState {
             hover_card(ui, c, t);
         }
     }
+}
+
+fn opaque(o: &Overlay) -> Color32 {
+    let [r, g, b, _] = o.color.map(|c| (c.clamp(0.0, 1.0) * 255.0) as u8);
+    Color32::from_rgb(r, g, b)
 }
 
 fn dashed_h(p: &egui::Painter, x: egui::Rangef, y: f32, s: Stroke) {

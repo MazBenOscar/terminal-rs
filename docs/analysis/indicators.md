@@ -32,3 +32,25 @@
   sub-pane heights are a fraction of the chart rect and share the x-transform with the price pane.
 - Indicators computed locally in `tr-core::indicators` (all O(n), ~ms for 1M bars) and cached per
   (series version, params); recomputed off the UI thread when data changes.
+
+## As built
+
+- One registry (`tr-core::indicators::registry`) describes all 151 indicators: code and aliases,
+  name, category, parameters (default, bounds, integer or real), overlay or pane, a fixed range and
+  reference levels for bounded oscillators, and a compute function returning named, styled outputs
+  (line, histogram, dots, or per-bar steps for session levels such as pivots; main, signal,
+  up/down or extra series colours). The command line, the
+  `IND` picker (the ⌘K palette scoped to indicators, staying open to toggle several), the chart's
+  right-click menu (one submenu per category), help, the worker and saved layouts all read it, so
+  adding an indicator is one registry entry.
+- `CODE p1 p2…` toggles an indicator; missing parameters take defaults, out-of-range ones are
+  clamped. Repeating the same command removes it; new parameters replace the instance on the
+  chart, except for moving averages, where `SMA 50` and `SMA 200` coexist.
+- Codes never shadow a listed ticker or an existing command (both are tested); where a common
+  abbreviation would, the indicator takes a longer code (`STOCHMI` for SMI, `EFI` for force index,
+  `VOSC` for the volume oscillator, `TRANGE` for true range).
+- Layouts store each indicator as its label (`"BB 20 2"`); the older tagged forms (`{"Sma":20}`,
+  `"Vwap"`…) still load, and unknown codes round-trip unchanged.
+- Conventions: outputs align with the bars and are NaN during warm-up; EMA is seeded with the SMA;
+  RSI, ATR and ADX use Wilder smoothing; standard deviations are population; sessions (VWAP,
+  pivots) are days for intraday bars, months for daily and years above.

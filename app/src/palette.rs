@@ -25,6 +25,7 @@ pub enum Kind {
     Theme,
     Settings,
     Action,
+    Indicator,
 }
 
 impl Kind {
@@ -37,6 +38,7 @@ impl Kind {
             Kind::Theme => "THEME",
             Kind::Settings => "SETTINGS",
             Kind::Action => "ACTION",
+            Kind::Indicator => "STUDY",
         }
     }
 }
@@ -171,6 +173,8 @@ pub struct Palette {
     pub query: String,
     pub selected: usize,
     pub recents: Vec<Item>,
+    /// Only items of this kind are offered (the indicator picker).
+    pub scope: Option<Kind>,
     /// Set when opened, to focus the search field on the next frame.
     pub just_opened: bool,
     path: Option<PathBuf>,
@@ -188,6 +192,18 @@ impl Palette {
         self.just_opened = true;
         self.query.clear();
         self.selected = 0;
+        self.scope = None;
+    }
+
+    /// Open showing only `kind`, searching for `query`.
+    pub fn open_scoped(&mut self, kind: Kind, query: &str) {
+        self.open();
+        self.scope = Some(kind);
+        self.query = query.trim().to_string();
+    }
+
+    fn in_scope(&self, it: &Item) -> bool {
+        self.scope.is_none_or(|k| it.kind == k)
     }
 
     pub fn close(&mut self) {
@@ -222,7 +238,22 @@ impl Palette {
 
     /// Ranked results for the current query over `items`.
     pub fn results(&self, items: &[Item]) -> Vec<Item> {
-        rank(items, &self.recents, &self.query)
+        let (items, recents) = self.scoped(items);
+        rank(&items, &recents, &self.query)
+    }
+
+    /// How many of [`Self::results`] are recent picks listed first (none while searching).
+    pub fn recent_count(&self, items: &[Item]) -> usize {
+        if !self.query.trim().is_empty() {
+            return 0;
+        }
+        let (items, recents) = self.scoped(items);
+        live_recents(&items, &recents).len()
+    }
+
+    fn scoped(&self, items: &[Item]) -> (Vec<Item>, Vec<Item>) {
+        let keep = |v: &[Item]| -> Vec<Item> { v.iter().filter(|it| self.in_scope(it)).cloned().collect() };
+        (keep(items), keep(&self.recents))
     }
 }
 
@@ -362,6 +393,24 @@ mod tests {
         assert_eq!(r[1].hotkey, Some(Action::Layout2), "shortcut hints follow the live row");
         assert_eq!(titles(&rank(&live, &recents, "")), ["Nord", "Desk", "MSFT US Equity"]);
         assert!(rank(&live, &recents, "gone").is_empty());
+    }
+
+    #[test]
+    fn scoped_palette_offers_only_its_kind() {
+        let rsi = Item::new(Kind::Indicator, "Relative Strength Index", "RSI 14", Target::Run("RSI".into()));
+        let mut items = catalogue();
+        items.push(rsi.clone());
+        let mut p = Palette { recents: vec![items[0].clone(), rsi.clone()], ..Default::default() };
+        p.open_scoped(Kind::Indicator, "  ");
+        assert_eq!(p.query, "");
+        assert_eq!(p.results(&items), std::slice::from_ref(&rsi));
+        assert_eq!(p.recent_count(&items), 1, "recents outside the scope are hidden");
+        p.query = "port".into();
+        assert!(p.results(&items).is_empty());
+        p.open();
+        assert_eq!(p.scope, None, "a plain open drops the scope");
+        assert_eq!(p.results(&items).len(), items.len());
+        assert_eq!(p.recent_count(&items), 2);
     }
 
     #[test]

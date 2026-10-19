@@ -629,6 +629,19 @@ impl TerminalApp {
         id
     }
 
+    /// The existing chart [`Self::chart_target`] would pick, without revealing or creating one.
+    pub(super) fn peek_chart(&self) -> Option<&crate::chart_view::ChartState> {
+        let chart = |id: PaneId| {
+            self.idx(id).and_then(|i| match &self.panes[i].kind {
+                PaneKind::Chart(c) => Some(&**c),
+                _ => None,
+            })
+        };
+        chart(self.focus)
+            .or_else(|| self.dock.visible().into_iter().find_map(chart))
+            .or_else(|| self.panes.iter().find_map(|p| chart(p.id)))
+    }
+
     pub(super) fn with_chart(&mut self, f: impl FnOnce(&mut crate::chart_view::ChartState, &Worker)) {
         let id = self.chart_target();
         self.focus = id;

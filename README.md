@@ -48,9 +48,21 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   matches across all asset classes (catalog instantly, plus Yahoo search after a short pause);
   ↑/↓, Tab, Enter; history with ↑/↓. `SECF gold cmdty` opens a full search panel.
 - **Charts** — GPU-rendered candles, OHLC bars, line and area; 1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W,
-  1M plus quick ranges (1D … ALL); volume; SMA, EMA, VWAP, Bollinger overlays; RSI and MACD
-  sub-panes; `CMP <SYM>` compare; log scale; crosshair with OHLC legend; smooth pan and zoom over
-  a million bars. Live crypto bars from the Binance websocket (Coinbase fallback).
+  1M plus quick ranges (1D … ALL); volume; 151 indicators; `CMP <SYM>` compare; log scale;
+  crosshair with OHLC legend; smooth pan and zoom over a million bars. Live crypto bars from the
+  Binance websocket (Coinbase fallback).
+- **Indicators** — 151 built-in studies: 23 moving averages (SMA, EMA, WMA, Hull, DEMA/TEMA, KAMA,
+  ALMA, T3, McGinley, VIDYA, FRAMA, MAMA/FAMA, Ehlers filters, GMMA…), 8 bands and channels
+  (Bollinger, Keltner, Donchian, STARC, standard-error and VWAP bands…), 43 momentum oscillators
+  (RSI, MACD, Stochastic, StochRSI, CCI, Williams %R, TSI, KST, Fisher, Schaff, QQE, WaveTrend,
+  Connors RSI…), 22 trend tools (ADX/DMI, Aroon, Vortex, Parabolic SAR, SuperTrend, Ichimoku,
+  Alligator, ZigZag, fractals, Chandelier and Chande Kroll stops…), 16 volatility measures (ATR,
+  close-to-close and Parkinson, Garman-Klass, Rogers-Satchell and Yang-Zhang estimators, Ulcer,
+  Mass index, squeeze momentum…), 23 volume studies (OBV, A/D, CMF, MFI, Klinger, NVI/PVI, VZO…),
+  11 rolling statistics and five pivot-point families. Type a code with optional parameters
+  (`RSI`, `SMA 200`, `BB 20 2.5`), browse and search with `IND`, or right-click the chart.
+  Oscillators get their own panes (up to six) with reference levels; moving averages can be added
+  several times; indicators are saved with the layout.
 - **Drawings** — trendline (Alt+T), horizontal (Alt+H), vertical (Alt+V) and fib retracement
   (Alt+F), stored in (time, price) so they survive zoom and timeframe changes; magnet (Alt+M) snaps
   to OHLC; click to select, Del to remove.
@@ -288,7 +300,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `AAPL` · `AAPL US EQUITY <GO>` | load a security in the focused chart |
 | `BTCUSD <CRNCY>` · `EURUSD <CRNCY>` · `US10Y <GOVT>` · `CL1 <CMDTY>` · `SPX <INDEX>` | other asset classes |
 | `5` `1H` `D` `1W` `1M` · `YTD` `5Y` `ALL` | interval · quick range |
-| `RSI` `MACD` `BB` `SMA 50` `EMA 20` `VWAP` · `CLEAR` | toggle indicators |
+| `RSI` `MACD` `SMA 200` `BB 20 2.5` · `IND` `IND VOLUME` · `CLEAR` | toggle any of the 151 indicators (optional parameters) · indicator picker · remove all |
 | `CMP MSFT` · `LOG` · `CANDLE` `BAR` `LINE` `AREA` | compare · log scale · chart type |
 | `AAPL OMON` · `AAPL CN` · `BTCUSD CRNCY OB` · `WEI` · `GC` · `SECF <query>` | options · news · order book · world markets · yield curve · search |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
@@ -312,7 +324,8 @@ app/            eframe shell: command line, docked panes, chart widget, panels
   themes.rs     theme model, built-in themes, TOML/JSON theme files and the themes folder
   app/          workspace (drag and drop, pop-out windows, link groups), panels, settings, chrome
   worker.rs     tokio runtime: all network, SQLite, pyramid and indicator work (UI never blocks)
-crates/core     Bar/Series, timeframes, market keys + security catalog, indicators, sample data
+crates/core     Bar/Series, timeframes, market keys + security catalog, indicators and their
+                registry (codes, parameters, panes, levels), sample data
 crates/data     MarketData trait; per-class router (Binance/Coinbase, Treasury.gov/FRED, Yahoo,
                 Alpaca), websocket live feeds, sample provider with simulated ticks; bar cache
 crates/chart    wgpu renderer, LOD pyramids, viewport math, axes, drawings, egui paint callback
@@ -362,7 +375,8 @@ Measured on Linux with Mesa **llvmpipe (a CPU software rasterizer)** — a real 
   is the benchmark above).
 - **Indicators over 1M bars** (`cargo bench -p tr-core`): SMA 1.8 ms, EMA 2.2 ms, VWAP 7.0 ms,
   Bollinger 29 ms; RSI and MACD are single-pass (≈ 12 ms and 26 ms including first-touch of their
-  output memory).
+  output memory). The whole 151-indicator catalogue at default parameters over 100k one-minute
+  bars takes ≈ 134 ms on macOS (Ichimoku, the slowest, 6.6 ms).
 
 ## Tests
 
@@ -382,7 +396,11 @@ cargo bench -p tr-core && cargo bench -p tr-chart
   chart/spark/search. Market-key parsing, catalog search and symbol mapping per source are unit
   tested; opt-in live tests hit the real sources for every asset class.
 - Indicators are checked against reference values (Wilder's RSI example, hand-computed EMA, MACD,
-  population-SD Bollinger, session VWAP).
+  population-SD Bollinger, session VWAP) and hand-computed windows (stochastic, %R, CCI, WMA,
+  true range, Donchian, envelopes, %B, OBV and A/D, CMF, Aroon, pivots). Every catalogue entry
+  runs on intraday and daily random walks and on degenerate input (no bars, one to three bars,
+  flat zero-volume bars) at its default, minimum and maximum parameters, checking alignment,
+  declared ranges and no panics; layouts saved in the old indicator format still load.
 - Layouts: the dock tree (insert, split, tab, move, remove/normalise, resize clamping, presets,
   JSON round trip and repair of hand-edited files), layout documents (every panel kind and its
   settings, links, popped windows, older formats), the store (save, list, rename, duplicate,

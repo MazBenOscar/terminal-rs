@@ -7,15 +7,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use chrono::Datelike;
 use tokio::sync::Mutex;
 use tr_chart::gpu::{LineKind, LineRef};
-use tr_chart::scene::{Overlay, SeriesGpu, line_ref};
+use tr_chart::scene::{Overlay, SeriesGpu, line_ref, marker_ref};
 use tr_congress::db::{Alert, PoliticianSummary};
 use tr_congress::performance::{self, Performance, TradeReturn};
 use tr_congress::refresh::{self, HttpSource, NewTradeAlert, RefreshConfig};
 use tr_congress::{Db, Politician, Trade};
-use tr_core::{Bar, Security, Series, Timeframe, indicators};
+use tr_core::indicators::registry::{Input, Plot, Tone};
+use tr_core::{Bar, Security, Series, Timeframe};
 use tr_data::{BarCache, Provider, Quote, SearchHit, YieldCurves};
 
 use crate::command::IndicatorSpec;
@@ -399,61 +399,51 @@ async fn congress_refresh(s: &Shared) {
     }
 }
 
-fn session_key(tf: Timeframe) -> impl Fn(i64) -> i64 {
-    move |ts| {
-        let d = chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default();
-        match tf {
-            t if t.is_intraday() => ts.div_euclid(86_400),
-            Timeframe::D1 => (d.year() * 12 + d.month() as i32) as i64,
-            _ => d.year() as i64,
-        }
-    }
-}
-
 fn overlay(values: &[f64], color: egui::Color32, kind: LineKind) -> Overlay {
-    Overlay { line: line_ref(values), color: theme::rgba(color), kind, scale: 1.0 }
+    let line = if kind == LineKind::Dots { marker_ref(values) } else { line_ref(values) };
+    Overlay { line, color: theme::rgba(color), kind, scale: 1.0 }
 }
 
+/// Compute every indicator on `bars`. The `i`-th indicator takes the `i`-th series colour;
+/// its signal lines, outer bands and up/down lines take theme roles.
 pub fn build_indicators(
     bars: &[Bar],
     tf: Timeframe,
     specs: &[IndicatorSpec],
     palette: &theme::Palette,
 ) -> Vec<BuiltIndicator> {
-    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+    let input = Input::new(bars, tf);
+    let colors = palette.series.len();
     specs
         .iter()
         .enumerate()
         .map(|(i, spec)| {
-            let c = palette.series[i % palette.series.len()];
-            let overlays = match *spec {
-                IndicatorSpec::Sma(n) => vec![(spec.label(), overlay(&indicators::sma(&closes, n), c, LineKind::Line))],
-                IndicatorSpec::Ema(n) => vec![(spec.label(), overlay(&indicators::ema(&closes, n), c, LineKind::Line))],
-                IndicatorSpec::Vwap => {
-                    vec![(spec.label(), overlay(&indicators::vwap_by(bars, session_key(tf)), c, LineKind::Line))]
-                }
-                IndicatorSpec::Bollinger(n, k) => {
-                    let b = indicators::bollinger(&closes, n, k);
-                    let dim = c.gamma_multiply(0.7);
-                    vec![
-                        ("BB upper".into(), overlay(&b.upper, dim, LineKind::Line)),
-                        ("BB basis".into(), overlay(&b.middle, c, LineKind::Line)),
-                        ("BB lower".into(), overlay(&b.lower, dim, LineKind::Line)),
-                    ]
-                }
-                IndicatorSpec::Rsi(n) => {
-                    vec![(spec.label(), overlay(&indicators::rsi(&closes, n), palette.series[1], LineKind::Line))]
-                }
-                IndicatorSpec::Macd(f, sl, sg) => {
-                    let m = indicators::macd(&closes, f, sl, sg);
-                    vec![
-                        ("Hist".into(), overlay(&m.histogram, egui::Color32::WHITE, LineKind::Hist)),
-                        ("MACD".into(), overlay(&m.macd, palette.cyan, LineKind::Line)),
-                        ("Signal".into(), overlay(&m.signal, palette.amber, LineKind::Line)),
-                    ]
-                }
-            };
-            BuiltIndicator { spec: *spec, overlays }
+            let main = palette.series[i % colors];
+            let mut outputs = spec.compute(&input);
+            // Columns first, so lines and markers draw over them.
+            outputs.sort_by_key(|o| o.plot != Plot::Hist);
+            let overlays = outputs
+                .into_iter()
+                .map(|o| {
+                    let color = match o.tone {
+                        Tone::Main => main,
+                        Tone::Signal if main == palette.amber => palette.cyan,
+                        Tone::Signal => palette.amber,
+                        Tone::Dim => main.gamma_multiply(0.6),
+                        Tone::Up => palette.up,
+                        Tone::Down => palette.down,
+                        Tone::Series(k) => palette.series[(i + 1 + k as usize) % colors],
+                    };
+                    let kind = match o.plot {
+                        Plot::Line => LineKind::Line,
+                        Plot::Hist => LineKind::Hist,
+                        Plot::Dots => LineKind::Dots,
+                        Plot::Steps => LineKind::Steps,
+                    };
+                    (o.name.to_string(), overlay(&o.values, color, kind))
+                })
+                .collect();
+            BuiltIndicator { spec: spec.clone(), overlays }
         })
         .collect()
 }
@@ -907,15 +897,22 @@ mod tests {
     #[test]
     fn indicators_build_expected_overlays() {
         let bars = tr_core::sample::generate("X", Timeframe::D1, 300, 1_790_000_000);
-        let built = build_indicators(
-            &bars,
-            Timeframe::D1,
-            &[IndicatorSpec::Bollinger(20, 2.0), IndicatorSpec::Macd(12, 26, 9), IndicatorSpec::Vwap],
-            &crate::themes::terminal_light().palette(theme::DEFAULT_ACCENT),
-        );
+        let palette = crate::themes::terminal_light().palette(theme::DEFAULT_ACCENT);
+        let specs: Vec<IndicatorSpec> =
+            ["BB", "MACD", "VWAP", "PSAR", "PIVOT"].iter().map(|c| IndicatorSpec::new(c, &[]).unwrap()).collect();
+        let built = build_indicators(&bars, Timeframe::D1, &specs, &palette);
         assert_eq!(built[0].overlays.len(), 3);
+        // The histogram draws first, under the MACD and signal lines.
         assert_eq!(built[1].overlays[0].1.kind, LineKind::Hist);
+        assert_ne!(built[1].overlays[2].1.color, built[1].overlays[1].1.color, "signal stands out from MACD");
         assert_eq!(built[2].overlays.len(), 1);
+        assert!(built[3].overlays.iter().all(|(_, o)| o.kind == LineKind::Dots));
+        assert_eq!(built[3].overlays[0].1.color, theme::rgba(palette.up));
+        // Every pair of bars holding a marker keeps one when zoomed out.
+        let up = &built[3].overlays[0].1.line.pyramid;
+        let pairs = up.data[..up.offsets[1]].chunks(2).filter(|c| c.iter().any(|p| p[1].is_finite())).count();
+        assert_eq!(up.data[up.offsets[1]..up.offsets[2]].iter().filter(|p| p[1].is_finite()).count(), pairs);
+        assert!(built[4].overlays.iter().all(|(_, o)| o.kind == LineKind::Steps));
     }
 
     #[test]

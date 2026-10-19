@@ -1,49 +1,16 @@
 //! Bloomberg-style command line: `<SECURITY> [<FUNCTION> args] <GO>`.
 //!
-//! Examples: `AAPL`, `AAPL US EQUITY <GO>`, `5`, `1W`, `RSI`, `SMA 50`, `CMP MSFT`,
-//! `AAPL CONG`, `CONG`, `POL PELOSI`, `TRACK PELOSI`, `LAYOUT 4`, `FIB`, `HELP`.
+//! Examples: `AAPL`, `AAPL US EQUITY <GO>`, `5`, `1W`, `RSI`, `SMA 50`, `ICHIMOKU`, `IND MOMENTUM`,
+//! `CMP MSFT`, `AAPL CONG`, `CONG`, `POL PELOSI`, `TRACK PELOSI`, `LAYOUT 4`, `FIB`, `HELP`.
 
 use tr_chart::drawings::Tool;
 use tr_chart::scene::ChartType;
+pub use tr_core::indicators::registry::Spec as IndicatorSpec;
 use tr_core::{Security, Timeframe, YellowKey};
 
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum IndicatorSpec {
-    Sma(usize),
-    Ema(usize),
-    Vwap,
-    Bollinger(usize, f64),
-    Rsi(usize),
-    Macd(usize, usize, usize),
-}
-
-impl IndicatorSpec {
-    pub fn label(&self) -> String {
-        match self {
-            IndicatorSpec::Sma(n) => format!("SMA {n}"),
-            IndicatorSpec::Ema(n) => format!("EMA {n}"),
-            IndicatorSpec::Vwap => "VWAP".into(),
-            IndicatorSpec::Bollinger(n, k) => format!("BB {n} {k}"),
-            IndicatorSpec::Rsi(n) => format!("RSI {n}"),
-            IndicatorSpec::Macd(a, b, c) => format!("MACD {a} {b} {c}"),
-        }
-    }
-
-    /// Oscillators get their own sub-pane.
-    pub fn is_pane(&self) -> bool {
-        matches!(self, IndicatorSpec::Rsi(_) | IndicatorSpec::Macd(..))
-    }
-
-    /// Same indicator family (used to toggle and replace).
-    pub fn same_kind(&self, other: &IndicatorSpec) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
-            && match (self, other) {
-                (IndicatorSpec::Sma(a), IndicatorSpec::Sma(b)) | (IndicatorSpec::Ema(a), IndicatorSpec::Ema(b)) => {
-                    a == b
-                }
-                _ => true,
-            }
-    }
+/// Indicators on a new chart: the 20 and 50 bar simple moving averages.
+pub fn default_indicators() -> Vec<IndicatorSpec> {
+    [20.0, 50.0].iter().filter_map(|n| IndicatorSpec::new("SMA", &[*n])).collect()
 }
 
 /// Views of the brokerage portfolio pane (`PORT`, `ACCT`, `POS`, `ORD`, `ACTV`).
@@ -243,7 +210,10 @@ impl Range {
 pub enum Function {
     Timeframe(Timeframe),
     ChartType(ChartType),
+    /// Add or remove an indicator (any code from the catalog: `RSI`, `BB 20 2.5`, `ICHIMOKU`).
     Indicator(IndicatorSpec),
+    /// Open the indicator picker, pre-filled with a search (`IND`, `IND VOLUME`).
+    IndicatorPicker(String),
     ClearIndicators,
     Compare(Option<String>),
     LogScale,
@@ -318,19 +288,13 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "BAR" | "BARS" | "OHLC" => Function::ChartType(ChartType::Bars),
         "LINE" => Function::ChartType(ChartType::Line),
         "AREA" | "MOUNTAIN" => Function::ChartType(ChartType::Area),
-        "SMA" => Function::Indicator(IndicatorSpec::Sma(num(rest.first()).unwrap_or(20))),
-        "EMA" => Function::Indicator(IndicatorSpec::Ema(num(rest.first()).unwrap_or(20))),
-        "VWAP" => Function::Indicator(IndicatorSpec::Vwap),
-        "BB" | "BOLL" | "BOLLINGER" => Function::Indicator(IndicatorSpec::Bollinger(
-            num(rest.first()).unwrap_or(20),
-            num(rest.get(1)).unwrap_or(2.0),
-        )),
-        "RSI" => Function::Indicator(IndicatorSpec::Rsi(num(rest.first()).unwrap_or(14))),
-        "MACD" => Function::Indicator(IndicatorSpec::Macd(
-            num(rest.first()).unwrap_or(12),
-            num(rest.get(1)).unwrap_or(26),
-            num(rest.get(2)).unwrap_or(9),
-        )),
+        // `IND RSI 21` adds directly; anything else searches the picker.
+        "IND" | "INDICATOR" | "INDICATORS" | "STUDY" | "STUDIES" => {
+            match rest.split_first().and_then(|(code, args)| IndicatorSpec::parse(code, args)) {
+                Some(spec) => Function::Indicator(spec),
+                None => Function::IndicatorPicker(joined()),
+            }
+        }
         "CLEAR" | "CLR" => match words().first().map(String::as_str) {
             Some("DRAW") | Some("DRAWINGS") => Function::ClearDrawings,
             _ => Function::ClearIndicators,
@@ -398,13 +362,15 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             _ => return None,
         },
         "RANGE" => Function::Range(Range::parse(rest.first()?)?),
-        // Timeframes win where spellings overlap (`1D`, `1M`); otherwise try a range (`5D`, `YTD`).
+        // Timeframes win where spellings overlap (`1D`, `1M`); otherwise try a range (`5D`, `YTD`),
+        // then the indicator catalog (`RSI`, `BB 20 2.5`).
         _ => {
             return head
                 .parse::<Timeframe>()
                 .ok()
                 .map(Function::Timeframe)
-                .or_else(|| Range::parse(&up).map(Function::Range));
+                .or_else(|| Range::parse(&up).map(Function::Range))
+                .or_else(|| IndicatorSpec::parse(head, rest).map(Function::Indicator));
         }
     })
 }
@@ -475,7 +441,9 @@ fn describe(f: &Function) -> String {
             }
         ),
         Function::ChartType(c) => format!("Chart type {}", c.label()),
-        Function::Indicator(i) => format!("Toggle {}", i.label()),
+        Function::Indicator(i) => format!("Toggle {} — {}", i.label(), i.name()),
+        Function::IndicatorPicker(q) if q.is_empty() => "Browse indicators".into(),
+        Function::IndicatorPicker(q) => format!("Search indicators for \"{q}\""),
         Function::ClearIndicators => "Remove all indicators".into(),
         Function::Compare(Some(s)) => format!("Compare with {s}"),
         Function::Compare(None) => "Remove comparison".into(),
@@ -602,10 +570,19 @@ mod tests {
 
     #[test]
     fn functions() {
-        assert_eq!(parse("rsi"), Some(Command::Function(Function::Indicator(IndicatorSpec::Rsi(14)))));
-        assert_eq!(parse("SMA 50"), Some(Command::Function(Function::Indicator(IndicatorSpec::Sma(50)))));
-        assert_eq!(parse("bb 20 2.5"), Some(Command::Function(Function::Indicator(IndicatorSpec::Bollinger(20, 2.5)))));
-        assert_eq!(parse("MACD"), Some(Command::Function(Function::Indicator(IndicatorSpec::Macd(12, 26, 9)))));
+        let ind = |code: &str, params: &[f64]| {
+            Some(Command::Function(Function::Indicator(IndicatorSpec::new(code, params).unwrap())))
+        };
+        assert_eq!(parse("rsi"), ind("RSI", &[14.0]));
+        assert_eq!(parse("SMA 50"), ind("SMA", &[50.0]));
+        assert_eq!(parse("bb 20 2.5"), ind("BB", &[20.0, 2.5]));
+        assert_eq!(parse("MACD"), ind("MACD", &[12.0, 26.0, 9.0]));
+        assert_eq!(parse("ichimoku"), ind("ICHIMOKU", &[]));
+        assert_eq!(parse("IND STOCH 5 3 3"), ind("STOCH", &[5.0, 3.0, 3.0]));
+        assert_eq!(parse("IND"), Some(Command::Function(Function::IndicatorPicker(String::new()))));
+        assert_eq!(parse("study volume"), Some(Command::Function(Function::IndicatorPicker("volume".into()))));
+        let Some(Command::SymbolFunction(_, Function::Indicator(adx))) = parse("AAPL ADX") else { panic!("AAPL ADX") };
+        assert_eq!(adx.label(), "ADX 14 14");
         assert_eq!(parse("CMP msft"), Some(Command::Function(Function::Compare(Some("MSFT".into())))));
         assert_eq!(parse("CMP"), Some(Command::Function(Function::Compare(None))));
         assert_eq!(parse("FIB"), Some(Command::Function(Function::Draw(Tool::Fib))));
@@ -741,8 +718,24 @@ mod tests {
 
     #[test]
     fn indicator_identity() {
-        assert!(IndicatorSpec::Rsi(14).same_kind(&IndicatorSpec::Rsi(21)));
-        assert!(!IndicatorSpec::Sma(20).same_kind(&IndicatorSpec::Sma(50)));
-        assert!(IndicatorSpec::Macd(12, 26, 9).is_pane());
+        let spec = |code: &str, params: &[f64]| IndicatorSpec::new(code, params).unwrap();
+        assert!(spec("RSI", &[14.0]).same_kind(&spec("RSI", &[21.0])));
+        assert!(!spec("SMA", &[20.0]).same_kind(&spec("SMA", &[50.0])));
+        assert!(spec("MACD", &[]).is_pane());
+    }
+
+    /// Every indicator code and alias reaches the indicator: no function, timeframe or range
+    /// spelling shadows it.
+    #[test]
+    fn every_indicator_code_parses_to_its_indicator() {
+        for def in tr_core::indicators::registry::all() {
+            for code in std::iter::once(&def.code).chain(def.aliases) {
+                match parse(code) {
+                    Some(Command::Function(Function::Indicator(s))) => assert_eq!(s.code, def.code, "{code}"),
+                    other => panic!("{code} parses as {other:?}"),
+                }
+                assert_eq!(parse(&format!("IND {code}")), parse(code), "IND {code}");
+            }
+        }
     }
 }

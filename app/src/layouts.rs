@@ -267,7 +267,7 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         tf: d.timeframe,
         chart_type: d.chart_type,
         log: false,
-        indicators: vec![IndicatorSpec::Sma(20), IndicatorSpec::Sma(50)],
+        indicators: crate::command::default_indicators(),
         drawings: Vec::new(),
         compare: None,
         show_volume: d.show_volume,

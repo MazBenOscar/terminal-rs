@@ -81,6 +81,11 @@ pub fn line_ref(values: &[f64]) -> LineRef {
     LineRef { key: next_key(), version: 1, pyramid: Arc::new(LinePyramid::build(values)) }
 }
 
+/// A [`LineKind::Dots`] series, reduced so sparse markers stay visible when zoomed out.
+pub fn marker_ref(values: &[f64]) -> LineRef {
+    LineRef { key: next_key(), version: 1, pyramid: Arc::new(LinePyramid::build_markers(values)) }
+}
+
 /// A line overlay with its colour.
 #[derive(Clone)]
 pub struct Overlay {
@@ -143,7 +148,7 @@ pub fn visible_extent(
         }
         _ => p.extent(k, lo, hi)?,
     };
-    for o in overlays.iter().filter(|o| o.kind == LineKind::Line) {
+    for o in overlays.iter().filter(|o| matches!(o.kind, LineKind::Line | LineKind::Dots | LineKind::Steps)) {
         let kk = level_for(v.bar_px, o.line.pyramid.levels());
         if let Some((a, b)) = o.line.pyramid.extent(kk, lo, hi) {
             l = l.min(a * o.scale);
@@ -250,8 +255,9 @@ fn overlay_cmds(overlays: &[Overlay], v: &Viewport, t: &PaneTransform, base: &St
                 }
             }
             let range = match o.kind {
-                LineKind::Hist => {
-                    s.hist_width_bars = (base.body_frac as f64 * (1u64 << k) as f64) as f32;
+                LineKind::Hist | LineKind::Dots | LineKind::Steps => {
+                    let frac = if o.kind == LineKind::Steps { 1.0 } else { base.body_frac as f64 };
+                    s.hist_width_bars = (frac * (1u64 << k) as f64) as f32;
                     let n = lp.level_len(k);
                     let off = lp.offsets[k];
                     let a = (lo >> k).min(n);
@@ -439,5 +445,88 @@ mod tests {
         assert!(out.scale.lo < -0.9 && out.scale.hi > 0.9);
         let fixed = sub_pane(&[o], &v, 100.0, Some((0.0, 100.0)), Style::default());
         assert_eq!((fixed.scale.lo, fixed.scale.hi), (0.0, 100.0));
+    }
+
+    #[test]
+    fn dots_draw_one_instance_per_point_and_scale_the_price_pane() {
+        let bars = sample::generate("X", Timeframe::D1, 200, 1_790_000_000);
+        let s = SeriesGpu::build(&bars);
+        let v = Viewport::fit_last(200, 200, 800.0);
+        let top = bars.iter().map(|b| b.high).fold(f64::MIN, f64::max) * 2.0;
+        let mut marks = vec![f64::NAN; 200];
+        marks[150] = top;
+        let o = Overlay { line: line_ref(&marks), color: [1.0; 4], kind: LineKind::Dots, scale: 1.0 };
+        let out = price_pane(&PricePane {
+            series: &s,
+            chart_type: ChartType::Candles,
+            show_volume: false,
+            overlays: std::slice::from_ref(&o),
+            viewport: &v,
+            height_px: 400.0,
+            log: false,
+            manual_scale: None,
+            style: Style::default(),
+        });
+        let Some(DrawCmd::Line { kind: LineKind::Dots, range, .. }) = out.cmds.last() else { panic!("no dots drawn") };
+        assert_eq!(range.1 - range.0, 200);
+        assert!(out.scale.hi >= top);
+    }
+
+    #[test]
+    fn zoomed_out_markers_keep_sparse_points() {
+        let bars = sample::generate("X", Timeframe::M1, 4096, 1_790_000_000);
+        let s = SeriesGpu::build(&bars);
+        let v = Viewport { right: 4096.0, bar_px: 0.2, width_px: 800.0 };
+        let top = bars.iter().map(|b| b.high).fold(f64::MIN, f64::max) * 2.0;
+        // A fractal-like marker whose neighbours are blank.
+        let mut marks = vec![f64::NAN; 4096];
+        marks[2002] = top;
+        let pane = |line: LineRef| {
+            let o = Overlay { line, color: [1.0; 4], kind: LineKind::Dots, scale: 1.0 };
+            let out = price_pane(&PricePane {
+                series: &s,
+                chart_type: ChartType::Candles,
+                show_volume: false,
+                overlays: std::slice::from_ref(&o),
+                viewport: &v,
+                height_px: 400.0,
+                log: false,
+                manual_scale: None,
+                style: Style::default(),
+            });
+            let Some(DrawCmd::Line { data, range, .. }) = out.cmds.last() else { panic!("no dots drawn") };
+            let drawn = data.pyramid.data[range.0 as usize..range.1 as usize].contains(&[2002.5, top as f32]);
+            (out.level, drawn, out.scale.hi >= top)
+        };
+        let (level, drawn, scaled) = pane(marker_ref(&marks));
+        assert!(level > 0 && drawn && scaled, "level {level}: drawn {drawn}, scaled {scaled}");
+        assert_eq!(pane(line_ref(&marks)), (level, false, false), "line reduction drops the marker");
+    }
+
+    #[test]
+    fn steps_draw_one_full_bar_dash_per_point() {
+        let s = SeriesGpu::build(&sample::generate("X", Timeframe::H4, 200, 1_790_000_000));
+        let levels: Vec<f64> = (0..200).map(|i| if i / 2 % 2 == 0 { 1.0 } else { 1e6 }).collect();
+        let o = Overlay { line: line_ref(&levels), color: [1.0; 4], kind: LineKind::Steps, scale: 1.0 };
+        for (bar_px, group) in [(4.0, 1.0), (0.5, 4.0)] {
+            let v = Viewport { right: 200.0, bar_px, width_px: 800.0 };
+            let out = price_pane(&PricePane {
+                series: &s,
+                chart_type: ChartType::Candles,
+                show_volume: false,
+                overlays: std::slice::from_ref(&o),
+                viewport: &v,
+                height_px: 400.0,
+                log: false,
+                manual_scale: None,
+                style: Style::default(),
+            });
+            let Some(DrawCmd::Line { kind: LineKind::Steps, range, uniforms, .. }) = out.cmds.last() else {
+                panic!("no steps drawn")
+            };
+            assert_eq!(uniforms.extra[2], group, "a dash spans its whole group of bars");
+            assert_eq!(range.1 - range.0, 200 / group as u32);
+            assert!(out.scale.hi >= 1e6);
+        }
     }
 }

@@ -410,8 +410,8 @@ impl TerminalApp {
             }
             self.cmd_hist_pos = None;
             // The command line stays live, Bloomberg-style, unless the command opened the
-            // order ticket, which takes the keyboard for its quantity.
-            self.focus_cmd = !self.trading.ticket.as_ref().is_some_and(|t| t.focus_qty > 0);
+            // order ticket (which takes the keyboard for its quantity) or the palette.
+            self.focus_cmd = !self.palette.open && !self.trading.ticket.as_ref().is_some_and(|t| t.focus_qty > 0);
             if !self.focus_cmd {
                 resp.surrender_focus();
             }

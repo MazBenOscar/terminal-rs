@@ -2,11 +2,12 @@
 //! from the app's state, the centred search card, and running the picked item.
 
 use egui::{Color32, Id, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
+use tr_core::indicators::registry;
 
 use super::TerminalApp;
 use super::settings_view::SettingsTab;
 use crate::anim;
-use crate::command::{self, Function};
+use crate::command::{self, Function, IndicatorSpec};
 use crate::layout::Layout;
 use crate::palette::{Item, Kind, Target};
 use crate::prefs::Action;
@@ -61,13 +62,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("LINE", "", "chart type", None),
     ("AREA", "", "chart type mountain", None),
     ("LOG", "", "log scale chart", Some(Action::LogScale)),
-    ("RSI", "", "indicator oscillator", None),
-    ("MACD", "", "indicator oscillator", None),
-    ("BB", "", "bollinger bands indicator", None),
-    ("SMA 50", "", "moving average indicator", None),
-    ("SMA 200", "", "moving average indicator", None),
-    ("EMA 20", "", "moving average indicator", None),
-    ("VWAP", "", "indicator volume weighted", None),
+    ("IND", "", "indicators studies technical analysis picker", None),
     ("CLEAR", "", "indicators remove", None),
     ("CMP", "", "compare comparison remove", None),
     ("TL", "", "trendline draw", Some(Action::DrawTrendline)),
@@ -204,6 +199,22 @@ pub(super) fn static_items() -> Vec<Item> {
     v
 }
 
+/// One row per catalogue indicator. Those already on the target chart say so and run
+/// their exact label, so picking them removes them.
+fn indicator_items(active: &[IndicatorSpec]) -> Vec<Item> {
+    registry::all()
+        .iter()
+        .map(|d| {
+            let on = active.iter().find(|s| s.code == d.code);
+            let label = on.map_or_else(|| IndicatorSpec::of(d).label(), IndicatorSpec::label);
+            let sub = format!("{label} · {}{}", d.category.label(), if on.is_some() { " · on chart" } else { "" });
+            let words = format!("{} {} {} indicator study", d.code, d.aliases.join(" "), d.category.label());
+            let line = if on.is_some() { label } else { d.code.to_string() };
+            Item::new(Kind::Indicator, d.name, sub, Target::Run(line)).keywords(words)
+        })
+        .collect()
+}
+
 fn ticker_item(key: &str) -> Item {
     let name = tr_core::Security::parse(key).and_then(|s| s.name()).unwrap_or("");
     Item::new(
@@ -224,6 +235,7 @@ fn kind_color(k: Kind) -> Color32 {
         Kind::Theme => theme::series(4),
         Kind::Settings => theme::muted(),
         Kind::Action => theme::up(),
+        Kind::Indicator => theme::series(3),
     }
 }
 
@@ -258,13 +270,22 @@ impl TerminalApp {
         for key in &self.watchlist {
             v.push(ticker_item(key).keywords("watchlist"));
         }
+        v.extend(indicator_items(self.peek_chart().map_or(&[][..], |c| c.indicators.as_slice())));
         let q = self.palette.query.trim();
+        let offered = |v: &[Item]| v.iter().any(|it| matches!(&it.target, Target::Run(l) if l.eq_ignore_ascii_case(q)));
         if !q.is_empty() {
             for l in tr_core::catalog::search(q, 12) {
                 v.push(ticker_item(&l.key()));
             }
             // Whatever the command line would do with the query, offered as-is.
             match command::parse(q) {
+                // An indicator with custom parameters (`SMA 200`, `BB 20 3`).
+                Some(command::Command::Function(Function::Indicator(spec)))
+                    if !offered(&v) && spec.def().is_some_and(|d| IndicatorSpec::of(d) != spec) =>
+                {
+                    let sub = format!("{} · toggle on the chart", spec.name());
+                    v.push(Item::new(Kind::Indicator, spec.label(), sub, Target::Run(q.into())));
+                }
                 Some(command::Command::Symbol(key)) => {
                     v.push(ticker_item(&key));
                     let sec = tr_data::security(&key);
@@ -306,7 +327,7 @@ impl TerminalApp {
                     }
                 }
                 // Kept as typed: arguments such as paths and titles are case-sensitive.
-                Some(_) if !v.iter().any(|it| matches!(&it.target, Target::Run(l) if l.eq_ignore_ascii_case(q))) => {
+                Some(_) if !offered(&v) => {
                     v.push(Item::new(Kind::Command, q, command::hint(q), Target::Run(q.into())));
                 }
                 Some(_) => {}
@@ -355,6 +376,7 @@ impl TerminalApp {
             (up, down, enter, esc)
         });
         let keyed = up || down;
+        let scoped = self.palette.scope.is_some();
         let screen = ctx.content_rect();
         let mut picked = None;
         let mut close = esc;
@@ -380,7 +402,11 @@ impl TerminalApp {
                     .font(ui_font(16.0))
                     .frame(egui::Frame::NONE)
                     .text_color(text())
-                    .hint_text("Search commands, tickers, panels, layouts, themes, settings…")
+                    .hint_text(if scoped {
+                        "Search indicators by name, code or category…"
+                    } else {
+                        "Search commands, tickers, panels, layouts, themes, settings…"
+                    })
                     .desired_width(field.width() - dp(36.0));
                 let field_rect = Rect::from_min_max(pos2(field.left() + dp(28.0), field.top()), field.max);
                 let resp = ui
@@ -399,11 +425,7 @@ impl TerminalApp {
 
                 let items = self.palette_items();
                 let results = self.palette.results(&items);
-                let recents = if self.palette.query.trim().is_empty() {
-                    crate::palette::live_recents(&items, &self.palette.recents).len()
-                } else {
-                    0
-                };
+                let recents = self.palette.recent_count(&items);
                 if up {
                     self.palette.step(-1, results.len());
                 }
@@ -479,7 +501,11 @@ impl TerminalApp {
                 p.text(
                     pos2(foot.left() + dp(4.0), foot.center().y),
                     egui::Align2::LEFT_CENTER,
-                    "↑↓ select   ↵ open   esc close",
+                    if scoped {
+                        "↑↓ select   ↵ add/remove   esc close"
+                    } else {
+                        "↑↓ select   ↵ open   esc close"
+                    },
                     mono(11.0),
                     muted(),
                 );
@@ -495,8 +521,12 @@ impl TerminalApp {
             .inner;
 
         if let Some(item) = picked.and_then(|i| results.get(i)).cloned() {
-            self.palette.close();
-            self.palette.record(&item);
+            // The indicator picker stays open to toggle several, and leaves recents alone
+            // so rows do not reorder under the selection.
+            if !scoped {
+                self.palette.close();
+                self.palette.record(&item);
+            }
             self.run_palette_target(item.target);
         } else if picked.is_some() && !self.palette.query.trim().is_empty() {
             // Nothing matched: behave like the command line.
@@ -621,5 +651,31 @@ mod tests {
         assert!(b.contains(&"Open Brokerage settings".to_string()) && b.contains(&"Settings › Brokerage".to_string()));
         let b = best2("yield curve");
         assert!(b.contains(&"GC".to_string()), "{b:?}");
+    }
+
+    #[test]
+    fn indicators_are_found_by_code_name_and_category() {
+        let active = [IndicatorSpec::new("RSI", &[21.0]).unwrap()];
+        let items: Vec<Item> = static_items().into_iter().chain(indicator_items(&active)).collect();
+        let top = |q: &str| rank(&items, &[], q).first().map(|i| i.title.clone()).unwrap_or_default();
+        assert_eq!(top("rsi"), "Relative Strength Index");
+        assert_eq!(top("macd"), "Moving Average Convergence Divergence");
+        assert_eq!(top("bollinger"), "Bollinger Bands");
+        assert_eq!(top("psar"), "Parabolic SAR");
+        assert_eq!(top("ichimoku"), "Ichimoku Cloud");
+        assert_eq!(top("supertrend"), "SuperTrend");
+        assert_eq!(top("on balance volume"), "On-Balance Volume");
+        assert_eq!(top("ind"), "IND");
+        let rsi = items.iter().find(|i| i.title == "Relative Strength Index").unwrap();
+        assert_eq!(rsi.subtitle, "RSI 21 · Momentum · on chart");
+        assert_eq!(rsi.target, Target::Run("RSI 21".into()), "picking an active indicator removes it");
+        let n = indicator_items(&[]).len();
+        assert_eq!(n, registry::all().len());
+        let volume = rank(&items, &[], "volume").iter().filter(|i| i.kind == Kind::Indicator).count();
+        assert!(volume >= 10, "category words match: {volume}");
+        for it in indicator_items(&[]) {
+            let Target::Run(line) = &it.target else { panic!() };
+            assert!(matches!(command::parse(line), Some(command::Command::Function(Function::Indicator(_)))), "{line}");
+        }
     }
 }

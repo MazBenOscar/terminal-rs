@@ -82,3 +82,36 @@ fn vs_hist(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let cx = x_ndc(a.x);
     return rect(vi, cx - half, cx + half, y_ndc(u.extra.w), y_ndc(mix(u.extra.w, a.y, g)), color);
 }
+
+// Flat dash at point ii's level across the bars of its group (extra.z bars wide, one when
+// not zoomed out). The point is its group's last bar, so the dash runs from the group's
+// start to that bar; a short final group stays short. Consecutive levels never join, so a
+// session's pivot starts afresh instead of stepping up from the last one.
+@vertex
+fn vs_steps(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+    let a = pts[ii];
+    let x1 = a.x + 0.5;
+    let x0 = floor(a.x / u.extra.z) * u.extra.z;
+    if (!finite(a.y) || x0 - u.rect.z >= u.anim.z) {
+        return degenerate();
+    }
+    let hy = px_to_ndc_y(u.params.z * 0.5);
+    let cy = y_ndc(a.y);
+    return rect(vi, x_ndc(x0), x_ndc(min(x1, u.rect.z + u.anim.z)), cy - hy, cy + hy, u.color);
+}
+
+// Square marker centred on point ii (e.g. parabolic SAR), sized from the line thickness.
+// Markers grow in behind the reveal front.
+@vertex
+fn vs_dots(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+    let a = pts[ii];
+    let g = grow(a.x);
+    if (!finite(a.y) || g <= 0.0) {
+        return degenerate();
+    }
+    let hx = px_to_ndc_x(u.params.z * 1.25 * g);
+    let hy = px_to_ndc_y(u.params.z * 1.25 * g);
+    let cx = x_ndc(a.x);
+    let cy = y_ndc(a.y);
+    return rect(vi, cx - hx, cx + hx, cy - hy, cy + hy, u.color);
+}

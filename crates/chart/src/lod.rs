@@ -133,15 +133,25 @@ pub struct LinePyramid {
 }
 
 impl LinePyramid {
+    /// Keeps the later point of each pair (its value is the group's close).
     pub fn build(values: &[f64]) -> Self {
+        Self::reduce(values, |_, later| later)
+    }
+
+    /// For sparse markers: a pair whose later point is blank keeps the earlier one, so
+    /// markers survive zooming out.
+    pub fn build_markers(values: &[f64]) -> Self {
+        Self::reduce(values, |earlier, later| if later[1].is_nan() { earlier } else { later })
+    }
+
+    fn reduce(values: &[f64], merge: impl Fn([f32; 2], [f32; 2]) -> [f32; 2]) -> Self {
         let mut data: Vec<[f32; 2]> = values.iter().enumerate().map(|(i, v)| [i as f32 + 0.5, *v as f32]).collect();
         let mut offsets = vec![0];
         let (mut start, mut n) = (0, values.len());
         while n > 1 {
             let next_start = data.len();
             for j in (0..n).step_by(2) {
-                // Keep the later point of each pair (its value is the group's close).
-                let p = if j + 1 < n { data[start + j + 1] } else { data[start + j] };
+                let p = if j + 1 < n { merge(data[start + j], data[start + j + 1]) } else { data[start + j] };
                 data.push(p);
             }
             offsets.push(next_start);
@@ -250,5 +260,22 @@ mod tests {
         let (a, b) = p.segment_range(0, 3, 6);
         assert_eq!((a, b), (2, 7));
         assert_eq!(p.segment_range(0, 0, 0), (0, 1));
+    }
+
+    #[test]
+    fn marker_pyramid_keeps_sparse_points() {
+        let mut v = vec![f64::NAN; 16];
+        v[2] = 5.0;
+        v[9] = 7.0;
+        let lines = LinePyramid::build(&v);
+        assert_eq!(lines.extent(1, 0, 16), Some((7.0, 7.0)), "lines keep the later point");
+        let marks = LinePyramid::build_markers(&v);
+        // Both survive every level where they fall in different groups, at their own bars.
+        for k in 0..marks.levels() - 1 {
+            assert_eq!(marks.extent(k, 0, 16), Some((5.0, 7.0)), "level {k}");
+            let level = &marks.data[marks.offsets[k]..marks.offsets[k + 1]];
+            assert!(level.contains(&[2.5, 5.0]) && level.contains(&[9.5, 7.0]), "level {k}");
+        }
+        assert_eq!(marks.data[marks.offsets[marks.levels() - 1]], [9.5, 7.0]);
     }
 }

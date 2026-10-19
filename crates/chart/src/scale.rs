@@ -60,6 +60,19 @@ pub fn format_volume(v: f64) -> String {
     }
 }
 
+/// Indicator values of any magnitude in a few characters: 1.25B, 37.9K, 245.3, 61.42,
+/// 0.734, 0.0012.
+pub fn format_value(v: f64) -> String {
+    match v.abs() {
+        x if x >= 1e4 => format_volume(v),
+        x if x >= 100.0 => format!("{v:.1}"),
+        x if x >= 1.0 || x == 0.0 => format!("{v:.2}"),
+        x if x >= 0.01 => format!("{v:.3}"),
+        x if x >= 1e-4 => format!("{v:.4}"),
+        _ => format!("{v:.1e}"),
+    }
+}
+
 /// How significant a time boundary is; larger boundaries get labels first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Boundary {
@@ -152,6 +165,14 @@ mod tests {
     fn formatting() {
         assert_eq!(format_volume(37_881_199.0), "37.88M");
         assert_eq!(format_volume(101_820.0), "101.8K");
+        assert_eq!(format_value(-1_250_000_000.0), "-1.25B");
+        assert_eq!(format_value(37_900.0), "37.9K");
+        assert_eq!(format_value(245.31), "245.3");
+        assert_eq!(format_value(61.416), "61.42");
+        assert_eq!(format_value(0.0), "0.00");
+        assert_eq!(format_value(0.7341), "0.734");
+        assert_eq!(format_value(-0.00123), "-0.0012");
+        assert_eq!(format_value(0.000012), "1.2e-5");
         assert_eq!(decimals_for(0.25), 2);
         assert_eq!(decimals_for(0.001), 3);
         assert_eq!(decimals_for(10.0), 0);

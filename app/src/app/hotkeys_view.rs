@@ -1,8 +1,10 @@
 //! Native keyboard-shortcut table (click a binding to record a new one) and the Help pane.
 
 use egui::{Align2, Color32, Id, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use tr_core::indicators::registry::{self, Category};
 
 use super::TerminalApp;
+use crate::command::IndicatorSpec;
 use crate::prefs::{Action, Keymap};
 use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
 
@@ -35,13 +37,15 @@ fn para(ui: &mut Ui, s: &str) {
     ui.label(RichText::new(s).font(ui_font(12.5)).color(muted()));
 }
 
+fn chip(ui: &mut Ui, code: &str) -> egui::Response {
+    ui.label(RichText::new(format!(" {code} ")).font(mono(12.0)).color(amber()).background_color(theme::control()))
+}
+
 fn chips(ui: &mut Ui, codes: &[&str]) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for c in codes {
-            ui.label(
-                RichText::new(format!(" {c} ")).font(mono(12.0)).color(amber()).background_color(theme::control()),
-            );
+            chip(ui, c);
         }
     });
 }
@@ -297,7 +301,7 @@ impl TerminalApp {
                     (&["1", "5", "1H", "D", "1W"], "Interval"),
                     (&["1D", "5D", "YTD", "1Y", "ALL"], "Quick range"),
                     (&["CANDLE", "BAR", "LINE", "AREA", "LOG"], "Chart type and log scale"),
-                    (&["SMA 50", "EMA 20", "BB 20 2", "RSI", "MACD", "VWAP"], "Toggle indicators (CLEAR removes all)"),
+                    (&["SMA 50", "RSI", "IND"], "Indicators (see below)"),
                     (&["CMP MSFT"], "Compare, rebased to the main symbol"),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
                 ],
@@ -306,6 +310,33 @@ impl TerminalApp {
                 ui,
                 "Wheel zooms, drag pans, drag an axis to stretch, double-click resets. Right-click for the chart menu.",
             );
+
+            section(ui, &format!("Indicators ({})", registry::all().len()));
+            command_table(
+                ui,
+                "help-ind",
+                &[
+                    (&["RSI", "SMA 200", "BB 20 2.5"], "Toggle an indicator; numbers set its parameters"),
+                    (&["IND", "IND VOLUME"], "Indicator picker: search by name, code or category"),
+                    (&["AAPL ADX"], "Load a security and add the indicator"),
+                    (&["CLEAR"], "Remove all indicators"),
+                ],
+            );
+            para(
+                ui,
+                "Missing parameters take their defaults and out-of-range ones are clamped. Moving averages can be \
+                 added several times with different lengths. Hover a code for its name and defaults.",
+            );
+            for cat in Category::ALL {
+                ui.add_space(dp(4.0));
+                ui.label(RichText::new(cat.label()).font(ui_font(12.5)).color(text()));
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for d in registry::all().iter().filter(|d| d.category == cat) {
+                        chip(ui, d.code).on_hover_text(format!("{} · {}", d.name, IndicatorSpec::of(d).label()));
+                    }
+                });
+            }
 
             section(ui, "Workspace");
             command_table(
