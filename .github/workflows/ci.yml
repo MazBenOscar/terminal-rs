@@ -75,7 +75,7 @@ jobs:
             screenshot-*.png
             smoke.log
             live.log
-            target/release/terminal-rs.app
+            target/release/Terminal.app
 
   linux:
     runs-on: ubuntu-24.04

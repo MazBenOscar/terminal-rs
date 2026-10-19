@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a universal (Apple Silicon + Intel) terminal-rs.app, sign it with a Developer ID
+# Build a universal (Apple Silicon + Intel) Terminal.app, sign it with a Developer ID
 # certificate and the hardened runtime, notarize and staple it, then package it as
 # target/universal-apple-darwin/release/terminal-rs-universal.dmg, itself signed, notarized and
 # stapled. That file name is the release asset the download page links to.
@@ -48,23 +48,23 @@ mkdir -p "$out"
 lipo -create -output "$out/terminal-rs" \
   target/aarch64-apple-darwin/release/terminal-rs target/x86_64-apple-darwin/release/terminal-rs
 scripts/bundle-macos.sh "$out/terminal-rs"
-app=$out/terminal-rs.app
+app=$out/Terminal.app
 
 echo "signing as $identity"
 codesign --force --options runtime --timestamp --sign "$identity" "$app"
 codesign --verify --strict --verbose=2 "$app"
 if [ "$notarize" = 1 ]; then
-  ditto -c -k --keepParent "$app" "$out/terminal-rs.zip"
-  notarize "$out/terminal-rs.zip" "$app"
-  rm "$out/terminal-rs.zip"
+  ditto -c -k --keepParent "$app" "$out/Terminal.zip"
+  notarize "$out/Terminal.zip" "$app"
+  rm "$out/Terminal.zip"
 fi
 
 dmg=$out/terminal-rs-universal.dmg
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-ditto "$app" "$stage/terminal-rs.app"
+ditto "$app" "$stage/Terminal.app"
 ln -s /Applications "$stage/Applications"
-hdiutil create -volname terminal-rs -srcfolder "$stage" -format UDZO -ov "$dmg"
+hdiutil create -volname Terminal -srcfolder "$stage" -format UDZO -ov "$dmg"
 codesign --force --timestamp --sign "$identity" "$dmg"
 if [ "$notarize" = 1 ]; then
   notarize "$dmg" "$dmg"

@@ -35,8 +35,9 @@ fn main() -> eframe::Result {
         .filter(|n| matches!(n, 1 | 2 | 4 | 8))
         .unwrap_or(if cfg!(target_os = "macos") { 4 } else { 1 });
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("terminal-rs")
+        .with_title("Terminal")
         .with_app_id("terminal-rs")
+        .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("app icon"))
         .with_inner_size([1600.0, 960.0])
         .with_min_inner_size([900.0, 560.0]);
     if cfg!(target_os = "macos") {
