@@ -9,7 +9,6 @@
 	--accent-ink: #1a1405;
 	--accent-text: #ffb000;
 	--accent-wash: rgba(255, 176, 0, 0.1);
-	--grid: rgba(255, 255, 255, 0.035);
 	--shot-shadow: 0 0 0 1px rgba(255, 255, 255, 0.07), 0 30px 80px rgba(0, 0, 0, 0.6);
 	--mono:
 		ui-monospace, 'SF Mono', SFMono-Regular, Menlo, 'Cascadia Mono', Consolas, 'Liberation Mono',
@@ -27,7 +26,6 @@
 	--chip: #efede6;
 	--accent-text: #9a5b00;
 	--accent-wash: rgba(255, 176, 0, 0.14);
-	--grid: rgba(0, 0, 0, 0.045);
 	--shot-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06), 0 30px 80px rgba(40, 30, 10, 0.16);
 	color-scheme: light;
 }

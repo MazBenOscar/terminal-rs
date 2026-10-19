@@ -34,161 +34,138 @@
 	<meta name="twitter:image" content="{SITE_URL}/og.jpg" />
 </svelte:head>
 
-<div class="page">
-	<div class="backdrop" aria-hidden="true"></div>
-	<div class="wrap">
-		<header>
-			<button type="button" class="theme-toggle" data-theme-toggle aria-label="Switch theme">
-				<svg class="sun" viewBox="0 0 24 24" aria-hidden="true">
-					<circle cx="12" cy="12" r="4" />
-					<path
-						d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"
+<div class="wrap">
+	<header>
+		<button type="button" class="theme-toggle" data-theme-toggle aria-label="Switch theme">
+			<svg class="sun" viewBox="0 0 24 24" aria-hidden="true">
+				<circle cx="12" cy="12" r="4" />
+				<path
+					d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"
+				/>
+			</svg>
+			<svg class="moon" viewBox="0 0 24 24" aria-hidden="true">
+				<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+			</svg>
+		</button>
+
+		<img class="icon" src={asset('icon.png')} width="112" height="112" alt="terminal-rs app icon" />
+		<h1>The market,<br /> one command away.</h1>
+		<p class="lede">
+			A fast, keyboard-driven market terminal for the Mac, written in Rust. GPU charts, dense tiled
+			panes and a command line for stocks, crypto, FX, Treasuries, futures and options.
+		</p>
+		<a class="btn" href={resolve('/download')}>
+			<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M6 11l6 6 6-6M5 21h14" /></svg>
+			Download for Mac
+		</a>
+		<p class="meta">Version {VERSION} · {ARCH} · Free</p>
+
+		<div class="shot">
+			{#each shots as shot (shot.theme)}
+				<picture class={shot.theme}>
+					<source
+						media={narrow}
+						type="image/avif"
+						srcset={asset(`hero-${shot.theme}-crop.avif`)}
+						width="1080"
+						height="587"
 					/>
-				</svg>
-				<svg class="moon" viewBox="0 0 24 24" aria-hidden="true">
-					<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
-				</svg>
-			</button>
+					<source
+						media={narrow}
+						type="image/webp"
+						srcset={asset(`hero-${shot.theme}-crop.webp`)}
+						width="1080"
+						height="587"
+					/>
+					<source
+						type="image/avif"
+						srcset="{asset(`hero-${shot.theme}-1080.avif`)} 1080w, {asset(
+							`hero-${shot.theme}-2160.avif`
+						)} 2160w"
+						{sizes}
+					/>
+					<img
+						src={asset(`hero-${shot.theme}-1080.webp`)}
+						srcset="{asset(`hero-${shot.theme}-1080.webp`)} 1080w, {asset(
+							`hero-${shot.theme}-2160.webp`
+						)} 2160w"
+						{sizes}
+						width="2160"
+						height="1296"
+						alt={shot.alt}
+						loading="lazy"
+						decoding="async"
+					/>
+				</picture>
+			{/each}
+		</div>
+	</header>
 
-			<img class="icon" src={asset('icon.png')} width="112" height="112" alt="terminal-rs app icon" />
-			<h1>The market,<br /> one command away.</h1>
-			<p class="lede">
-				A fast, keyboard-driven market terminal for the Mac, written in Rust. GPU charts, dense tiled
-				panes and a command line for stocks, crypto, FX, Treasuries, futures and options.
-			</p>
-			<a class="btn" href={resolve('/download')}>
-				<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M6 11l6 6 6-6M5 21h14" /></svg>
-				Download for Mac
-			</a>
-			<p class="meta">Version {VERSION} · {ARCH} · Free</p>
-
-			<div class="shot">
-				{#each shots as shot (shot.theme)}
-					<picture class={shot.theme}>
-						<source
-							media={narrow}
-							type="image/avif"
-							srcset={asset(`hero-${shot.theme}-crop.avif`)}
-							width="1080"
-							height="587"
-						/>
-						<source
-							media={narrow}
-							type="image/webp"
-							srcset={asset(`hero-${shot.theme}-crop.webp`)}
-							width="1080"
-							height="587"
-						/>
-						<source
-							type="image/avif"
-							srcset="{asset(`hero-${shot.theme}-1080.avif`)} 1080w, {asset(
-								`hero-${shot.theme}-2160.avif`
-							)} 2160w"
-							{sizes}
-						/>
-						<img
-							src={asset(`hero-${shot.theme}-1080.webp`)}
-							srcset="{asset(`hero-${shot.theme}-1080.webp`)} 1080w, {asset(
-								`hero-${shot.theme}-2160.webp`
-							)} 2160w"
-							{sizes}
-							width="2160"
-							height="1296"
-							alt={shot.alt}
-							loading="lazy"
-							decoding="async"
-						/>
-					</picture>
-				{/each}
-			</div>
-		</header>
-
-		<section class="features" aria-labelledby="features-title">
-			<h2 id="features-title" class="visually-hidden">Features</h2>
-			<article>
-				<span class="code">&lt;GO&gt;</span>
-				<h3>Command line</h3>
-				<p>
-					Start typing anywhere. <code>AAPL &lt;GO&gt;</code> loads a chart, <code>5</code> switches
-					to five-minute bars and <code>NVDA OMON</code> opens the option chain, with matches across every
-					market as you type.
-				</p>
-			</article>
-			<article>
-				<span class="code">GP</span>
-				<h3>GPU charts</h3>
-				<p>
-					Candles, bars, line and area drawn on the GPU, with moving averages, VWAP, Bollinger bands,
-					RSI, MACD, drawings, compare and log scale. Pans and zooms smoothly across a million bars.
-				</p>
-			</article>
-			<article>
-				<span class="code">WEI</span>
-				<h3>Multi-asset</h3>
-				<p>
-					Stocks, ETFs, indices, FX, crypto, US Treasuries, futures and options from free public
-					sources, with no API keys. World markets, the yield curve, headlines and live crypto order
-					books.
-				</p>
-			</article>
-			<article>
-				<span class="code">CONG</span>
-				<h3>Congress trades</h3>
-				<p>
-					Stock trades by members of Congress, read from the official House and Senate disclosure
-					filings. See who traded a ticker, their buys and sells marked on the chart, and an alert when
-					someone you track files.
-				</p>
-			</article>
-			<article>
-				<span class="code">PORT</span>
-				<h3>Your brokerage</h3>
-				<p>
-					Connect your brokers through SnapTrade to see accounts, balances, positions, orders and
-					activity, with holdings repriced at the terminal's live quotes. Keys stay in your Mac's
-					Keychain.
-				</p>
-			</article>
-			<article>
-				<span class="code">LAYOUT</span>
-				<h3>Your desk</h3>
-				<p>
-					Dock any panel anywhere, link panes by colour so one ticker drives them all, and save named
-					layouts. Eight themes, from amber on black to Solarized and Nord, with a live editor.
-				</p>
-			</article>
-		</section>
-
-		<footer>
+	<section class="features" aria-labelledby="features-title">
+		<h2 id="features-title" class="visually-hidden">Features</h2>
+		<article>
+			<span class="code">&lt;GO&gt;</span>
+			<h3>Command line</h3>
 			<p>
-				Requires macOS {MIN_MACOS} or later on {ARCH}. Made by <a href="https://rasmic.xyz">Micky</a>.
+				Start typing anywhere. <code>AAPL &lt;GO&gt;</code> loads a chart, <code>5</code> switches
+				to five-minute bars and <code>NVDA OMON</code> opens the option chain, with matches across every
+				market as you type.
 			</p>
-			<p class="fine">Quotes come from free public sources and may be delayed. Not investment advice.</p>
-		</footer>
-	</div>
+		</article>
+		<article>
+			<span class="code">GP</span>
+			<h3>GPU charts</h3>
+			<p>
+				Candles, bars, line and area drawn on the GPU, with moving averages, VWAP, Bollinger bands,
+				RSI, MACD, drawings, compare and log scale. Pans and zooms smoothly across a million bars.
+			</p>
+		</article>
+		<article>
+			<span class="code">WEI</span>
+			<h3>Multi-asset</h3>
+			<p>
+				Stocks, ETFs, indices, FX, crypto, US Treasuries, futures and options from free public
+				sources, with no API keys. World markets, the yield curve, headlines and live crypto order
+				books.
+			</p>
+		</article>
+		<article>
+			<span class="code">CONG</span>
+			<h3>Congress trades</h3>
+			<p>
+				Stock trades by members of Congress, read from the official House and Senate disclosure
+				filings. See who traded a ticker, their buys and sells marked on the chart, and an alert when
+				someone you track files.
+			</p>
+		</article>
+		<article>
+			<span class="code">PORT</span>
+			<h3>Your brokerage</h3>
+			<p>
+				Connect your brokers through SnapTrade to see accounts, balances, positions, orders and
+				activity, with holdings repriced at the terminal's live quotes. Keys stay in your Mac's
+				Keychain.
+			</p>
+		</article>
+		<article>
+			<span class="code">LAYOUT</span>
+			<h3>Your desk</h3>
+			<p>
+				Dock any panel anywhere, link panes by colour so one ticker drives them all, and save named
+				layouts. Eight themes, from amber on black to Solarized and Nord, with a live editor.
+			</p>
+		</article>
+	</section>
+
+	<footer>
+		<p>
+			Requires macOS {MIN_MACOS} or later on {ARCH}. Made by <a href="https://rasmic.xyz">Micky</a>.
+		</p>
+		<p class="fine">Quotes come from free public sources and may be delayed. Not investment advice.</p>
+	</footer>
 </div>
 
 <style>
-	.page {
-		position: relative;
-		isolation: isolate;
-	}
-
-	.backdrop {
-		position: absolute;
-		inset: 0 0 auto;
-		height: 880px;
-		z-index: -1;
-		pointer-events: none;
-		background-image:
-			linear-gradient(var(--grid) 1px, transparent 1px),
-			linear-gradient(90deg, var(--grid) 1px, transparent 1px);
-		background-size: 40px 40px;
-		background-position: center top;
-		-webkit-mask-image: linear-gradient(to bottom, #000 35%, transparent);
-		mask-image: linear-gradient(to bottom, #000 35%, transparent);
-	}
-
 	.wrap {
 		max-width: 1080px;
 		margin: 0 auto;
