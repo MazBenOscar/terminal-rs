@@ -56,6 +56,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("SIDEBAR LEFT", "Sidebar on the left", "dock side", None),
     ("SIDEBAR RIGHT", "Sidebar on the right", "dock side", None),
     ("PREFS", "", "settings preferences config", Some(Action::Settings)),
+    ("UPDATE", "", "check for updates new version upgrade", None),
     ("HELP", "", "help functions reference", Some(Action::Help)),
     ("CANDLE", "", "chart type candlesticks", None),
     ("BAR", "", "chart type ohlc", None),

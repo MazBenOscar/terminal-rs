@@ -255,6 +255,8 @@ pub enum Function {
     /// `SIDEBAR LEFT|RIGHT|TOGGLE|SHOW|HIDE|SWAP`.
     Sidebar(String),
     Settings,
+    /// Check for a newer release of the app.
+    Update,
     /// `THEME LIGHT|DARK|SYSTEM|COMPACT|REGULAR|COMFORTABLE`.
     Theme(String),
     /// Rename the focused tab (empty resets).
@@ -337,6 +339,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "OMON" | "OMST" | "OPT" | "OPTIONS" | "CHAIN" => Function::Options,
         "SIDEBAR" | "SB" => Function::Sidebar(words().join(" ")),
         "PREFS" | "SETTINGS" | "PDF" | "CONFIG" => Function::Settings,
+        "UPDATE" | "UPDATES" => Function::Update,
         "THEME" => Function::Theme(words().join(" ")),
         "TITLE" | "RENAME" => Function::Title(joined()),
         "CLOSE" => Function::ClosePane,
@@ -482,6 +485,7 @@ fn describe(f: &Function) -> String {
         Function::Sidebar(s) if s.is_empty() => "Toggle the sidebar".into(),
         Function::Sidebar(s) => format!("Sidebar {}", s.to_lowercase()),
         Function::Settings => "Settings: theme, fonts, density, hotkeys, panels, layouts".into(),
+        Function::Update => "Check for updates".into(),
         Function::Theme(t) => format!("Theme {t}"),
         Function::Title(t) => format!("Rename tab to {t:?}"),
         Function::ClosePane => "Close focused pane".into(),
@@ -612,6 +616,7 @@ mod tests {
             Some(Command::SymbolFunction("BTCUSD Curncy".into(), Function::OrderBook(Some(50))))
         );
         assert_eq!(parse("PREFS"), Some(Command::Function(Function::Settings)));
+        assert_eq!(parse("update"), Some(Command::Function(Function::Update)));
         assert_eq!(parse("AAPL OMON"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Options)));
         assert_eq!(parse("SPX INDEX OMON"), Some(Command::SymbolFunction("SPX Index".into(), Function::Options)));
         assert_eq!(parse("OMON"), Some(Command::Function(Function::Options)));

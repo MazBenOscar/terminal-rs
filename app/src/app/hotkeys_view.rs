@@ -260,6 +260,7 @@ impl TerminalApp {
                     (&["POL", "POL PELOSI", "TRACK PELOSI"], "Politicians, profiles and alerts"),
                     (&["WL", "WL ADD SOLUSD CRNCY"], "Watchlist"),
                     (&["PREFS"], "Settings: theme, fonts, density, hotkeys, layouts"),
+                    (&["UPDATE"], "Check for updates"),
                 ],
             );
 

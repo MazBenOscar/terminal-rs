@@ -6,6 +6,9 @@
 //! - [`chrome_metrics`]: the live height of that title bar region and the width taken by
 //!   the traffic lights, so app content never sits under the system's drag region.
 //! - [`accent_color`]: the user's system accent colour (`NSColor.controlAccentColor`).
+//! - [`updater`]: update checks and installs through Sparkle.
+
+pub mod updater;
 
 use std::ffi::c_void;
 

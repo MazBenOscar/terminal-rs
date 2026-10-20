@@ -190,8 +190,11 @@ Appearance: `TR_THEME=light|dark|<theme name>` overrides the saved theme, `TR_MS
 chart anti-aliasing (default 4 on macOS), `TR_VIBRANCY=0` disables the translucent sidebar, and
 ⌃⌘S (Ctrl+Shift+S elsewhere) toggles the sidebar. `scripts/bundle-macos.sh` builds a retina-capable
 `Terminal.app` (icon from `scripts/build-icon.sh`); `scripts/release-macos.sh` builds the universal (Apple Silicon + Intel) app,
-signs it with a Developer ID certificate, notarizes it and packages `terminal-rs-universal.dmg`
-(one-time credential setup is at the top of the script); `scripts/check-macos-cross.sh` compiles
+signs it with a Developer ID certificate, notarizes it and packages `terminal-rs-universal.dmg`,
+plus the zip and signed `appcast.xml` that installed copies update from (one-time credential
+setup is at the top of the script). The app checks that feed once a day through
+[Sparkle](https://sparkle-project.org) and offers to install a newer release; Terminal › Check
+for Updates… or `UPDATE` checks at once. `scripts/check-macos-cross.sh` compiles
 and lints the whole workspace for aarch64-apple-darwin from Linux (zig as the C cross-compiler;
 linking needs the macOS SDK).
 

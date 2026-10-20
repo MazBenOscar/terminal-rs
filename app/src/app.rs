@@ -501,6 +501,7 @@ pub struct TerminalApp {
     system_accent: Color32,
     last_accent_poll: Option<Instant>,
     window_styled: bool,
+    updater_started: bool,
     /// The window is see-through behind the sidebar (macOS vibrancy).
     vibrancy: bool,
     /// Measured macOS title bar geometry (polled; changes with full screen).
@@ -639,6 +640,7 @@ impl TerminalApp {
             system_accent,
             last_accent_poll: None,
             window_styled: false,
+            updater_started: false,
             vibrancy: false,
             chrome: None,
             last_chrome_poll: None,
@@ -858,6 +860,15 @@ impl TerminalApp {
                 self.open_panel(PaneKind::OrderBook(Box::new(BookPane::new(&sym, depth, 0.0))));
             }
             Function::Settings => self.open_panel(PaneKind::Settings),
+            Function::Update => {
+                if !tr_macos::updater::check_for_updates() {
+                    let url = format!("{}/latest", tr_macos::updater::RELEASES);
+                    self.status = match broker::open_external(&url) {
+                        Ok(()) => "Opened the latest release on GitHub".into(),
+                        Err(e) => format!("Could not open {url}: {e}"),
+                    };
+                }
+            }
             Function::Options => {
                 let sym = self.optionable_symbol();
                 self.open_panel(PaneKind::Options(Box::new(OptionsPane::new(&sym, 12, true))));
@@ -1440,6 +1451,10 @@ impl eframe::App for TerminalApp {
         if !self.window_styled {
             self.window_styled = true;
             self.vibrancy = style_native_window(frame, self.prefs.appearance.vibrancy);
+        } else if !self.updater_started {
+            // From the second frame, so loading Sparkle doesn't delay the first.
+            self.updater_started = true;
+            tr_macos::updater::start();
         }
         if self.last_chrome_poll.is_none_or(|t| t.elapsed() > Duration::from_millis(750)) {
             let c = native_chrome(frame);

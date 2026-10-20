@@ -1,12 +1,12 @@
 [package]
 name = "tr-macos"
-description = "macOS window chrome for terminal-rs: unified toolbar, vibrancy, accent colour"
+description = "macOS window chrome for terminal-rs: unified toolbar, vibrancy, accent colour, updates"
 version.workspace = true
 edition.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSObject"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSObject", "NSBundle"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSResponder",
@@ -22,5 +22,8 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSControl",
     "NSWorkspace",
     "NSAccessibility",
+    "NSApplication",
+    "NSMenu",
+    "NSMenuItem",
     "objc2-core-foundation",
 ] }
