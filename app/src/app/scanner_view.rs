@@ -14,6 +14,7 @@ use crate::congress_view::Action;
 use crate::theme::{amber, mono, muted};
 use tr_data::universe::Universe;
 
+use crate::layouts::ScanSettings;
 use crate::worker::{PaneId, Request, ScanRow, data_dir};
 
 pub struct ScannerPane {
@@ -23,7 +24,7 @@ pub struct ScannerPane {
     pub rows: Vec<ScanRow>,
     pub completed: Option<chrono::DateTime<chrono::Utc>>,
     snapshot_symbols: Vec<String>,
-    saved: Vec<ScanDefinition>,
+    saved: Vec<ScanSettings>,
     notice: Option<String>,
     matches_only: bool,
     pub universe: Universe,
@@ -42,12 +43,16 @@ impl Default for ScannerPane {
 
 impl ScannerPane {
     pub fn new(definition: ScanDefinition) -> Self {
+        Self::from_settings(definition.into())
+    }
+
+    pub fn from_settings(settings: ScanSettings) -> Self {
         let (saved, notice) = match load_saved() {
             Ok(saved) => (saved, None),
             Err(e) => (Vec::new(), Some(e)),
         };
         Self {
-            definition,
+            definition: settings.definition,
             generation: 0,
             running: false,
             rows: Vec::new(),
@@ -56,7 +61,7 @@ impl ScannerPane {
             saved,
             notice,
             matches_only: true,
-            universe: Universe::Watchlist,
+            universe: settings.universe,
             progress: None,
             cancel: None,
             show_unavailable: false,
@@ -78,11 +83,11 @@ impl Drop for ScannerPane {
     }
 }
 
-fn load_saved() -> Result<Vec<ScanDefinition>, String> {
+fn load_saved() -> Result<Vec<ScanSettings>, String> {
     load_saved_at(&data_dir())
 }
 
-fn load_saved_at(dir: &std::path::Path) -> Result<Vec<ScanDefinition>, String> {
+fn load_saved_at(dir: &std::path::Path) -> Result<Vec<ScanSettings>, String> {
     match std::fs::read(dir.join("scans.json")) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("Could not read saved scans: {e}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -91,18 +96,18 @@ fn load_saved_at(dir: &std::path::Path) -> Result<Vec<ScanDefinition>, String> {
 }
 
 /// Merge against disk so saving from two scanner panes does not discard the other scan.
-fn save_definition(definition: &ScanDefinition) -> Result<Vec<ScanDefinition>, String> {
+fn save_definition(definition: &ScanSettings) -> Result<Vec<ScanSettings>, String> {
     save_definition_at(definition, &data_dir())
 }
 
-fn save_definition_at(definition: &ScanDefinition, dir: &std::path::Path) -> Result<Vec<ScanDefinition>, String> {
-    definition.validate()?;
+fn save_definition_at(definition: &ScanSettings, dir: &std::path::Path) -> Result<Vec<ScanSettings>, String> {
+    definition.definition.validate()?;
     let mut saved = load_saved_at(dir)?;
-    saved.retain(|s| !s.name.eq_ignore_ascii_case(definition.name.trim()));
+    saved.retain(|s| !s.definition.name.eq_ignore_ascii_case(definition.definition.name.trim()));
     let mut definition = definition.clone();
-    definition.name = definition.name.trim().into();
+    definition.definition.name = definition.definition.name.trim().into();
     saved.push(definition);
-    saved.sort_by(|a, b| a.name.cmp(&b.name));
+    saved.sort_by(|a, b| a.definition.name.cmp(&b.definition.name));
     std::fs::create_dir_all(dir).map_err(|e| format!("Could not create scan folder: {e}"))?;
     let bytes = serde_json::to_vec_pretty(&saved).map_err(|e| format!("Could not encode scans: {e}"))?;
     let tmp = dir.join("scans.json.tmp");
@@ -285,7 +290,7 @@ pub fn show(
                 }
             }
             if ui.add_enabled(!pane.running && validation.is_none(), egui::Button::new("Save scan")).clicked() {
-                match save_definition(&pane.definition) {
+                match save_definition(&ScanSettings { definition: pane.definition.clone(), universe: pane.universe }) {
                     Ok(saved) => { pane.saved = saved; pane.notice = Some("Scan saved to scans.json".into()); }
                     Err(e) => pane.notice = Some(e),
                 }
@@ -295,17 +300,17 @@ pub fn show(
                 egui::ComboBox::from_id_salt("saved-scans").selected_text("Load scan").show_ui(ui, |ui| {
                     ui.label(RichText::new("PRESETS").small().color(muted()));
                     for preset in ScanDefinition::presets() {
-                        if ui.selectable_label(false, &preset.name).clicked() { selected = Some(preset); }
+                        if ui.selectable_label(false, &preset.name).clicked() { selected = Some(ScanSettings { definition: preset, universe: pane.universe }); }
                     }
                     ui.separator();
                     ui.label(RichText::new("SAVED").small().color(muted()));
                     if pane.saved.is_empty() { ui.label("No saved scans yet"); }
                     for saved in &pane.saved {
-                        if ui.selectable_label(false, &saved.name).clicked() { selected = Some(saved.clone()); }
+                        if ui.selectable_label(false, &saved.definition.name).clicked() { selected = Some(saved.clone()); }
                     }
                 });
             });
-            if let Some(definition) = selected { pane.definition = definition; pane.invalidate(); }
+            if let Some(settings) = selected { pane.definition = settings.definition; pane.universe = settings.universe; pane.invalidate(); }
             if pane.running && !market { ui.spinner(); ui.label(format!("Scanning {} symbols… up to 15 seconds per symbol, four at a time", pane.snapshot_symbols.len())); }
         });
         if pane.running && market {
@@ -321,7 +326,7 @@ pub fn show(
                     cancel.store(true, Ordering::Relaxed);
                 }
             });
-            ui.label(RichText::new("The first run downloads full history for every stock (about 10–15 minutes); later runs reuse stored bars and fetch only the newest.").small().color(muted()));
+            ui.label(RichText::new("Fresh snapshots are reused. Stale data, changed sources and larger lookbacks download full history; a market-wide refresh can take 10–15 minutes.").small().color(muted()));
         }
         if market && !bulk_ready { ui.label("Market-wide scans need a bulk data source: set up Questrade in Settings › Brokerage."); }
         if !market && symbols.is_empty() { ui.label("Your watchlist is empty. Add symbols with WL ADD <KEY>, then run the scan."); }
@@ -444,18 +449,33 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap()
         ));
-        let mut definition = ScanDefinition { name: "First".into(), ..Default::default() };
+        let mut definition = ScanSettings {
+            definition: ScanDefinition { name: "First".into(), ..Default::default() },
+            universe: Universe::Nasdaq,
+        };
         assert_eq!(save_definition_at(&definition, &dir).unwrap().len(), 1);
-        definition.name = "Second".into();
+        definition.definition.name = "Second".into();
+        definition.universe = Universe::Nyse;
         assert_eq!(save_definition_at(&definition, &dir).unwrap().len(), 2);
-        definition.name = " first ".into();
-        definition.timeframe = Timeframe::W1;
+        definition.definition.name = " first ".into();
+        definition.definition.timeframe = Timeframe::W1;
         let saved = save_definition_at(&definition, &dir).unwrap();
         assert_eq!(saved.len(), 2);
-        assert!(saved.iter().any(|s| s.name == "first" && s.timeframe == Timeframe::W1));
+        assert!(saved.iter().any(|s| s.definition.name == "first"
+            && s.definition.timeframe == Timeframe::W1
+            && s.universe == Universe::Nyse));
+        assert_eq!(load_saved_at(&dir).unwrap(), saved);
         std::fs::write(dir.join("scans.json"), b"broken JSON").unwrap();
         assert!(save_definition_at(&definition, &dir).is_err());
         assert_eq!(std::fs::read(dir.join("scans.json")).unwrap(), b"broken JSON");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_scan_libraries_default_to_watchlist() {
+        let legacy = serde_json::to_string(&vec![ScanDefinition::default()]).unwrap();
+        let restored: Vec<ScanSettings> = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(restored[0].universe, Universe::Watchlist);
+        assert_eq!(restored[0].definition, ScanDefinition::default());
     }
 }

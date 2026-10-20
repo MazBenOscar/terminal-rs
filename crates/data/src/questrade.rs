@@ -202,8 +202,10 @@ impl Questrade {
     /// Replace (or with `None`, forget) the refresh token, persisting it first.
     pub async fn set_refresh_token(&self, token: Option<String>) -> Result<()> {
         let token = token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-        (self.inner.sink)(token.as_deref())?;
         let mut session = self.inner.session.lock().await;
+        // Rotation holds this same lock while persisting its successor token. Keep
+        // manual changes in that order too, so an in-flight refresh cannot undo removal.
+        (self.inner.sink)(token.as_deref())?;
         self.inner.configured.store(token.is_some(), Ordering::Relaxed);
         *session = Session { refresh: token, access: None };
         drop(session);
@@ -430,5 +432,39 @@ mod tests {
         assert!(!q.is_configured());
         assert_eq!(*saved.lock().unwrap(), vec![Some("abc".to_string()), None]);
         assert!(q.history("AAPL", Timeframe::D1, None, 5).await.unwrap_err().to_string().contains("not set up"));
+    }
+
+    #[tokio::test]
+    async fn manual_token_changes_wait_for_in_flight_rotation() {
+        for replacement in [None, Some("new-manual-token".to_string())] {
+            let saved = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = saved.clone();
+            let q = Questrade::new(
+                Some("old-token".into()),
+                Box::new(move |token| {
+                    log.lock().unwrap().push(token.map(str::to_string));
+                    Ok(())
+                }),
+            )
+            .unwrap();
+            // access() holds this mutex across the redemption and its token sink.
+            let mut rotating = q.inner.session.lock().await;
+            let (started, waiting) = tokio::sync::oneshot::channel();
+            let setter = q.clone();
+            let new_token = replacement.clone();
+            let task = tokio::spawn(async move {
+                started.send(()).unwrap();
+                setter.set_refresh_token(new_token).await
+            });
+            waiting.await.unwrap();
+            assert!(saved.lock().unwrap().is_empty(), "Manual persistence must wait for rotation");
+            (q.inner.sink)(Some("rotated-token")).unwrap();
+            rotating.refresh = Some("rotated-token".into());
+            drop(rotating);
+            task.await.unwrap().unwrap();
+            assert_eq!(*saved.lock().unwrap(), vec![Some("rotated-token".into()), replacement.clone()]);
+            assert_eq!(q.inner.session.lock().await.refresh, replacement);
+            assert_eq!(q.is_configured(), replacement.is_some());
+        }
     }
 }

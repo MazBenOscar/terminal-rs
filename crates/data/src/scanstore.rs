@@ -1,6 +1,7 @@
 //! The scanner's own bar store, separate from the chart cache: every symbol records when it
 //! was fetched, from which source and whether the bars were simulated, so a market-wide scan
-//! can reuse history and fetch only the newest bars without losing provenance.
+//! can reuse compatible fresh snapshots without losing provenance. Refreshes replace
+//! the full fetched history rather than merging an unverified tail into older data.
 
 use std::path::Path;
 
@@ -49,9 +50,11 @@ impl ScanStore {
         Ok(Self { conn })
     }
 
-    /// Upsert `bars` (newer values replace a still-forming bar) and record the fetch.
+    /// Atomically replace one complete fetched snapshot and its provenance. Never
+    /// merge histories from different providers, simulation modes or coverage windows.
     pub fn store(&mut self, symbol: &str, tf: Timeframe, bars: &[Bar], fetch: &Fetch) -> Result<()> {
         let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM scan_bars WHERE symbol = ?1 AND tf = ?2", params![symbol, tf.label()])?;
         {
             let mut st = tx.prepare_cached(
                 "INSERT INTO scan_bars (symbol, tf, ts, o, h, l, c, v) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -152,11 +155,11 @@ mod tests {
         let bars: Vec<Bar> = (0..5).map(|i| Bar::new(i * 86_400, 1.0, 2.0, 0.5, 1.5, 10.0)).collect();
         let fetch = Fetch { at: 100, source: "questrade".into(), simulated: false };
         store.store("AAPL US Equity", Timeframe::D1, &bars, &fetch).unwrap();
-        // A refreshed, still-forming last bar replaces the stored one.
+        // A complete refreshed snapshot replaces the stored history.
         let fetch2 = Fetch { at: 200, ..fetch };
-        store
-            .store("AAPL US Equity", Timeframe::D1, &[Bar::new(4 * 86_400, 1.0, 3.0, 0.5, 2.5, 20.0)], &fetch2)
-            .unwrap();
+        let mut refreshed = bars.clone();
+        refreshed[4] = Bar::new(4 * 86_400, 1.0, 3.0, 0.5, 2.5, 20.0);
+        store.store("AAPL US Equity", Timeframe::D1, &refreshed, &fetch2).unwrap();
         let got = store.load("AAPL US Equity", Timeframe::D1, 3).unwrap();
         assert_eq!((got.len(), got[0].ts, got[2].close), (3, 2 * 86_400, 2.5));
         assert_eq!(store.fetched("AAPL US Equity", Timeframe::D1).unwrap(), Some(fetch2));

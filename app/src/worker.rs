@@ -836,10 +836,12 @@ async fn scan(provider: Provider, definition: ScanDefinition, symbols: Vec<Strin
     futures::stream::iter(fetches).buffered(4).collect().await
 }
 
-/// Bars for one universe symbol: stored bars while fresh, the newest few when stale, the
-/// full history the first time. Errors are per symbol and never fall back to other data.
+/// Reuse a fresh snapshot only when its provider and requested coverage match.
+/// Fetch a full replacement otherwise: a fixed-size tail cannot prove continuity
+/// after an absence or satisfy a larger indicator lookback.
 async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize) -> Result<(Vec<Bar>, bool), String> {
     let now = chrono::Utc::now().timestamp();
+    let source = s.provider.scan_cache_key(symbol);
     let (stored, fetched) = {
         let store = s.scan_store.lock().expect("scan store");
         let store = store.as_ref().ok_or("The scan store could not be opened")?;
@@ -847,18 +849,23 @@ async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize)
         (store.load(symbol, tf, limit).map_err(err)?, store.fetched(symbol, tf).map_err(err)?)
     };
     if let Some(f) = &fetched
-        && !stored.is_empty()
+        && stored.len() >= limit
+        && f.source == source
         && tr_data::scanstore::is_fresh(f.at, now)
     {
         return Ok((stored, f.simulated));
     }
-    // A stale but complete history only needs its newest bars (the forming bar is replaced).
-    let fetch_limit = if fetched.is_some() && !stored.is_empty() { 10 } else { limit };
-    let history = tokio::time::timeout(Duration::from_secs(20), s.provider.scan_history(symbol, tf, fetch_limit))
+    let history = tokio::time::timeout(Duration::from_secs(20), s.provider.scan_history(symbol, tf, limit))
         .await
         .map_err(|_| "History request timed out after 20 seconds".to_string())?
         .map_err(|e| format!("{e:#}"))?;
-    let fetch = Fetch { at: now, source: s.provider.name().to_string(), simulated: history.simulated };
+    if history.bars.is_empty() {
+        return Err(format!("No history for {symbol}"));
+    }
+    if s.provider.scan_cache_key(symbol) != source {
+        return Err("The scan data source changed during the request; run the scan again".into());
+    }
+    let fetch = Fetch { at: now, source, simulated: history.simulated };
     let mut store = s.scan_store.lock().expect("scan store");
     let store = store.as_mut().ok_or("The scan store could not be opened")?;
     store.store(symbol, tf, &history.bars, &fetch).map_err(|e| format!("scan store: {e:#}"))?;
@@ -1192,6 +1199,102 @@ mod tests {
         let (again, simulated) = rt.block_on(universe_history(&s, "AAPL US Equity", Timeframe::D1, 300)).unwrap();
         assert!(simulated);
         assert_eq!(again.last().map(|b| b.ts), bars.last().map(|b| b.ts));
+    }
+
+    #[test]
+    fn universe_cache_refetches_for_source_changes_gaps_and_larger_lookbacks() {
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+        struct Fixture {
+            simulated: AtomicBool,
+            latest: AtomicI64,
+            empty: AtomicBool,
+            requests: std::sync::Mutex<Vec<usize>>,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Fixture {
+            fn name(&self) -> &str {
+                "fixture-router"
+            }
+            fn scan_cache_key(&self, _: &str) -> String {
+                if self.simulated.load(Ordering::Relaxed) { "sample" } else { "live" }.into()
+            }
+            async fn history(&self, _: &str, tf: Timeframe, _: Option<i64>, limit: usize) -> anyhow::Result<Vec<Bar>> {
+                self.requests.lock().unwrap().push(limit);
+                if self.empty.load(Ordering::Relaxed) {
+                    return Ok(Vec::new());
+                }
+                let end = self.latest.load(Ordering::Relaxed);
+                let price = if self.simulated.load(Ordering::Relaxed) { 10.0 } else { 100.0 };
+                Ok((0..limit)
+                    .map(|i| {
+                        Bar::new((end - (limit - 1 - i) as i64) * tf.seconds(), price, price, price, price, 1000.0)
+                    })
+                    .collect())
+            }
+            async fn scan_history(
+                &self,
+                symbol: &str,
+                tf: Timeframe,
+                limit: usize,
+            ) -> anyhow::Result<tr_data::ScanHistory> {
+                Ok(tr_data::ScanHistory {
+                    bars: self.history(symbol, tf, None, limit).await?,
+                    simulated: self.simulated.load(Ordering::Relaxed),
+                })
+            }
+        }
+        let fixture = Arc::new(Fixture {
+            simulated: AtomicBool::new(true),
+            latest: AtomicI64::new(1000),
+            empty: AtomicBool::new(false),
+            requests: Default::default(),
+        });
+        let (out, _rx) = mpsc::channel();
+        let s = Shared {
+            provider: fixture.clone(),
+            series: Default::default(),
+            cache: std::sync::Mutex::new(None),
+            scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
+            db: Mutex::new(Db::open_in_memory().unwrap()),
+            out,
+            ctx: egui::Context::default(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let tf = Timeframe::D1;
+        let symbol = "AAPL US Equity";
+        let get = |limit| rt.block_on(universe_history(&s, symbol, tf, limit));
+        assert!(get(300).unwrap().1);
+        assert!(get(300).unwrap().1);
+        assert_eq!(*fixture.requests.lock().unwrap(), [300], "Fresh compatible snapshots are reused");
+
+        fixture.simulated.store(false, Ordering::Relaxed);
+        let (real, simulated) = get(300).unwrap();
+        assert!(!simulated);
+        assert!(real.iter().all(|bar| bar.close == 100.0), "No sample bars survive a source switch");
+        assert_eq!(get(500).unwrap().0.len(), 500, "A larger lookback must be fetched even while fresh");
+
+        let expire = || {
+            let mut guard = s.scan_store.lock().unwrap();
+            let store = guard.as_mut().unwrap();
+            let bars = store.load(symbol, tf, 500).unwrap();
+            store.store(symbol, tf, &bars, &Fetch { at: 0, source: "live".into(), simulated: false }).unwrap();
+        };
+        expire();
+        fixture.latest.store(5000, Ordering::Relaxed);
+        let (refreshed, simulated) = get(500).unwrap();
+        assert!(!simulated);
+        assert_eq!(refreshed.first().unwrap().ts, 4501 * tf.seconds());
+        assert!(refreshed.windows(2).all(|bars| bars[1].ts - bars[0].ts == tf.seconds()));
+        assert_eq!(*fixture.requests.lock().unwrap(), [300, 300, 500, 500]);
+
+        expire();
+        fixture.empty.store(true, Ordering::Relaxed);
+        assert!(get(500).unwrap_err().contains("No history"));
+        assert_eq!(
+            s.scan_store.lock().unwrap().as_ref().unwrap().fetched(symbol, tf).unwrap().unwrap().at,
+            0,
+            "Empty refresh must not mark old bars fresh"
+        );
     }
 
     #[test]

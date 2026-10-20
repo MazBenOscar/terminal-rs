@@ -214,9 +214,16 @@ header is an error rather than an empty universe.
 **Scan store.** Universe scans read `scan_bars.sqlite3`, separate from the chart cache, which
 records each symbol's fetch time, source and simulated flag. Stored bars are reused while fresh:
 during a (conservatively wide) US session for 15 minutes, otherwise if fetched after the latest
-weekday 21:15 UTC close boundary. Stale symbols fetch only their newest 10 bars; new ones fetch
-full history. Fetch failures are per-symbol unavailable rows. Scans report progress every 25
+weekday 21:15 UTC close boundary. Reuse also requires the active data route and requested
+history length to match. Stale snapshots, source changes and larger lookbacks fetch a full
+replacement, so old/simulated bars cannot be spliced into a new snapshot. Fetch failures and
+empty refreshes are per-symbol unavailable rows. Scans report progress every 25
 symbols, can be stopped, and stop when their pane closes.
+
+Scan libraries and layouts now persist the selected universe alongside their definition.
+Existing files without a universe continue to open as Watchlist scans. Manual Questrade
+token changes share the rotation mutex, including persistence, so a refresh cannot undo
+token removal or replacement.
 
 **Data source.** SnapTrade has no price history and warns against polling its quotes, so it
 cannot feed a scanner. Questrade's personal API serves candles (2,000 per request) and symbol

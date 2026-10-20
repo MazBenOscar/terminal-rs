@@ -261,7 +261,10 @@ impl PaneKind {
             PaneKind::Politicians => PaneSettings::Politicians,
             PaneKind::Alerts => PaneSettings::Alerts,
             PaneKind::Watchlist => PaneSettings::Watchlist,
-            PaneKind::Scanner(s) => PaneSettings::Scanner(s.definition.clone()),
+            PaneKind::Scanner(s) => PaneSettings::Scanner(crate::layouts::ScanSettings {
+                definition: s.definition.clone(),
+                universe: s.universe,
+            }),
             PaneKind::Help => PaneSettings::Help,
             PaneKind::Wei => PaneSettings::Wei,
             PaneKind::Curve => PaneSettings::Curve,
@@ -315,8 +318,8 @@ impl PaneKind {
             PaneSettings::Politicians => PaneKind::Politicians,
             PaneSettings::Alerts => PaneKind::Alerts,
             PaneSettings::Watchlist => PaneKind::Watchlist,
-            PaneSettings::Scanner(definition) => {
-                PaneKind::Scanner(Box::new(scanner_view::ScannerPane::new(definition)))
+            PaneSettings::Scanner(settings) => {
+                PaneKind::Scanner(Box::new(scanner_view::ScannerPane::from_settings(settings)))
             }
             PaneSettings::Help => PaneKind::Help,
             PaneSettings::Wei => PaneKind::Wei,

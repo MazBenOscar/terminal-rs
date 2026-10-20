@@ -78,7 +78,7 @@ pub enum PaneSettings {
     Politicians,
     Alerts,
     Watchlist,
-    Scanner(tr_core::scanner::ScanDefinition),
+    Scanner(ScanSettings),
     Help,
     Wei,
     Curve,
@@ -119,6 +119,22 @@ pub enum PaneSettings {
 
 fn yes() -> bool {
     true
+}
+
+/// Flattening keeps older scan definitions/layouts readable; missing universes
+/// retain their original watchlist behavior.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanSettings {
+    #[serde(flatten)]
+    pub definition: tr_core::scanner::ScanDefinition,
+    #[serde(default)]
+    pub universe: tr_data::universe::Universe,
+}
+
+impl From<tr_core::scanner::ScanDefinition> for ScanSettings {
+    fn from(definition: tr_core::scanner::ScanDefinition) -> Self {
+        Self { definition, universe: Default::default() }
+    }
 }
 
 /// Serializable mirror of the Congress feed filter.
@@ -441,9 +457,18 @@ mod tests {
     fn scanner_conditions_survive_workspace_roundtrip() {
         let definition = tr_core::scanner::ScanDefinition::default();
         let mut doc = LayoutDoc::default_workspace("Scanner", &PanelDefaults::default());
-        doc.panes[0].settings = PaneSettings::Scanner(definition.clone());
+        let settings = ScanSettings { definition, universe: tr_data::universe::Universe::Nasdaq };
+        doc.panes[0].settings = PaneSettings::Scanner(settings.clone());
         let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
-        assert_eq!(restored.panes[0].settings, PaneSettings::Scanner(definition));
+        assert_eq!(restored.panes[0].settings, PaneSettings::Scanner(settings));
+    }
+
+    #[test]
+    fn older_scanner_layouts_default_to_watchlist() {
+        let definition = tr_core::scanner::ScanDefinition::default();
+        let legacy = serde_json::json!({"Scanner": definition});
+        let settings: PaneSettings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(settings, PaneSettings::Scanner(definition.into()));
     }
 
     fn temp_store(tag: &str) -> Store {

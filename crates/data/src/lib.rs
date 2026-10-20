@@ -222,6 +222,12 @@ pub trait MarketData: Send + Sync {
     /// Short provider name shown in the status bar.
     fn name(&self) -> &str;
 
+    /// Identity of the active scanner data route, without credentials. Wrappers and
+    /// providers whose routing can change at runtime must forward/override this key.
+    fn scan_cache_key(&self, _symbol: &str) -> String {
+        self.name().to_string()
+    }
+
     /// Up to `limit` bars at `tf` ending at or before `end` (Unix seconds; `None` = now),
     /// ascending by time. Paging older history means calling again with `end` set to the
     /// oldest bar already held.
@@ -316,6 +322,9 @@ impl<P: MarketData> Fallback<P> {
 
 #[async_trait]
 impl<P: MarketData> MarketData for Fallback<P> {
+    fn scan_cache_key(&self, symbol: &str) -> String {
+        self.primary.scan_cache_key(symbol)
+    }
     fn name(&self) -> &str {
         &self.name
     }

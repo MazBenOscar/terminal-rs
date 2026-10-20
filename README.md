@@ -48,8 +48,8 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   Built-in presets: **Momentum Ignition** (the first day RSI(14) reaches 70 above a 4-day EMA)
   and **Volume Thrust** (RSI(14) ≥ 69.8 on 2.5× the 50-day volume EMA with a true range over
   $0.50). Market-wide scans keep their own bar store (`scan_bars.sqlite3`, with source and
-  fetch time per symbol): the first run downloads full history (several minutes through
-  Questrade), later runs fetch only the newest bars, with progress and **Stop**. Results show
+  fetch time per symbol): compatible fresh snapshots are reused; stale snapshots and larger
+  lookbacks fetch full history (several minutes through Questrade), with progress and **Stop**. Results show
   bar timestamps, missing-data errors and explicit sample-data labels; a failed fetch is
   "unavailable", never a silent fallback. Evaluation is local; it does not connect to TC2000.
   Research and scope: [EasyScan analysis](docs/analysis/tc2000-easyscan.md).

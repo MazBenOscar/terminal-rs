@@ -61,6 +61,16 @@ impl Markets {
 
 #[async_trait]
 impl MarketData for Markets {
+    fn scan_cache_key(&self, symbol: &str) -> String {
+        match security(symbol).class {
+            AssetClass::Equity | AssetClass::Etf if self.questrade().is_some() => "questrade",
+            AssetClass::Equity | AssetClass::Etf if self.alpaca.is_some() => "alpaca+yahoo",
+            AssetClass::Crypto => "binance+coinbase",
+            AssetClass::Govt => "treasury+yahoo+fred",
+            _ => "yahoo",
+        }
+        .into()
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -230,4 +240,20 @@ impl MarketData for Markets {
 /// Market key for a security (convenience for callers holding a [`Security`]).
 pub fn key(sec: &Security) -> String {
     sec.key()
+}
+
+#[cfg(test)]
+mod scanner_cache_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cache_identity_tracks_active_routing_through_fallback() {
+        let q = Questrade::new(None, Box::new(|_| Ok(()))).unwrap();
+        let provider = crate::Fallback::new(Markets::with_questrade(None, Some(q.clone())).unwrap());
+        assert_eq!(provider.scan_cache_key("AAPL US Equity"), "yahoo");
+        q.set_refresh_token(Some("test-token".into())).await.unwrap();
+        assert_eq!(provider.scan_cache_key("AAPL US Equity"), "questrade");
+        q.set_refresh_token(None).await.unwrap();
+        assert_eq!(provider.scan_cache_key("AAPL US Equity"), "yahoo");
+    }
 }
