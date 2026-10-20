@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 pub const KEYCHAIN_SERVICE: &str = "terminal-rs";
 pub const KEYCHAIN_ACCOUNT: &str = "snaptrade";
+/// Keychain account (and file stem) for the Questrade market-data refresh token.
+pub const QUESTRADE_ACCOUNT: &str = "questrade";
 
 /// Environment variables that override stored credentials.
 pub const ENV_CLIENT_ID: &str = "SNAPTRADE_CLIENT_ID";
@@ -111,59 +113,73 @@ pub enum Backend {
 #[derive(Debug, Clone)]
 pub struct SecretStore {
     pub backend: Backend,
+    /// Keychain account name; one item per service (`snaptrade`, `questrade`).
+    pub account: &'static str,
 }
 
 impl SecretStore {
     /// The platform store: the Keychain on macOS (unless `TR_SECRET_STORE=file`), otherwise
     /// `<data_dir>/secrets/snaptrade.json`.
     pub fn platform(data_dir: &Path) -> Self {
-        let file = Backend::File(data_dir.join("secrets").join("snaptrade.json"));
+        Self::platform_for(data_dir, KEYCHAIN_ACCOUNT)
+    }
+
+    /// The platform store for another secret: Keychain account `account`, or
+    /// `<data_dir>/secrets/<account>.json`.
+    pub fn platform_for(data_dir: &Path, account: &'static str) -> Self {
+        let file = Backend::File(data_dir.join("secrets").join(format!("{account}.json")));
         let force_file = std::env::var("TR_SECRET_STORE").is_ok_and(|v| v.eq_ignore_ascii_case("file"));
         let backend = if cfg!(target_os = "macos") && !force_file { Backend::Keychain } else { file };
-        Self { backend }
+        Self { backend, account }
     }
 
     pub fn file(path: impl Into<PathBuf>) -> Self {
-        Self { backend: Backend::File(path.into()) }
+        Self { backend: Backend::File(path.into()), account: KEYCHAIN_ACCOUNT }
     }
 
     /// Where credentials live, for the settings screen.
     pub fn describe(&self) -> String {
         match &self.backend {
-            Backend::Keychain => format!("macOS Keychain ({KEYCHAIN_SERVICE} / {KEYCHAIN_ACCOUNT})"),
+            Backend::Keychain => format!("macOS Keychain ({KEYCHAIN_SERVICE} / {})", self.account),
             Backend::File(p) => format!("{} (owner-only)", p.display()),
         }
     }
 
     pub fn load(&self) -> Result<Option<Credentials>> {
+        match self.load_text()? {
+            Some(t) => Ok(Some(serde_json::from_str(&t).context("SnapTrade credentials are not valid JSON")?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn save(&self, creds: &Credentials) -> Result<()> {
+        self.save_text(&serde_json::to_string(&creds.trimmed())?)
+    }
+
+    /// The stored text, or `None` when nothing (or only whitespace) is stored.
+    pub fn load_text(&self) -> Result<Option<String>> {
         let text = match &self.backend {
-            Backend::Keychain => keychain::get()?,
+            Backend::Keychain => keychain::get(self.account)?,
             Backend::File(p) => match std::fs::read_to_string(p) {
                 Ok(t) => Some(t),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(e).with_context(|| format!("reading {}", p.display())),
             },
         };
-        match text {
-            Some(t) if !t.trim().is_empty() => {
-                Ok(Some(serde_json::from_str(&t).context("SnapTrade credentials are not valid JSON")?))
-            }
-            _ => Ok(None),
-        }
+        Ok(text.filter(|t| !t.trim().is_empty()))
     }
 
-    pub fn save(&self, creds: &Credentials) -> Result<()> {
-        let json = serde_json::to_string(&creds.trimmed())?;
+    pub fn save_text(&self, text: &str) -> Result<()> {
         match &self.backend {
-            Backend::Keychain => keychain::set(&json),
-            Backend::File(p) => write_private(p, &json),
+            Backend::Keychain => keychain::set(self.account, text),
+            Backend::File(p) => write_private(p, text),
         }
     }
 
     /// Remove stored credentials (environment variables are unaffected).
     pub fn clear(&self) -> Result<()> {
         match &self.backend {
-            Backend::Keychain => keychain::delete(),
+            Backend::Keychain => keychain::delete(self.account),
             Backend::File(p) => match std::fs::remove_file(p) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
                 _ => Ok(()),
@@ -204,26 +220,26 @@ mod keychain {
     use anyhow::{Context, Result};
     use security_framework::passwords::{delete_generic_password, get_generic_password, set_generic_password};
 
-    use super::{KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE};
+    use super::KEYCHAIN_SERVICE;
 
     /// `errSecItemNotFound`.
     const NOT_FOUND: i32 = -25300;
 
-    pub fn get() -> Result<Option<String>> {
-        match get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+    pub fn get(account: &str) -> Result<Option<String>> {
+        match get_generic_password(KEYCHAIN_SERVICE, account) {
             Ok(bytes) => Ok(Some(String::from_utf8(bytes).context("Keychain item is not UTF-8")?)),
             Err(e) if e.code() == NOT_FOUND => Ok(None),
             Err(e) => Err(anyhow::anyhow!("reading the Keychain: {e}")),
         }
     }
 
-    pub fn set(value: &str) -> Result<()> {
-        set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, value.as_bytes())
+    pub fn set(account: &str, value: &str) -> Result<()> {
+        set_generic_password(KEYCHAIN_SERVICE, account, value.as_bytes())
             .map_err(|e| anyhow::anyhow!("writing the Keychain: {e}"))
     }
 
-    pub fn delete() -> Result<()> {
-        match delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+    pub fn delete(account: &str) -> Result<()> {
+        match delete_generic_password(KEYCHAIN_SERVICE, account) {
             Err(e) if e.code() != NOT_FOUND => Err(anyhow::anyhow!("deleting from the Keychain: {e}")),
             _ => Ok(()),
         }
@@ -234,13 +250,13 @@ mod keychain {
 mod keychain {
     use anyhow::{Result, bail};
 
-    pub fn get() -> Result<Option<String>> {
+    pub fn get(_: &str) -> Result<Option<String>> {
         bail!("the Keychain is only available on macOS")
     }
-    pub fn set(_: &str) -> Result<()> {
+    pub fn set(_: &str, _: &str) -> Result<()> {
         bail!("the Keychain is only available on macOS")
     }
-    pub fn delete() -> Result<()> {
+    pub fn delete(_: &str) -> Result<()> {
         bail!("the Keychain is only available on macOS")
     }
 }
