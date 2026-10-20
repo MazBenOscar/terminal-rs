@@ -15,7 +15,9 @@ use crate::alpaca::AlpacaProvider;
 use crate::crypto::CryptoProvider;
 use crate::treasury::TreasuryProvider;
 use crate::yahoo::{YahooProvider, yahoo_symbol};
-use crate::{LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, SearchHit, YieldCurves, security};
+use crate::{
+    LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, ScanHistory, SearchHit, YieldCurves, security,
+};
 
 pub struct Markets {
     yahoo: YahooProvider,
@@ -61,6 +63,38 @@ impl MarketData for Markets {
                 }
             }
             _ => self.yahoo.history(&yahoo_symbol(&sec), tf, end, limit).await,
+        }
+    }
+
+    async fn scan_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
+        let sec = security(symbol);
+        match sec.class {
+            AssetClass::Crypto => {
+                Ok(ScanHistory { bars: self.crypto.history(&sec, tf, None, limit).await?, simulated: false })
+            }
+            AssetClass::Govt => {
+                let mut history = if tf.is_intraday() {
+                    let y = catalog::by_security(&sec).and_then(|l| l.yahoo).ok_or_else(|| {
+                        anyhow!("intraday yields are not available for {}; use D, W or M", sec.ticker)
+                    })?;
+                    self.yahoo.scan_history(y, tf, limit).await?
+                } else {
+                    ScanHistory { bars: self.treasury.history(&sec, tf, None, limit).await?, simulated: false }
+                };
+                // Yield series have no traded-volume measure, including Yahoo proxies.
+                for bar in &mut history.bars {
+                    bar.volume = f64::NAN;
+                }
+                Ok(history)
+            }
+            AssetClass::Equity | AssetClass::Etf if self.alpaca.is_some() => {
+                let a = self.alpaca.as_ref().expect("checked");
+                match a.scan_history(&sec.ticker, tf, limit).await {
+                    Ok(history) if !history.bars.is_empty() => Ok(history),
+                    _ => self.yahoo.scan_history(&yahoo_symbol(&sec), tf, limit).await,
+                }
+            }
+            _ => self.yahoo.scan_history(&yahoo_symbol(&sec), tf, limit).await,
         }
     }
 

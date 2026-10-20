@@ -229,6 +229,7 @@ pub enum Function {
     Alerts,
     Refresh,
     Watchlist,
+    Scanner,
     WatchAdd(Vec<String>),
     WatchRemove(Vec<String>),
     /// `LAYOUT 1|2|2H|3|4|6` preset, `LAYOUT <name>` switch, or a layout subcommand
@@ -314,6 +315,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "UNTRACK" => Function::Untrack(joined()),
         "ALRT" | "ALERTS" | "ALERT" => Function::Alerts,
         "REFRESH" | "SYNC" => Function::Refresh,
+        "SCAN" | "SCANNER" | "EASYSCAN" => Function::Scanner,
         "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => match words().first().map(String::as_str) {
             Some("ADD") => Function::WatchAdd(words()[1..].to_vec()),
             Some("DEL") | Some("RM") | Some("REMOVE") => Function::WatchRemove(words()[1..].to_vec()),
@@ -462,6 +464,7 @@ fn describe(f: &Function) -> String {
         Function::Alerts => "Alerts".into(),
         Function::Refresh => "Refresh congressional disclosures now".into(),
         Function::Watchlist => "Watchlist".into(),
+        Function::Scanner => "Scan the watchlist with saved conditions".into(),
         Function::WatchAdd(s) => format!("Add {} to watchlist", s.join(", ")),
         Function::WatchRemove(s) => format!("Remove {} from watchlist", s.join(", ")),
         Function::Layout(l) if l.trim().is_empty() => "Saved layouts".into(),
@@ -540,6 +543,18 @@ fn describe(f: &Function) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanner_commands_and_panel_specs() {
+        for command in ["SCAN", "scanner", "EASYSCAN"] {
+            assert_eq!(parse(command), Some(Command::Function(Function::Scanner)));
+        }
+        assert_eq!(parse("NEW SCAN"), Some(Command::Function(Function::NewPanel("SCAN".into()))));
+        assert_eq!(
+            parse("SPLIT DOWN SCAN"),
+            Some(Command::Function(Function::Split { down: true, panel: "SCAN".into() }))
+        );
+    }
 
     #[test]
     fn symbols() {

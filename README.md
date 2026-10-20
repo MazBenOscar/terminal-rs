@@ -37,6 +37,15 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
 
 ## Features
 
+- **Watchlist scanner** (`SCAN`, `NEW SCAN`, `SPLIT SCAN`) — manually scan up to 200 watchlist
+  symbols using price, volume, previous-bar change, SMA and RSI conditions. Combine conditions
+  with All/Any, compare values or indicators, and detect crosses above/below. Save named scans,
+  restore definitions with workspace layouts, and click results to open linked charts. Results
+  show their last bar timestamp, missing-data errors and explicit sample-data labels. Scans use
+  provider snapshots (possibly delayed or still forming), with no automatic sample fallback.
+  This first version evaluates locally; it does not connect to TC2000 or reproduce its remote
+  scanning service. Research and scope: [EasyScan analysis](docs/analysis/tc2000-easyscan.md).
+
 - **Multi-asset with Bloomberg-style market keys** — `AAPL <EQUITY>`, `SPY <EQUITY>`,
   `SPX <INDEX>`, `BTCUSD <CRNCY>`, `EURUSD <CRNCY>`, `US10Y <GOVT>`, `CL1 <CMDTY>` (keys display
   as `AAPL US Equity`, `BTCUSD Curncy`, `US10Y Govt`, `CL1 Comdty`). The yellow key is optional for

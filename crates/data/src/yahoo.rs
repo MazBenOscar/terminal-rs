@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tr_core::{AssetClass, Bar, Security, Timeframe, catalog};
 
-use crate::{MarketData, Quote, SearchHit};
+use crate::{MarketData, Quote, ScanHistory, SearchHit};
 
 const BASE: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 
@@ -32,7 +32,14 @@ impl YahooProvider {
         Ok(Self { client, crumb: tokio::sync::Mutex::new(None) })
     }
 
-    async fn chart(&self, symbol: &str, interval: &str, period1: i64, period2: i64) -> Result<Chart> {
+    async fn chart(
+        &self,
+        symbol: &str,
+        interval: &str,
+        period1: i64,
+        period2: i64,
+        missing_volume: f64,
+    ) -> Result<Chart> {
         let url = format!("{BASE}/{}", urlencode(symbol));
         let resp = self
             .client
@@ -48,7 +55,7 @@ impl YahooProvider {
         if !resp.status().is_success() {
             bail!("yahoo {symbol}: HTTP {}", resp.status());
         }
-        parse_chart(&resp.text().await?)
+        parse_chart_with_volume(&resp.text().await?, missing_volume)
     }
 }
 
@@ -127,6 +134,10 @@ struct QuoteArrays {
 /// Parse a chart response. Rows with any missing OHLC value (Yahoo emits nulls for
 /// halted or partial periods) are skipped.
 pub fn parse_chart(json: &str) -> Result<Chart> {
+    parse_chart_with_volume(json, 0.0)
+}
+
+fn parse_chart_with_volume(json: &str, missing_volume: f64) -> Result<Chart> {
     let env: Envelope = serde_json::from_str(json).context("parsing Yahoo chart JSON")?;
     if let Some(err) = env.chart.error.filter(|e| !e.is_null()) {
         return Err(anyhow!("yahoo error: {err}"));
@@ -137,7 +148,7 @@ pub fn parse_chart(json: &str) -> Result<Chart> {
     for (i, &ts) in r.timestamp.iter().enumerate() {
         let get = |v: &Vec<Option<f64>>| v.get(i).copied().flatten();
         if let (Some(o), Some(h), Some(l), Some(c)) = (get(&q.open), get(&q.high), get(&q.low), get(&q.close)) {
-            bars.push(Bar::new(ts, o, h, l, c, get(&q.volume).unwrap_or(0.0)));
+            bars.push(Bar::new(ts, o, h, l, c, get(&q.volume).unwrap_or(missing_volume)));
         }
     }
     Ok(Chart {
@@ -147,13 +158,15 @@ pub fn parse_chart(json: &str) -> Result<Chart> {
     })
 }
 
-#[async_trait]
-impl MarketData for YahooProvider {
-    fn name(&self) -> &str {
-        "yahoo"
-    }
-
-    async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+impl YahooProvider {
+    async fn history_with_volume(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        missing_volume: f64,
+    ) -> Result<Vec<Bar>> {
         let now = chrono::Utc::now().timestamp();
         let period2 = end.unwrap_or(now + 60);
         let (iv, max_back) = interval(tf);
@@ -170,12 +183,28 @@ impl MarketData for YahooProvider {
         if period1 >= period2 {
             return Ok(Vec::new());
         }
-        let mut bars = self.chart(symbol, iv, period1, period2).await?.bars;
+        let mut bars = self.chart(symbol, iv, period1, period2, missing_volume).await?.bars;
         // Yahoo's weekly/monthly timestamps are session opens; snap to our calendar buckets.
         if matches!(tf, Timeframe::W1 | Timeframe::MN1 | Timeframe::H4) {
             bars = tf.resample(&bars);
         }
         Ok(crate::clip(bars, end, limit))
+    }
+}
+
+#[async_trait]
+impl MarketData for YahooProvider {
+    fn name(&self) -> &str {
+        "yahoo"
+    }
+
+    async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        self.history_with_volume(symbol, tf, end, limit, 0.0).await
+    }
+
+    async fn scan_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
+        // Unknown volume stays unavailable in predicates; a reported zero remains zero.
+        Ok(ScanHistory { bars: self.history_with_volume(symbol, tf, None, limit, f64::NAN).await?, simulated: false })
     }
 
     /// Batched via the spark endpoint (20 symbols per request).
@@ -458,6 +487,32 @@ mod tests {
         assert_eq!(parse_chart(json).unwrap().bars.len(), 1);
         let err = r#"{"chart":{"result":null,"error":{"code":"Not Found","description":"No data found"}}}"#;
         assert!(parse_chart(err).is_err());
+    }
+
+    #[test]
+    fn scanner_preserves_unknown_volume_without_losing_prices() {
+        use tr_core::scanner::{Comparison, MatchMode, ScanCondition, ScanDefinition, ScanOperand, ScanOutcome};
+        let json = r#"{"chart":{"result":[{"meta":{},"timestamp":[1,2],"indicators":{"quote":[{"open":[1,1],"high":[2,2],"low":[0.5,0.5],"close":[1.5,1.5],"volume":[0,null]}]}}],"error":null}}"#;
+        let chart = parse_chart_with_volume(json, f64::NAN).unwrap();
+        assert_eq!(chart.bars[0].volume, 0.0);
+        assert!(chart.bars[1].volume.is_nan());
+        let series = tr_core::Series::new("X", Timeframe::D1, chart.bars);
+        let mut definition = ScanDefinition {
+            name: "Volume below ten".into(),
+            timeframe: Timeframe::D1,
+            match_mode: MatchMode::All,
+            conditions: vec![ScanCondition {
+                left: ScanOperand::Volume,
+                comparison: Comparison::Below,
+                right: ScanOperand::Constant(10.0),
+            }],
+        };
+        assert_eq!(definition.evaluate(&series).outcome, ScanOutcome::Unavailable);
+        definition.conditions[0].left = ScanOperand::Price;
+        assert_eq!(definition.evaluate(&series).outcome, ScanOutcome::Match);
+        // Missing volume inside an aggregate must also stay unknown.
+        assert!(Timeframe::W1.resample(&series.bars)[0].volume.is_nan());
+        assert_eq!(parse_chart(json).unwrap().bars[1].volume, 0.0);
     }
 
     #[test]

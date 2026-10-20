@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tr_core::{Bar, Timeframe, sample};
 
-use crate::{LiveFeed, MarketData, OptionChain, OrderBook, security};
+use crate::{LiveFeed, MarketData, OptionChain, OrderBook, ScanHistory, security};
 
 /// Deterministic synthetic data anchored at a fixed "now" per process, so paging is
 /// consistent: page N+1 is exactly the bars preceding page N. Levels and volatility
@@ -50,6 +50,10 @@ impl MarketData for SampleProvider {
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
         Ok(crate::clip(self.bars(symbol, tf), end, limit))
+    }
+
+    async fn scan_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
+        Ok(ScanHistory { bars: self.history(symbol, tf, None, limit).await?, simulated: true })
     }
 
     /// A synthetic chain priced with Black-Scholes around the last price.

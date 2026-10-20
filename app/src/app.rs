@@ -12,6 +12,7 @@ mod options_view;
 mod palette_view;
 mod panels;
 mod portfolio_view;
+mod scanner_view;
 mod settings_view;
 mod theming;
 mod trading;
@@ -62,6 +63,7 @@ pub enum PaneKind {
     Politicians,
     Alerts,
     Watchlist,
+    Scanner(Box<scanner_view::ScannerPane>),
     Help,
     Wei,
     Curve,
@@ -176,6 +178,7 @@ impl PaneKind {
             PaneKind::Politicians => "Politicians".into(),
             PaneKind::Alerts => "Alerts".into(),
             PaneKind::Watchlist => "Watchlist".into(),
+            PaneKind::Scanner(s) => format!("Scan: {}", s.definition.name),
             PaneKind::Help => "Help".into(),
             PaneKind::Wei => "World Markets".into(),
             PaneKind::Curve => "Yield Curve".into(),
@@ -200,6 +203,7 @@ impl PaneKind {
             PaneKind::Profile { .. } | PaneKind::Politicians => "POL",
             PaneKind::Alerts => "ALRT",
             PaneKind::Watchlist => "WL",
+            PaneKind::Scanner(_) => "SCAN",
             PaneKind::Help => "HELP",
             PaneKind::Wei => "WEI",
             PaneKind::Curve => "GC",
@@ -257,6 +261,7 @@ impl PaneKind {
             PaneKind::Politicians => PaneSettings::Politicians,
             PaneKind::Alerts => PaneSettings::Alerts,
             PaneKind::Watchlist => PaneSettings::Watchlist,
+            PaneKind::Scanner(s) => PaneSettings::Scanner(s.definition.clone()),
             PaneKind::Help => PaneSettings::Help,
             PaneKind::Wei => PaneSettings::Wei,
             PaneKind::Curve => PaneSettings::Curve,
@@ -310,6 +315,9 @@ impl PaneKind {
             PaneSettings::Politicians => PaneKind::Politicians,
             PaneSettings::Alerts => PaneKind::Alerts,
             PaneSettings::Watchlist => PaneKind::Watchlist,
+            PaneSettings::Scanner(definition) => {
+                PaneKind::Scanner(Box::new(scanner_view::ScannerPane::new(definition)))
+            }
             PaneSettings::Help => PaneKind::Help,
             PaneSettings::Wei => PaneKind::Wei,
             PaneSettings::Curve => PaneKind::Curve,
@@ -809,6 +817,7 @@ impl TerminalApp {
             }
             Function::Refresh => self.worker.send(Request::RefreshCongress),
             Function::Watchlist => self.open_panel(PaneKind::Watchlist),
+            Function::Scanner => self.open_panel(PaneKind::Scanner(Box::default())),
             Function::WatchAdd(words) => {
                 for key in keys_from_words(&words) {
                     if !self.watchlist.contains(&key) {
@@ -935,6 +944,16 @@ impl TerminalApp {
     fn drain(&mut self) {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
+                Response::Scan { pane, generation, rows } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::Scanner(s) = &mut p.kind
+                        && s.generation == generation
+                    {
+                        s.rows = rows;
+                        s.running = false;
+                        s.completed = Some(chrono::Utc::now());
+                    }
+                }
                 Response::History {
                     pane,
                     generation,

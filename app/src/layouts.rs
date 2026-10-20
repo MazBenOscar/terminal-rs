@@ -78,6 +78,7 @@ pub enum PaneSettings {
     Politicians,
     Alerts,
     Watchlist,
+    Scanner(tr_core::scanner::ScanDefinition),
     Help,
     Wei,
     Curve,
@@ -435,6 +436,15 @@ mod tests {
     use super::*;
     use crate::dock::Zone;
     use crate::prefs::PanelDefaults;
+
+    #[test]
+    fn scanner_conditions_survive_workspace_roundtrip() {
+        let definition = tr_core::scanner::ScanDefinition::default();
+        let mut doc = LayoutDoc::default_workspace("Scanner", &PanelDefaults::default());
+        doc.panes[0].settings = PaneSettings::Scanner(definition.clone());
+        let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(restored.panes[0].settings, PaneSettings::Scanner(definition));
+    }
 
     fn temp_store(tag: &str) -> Store {
         let dir = std::env::temp_dir().join(format!("tr-layouts-{tag}-{}", std::process::id()));

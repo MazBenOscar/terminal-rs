@@ -15,6 +15,7 @@ use tr_congress::performance::{self, Performance, TradeReturn};
 use tr_congress::refresh::{self, HttpSource, NewTradeAlert, RefreshConfig};
 use tr_congress::{Db, Politician, Trade};
 use tr_core::indicators::registry::{Input, Plot, Tone};
+use tr_core::scanner::{ScanDefinition, ScanEvaluation};
 use tr_core::{Bar, Security, Series, Timeframe};
 use tr_data::{BarCache, Provider, Quote, SearchHit, YieldCurves};
 
@@ -26,7 +27,26 @@ pub type PaneId = u64;
 /// Minutes between Congress disclosure checks (`TR_CONGRESS_REFRESH_MIN`; 0 disables).
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
 
+/// Bounded, on-demand scanner universe. Larger universes need a bulk data provider.
+pub const MAX_SCAN_SYMBOLS: usize = 200;
+
+#[derive(Debug, Clone)]
+pub struct ScanRow {
+    pub symbol: String,
+    pub evaluation: Option<ScanEvaluation>,
+    /// Most recent evaluated bar's open time; providers may supply delayed data.
+    pub ts: Option<i64>,
+    pub simulated: bool,
+    pub error: Option<String>,
+}
+
 pub enum Request {
+    Scan {
+        pane: PaneId,
+        generation: u64,
+        definition: ScanDefinition,
+        symbols: Vec<String>,
+    },
     /// Load the brokerage portfolio through SnapTrade (`None` = the simulated sample).
     Portfolio(Option<tr_broker::Credentials>),
     /// Register a SnapTrade user under the partner keys.
@@ -198,6 +218,11 @@ pub struct Profile {
 }
 
 pub enum Response {
+    Scan {
+        pane: PaneId,
+        generation: u64,
+        rows: Vec<ScanRow>,
+    },
     Portfolio(Result<Box<tr_broker::Portfolio>, String>),
     /// `(userId, userSecret)` for a newly registered SnapTrade user.
     BrokerRegistered(Result<(String, String), String>),
@@ -481,6 +506,10 @@ pub fn initial_limit(tf: Timeframe) -> usize {
 
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
+        Request::Scan { pane, generation, definition, symbols } => {
+            let rows = scan(s.provider.clone(), definition, symbols, Duration::from_secs(15)).await;
+            s.send(Response::Scan { pane, generation, rows });
+        }
         Request::History { pane, generation, symbol, tf, limit } => {
             if !claim_series(s, pane, generation) {
                 return; // a newer load for this pane is already running
@@ -698,6 +727,57 @@ async fn handle(s: &Arc<Shared>, req: Request) {
     }
 }
 
+/// Fetch a snapshot directly from the provider, independently of chart caches/live feeds.
+/// Input order is retained even when fetches complete out of order.
+async fn scan(provider: Provider, definition: ScanDefinition, symbols: Vec<String>, timeout: Duration) -> Vec<ScanRow> {
+    use futures::StreamExt;
+    let mut seen = std::collections::HashSet::new();
+    let symbols: Vec<String> = symbols
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && seen.insert(s.to_ascii_uppercase()))
+        .collect();
+    let invalid = definition.validate().err().or_else(|| {
+        (symbols.len() > MAX_SCAN_SYMBOLS)
+            .then(|| format!("Scan limit is {MAX_SCAN_SYMBOLS} unique symbols; narrow the universe"))
+    });
+    if let Some(error) = invalid {
+        return symbols
+            .into_iter()
+            .map(|symbol| ScanRow { symbol, evaluation: None, ts: None, simulated: false, error: Some(error.clone()) })
+            .collect();
+    }
+    // Extra history stabilizes Wilder RSI; indicator evaluation still checks warm-up.
+    let limit = definition.required_bars().saturating_mul(3).max(300);
+    let fetches = symbols.into_iter().map(|symbol| {
+        let provider = provider.clone();
+        let definition = &definition;
+        async move {
+            let fetched =
+                tokio::time::timeout(timeout, provider.scan_history(&symbol, definition.timeframe, limit)).await;
+            let result = match fetched {
+                Ok(r) => r.map_err(|e| format!("{e:#}")),
+                Err(_) => Err(format!("History request timed out after {} seconds", timeout.as_secs())),
+            };
+            match result {
+                Ok(history) => {
+                    let series = Series::new(symbol.clone(), definition.timeframe, history.bars);
+                    let ts = series.bars.last().map(|b| b.ts);
+                    ScanRow {
+                        symbol,
+                        evaluation: Some(definition.evaluate(&series)),
+                        ts,
+                        simulated: history.simulated,
+                        error: None,
+                    }
+                }
+                Err(error) => ScanRow { symbol, evaluation: None, ts: None, simulated: false, error: Some(error) },
+            }
+        }
+    });
+    futures::stream::iter(fetches).buffered(4).collect().await
+}
+
 async fn trade(t: TradeRequest) -> TradeResponse {
     let err = |e: anyhow::Error| format!("{e:#}");
     let client = |creds| tr_broker::SnapTrade::new(creds).map_err(err);
@@ -884,6 +964,34 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_deduplicates_and_labels_explicit_samples() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let provider: Provider = Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 400));
+        let rows = rt.block_on(scan(
+            provider,
+            ScanDefinition::default(),
+            vec![" AAPL ".into(), "aapl".into(), "".into(), "MSFT".into()],
+            Duration::from_secs(1),
+        ));
+        assert_eq!(rows.iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), vec!["AAPL", "MSFT"]);
+        assert!(rows.iter().all(|r| r.simulated && r.ts.is_some() && r.evaluation.is_some() && r.error.is_none()));
+    }
+
+    #[test]
+    fn scan_rejects_oversized_universe() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let provider: Provider = Arc::new(tr_data::sample::SampleProvider::at(0, 0));
+        let rows = rt.block_on(scan(
+            provider,
+            ScanDefinition::default(),
+            (0..=MAX_SCAN_SYMBOLS).map(|i| format!("SYMBOL{i}")).collect(),
+            Duration::from_secs(1),
+        ));
+        assert_eq!(rows.len(), MAX_SCAN_SYMBOLS + 1);
+        assert!(rows.iter().all(|r| r.evaluation.is_none() && r.error.as_ref().unwrap().contains("Scan limit")));
+    }
 
     #[test]
     fn compare_alignment_carries_last_close() {

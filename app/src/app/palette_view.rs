@@ -35,6 +35,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("ALRT", "", "alerts tracked filings", Some(Action::Alerts)),
     ("REFRESH", "", "congress disclosures sync", Some(Action::Refresh)),
     ("WL", "", "watchlist monitor", Some(Action::Watchlist)),
+    ("SCAN", "Watchlist scanner", "easyscan screener conditions filter", None),
     ("N", "", "news headlines", None),
     ("OB", "", "order book depth dom", None),
     ("WEI", "", "world equity indices markets", None),

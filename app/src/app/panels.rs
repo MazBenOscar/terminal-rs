@@ -80,6 +80,10 @@ impl TerminalApp {
                     actions.push(a);
                 }
             }
+            PaneKind::Scanner(s) => {
+                actions
+                    .extend(super::scanner_view::show(ui, s, id, &self.watchlist, |request| self.worker.send(request)));
+            }
             PaneKind::Portfolio(pp) => {
                 let demo =
                     (self.prefs.trading.account_mode == crate::prefs::AccountMode::Demo).then_some(&*self.demo.pf);
