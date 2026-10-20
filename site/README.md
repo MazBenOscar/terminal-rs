@@ -1,7 +1,8 @@
 # site
 
 The download page for Terminal. It is one static page built with SvelteKit for Vercel, plus a
-`/download` route that redirects to the latest release DMG.
+`/download` route that redirects to the latest release DMG and saves the email visitors give before
+downloading.
 
 This folder is its own npm project, separate from the Cargo workspace. Run the commands below from
 `site/`, and set the Vercel project's Root Directory to `site`. It needs Node 22.17 or later, the
@@ -35,10 +36,38 @@ npm run check
 - `src/lib/site.ts` holds the version, architecture, minimum macOS, site URL and download URL,
   plus the name, title and description used by the page's metadata. Update it with each release.
   `static/robots.txt` and `static/sitemap.xml` repeat the site URL.
-- `src/routes/download/+server.ts` answers `/download` with a 302 to
+- `src/routes/download/+server.ts` answers `GET /download` with a 302 to
   `https://github.com/michaelshimeles/terminal-rs/releases/latest/download/terminal-rs-universal.dmg`.
   That URL works only once a GitHub release includes an asset named exactly
   `terminal-rs-universal.dmg`.
+- The download buttons open `src/lib/DownloadDialog.svelte`, which asks for an email, sends it to
+  `POST /download`, then starts the download with `GET /download`. The browser remembers that it
+  gave an email, so later downloads skip the dialog. If saving fails or takes more than 3 seconds,
+  the download starts anyway.
+  Without JavaScript the buttons link straight to `/download`.
+
+## Emails
+
+`POST /download` adds each email to the `emails` sorted set in Upstash Redis, scored by when the
+address was first given in milliseconds since the epoch. It reads `KV_REST_API_URL` and
+`KV_REST_API_TOKEN`, declared in `src/env.ts`. Without them the site still builds and serves
+downloads, but every save fails and logs an error.
+
+To set them up, add Upstash for Redis to the Vercel project, which connects the database and sets
+both variables:
+
+```sh
+vercel link --scope goshen-labs --project terminal
+vercel integration add upstash/upstash-kv --name terminal-emails
+vercel env pull .env.local    # for npm run dev
+```
+
+To list the emails, oldest first, with the read-only token the integration also sets:
+
+```sh
+set -a; . ./.env.local; set +a
+curl -H "Authorization: Bearer $KV_REST_API_READ_ONLY_TOKEN" "$KV_REST_API_URL/zrange/emails/0/-1"
+```
 
 ## Images
 

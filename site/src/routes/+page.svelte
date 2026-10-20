@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 	import DownloadCount from '#lib/DownloadCount.svelte';
+	import DownloadDialog from '#lib/DownloadDialog.svelte';
 	import Logo from '#lib/Logo.svelte';
 	import ChartCard from '#lib/cards/ChartCard.svelte';
 	import CongressCard from '#lib/cards/CongressCard.svelte';
@@ -44,6 +45,12 @@
 	const jsonLd = `<script type="application/ld+json">${app}<\/script>`;
 
 	const player = new Player();
+
+	let downloadDialog: ReturnType<typeof DownloadDialog>;
+
+	function download(event: MouseEvent) {
+		downloadDialog.intercept(event);
+	}
 
 	function toggleTheme() {
 		theme.toggle();
@@ -176,7 +183,7 @@
 					/>
 				</svg>
 			</button>
-			<a class="pill" href={resolve('/download')}>Download</a>
+			<a class="pill" href={resolve('/download')} onclick={download}>Download</a>
 		</div>
 	</div>
 </nav>
@@ -190,7 +197,7 @@
 			and the chart is already there.
 		</p>
 		<div class="cta">
-			<a class="download" href={resolve('/download')}>
+			<a class="download" href={resolve('/download')} onclick={download}>
 				{@render apple()}
 				Download for macOS
 			</a>
@@ -247,7 +254,7 @@
 		<div class="intro" {@attach reveal}>
 			<h2 id="install-title">Install</h2>
 			<p>Free. macOS {MIN_MACOS} or later on {ARCH}.</p>
-			<a class="download" href={resolve('/download')}>
+			<a class="download" href={resolve('/download')} onclick={download}>
 				{@render apple()}
 				Download for macOS
 			</a>
@@ -266,6 +273,8 @@
 		GitHub
 	</a>
 </footer>
+
+<DownloadDialog bind:this={downloadDialog} />
 
 <style>
 	.glass {
