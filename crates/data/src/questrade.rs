@@ -227,7 +227,8 @@ impl Questrade {
             .query(&[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())])
             .send()
             .await
-            .context("contacting Questrade login")?;
+            // reqwest errors carry the URL, whose query holds the refresh token.
+            .map_err(|e| anyhow!("contacting Questrade login: {}", e.without_url()))?;
         if !resp.status().is_success() {
             session.access = None;
             bail!(
@@ -236,7 +237,8 @@ impl Questrade {
                 resp.status().as_u16()
             );
         }
-        let (token, ttl, next, server) = parse_token(&resp.text().await?)?;
+        let body = resp.text().await.map_err(|e| anyhow!("reading the Questrade token: {}", e.without_url()))?;
+        let (token, ttl, next, server) = parse_token(&body)?;
         // The old refresh token is now spent: keep the new one before anything else can fail.
         if let Err(e) = (self.inner.sink)(Some(&next)) {
             tracing::error!("could not save the rotated Questrade token, re-enter it after restart: {e:#}");
@@ -400,6 +402,16 @@ mod tests {
         assert!(window(Timeframe::D1, 300) > 420 * 86_400);
         assert!(window(Timeframe::M5, 100) > 100 * 300);
         assert_eq!(interval(Timeframe::M30), "HalfHour");
+    }
+
+    #[tokio::test]
+    async fn token_exchange_errors_never_contain_the_token() {
+        // Nothing listens on port 9: the exchange fails before any response.
+        let q = Questrade::with_login(Some("SECRET-REFRESH-TOKEN".into()), Box::new(|_| Ok(())), "https://127.0.0.1:9")
+            .unwrap();
+        let error = format!("{:#}", q.history("AAPL", Timeframe::D1, None, 5).await.unwrap_err());
+        assert!(error.contains("contacting Questrade login"), "{error}");
+        assert!(!error.contains("SECRET-REFRESH-TOKEN"), "{error}");
     }
 
     #[tokio::test]
