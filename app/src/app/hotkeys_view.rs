@@ -259,6 +259,7 @@ impl TerminalApp {
                     (&["CONG", "NVDA CONG"], "Congress trades feed / who traded a ticker"),
                     (&["POL", "POL PELOSI", "TRACK PELOSI"], "Politicians, profiles and alerts"),
                     (&["WL", "WL ADD SOLUSD CRNCY"], "Watchlist"),
+                    (&["SCAN", "NEW SCAN", "SPLIT SCAN"], "Watchlist scanner: conditions, snapshots and saved scans"),
                     (&["PREFS"], "Settings: theme, fonts, density, hotkeys, layouts"),
                     (&["UPDATE"], "Check for updates"),
                 ],

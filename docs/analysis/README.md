@@ -27,6 +27,9 @@ Labels used in every note:
 
 ## Notes
 
+- [TC2000 EasyScan](tc2000-easyscan.md) — separate static REA study of scan definitions,
+  condition sets, snapshot/streaming query paths, and the scope of the independent Rust scanner.
+
 - [interactions.md](interactions.md) — pan/zoom, crosshair, scales, legend, quick ranges
 - [drawing-tools.md](drawing-tools.md) — tool taxonomy, hotkeys, magnet, fib levels
 - [indicators.md](indicators.md) — dialog flow, defaults, panes

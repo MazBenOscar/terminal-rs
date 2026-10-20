@@ -80,6 +80,12 @@ impl TerminalApp {
                     actions.push(a);
                 }
             }
+            PaneKind::Scanner(s) => {
+                let bulk_ready = self.broker.questrade.as_ref().is_some_and(|q| q.is_configured());
+                actions.extend(super::scanner_view::show(ui, s, id, &self.watchlist, bulk_ready, |request| {
+                    self.worker.send(request)
+                }));
+            }
             PaneKind::Portfolio(pp) => {
                 let demo =
                     (self.prefs.trading.account_mode == crate::prefs::AccountMode::Demo).then_some(&*self.demo.pf);

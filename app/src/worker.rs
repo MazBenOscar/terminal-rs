@@ -15,7 +15,10 @@ use tr_congress::performance::{self, Performance, TradeReturn};
 use tr_congress::refresh::{self, HttpSource, NewTradeAlert, RefreshConfig};
 use tr_congress::{Db, Politician, Trade};
 use tr_core::indicators::registry::{Input, Plot, Tone};
+use tr_core::scanner::{ScanDefinition, ScanEvaluation};
 use tr_core::{Bar, Security, Series, Timeframe};
+use tr_data::scanstore::{Fetch, ScanStore};
+use tr_data::universe::Universe;
 use tr_data::{BarCache, Provider, Quote, SearchHit, YieldCurves};
 
 use crate::command::IndicatorSpec;
@@ -26,7 +29,45 @@ pub type PaneId = u64;
 /// Minutes between Congress disclosure checks (`TR_CONGRESS_REFRESH_MIN`; 0 disables).
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
 
+/// Bounded, on-demand scanner universe. Larger universes need a bulk data provider.
+pub const MAX_SCAN_SYMBOLS: usize = 200;
+
+#[derive(Debug, Clone)]
+pub struct ScanRow {
+    pub symbol: String,
+    pub evaluation: Option<ScanEvaluation>,
+    /// Most recent evaluated bar's open time; providers may supply delayed data.
+    pub ts: Option<i64>,
+    pub simulated: bool,
+    pub error: Option<String>,
+}
+
+/// Settings › Brokerage actions on the optional Questrade market-data source.
+pub enum QuestradeAction {
+    /// Save (or with `None`, forget) the refresh token, then test it.
+    Save(Option<String>),
+    Test,
+}
+
 pub enum Request {
+    Questrade {
+        handle: tr_data::questrade::Questrade,
+        action: QuestradeAction,
+    },
+    Scan {
+        pane: PaneId,
+        generation: u64,
+        definition: ScanDefinition,
+        symbols: Vec<String>,
+    },
+    /// Scan a market-wide universe through the scanner's bar store; `cancel` stops it.
+    ScanUniverse {
+        pane: PaneId,
+        generation: u64,
+        definition: ScanDefinition,
+        universe: Universe,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
     /// Load the brokerage portfolio through SnapTrade (`None` = the simulated sample).
     Portfolio(Option<tr_broker::Credentials>),
     /// Register a SnapTrade user under the partner keys.
@@ -198,6 +239,20 @@ pub struct Profile {
 }
 
 pub enum Response {
+    /// Outcome of a [`QuestradeAction`]: a status line or an error.
+    Questrade(Result<String, String>),
+    Scan {
+        pane: PaneId,
+        generation: u64,
+        rows: Vec<ScanRow>,
+    },
+    /// Symbols evaluated so far in a universe scan.
+    ScanProgress {
+        pane: PaneId,
+        generation: u64,
+        done: usize,
+        total: usize,
+    },
     Portfolio(Result<Box<tr_broker::Portfolio>, String>),
     /// `(userId, userSecret)` for a newly registered SnapTrade user.
     BrokerRegistered(Result<(String, String), String>),
@@ -294,6 +349,7 @@ struct Shared {
     /// tagged with the pane's load generation.
     series: std::sync::Mutex<SeriesMap>,
     cache: std::sync::Mutex<Option<BarCache>>,
+    scan_store: std::sync::Mutex<Option<ScanStore>>,
     db: Mutex<Db>,
     out: mpsc::Sender<Response>,
     ctx: egui::Context,
@@ -331,6 +387,9 @@ impl Worker {
         })?;
         let cache =
             BarCache::open(dir.join("bars.sqlite3")).map_err(|e| tracing::warn!("bar cache unavailable: {e:#}")).ok();
+        let scan_store = ScanStore::open(dir.join("scan_bars.sqlite3"))
+            .map_err(|e| tracing::warn!("scan store unavailable: {e:#}"))
+            .ok();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -342,6 +401,7 @@ impl Worker {
             provider,
             series: Default::default(),
             cache: std::sync::Mutex::new(cache),
+            scan_store: std::sync::Mutex::new(scan_store),
             db: Mutex::new(db),
             out,
             ctx,
@@ -481,6 +541,33 @@ pub fn initial_limit(tf: Timeframe) -> usize {
 
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
+        Request::Questrade { handle, action } => {
+            let test = async |h: &tr_data::questrade::Questrade| {
+                let bar = h.test("AAPL").await?;
+                let day = chrono::DateTime::from_timestamp(bar.ts, 0)
+                    .map_or_else(String::new, |d| d.format("%Y-%m-%d").to_string());
+                anyhow::Ok(format!("Questrade connected · AAPL {day} close {:.2}", bar.close))
+            };
+            let result = match action {
+                QuestradeAction::Save(None) => {
+                    handle.set_refresh_token(None).await.map(|()| "Questrade token removed".to_string())
+                }
+                QuestradeAction::Save(token) => match handle.set_refresh_token(token).await {
+                    Ok(()) => test(&handle).await,
+                    Err(e) => Err(e.context("saving the Questrade token")),
+                },
+                QuestradeAction::Test => test(&handle).await,
+            };
+            s.send(Response::Questrade(result.map_err(|e| format!("{e:#}"))));
+        }
+        Request::ScanUniverse { pane, generation, definition, universe, cancel } => {
+            let rows = scan_universe(s, pane, generation, &definition, universe, &cancel).await;
+            s.send(Response::Scan { pane, generation, rows });
+        }
+        Request::Scan { pane, generation, definition, symbols } => {
+            let rows = scan(s.provider.clone(), definition, symbols, Duration::from_secs(15)).await;
+            s.send(Response::Scan { pane, generation, rows });
+        }
         Request::History { pane, generation, symbol, tf, limit } => {
             if !claim_series(s, pane, generation) {
                 return; // a newer load for this pane is already running
@@ -698,6 +785,153 @@ async fn handle(s: &Arc<Shared>, req: Request) {
     }
 }
 
+/// Fetch a snapshot directly from the provider, independently of chart caches/live feeds.
+/// Input order is retained even when fetches complete out of order.
+async fn scan(provider: Provider, definition: ScanDefinition, symbols: Vec<String>, timeout: Duration) -> Vec<ScanRow> {
+    use futures::StreamExt;
+    let mut seen = std::collections::HashSet::new();
+    let symbols: Vec<String> = symbols
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && seen.insert(s.to_ascii_uppercase()))
+        .collect();
+    let invalid = definition.validate().err().or_else(|| {
+        (symbols.len() > MAX_SCAN_SYMBOLS)
+            .then(|| format!("Scan limit is {MAX_SCAN_SYMBOLS} unique symbols; narrow the universe"))
+    });
+    if let Some(error) = invalid {
+        return symbols
+            .into_iter()
+            .map(|symbol| ScanRow { symbol, evaluation: None, ts: None, simulated: false, error: Some(error.clone()) })
+            .collect();
+    }
+    // Extra history stabilizes Wilder RSI; indicator evaluation still checks warm-up.
+    let limit = definition.required_bars().saturating_mul(3).max(300);
+    let fetches = symbols.into_iter().map(|symbol| {
+        let provider = provider.clone();
+        let definition = &definition;
+        async move {
+            let fetched =
+                tokio::time::timeout(timeout, provider.scan_history(&symbol, definition.timeframe, limit)).await;
+            let result = match fetched {
+                Ok(r) => r.map_err(|e| format!("{e:#}")),
+                Err(_) => Err(format!("History request timed out after {} seconds", timeout.as_secs())),
+            };
+            match result {
+                Ok(history) => {
+                    let series = Series::new(symbol.clone(), definition.timeframe, history.bars);
+                    let ts = series.bars.last().map(|b| b.ts);
+                    ScanRow {
+                        symbol,
+                        evaluation: Some(definition.evaluate(&series)),
+                        ts,
+                        simulated: history.simulated,
+                        error: None,
+                    }
+                }
+                Err(error) => ScanRow { symbol, evaluation: None, ts: None, simulated: false, error: Some(error) },
+            }
+        }
+    });
+    futures::stream::iter(fetches).buffered(4).collect().await
+}
+
+/// Reuse a fresh snapshot only when its provider and requested coverage match.
+/// Fetch a full replacement otherwise: a fixed-size tail cannot prove continuity
+/// after an absence or satisfy a larger indicator lookback.
+async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize) -> Result<(Vec<Bar>, bool), String> {
+    let now = chrono::Utc::now().timestamp();
+    let source = s.provider.scan_cache_key(symbol);
+    let (stored, fetched) = {
+        let store = s.scan_store.lock().expect("scan store");
+        let store = store.as_ref().ok_or("The scan store could not be opened")?;
+        let err = |e: anyhow::Error| format!("scan store: {e:#}");
+        (store.load(symbol, tf, limit).map_err(err)?, store.fetched(symbol, tf).map_err(err)?)
+    };
+    if let Some(f) = &fetched
+        && stored.len() >= limit
+        && f.source == source
+        && tr_data::scanstore::is_fresh(f.at, now)
+    {
+        return Ok((stored, f.simulated));
+    }
+    let history = tokio::time::timeout(Duration::from_secs(20), s.provider.scan_history(symbol, tf, limit))
+        .await
+        .map_err(|_| "History request timed out after 20 seconds".to_string())?
+        .map_err(|e| format!("{e:#}"))?;
+    if history.bars.is_empty() {
+        return Err(format!("No history for {symbol}"));
+    }
+    if s.provider.scan_cache_key(symbol) != source {
+        return Err("The scan data source changed during the request; run the scan again".into());
+    }
+    let fetch = Fetch { at: now, source, simulated: history.simulated };
+    let mut store = s.scan_store.lock().expect("scan store");
+    let store = store.as_mut().ok_or("The scan store could not be opened")?;
+    store.store(symbol, tf, &history.bars, &fetch).map_err(|e| format!("scan store: {e:#}"))?;
+    Ok((store.load(symbol, tf, limit).map_err(|e| format!("scan store: {e:#}"))?, history.simulated))
+}
+
+async fn scan_universe(
+    s: &Shared,
+    pane: PaneId,
+    generation: u64,
+    definition: &ScanDefinition,
+    universe: Universe,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<ScanRow> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::StreamExt;
+    let failed = |error: String| {
+        vec![ScanRow {
+            symbol: universe.label().into(),
+            evaluation: None,
+            ts: None,
+            simulated: false,
+            error: Some(error),
+        }]
+    };
+    if let Err(e) = definition.validate() {
+        return failed(e);
+    }
+    let listings =
+        match tr_data::universe::load_or_fetch(&data_dir().join("universe.json"), Duration::from_secs(86_400)).await {
+            Ok(l) => l,
+            Err(e) => return failed(format!("Could not load the US symbol directory: {e:#}")),
+        };
+    let symbols: Vec<String> = listings.iter().filter(|l| universe.includes(l.venue)).map(|l| l.key()).collect();
+    let total = symbols.len();
+    let done = AtomicUsize::new(0);
+    s.send(Response::ScanProgress { pane, generation, done: 0, total });
+    let limit = definition.required_bars().saturating_mul(3).max(300);
+    futures::stream::iter(symbols.into_iter().map(|symbol| {
+        let done = &done;
+        async move {
+            let row = if cancel.load(Ordering::Relaxed) {
+                ScanRow { symbol, evaluation: None, ts: None, simulated: false, error: Some("Stopped".into()) }
+            } else {
+                match universe_history(s, &symbol, definition.timeframe, limit).await {
+                    Ok((bars, simulated)) => {
+                        let series = Series::new(symbol.clone(), definition.timeframe, bars);
+                        let ts = series.bars.last().map(|b| b.ts);
+                        ScanRow { symbol, evaluation: Some(definition.evaluate(&series)), ts, simulated, error: None }
+                    }
+                    Err(error) => ScanRow { symbol, evaluation: None, ts: None, simulated: false, error: Some(error) },
+                }
+            };
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(25) || n == total {
+                s.send(Response::ScanProgress { pane, generation, done: n, total });
+            }
+            row
+        }
+    }))
+    .buffered(4)
+    .collect()
+    .await
+}
+
 async fn trade(t: TradeRequest) -> TradeResponse {
     let err = |e: anyhow::Error| format!("{e:#}");
     let client = |creds| tr_broker::SnapTrade::new(creds).map_err(err);
@@ -886,6 +1120,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scan_deduplicates_and_labels_explicit_samples() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let provider: Provider = Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 400));
+        let rows = rt.block_on(scan(
+            provider,
+            ScanDefinition::default(),
+            vec![" AAPL ".into(), "aapl".into(), "".into(), "MSFT".into()],
+            Duration::from_secs(1),
+        ));
+        assert_eq!(rows.iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), vec!["AAPL", "MSFT"]);
+        assert!(rows.iter().all(|r| r.simulated && r.ts.is_some() && r.evaluation.is_some() && r.error.is_none()));
+    }
+
+    #[test]
+    fn scan_rejects_oversized_universe() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let provider: Provider = Arc::new(tr_data::sample::SampleProvider::at(0, 0));
+        let rows = rt.block_on(scan(
+            provider,
+            ScanDefinition::default(),
+            (0..=MAX_SCAN_SYMBOLS).map(|i| format!("SYMBOL{i}")).collect(),
+            Duration::from_secs(1),
+        ));
+        assert_eq!(rows.len(), MAX_SCAN_SYMBOLS + 1);
+        assert!(rows.iter().all(|r| r.evaluation.is_none() && r.error.as_ref().unwrap().contains("Scan limit")));
+    }
+
+    #[test]
     fn compare_alignment_carries_last_close() {
         let base: Vec<Bar> = (0..5).map(|i| Bar::new(i * 10, 100.0, 100.0, 100.0, 100.0 + i as f64, 1.0)).collect();
         let other: Vec<Bar> = vec![Bar::new(5, 0.0, 0.0, 0.0, 50.0, 1.0), Bar::new(25, 0.0, 0.0, 0.0, 55.0, 1.0)];
@@ -916,12 +1178,133 @@ mod tests {
     }
 
     #[test]
+    fn universe_history_stores_reuses_and_labels_samples() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let (out, _rx) = mpsc::channel();
+        let s = Shared {
+            provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 400)),
+            series: Default::default(),
+            cache: std::sync::Mutex::new(None),
+            scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
+            db: Mutex::new(Db::open_in_memory().unwrap()),
+            out,
+            ctx: egui::Context::default(),
+        };
+        let (bars, simulated) = rt.block_on(universe_history(&s, "AAPL US Equity", Timeframe::D1, 300)).unwrap();
+        assert!(simulated);
+        assert_eq!(bars.len(), 300);
+        let fetch = s.scan_store.lock().unwrap().as_ref().unwrap().fetched("AAPL US Equity", Timeframe::D1).unwrap();
+        assert!(fetch.is_some_and(|f| f.simulated && f.source == s.provider.name()));
+        // Fresh bars come back from the store with their provenance intact.
+        let (again, simulated) = rt.block_on(universe_history(&s, "AAPL US Equity", Timeframe::D1, 300)).unwrap();
+        assert!(simulated);
+        assert_eq!(again.last().map(|b| b.ts), bars.last().map(|b| b.ts));
+    }
+
+    #[test]
+    fn universe_cache_refetches_for_source_changes_gaps_and_larger_lookbacks() {
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+        struct Fixture {
+            simulated: AtomicBool,
+            latest: AtomicI64,
+            empty: AtomicBool,
+            requests: std::sync::Mutex<Vec<usize>>,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Fixture {
+            fn name(&self) -> &str {
+                "fixture-router"
+            }
+            fn scan_cache_key(&self, _: &str) -> String {
+                if self.simulated.load(Ordering::Relaxed) { "sample" } else { "live" }.into()
+            }
+            async fn history(&self, _: &str, tf: Timeframe, _: Option<i64>, limit: usize) -> anyhow::Result<Vec<Bar>> {
+                self.requests.lock().unwrap().push(limit);
+                if self.empty.load(Ordering::Relaxed) {
+                    return Ok(Vec::new());
+                }
+                let end = self.latest.load(Ordering::Relaxed);
+                let price = if self.simulated.load(Ordering::Relaxed) { 10.0 } else { 100.0 };
+                Ok((0..limit)
+                    .map(|i| {
+                        Bar::new((end - (limit - 1 - i) as i64) * tf.seconds(), price, price, price, price, 1000.0)
+                    })
+                    .collect())
+            }
+            async fn scan_history(
+                &self,
+                symbol: &str,
+                tf: Timeframe,
+                limit: usize,
+            ) -> anyhow::Result<tr_data::ScanHistory> {
+                Ok(tr_data::ScanHistory {
+                    bars: self.history(symbol, tf, None, limit).await?,
+                    simulated: self.simulated.load(Ordering::Relaxed),
+                })
+            }
+        }
+        let fixture = Arc::new(Fixture {
+            simulated: AtomicBool::new(true),
+            latest: AtomicI64::new(1000),
+            empty: AtomicBool::new(false),
+            requests: Default::default(),
+        });
+        let (out, _rx) = mpsc::channel();
+        let s = Shared {
+            provider: fixture.clone(),
+            series: Default::default(),
+            cache: std::sync::Mutex::new(None),
+            scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
+            db: Mutex::new(Db::open_in_memory().unwrap()),
+            out,
+            ctx: egui::Context::default(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let tf = Timeframe::D1;
+        let symbol = "AAPL US Equity";
+        let get = |limit| rt.block_on(universe_history(&s, symbol, tf, limit));
+        assert!(get(300).unwrap().1);
+        assert!(get(300).unwrap().1);
+        assert_eq!(*fixture.requests.lock().unwrap(), [300], "Fresh compatible snapshots are reused");
+
+        fixture.simulated.store(false, Ordering::Relaxed);
+        let (real, simulated) = get(300).unwrap();
+        assert!(!simulated);
+        assert!(real.iter().all(|bar| bar.close == 100.0), "No sample bars survive a source switch");
+        assert_eq!(get(500).unwrap().0.len(), 500, "A larger lookback must be fetched even while fresh");
+
+        let expire = || {
+            let mut guard = s.scan_store.lock().unwrap();
+            let store = guard.as_mut().unwrap();
+            let bars = store.load(symbol, tf, 500).unwrap();
+            store.store(symbol, tf, &bars, &Fetch { at: 0, source: "live".into(), simulated: false }).unwrap();
+        };
+        expire();
+        fixture.latest.store(5000, Ordering::Relaxed);
+        let (refreshed, simulated) = get(500).unwrap();
+        assert!(!simulated);
+        assert_eq!(refreshed.first().unwrap().ts, 4501 * tf.seconds());
+        assert!(refreshed.windows(2).all(|bars| bars[1].ts - bars[0].ts == tf.seconds()));
+        assert_eq!(*fixture.requests.lock().unwrap(), [300, 300, 500, 500]);
+
+        expire();
+        fixture.empty.store(true, Ordering::Relaxed);
+        assert!(get(500).unwrap_err().contains("No history"));
+        assert_eq!(
+            s.scan_store.lock().unwrap().as_ref().unwrap().fetched(symbol, tf).unwrap().unwrap().at,
+            0,
+            "Empty refresh must not mark old bars fresh"
+        );
+    }
+
+    #[test]
     fn series_generations_only_move_forward() {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
+            scan_store: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             out,
             ctx: egui::Context::default(),

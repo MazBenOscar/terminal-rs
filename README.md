@@ -37,6 +37,23 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
 
 ## Features
 
+- **Scanner** (`SCAN`, `NEW SCAN`, `SPLIT SCAN`) — scan your watchlist (up to 200 symbols) or,
+  with a bulk data source, the whole market: **All US stocks** (about 5,600), **Nasdaq** or
+  **NYSE** listings from Nasdaq Trader's daily symbol directory, without ETFs, test issues,
+  warrants, units, rights, preferreds, notes or ADRs. Conditions compare price, volume,
+  previous-bar change, SMA and EMA (of close or volume), RSI and ATR against values or each other,
+  with `>`, `<`, `>=`, `<=` and crosses; any operand can look **N bars back** ("yesterday's RSI")
+  and the right side can be **multiplied** (`Volume >= EMA(50, Volume) × 2.5`). Combine with
+  All/Any, save named scans, restore them with layouts, and click results to open linked charts.
+  Built-in presets: **Momentum Ignition** (the first day RSI(14) reaches 70 above a 4-day EMA)
+  and **Volume Thrust** (RSI(14) ≥ 69.8 on 2.5× the 50-day volume EMA with a true range over
+  $0.50). Market-wide scans keep their own bar store (`scan_bars.sqlite3`, with source and
+  fetch time per symbol): compatible fresh snapshots are reused; stale snapshots and larger
+  lookbacks fetch full history (several minutes through Questrade), with progress and **Stop**. Results show
+  bar timestamps, missing-data errors and explicit sample-data labels; a failed fetch is
+  "unavailable", never a silent fallback. Evaluation is local; it does not connect to TC2000.
+  Research and scope: [EasyScan analysis](docs/analysis/tc2000-easyscan.md).
+
 - **Multi-asset with Bloomberg-style market keys** — `AAPL <EQUITY>`, `SPY <EQUITY>`,
   `SPX <INDEX>`, `BTCUSD <CRNCY>`, `EURUSD <CRNCY>`, `US10Y <GOVT>`, `CL1 <CMDTY>` (keys display
   as `AAPL US Equity`, `BTCUSD Curncy`, `US10Y Govt`, `CL1 Comdty`). The yellow key is optional for
@@ -83,7 +100,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   | Crypto | Binance public REST (`data-api.binance.vision`, then `api.binance.com`), Coinbase Exchange fallback | Binance 24h ticker | Binance kline websocket, Coinbase ticker fallback |
   | US Treasuries | Treasury.gov daily par yield curve CSV (FRED fallback); Yahoo `^IRX/^FVX/^TNX/^TYX` intraday | Treasury.gov | — |
   | FX, indices, futures | Yahoo Finance (`EURUSD=X`, `^GSPC`, `CL=F`) | Yahoo spark (batched) | — |
-  | Stocks, ETFs | Alpaca when `APCA_API_KEY_ID`/`APCA_API_SECRET_KEY` are set, else Yahoo | Yahoo spark | — |
+  | Stocks, ETFs | Questrade when a token is set (scans use it exclusively), then Alpaca when `APCA_API_KEY_ID`/`APCA_API_SECRET_KEY` are set, else Yahoo | Yahoo spark | — |
 
   No keys are required. `TR_PROVIDER=sample` runs fully offline on deterministic, class-aware sample
   data (BTCUSD near 65,000, EURUSD near 1.09, US10Y near 4.2%) **with simulated live ticks**, and
@@ -179,6 +196,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
 cargo run --release                  # Yahoo data, congress ingest in the background
 TR_PROVIDER=sample cargo run --release   # offline
 APCA_API_KEY_ID=… APCA_API_SECRET_KEY=… cargo run --release   # Alpaca
+QUESTRADE_REFRESH_TOKEN=… cargo run --release                  # Questrade (first run only, see below)
 ```
 
 Data lives in `~/Library/Application Support/terminal-rs` (macOS) or
@@ -237,6 +255,31 @@ holding a base64 HMAC-SHA256 (keyed with the consumer key) of the canonical JSON
 visible (every 20 s for five minutes after opening the portal); `PORT REFRESH` reloads on demand.
 Brokerage data can be delayed or cached by SnapTrade depending on your plan, which is why holdings
 are repriced with the terminal's live quotes where a market key exists.
+
+## Market data setup (Questrade, optional)
+
+SnapTrade connects brokerage *accounts* but has no price history, so scans of stocks and ETFs can
+use a separate market-data source. For Questrade clients (Questrade serves Canadian residents),
+**Settings › Brokerage › Market data · Questrade** takes a personal-app token:
+
+1. In Questrade's **API Centre**, register a personal app with **both** OAuth scopes ticked:
+   "Retrieve balances, positions, orders and executions" and "Retrieve delayed and real-time
+   market data". Symbol search, which turns tickers into Questrade's numeric IDs, is refused
+   with error 1016 ("out of allowed OAuth scopes") without the account scope. Personal apps
+   cannot trade, so the token is read-only either way.
+2. Click **New manual authorization › Generate new token**, paste it into **Refresh token** and
+   click **Save & Test**. "Questrade connected · AAPL … close …" confirms access.
+
+Each redemption returns a new refresh token and invalidates the old one, so the app saves every
+rotation immediately, next to the SnapTrade keys (Keychain account `questrade`, or
+`<data dir>/secrets/questrade.json`). A token unused for 7 days expires; generate a new one the
+same way. `QUESTRADE_REFRESH_TOKEN` seeds the store only when nothing is saved. Requests are
+paced to about 16 per second, under Questrade's 20/s and 15,000/hour market-data limits.
+
+With a token saved, stock and ETF **scans use Questrade only** (its errors show as unavailable
+rows) and charts try it first, falling back to Yahoo. Remove the token to return to the default
+sources. Users without Questrade are unaffected: every source sits behind
+`tr_data::MarketData`, so other regions can plug in another provider without scanner changes.
 
 ## Trading (opt-in)
 
@@ -330,7 +373,8 @@ app/            eframe shell: command line, docked panes, chart widget, panels
 crates/core     Bar/Series, timeframes, market keys + security catalog, indicators and their
                 registry (codes, parameters, panes, levels), sample data
 crates/data     MarketData trait; per-class router (Binance/Coinbase, Treasury.gov/FRED, Yahoo,
-                Alpaca), websocket live feeds, sample provider with simulated ticks; bar cache
+                Alpaca, Questrade), websocket live feeds, sample provider with simulated ticks;
+                bar cache, scanner bar store and US symbol directory (universes)
 crates/chart    wgpu renderer, LOD pyramids, viewport math, axes, drawings, egui paint callback
 crates/congress Senate eFD + House Clerk parsers, rosters, SQLite store, refresh, alerts, performance
 crates/broker   SnapTrade client (request signing, accounts, balances, positions, orders, activity),
@@ -438,5 +482,8 @@ cargo bench -p tr-core && cargo bench -p tr-chart
 - Estimated performance uses disclosed value bands (midpoints), so it is an estimate of trade-level
   skill, not a reconstruction of anyone's portfolio.
 - Yahoo's chart endpoint is unofficial and rate-limited; use Alpaca for a supported free source.
+  Market-wide scans are only offered with a bulk-capable source (Questrade today).
+- Scanner universes approximate `[type = stock] and [country = us]` by listing venue: US-listed
+  common stocks, ADRs excluded by name. Foreign companies with ordinary US listings stay in.
   Senate eFD terms prohibit using the data for commercial purposes or credit decisions; the terminal
   accepts the eFD agreement on your behalf for personal research use.

@@ -12,12 +12,13 @@ mod options_view;
 mod palette_view;
 mod panels;
 mod portfolio_view;
+mod scanner_view;
 mod settings_view;
 mod theming;
 mod trading;
 mod workspace;
 
-pub use broker::PosSort;
+pub use broker::{PosSort, questrade_handle};
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -62,6 +63,7 @@ pub enum PaneKind {
     Politicians,
     Alerts,
     Watchlist,
+    Scanner(Box<scanner_view::ScannerPane>),
     Help,
     Wei,
     Curve,
@@ -176,6 +178,7 @@ impl PaneKind {
             PaneKind::Politicians => "Politicians".into(),
             PaneKind::Alerts => "Alerts".into(),
             PaneKind::Watchlist => "Watchlist".into(),
+            PaneKind::Scanner(s) => format!("Scan: {}", s.definition.name),
             PaneKind::Help => "Help".into(),
             PaneKind::Wei => "World Markets".into(),
             PaneKind::Curve => "Yield Curve".into(),
@@ -200,6 +203,7 @@ impl PaneKind {
             PaneKind::Profile { .. } | PaneKind::Politicians => "POL",
             PaneKind::Alerts => "ALRT",
             PaneKind::Watchlist => "WL",
+            PaneKind::Scanner(_) => "SCAN",
             PaneKind::Help => "HELP",
             PaneKind::Wei => "WEI",
             PaneKind::Curve => "GC",
@@ -257,6 +261,10 @@ impl PaneKind {
             PaneKind::Politicians => PaneSettings::Politicians,
             PaneKind::Alerts => PaneSettings::Alerts,
             PaneKind::Watchlist => PaneSettings::Watchlist,
+            PaneKind::Scanner(s) => PaneSettings::Scanner(crate::layouts::ScanSettings {
+                definition: s.definition.clone(),
+                universe: s.universe,
+            }),
             PaneKind::Help => PaneSettings::Help,
             PaneKind::Wei => PaneSettings::Wei,
             PaneKind::Curve => PaneSettings::Curve,
@@ -310,6 +318,9 @@ impl PaneKind {
             PaneSettings::Politicians => PaneKind::Politicians,
             PaneSettings::Alerts => PaneKind::Alerts,
             PaneSettings::Watchlist => PaneKind::Watchlist,
+            PaneSettings::Scanner(settings) => {
+                PaneKind::Scanner(Box::new(scanner_view::ScannerPane::from_settings(settings)))
+            }
             PaneSettings::Help => PaneKind::Help,
             PaneSettings::Wei => PaneKind::Wei,
             PaneSettings::Curve => PaneKind::Curve,
@@ -543,7 +554,12 @@ fn prefs_path() -> std::path::PathBuf {
 }
 
 impl TerminalApp {
-    pub fn new(ctx: &egui::Context, worker: Worker, provider: String) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        worker: Worker,
+        provider: String,
+        questrade: Option<tr_data::questrade::Questrade>,
+    ) -> Self {
         let system_accent =
             tr_macos::accent_color().map_or(theme::DEFAULT_ACCENT, |[r, g, b]| Color32::from_rgb(r, g, b));
         let mut prefs = Prefs::load(&prefs_path());
@@ -569,7 +585,8 @@ impl TerminalApp {
         }
         let settings: Option<Settings> =
             std::fs::read(settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
-        let broker = broker::BrokerState::load(provider.eq_ignore_ascii_case("sample"));
+        let mut broker = broker::BrokerState::load(provider.eq_ignore_ascii_case("sample"));
+        broker.questrade = questrade;
         let (demo, demo_note) = demo::DemoState::load(demo::demo_path());
         let mut app = Self {
             broker,
@@ -809,6 +826,7 @@ impl TerminalApp {
             }
             Function::Refresh => self.worker.send(Request::RefreshCongress),
             Function::Watchlist => self.open_panel(PaneKind::Watchlist),
+            Function::Scanner => self.open_panel(PaneKind::Scanner(Box::default())),
             Function::WatchAdd(words) => {
                 for key in keys_from_words(&words) {
                     if !self.watchlist.contains(&key) {
@@ -935,6 +953,26 @@ impl TerminalApp {
     fn drain(&mut self) {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
+                Response::Scan { pane, generation, rows } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::Scanner(s) = &mut p.kind
+                        && s.generation == generation
+                    {
+                        s.rows = rows;
+                        s.running = false;
+                        s.progress = None;
+                        s.cancel = None;
+                        s.completed = Some(chrono::Utc::now());
+                    }
+                }
+                Response::ScanProgress { pane, generation, done, total } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::Scanner(s) = &mut p.kind
+                        && s.generation == generation
+                    {
+                        s.progress = Some((done, total));
+                    }
+                }
                 Response::History {
                     pane,
                     generation,
@@ -1059,6 +1097,13 @@ impl TerminalApp {
                     self.on_portfolio(result)
                 }
                 Response::BrokerRegistered(result) => self.on_broker_registered(result),
+                Response::Questrade(result) => {
+                    self.broker.questrade_busy = false;
+                    self.broker.questrade_message = Some(match result {
+                        Ok(m) => (m, false),
+                        Err(e) => (e, true),
+                    });
+                }
                 Response::BrokerPortal(result) => self.on_broker_portal(result),
                 Response::BrokerDisconnected(result) => self.on_broker_disconnected(result),
                 Response::Politicians(list) => self.politicians = list,

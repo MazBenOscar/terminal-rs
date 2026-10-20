@@ -20,9 +20,10 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 14] = [
+pub const PANELS: [(&str, &str); 15] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
+    ("Scanner", "SCAN"),
     ("News", "NEWS"),
     ("Order Book", "BOOK"),
     ("Options", "OMON"),
@@ -668,6 +669,7 @@ impl TerminalApp {
                 d,
             )),
             "WL" | "WATCHLIST" | "W" => PaneKind::Watchlist,
+            "SCAN" | "SCANNER" | "EASYSCAN" => PaneKind::Scanner(Box::default()),
             "NEWS" | "N" | "CN" | "TOP" => PaneKind::News(Box::new(NewsPane::new(current))),
             "BOOK" | "OB" | "DEPTH" | "DOM" => {
                 // Default to a market with a public book.

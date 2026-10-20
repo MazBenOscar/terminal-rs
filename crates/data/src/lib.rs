@@ -16,9 +16,12 @@ pub mod alpaca;
 pub mod cache;
 pub mod crypto;
 pub mod markets;
+pub mod questrade;
 pub mod rss;
 pub mod sample;
+pub mod scanstore;
 pub mod treasury;
+pub mod universe;
 pub mod yahoo;
 
 use std::sync::Arc;
@@ -186,6 +189,14 @@ pub struct OptionChain {
 /// the current (possibly still forming) bar. The feed stops when the receiver is dropped.
 pub type LiveFeed = mpsc::Receiver<Bar>;
 
+/// History fetched for a scanner, with explicit synthetic-data provenance.
+/// Unlike chart history, this path must never silently manufacture fallback prices.
+#[derive(Debug, Clone)]
+pub struct ScanHistory {
+    pub bars: Vec<Bar>,
+    pub simulated: bool,
+}
+
 /// Pick curve snapshots from per-date rows: latest, nearest at or before -30d and -365d.
 pub fn pick_curves(mut rows: Vec<YieldCurve>) -> Option<YieldCurves> {
     rows.retain(|r| !r.points.is_empty());
@@ -211,10 +222,22 @@ pub trait MarketData: Send + Sync {
     /// Short provider name shown in the status bar.
     fn name(&self) -> &str;
 
+    /// Identity of the active scanner data route, without credentials. Wrappers and
+    /// providers whose routing can change at runtime must forward/override this key.
+    fn scan_cache_key(&self, _symbol: &str) -> String {
+        self.name().to_string()
+    }
+
     /// Up to `limit` bars at `tf` ending at or before `end` (Unix seconds; `None` = now),
     /// ascending by time. Paging older history means calling again with `end` set to the
     /// oldest bar already held.
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>>;
+
+    /// Scanner history bypasses chart caches. Providers that synthesize data or wrap
+    /// other sources must override this method to preserve provenance and failures.
+    async fn scan_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
+        Ok(ScanHistory { bars: self.history(symbol, tf, None, limit).await?, simulated: false })
+    }
 
     /// Latest quotes for `symbols`. The default derives them from daily history.
     async fn quotes(&self, symbols: &[String]) -> Result<Vec<Quote>> {
@@ -299,8 +322,16 @@ impl<P: MarketData> Fallback<P> {
 
 #[async_trait]
 impl<P: MarketData> MarketData for Fallback<P> {
+    fn scan_cache_key(&self, symbol: &str) -> String {
+        self.primary.scan_cache_key(symbol)
+    }
     fn name(&self) -> &str {
         &self.name
+    }
+
+    async fn scan_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
+        // An unavailable market is a visible scanner error, never a synthetic match.
+        self.primary.scan_history(symbol, tf, limit).await
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
@@ -385,6 +416,11 @@ pub fn security(symbol: &str) -> Security {
 
 /// Build the provider described in the crate docs from environment variables.
 pub fn from_env() -> Provider {
+    from_env_with(None)
+}
+
+/// [`from_env`] with an optional Questrade source, active whenever it holds a token.
+pub fn from_env_with(questrade: Option<questrade::Questrade>) -> Provider {
     // reqwest and the websocket client both use rustls; pin one crypto provider.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
@@ -398,7 +434,7 @@ pub fn from_env() -> Provider {
         }
         _ => None,
     };
-    match markets::Markets::new(alpaca) {
+    match markets::Markets::with_questrade(alpaca, questrade) {
         Ok(m) => Arc::new(Fallback::new(m)),
         Err(_) => Arc::new(sample::SampleProvider::default().with_live_ticks()),
     }
@@ -472,6 +508,21 @@ mod tests {
         // Paging must surface the error instead of mixing in synthetic bars.
         assert!(p.history("AAPL", Timeframe::D1, Some(bars[0].ts), 100).await.is_err());
         assert_eq!(p.name(), "broken");
+    }
+
+    #[tokio::test]
+    async fn scanner_never_silently_uses_chart_fallback() {
+        let p = Fallback::new(Broken);
+        assert_eq!(p.history("AAPL", Timeframe::D1, None, 10).await.unwrap().len(), 10);
+        assert!(p.scan_history("AAPL", Timeframe::D1, 10).await.unwrap_err().to_string().contains("offline"));
+    }
+
+    #[tokio::test]
+    async fn explicit_sample_scanner_history_keeps_provenance_through_wrappers() {
+        let p = Fallback::new(sample::SampleProvider::at(1_790_000_000, 100));
+        let history = p.scan_history("AAPL", Timeframe::D1, 10).await.unwrap();
+        assert!(history.simulated);
+        assert_eq!(history.bars.len(), 10);
     }
 
     #[tokio::test]

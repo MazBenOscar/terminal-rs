@@ -614,6 +614,11 @@ impl TerminalApp {
             if nav_row(ui, Icon::List, "Open Watchlist Pane", None, is_focused(&PaneKind::Watchlist)).clicked() {
                 out.push(SidebarCmd::Function(Function::Watchlist));
             }
+            let scanner_focused =
+                self.panes.iter().any(|p| p.id == self.focus && matches!(p.kind, PaneKind::Scanner(_)));
+            if nav_row(ui, Icon::List, "Watchlist Scanner", Some("SCAN"), scanner_focused).clicked() {
+                out.push(SidebarCmd::Function(Function::Scanner));
+            }
 
             section(ui, "Markets");
             let items = [

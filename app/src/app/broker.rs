@@ -9,7 +9,7 @@ use tr_broker::{Credentials, Portfolio, Position, SecretStore};
 
 use super::{PaneKind, TerminalApp};
 use crate::command::PortView;
-use crate::worker::{Request, data_dir};
+use crate::worker::{QuestradeAction, Request, data_dir};
 
 /// Portfolio reload interval while a portfolio pane is visible (SnapTrade caches holdings
 /// for most plans, so polling faster gains nothing).
@@ -96,11 +96,20 @@ pub struct BrokerState {
     /// Connection awaiting "Disconnect" confirmation, and the one being removed.
     pub confirm_disconnect: Option<String>,
     pub disconnecting: Option<String>,
+    /// Optional Questrade market-data source (Canadian clients), shared with the provider.
+    pub questrade: Option<tr_data::questrade::Questrade>,
+    pub questrade_form: String,
+    pub questrade_busy: bool,
+    pub questrade_message: Option<(String, bool)>,
 }
 
 impl BrokerState {
     pub fn load(offline: bool) -> Self {
-        let store = SecretStore::platform(&data_dir());
+        Self::with_store(SecretStore::platform(&data_dir()), offline)
+    }
+
+    /// State backed by `store`; tests pass a private file so they never open the Keychain.
+    pub fn with_store(store: SecretStore, offline: bool) -> Self {
         let mut message = None;
         let stored = match store.load() {
             Ok(c) => c.unwrap_or_default(),
@@ -133,6 +142,10 @@ impl BrokerState {
             testing: false,
             confirm_disconnect: None,
             disconnecting: None,
+            questrade: None,
+            questrade_form: String::new(),
+            questrade_busy: false,
+            questrade_message: None,
         }
     }
 
@@ -157,6 +170,23 @@ impl BrokerState {
 }
 
 /// Open a URL or path with the system handler.
+/// The Questrade market-data source. Its token lives in the secret store, seeded once from
+/// `QUESTRADE_REFRESH_TOKEN` when nothing is stored: tokens rotate on every use, so the
+/// stored (latest) token always wins over the environment.
+pub fn questrade_handle() -> Option<tr_data::questrade::Questrade> {
+    let store = SecretStore::platform_for(&data_dir(), tr_broker::secrets::QUESTRADE_ACCOUNT);
+    let stored = store.load_text().unwrap_or_else(|e| {
+        tracing::warn!("Questrade token unavailable: {e:#}");
+        None
+    });
+    let token = stored.or_else(|| std::env::var("QUESTRADE_REFRESH_TOKEN").ok());
+    let sink: tr_data::questrade::TokenSink = Box::new(move |token| match token {
+        Some(t) => store.save_text(t),
+        None => store.clear(),
+    });
+    tr_data::questrade::Questrade::new(token, sink).map_err(|e| tracing::warn!("questrade init failed: {e:#}")).ok()
+}
+
 pub fn open_external(target: &str) -> std::io::Result<()> {
     let opener = if cfg!(target_os = "macos") {
         "open"
@@ -756,6 +786,72 @@ impl TerminalApp {
             ui,
             "After you finish in the browser, new accounts appear here and in the portfolio panes within a minute.",
         );
+
+        // ---- Questrade market data ----
+        if let Some(handle) = self.broker.questrade.clone() {
+            section(ui, "Market data · Questrade (optional, Canadian clients)");
+            note(
+                ui,
+                "Daily and intraday candles for stocks and ETFs from your Questrade account, used by the scanner \
+                 instead of Yahoo. SnapTrade has no price history, so this is a separate personal-app token: \
+                 API Centre › Register a personal app (tick both OAuth scopes: symbol search needs the account \
+                 scope) › New manual authorization › Generate new token.",
+            );
+            let configured = handle.is_configured();
+            let busy = self.broker.questrade_busy;
+            ui.horizontal(|ui| {
+                ui.add_sized([130.0, 20.0], egui::Label::new(RichText::new("Refresh token").font(ui_font(12.5))));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.broker.questrade_form)
+                        .password(!self.broker.reveal)
+                        .hint_text(if configured { "saved · paste a new token to replace" } else { "paste token" })
+                        .font(mono(12.0))
+                        .desired_width(330.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(134.0);
+                let token = self.broker.questrade_form.trim().to_string();
+                let mut send = |action| {
+                    self.broker.questrade_busy = true;
+                    self.broker.questrade_message = None;
+                    self.worker.send(Request::Questrade { handle: handle.clone(), action });
+                };
+                if ui.add_enabled(!busy && !token.is_empty(), egui::Button::new("Save & Test")).clicked() {
+                    send(QuestradeAction::Save(Some(token)));
+                    self.broker.questrade_form.clear();
+                }
+                if ui.add_enabled(!busy && configured, egui::Button::new("Test")).clicked() {
+                    send(QuestradeAction::Test);
+                }
+                if ui
+                    .add_enabled(!busy && configured, egui::Button::new("Remove"))
+                    .on_hover_text("Forget the token; the scanner returns to the default sources")
+                    .clicked()
+                {
+                    send(QuestradeAction::Save(None));
+                }
+                if ui.link("Open the Questrade API Centre").clicked()
+                    && let Err(e) = open_external(tr_data::questrade::API_CENTRE_URL)
+                {
+                    self.status = format!("Could not open the browser: {e}");
+                }
+                if busy {
+                    ui.add(egui::Spinner::new().size(12.0));
+                }
+            });
+            match &self.broker.questrade_message {
+                Some((m, err)) => {
+                    ui.label(RichText::new(m).font(ui_font(12.0)).color(if *err {
+                        theme::down()
+                    } else {
+                        theme::up()
+                    }));
+                }
+                None => note(ui, if configured { "Token saved: stock scans use Questrade." } else { "Not set up." }),
+            }
+            note(ui, "Tokens work once and rotate automatically; one unused for 7 days expires and must be replaced.");
+        }
 
         // ---- remove ----
         section(ui, "Remove from this computer");
