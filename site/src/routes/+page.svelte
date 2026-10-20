@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
+	import DownloadCount from '#lib/DownloadCount.svelte';
 	import Logo from '#lib/Logo.svelte';
 	import ChartCard from '#lib/cards/ChartCard.svelte';
 	import CongressCard from '#lib/cards/CongressCard.svelte';
@@ -193,7 +194,9 @@
 				{@render apple()}
 				Download for macOS
 			</a>
-			<p class="meta">Free · Version {VERSION} · {ARCH} · macOS {MIN_MACOS} or later</p>
+			<p class="meta">
+				Free · Version {VERSION} · {ARCH} · macOS {MIN_MACOS} or later<DownloadCount repo={REPO_URL} />
+			</p>
 		</div>
 	</header>
 
