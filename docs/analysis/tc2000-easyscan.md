@@ -182,3 +182,47 @@ Headless egui tests exercise narrow/wide empty, running and error-result states;
 library and workspace tests cover persistence. Numerical/provider tests cover
 warmup, crossovers, missing data and simulation provenance. This does not establish
 live-provider or Windows-native UI parity.
+
+## Second iteration: operands, presets and market-wide universes
+
+Driven by StockCharts-style scans that the first version could not express, for example
+`[sma(1,daily volume) > 100000] and [daily rsi(14) >= 70] and
+[daily close >= daily ema(4,daily close)] and [yesterday's daily rsi(14) < 69.9]`:
+
+- **Operands.** EMA joins SMA, and both take a source (close or volume), so
+  `sma(1, volume)` and `ema(50, volume)` are expressible. ATR (Wilder) joins RSI; ATR(1) is the
+  latest true range. Both reject gaps anywhere in their seeded history, like RSI.
+- **Bars ago.** Each side of a condition may be read N bars back (0–250): `RSI(14) [1 bar ago]`.
+  A shifted side needs that many more bars; a shift before the first bar is unavailable, not
+  clamped. Crossovers compare the shifted bar with the one before it.
+- **Multiplier.** The right side may be scaled (`Volume >= EMA(50, Volume) × 2.5`).
+- **Compatibility.** New fields have serde defaults (close source, 0 bars ago, ×1), so scans
+  saved by the first version load unchanged; a test pins the old JSON.
+- **Presets.** Momentum Ignition (the scan above) and Volume Thrust
+  (`[sma(1,volume) > 100000] and [rsi(14) >= 69.8] and [volume >= ema(50,volume) × 2.5] and
+  [close >= 0.2] and [ATR(1) > 0.50]`) are built in, listed under PRESETS in Load scan, and
+  each has a synthetic-bar test that matches the intended setup and rejects a near miss.
+
+**Universes.** All US stocks, Nasdaq and NYSE (with NYSE American) come from Nasdaq Trader's
+`nasdaqlisted.txt` and `otherlisted.txt`, cached for a day. Filters: ETF and test-issue flags,
+plain tickers with an optional one-letter class (`BRK.B`, but not `.U`/`.W`/`.R`), and names
+without warrant, unit, right, preferred, note, debenture, depositary or `%`. On 2026-10-20 this
+kept 3,270 Nasdaq and 2,361 other listings (5,628 after de-duplication). Keys are written as
+`<SYM> US Equity` so tickers such as `CL` resolve as stocks, not commodities. A changed file
+header is an error rather than an empty universe.
+
+**Scan store.** Universe scans read `scan_bars.sqlite3`, separate from the chart cache, which
+records each symbol's fetch time, source and simulated flag. Stored bars are reused while fresh:
+during a (conservatively wide) US session for 15 minutes, otherwise if fetched after the latest
+weekday 21:15 UTC close boundary. Stale symbols fetch only their newest 10 bars; new ones fetch
+full history. Fetch failures are per-symbol unavailable rows. Scans report progress every 25
+symbols, can be stopped, and stop when their pane closes.
+
+**Data source.** SnapTrade has no price history and warns against polling its quotes, so it
+cannot feed a scanner. Questrade's personal API serves candles (2,000 per request) and symbol
+search; with a token saved, stock scans use it exclusively, paced to ~16 requests/second.
+Validated live: a full 5,628-symbol Momentum Ignition run completed from an empty store
+(about half the universe was done four minutes in). Store reuse is covered by tests, not yet
+timed live. Comparing match lists with
+StockCharts or Finviz remains to be done; formula differences (RSI/EMA seeding, history depth,
+adjusted prices) can legitimately produce small disagreements.
