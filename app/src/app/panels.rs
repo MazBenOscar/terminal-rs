@@ -81,8 +81,10 @@ impl TerminalApp {
                 }
             }
             PaneKind::Scanner(s) => {
-                actions
-                    .extend(super::scanner_view::show(ui, s, id, &self.watchlist, |request| self.worker.send(request)));
+                let bulk_ready = self.broker.questrade.as_ref().is_some_and(|q| q.is_configured());
+                actions.extend(super::scanner_view::show(ui, s, id, &self.watchlist, bulk_ready, |request| {
+                    self.worker.send(request)
+                }));
             }
             PaneKind::Portfolio(pp) => {
                 let demo =

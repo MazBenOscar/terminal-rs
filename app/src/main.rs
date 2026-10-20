@@ -65,11 +65,12 @@ fn main() -> eframe::Result {
                 rs.target_format,
                 u32::from(msaa),
             ));
-            let provider = tr_data::from_env();
+            let questrade = app::questrade_handle();
+            let provider = tr_data::from_env_with(questrade.clone());
             let name = provider.name().to_string();
             let worker = worker::Worker::spawn(cc.egui_ctx.clone(), provider)?;
             tracing::info!("window + GPU ready in {:?} (adapter: {})", t0.elapsed(), rs.adapter.get_info().name);
-            Ok(Box::new(app::TerminalApp::new(&cc.egui_ctx, worker, name)))
+            Ok(Box::new(app::TerminalApp::new(&cc.egui_ctx, worker, name, questrade)))
         }),
     )
 }

@@ -1174,7 +1174,8 @@ mod tests {
     #[test]
     fn renders_every_view_without_panicking() {
         let ctx = egui::Context::default();
-        let mut b = BrokerState::load(true);
+        let missing = std::env::temp_dir().join(format!("tr-no-secrets-{}.json", std::process::id()));
+        let mut b = BrokerState::with_store(tr_broker::SecretStore::file(missing), true);
         b.creds = tr_broker::Credentials::default();
         b.portfolio = Some(Box::new(tr_broker::sample::portfolio()));
         let quotes = HashMap::new();

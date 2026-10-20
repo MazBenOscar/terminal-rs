@@ -1,11 +1,19 @@
-//! Watchlist snapshots: editable conditions, named definitions and explicit data status.
+//! Watchlist and market-wide snapshots: editable conditions, named definitions and explicit
+//! data status.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use egui::{RichText, Ui};
 use tr_core::Timeframe;
-use tr_core::scanner::{Comparison, MatchMode, ScanCondition, ScanDefinition, ScanOperand, ScanOutcome};
+use tr_core::scanner::{
+    Comparison, MAX_BARS_AGO, MatchMode, ScanCondition, ScanDefinition, ScanOperand, ScanOutcome, Source,
+};
 
 use crate::congress_view::Action;
 use crate::theme::{amber, mono, muted};
+use tr_data::universe::Universe;
+
 use crate::worker::{PaneId, Request, ScanRow, data_dir};
 
 pub struct ScannerPane {
@@ -18,6 +26,12 @@ pub struct ScannerPane {
     saved: Vec<ScanDefinition>,
     notice: Option<String>,
     matches_only: bool,
+    pub universe: Universe,
+    /// Universe scan progress: symbols evaluated and total.
+    pub progress: Option<(usize, usize)>,
+    /// Stops the running universe scan.
+    pub cancel: Option<Arc<AtomicBool>>,
+    show_unavailable: bool,
 }
 
 impl Default for ScannerPane {
@@ -42,12 +56,25 @@ impl ScannerPane {
             saved,
             notice,
             matches_only: true,
+            universe: Universe::Watchlist,
+            progress: None,
+            cancel: None,
+            show_unavailable: false,
         }
     }
 
     fn invalidate(&mut self) {
         self.rows.clear();
         self.completed = None;
+    }
+}
+
+impl Drop for ScannerPane {
+    /// A closed pane stops its universe scan instead of letting it run on unseen.
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -84,46 +111,64 @@ fn save_definition_at(definition: &ScanDefinition, dir: &std::path::Path) -> Res
     Ok(saved)
 }
 
+const OPERAND_KINDS: [&str; 8] = ["Price", "Volume", "Bar change %", "SMA", "EMA", "RSI", "ATR", "Value"];
+
 fn operand_kind(operand: &ScanOperand) -> usize {
     match operand {
         ScanOperand::Price => 0,
         ScanOperand::Volume => 1,
         ScanOperand::ChangePercent => 2,
         ScanOperand::Sma { .. } => 3,
-        ScanOperand::Rsi { .. } => 4,
-        ScanOperand::Constant(_) => 5,
+        ScanOperand::Ema { .. } => 4,
+        ScanOperand::Rsi { .. } => 5,
+        ScanOperand::Atr { .. } => 6,
+        ScanOperand::Constant(_) => 7,
     }
 }
 
-fn operand_editor(ui: &mut Ui, operand: &mut ScanOperand, id: &str) {
+fn operand_editor(ui: &mut Ui, operand: &mut ScanOperand, bars_ago: &mut usize, id: &str) {
     let mut kind = operand_kind(operand);
     let before = kind;
-    egui::ComboBox::from_id_salt(id)
-        .width(95.0)
-        .selected_text(["Price", "Volume", "Bar change %", "SMA", "RSI", "Value"][kind])
-        .show_ui(ui, |ui| {
-            for (i, name) in ["Price", "Volume", "Bar change %", "SMA", "RSI", "Value"].iter().enumerate() {
-                ui.selectable_value(&mut kind, i, *name);
-            }
-        });
+    egui::ComboBox::from_id_salt(id).width(95.0).selected_text(OPERAND_KINDS[kind]).show_ui(ui, |ui| {
+        for (i, name) in OPERAND_KINDS.iter().enumerate() {
+            ui.selectable_value(&mut kind, i, *name);
+        }
+    });
     if kind != before {
         *operand = match kind {
             0 => ScanOperand::Price,
             1 => ScanOperand::Volume,
             2 => ScanOperand::ChangePercent,
-            3 => ScanOperand::Sma { period: 20 },
-            4 => ScanOperand::Rsi { period: 14 },
+            3 => ScanOperand::Sma { period: 20, source: Source::Close },
+            4 => ScanOperand::Ema { period: 20, source: Source::Close },
+            5 => ScanOperand::Rsi { period: 14 },
+            6 => ScanOperand::Atr { period: 14 },
             _ => ScanOperand::Constant(0.0),
         };
     }
     match operand {
-        ScanOperand::Sma { period } | ScanOperand::Rsi { period } => {
+        ScanOperand::Sma { period, source } | ScanOperand::Ema { period, source } => {
+            egui::ComboBox::from_id_salt((id, "source")).width(70.0).selected_text(source.label()).show_ui(ui, |ui| {
+                for s in Source::ALL {
+                    ui.selectable_value(source, s, s.label());
+                }
+            });
+            ui.add(egui::DragValue::new(period).range(1..=500).prefix("Period "));
+        }
+        ScanOperand::Rsi { period } | ScanOperand::Atr { period } => {
             ui.add(egui::DragValue::new(period).range(1..=500).prefix("Period "));
         }
         ScanOperand::Constant(value) => {
             ui.add(egui::DragValue::new(value).speed(0.1).max_decimals(4));
         }
         _ => {}
+    }
+    // A constant is the same on every bar.
+    if matches!(operand, ScanOperand::Constant(_)) {
+        *bars_ago = 0;
+    } else {
+        ui.add(egui::DragValue::new(bars_ago).range(0..=MAX_BARS_AGO).suffix(" bars ago"))
+            .on_hover_text("0 = latest bar; 1 = the bar before it (yesterday on 1D)");
     }
 }
 
@@ -132,13 +177,20 @@ pub fn show(
     pane: &mut ScannerPane,
     id: PaneId,
     symbols: &[String],
+    bulk_ready: bool,
     mut send: impl FnMut(Request),
 ) -> Vec<Action> {
     let mut actions = Vec::new();
+    let market = pane.universe != Universe::Watchlist;
     egui::ScrollArea::vertical().id_salt(("scanner", id)).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("WATCHLIST SCANNER").font(mono(12.0)).color(amber()));
-            ui.label(format!("{} symbols · manual snapshot", symbols.len()));
+            if market {
+                ui.label(RichText::new("MARKET SCANNER").font(mono(12.0)).color(amber()));
+                ui.label(format!("{} · manual snapshot", pane.universe.label()));
+            } else {
+                ui.label(RichText::new("WATCHLIST SCANNER").font(mono(12.0)).color(amber()));
+                ui.label(format!("{} symbols · manual snapshot", symbols.len()));
+            }
         });
         ui.label(RichText::new("Uses the latest provider bar, which may still be forming. No automatic refresh.").small().color(muted()));
         let before = pane.definition.clone();
@@ -153,6 +205,20 @@ pub fn show(
                         ui.selectable_value(&mut pane.definition.timeframe, tf, tf.label());
                     }
                 });
+                ui.label("Universe");
+                let before = pane.universe;
+                egui::ComboBox::from_id_salt("scan-universe").selected_text(pane.universe.label()).show_ui(ui, |ui| {
+                    for universe in Universe::ALL {
+                        let enabled = universe == Universe::Watchlist || bulk_ready;
+                        ui.add_enabled_ui(enabled, |ui| {
+                            ui.selectable_value(&mut pane.universe, universe, universe.label())
+                                .on_disabled_hover_text("Market-wide scans need a bulk data source: set up Questrade in Settings › Brokerage");
+                        });
+                    }
+                });
+                if pane.universe != before {
+                    pane.invalidate();
+                }
                 egui::ComboBox::from_id_salt("scan-mode")
                     .selected_text(if pane.definition.match_mode == MatchMode::All { "Match all" } else { "Match any" })
                     .show_ui(ui, |ui| {
@@ -164,14 +230,21 @@ pub fn show(
             for (i, condition) in pane.definition.conditions.iter_mut().enumerate() {
                 ui.push_id(i, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        operand_editor(ui, &mut condition.left, "left");
+                        operand_editor(ui, &mut condition.left, &mut condition.left_bars_ago, "left");
                         egui::ComboBox::from_id_salt("comparison").width(115.0)
                             .selected_text(condition.comparison.label()).show_ui(ui, |ui| {
                             for comparison in Comparison::ALL {
                                 ui.selectable_value(&mut condition.comparison, comparison, comparison.label());
                             }
                         });
-                        operand_editor(ui, &mut condition.right, "right");
+                        operand_editor(ui, &mut condition.right, &mut condition.right_bars_ago, "right");
+                        // Scaling a constant is just a different constant.
+                        if matches!(condition.right, ScanOperand::Constant(_)) {
+                            condition.right_multiplier = 1.0;
+                        } else {
+                            ui.add(egui::DragValue::new(&mut condition.right_multiplier).speed(0.05).max_decimals(3).prefix("× "))
+                                .on_hover_text("Multiplies the right side, e.g. Volume >= EMA(50, Volume) × 2.5");
+                        }
                         if ui.small_button("Remove").clicked() { remove = Some(i); }
                     });
                 });
@@ -185,7 +258,9 @@ pub fn show(
         ui.separator();
         let validation = pane.definition.validate().err();
         if let Some(error) = &validation { ui.label(error); }
-        let can_run = !pane.running && validation.is_none() && !symbols.is_empty() && symbols.len() <= 200;
+        let can_run = !pane.running
+            && validation.is_none()
+            && if market { bulk_ready } else { !symbols.is_empty() && symbols.len() <= 200 };
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(can_run, egui::Button::new("Run scan")).clicked() {
                 // Never reuse a generation after restoring a layout or recreating a pane.
@@ -193,11 +268,21 @@ pub fn show(
                 pane.generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 pane.invalidate();
                 pane.running = true;
-                pane.snapshot_symbols = symbols.to_vec();
                 pane.notice = None;
-                send(Request::Scan {
-                    pane: id, generation: pane.generation, definition: pane.definition.clone(), symbols: symbols.to_vec(),
-                });
+                if market {
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    pane.cancel = Some(cancel.clone());
+                    pane.snapshot_symbols.clear();
+                    pane.progress = Some((0, 0));
+                    send(Request::ScanUniverse {
+                        pane: id, generation: pane.generation, definition: pane.definition.clone(), universe: pane.universe, cancel,
+                    });
+                } else {
+                    pane.snapshot_symbols = symbols.to_vec();
+                    send(Request::Scan {
+                        pane: id, generation: pane.generation, definition: pane.definition.clone(), symbols: symbols.to_vec(),
+                    });
+                }
             }
             if ui.add_enabled(!pane.running && validation.is_none(), egui::Button::new("Save scan")).clicked() {
                 match save_definition(&pane.definition) {
@@ -207,18 +292,40 @@ pub fn show(
             }
             let mut selected = None;
             ui.add_enabled_ui(!pane.running, |ui| {
-                egui::ComboBox::from_id_salt("saved-scans").selected_text("Load saved scan").show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("saved-scans").selected_text("Load scan").show_ui(ui, |ui| {
+                    ui.label(RichText::new("PRESETS").small().color(muted()));
+                    for preset in ScanDefinition::presets() {
+                        if ui.selectable_label(false, &preset.name).clicked() { selected = Some(preset); }
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("SAVED").small().color(muted()));
                     if pane.saved.is_empty() { ui.label("No saved scans yet"); }
-                    for (i, saved) in pane.saved.iter().enumerate() {
-                        if ui.selectable_label(false, &saved.name).clicked() { selected = Some(i); }
+                    for saved in &pane.saved {
+                        if ui.selectable_label(false, &saved.name).clicked() { selected = Some(saved.clone()); }
                     }
                 });
             });
-            if let Some(i) = selected { pane.definition = pane.saved[i].clone(); pane.invalidate(); }
-            if pane.running { ui.spinner(); ui.label(format!("Scanning {} symbols… up to 15 seconds per symbol, four at a time", pane.snapshot_symbols.len())); }
+            if let Some(definition) = selected { pane.definition = definition; pane.invalidate(); }
+            if pane.running && !market { ui.spinner(); ui.label(format!("Scanning {} symbols… up to 15 seconds per symbol, four at a time", pane.snapshot_symbols.len())); }
         });
-        if symbols.is_empty() { ui.label("Your watchlist is empty. Add symbols with WL ADD <KEY>, then run the scan."); }
-        if symbols.len() > 200 { ui.label("This version supports up to 200 watchlist symbols. Reduce the list before running."); }
+        if pane.running && market {
+            let (done, total) = pane.progress.unwrap_or((0, 0));
+            ui.horizontal(|ui| {
+                let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+                let text = if total == 0 { "Loading the US symbol directory…".to_string() } else { format!("{done} / {total}") };
+                ui.add(egui::ProgressBar::new(fraction).text(text).desired_width(260.0));
+                let stopping = pane.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+                if ui.add_enabled(!stopping, egui::Button::new(if stopping { "Stopping…" } else { "Stop" })).clicked()
+                    && let Some(cancel) = &pane.cancel
+                {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
+            ui.label(RichText::new("The first run downloads full history for every stock (about 10–15 minutes); later runs reuse stored bars and fetch only the newest.").small().color(muted()));
+        }
+        if market && !bulk_ready { ui.label("Market-wide scans need a bulk data source: set up Questrade in Settings › Brokerage."); }
+        if !market && symbols.is_empty() { ui.label("Your watchlist is empty. Add symbols with WL ADD <KEY>, then run the scan."); }
+        if !market && symbols.len() > 200 { ui.label("This version supports up to 200 watchlist symbols. Reduce the list before running."); }
         if let Some(notice) = &pane.notice { ui.label(notice); }
         if let Some(completed) = pane.completed {
             let count = |outcome| pane.rows.iter().filter(|r| r.evaluation.as_ref().is_some_and(|e| e.outcome == outcome)).count();
@@ -226,10 +333,16 @@ pub fn show(
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{} matches · {} non-matches · {} unavailable", count(ScanOutcome::Match), count(ScanOutcome::NoMatch), unavailable));
-                ui.checkbox(&mut pane.matches_only, "Matches only (always show errors)");
+                if market {
+                    ui.checkbox(&mut pane.matches_only, "Matches only");
+                    ui.checkbox(&mut pane.show_unavailable, "Show unavailable");
+                } else {
+                    ui.checkbox(&mut pane.matches_only, "Matches only (always show errors)");
+                }
             });
-            ui.label(RichText::new(format!("Scanned {} symbols · finished {} UTC · click a symbol to chart it", pane.snapshot_symbols.len(), completed.format("%Y-%m-%d %H:%M:%S"))).small().color(muted()));
-            if pane.snapshot_symbols != symbols {
+            let scanned = if market { pane.rows.len() } else { pane.snapshot_symbols.len() };
+            ui.label(RichText::new(format!("Scanned {scanned} symbols · finished {} UTC · click a symbol to chart it", completed.format("%Y-%m-%d %H:%M:%S"))).small().color(muted()));
+            if !market && pane.snapshot_symbols != symbols {
                 ui.label("The watchlist has changed since this snapshot. Run again to scan the current list.");
             }
             if pane.rows.iter().any(|r| r.simulated) { ui.label(RichText::new("SIMULATED DATA — these results use generated sample bars.").color(amber())); }
@@ -240,9 +353,10 @@ pub fn show(
                     for row in &pane.rows {
                         let outcome = row.evaluation.as_ref().map(|e| e.outcome).unwrap_or(ScanOutcome::Unavailable);
                         if pane.matches_only && outcome == ScanOutcome::NoMatch { continue; }
+                        if market && !pane.show_unavailable && outcome == ScanOutcome::Unavailable { continue; }
                         if ui.link(&row.symbol).clicked() { actions.push(Action::OpenChart(row.symbol.clone())); }
                         ui.label(match outcome { ScanOutcome::Match => "Match", ScanOutcome::NoMatch => "No match", ScanOutcome::Unavailable => "Unavailable" });
-                        ui.label(if row.simulated { "Simulated" } else if row.error.is_some() { "Unavailable" } else { "Provider snapshot" });
+                        ui.label(if row.simulated { "Simulated" } else if row.error.is_some() { "Unavailable" } else if market { "Stored bars" } else { "Provider snapshot" });
                         let ts = row.ts.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
                         ui.label(ts.map_or_else(|| "—".into(), |ts| ts.format("%Y-%m-%d %H:%M").to_string()));
                         ui.label(row.ts.map_or_else(|| "—".into(), |ts| {
@@ -284,6 +398,10 @@ mod tests {
             saved: Vec::new(),
             notice: None,
             matches_only: true,
+            universe: Universe::Watchlist,
+            progress: None,
+            cancel: None,
+            show_unavailable: false,
         };
         // Full pane layout, including narrow docks, without a network worker or GPU.
         for width in [280.0, 900.0] {
@@ -306,7 +424,7 @@ mod tests {
                     },
                     |ui| {
                         egui::CentralPanel::default().show(ui, |ui| {
-                            show(ui, &mut pane, 1, &["AAPL US Equity".into()], |_| {
+                            show(ui, &mut pane, 1, &["AAPL US Equity".into()], false, |_| {
                                 panic!("No scan requested during render")
                             });
                         });

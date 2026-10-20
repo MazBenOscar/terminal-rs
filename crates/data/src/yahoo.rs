@@ -505,6 +505,7 @@ mod tests {
                 left: ScanOperand::Volume,
                 comparison: Comparison::Below,
                 right: ScanOperand::Constant(10.0),
+                ..ScanCondition::default()
             }],
         };
         assert_eq!(definition.evaluate(&series).outcome, ScanOutcome::Unavailable);

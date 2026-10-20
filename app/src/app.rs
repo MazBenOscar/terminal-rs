@@ -18,7 +18,7 @@ mod theming;
 mod trading;
 mod workspace;
 
-pub use broker::PosSort;
+pub use broker::{PosSort, questrade_handle};
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -551,7 +551,12 @@ fn prefs_path() -> std::path::PathBuf {
 }
 
 impl TerminalApp {
-    pub fn new(ctx: &egui::Context, worker: Worker, provider: String) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        worker: Worker,
+        provider: String,
+        questrade: Option<tr_data::questrade::Questrade>,
+    ) -> Self {
         let system_accent =
             tr_macos::accent_color().map_or(theme::DEFAULT_ACCENT, |[r, g, b]| Color32::from_rgb(r, g, b));
         let mut prefs = Prefs::load(&prefs_path());
@@ -577,7 +582,8 @@ impl TerminalApp {
         }
         let settings: Option<Settings> =
             std::fs::read(settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
-        let broker = broker::BrokerState::load(provider.eq_ignore_ascii_case("sample"));
+        let mut broker = broker::BrokerState::load(provider.eq_ignore_ascii_case("sample"));
+        broker.questrade = questrade;
         let (demo, demo_note) = demo::DemoState::load(demo::demo_path());
         let mut app = Self {
             broker,
@@ -951,7 +957,17 @@ impl TerminalApp {
                     {
                         s.rows = rows;
                         s.running = false;
+                        s.progress = None;
+                        s.cancel = None;
                         s.completed = Some(chrono::Utc::now());
+                    }
+                }
+                Response::ScanProgress { pane, generation, done, total } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::Scanner(s) = &mut p.kind
+                        && s.generation == generation
+                    {
+                        s.progress = Some((done, total));
                     }
                 }
                 Response::History {
@@ -1078,6 +1094,13 @@ impl TerminalApp {
                     self.on_portfolio(result)
                 }
                 Response::BrokerRegistered(result) => self.on_broker_registered(result),
+                Response::Questrade(result) => {
+                    self.broker.questrade_busy = false;
+                    self.broker.questrade_message = Some(match result {
+                        Ok(m) => (m, false),
+                        Err(e) => (e, true),
+                    });
+                }
                 Response::BrokerPortal(result) => self.on_broker_portal(result),
                 Response::BrokerDisconnected(result) => self.on_broker_disconnected(result),
                 Response::Politicians(list) => self.politicians = list,

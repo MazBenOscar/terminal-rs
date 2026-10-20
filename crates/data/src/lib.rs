@@ -16,9 +16,12 @@ pub mod alpaca;
 pub mod cache;
 pub mod crypto;
 pub mod markets;
+pub mod questrade;
 pub mod rss;
 pub mod sample;
+pub mod scanstore;
 pub mod treasury;
+pub mod universe;
 pub mod yahoo;
 
 use std::sync::Arc;
@@ -404,6 +407,11 @@ pub fn security(symbol: &str) -> Security {
 
 /// Build the provider described in the crate docs from environment variables.
 pub fn from_env() -> Provider {
+    from_env_with(None)
+}
+
+/// [`from_env`] with an optional Questrade source, active whenever it holds a token.
+pub fn from_env_with(questrade: Option<questrade::Questrade>) -> Provider {
     // reqwest and the websocket client both use rustls; pin one crypto provider.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
@@ -417,7 +425,7 @@ pub fn from_env() -> Provider {
         }
         _ => None,
     };
-    match markets::Markets::new(alpaca) {
+    match markets::Markets::with_questrade(alpaca, questrade) {
         Ok(m) => Arc::new(Fallback::new(m)),
         Err(_) => Arc::new(sample::SampleProvider::default().with_live_ticks()),
     }

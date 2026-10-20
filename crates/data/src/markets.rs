@@ -4,7 +4,7 @@
 //! |---|---|---|---|
 //! | Crypto | Binance klines (Coinbase fallback) | Binance 24h ticker | Binance kline websocket (Coinbase ticker fallback) |
 //! | Govt | Treasury.gov daily curve (FRED fallback); Yahoo `^TNX` etc. intraday | Treasury.gov | — |
-//! | Equity/ETF | Alpaca if keyed, else Yahoo | Yahoo spark | — |
+//! | Equity/ETF | Questrade if a token is set (scans use it exclusively), then Alpaca if keyed, else Yahoo | Yahoo spark | — |
 //! | FX/Index/Comdty | Yahoo (`EURUSD=X`, `^GSPC`, `CL=F`) | Yahoo spark | — |
 
 use anyhow::{Result, anyhow, bail};
@@ -13,6 +13,7 @@ use tr_core::{AssetClass, Bar, Security, Timeframe, catalog};
 
 use crate::alpaca::AlpacaProvider;
 use crate::crypto::CryptoProvider;
+use crate::questrade::Questrade;
 use crate::treasury::TreasuryProvider;
 use crate::yahoo::{YahooProvider, yahoo_symbol};
 use crate::{
@@ -24,19 +25,37 @@ pub struct Markets {
     crypto: CryptoProvider,
     treasury: TreasuryProvider,
     alpaca: Option<AlpacaProvider>,
+    /// Present when the app offers Questrade; active only while it holds a token.
+    questrade: Option<Questrade>,
     name: String,
 }
 
 impl Markets {
     pub fn new(alpaca: Option<AlpacaProvider>) -> Result<Self> {
-        let name = if alpaca.is_some() { "alpaca+yahoo+binance+ust" } else { "yahoo+binance+ust" }.to_string();
+        Self::with_questrade(alpaca, None)
+    }
+
+    pub fn with_questrade(alpaca: Option<AlpacaProvider>, questrade: Option<Questrade>) -> Result<Self> {
+        let mut name = String::new();
+        if questrade.is_some() {
+            name.push_str("questrade+");
+        }
+        if alpaca.is_some() {
+            name.push_str("alpaca+");
+        }
+        name.push_str("yahoo+binance+ust");
         Ok(Self {
             yahoo: YahooProvider::new()?,
             crypto: CryptoProvider::new()?,
             treasury: TreasuryProvider::new()?,
             alpaca,
+            questrade,
             name,
         })
+    }
+
+    fn questrade(&self) -> Option<&Questrade> {
+        self.questrade.as_ref().filter(|q| q.is_configured())
     }
 }
 
@@ -55,6 +74,17 @@ impl MarketData for Markets {
                 None => bail!("intraday yields are not available for {}; use D, W or M", sec.ticker),
             },
             AssetClass::Govt => self.treasury.history(&sec, tf, end, limit).await,
+            AssetClass::Equity | AssetClass::Etf if self.questrade().is_some() => {
+                let q = self.questrade().expect("checked");
+                match q.history(&sec.ticker, tf, end, limit).await {
+                    Ok(b) if !b.is_empty() => Ok(b),
+                    Ok(_) => self.yahoo.history(&yahoo_symbol(&sec), tf, end, limit).await,
+                    Err(e) => {
+                        tracing::warn!("questrade {}: {e:#}; charting from Yahoo", sec.ticker);
+                        self.yahoo.history(&yahoo_symbol(&sec), tf, end, limit).await
+                    }
+                }
+            }
             AssetClass::Equity | AssetClass::Etf if self.alpaca.is_some() => {
                 let a = self.alpaca.as_ref().expect("checked");
                 match a.history(&sec.ticker, tf, end, limit).await {
@@ -86,6 +116,11 @@ impl MarketData for Markets {
                     bar.volume = f64::NAN;
                 }
                 Ok(history)
+            }
+            // A configured Questrade is the scanner's only stock source: its failures stay
+            // visible instead of being replaced by rate-limited Yahoo data.
+            AssetClass::Equity | AssetClass::Etf if self.questrade().is_some() => {
+                self.questrade().expect("checked").scan_history(&sec.ticker, tf, limit).await
             }
             AssetClass::Equity | AssetClass::Etf if self.alpaca.is_some() => {
                 let a = self.alpaca.as_ref().expect("checked");
