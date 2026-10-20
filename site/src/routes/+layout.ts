@@ -1,4 +1,5 @@
 import { dev } from '$app/env';
-import { injectAnalytics } from '@vercel/analytics/sveltekit';
+import { inject } from '@vercel/analytics';
 
-injectAnalytics({ mode: dev ? 'development' : 'production' });
+// `@vercel/analytics/sveltekit` subscribes to `$app/stores`, which throws in SvelteKit 3.
+inject({ mode: dev ? 'development' : 'production', framework: 'sveltekit' });
