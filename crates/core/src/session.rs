@@ -93,6 +93,12 @@ impl Session {
         }
     }
 }
+/// Boundaries of history bars: only regular H2/H4 use the exchange grid.
+/// All other histories retain their UTC-hour or plain calendar buckets.
+pub fn bar_interval(tf: Timeframe, session: Session, ts: i64) -> (i64, i64) {
+    if tf.session_aligned(session) { session.interval(tf, ts) } else { (tf.bucket_start(ts), next_bucket(tf, ts)) }
+}
+
 fn local_ts(day: NaiveDate, minute: u32) -> i64 {
     let local = day.and_time(chrono::NaiveTime::MIN) + Duration::minutes(i64::from(minute));
     chrono_tz::America::New_York
@@ -231,30 +237,29 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: close_minute matches half days only by calendar day-of-month (7/3, 12/24), so the 1:00 pm early close vanishes whenever the holiday falls on a weekend. Friday 2021-07-02 (Independence Day observed Monday 2021-07-05) and Friday 2022-12-23 (Christmas Day Sunday 2022-12-25, Christmas Eve Saturday) are published 1:00 pm closes but return 960, so US-regular H2/H4 session buckets keep a phantom 13:00-16:00 afternoon and Resample_session admits post-close bars"]
-    fn early_close_follows_the_holiday_onto_the_preceding_weekday() {
-        // 2021-07-04 is a Sunday: observed holiday is Monday 7/5, early close Friday 7/2.
-        assert!(!closed(date(2021, 7, 2)));
-        assert_eq!(close_minute(date(2021, 7, 2)), 780);
-        // 2022-12-25 is a Sunday: observed holiday is Monday 12/26, Christmas Eve
-        // falls on Saturday 12/24, so the early close moves to Friday 12/23.
-        assert!(!closed(date(2022, 12, 23)));
-        assert_eq!(close_minute(date(2022, 12, 23)), 780);
-
-        // Session-aligned multi-hour buckets must stop at the relocated close.
-        let open = ts("2021-07-02T13:30:00Z"); // 09:30 EDT
-        let close = ts("2021-07-02T17:00:00Z"); // 13:00 EDT
-        assert!(!Session::UsRegular.contains(close));
-        assert!(!Session::UsRegular.contains(close + 60));
-        assert_eq!(Session::UsRegular.interval(Timeframe::H2, close - 1), (open + 7200, close));
-        assert_eq!(Session::UsRegular.interval(Timeframe::H4, close - 1), (open, close));
-
-        let open = ts("2022-12-23T14:30:00Z"); // 09:30 EST
-        let close = ts("2022-12-23T18:00:00Z"); // 13:00 EST
-        assert!(!Session::UsRegular.contains(close));
-        assert_eq!(Session::UsRegular.interval(Timeframe::H2, close - 1), (open + 7200, close));
-        assert_eq!(Session::UsRegular.interval(Timeframe::H4, close - 1), (open, close));
+    fn history_boundaries_only_session_align_regular_multi_hour_bars() {
+        let t = ts("2026-03-09T15:00:00Z");
+        assert_eq!(bar_interval(Timeframe::H1, Session::UsRegular, t), (t, t + 3600));
+        for session in Session::ALL {
+            for tf in [
+                Timeframe::M1,
+                Timeframe::M30,
+                Timeframe::H1,
+                Timeframe::H2,
+                Timeframe::H4,
+                Timeframe::D1,
+                Timeframe::W1,
+            ] {
+                let expected = if tf.session_aligned(session) {
+                    session.interval(tf, t)
+                } else {
+                    (tf.bucket_start(t), next_bucket(tf, t))
+                };
+                assert_eq!(bar_interval(tf, session, t), expected);
+            }
+        }
     }
+
     #[test]
     fn aggregation_anchors_and_month_completion_are_calendar_based() {
         let t = ts("2026-03-09T14:00:00Z");

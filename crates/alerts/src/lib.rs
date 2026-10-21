@@ -210,28 +210,34 @@ pub fn merge_rule(
 #[derive(Default)]
 pub struct Monitor {
     cached: Option<Book>,
+    disk_snapshot: Option<serde_json::Value>,
 }
 impl Monitor {
     pub async fn cycle(&mut self, dir: &std::path::Path, provider: Provider) -> Result<Vec<Event>, String> {
         self.cycle_with(dir, || provider).await
     }
 
-    /// Holds the app gate across provider setup and the entire transaction.
-    /// No credentials are loaded or provider clients constructed while the app owns the gate.
+    /// Check the app gate briefly, then fetch without either lock. Recheck under
+    /// the book lock before saving or returning events; an app handoff wins.
     pub async fn cycle_with(
         &mut self,
         dir: &std::path::Path,
         provider: impl FnOnce() -> Provider,
     ) -> Result<Vec<Event>, String> {
-        let Some(_gate) = storage::Lock::try_acquire(&dir.join("app.lock")).map_err(|e| e.to_string())? else {
+        let Some(gate) = storage::Lock::try_acquire(&dir.join("app.lock")).map_err(|e| e.to_string())? else {
             self.cached = None;
+            self.disk_snapshot = None;
             return Ok(vec![]);
         };
+        drop(gate);
         let path = dir.join("price-alerts.json");
-        let _book_lock = storage::Lock::acquire(&dir.join("price-alerts.lock")).map_err(|e| e.to_string())?;
-        let loaded = storage::load(&path)?;
+        let loaded = {
+            let _book_lock = storage::Lock::acquire(&dir.join("price-alerts.lock")).map_err(|e| e.to_string())?;
+            storage::load(&path)?
+        };
+        let snapshot = serde_json::to_value(&loaded).map_err(|e| e.to_string())?;
         let mut book = match self.cached.take() {
-            Some(cached) if serde_json::to_value(&cached).ok() == serde_json::to_value(&loaded).ok() => cached,
+            Some(cached) if self.disk_snapshot.as_ref() == Some(&snapshot) => cached,
             _ => loaded,
         };
         let provider = provider();
@@ -257,7 +263,23 @@ impl Monitor {
                 events.extend(merge_rule(&mut book, id, result, simulated, chrono::Utc::now().timestamp()));
             }
         }
-        storage::save_locked(&path, &book)?;
+        let _book_lock = storage::Lock::acquire(&dir.join("price-alerts.lock")).map_err(|e| e.to_string())?;
+        let Some(_gate) = storage::Lock::try_acquire(&dir.join("app.lock")).map_err(|e| e.to_string())? else {
+            self.cached = None;
+            self.disk_snapshot = None;
+            return Ok(vec![]);
+        };
+        // Do not overwrite edits made while the network requests were in flight.
+        if serde_json::to_value(storage::load(&path)?).map_err(|e| e.to_string())? != snapshot {
+            self.cached = None;
+            self.disk_snapshot = None;
+            return Ok(vec![]);
+        }
+        self.disk_snapshot = Some(snapshot);
+        match storage::save_locked(&path, &book) {
+            Ok(()) => self.disk_snapshot = serde_json::to_value(&book).ok(),
+            Err(error) => eprintln!("Saving price alerts failed; will retry next cycle: {error}"),
+        }
         self.cached = Some(book);
         Ok(events)
     }

@@ -70,6 +70,7 @@ impl MarketData for Markets {
         options: crate::HistoryOptions,
     ) -> Result<Vec<Bar>> {
         let sec = security(symbol);
+        let options = options.for_chart(sec.class, tf);
         if matches!(sec.class, AssetClass::Equity | AssetClass::Etf) && tf.session_aligned(options.session) {
             let source_options = crate::HistoryOptions { session: Default::default(), ..options };
             let factor = (tf.seconds() / Timeframe::M30.seconds()) as usize;

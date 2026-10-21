@@ -110,7 +110,7 @@ impl Settings {
             && let Some(last) = bars.last()
         {
             let now = chrono::Utc::now().timestamp();
-            let end = session.interval(tf, last.ts).1;
+            let end = tr_core::session::bar_interval(tf, session, last.ts).1;
             let label = if now < last.ts {
                 "Future bar".into()
             } else if now >= end {

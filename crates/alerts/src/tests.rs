@@ -92,10 +92,8 @@ async fn daemon_preserves_invalid_book_instead_of_overwriting_it() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// The app side of the handshake is a blocking `Lock::acquire` on `app.lock`
-/// (app/src/main.rs); it must be able to take the gate over promptly.
+/// The app must take over promptly and the daemon must discard in-flight work.
 #[tokio::test]
-#[ignore = "BUG: Monitor::cycle_with holds app.lock across the provider fetch (20s timeout per symbol, 4 in flight), and the app's only entry point is a blocking storage::Lock::acquire on the same file — launching Terminal while a daemon cycle is in flight freezes startup for the entire remainder of the cycle (minutes with a full alert book) instead of the daemon yielding the gate"]
 async fn app_launch_takes_over_the_gate_without_waiting_out_a_daemon_cycle() {
     struct Slow;
     #[async_trait::async_trait]
@@ -133,20 +131,20 @@ async fn app_launch_takes_over_the_gate_without_waiting_out_a_daemon_cycle() {
     let (tx, rx) = std::sync::mpsc::channel();
     let app_dir = dir.clone();
     std::thread::spawn(move || {
-        let lock = storage::Lock::acquire(&app_dir.join("app.lock")).unwrap();
-        drop(lock);
-        let _ = tx.send(());
+        let lock = storage::Lock::acquire_app(&app_dir.join("app.lock")).unwrap();
+        let _ = tx.send(lock);
     });
-    assert!(
-        rx.recv_timeout(std::time::Duration::from_millis(500)).is_ok(),
-        "app startup stayed blocked on app.lock while the daemon cycle was still running"
-    );
-    let _ = cycle.await.unwrap();
+    let takeover = rx.recv_timeout(std::time::Duration::from_millis(500));
+    assert!(takeover.is_ok(), "app startup stayed blocked on app.lock while the daemon cycle was still running");
+    let app_lock = takeover.unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(cycle.await.unwrap().unwrap().is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before, "handoff must discard cycle results");
+    drop(app_lock);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]
-#[ignore = "BUG: Monitor::cycle_with ends with storage::save_locked(&path, &book)? which propagates any write error (full disk, read-only directory, rename failure) and discards the Vec<Event> already computed — alertd only delivers on Ok, so a detected crossing produces neither a notification nor a persisted last_fired and is silently lost instead of being delivered and retried"]
 async fn fired_events_survive_a_failed_book_write() {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("tr-alert-savefail-{}", std::process::id()));
@@ -165,10 +163,17 @@ async fn fired_events_survive_a_failed_book_write() {
     // Freeze the directory so the atomic temp file cannot be created, then cross.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     provider.set(101., now - 9);
-    let result = daemon.cycle(&dir, provider).await;
+    let result = daemon.cycle(&dir, provider.clone()).await;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     let events = result.expect("a fired alert must still be reported when the book cannot be written");
     assert_eq!(events.len(), 1, "the crossing must be delivered even though persistence failed");
     assert_eq!(events[0].alert.id, id);
+    let failed_disk = storage::load(&path).unwrap();
+    assert!(failed_disk.alerts[0].last_fired.is_none(), "failed write must leave the disk book untouched");
+    provider.set(99., now - 8);
+    assert!(daemon.cycle(&dir, provider.clone()).await.unwrap().is_empty());
+    provider.set(101., now - 7);
+    assert!(daemon.cycle(&dir, provider).await.unwrap().is_empty(), "failed persistence must not refire");
+    assert!(storage::load(&path).unwrap().alerts[0].last_fired.is_some(), "next cycle retries persistence");
     std::fs::remove_dir_all(dir).unwrap();
 }

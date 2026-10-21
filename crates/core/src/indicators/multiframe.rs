@@ -69,7 +69,13 @@ pub(super) fn evaluate(specs: &[Spec], input: &Input<'_>, session: Session, hist
                                 } else {
                                     b.ts
                                 };
-                                aggregation.interval(tf, ts).1
+                                if tf.is_intraday() {
+                                    crate::session::bar_interval(tf, aggregation, ts).1
+                                } else {
+                                    // Calendar labels are plain UTC buckets, but a daily
+                                    // study on intraday bars completes at the trading close.
+                                    aggregation.interval(tf, ts).1
+                                }
                             })
                             .collect();
                         (bars, ends)
@@ -91,15 +97,12 @@ pub(super) fn evaluate(specs: &[Spec], input: &Input<'_>, session: Session, hist
                     .iter()
                     .enumerate()
                     .map(|(i, bar)| {
-                        let mut as_of = if input.tf.session_aligned(session) {
-                            session.interval(input.tf, bar.ts).1
-                        } else {
-                            crate::session::next_bucket(input.tf, bar.ts)
-                        };
+                        let chart_session = if input.tf.is_intraday() { session } else { Session::Provider };
+                        let mut as_of = crate::session::bar_interval(input.tf, chart_session, bar.ts).1;
                         // A successor can prove closure across weekends/holidays, but
                         // only for this bar's own study period, never a later gap period.
                         let aggregation = if input.tf.is_intraday() { session } else { Session::Provider };
-                        let own_end = aggregation.interval(tf, bar.ts).1;
+                        let own_end = crate::session::bar_interval(tf, aggregation, bar.ts).1;
                         if !input.tf.is_intraday()
                             && let Some(next) = input.bars.get(i + 1)
                             && next.ts >= own_end
@@ -119,7 +122,8 @@ fn aggregate(bars: &[Bar], tf: Timeframe, session: Session) -> (Vec<Bar>, Vec<i6
     let mut out: Vec<Bar> = Vec::new();
     let mut ends = Vec::new();
     for bar in bars.iter().filter(|b| session.contains(b.ts)) {
-        let (start, end) = session.interval(tf, bar.ts);
+        let (start, boundary) = crate::session::bar_interval(tf, session, bar.ts);
+        let end = if tf.is_intraday() { boundary } else { session.interval(tf, bar.ts).1 };
         if let Some(last) = out.last_mut()
             && last.ts == start
         {
@@ -210,7 +214,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: fetched study-history ends are computed as session.interval(tf, ts).1, which anchors every intraday study timeframe at the 09:30 NY open, but chart_history only session-aligns H2/H4 and returns UTC-bucketed bars for H1 (and other tfs). An H1 bar stamped 15:00Z really closes 16:00Z, yet ends lands on 15:30Z so its value is painted onto the 09:30-11:30 H2 bar 30 minutes before the H1 bar finishes — look-ahead bias for any H1 study on a session-aligned 2H/4H chart"]
     fn h1_study_on_session_aligned_multi_hour_chart_waits_for_the_real_bar_close() {
         let open = chrono::DateTime::parse_from_rfc3339("2026-03-09T13:30:00Z").unwrap().timestamp();
         let bars: Vec<_> = (0..4).map(|i| bar(open + i * 7200, 1.)).collect();
@@ -382,10 +385,10 @@ mod tests {
         (open..close).step_by(300).map(|ts| bar(ts, 0.)).collect()
     }
 
-    /// Session-anchored 1H history bars: open, open+1h, …
+    /// Fetched H1 bars use UTC hours, not the half-hour session grid.
     fn session_1h(open: i64, close: i64, values: impl Fn(usize) -> f64) -> Vec<Bar> {
-        let hours = ((close - open) + 3599) / 3600;
-        (0..hours).map(|k| bar(open + k * 3600, values(k as usize))).collect()
+        let first = crate::session::next_bucket(Timeframe::H1, open);
+        (first..close).step_by(3600).enumerate().map(|(k, ts)| bar(ts, values(k))).collect()
     }
 
     fn both(
@@ -437,10 +440,10 @@ mod tests {
             );
             assert_eq!(out[1][end - 1], 1000. + day, "day {day} daily close");
             assert_eq!(chart[end - 1].ts + 300, session_close, "day {day} last bar ends at session close");
-            // 1H value k appears when its session-anchored hour ends; the last hour
-            // ends at the session close (30 minutes on these full 6.5h sessions).
-            for k in 0..7 {
-                let hour_end = if k == 6 { session_close } else { chart[start].ts + (k as i64 + 1) * 3600 };
+            // H1 value k waits for its actual UTC-hour close, including across DST.
+            for k in 0..6 {
+                let first = crate::session::next_bucket(Timeframe::H1, chart[start].ts);
+                let hour_end = first + (k as i64 + 1) * 3600;
                 let at = start + ((hour_end - chart[start].ts) / 300) as usize - 1;
                 assert_eq!(out[0][at], 100. * day + k as f64, "day {day} hour {k}");
                 assert!(out[0][start..at].iter().all(|v| v.is_nan() || *v != 100. * day + k as f64));
@@ -767,9 +770,10 @@ mod tests {
         assert_eq!(bars[last].ts + 300, close);
         assert!(out[1][..last].iter().all(|v| v.is_nan()));
         assert_eq!(out[1][last], 99., "daily value waits for the early close");
-        // Four session-anchored hours: 09:30, 10:30, 11:30, 12:30–13:00.
-        assert_eq!(out[0][last], 13., "last 1H value is the 12:30 hour ending at 13:00");
-        let hour2 = out[0].iter().position(|v| *v == 12.).unwrap();
-        assert_eq!(bars[hour2].ts + 300, open + 3 * 3600, "11:30 hour lands on its 12:30 end");
+        // UTC-hour history: 10:00, 11:00, 12:00; the last ends at 13:00.
+        assert_eq!(out[0][last], 12., "last 1H value is the 12:00 hour ending at 13:00");
+        let hour2 = out[0].iter().position(|v| *v == 11.).unwrap();
+        assert_eq!(bars[hour2].ts + 300, close - 3600, "11:00 hour lands on its 12:00 end");
+        assert!(out[0][..last].iter().all(|v| *v != 12.), "last hour must not leak before early close");
     }
 }
