@@ -1067,6 +1067,12 @@ impl TerminalApp {
                     }
                 }
                 Response::ExportChart { pane, result } => {
+                    self.status = match &result {
+                        Ok(path) => {
+                            format!("Exported {}", path.file_name().unwrap_or(path.as_os_str()).to_string_lossy())
+                        }
+                        Err(err) => format!("Export failed: {err}"),
+                    };
                     if let Some(c) = self.chart_mut(pane) {
                         c.export_notice = Some(result);
                     }

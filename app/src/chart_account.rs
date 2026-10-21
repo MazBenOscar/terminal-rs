@@ -192,7 +192,14 @@ impl Snapshot {
             p.galley(r.min + vec2(3., 0.), galley, color);
             last_label = r.bottom() + 2.;
         }
-        p.text(plot.left_bottom() + vec2(6., -3.), Align2::LEFT_BOTTOM, &self.status, mono(9.5), muted());
+        crate::chart_view::label_text(
+            &p,
+            plot.left_bottom() + vec2(6., -3.),
+            Align2::LEFT_BOTTOM,
+            &self.status,
+            mono(9.5),
+            muted(),
+        );
     }
 }
 

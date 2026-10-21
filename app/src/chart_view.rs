@@ -25,6 +25,24 @@ use crate::theme::{self, amber, amber_dim, mono, muted, text, ui_font};
 use crate::widgets;
 use crate::worker::{BuiltIndicator, PaneId, Request, Worker, initial_limit};
 
+pub(crate) fn label_plate(painter: &egui::Painter, rect: Rect) {
+    painter.rect_filled(rect.expand2(vec2(2., 1.)), 2., theme::card().gamma_multiply(0.82));
+}
+
+pub(crate) fn label_text(
+    painter: &egui::Painter,
+    pos: Pos2,
+    anchor: Align2,
+    text: impl Into<String>,
+    font: egui::FontId,
+    color: Color32,
+) {
+    let galley = painter.layout_no_wrap(text.into(), font, color);
+    let rect = anchor.anchor_size(pos, galley.size());
+    label_plate(painter, rect);
+    painter.galley(rect.min, galley, color);
+}
+
 const AXIS_W: f32 = 66.0;
 const TIME_H: f32 = 16.0;
 /// Fallback header row, used when the pane's tab strip has no room for the controls.
@@ -2689,7 +2707,9 @@ impl ChartState {
             if let Some(result) = &self.export_notice {
                 match result {
                     Ok(path) => {
-                        ui.label(format!("Saved {}", path.display()));
+                        let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                        ui.add(egui::Label::new(format!("Saved {name}")).truncate())
+                            .on_hover_text(path.display().to_string());
                         if ui.button("Open export folder").clicked() {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
                                 "file://{}",
@@ -3004,6 +3024,7 @@ impl ChartState {
         let y = price_rect.top() + 4.0;
         let put = |text: String, color: Color32, x: &mut f32| {
             let g = p.layout_no_wrap(text, mono(11.5), color);
+            label_plate(&p, Rect::from_min_size(pos2(*x, y), g.size()));
             p.galley(pos2(*x, y), g.clone(), color);
             *x += g.size().x + 8.0;
         };
@@ -3020,7 +3041,7 @@ impl ChartState {
         if hidden > 0 {
             let note =
                 format!("+{hidden} more oscillator{} (max {MAX_SUB_PANES} panes)", if hidden == 1 { "" } else { "s" });
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, note, mono(11.0), muted());
+            label_text(&p, pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, note, mono(11.0), muted());
             ly += 14.0;
         }
         if let Some(sym) = &self.compare {
@@ -3046,7 +3067,8 @@ impl ChartState {
                     _ => format!("CMP {sym}"),
                 }
             };
-            p.text(
+            label_text(
+                &p,
                 pos2(price_rect.left() + 6.0, ly),
                 Align2::LEFT_TOP,
                 text,
@@ -3076,7 +3098,8 @@ impl ChartState {
                         })
                     })
             };
-            p.text(
+            label_text(
+                &p,
                 pos2(price_rect.left() + 6., ly),
                 Align2::LEFT_TOP,
                 format!("CMP {key} · {state}"),
@@ -3086,7 +3109,8 @@ impl ChartState {
             ly += 14.;
         }
         if self.replay_cutoff.is_some() || self.chart_type == ChartType::Renko {
-            p.text(
+            label_text(
+                &p,
                 pos2(price_rect.left() + 6., ly),
                 Align2::LEFT_TOP,
                 if self.chart_type == ChartType::Renko {
@@ -3100,7 +3124,8 @@ impl ChartState {
             ly += 14.;
         }
         if self.chart_type == ChartType::HeikinAshi {
-            p.text(
+            label_text(
+                &p,
                 pos2(price_rect.left() + 6., ly),
                 Align2::LEFT_TOP,
                 "Heikin Ashi display · OHLC/studies/P&L use source bars",
@@ -3117,7 +3142,8 @@ impl ChartState {
                 .and_then(|line| line.pyramid.data.get(i))
                 .map(|p| p[1])
                 .filter(|v| v.is_finite());
-            p.text(
+            label_text(
+                &p,
                 pos2(price_rect.left() + 6., ly),
                 Align2::LEFT_TOP,
                 value.map_or("Anchored VWAP · unavailable in loaded history".into(), |v| {
@@ -3136,7 +3162,8 @@ impl ChartState {
             } else {
                 "click to place (Esc cancels)"
             };
-            p.text(
+            label_text(
+                &p,
                 pos2(price_rect.left() + 6.0, ly),
                 Align2::LEFT_TOP,
                 format!("{}: {msg}", tool.label()),
@@ -3517,7 +3544,8 @@ impl ChartState {
                     Shape::Segment(a, b) => {
                         p.line_segment([pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32)], stroke);
                         if let Some(l) = label {
-                            p.text(
+                            label_text(
+                                &p,
                                 pos2(a[0] as f32 + 3.0, a[1] as f32 - 1.0),
                                 Align2::LEFT_BOTTOM,
                                 l,
@@ -3529,7 +3557,8 @@ impl ChartState {
                     Shape::HLine(y) => {
                         p.hline(rect.x_range(), y as f32, stroke);
                         if let Some(l) = label {
-                            p.text(
+                            label_text(
+                                &p,
                                 pos2(rect.right() - 4.0, y as f32 - 1.0),
                                 Align2::RIGHT_BOTTOM,
                                 l,
@@ -3544,11 +3573,12 @@ impl ChartState {
                     Shape::Rect(a, b) => {
                         let r = Rect::from_two_pos(pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32));
                         if d.tool == Tool::Text {
-                            p.rect_filled(r, 2., theme::card());
+                            // The text gets its own plate below.
                             if selected {
                                 p.rect_stroke(r, 2., stroke, StrokeKind::Inside);
                             }
                             let galley = p.layout(label.unwrap_or_default(), ui_font(11.5), color, 220.);
+                            label_plate(&p, Rect::from_min_size(r.min + vec2(4., 2.), galley.size()));
                             p.galley(r.min + vec2(4., 2.), galley, color);
                         } else {
                             let fill = if matches!(d.tool, Tool::LongPosition | Tool::ShortPosition) {
@@ -3569,7 +3599,7 @@ impl ChartState {
                                     r.left().clamp(rect.left(), (rect.right() - size.x).max(rect.left())),
                                     (r.top() - size.y - 2.).max(rect.top()),
                                 );
-                                p.rect_filled(Rect::from_min_size(min, size), 2., theme::card());
+                                label_plate(&p, Rect::from_min_size(min + vec2(4., 2.), galley.size()));
                                 p.galley(min + vec2(4., 2.), galley, color);
                             }
                         }
