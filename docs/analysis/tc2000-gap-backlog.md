@@ -129,6 +129,28 @@ In progress: drawing favorites strip and explicit Auto/Log controls
 | Q02 | Implementation gap, product choice | **Save scan results as a watchlist.** Finished scan results have no way to reach the watchlist; the app has a single watchlist (`WL ADD`). First increment: result-table actions "Add matches to watchlist" (deduplicated, respecting the watchlist cap) and "Replace watchlist with matches" with an undo toast, plus a per-row context-menu add. Larger option needing a product decision: named watchlists (create, switch, rename, delete; a scan result saved as a new named list). Test: matches only, unavailable rows excluded, order preserved, persistence with the layout. |
 | Q03 | Defect | **Removed scan plot keeps coming back.** Opening a ticker from scan results (`Action::ScanChart`) always calls `plot_scan`, adding a "PCF Custom formula" study in its own pane on every ticker, even after the user removes it. Make the automatic plot opt-in: a per-chart "Show scan conditions on chart" toggle (default off, persisted with the chart's workflow), removing the scan-plot study turns the toggle off, and "Plot scan conditions" still adds it once on demand. Test: navigating results never re-adds a removed plot; with the toggle on, exactly one scan plot is kept and replaced per ticker. |
 
+## Drawing tools programme
+
+User-supplied reference screenshots (2026-10-21) define the rail structure:
+crosshair; trend lines; Fib and Gann; patterns; forecasting, volume-based and
+measurers; brushes, arrows and shapes; text, notes and content; emoji and
+stickers; then ruler and zoom, magnet, lock drawings, a Hide menu (drawings,
+indicators, positions and orders, all), link and remove all. Icons are original
+line icons in the app's stroke style, never traced from third-party artwork.
+Post and Idea entries (social-platform features) are out of scope.
+
+| Phase | Scope | Notes |
+|---|---|---|
+| D0 | Category rail matching the reference structure (data-driven table, sectioned flyouts, Patterns category, Hide menu, Lock drawings), then refactor drawings into one module per tool family (own enum, geometry, hit-testing, handles, rendering, icons) | Sequential; unblocks parallel work |
+| D1 | Lines, channels, pitchforks: info line, extended line, trend angle, horizontal ray, cross line, regression trend, flat top/bottom, disjoint channel, Schiff, modified Schiff, inside pitchfork | Parallel after D0 |
+| D2 | Fibonacci and Gann: fib channel, time zone, speed resistance fan and arcs, trend-based fib time, circles, spiral, wedge, pitchfan; Gann box, square fixed, square, fan | Parallel after D0 |
+| D3 | Patterns: XABCD, Cypher, head and shoulders, ABCD, triangle, three drives; Elliott impulse, correction, triangle, double and triple combo; cyclic lines, time cycles, sine line | Parallel after D0 |
+| D4 | Brushes (brush, highlighter), arrows (marker, arrow, mark up, mark down), shapes (rotated rectangle, path, circle, ellipse, polyline, triangle, arc, curve, double curve) | Parallel after D0 |
+| D5 | Text and notes (note, price note, pin, table, callout, comment, price label, signpost, flag mark), local image drawing, emoji/sticker/icon picker | Parallel after D0 |
+
+Each phase ships with adversarial review, persistence round trips, undo,
+hit-testing and replay/Renko visibility rules matching existing drawings.
+
 ## Implementation sequence and branch policy
 
 Next: Q01 and the first Q02 increment, alongside the in-progress quick tools and
