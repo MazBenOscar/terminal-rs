@@ -37,10 +37,21 @@ pub enum ChartType {
     Bars,
     Line,
     Area,
+    HeikinAshi,
+    Hollow,
+    Baseline,
 }
 
 impl ChartType {
-    pub const ALL: [ChartType; 4] = [ChartType::Candles, ChartType::Bars, ChartType::Line, ChartType::Area];
+    pub const ALL: [ChartType; 7] = [
+        ChartType::Candles,
+        ChartType::Bars,
+        ChartType::Line,
+        ChartType::Area,
+        ChartType::HeikinAshi,
+        ChartType::Hollow,
+        ChartType::Baseline,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -48,6 +59,9 @@ impl ChartType {
             ChartType::Bars => "Bars",
             ChartType::Line => "Line",
             ChartType::Area => "Area",
+            ChartType::HeikinAshi => "Heikin Ashi",
+            ChartType::Hollow => "Hollow",
+            ChartType::Baseline => "Baseline",
         }
     }
 }
@@ -144,7 +158,7 @@ pub fn visible_extent(
     let (lo, hi) = v.visible_range(p.len0);
     let k = level_for(v.bar_px, p.levels());
     let (mut l, mut h, vmax) = match chart_type {
-        ChartType::Line | ChartType::Area => {
+        ChartType::Line | ChartType::Area | ChartType::Baseline => {
             let (l, h) = series.closes.pyramid.extent(k, lo, hi)?;
             (l, h, p.extent(k, lo, hi).map(|e| e.2).unwrap_or(0.0))
         }
@@ -189,10 +203,13 @@ pub fn price_pane(p: &PricePane<'_>) -> PaneOutput {
     let t = transform(v, p.height_px, &scale, p.style.pixels_per_point);
     let mut style = p.style;
     style.ohlc_bars = p.chart_type == ChartType::Bars;
+    style.hollow = p.chart_type == ChartType::Hollow;
+    style.baseline_mode = p.chart_type == ChartType::Baseline;
     style.vol_max = vol_max as f32;
     let mut cmds = Vec::new();
     if p.show_volume {
         let mut vs = style;
+        vs.baseline_mode = false;
         vs.color[3] = 0.35;
         cmds.push(DrawCmd::Volume {
             data: p.series.bars.clone(),
@@ -201,16 +218,18 @@ pub fn price_pane(p: &PricePane<'_>) -> PaneOutput {
         });
     }
     match p.chart_type {
-        ChartType::Candles | ChartType::Bars => cmds.push(DrawCmd::Candles {
-            data: p.series.bars.clone(),
-            range: pyr.instance_range(k, lo, hi),
-            uniforms: Uniforms::new(&t, &style),
-        }),
-        ChartType::Line | ChartType::Area => {
+        ChartType::Candles | ChartType::Bars | ChartType::HeikinAshi | ChartType::Hollow => {
+            cmds.push(DrawCmd::Candles {
+                data: p.series.bars.clone(),
+                range: pyr.instance_range(k, lo, hi),
+                uniforms: Uniforms::new(&t, &style),
+            })
+        }
+        ChartType::Line | ChartType::Area | ChartType::Baseline => {
             let lp = &p.series.closes.pyramid;
             let kk = level_for(v.bar_px, lp.levels());
             let range = lp.segment_range(kk, lo, hi);
-            if p.chart_type == ChartType::Area {
+            if matches!(p.chart_type, ChartType::Area | ChartType::Baseline) {
                 let mut a = style;
                 a.color[3] = 0.25;
                 cmds.push(DrawCmd::Line {
@@ -243,6 +262,7 @@ fn overlay_cmds(overlays: &[Overlay], v: &Viewport, t: &PaneTransform, base: &St
             let lp = &o.line.pyramid;
             let k = level_for(v.bar_px, lp.levels());
             let mut s = *base;
+            s.baseline_mode = false;
             s.color = o.color;
             s.thickness_px = o.width.clamp(0.5, 8.0);
             if let Some(color) = o.histogram_color {

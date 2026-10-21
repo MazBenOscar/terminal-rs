@@ -1056,6 +1056,11 @@ impl TerminalApp {
                         c.on_indicators(generation, revision, built);
                     }
                 }
+                Response::Heikin { pane, generation, bars, gpu } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_heikin(generation, bars, gpu);
+                    }
+                }
                 Response::Compare { pane, generation, symbol, line, revision } => {
                     if let Some(c) = self.chart_mut(pane) {
                         c.on_compare(generation, revision, &symbol, line);

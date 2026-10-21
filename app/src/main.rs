@@ -11,6 +11,7 @@ mod chart_data;
 mod chart_fill;
 mod chart_legend;
 mod chart_navigation;
+mod chart_studies;
 mod chart_templates;
 mod chart_view;
 mod chart_workflow;

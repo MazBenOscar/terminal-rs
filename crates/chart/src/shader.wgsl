@@ -23,6 +23,7 @@ struct Uniforms {
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) relative: f32,
 };
 
 fn x_ndc(idx: f32) -> f32 {
@@ -87,6 +88,10 @@ fn degenerate() -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if (u.params.w > 2.5) {
+        let rgb = select(u.down.rgb,u.up.rgb,in.relative>=0.0);
+        return vec4<f32>(rgb*in.color.a,in.color.a);
+    }
     return in.color;
 }
 
@@ -125,7 +130,17 @@ fn vs_candle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
     let half_wick = px_to_ndc_x(u.params.y * 0.5);
     let r = vi / 6u;
     let one_px = px_to_ndc_y(1.0);
-    if (u.params.w < 0.5) {
+    if (u.params.w > 1.5 && b.close >= b.open) {
+        let y0 = y_ndc(min(b.open,close));
+        let y1 = max(y_ndc(max(b.open,close)),y0+one_px);
+        if (r == 0u) {return rect(vi,cx-half_wick,cx+half_wick,y_ndc(low),y0,color);}
+        if (r == 1u) {return rect(vi,cx-half_wick,cx+half_wick,y1,max(y_ndc(high),y1),color);}
+        if (r == 2u) {return rect(vi,cx-half_body,cx-half_body+half_wick*2.0,y0,y1,color);}
+        if (r == 3u) {return rect(vi,cx+half_body-half_wick*2.0,cx+half_body,y0,y1,color);}
+        if (r == 4u) {return rect(vi,cx-half_body,cx+half_body,y0,y0+one_px,color);}
+        return rect(vi,cx-half_body,cx+half_body,y1-one_px,y1,color);
+    }
+    if (u.params.w < 0.5 || u.params.w > 1.5) {
         if (r == 0u) {
             return rect(vi, cx - half_wick, cx + half_wick, y_ndc(low), max(y_ndc(high), y_ndc(low) + one_px), color);
         }
@@ -144,6 +159,7 @@ fn vs_candle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
         let y = y_ndc(b.open);
         return rect(vi, cx - half_body, cx, y - tick, y + tick, color);
     }
+    if (r > 2u) {return degenerate();}
     let y = y_ndc(close);
     return rect(vi, cx, cx + half_body, y - tick, y + tick, color);
 }

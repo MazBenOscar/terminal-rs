@@ -120,6 +120,9 @@ pub struct ChartState {
 
     bars: Arc<Vec<Bar>>,
     gpu: Option<SeriesGpu>,
+    ha_gpu: Option<(Arc<Vec<Bar>>, Option<SeriesGpu>)>,
+    analytics: crate::chart_studies::Cache,
+    context_timestamp: Option<i64>,
     generation: u64,
     viewport: Option<Viewport>,
     plot_width: f64,
@@ -206,6 +209,9 @@ impl ChartState {
             pending_dates: None,
             bars: Arc::new(Vec::new()),
             gpu: None,
+            ha_gpu: None,
+            analytics: Default::default(),
+            context_timestamp: None,
             generation: 0,
             viewport: None,
             plot_width: 800.,
@@ -788,6 +794,12 @@ impl ChartState {
         }
     }
 
+    pub fn on_heikin(&mut self, generation: u64, bars: Arc<Vec<Bar>>, gpu: SeriesGpu) {
+        if generation == self.generation && Arc::ptr_eq(&self.bars, &bars) {
+            self.ha_gpu = Some((bars, Some(gpu)));
+        }
+    }
+
     pub fn on_compare_error(&mut self, generation: u64, revision: u64, symbol: &str, error: String) {
         if generation == self.generation
             && revision == self.compare_revision
@@ -1102,7 +1114,19 @@ impl ChartState {
             return clicked;
         }
 
-        let Some(gpu) = self.gpu.clone() else {
+        if self.chart_type == ChartType::HeikinAshi
+            && !self.bars.is_empty()
+            && self.ha_gpu.as_ref().is_none_or(|(bars, _)| !Arc::ptr_eq(bars, &self.bars))
+        {
+            self.ha_gpu = Some((self.bars.clone(), None));
+            w.send(Request::Heikin { pane: self.id, generation: self.generation, bars: self.bars.clone() });
+        }
+        let display = if self.chart_type == ChartType::HeikinAshi {
+            self.ha_gpu.as_ref().and_then(|(_, gpu)| gpu.clone()).or_else(|| self.gpu.clone())
+        } else {
+            self.gpu.clone()
+        };
+        let Some(gpu) = display else {
             let msg = self.error.clone().unwrap_or_else(|| format!("Loading {} {}…", self.symbol, self.tf));
             painter.text(plot_all.center(), Align2::CENTER_CENTER, msg, mono(13.0), amber_dim());
             return clicked;
@@ -1275,6 +1299,12 @@ impl ChartState {
         // Percent mode labels prices relative to the main close at the visible left edge, where
         // the comparison is rebased too, so both series read as % change from the same bar.
         let mut percent_base = None;
+        self.analytics.update(&self.bars, self.data.analytics.anchor);
+        if let Some(vwap) = &self.analytics.vwap {
+            let mut overlay = compare_overlay(vwap, 1.);
+            overlay.color = theme::rgba(theme::series(1));
+            overlays.push(overlay);
+        }
         let (lo, hi) = v.visible_range(len);
         let primary_visible = self.compare.as_ref().is_some_and(|s| !self.data.hidden_comparisons.contains(s));
         let mut lines: Vec<LineRef> = self
@@ -1317,6 +1347,12 @@ impl ChartState {
             crate::anim::progress(ui.ctx(), egui::Id::new(("chart-reveal", self.id)), self.reveal_key, REVEAL_SECS);
         let reveal = Reveal { opacity: ui.opacity(), ..Reveal::sweep(reveal_t, v.left(), v.visible_bars()) };
         let style = Style {
+            baseline: self
+                .data
+                .analytics
+                .baseline
+                .unwrap_or_else(|| self.bars.get(v.visible_range(len).0).map_or(0., |b| b.close))
+                as f32,
             up: theme::rgba(theme::candle_up()),
             down: theme::rgba(theme::candle_down()),
             color: theme::rgba(amber()),
@@ -1351,6 +1387,12 @@ impl ChartState {
         scale.height_px = price_rect.height() as f64;
         if self.draw.tool.is_none() && !over_legend {
             if plot_resp.secondary_clicked() {
+                self.context_timestamp = plot_resp
+                    .interact_pointer_pos()
+                    .filter(|p| price_rect.contains(*p))
+                    .and_then(|p| v.bar_at((p.x - price_rect.left()) as f64, len))
+                    .and_then(|i| self.bars.get(i))
+                    .map(|b| b.ts);
                 self.context_price = plot_resp
                     .interact_pointer_pos()
                     .filter(|p| price_rect.contains(*p))
@@ -1634,6 +1676,7 @@ impl ChartState {
         }
 
         self.paint_price_alerts(ui, price_rect, &scale);
+        self.data.analytics.paint_profile(ui, price_rect, &v, &self.bars, (self.tf, us), &scale);
         self.data.context.paint(ui, price_rect, &scale, &self.bars, (self.tf, us, self.data.session));
         if self.data.account.positions || self.data.account.orders {
             self.account_overlay.paint(ui, price_rect, &scale, self.bars.last().map(|b| b.close));
@@ -2324,6 +2367,9 @@ impl ChartState {
     }
 
     fn context_menu(&mut self, ui: &mut Ui, w: &Worker) {
+        ui.menu_button("Anchored VWAP and volume profile", |ui| {
+            self.data.analytics.menu(ui, self.context_timestamp, self.context_price)
+        });
         ui.menu_button("Price and session context", |ui| self.data.context.menu(ui));
         ui.menu_button("Chart navigation", |ui| {
             ui.label("DATE YYYY-MM-DD jumps to a date; provider history limits apply.");
@@ -2653,6 +2699,35 @@ impl ChartState {
                 format!("CMP {key} · {state}"),
                 mono(11.),
                 crate::chart_compare::color(index + 1),
+            );
+            ly += 14.;
+        }
+        if self.chart_type == ChartType::HeikinAshi {
+            p.text(
+                pos2(price_rect.left() + 6., ly),
+                Align2::LEFT_TOP,
+                "Heikin Ashi display · OHLC/studies/P&L use source bars",
+                mono(10.),
+                muted(),
+            );
+            ly += 14.;
+        }
+        if self.data.analytics.anchor.is_some() {
+            let value = self
+                .analytics
+                .vwap
+                .as_ref()
+                .and_then(|line| line.pyramid.data.get(i))
+                .map(|p| p[1])
+                .filter(|v| v.is_finite());
+            p.text(
+                pos2(price_rect.left() + 6., ly),
+                Align2::LEFT_TOP,
+                value.map_or("Anchored VWAP · unavailable in loaded history".into(), |v| {
+                    format!("Anchored VWAP {v:.2}")
+                }),
+                mono(10.),
+                theme::series(1),
             );
             ly += 14.;
         }

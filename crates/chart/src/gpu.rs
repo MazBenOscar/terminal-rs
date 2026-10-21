@@ -79,6 +79,8 @@ pub struct Style {
     pub wick_px: f32,
     pub thickness_px: f32,
     pub ohlc_bars: bool,
+    pub hollow: bool,
+    pub baseline_mode: bool,
     pub vol_frac: f32,
     pub vol_max: f32,
     pub hist_width_bars: f32,
@@ -99,6 +101,8 @@ impl Default for Style {
             wick_px: 1.0,
             thickness_px: 1.5,
             ohlc_bars: false,
+            hollow: false,
+            baseline_mode: false,
             vol_frac: 0.2,
             vol_max: 1.0,
             hist_width_bars: 0.7,
@@ -125,7 +129,15 @@ impl Uniforms {
                 s.body_frac,
                 s.wick_px * s.pixels_per_point,
                 s.thickness_px * s.pixels_per_point,
-                if s.ohlc_bars { 1.0 } else { 0.0 },
+                if s.baseline_mode {
+                    3.
+                } else if s.ohlc_bars {
+                    1.0
+                } else if s.hollow {
+                    2.
+                } else {
+                    0.0
+                },
             ],
             extra: [s.vol_frac, s.vol_max, s.hist_width_bars, s.baseline],
             anim: [rel(r.front), r.ramp.max(1e-3), rel(r.line_front), r.opacity],
@@ -239,7 +251,7 @@ impl ChartRenderer {
             label: Some("chart-uniforms"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
@@ -415,7 +427,7 @@ impl ChartRenderer {
                 continue;
             }
             let (pipeline, verts) = match d.pipe {
-                Pipe::Candle => (&self.candle, 18),
+                Pipe::Candle => (&self.candle, 36),
                 Pipe::Volume => (&self.volume, 6),
                 Pipe::Line => (&self.line, 6),
                 Pipe::Area => (&self.area, 6),

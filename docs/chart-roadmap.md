@@ -67,3 +67,18 @@ close, loaded-session high/low and shading of available US pre/post-market bars.
 These are derived from loaded bars, not fabricated official exchange prices or extra
 history. The countdown says Bar closed for an expired last bar. Context visibility
 persists with the layout; exchange/session/provider limitations remain explicit.
+
+## Studies and display types
+
+Right-click a loaded price bar and use **Anchored VWAP and volume profile** to set
+an anchor, choose visible-range/latest-session profiles, set the bin count or a
+baseline price. VWAP uses HLC3 weighted by reported volume and becomes unavailable
+when the anchor history or subsequent volume is missing. Profiles distribute each
+bar's volume across its high/low bins, displaying POC and an approximately 70% value
+area; partial data is labeled. These are estimates, not exchange volume-at-price.
+
+Chart types now include Heikin Ashi, hollow up candles and baseline charts. Heikin
+Ashi construction runs in the worker and keeps raw timestamps; source OHLC, studies,
+alerts and account valuations still use actual source bars. Baseline lines/fills use
+positive/negative colors relative to the chosen reference or visible start. Layouts
+use v7 so older builds cannot silently discard the new style and study settings.

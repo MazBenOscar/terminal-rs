@@ -296,6 +296,9 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "BAR" | "BARS" | "OHLC" => Function::ChartType(ChartType::Bars),
         "LINE" => Function::ChartType(ChartType::Line),
         "AREA" | "MOUNTAIN" => Function::ChartType(ChartType::Area),
+        "HEIKIN" | "HA" => Function::ChartType(ChartType::HeikinAshi),
+        "HOLLOW" => Function::ChartType(ChartType::Hollow),
+        "BASELINE" => Function::ChartType(ChartType::Baseline),
         // `IND RSI 21` adds directly; anything else searches the picker.
         "IND" | "INDICATOR" | "INDICATORS" | "STUDY" | "STUDIES" => {
             match rest.split_first().and_then(|(code, args)| IndicatorSpec::parse(code, args)) {

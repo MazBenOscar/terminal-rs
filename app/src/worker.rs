@@ -141,6 +141,11 @@ pub enum Request {
         pane: PaneId,
         query: String,
     },
+    Heikin {
+        pane: PaneId,
+        generation: u64,
+        bars: Arc<Vec<Bar>>,
+    },
     Markers {
         pane: PaneId,
         symbol: String,
@@ -255,6 +260,12 @@ pub struct Profile {
 }
 
 pub enum Response {
+    Heikin {
+        pane: PaneId,
+        generation: u64,
+        bars: Arc<Vec<Bar>>,
+        gpu: SeriesGpu,
+    },
     /// Outcome of a [`QuestradeAction`]: a status line or an error.
     Questrade(Result<String, String>),
     Scan {
@@ -873,6 +884,15 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     .collect()
                     .await;
             s.send(Response::PriceAlertQuotes { revision, observations });
+        }
+        Request::Heikin { pane, generation, bars } => {
+            let input = bars.clone();
+            if let Ok(gpu) =
+                tokio::task::spawn_blocking(move || SeriesGpu::build(&tr_core::chart_analytics::heikin_ashi(&input)))
+                    .await
+            {
+                s.send(Response::Heikin { pane, generation, bars, gpu });
+            }
         }
         Request::Quotes(symbols) => match s.provider.quotes(&symbols).await {
             Ok(q) => s.send(Response::Quotes(q)),

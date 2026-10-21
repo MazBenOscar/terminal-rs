@@ -12,6 +12,7 @@ pub struct ChartData {
     pub hidden_comparisons: Vec<String>,
     pub workflow: Box<crate::chart_workflow::Workflow>,
     pub context: crate::chart_context::Settings,
+    pub analytics: Box<crate::chart_studies::Settings>,
 }
 impl ChartData {
     pub fn edit(&mut self, ui: &mut egui::Ui, us_equity: bool) {

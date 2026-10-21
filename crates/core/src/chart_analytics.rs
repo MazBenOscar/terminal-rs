@@ -1,0 +1,130 @@
+//! Causal bar-derived chart analytics; profiles are OHLCV estimates, not trade prints.
+use crate::Bar;
+pub fn anchored_vwap(bars: &[Bar], anchor: i64) -> Vec<f64> {
+    let mut out = vec![f64::NAN; bars.len()];
+    if bars.first().is_none_or(|b| anchor < b.ts) || bars.last().is_none_or(|b| anchor > b.ts) {
+        return out;
+    }
+    let start = bars.partition_point(|b| b.ts < anchor);
+    let (mut pv, mut volume) = (0., 0.);
+    for (i, b) in bars.iter().enumerate().skip(start) {
+        if !b.volume.is_finite() || b.volume < 0. || ![b.high, b.low, b.close].iter().all(|p| p.is_finite()) {
+            break;
+        }
+        volume += b.volume;
+        pv += (b.high + b.low + b.close) / 3. * b.volume;
+        if volume > 0. {
+            out[i] = pv / volume;
+        }
+    }
+    out
+}
+#[derive(Debug, Clone)]
+pub struct Profile {
+    pub low: f64,
+    pub step: f64,
+    pub volume: Vec<f64>,
+    pub poc: usize,
+    pub value_low: usize,
+    pub value_high: usize,
+}
+pub fn volume_profile(bars: &[Bar], bins: usize) -> Option<Profile> {
+    let bins = bins.clamp(8, 128);
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    for b in bars {
+        if b.low.is_finite() && b.high.is_finite() && b.high >= b.low {
+            low = low.min(b.low);
+            high = high.max(b.high);
+        }
+    }
+    if !low.is_finite() || !high.is_finite() {
+        return None;
+    }
+    let step = ((high - low) / bins as f64).max(low.abs() * 1e-8).max(1e-8);
+    let mut changes = vec![0.; bins + 1];
+    for b in bars {
+        if !b.volume.is_finite() || b.volume < 0. || !b.low.is_finite() || !b.high.is_finite() || b.high < b.low {
+            continue;
+        }
+        let lo = (((b.low - low) / step).floor().max(0.) as usize).min(bins - 1);
+        let hi = (((b.high - low) / step).floor().max(0.) as usize).min(bins - 1);
+        let amount = b.volume / (hi - lo + 1) as f64;
+        changes[lo] += amount;
+        changes[hi + 1] -= amount;
+    }
+    let mut running = 0.;
+    let volume: Vec<_> = changes[..bins]
+        .iter()
+        .map(|v| {
+            running += v;
+            running.max(0.)
+        })
+        .collect();
+    let total: f64 = volume.iter().sum();
+    if total <= 0. {
+        return None;
+    }
+    let poc = volume.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?.0;
+    let (mut a, mut b, mut sum) = (poc, poc, volume[poc]);
+    while sum < total * 0.7 && (a > 0 || b + 1 < bins) {
+        if b + 1 < bins && (a == 0 || volume[b + 1] >= volume[a - 1]) {
+            b += 1;
+            sum += volume[b];
+        } else {
+            a -= 1;
+            sum += volume[a];
+        }
+    }
+    Some(Profile { low, step, volume, poc, value_low: a, value_high: b })
+}
+pub fn heikin_ashi(bars: &[Bar]) -> Vec<Bar> {
+    let mut previous: Option<(f64, f64)> = None;
+    bars.iter()
+        .map(|b| {
+            let close = (b.open + b.high + b.low + b.close) / 4.;
+            let open = previous.map_or((b.open + b.close) / 2., |(o, c)| (o + c) / 2.);
+            let result = Bar::new(b.ts, open, b.high.max(open).max(close), b.low.min(open).min(close), close, b.volume);
+            previous = (open.is_finite() && close.is_finite()).then_some((open, close));
+            result
+        })
+        .collect()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn anchored_vwap_is_causal_and_never_substitutes_missing_volume_or_anchor_history() {
+        let b = [
+            Bar::new(1, 10., 10., 10., 10., 2.),
+            Bar::new(2, 20., 20., 20., 20., 1.),
+            Bar::new(3, 30., 30., 30., 30., 0.),
+        ];
+        assert_eq!(anchored_vwap(&b, 1), vec![10., 40. / 3., 40. / 3.]);
+        assert!(anchored_vwap(&b, 2)[0].is_nan());
+        assert_eq!(anchored_vwap(&b, 2)[1], 20.);
+        assert!(anchored_vwap(&b, 0).iter().all(|v| v.is_nan()));
+        let mut broken = b;
+        broken[1].volume = f64::NAN;
+        assert!(anchored_vwap(&broken, 1)[2].is_nan());
+    }
+    #[test]
+    fn profiles_conserve_available_volume_and_identify_value_area() {
+        let bars = [Bar::new(0, 10., 20., 10., 15., 100.), Bar::new(1, 15., 15., 15., 15., 50.)];
+        let p = volume_profile(&bars, 16).unwrap();
+        assert!((p.volume.iter().sum::<f64>() - 150.).abs() < 1e-8);
+        assert!(p.value_low <= p.poc && p.value_high >= p.poc);
+        assert!(volume_profile(&[Bar { volume: f64::NAN, ..bars[0] }], 16).is_none());
+    }
+    #[test]
+    fn heikin_ashi_uses_recursive_open_and_keeps_time_and_volume() {
+        let b = [Bar::new(1, 10., 14., 8., 12., 50.), Bar::new(2, 12., 16., 11., 15., 60.)];
+        let ha = heikin_ashi(&b);
+        assert_eq!(ha[0].open, 11.);
+        assert_eq!(ha[0].close, 11.);
+        assert_eq!(ha[1].open, 11.);
+        assert_eq!(ha[1].close, 13.5);
+        assert_eq!(ha[1].ts, 2);
+        assert_eq!(ha[1].volume, 60.);
+    }
+}

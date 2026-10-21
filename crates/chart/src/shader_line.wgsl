@@ -47,6 +47,7 @@ fn vs_line(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     var out: VsOut;
     out.pos = vec4<f32>(px_to_ndc(p), 0.0, 1.0);
     out.color = shade(u.color);
+    out.relative = mix(a.y,b.y,c.x)-u.extra.w;
     return out;
 }
 
@@ -61,11 +62,13 @@ fn vs_area(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let c = corner(vi);
     let x = mix(x_ndc(a.x), x_ndc(b.x), c.x);
     let top = mix(y_ndc(a.y), y_ndc(b.y), c.x);
-    let y = mix(-1.0, top, c.y);
+    let bottom=select(-1.0,y_ndc(u.extra.w),u.params.w>2.5);
+    let y = mix(bottom, top, c.y);
     // Fade towards the bottom.
     var out: VsOut;
     out.pos = vec4<f32>(x, y, 0.0, 1.0);
     out.color = shade(vec4<f32>(u.color.rgb, u.color.a * mix(0.15, 1.0, c.y)));
+    out.relative=mix(u.extra.w,mix(a.y,b.y,c.x),c.y)-u.extra.w;
     return out;
 }
 
