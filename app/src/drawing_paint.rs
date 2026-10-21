@@ -30,9 +30,15 @@ pub fn paint(drawing: &Drawing, paint: &Paint<'_>, shapes: Vec<LabeledShape>) {
         | Tool::Channel
         | Tool::Pitchfork => paint_lines(paint, shapes),
         Tool::Fib | Tool::FibExtension | Tool::FibChannel | Tool::FibTimeZone => paint_fib(paint, shapes),
-        Tool::Measure | Tool::LongPosition | Tool::ShortPosition => {
-            paint_measure(paint, shapes, drawing.tool != Tool::Measure)
+        Tool::Measure
+        | Tool::PriceRange
+        | Tool::DateRange
+        | Tool::DatePriceRange
+        | Tool::LongPosition
+        | Tool::ShortPosition => {
+            paint_measure(paint, shapes, matches!(drawing.tool, Tool::LongPosition | Tool::ShortPosition))
         }
+        Tool::AnchoredVwap | Tool::FixedRangeVolumeProfile => paint_volume(paint, shapes),
         Tool::Rectangle => paint_shapes(paint, shapes),
         Tool::Text => paint_text(paint, shapes),
     }
@@ -49,6 +55,20 @@ fn paint_shapes(p: &Paint<'_>, shapes: Vec<LabeledShape>) {
 }
 fn paint_measure(p: &Paint<'_>, shapes: Vec<LabeledShape>, risk_reward: bool) {
     primitives(p, shapes, if risk_reward { RectStyle::RiskReward } else { RectStyle::Plain });
+}
+fn paint_volume(p: &Paint<'_>, shapes: Vec<LabeledShape>) {
+    for (shape, label) in shapes {
+        let poc = label.as_deref() == Some("Point of control");
+        let value_area = label.as_deref() == Some("Value area");
+        let context = Paint {
+            stroke: Stroke::new(
+                if poc { p.stroke.width + 1.5 } else { p.stroke.width },
+                if poc || value_area { p.stroke.color } else { p.stroke.color.gamma_multiply(0.45) },
+            ),
+            ..*p
+        };
+        primitives(&context, vec![(shape, if poc { label } else { None })], RectStyle::Plain);
+    }
 }
 fn paint_text(p: &Paint<'_>, shapes: Vec<LabeledShape>) {
     primitives(p, shapes, RectStyle::Text);

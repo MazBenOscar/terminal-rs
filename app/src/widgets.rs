@@ -124,6 +124,11 @@ pub enum Icon {
     LongPosition,
     ShortPosition,
     Measure,
+    PriceRange,
+    DateRange,
+    DatePriceRange,
+    AnchoredVwap,
+    FixedRangeVolumeProfile,
     Magnet,
     Lock,
     Unlock,
@@ -132,6 +137,39 @@ pub enum Icon {
     Trash,
     Grip,
     ChevronSmall,
+}
+
+/// Original measure-family glyphs on a 12-unit grid.
+fn measure_volume_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
+    let unit = r.width().min(r.height()) / 12.;
+    let pt = |x: f32, y: f32| r.center() + vec2((x - 6.) * unit, (y - 6.) * unit);
+    let stroke = Stroke::new(1.4, color);
+    if icon == Icon::AnchoredVwap {
+        p.circle_stroke(pt(2., 9.), unit, stroke);
+        p.add(Shape::line(vec![pt(2., 8.), pt(4., 5.), pt(6., 6.), pt(8., 3.), pt(11., 2.)], stroke));
+    } else if icon == Icon::FixedRangeVolumeProfile {
+        p.line_segment([pt(2., 1.), pt(2., 11.)], stroke);
+        for (y, end) in [(2., 6.), (4., 9.), (6., 11.), (8., 7.), (10., 5.)] {
+            p.line_segment([pt(2., y), pt(end, y)], stroke);
+        }
+    } else {
+        if icon != Icon::DateRange {
+            p.line_segment([pt(3., 1.), pt(3., 11.)], stroke);
+            for y in [1., 11.] {
+                p.line_segment([pt(1., y), pt(5., y)], stroke);
+            }
+        }
+        if icon != Icon::PriceRange {
+            p.line_segment([pt(1., 8.), pt(11., 8.)], stroke);
+            for x in [1., 11.] {
+                p.line_segment([pt(x, 6.), pt(x, 10.)], stroke);
+            }
+        }
+        if icon == Icon::DatePriceRange {
+            p.line_segment([pt(6., 2.), pt(10., 2.)], stroke);
+            p.line_segment([pt(10., 2.), pt(10., 5.)], stroke);
+        }
+    }
 }
 
 pub fn tool_icon(tool: tr_chart::drawings::Tool) -> Icon {
@@ -156,6 +194,11 @@ pub fn tool_icon(tool: tr_chart::drawings::Tool) -> Icon {
         Tool::LongPosition => Icon::LongPosition,
         Tool::ShortPosition => Icon::ShortPosition,
         Tool::Measure => Icon::Measure,
+        Tool::PriceRange => Icon::PriceRange,
+        Tool::DateRange => Icon::DateRange,
+        Tool::DatePriceRange => Icon::DatePriceRange,
+        Tool::AnchoredVwap => Icon::AnchoredVwap,
+        Tool::FixedRangeVolumeProfile => Icon::FixedRangeVolumeProfile,
     }
 }
 
@@ -212,6 +255,11 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
         Icon::Rectangle => crate::drawing_paint::shapes(p, r, color),
         Icon::Text => crate::drawing_paint::text(p, r, color),
         Icon::LongPosition | Icon::ShortPosition | Icon::Measure => crate::drawing_paint::measure(p, r, icon, color),
+        Icon::PriceRange
+        | Icon::DateRange
+        | Icon::DatePriceRange
+        | Icon::AnchoredVwap
+        | Icon::FixedRangeVolumeProfile => measure_volume_icon(p, r, icon, color),
         Icon::Magnet => {
             p.add(Shape::line(vec![pt(-5., -5.), pt(-5., 2.), pt(-3., 5.), pt(3., 5.), pt(5., 2.), pt(5., -5.)], s));
             p.line_segment([pt(-5., -2.), pt(-2., -2.)], s);

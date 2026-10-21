@@ -92,7 +92,7 @@ pub struct Profile {
     pub value_high: usize,
 }
 pub fn volume_profile(bars: &[Bar], bins: usize) -> Option<Profile> {
-    let bins = bins.clamp(8, 128);
+    let bins = bins.clamp(4, 200);
     let mut low = f64::INFINITY;
     let mut high = f64::NEG_INFINITY;
     for b in bars {

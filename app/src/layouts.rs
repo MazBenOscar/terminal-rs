@@ -751,6 +751,26 @@ mod tests {
     }
 
     #[test]
+    fn volume_drawing_rows_roundtrip_and_loaded_bounds() {
+        use tr_chart::drawings::{Anchor, Drawing, Tool};
+        let anchor = Anchor { ts: 1, price: 10. };
+        let mut d = Drawing::new(Tool::FixedRangeVolumeProfile, anchor, anchor);
+        for rows in [4, 24, 200] {
+            d.profile_rows = rows;
+            let saved = serde_json::to_string(&d).unwrap();
+            assert_eq!(serde_json::from_str::<Drawing>(&saved).unwrap(), d);
+        }
+        for (saved, expected) in [(0, 4), (201, 200)] {
+            d.profile_rows = saved;
+            let loaded: Drawing = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+            assert_eq!(loaded.profile_rows, expected);
+        }
+        let legacy: Drawing =
+            serde_json::from_str(r#"{"tool":"Measure","a":{"ts":1,"price":10},"b":{"ts":2,"price":20}}"#).unwrap();
+        assert_eq!(legacy.profile_rows, 24);
+    }
+
+    #[test]
     fn expanded_drawings_roundtrip_and_legacy_drawings_keep_default_fields() {
         use tr_chart::drawings::{Anchor, Drawing, Tool};
         let old: Drawing =
