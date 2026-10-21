@@ -145,7 +145,7 @@ pub fn sort_key(cell: Option<&Cell>) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conditions::ConditionItem;
+    use crate::conditions::{ConditionItem, ScanCondition};
     use crate::scanner::MatchMode;
     use crate::{Bar, Series};
 
@@ -228,5 +228,94 @@ mod tests {
         set.columns = vec![column("C"); 9];
         assert!(set.validate().is_err());
         assert!(column("").validate().is_err());
+    }
+
+    #[test]
+    #[ignore = "BUG: ColumnDef::required_bars_for hardcodes 300 for Formula columns and never calls pcf::lookback, so AVG(C,1000)/XAVGC300 under-plan history (column_history_plan multiplies by 3 but still lands at 900 < 1000) and those columns evaluate as Unavailable"]
+    fn formula_columns_size_history_from_expression_lookback() {
+        // AVG(C,1000) needs 1000 bars; XAVGC300 needs 300*4-1 + 1 = 1200.
+        for (expression, needed) in [("AVG(C,1000)", 1000), ("XAVGC300", 1200), ("AVGC20", 20)] {
+            let c = column(expression);
+            assert!(c.validate().is_ok(), "{expression}");
+            assert!(
+                c.required_bars_for(Timeframe::D1) >= needed,
+                "{expression} required_bars_for={} but needs {needed}",
+                c.required_bars_for(Timeframe::D1)
+            );
+        }
+        // Other timeframes must not inflate a single-timeframe formula column.
+        assert_eq!(column("AVG(C,1000)").required_bars_for(Timeframe::W1), 1);
+    }
+
+    #[test]
+    #[ignore = "BUG: ColumnSet::validate and sanitized() never reject or renumber duplicate ColumnDef.id values, so imported layouts/sets can ship colliding ids and the editor's selected: Option<u32> expands every twin row"]
+    fn column_set_validate_rejects_duplicate_ids() {
+        let mut set = ColumnSet::default();
+        let mut a = column("C");
+        a.id = 7;
+        let mut b = column("H");
+        b.id = 7;
+        set.columns = vec![a, b];
+        assert!(set.validate().is_err(), "duplicate column ids make editor selection and COL DEL ambiguous");
+        let (clean, _) = set.sanitized();
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            clean.columns.iter().all(|c| seen.insert(c.id)),
+            "sanitized() must not keep duplicate ids: {:?}",
+            clean.columns.iter().map(|c| c.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "BUG: ColumnSet::validate allows case-insensitive duplicate titles; COL DEL retain()s every eq_ignore_ascii_case match so one delete removes both twins, and the editor Apply path never checks uniqueness"]
+    fn column_set_validate_rejects_duplicate_titles() {
+        let mut set = ColumnSet::default();
+        let mut a = column("C");
+        a.title = "SMA".into();
+        let mut b = column("H");
+        b.title = "sma".into();
+        set.columns = vec![a, b];
+        // COL DEL matches titles case-insensitively and retain() drops every match,
+        // so two same-titled columns would both disappear on one delete.
+        assert!(set.validate().is_err(), "duplicate titles (case-insensitive) must be rejected");
+    }
+
+    #[test]
+    fn sort_key_maps_non_finite_values_to_unavailable() {
+        assert_eq!(sort_key(Some(&Cell::Value(f64::NAN))), None);
+        assert_eq!(sort_key(Some(&Cell::Value(f64::INFINITY))), None);
+        assert_eq!(sort_key(Some(&Cell::Value(f64::NEG_INFINITY))), None);
+        assert_eq!(sort_key(Some(&Cell::Value(-0.0))), Some(0.0));
+    }
+
+    #[test]
+    fn condition_overrides_collect_timeframes_and_bars_ago() {
+        let mut c = column("1");
+        c.kind = ColumnKind::Condition(ConditionGroup {
+            mode: MatchMode::All,
+            items: vec![ConditionItem::Compare(ScanCondition {
+                timeframe: Some(Timeframe::W1),
+                right: crate::scanner::ScanOperand::Sma { period: 500, source: crate::scanner::Source::Close },
+                right_bars_ago: 250,
+                ..Default::default()
+            })],
+        });
+        assert!(c.validate().is_ok());
+        assert!(c.timeframes().contains(&Timeframe::D1));
+        assert!(c.timeframes().contains(&Timeframe::W1));
+        // SMA(500) shifted 250 bars ago needs 750 bars on the override timeframe.
+        assert!(c.required_bars_for(Timeframe::W1) >= 750, "{}", c.required_bars_for(Timeframe::W1));
+        // The column timeframe is still listed but unused by this leaf.
+        assert_eq!(c.required_bars_for(Timeframe::D1), 1);
+    }
+
+    #[test]
+    fn oversized_formulas_are_rejected_before_evaluation() {
+        let mut c = column(&"C+".repeat(300));
+        assert!(c.validate().is_err());
+        c.kind = ColumnKind::Formula { expression: "C".repeat(501) };
+        assert!(c.validate().is_err());
+        c.kind = ColumnKind::Formula { expression: " ".repeat(20) };
+        assert!(c.validate().is_err());
     }
 }

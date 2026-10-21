@@ -650,4 +650,75 @@ mod tests {
         assert_eq!(Store::file_stem("My Layout 2"), "My Layout 2");
         assert_eq!(Store::file_stem(".hidden"), "hidden");
     }
+
+    #[test]
+    fn watch_columns_round_trip_through_layout_json() {
+        use tr_core::columns::{ColumnDef, ColumnKind, ColumnSet};
+        use tr_core::conditions::{ConditionGroup, ConditionItem, FormulaCondition, ScanCondition};
+        use tr_core::scanner::MatchMode;
+
+        let mut doc = LayoutDoc::default_workspace("Cols", &PanelDefaults::default());
+        let mut watch = ColumnSet::default();
+        watch.name = "Desk".into();
+        watch.columns = vec![
+            ColumnDef {
+                id: 3,
+                title: "RSI".into(),
+                timeframe: tr_core::Timeframe::W1,
+                kind: ColumnKind::Formula { expression: "RSI14".into() },
+            },
+            ColumnDef {
+                id: 9,
+                title: "Above".into(),
+                timeframe: tr_core::Timeframe::D1,
+                kind: ColumnKind::Condition(ConditionGroup {
+                    mode: MatchMode::All,
+                    items: vec![
+                        ConditionItem::Compare(ScanCondition {
+                            timeframe: Some(tr_core::Timeframe::M5),
+                            ..Default::default()
+                        }),
+                        ConditionItem::Formula(FormulaCondition {
+                            expression: "C > C1".into(),
+                            timeframe: Some(tr_core::Timeframe::H1),
+                        }),
+                    ],
+                }),
+            },
+        ];
+        doc.watch_columns = watch;
+        let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(restored.watch_columns, doc.watch_columns);
+        assert!(restored.watch_columns.validate().is_ok());
+    }
+
+    #[test]
+    fn invalid_watch_columns_survive_round_trip_unsanitized() {
+        use tr_core::columns::{ColumnDef, ColumnKind, ColumnSet};
+        let mut doc = LayoutDoc::default_workspace("BadCols", &PanelDefaults::default());
+        let mut watch = ColumnSet::default();
+        watch.name = "Bad".into();
+        watch.columns = vec![ColumnDef {
+            id: 1,
+            title: "x".repeat(30),
+            timeframe: tr_core::Timeframe::D1,
+            kind: ColumnKind::Formula { expression: "C".into() },
+        }];
+        doc.watch_columns = watch;
+        // from_json/repair does not sanitize watch_columns; apply_doc does.
+        let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(restored.watch_columns, doc.watch_columns);
+        assert!(restored.watch_columns.validate().is_err());
+    }
+
+    #[test]
+    fn watch_columns_version_is_ignored_on_deserialize() {
+        use tr_core::columns::ColumnSet;
+        let raw = r#"{"version":99,"name":"Future","columns":[]}"#;
+        let set: ColumnSet = serde_json::from_str(raw).unwrap();
+        assert_eq!(set.name, "Future");
+        // Serialization always rewrites version=1.
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["version"], 1);
+    }
 }

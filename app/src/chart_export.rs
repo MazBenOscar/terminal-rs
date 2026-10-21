@@ -174,4 +174,55 @@ mod tests {
         assert!(image.contains("<rect x="));
         assert!(!image.contains("NaN"));
     }
+
+    #[test]
+    fn crop_png_rounds_up_partial_pixels_and_clamps_offscreen_rects() {
+        // 4x3 image, crop that starts at x=1 and asks for 3 px but only 3 remain.
+        let image = egui::ColorImage::filled([4, 3], egui::Color32::from_rgb(1, 2, 3));
+        let bytes = crop_png(&image, [1, 1, 3, 5]).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height), (3, 2), "clamped to remaining pixels");
+
+        // Fully off-screen right / bottom yields an empty crop error, not a panic.
+        assert!(crop_png(&image, [10, 1, 2, 2]).is_err());
+        assert!(crop_png(&image, [1, 10, 2, 2]).is_err());
+        // Zero-area after clamp is empty.
+        assert!(crop_png(&image, [4, 0, 2, 2]).is_err());
+    }
+
+    #[test]
+    fn crop_png_preserves_corner_pixels_when_rect_is_one_pixel() {
+        let mut image = egui::ColorImage::filled([3, 3], egui::Color32::from_rgb(0, 0, 0));
+        image.pixels[8] = egui::Color32::from_rgb(9, 8, 7); // bottom-right
+        let bytes = crop_png(&image, [2, 2, 1, 1]).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut pixels).unwrap();
+        assert_eq!(&pixels[..4], &[9, 8, 7, 255]);
+    }
+
+    #[test]
+    #[ignore = "BUG: save_bytes sanitises the symbol but appends `extension` verbatim into the file name; a path-like extension (`png/../../evil`) yields a multi-component path that Path::join treats as nested segments (ENOENT here, or escape/write outside the exports dir when intermediate dirs exist)"]
+    fn save_bytes_sanitises_extension_and_colliding_names() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target").join(format!("export-ext-{stamp}"));
+        // Extension is appended verbatim: a path-like extension must not escape the directory.
+        let path = save_bytes(&directory, "AAPL", &[1], "png/../../evil").unwrap();
+        assert_eq!(path.parent(), Some(directory.as_path()), "extension must not introduce path segments");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_bytes_rejects_empty_symbol_becomes_dash_only_and_still_lands_in_directory() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target").join(format!("export-empty-{stamp}"));
+        let path = save_bytes(&directory, "///", &[0], "png").unwrap();
+        assert_eq!(path.parent(), Some(directory.as_path()));
+        assert!(path.file_name().unwrap().to_str().unwrap().starts_with('-'));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -633,6 +633,30 @@ mod tests {
     }
 
     #[test]
+    fn column_values_reject_nan_and_infinite_last_prices_as_non_price_like() {
+        let eur = tr_core::Security::new("EURUSD", tr_core::AssetClass::Fx);
+        // NaN / ±inf last prices must not make the range check succeed.
+        assert_eq!(format_column_value(&eur, 1.1457, Some(f64::NAN)), "1.15");
+        assert_eq!(format_column_value(&eur, 1.1457, Some(f64::INFINITY)), "1.15");
+        assert_eq!(format_column_value(&eur, 1.1457, Some(f64::NEG_INFINITY)), "1.15");
+        // Non-finite formula values fall back to two decimals rather than panicking.
+        assert_eq!(format_column_value(&eur, f64::NAN, Some(1.1237)), "NaN");
+    }
+
+    #[test]
+    fn column_value_price_like_range_edges_are_inclusive_even_for_huge_levels() {
+        let btc = tr_core::Security::new("BTCUSD", tr_core::AssetClass::Crypto);
+        let last = 500_000.0;
+        // Exactly 0.5x and just under 2x are price-like with two decimals.
+        assert_eq!(format_column_value(&btc, 250_000.0, Some(last)), "250000.00");
+        assert_eq!(format_column_value(&btc, 999_999.0, Some(last)), "999999.00");
+        // One step outside the 0.5x bound is still two decimals (not price precision).
+        assert_eq!(format_column_value(&btc, 249_999.0, Some(last)), "249999.00");
+        // Values at/above 1e6 use compact formatting regardless of price-likeness.
+        assert_eq!(format_column_value(&btc, 1e6, Some(last)), "1.00M");
+    }
+
+    #[test]
     fn group_steps_scale_with_price() {
         assert_eq!(group_steps(82_000.0), [0.0, 1.0, 10.0, 100.0]);
         let fx = group_steps(1.09);

@@ -1565,6 +1565,33 @@ mod column_tests {
         let c = ColumnDef { kind: ColumnKind::Condition(definition.root), ..column(Timeframe::D1) };
         assert_eq!(column_history_plan(&[c]), vec![(Timeframe::D1, MAX_COLUMN_HISTORY_BARS)]);
     }
+
+    #[test]
+    #[ignore = "BUG: column_history_plan sizes Formula columns from ColumnDef::required_bars_for which hardcodes 300 and never consults pcf::lookback; AVG(C,1000) therefore plans 900 bars (300*3) and the cell evaluates as Unavailable"]
+    fn column_history_plan_covers_formula_lookback() {
+        let column = |expression: &str| ColumnDef {
+            id: 1,
+            title: "F".into(),
+            timeframe: Timeframe::D1,
+            kind: ColumnKind::Formula { expression: expression.into() },
+        };
+        let plan = column_history_plan(&[column("AVG(C,1000)")]);
+        // required_bars_for is 300 today, so the plan lands at 900; it must reach 3000.
+        assert_eq!(plan, vec![(Timeframe::D1, 3000)]);
+        assert!(plan[0].1 >= 1000, "plan must cover the formula lookback, got {}", plan[0].1);
+    }
+
+    #[test]
+    fn column_history_plan_multiplies_required_bars_by_three() {
+        let column = |expression: &str| ColumnDef {
+            id: 1,
+            title: "F".into(),
+            timeframe: Timeframe::D1,
+            kind: ColumnKind::Formula { expression: expression.into() },
+        };
+        // required_bars_for("C") is the hardcoded 300, and the plan multiplies by 3.
+        assert_eq!(column_history_plan(&[column("C")]), vec![(Timeframe::D1, 900)]);
+    }
 }
 
 fn column_history_plan(columns: &[tr_core::columns::ColumnDef]) -> Vec<(Timeframe, usize)> {
