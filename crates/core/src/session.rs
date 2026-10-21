@@ -61,7 +61,7 @@ impl Session {
             return false;
         }
         let minute = dt.hour() * 60 + dt.minute();
-        let (open, close) = if self == Self::UsRegular { (570, close_minute(date)) } else { (240, 1200) };
+        let (open, close) = if self == Self::UsRegular { (open_minute(date), close_minute(date)) } else { (240, 1200) };
         minute >= open && minute < close
     }
     pub fn filter(self, bars: &[Bar], tf: Timeframe) -> Vec<Bar> {
@@ -81,13 +81,13 @@ impl Session {
                 .timestamp()
         };
         if tf.is_intraday() {
-            let open = local_ts(date, if self == Self::UsRegular { 570 } else { 240 });
+            let open = local_ts(date, if self == Self::UsRegular { open_minute(date) } else { 240 });
             let end = local_ts(date, if self == Self::UsRegular { close_minute(date) } else { 1200 });
             let start = open + (ts - open).div_euclid(tf.seconds()) * tf.seconds();
             (start, (start + tf.seconds()).min(end))
         } else if tf == Timeframe::D1 {
             (
-                local_ts(date, if self == Self::UsRegular { 570 } else { 240 }),
+                local_ts(date, if self == Self::UsRegular { open_minute(date) } else { 240 }),
                 local_ts(date, if self == Self::UsRegular { close_minute(date) } else { 1200 }),
             )
         } else {
@@ -144,6 +144,9 @@ fn easter(y: i32) -> NaiveDate {
     date(y, ((h + l - 7 * m + 114) / 31) as u32, ((h + l - 7 * m + 114) % 31 + 1) as u32)
 }
 pub fn closed(d: NaiveDate) -> bool {
+    if let Some(day) = crate::exchange_calendar::day(d) {
+        return day.is_none();
+    }
     if matches!(d.weekday(), Weekday::Sat | Weekday::Sun) {
         return true;
     }
@@ -178,7 +181,13 @@ pub fn closed(d: NaiveDate) -> bool {
         ]
         .contains(&d)
 }
+pub fn open_minute(d: NaiveDate) -> u32 {
+    crate::exchange_calendar::day(d).flatten().map_or(570, |d| d.open)
+}
 pub fn close_minute(d: NaiveDate) -> u32 {
+    if let Some(day) = crate::exchange_calendar::day(d).flatten() {
+        return day.close;
+    }
     let black_friday = nth(d.year(), 11, Weekday::Thu, 4) + Duration::days(1);
     if d == black_friday || d.month() == 12 && d.day() == 24 || d.month() == 7 && d.day() == 3 { 780 } else { 960 }
 }

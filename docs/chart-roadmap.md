@@ -1,4 +1,4 @@
-# Remaining chart delivery
+# Chart audit delivery
 
 The working baseline incorporates price alerts, comparison scale modes and expanded
 drawing tools through `03019b3`. The user requested continuing through the remaining
@@ -11,10 +11,11 @@ its feature branch for review):
 2. `codex/chart-compare-scales`: several comparison symbols and indexed-to-100 scale.
 3. `codex/chart-scan-workflow`: keyboard navigation, scanner traversal/conditions and
    last-price/session context.
-4. Chart studies/types: anchored VWAP, volume profile and additional chart types.
-5. Drawing/alert extensions: remaining advanced drawing tools and reusable conditions.
-6. Replay, exports and timeframe extensions.
-7. Event/provider coverage: implement supported data paths; explicitly record evidence
+4. `codex/chart-studies-types`: anchored VWAP, volume profile and additional chart types.
+5. `codex/chart-advanced-drawings` and `codex/chart-alert-conditions`: tools and conditions.
+6. `codex/chart-replay-exports`: replay, exports, Renko and timeframe extensions.
+7. `codex/chart-event-data`: event/provider coverage and optional minute streaming;
+   implement supported data paths and explicitly record evidence
    or credential limitations rather than inventing data or claiming full TC2000 parity.
 
 ## Account overlays
@@ -139,3 +140,90 @@ Quarter boundaries and completion use actual calendar months. Crypto streaming i
 disabled for these aggregated intervals; history refresh remains available. Provider
 depth limits still apply, including the minute-history limit for 2m/3m. Layout v8
 accepts older layouts and protects the new interval/type settings from old builds.
+
+## Events and provider options
+
+**Earnings, dividends and splits** in the chart context menu enables E/D/S markers.
+Yahoo's reported dividend/split records are fetched independently of price bars;
+errors and incomplete coverage are visible in the menu. Event markers map to the
+displayed daily, weekly, monthly or quarterly bucket. Replay and Renko hide events.
+A live Yahoo probe returned actual dividend dates/amounts; parser fixtures cover
+dividends and split ratios. No automatic earnings coverage is claimed.
+
+Attributed local events, including earnings, can be loaded from `chart-events.json`
+in the app data directory. The file is a JSON array, at most 2 MiB/10,000 events:
+
+```json
+[{"symbol":"AAPL US Equity","ts":1792497600,"kind":"Earnings",
+  "detail":"Illustrative earnings annotation; replace with verified data",
+  "source":"Example schema only"}]
+```
+
+Kinds are `Earnings`, `Dividend` and `Split`; timestamps are Unix UTC seconds.
+Use **Reload event data** after changing the file. These are annotations, not a
+point-in-time fundamental database, and no missing event is silently fabricated.
+
+**Time zone, session & refresh** now separates session filtering from requesting
+extended-hours history. Yahoo passes `includePrePost=true` when requested. Alpaca
+offers raw or split-adjusted OHLC through its `adjustment` parameter. Unsupported
+provider/asset options produce an error rather than silently changing the source.
+History/paging/comparisons use the same options; caches have separate namespaces.
+Ordinary quotes/alerts retain their independent source convention. Sample-mode
+options do not create real corporate actions or exchange sessions. Layout **v9**
+protects these source settings and accepts earlier layouts.
+
+## Exchange calendars
+
+Set `TR_US_CALENDAR` to an attributed JSON schedule and restart to replace the
+built-in approximation within explicit coverage. An example schema (not an
+authoritative schedule):
+
+```json
+{"start":"2026-10-19","end":"2026-10-20","source":"Example only",
+ "sessions":[{"date":"2026-10-19","open":570,"close":960},
+             {"date":"2026-10-20","open":570,"close":960}]}
+```
+
+Times are minutes after midnight in New York. List **every open session** in the
+coverage range; absent dates inside it are closed. This supports exceptional
+closures, late openings and short days. Invalid files produce an explicit warning;
+outside coverage the built-in holiday approximation still applies. The menu shows
+coverage and attribution. A full historical/venue schedule has not been supplied
+or independently certified, so complete exchange-calendar parity remains open.
+
+## Optional equity minute streaming
+
+Set `TR_ALPACA_STREAM=1` alongside the existing `APCA_API_KEY_ID`,
+`APCA_API_SECRET_KEY` and `APCA_DATA_FEED` (`iex`, `sip` or `delayed_sip`). Streaming
+is opt-in, limited to **1m stock charts with default history options**, and shares
+one authenticated connection across up to 64 distinct chart symbols. It subscribes
+to minute bars and updated bars, handles reconnect/subscription changes and shows
+waiting/error status. Full snapshots replace corrected timestamps; partial crypto
+updates retain their existing merge semantics. There is no tick-by-tick stock feed.
+
+With streaming enabled, Alpaca chart history does not fall back to Yahoo and its
+cache namespace is distinct. Reconnect/consumer gaps require a history refresh;
+there is no fabricated backfill. Credentials are never included in status/log
+messages. A local WebSocket server verifies authentication, multi-symbol subscription
+and routing. Live authentication, account entitlement and exchange coverage were
+not tested. Protocol references: [Alpaca streaming](https://docs.alpaca.markets/us/docs/streaming-market-data)
+and [stock bars](https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data).
+
+## Delivery and remaining external validation
+
+The audit's local chart increments are implemented on stacked feature branches;
+`personal/main` collects them for testing. This is not a claim of complete TC2000
+parity. Remaining external work is verified earnings/calendar coverage, entitled
+live-feed testing, matched TC2000 numeric exports/proprietary formulas, and review
+of the visible app on a functioning graphics session. Native independent study
+histories and unrestricted PCF syntax remain separate larger parity work.
+
+The visible-app smoke attempt on this machine failed with Wayland `NoCompositor`;
+both Wayland and X11 socket directories were empty. GPU render and headless egui
+checks remain useful, but they do not certify the final desktop appearance.
+
+Final workspace verification: **416 tests passed, 5 existing network tests ignored**,
+including all four offscreen GPU render tests. `cargo fmt --all -- --check` and
+strict workspace/all-target Clippy passed under WSL. The local stream fixture and
+headless interaction tests passed. The UI source detector returned no findings;
+its coverage of native Rust/egui code is limited and does not replace visible QA.

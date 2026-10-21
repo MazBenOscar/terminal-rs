@@ -44,6 +44,16 @@ impl SampleProvider {
 
 #[async_trait]
 impl MarketData for SampleProvider {
+    async fn chart_history(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        _options: crate::HistoryOptions,
+    ) -> Result<Vec<Bar>> {
+        self.history(symbol, tf, end, limit).await
+    }
     fn name(&self) -> &str {
         "sample"
     }
@@ -92,7 +102,7 @@ impl MarketData for SampleProvider {
                 bar.high = bar.high.max(px);
                 bar.low = bar.low.min(px);
                 bar.volume += (rng.f64() * 100.0).round();
-                if tx.send(bar).await.is_err() {
+                if tx.send(crate::LiveUpdate::Partial(bar)).await.is_err() {
                     break;
                 }
             }
@@ -229,6 +239,9 @@ mod tests {
         let mut rx = p.live("ETHUSD Curncy", Timeframe::M1).unwrap();
         let a = rx.recv().await.unwrap();
         let b = rx.recv().await.unwrap();
+        let (crate::LiveUpdate::Partial(a), crate::LiveUpdate::Partial(b)) = (a, b) else {
+            panic!("sample updates must be partial");
+        };
         assert!(a.high >= a.low && b.ts >= a.ts && b.close > 0.0);
         assert!(SampleProvider::at(0, 10).live("X", Timeframe::M1).is_none());
     }

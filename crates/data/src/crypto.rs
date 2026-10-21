@@ -396,13 +396,13 @@ impl CryptoProvider {
     }
 }
 
-async fn binance_ws(url: &str, tx: &mpsc::Sender<Bar>) -> Result<()> {
+async fn binance_ws(url: &str, tx: &mpsc::Sender<crate::LiveUpdate>) -> Result<()> {
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.context("binance websocket")?;
     while let Some(msg) = ws.next().await {
         match msg? {
             Message::Text(t) => {
                 if let Some(bar) = parse_binance_ws(t.as_str())
-                    && tx.send(bar).await.is_err()
+                    && tx.send(crate::LiveUpdate::Partial(bar)).await.is_err()
                 {
                     return Ok(());
                 }
@@ -414,7 +414,7 @@ async fn binance_ws(url: &str, tx: &mpsc::Sender<Bar>) -> Result<()> {
     bail!("binance websocket closed")
 }
 
-async fn coinbase_ws(product: &str, tf: Timeframe, tx: &mpsc::Sender<Bar>) -> Result<()> {
+async fn coinbase_ws(product: &str, tf: Timeframe, tx: &mpsc::Sender<crate::LiveUpdate>) -> Result<()> {
     let (mut ws, _) = tokio_tungstenite::connect_async(COINBASE_WS).await.context("coinbase websocket")?;
     let sub = serde_json::json!({"type": "subscribe", "product_ids": [product], "channels": ["ticker"]});
     ws.send(Message::Text(sub.to_string().into())).await?;
@@ -434,7 +434,7 @@ async fn coinbase_ws(product: &str, tf: Timeframe, tx: &mpsc::Sender<Bar>) -> Re
             }
             _ => *bar.insert(Bar::new(bucket, px, px, px, px, size)),
         };
-        if tx.send(b).await.is_err() {
+        if tx.send(crate::LiveUpdate::Partial(b)).await.is_err() {
             return Ok(());
         }
     }

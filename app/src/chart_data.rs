@@ -13,6 +13,8 @@ pub struct ChartData {
     pub workflow: Box<crate::chart_workflow::Workflow>,
     pub context: crate::chart_context::Settings,
     pub analytics: Box<crate::chart_studies::Settings>,
+    pub history: tr_data::HistoryOptions,
+    pub show_events: bool,
 }
 impl ChartData {
     pub fn edit(&mut self, ui: &mut egui::Ui, us_equity: bool) {
@@ -30,8 +32,22 @@ impl ChartData {
                 }
             });
         });
-        ui.label("Sessions filter available intraday bars; they do not request extra data.");
-        ui.label("US calendar: recurring holidays and selected exceptional closures.");
+        ui.add_enabled_ui(us_equity, |ui| {
+            ui.checkbox(&mut self.history.extended_hours, "Request extended-hours history");
+            egui::ComboBox::from_id_salt("price-basis")
+                .selected_text(format!("Price basis: {:?}", self.history.price_basis))
+                .show_ui(ui, |ui| {
+                    for (basis, label) in [
+                        (tr_data::PriceBasis::Provider, "Provider prices"),
+                        (tr_data::PriceBasis::Raw, "Unadjusted (Alpaca)"),
+                        (tr_data::PriceBasis::SplitAdjusted, "Split adjusted (Alpaca)"),
+                    ] {
+                        ui.selectable_value(&mut self.history.price_basis, basis, label);
+                    }
+                });
+        });
+        ui.label("Session filters are separate from history requests. Unsupported provider options show an error.");
+        ui.label(tr_core::exchange_calendar::description());
         let mut refresh = self.refresh_seconds > 0;
         if ui.checkbox(&mut refresh, "Refresh chart history automatically").changed() {
             self.refresh_seconds = if refresh { 60 } else { 0 };

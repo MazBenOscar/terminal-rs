@@ -76,6 +76,9 @@ mod markets {
         assert!(hits.iter().any(|h| h.key == "BTCUSD Curncy"), "{hits:?}");
         let mut feed = m.live("BTCUSD Curncy", Timeframe::M1).unwrap();
         let bar = tokio::time::timeout(Duration::from_secs(20), feed.recv()).await.expect("live tick").unwrap();
+        let tr_data::LiveUpdate::Partial(bar) = bar else {
+            panic!("expected crypto partial update");
+        };
         assert!(bar.close > 1000.0);
     }
 

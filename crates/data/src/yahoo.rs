@@ -39,6 +39,7 @@ impl YahooProvider {
         period1: i64,
         period2: i64,
         missing_volume: f64,
+        extended: bool,
     ) -> Result<Chart> {
         let url = format!("{BASE}/{}", urlencode(symbol));
         let resp = self
@@ -48,7 +49,8 @@ impl YahooProvider {
                 ("interval", interval.to_string()),
                 ("period1", period1.to_string()),
                 ("period2", period2.to_string()),
-                ("includePrePost", "false".into()),
+                ("includePrePost", extended.to_string()),
+                ("events", "div,splits".into()),
             ])
             .send()
             .await?;
@@ -66,6 +68,39 @@ fn urlencode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+fn parse_events(events: &serde_json::Value) -> Vec<crate::ChartEvent> {
+    let mut out = Vec::new();
+    for (key, kind) in [("dividends", crate::EventKind::Dividend), ("splits", crate::EventKind::Split)] {
+        if let Some(values) = events[key].as_object() {
+            for value in values.values().take(10_000) {
+                let Some(ts) = value["date"].as_i64().filter(|n| *n > 0) else {
+                    continue;
+                };
+                let detail = if key == "dividends" {
+                    let Some(amount) = value["amount"].as_f64().filter(|n| n.is_finite() && *n >= 0.) else {
+                        continue;
+                    };
+                    format!("Dividend {amount} (provider currency)")
+                } else {
+                    let Some(ratio) = value["splitRatio"].as_str().filter(|s| s.len() <= 40) else {
+                        continue;
+                    };
+                    format!("Split {ratio}")
+                };
+                out.push(crate::ChartEvent {
+                    symbol: String::new(),
+                    ts,
+                    kind: kind.clone(),
+                    detail,
+                    source: "Yahoo corporate events".into(),
+                });
+            }
+        }
+    }
+    out.sort_by_key(|e| e.ts);
+    out
 }
 
 /// Map our timeframe to a Yahoo interval and the maximum lookback Yahoo serves for it.
@@ -91,6 +126,7 @@ pub struct Chart {
     pub bars: Vec<Bar>,
     pub last_price: Option<f64>,
     pub prev_close: Option<f64>,
+    pub events: Vec<crate::ChartEvent>,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +144,8 @@ struct ChartResult {
     #[serde(default)]
     timestamp: Vec<i64>,
     indicators: Indicators,
+    #[serde(default)]
+    events: serde_json::Value,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,6 +193,7 @@ fn parse_chart_with_volume(json: &str, missing_volume: f64) -> Result<Chart> {
         }
     }
     Ok(Chart {
+        events: parse_events(&r.events),
         bars,
         last_price: r.meta.regular_market_price,
         prev_close: r.meta.previous_close.or(r.meta.chart_previous_close),
@@ -169,6 +208,7 @@ impl YahooProvider {
         end: Option<i64>,
         limit: usize,
         missing_volume: f64,
+        options: crate::HistoryOptions,
     ) -> Result<Vec<Bar>> {
         let now = chrono::Utc::now().timestamp();
         let period2 = end.unwrap_or(now + 60);
@@ -186,7 +226,10 @@ impl YahooProvider {
         if period1 >= period2 {
             return Ok(Vec::new());
         }
-        let mut bars = self.chart(symbol, iv, period1, period2, missing_volume).await?.bars;
+        if options.price_basis != crate::PriceBasis::Provider {
+            bail!("Yahoo price-basis selection is unavailable; use provider prices or an Alpaca data source");
+        }
+        let mut bars = self.chart(symbol, iv, period1, period2, missing_volume, options.extended_hours).await?.bars;
         // Yahoo's weekly/monthly timestamps are session opens; snap to our calendar buckets.
         if tf.source_interval().is_some() || matches!(tf, Timeframe::W1 | Timeframe::MN1 | Timeframe::H4) {
             bars = tf.resample(&bars);
@@ -202,12 +245,32 @@ impl MarketData for YahooProvider {
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
-        self.history_with_volume(symbol, tf, end, limit, 0.0).await
+        self.history_with_volume(symbol, tf, end, limit, 0.0, crate::HistoryOptions::default()).await
+    }
+    async fn chart_history(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        options: crate::HistoryOptions,
+    ) -> Result<Vec<Bar>> {
+        self.history_with_volume(symbol, tf, end, limit, 0., options).await
+    }
+    async fn chart_events(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<crate::ChartEvent>> {
+        let mut events = self.chart(symbol, "1d", start, end, 0., false).await?.events;
+        for e in &mut events {
+            e.symbol = symbol.into();
+        }
+        Ok(events)
     }
 
     async fn scan_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
         // Unknown volume stays unavailable in predicates; a reported zero remains zero.
-        Ok(ScanHistory { bars: self.history_with_volume(symbol, tf, None, limit, f64::NAN).await?, simulated: false })
+        Ok(ScanHistory {
+            bars: self.history_with_volume(symbol, tf, None, limit, f64::NAN, crate::HistoryOptions::default()).await?,
+            simulated: false,
+        })
     }
 
     /// Batched via the spark endpoint (20 symbols per request).
@@ -473,6 +536,19 @@ pub fn parse_search(json: &str) -> Result<Vec<SearchHit>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn corporate_events_preserve_reported_times_amounts_and_split_ratios() {
+        let data = serde_json::json!({"dividends":{"1762785000":{"amount":0.26,"date":1762785000}},
+            "splits":{"1718026200":{"date":1718026200,"splitRatio":"10:1"}},
+            "earnings":{"1":{"date":1,"amount":1}}});
+        let events = parse_events(&data);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, crate::EventKind::Split);
+        assert_eq!(events[0].detail, "Split 10:1");
+        assert_eq!(events[1].ts, 1762785000);
+        assert!(events[1].detail.contains("0.26"));
+        assert!(events.iter().all(|e| !e.source.is_empty()));
+    }
 
     #[test]
     fn parses_fixture() {

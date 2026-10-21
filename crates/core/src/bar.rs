@@ -105,6 +105,22 @@ impl Series {
             }
         }
     }
+    /// Full provider snapshots/corrections replace exact timestamps, including older
+    /// loaded bars; partial trade aggregates must continue to use `apply_live`.
+    pub fn apply_snapshot(bars: &mut Vec<Bar>, live: Bar) -> bool {
+        match bars.binary_search_by_key(&live.ts, |b| b.ts) {
+            Ok(i) => {
+                let changed = bars[i] != live;
+                bars[i] = live;
+                changed
+            }
+            Err(i) if i == bars.len() => {
+                bars.push(live);
+                true
+            }
+            Err(_) => false,
+        }
+    }
 
     /// Merge newer bars (e.g. a streaming update) into the series.
     pub fn merge(&mut self, bars: impl IntoIterator<Item = Bar>) {
@@ -148,6 +164,9 @@ mod tests {
         assert!(!Series::apply_live(&mut v, Bar::new(0, 1.0, 1.0, 1.0, 1.0, 1.0)));
         assert!(Series::apply_live(&mut v, Bar::new(120, 11.5, 11.6, 11.4, 11.6, 5.0)));
         assert_eq!(v.len(), 2);
+        assert!(Series::apply_snapshot(&mut v, Bar::new(60, 10., 10.8, 9.5, 10.7, 80.)));
+        assert_eq!(v[0], Bar::new(60, 10., 10.8, 9.5, 10.7, 80.));
+        assert!(!Series::apply_snapshot(&mut v, Bar::new(0, 1., 1., 1., 1., 1.)));
     }
 
     #[test]

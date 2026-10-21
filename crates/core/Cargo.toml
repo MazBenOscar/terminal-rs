@@ -8,10 +8,10 @@ edition.workspace = true
 chrono.workspace = true
 chrono-tz = "0.10"
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-serde_json.workspace = true
 
 [[bench]]
 name = "indicators"

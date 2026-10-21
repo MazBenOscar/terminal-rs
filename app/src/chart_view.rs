@@ -166,6 +166,10 @@ pub struct ChartState {
     pub price_alert_actions: Vec<crate::price_alerts::Action>,
     pub account_overlay: crate::chart_account::Snapshot,
     pub export_notice: Option<Result<std::path::PathBuf, String>>,
+    events: Vec<tr_data::ChartEvent>,
+    events_range: Option<(i64, i64)>,
+    events_notice: String,
+    live_notice: Option<String>,
     context_price: Option<f64>,
     /// False while a pane is being dragged over the workspace: no crosshair or hover cards.
     pub hover_enabled: bool,
@@ -258,6 +262,10 @@ impl ChartState {
             price_alert_actions: Vec::new(),
             account_overlay: Default::default(),
             export_notice: None,
+            events: vec![],
+            events_range: None,
+            events_notice: String::new(),
+            live_notice: None,
             context_price: None,
             hover_enabled: true,
             controls_in_strip: false,
@@ -304,6 +312,7 @@ impl ChartState {
         }
         if !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
             self.data.session = tr_core::session::Session::Provider;
+            self.data.history = Default::default();
         }
         self.refresh_at = std::time::Instant::now();
         self.local_cursor = None;
@@ -329,6 +338,9 @@ impl ChartState {
         self.compare_error = None;
         self.compare_loading = false;
         self.markers.clear();
+        self.events.clear();
+        self.events_range = None;
+        self.events_notice.clear();
         // Never show the previous symbol's bars under the new title.
         self.bars = Arc::new(Vec::new());
         self.source_bars = Arc::new(Vec::new());
@@ -342,9 +354,11 @@ impl ChartState {
             generation: self.generation,
             symbol: self.symbol.clone(),
             tf: self.tf,
+            options: self.data.history,
             limit: initial_limit(self.tf),
         });
         self.last_live = None;
+        self.live_notice = None;
         if self.sec.has_congress_trades() {
             w.send(Request::Markers { pane: self.id, symbol: self.symbol.clone() });
         }
@@ -684,6 +698,7 @@ impl ChartState {
                     generation: self.generation,
                     symbol: sym,
                     tf: self.tf,
+                    options: self.data.history,
                     base: self.bars.clone(),
                 });
             }
@@ -781,7 +796,7 @@ impl ChartState {
             self.request_indicators(w);
             self.last_indicator_req = Some(std::time::Instant::now());
         }
-        if !live {
+        if !live || old_len != new_len {
             self.request_compare(w);
         }
     }
@@ -852,13 +867,13 @@ impl ChartState {
             self.replay_play = !self.replay_play;
             self.replay_tick = std::time::Instant::now();
         }
-        if ui.button("‹").on_hover_text("Previous source bar").clicked() {
+        if ui.button("Back").on_hover_text("Previous source bar").clicked() {
             index = index.saturating_sub(1);
         }
-        if ui.button("›").on_hover_text("Next source bar").clicked() {
+        if ui.button("Next").on_hover_text("Next source bar").clicked() {
             index = (index + 1).min(len - 1);
         }
-        if ui.available_width() > 180. {
+        if ui.available_width() > 240. {
             ui.add(egui::Slider::new(&mut index, 0..=len - 1).show_value(false));
         }
         if self.replay_play {
@@ -919,6 +934,24 @@ impl ChartState {
     pub fn on_heikin(&mut self, generation: u64, bars: Arc<Vec<Bar>>, gpu: SeriesGpu) {
         if generation == self.generation && Arc::ptr_eq(&self.bars, &bars) {
             self.ha_gpu = Some((bars, Some(gpu)));
+        }
+    }
+    pub fn on_live_status(&mut self, generation: u64, message: Option<String>) {
+        if generation == self.generation {
+            self.live_notice = message;
+        }
+    }
+    pub fn on_events(
+        &mut self,
+        generation: u64,
+        symbol: &str,
+        range: (i64, i64),
+        events: Vec<tr_data::ChartEvent>,
+        notice: String,
+    ) {
+        if generation == self.generation && symbol == self.symbol && self.events_range == Some(range) {
+            self.events = events;
+            self.events_notice = notice;
         }
     }
 
@@ -1061,6 +1094,24 @@ impl ChartState {
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
         self.refresh_view(w);
+        if self.data.show_events
+            && self.replay_cutoff.is_none()
+            && self.chart_type != ChartType::Renko
+            && let (Some(first), Some(last)) = (self.source_bars.first(), self.source_bars.last())
+        {
+            let range = (first.ts.saturating_sub(86_400), tr_core::session::next_bucket(self.tf, last.ts));
+            if self.events_range != Some(range) {
+                self.events_range = Some(range);
+                self.events_notice = "Loading corporate events…".into();
+                w.send(Request::ChartEvents {
+                    pane: self.id,
+                    generation: self.generation,
+                    symbol: self.symbol.clone(),
+                    start: range.0,
+                    end: range.1,
+                });
+            }
+        }
         self.local_cursor = None;
         if self.data.refresh_seconds > 0
             && !self.loading
@@ -1073,6 +1124,7 @@ impl ChartState {
                 generation: self.generation,
                 symbol: self.symbol.clone(),
                 tf: self.tf,
+                options: self.data.history,
                 limit: initial_limit(self.tf).max(self.bars.len()),
             });
         }
@@ -1427,6 +1479,7 @@ impl ChartState {
                 generation: self.generation,
                 symbol: self.symbol.clone(),
                 tf: self.tf,
+                options: self.data.history,
                 existing: self.source_bars.clone(),
                 limit: initial_limit(self.tf),
             });
@@ -1824,6 +1877,9 @@ impl ChartState {
         }
         self.data.analytics.paint_profile(ui, price_rect, &v, &self.bars, (self.tf, us), &scale);
         self.data.context.paint(ui, price_rect, &scale, &self.bars, (self.tf, us, self.data.session));
+        if self.data.show_events && self.replay_cutoff.is_none() && self.chart_type != ChartType::Renko {
+            crate::chart_events::paint(ui, price_rect, &v, &self.bars, self.tf, &self.events);
+        }
         if self.replay_cutoff.is_none()
             && self.chart_type != ChartType::Renko
             && (self.data.account.positions || self.data.account.orders)
@@ -1950,6 +2006,19 @@ impl ChartState {
     }
 
     fn paint_live_badge(&self, ui: &Ui, plot: Rect) {
+        if self.replay_cutoff.is_none()
+            && self.chart_type != ChartType::Renko
+            && plot.width() > 180.
+            && let Some(notice) = &self.live_notice
+        {
+            let painter = ui.painter_at(plot);
+            let galley = painter.layout_no_wrap("STREAM WAITING".into(), ui_font(10.), amber());
+            let badge = live_badge_rect(plot, galley.size().x);
+            painter.rect_filled(badge, 2., theme::card());
+            painter.galley(badge.left_center() + vec2(6., -galley.size().y / 2.), galley, amber());
+            ui.interact(badge, ui.id().with((self.id, "stream-status")), Sense::hover()).on_hover_text(notice);
+            return;
+        }
         if self.replay_cutoff.is_some()
             || self.chart_type == ChartType::Renko
             || !self.last_live.is_some_and(|t| t.elapsed().as_secs() < 5)
@@ -2527,6 +2596,13 @@ impl ChartState {
             self.data.analytics.menu(ui, self.context_timestamp, self.context_price)
         });
         ui.menu_button("Price and session context", |ui| self.data.context.menu(ui));
+        ui.menu_button("Earnings, dividends and splits", |ui| {
+            ui.checkbox(&mut self.data.show_events,"Show corporate event markers");
+            ui.label("E earnings · D dividends · S splits; hover for details and source.");
+            ui.label(&self.events_notice);
+            ui.label("Yahoo supplies available dividends/splits. Import attributed earnings in chart-events.json in the app data directory.");
+            if ui.button("Reload event data").clicked() { self.events_range = None; }
+        });
         ui.menu_button("Chart navigation", |ui| {
             ui.label("DATE YYYY-MM-DD jumps to a date; provider history limits apply.");
             if ui.button("Previous symbol (Up)").clicked() {
@@ -2683,9 +2759,12 @@ impl ChartState {
         ui.separator();
         ui.set_min_width(190.0);
         ui.menu_button("Time zone, session & refresh", |ui| {
+            if let Some(notice) = &self.live_notice {
+                ui.colored_label(amber(), notice);
+            }
             let before = self.data.clone();
             self.data.edit(ui, matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf));
-            if self.data.session != before.session {
+            if self.data.session != before.session || self.data.history != before.history {
                 self.pending_dates =
                     self.viewport.as_ref().and_then(|v| crate::chart_navigation::date_range(&self.bars, self.tf, v));
                 self.load(w);

@@ -170,12 +170,17 @@ repeatable; it does not manufacture evidence of equivalence.
 
 ## Remaining parity work
 
-Complete PCF and proprietary study formulas; exported TC2000 numeric fixtures;
-native provider-backed independent study histories and mixed-timeframe source
-edges; complete historical/venue calendars; requesting extended-hours history;
-corporate-action/source consistency and entitled equity streaming. Band fills
-are local to one study; cross-study fills and full drawing-tool coverage remain
-outside this increment. UI polish can follow the functional review above.
+See [the chart delivery roadmap](chart-roadmap.md) for the later audit increments:
+account overlays, multiple comparisons, scanner workflow, studies/types, advanced
+drawings, condition alerts, replay/exports, extra intervals and event/provider paths.
+That delivery adds extended-hours requests, supported raw/split history controls,
+attributed event/calendar imports and opt-in Alpaca minute streaming.
+
+Remaining full-parity work includes unrestricted PCF/proprietary studies, matched
+TC2000 numeric fixtures, native provider-backed independent study histories and
+mixed-timeframe edges, certified complete historical/venue calendars, verified
+earnings coverage and live-feed entitlements. Band fills remain local to one study;
+cross-study fills and additional specialist drawing tools are separate work.
 
 ## Verification on this machine
 

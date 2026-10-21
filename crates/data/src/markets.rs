@@ -61,9 +61,67 @@ impl Markets {
 
 #[async_trait]
 impl MarketData for Markets {
+    async fn chart_history(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        options: crate::HistoryOptions,
+    ) -> Result<Vec<Bar>> {
+        if options == crate::HistoryOptions::default() {
+            return self.history(symbol, tf, end, limit).await;
+        }
+        let sec = security(symbol);
+        match sec.class {
+            AssetClass::Equity | AssetClass::Etf if self.questrade().is_some() => {
+                self.questrade().unwrap().chart_history(&sec.ticker, tf, end, limit, options).await
+            }
+            AssetClass::Equity | AssetClass::Etf if self.alpaca.is_some() => {
+                self.alpaca.as_ref().unwrap().chart_history(&sec.ticker, tf, end, limit, options).await
+            }
+            AssetClass::Crypto | AssetClass::Govt => bail!("Extra equity history options do not apply to this asset"),
+            _ => self.yahoo.chart_history(&yahoo_symbol(&sec), tf, end, limit, options).await,
+        }
+    }
+    async fn chart_events(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<crate::ChartEvent>> {
+        let sec = security(symbol);
+        if !matches!(sec.class, AssetClass::Equity | AssetClass::Etf) {
+            bail!("No corporate events for this asset class");
+        }
+        let mut events = self.yahoo.chart_events(&yahoo_symbol(&sec), start, end).await?;
+        for event in &mut events {
+            event.symbol = symbol.into();
+        }
+        Ok(events)
+    }
+    async fn alert_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
+        let sec = security(symbol);
+        match (sec.class, self.questrade(), self.alpaca.as_ref()) {
+            (AssetClass::Equity | AssetClass::Etf, Some(q), _) => q.scan_history(&sec.ticker, tf, limit).await,
+            (AssetClass::Equity | AssetClass::Etf, None, Some(a)) => a.scan_history(&sec.ticker, tf, limit).await,
+            (AssetClass::Equity | AssetClass::Etf, None, None) => {
+                self.yahoo.scan_history(&yahoo_symbol(&sec), tf, limit).await
+            }
+            _ => self.scan_history(symbol, tf, limit).await,
+        }
+    }
     fn scan_cache_key(&self, symbol: &str) -> String {
+        if matches!(security(symbol).class, AssetClass::Equity | AssetClass::Etf)
+            && self.questrade().is_none()
+            && let Some(a) = &self.alpaca
+        {
+            return format!(
+                "alpaca:{}:{}",
+                a.feed_name(),
+                if a.streaming_enabled() { "exclusive-stream" } else { "yahoo-fallback" }
+            );
+        }
         match security(symbol).class {
             AssetClass::Equity | AssetClass::Etf if self.questrade().is_some() => "questrade",
+            AssetClass::Equity | AssetClass::Etf if self.alpaca.as_ref().is_some_and(|a| a.streaming_enabled()) => {
+                "alpaca-stream"
+            }
             AssetClass::Equity | AssetClass::Etf if self.alpaca.is_some() => "alpaca+yahoo",
             AssetClass::Crypto => "binance+coinbase",
             AssetClass::Govt => "treasury+yahoo+fred",
@@ -97,6 +155,9 @@ impl MarketData for Markets {
             }
             AssetClass::Equity | AssetClass::Etf if self.alpaca.is_some() => {
                 let a = self.alpaca.as_ref().expect("checked");
+                if a.streaming_enabled() {
+                    return a.history(&sec.ticker, tf, end, limit).await;
+                }
                 match a.history(&sec.ticker, tf, end, limit).await {
                     Ok(b) if !b.is_empty() => Ok(b),
                     _ => self.yahoo.history(&yahoo_symbol(&sec), tf, end, limit).await,
@@ -216,6 +277,9 @@ impl MarketData for Markets {
 
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
         let sec = security(symbol);
+        if matches!(sec.class, AssetClass::Equity | AssetClass::Etf) && self.questrade().is_none() {
+            return self.alpaca.as_ref().and_then(|a| a.live(&sec.ticker, tf));
+        }
         (sec.class == AssetClass::Crypto && tf.source_interval().is_none()).then(|| CryptoProvider::live(&sec, tf))
     }
 

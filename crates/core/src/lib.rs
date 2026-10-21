@@ -4,6 +4,7 @@
 pub mod bar;
 pub mod catalog;
 pub mod chart_analytics;
+pub mod exchange_calendar;
 pub mod indicators;
 pub mod options;
 pub mod price_alerts;

@@ -34,6 +34,34 @@ use tr_core::{AssetClass, Bar, Security, Timeframe, catalog};
 
 pub use cache::BarCache;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PriceBasis {
+    #[default]
+    Provider,
+    Raw,
+    SplitAdjusted,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryOptions {
+    pub extended_hours: bool,
+    pub price_basis: PriceBasis,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EventKind {
+    Earnings,
+    Dividend,
+    Split,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChartEvent {
+    pub symbol: String,
+    pub ts: i64,
+    pub kind: EventKind,
+    pub detail: String,
+    pub source: String,
+}
+
 /// Latest quote for a symbol.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Quote {
@@ -187,7 +215,14 @@ pub struct OptionChain {
 
 /// Live bar updates for one symbol and timeframe: each message is the latest state of
 /// the current (possibly still forming) bar. The feed stops when the receiver is dropped.
-pub type LiveFeed = mpsc::Receiver<Bar>;
+#[derive(Debug, Clone)]
+pub enum LiveUpdate {
+    Partial(Bar),
+    Snapshot(Bar),
+    Status(String),
+}
+pub type LiveFeed = mpsc::Receiver<LiveUpdate>;
+pub mod alpaca_stream;
 
 /// History fetched for a scanner, with explicit synthetic-data provenance.
 /// Unlike chart history, this path must never silently manufacture fallback prices.
@@ -232,6 +267,26 @@ pub trait MarketData: Send + Sync {
     /// ascending by time. Paging older history means calling again with `end` set to the
     /// oldest bar already held.
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>>;
+    async fn chart_history(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        options: HistoryOptions,
+    ) -> Result<Vec<Bar>> {
+        if options != HistoryOptions::default() {
+            anyhow::bail!("This provider does not support the requested extended-hours/price-basis options");
+        }
+        self.history(symbol, tf, end, limit).await
+    }
+    async fn chart_events(&self, _symbol: &str, _start: i64, _end: i64) -> Result<Vec<ChartEvent>> {
+        anyhow::bail!("Corporate events are unavailable from this provider")
+    }
+    /// Condition history uses the same stable source as alert observations.
+    async fn alert_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
+        self.scan_history(symbol, tf, limit).await
+    }
 
     /// Scanner history bypasses chart caches. Providers that synthesize data or wrap
     /// other sources must override this method to preserve provenance and failures.
@@ -336,6 +391,22 @@ impl<P: MarketData> Fallback<P> {
 
 #[async_trait]
 impl<P: MarketData> MarketData for Fallback<P> {
+    async fn chart_history(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        options: HistoryOptions,
+    ) -> Result<Vec<Bar>> {
+        self.primary.chart_history(symbol, tf, end, limit, options).await
+    }
+    async fn chart_events(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<ChartEvent>> {
+        self.primary.chart_events(symbol, start, end).await
+    }
+    async fn alert_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
+        self.primary.alert_history(symbol, tf, limit).await
+    }
     async fn alert_observation(&self, symbol: &str) -> Result<tr_core::price_alerts::Observation> {
         self.primary.alert_observation(symbol).await
     }
@@ -510,6 +581,19 @@ mod tests {
     #[tokio::test]
     async fn fallback_serves_sample_data() {
         let p = Fallback::new(Broken);
+        assert!(
+            p.chart_history(
+                "AAPL",
+                Timeframe::D1,
+                None,
+                100,
+                HistoryOptions { extended_hours: true, ..Default::default() }
+            )
+            .await
+            .is_err()
+        );
+        assert!(p.chart_events("AAPL", 1, 1000).await.is_err());
+        assert!(p.alert_history("AAPL", Timeframe::D1, 100).await.is_err());
         assert!(p.history("AAPL", Timeframe::D1, None, 100).await.unwrap_err().to_string().contains("offline"));
         let q = p.quotes(&["AAPL".into()]).await.unwrap();
         assert_eq!(q.len(), 1);

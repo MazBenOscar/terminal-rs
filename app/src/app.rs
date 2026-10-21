@@ -1056,6 +1056,16 @@ impl TerminalApp {
                         c.on_indicators(generation, revision, built);
                     }
                 }
+                Response::LiveStatus { pane, generation, message } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_live_status(generation, message);
+                    }
+                }
+                Response::ChartEvents { pane, generation, symbol, start, end, events, notice } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_events(generation, &symbol, (start, end), events, notice);
+                    }
+                }
                 Response::ExportChart { pane, result } => {
                     if let Some(c) = self.chart_mut(pane) {
                         c.export_notice = Some(result);

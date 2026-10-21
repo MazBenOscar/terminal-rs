@@ -107,6 +107,7 @@ pub enum Request {
         generation: u64,
         symbol: String,
         tf: Timeframe,
+        options: tr_data::HistoryOptions,
         limit: usize,
     },
     /// Prepend older history to `existing`.
@@ -115,6 +116,7 @@ pub enum Request {
         generation: u64,
         symbol: String,
         tf: Timeframe,
+        options: tr_data::HistoryOptions,
         existing: Arc<Vec<Bar>>,
         limit: usize,
     },
@@ -135,6 +137,7 @@ pub enum Request {
         generation: u64,
         symbol: String,
         tf: Timeframe,
+        options: tr_data::HistoryOptions,
         base: Arc<Vec<Bar>>,
     },
     CompareSearch {
@@ -157,6 +160,13 @@ pub enum Request {
     Markers {
         pane: PaneId,
         symbol: String,
+    },
+    ChartEvents {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        start: i64,
+        end: i64,
     },
     Quotes(Vec<String>),
     PriceAlertQuotes {
@@ -279,6 +289,20 @@ pub struct Profile {
 }
 
 pub enum Response {
+    LiveStatus {
+        pane: PaneId,
+        generation: u64,
+        message: Option<String>,
+    },
+    ChartEvents {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        start: i64,
+        end: i64,
+        events: Vec<tr_data::ChartEvent>,
+        notice: String,
+    },
     ExportChart {
         pane: PaneId,
         result: Result<PathBuf, String>,
@@ -720,9 +744,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let rows = scan(s.provider.clone(), definition, symbols, Duration::from_secs(15)).await;
             s.send(Response::Scan { pane, generation, rows });
         }
-        Request::History { pane, generation, symbol, tf, limit } => {
+        Request::History { pane, generation, symbol, tf, limit, options } => {
             let refreshing = current_series(s, pane, generation).is_some_and(|bars| !bars.is_empty());
-            let source = chart_cache_key(s.provider.as_ref(), &symbol);
+            let source = chart_options_key(s.provider.as_ref(), &symbol, options);
             if !claim_series(s, pane, generation, &source) {
                 if current_series(s, pane, generation).is_some() {
                     s.send(Response::HistoryError {
@@ -755,9 +779,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     live: false,
                 });
             }
-            match s.provider.history(&symbol, tf, None, limit).await {
+            match s.provider.chart_history(&symbol, tf, None, limit, options).await {
                 Ok(bars) if !bars.is_empty() => {
-                    if chart_cache_key(s.provider.as_ref(), &symbol) != source {
+                    if chart_options_key(s.provider.as_ref(), &symbol, options) != source {
                         s.send(Response::HistoryError {
                             pane,
                             generation,
@@ -788,7 +812,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         exhausted,
                         live: false,
                     });
-                    if !refreshing {
+                    if !refreshing && options == tr_data::HistoryOptions::default() {
                         start_live(s.clone(), pane, generation, symbol, tf);
                     }
                 }
@@ -796,8 +820,8 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
             }
         }
-        Request::MoreHistory { pane, generation, symbol, tf, existing, limit } => {
-            let source = chart_cache_key(s.provider.as_ref(), &symbol);
+        Request::MoreHistory { pane, generation, symbol, tf, existing, limit, options } => {
+            let source = chart_options_key(s.provider.as_ref(), &symbol, options);
             let previous = s
                 .series
                 .lock()
@@ -816,9 +840,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             // Page from the worker's copy (it may hold newer live bars than the UI's).
             let base = current_series(s, pane, generation).filter(|b| !b.is_empty()).unwrap_or(existing);
             let Some(first) = base.first().copied() else { return };
-            match s.provider.history(&symbol, tf, Some(first.ts), limit).await {
+            match s.provider.chart_history(&symbol, tf, Some(first.ts), limit, options).await {
                 Ok(older) => {
-                    if chart_cache_key(s.provider.as_ref(), &symbol) != source {
+                    if chart_options_key(s.provider.as_ref(), &symbol, options) != source {
                         s.send(Response::HistoryError {
                             pane,
                             generation,
@@ -861,9 +885,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     .unwrap_or_default();
             s.send(Response::Indicators { pane, generation, built, revision });
         }
-        Request::Compare { pane, generation, symbol, tf, base, revision } => {
+        Request::Compare { pane, generation, symbol, tf, base, revision, options } => {
             let limit = base.len().max(100);
-            match s.provider.history(&symbol, tf, None, limit).await {
+            let end = base.last().map(|b| tr_core::session::next_bucket(tf, b.ts));
+            match s.provider.chart_history(&symbol, tf, end, limit, options).await {
                 Ok(other) => {
                     let line = tokio::task::spawn_blocking(move || {
                         let values = align_compare(&base, &other);
@@ -890,6 +915,30 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         Request::CompareSearch { pane, query } => {
             let result = s.provider.search(&query).await.map_err(|e| format!("{e:#}"));
             s.send(Response::CompareSearch { pane, query, result });
+        }
+        Request::ChartEvents { pane, generation, symbol, start, end } => {
+            let result = s.provider.chart_events(&symbol, start, end).await;
+            let (mut events, mut notice) = match result {
+                Ok(events) => (
+                    events,
+                    "Provider events returned; coverage may be incomplete (earnings require import)".to_string(),
+                ),
+                Err(e) => (vec![], format!("Provider events unavailable: {e}")),
+            };
+            match crate::chart_events::imported(&data_dir().join("chart-events.json"), &symbol, start, end) {
+                Ok(imported) => {
+                    if !imported.is_empty() {
+                        notice.push_str(" · local events imported");
+                    }
+                    events.extend(imported);
+                }
+                Err(e) => {
+                    notice.push_str(&format!(" · import error: {e}"));
+                }
+            }
+            events.sort_by_key(|e| e.ts);
+            events.dedup_by(|a, b| a.ts == b.ts && a.kind == b.kind && a.detail == b.detail);
+            s.send(Response::ChartEvents { pane, generation, symbol, start, end, events, notice });
         }
         Request::Markers { pane, symbol } => {
             let sec = tr_data::security(&symbol);
@@ -920,42 +969,11 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::PriceAlertQuotes { revision, observations });
         }
         Request::PriceAlertRules { revision, alerts } => {
-            use futures::{StreamExt, stream};
-            let observations = stream::iter(alerts)
-                .map(|alert| async move {
-                    let result = tokio::time::timeout(Duration::from_secs(20), async {
-                        let rule = alert.rule.as_ref().ok_or("Missing condition")?;
-                        let mut q = s.provider.alert_observation(&alert.symbol).await.map_err(|e| e.to_string())?;
-                        if !q.valid_at(chrono::Utc::now().timestamp()) {
-                            return Err("Stale price observation".into());
-                        }
-                        let tf = match rule {
-                            tr_core::price_alerts::Rule::Formula { timeframe, .. } => *timeframe,
-                            _ => Timeframe::M1,
-                        };
-                        let history =
-                            s.provider.scan_history(&alert.symbol, tf, 1500).await.map_err(|e| e.to_string())?;
-                        if history.simulated != q.simulated {
-                            return Err("Condition and price data modes differ".into());
-                        }
-                        let last = history.bars.last().ok_or("No condition history")?;
-                        if last.ts > q.ts + 30 || q.ts.saturating_sub(last.ts) > tf.seconds() + 120 {
-                            return Err("Condition history is stale relative to price".into());
-                        }
-                        q.price = rule.value(&history.bars)?;
-                        q.source = format!("{} · {}", q.source, rule.label().chars().take(200).collect::<String>());
-                        Ok(q)
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err("Condition request timed out".into()));
-                    (alert.id, result)
-                })
-                .buffer_unordered(4)
-                .collect()
-                .await;
+            let observations = condition_observations(s.provider.clone(), alerts).await;
             s.send(Response::PriceAlertRules { revision, observations });
         }
         Request::ExportChart { pane, symbol, title, bars, image } => {
+            let title = format!("{title} · source {}", s.provider.name());
             let result = tokio::task::spawn_blocking(move || {
                 let content =
                     if image { crate::chart_export::svg(&title, &bars) } else { crate::chart_export::csv(&bars) };
@@ -1096,6 +1114,80 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         }
         Request::Trade(t) => s.send(Response::Trade(Box::new(trade(t).await))),
     }
+}
+
+/// Share provider requests across rules on the same symbol/interval. CPU evaluation
+/// stays off the async network executor, with at most four groups in flight.
+async fn condition_observations(
+    provider: Provider,
+    alerts: Vec<tr_core::price_alerts::Alert>,
+) -> Vec<(u64, Result<tr_core::price_alerts::Observation, String>)> {
+    use futures::{StreamExt, stream};
+    let mut groups = std::collections::BTreeMap::<(String, Timeframe), Vec<tr_core::price_alerts::Alert>>::new();
+    for alert in alerts {
+        let tf = match &alert.rule {
+            Some(tr_core::price_alerts::Rule::Formula { timeframe, .. }) => *timeframe,
+            _ => Timeframe::M1,
+        };
+        groups.entry((alert.symbol.clone(), tf)).or_default().push(alert);
+    }
+    let batches: Vec<_> = stream::iter(groups)
+        .map(|((symbol, tf), alerts)| {
+            let provider = provider.clone();
+            async move {
+                let input: Result<(tr_core::price_alerts::Observation, Vec<Bar>), String> =
+                    tokio::time::timeout(Duration::from_secs(20), async {
+                        let q = provider.alert_observation(&symbol).await.map_err(|e| e.to_string())?;
+                        if !q.valid_at(chrono::Utc::now().timestamp()) {
+                            return Err("Stale price observation".into());
+                        }
+                        let history = provider.alert_history(&symbol, tf, 1500).await.map_err(|e| e.to_string())?;
+                        if history.simulated != q.simulated {
+                            return Err("Condition and price data modes differ".into());
+                        }
+                        let last = history.bars.last().ok_or("No condition history")?;
+                        if last.ts > q.ts + 30 || q.ts.saturating_sub(last.ts) > tf.seconds() + 120 {
+                            return Err("Condition history is stale relative to price".into());
+                        }
+                        Ok((q, history.bars))
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("Condition request timed out".into()));
+                match input {
+                    Err(e) => alerts.into_iter().map(|a| (a.id, Err(e.clone()))).collect(),
+                    Ok((q, bars)) => {
+                        let ids: Vec<_> = alerts.iter().map(|a| a.id).collect();
+                        tokio::task::spawn_blocking(move || {
+                            alerts
+                                .into_iter()
+                                .map(|a| {
+                                    let result = (|| {
+                                        let rule = a.rule.as_ref().ok_or("Missing condition")?;
+                                        let mut observation = q.clone();
+                                        observation.price = rule.value(&bars)?;
+                                        observation.source = format!(
+                                            "{} · {}",
+                                            q.source,
+                                            rule.label().chars().take(200).collect::<String>()
+                                        );
+                                        Ok(observation)
+                                    })();
+                                    (a.id, result)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            ids.into_iter().map(|id| (id, Err("Condition evaluation failed".into()))).collect()
+                        })
+                    }
+                }
+            }
+        })
+        .buffer_unordered(4)
+        .collect()
+        .await;
+    batches.into_iter().flatten().collect()
 }
 
 /// Fetch a snapshot directly from the provider, independently of chart caches/live feeds.
@@ -1286,6 +1378,10 @@ async fn trade(t: TradeRequest) -> TradeResponse {
 
 /// Register a load for `generation`; generations only move forward, since request
 /// tasks run concurrently and may start out of order.
+fn chart_options_key(provider: &dyn tr_data::MarketData, symbol: &str, options: tr_data::HistoryOptions) -> String {
+    let base = chart_cache_key(provider, symbol);
+    if options == tr_data::HistoryOptions::default() { base } else { format!("{base}:options:{options:?}") }
+}
 fn chart_cache_key(provider: &dyn tr_data::MarketData, symbol: &str) -> String {
     // Versioned namespace excludes old, ambiguous caches (including legacy samples).
     let route = provider.scan_cache_key(symbol);
@@ -1332,10 +1428,19 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
             tokio::select! {
                 bar = feed.recv() => {
                     let Some(bar) = bar else { break };
+                    if let tr_data::LiveUpdate::Status(message) = &bar {
+                        s.send(Response::LiveStatus { pane,generation,message:Some(message.clone()) });
+                        continue;
+                    }
+                    s.send(Response::LiveStatus { pane,generation,message:None });
                     let mut map = s.series.lock().expect("series lock");
                     match map.get_mut(&pane) {
                         Some((g, bars, source)) if *g == generation && *source == chart_cache_key(s.provider.as_ref(),&symbol)
-                            => dirty |= Series::apply_live(Arc::make_mut(bars), bar),
+                            => dirty |= match bar {
+                                tr_data::LiveUpdate::Partial(bar) => Series::apply_live(Arc::make_mut(bars), bar),
+                                tr_data::LiveUpdate::Snapshot(bar) => Series::apply_snapshot(Arc::make_mut(bars), bar),
+                                tr_data::LiveUpdate::Status(_) => false,
+                            },
                         _ => break,
                     }
                 }
@@ -1439,6 +1544,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn condition_rules_share_history_requests_but_keep_their_own_values() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Counting {
+            fn name(&self) -> &str {
+                "fixture"
+            }
+            async fn history(&self, _: &str, tf: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Bar::new(tf.bucket_start(chrono::Utc::now().timestamp()), 100., 100., 100., 100., 1.)])
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut book = tr_core::price_alerts::Book::default();
+        for expression in ["C", "C+1"] {
+            let id = book.add("AAPL US Equity".into(), 100., tr_core::price_alerts::Direction::Above, false).unwrap();
+            book.set_rule(
+                id,
+                Some(tr_core::price_alerts::Rule::Formula { expression: expression.into(), timeframe: Timeframe::D1 }),
+            )
+            .unwrap();
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let mut results = runtime.block_on(condition_observations(Arc::new(Counting(count.clone())), book.alerts));
+        results.sort_by_key(|r| r.0);
+        assert_eq!(count.load(Ordering::SeqCst), 2); // one fresh minute quote and one shared daily history
+        assert_eq!(results[0].1.as_ref().unwrap().price, 100.);
+        assert_eq!(results[1].1.as_ref().unwrap().price, 101.);
+    }
 
     #[test]
     fn hidden_band_outlines_still_contribute_to_fill_autoscale() {
@@ -1485,7 +1621,14 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         runtime.block_on(handle(
             &shared,
-            Request::History { pane: 1, generation: 2, symbol: "AAPL US Equity".into(), tf: Timeframe::D1, limit: 100 },
+            Request::History {
+                pane: 1,
+                generation: 2,
+                symbol: "AAPL US Equity".into(),
+                tf: Timeframe::D1,
+                limit: 100,
+                options: Default::default(),
+            },
         ));
         assert!(
             matches!(rx.try_recv().unwrap(),Response::HistoryError {generation:2,error,..} if error.contains("route changed"))
@@ -1531,6 +1674,21 @@ mod tests {
 
     #[test]
     fn chart_cache_does_not_reuse_legacy_or_other_provider_history() {
+        let provider = tr_data::sample::SampleProvider::default();
+        let default = chart_options_key(&provider, "AAPL US Equity", Default::default());
+        let extended = chart_options_key(
+            &provider,
+            "AAPL US Equity",
+            tr_data::HistoryOptions { extended_hours: true, ..Default::default() },
+        );
+        let raw = chart_options_key(
+            &provider,
+            "AAPL US Equity",
+            tr_data::HistoryOptions { price_basis: tr_data::PriceBasis::Raw, ..Default::default() },
+        );
+        assert_ne!(default, extended);
+        assert_ne!(default, raw);
+        assert_ne!(raw, extended);
         let provider = tr_data::sample::SampleProvider::at(1_790_000_000, 100);
         let key = chart_cache_key(&provider, "AAPL US Equity");
         let mut cache = BarCache::open_in_memory().unwrap();

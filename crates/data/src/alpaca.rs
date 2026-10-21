@@ -18,12 +18,21 @@ pub struct AlpacaProvider {
     key: String,
     secret: String,
     feed: String,
+    stream: std::sync::Arc<crate::alpaca_stream::Hub>,
+    streaming: bool,
 }
 
 impl AlpacaProvider {
     pub fn new(key: String, secret: String, feed: String) -> Result<Self> {
         let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
-        Ok(Self { client, key, secret, feed })
+        let streaming = std::env::var("TR_ALPACA_STREAM").is_ok_and(|s| s == "1");
+        Ok(Self { client, key, secret, feed, stream: Default::default(), streaming })
+    }
+    pub fn streaming_enabled(&self) -> bool {
+        self.streaming
+    }
+    pub fn feed_name(&self) -> &str {
+        &self.feed
     }
 }
 
@@ -70,13 +79,31 @@ pub fn parse_bars_page(json: &str) -> Result<(Vec<Bar>, Option<String>)> {
 
 #[async_trait]
 impl MarketData for AlpacaProvider {
+    fn live(&self, symbol: &str, tf: Timeframe) -> Option<crate::LiveFeed> {
+        if self.streaming && tf == Timeframe::M1 {
+            self.stream.subscribe(symbol, self.key.clone(), self.secret.clone(), self.feed.clone())
+        } else {
+            None
+        }
+    }
     fn name(&self) -> &str {
         "alpaca"
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        self.chart_history(symbol, tf, end, limit, crate::HistoryOptions::default()).await
+    }
+    async fn chart_history(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        options: crate::HistoryOptions,
+    ) -> Result<Vec<Bar>> {
         if let Some((base, factor)) = tf.source_interval() {
-            let bars = self.history(symbol, base, end, limit.saturating_add(1).saturating_mul(factor)).await?;
+            let bars =
+                self.chart_history(symbol, base, end, limit.saturating_add(1).saturating_mul(factor), options).await?;
             return Ok(crate::clip(tf.resample(&bars), end, limit));
         }
         // Alpaca free data has a 15 minute delay for the latest bars on the SIP feed;
@@ -91,7 +118,7 @@ impl MarketData for AlpacaProvider {
                 ("end", end_dt.to_rfc3339()),
                 ("start", "2000-01-01T00:00:00Z".into()),
                 ("limit", (limit - out.len()).min(10_000).to_string()),
-                ("adjustment", "split".into()),
+                ("adjustment", if options.price_basis == crate::PriceBasis::Raw { "raw" } else { "split" }.into()),
                 ("feed", self.feed.clone()),
                 ("sort", "desc".into()),
             ];
