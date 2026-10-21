@@ -1,9 +1,15 @@
 use egui::{RichText, Ui};
 
 use crate::theme;
-use tr_core::indicators::study::{BandFill, PlotStyle, Settings};
+use tr_core::indicators::study::{BandFill, FillEdge, PlotStyle, Settings};
 
-pub fn output_styles(ui: &mut Ui, settings: &mut Settings, names: &[String]) {
+pub fn output_styles(
+    ui: &mut Ui,
+    settings: &mut Settings,
+    names: &[String],
+    targets: &[(FillEdge, String)],
+    error: Option<&str>,
+) {
     let base = settings.color.unwrap_or([100, 180, 240]);
     ui.collapsing("Output styles & band fill", |ui| {
         egui::Grid::new("outputs").num_columns(2).spacing([theme::dp(12.0), theme::dp(6.0)]).show(ui, |ui| {
@@ -35,13 +41,21 @@ pub fn output_styles(ui: &mut Ui, settings: &mut Settings, names: &[String]) {
                 ui.end_row();
             }
         });
-        if names.len() >= 2 {
+        if let Some(error) = error {
+            ui.label(RichText::new(error).color(theme::down()));
+        }
+        if !names.is_empty() {
             ui.add_space(theme::dp(4.0));
             let mut enabled = settings.fill.is_some();
             if ui.checkbox(&mut enabled, "Fill between outputs").changed() {
                 settings.fill = enabled.then(|| BandFill {
-                    upper: names.iter().find(|n| n.as_str() == "Upper").unwrap_or(&names[0]).clone(),
-                    lower: names.iter().find(|n| n.as_str() == "Lower").unwrap_or(&names[names.len() - 1]).clone(),
+                    upper: names.iter().find(|n| n.as_str() == "Upper").unwrap_or(&names[0]).clone().into(),
+                    lower: names
+                        .iter()
+                        .find(|n| n.as_str() == "Lower")
+                        .unwrap_or(&names[names.len() - 1])
+                        .clone()
+                        .into(),
                     color: settings.color.unwrap_or([100, 180, 240]),
                     opacity: 35,
                 });
@@ -51,11 +65,21 @@ pub fn output_styles(ui: &mut Ui, settings: &mut Settings, names: &[String]) {
                     for (label, value) in [("From", &mut fill.upper), ("To", &mut fill.lower)] {
                         ui.label(RichText::new(label).color(theme::muted()));
                         egui::ComboBox::from_id_salt(label)
-                            .selected_text(value.as_str())
+                            .selected_text(
+                                targets
+                                    .iter()
+                                    .find(|(edge, _)| edge == value)
+                                    .map_or(value.output.as_str(), |(_, label)| label.as_str()),
+                            )
                             .width(theme::dp(140.0))
                             .show_ui(ui, |ui| {
                                 for name in names {
-                                    ui.selectable_value(value, name.clone(), name);
+                                    ui.selectable_value(value, name.clone().into(), name);
+                                }
+                                if label == "To" {
+                                    for (edge, label) in targets {
+                                        ui.selectable_value(value, edge.clone(), label);
+                                    }
                                 }
                             });
                         ui.end_row();

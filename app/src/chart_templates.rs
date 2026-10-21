@@ -103,7 +103,7 @@ impl Template {
             .map_err(|e| format!("Saving chart template: {e}"))
     }
 
-    /// Merge by remapping every imported ID and both calculation and pane edges.
+    /// Merge by remapping every imported ID and calculation, pane and fill edges.
     /// All validation happens before the caller's current setup changes.
     pub fn merge_into(&self, current: &mut Vec<Spec>) -> Result<(), String> {
         if current.len() + self.indicators.len() > 128 {
@@ -129,6 +129,20 @@ impl Template {
             }
             if let study::Pane::With(id) = &mut c.pane {
                 *id = ids[id];
+            }
+            // A missing imported target must not accidentally bind to an
+            // unrelated existing study whose ID happens to match.
+            if c.fill.as_ref().is_some_and(|fill| {
+                [&fill.upper, &fill.lower].iter().any(|edge| edge.study.is_some_and(|id| !ids.contains_key(&id)))
+            }) {
+                c.fill = None;
+            }
+            if let Some(fill) = &mut c.fill {
+                for edge in [&mut fill.upper, &mut fill.lower] {
+                    if let Some(id) = &mut edge.study {
+                        *id = ids[id];
+                    }
+                }
             }
         }
         merged.extend(template.indicators);
@@ -170,6 +184,31 @@ mod tests {
         assert!(bad.merge_into(&mut current).is_err());
         assert_eq!(before, current);
     }
+    #[test]
+    fn cross_study_fill_template_round_trip_and_merge_remap_targets() {
+        let mut t = template();
+        t.indicators[0].chart.as_mut().unwrap().fill = Some(study::BandFill {
+            upper: "RSI".into(),
+            lower: study::FillEdge { study: Some(2), output: "EMA".into() },
+            color: [1, 2, 3],
+            opacity: 35,
+        });
+        let mut restored: Template = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, t);
+        let mut current = t.indicators.clone();
+        restored.merge_into(&mut current).unwrap();
+        let settings = current[2].chart.as_ref().unwrap();
+        assert_eq!(settings.id, 3);
+        let fill = settings.fill.as_ref().unwrap();
+        assert_eq!(fill.upper.study, None);
+        assert_eq!(fill.lower.study, Some(4));
+        assert!(study::validate_fill_edge(&current, 2, &fill.lower).is_ok());
+        t.indicators[0].chart.as_mut().unwrap().fill.as_mut().unwrap().lower.study = Some(999);
+        t.merge_into(&mut current).unwrap();
+        assert!(current[4].chart.as_ref().unwrap().fill.is_none());
+    }
+
     #[test]
     fn persistence_and_corrupt_file_protection() {
         let dir = std::env::temp_dir().join(format!(
