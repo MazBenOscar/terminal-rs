@@ -43,6 +43,16 @@ impl Default for ColumnSet {
 }
 
 impl ColumnSet {
+    /// Keep valid columns in input order, bounded by the supported column count.
+    /// The returned count includes both invalid columns and excess valid columns.
+    pub fn sanitized(mut self) -> (Self, usize) {
+        let original_len = self.columns.len();
+        self.columns.retain(|column| column.validate().is_ok());
+        self.columns.truncate(MAX_COLUMNS);
+        let dropped = original_len - self.columns.len();
+        (self, dropped)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.columns.len() > MAX_COLUMNS {
             return Err(format!("At most {MAX_COLUMNS} columns are supported"));
@@ -189,6 +199,21 @@ mod tests {
         assert!(sort_key(Some(&Cell::Check(true))) > sort_key(Some(&Cell::Check(false))));
         assert_eq!(sort_key(Some(&Cell::Unavailable("No history".into()))), None);
         assert_eq!(sort_key(None), None);
+    }
+
+    #[test]
+    fn sanitized_drops_invalid_and_oversized_columns_before_truncating() {
+        let mut columns = vec![column("INVALID("), column(&"C".repeat(501)), column("C")];
+        columns[2].title = "x".repeat(25);
+        columns.extend((0..10).map(|id| ColumnDef { id, ..column("C") }));
+        let set = ColumnSet { name: "Imported".into(), columns, ..Default::default() };
+        let (clean, dropped) = set.sanitized();
+        assert_eq!(dropped, 5);
+        assert_eq!(clean.name, "Imported");
+        assert_eq!(clean.columns.iter().map(|c| c.id).collect::<Vec<_>>(), (0..8).collect::<Vec<_>>());
+        assert!(clean.validate().is_ok());
+        assert_eq!(clean.clone().sanitized(), (clean, 0));
+        assert_eq!(ColumnSet::default().sanitized(), (ColumnSet::default(), 0));
     }
 
     #[test]

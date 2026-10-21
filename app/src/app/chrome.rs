@@ -908,7 +908,10 @@ impl TerminalApp {
                 },
                 None => match msg.strip_prefix(crate::price_alerts::TOAST_PREFIX) {
                     Some(m) => ("Price Alert", m, amber()),
-                    None => ("Congress Alert", msg.as_str(), amber()),
+                    None => match msg.strip_prefix("Layout: ") {
+                        Some(m) => ("Layout", m, amber()),
+                        None => ("Congress Alert", msg.as_str(), amber()),
+                    },
                 },
             };
             p.rect_filled(Rect::from_min_size(r.min + vec2(1.0, 6.0), vec2(3.0, r.height() - 12.0)), 1.5, color);

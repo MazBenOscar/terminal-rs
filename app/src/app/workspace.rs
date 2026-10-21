@@ -807,6 +807,16 @@ impl TerminalApp {
     /// panes can never reach the new ones.
     pub(super) fn apply_doc(&mut self, mut doc: LayoutDoc) {
         doc.repair();
+        if doc.watch_columns.validate().is_err() {
+            let (columns, dropped) = doc.watch_columns.sanitized();
+            doc.watch_columns = columns;
+            if dropped > 0 {
+                self.toasts.push((
+                    "Layout: Some watchlist columns in this layout were invalid and were skipped".into(),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
         self.watch_columns = doc.watch_columns;
         self.refresh_columns();
         for p in std::mem::take(&mut self.panes) {

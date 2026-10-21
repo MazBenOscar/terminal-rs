@@ -60,6 +60,9 @@ pub const CONGRESS_REFRESH_MIN: u64 = 30;
 /// Bounded, on-demand scanner universe. Larger universes need a bulk data provider.
 pub const MAX_SCAN_SYMBOLS: usize = 200;
 
+const MAX_COLUMN_HISTORY_BARS: usize = 5_000;
+const MAX_SCAN_HISTORY_BARS: usize = 5_000;
+
 #[derive(Debug, Clone)]
 pub struct ScanRow {
     pub symbol: String,
@@ -830,11 +833,15 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         Request::WatchlistColumns { revision, symbols, columns } => {
             use futures::{StreamExt, stream};
             use tr_core::columns::Cell;
-            let plan = column_history_plan(&columns);
+            let valid: Vec<_> = columns.iter().map(|c| c.validate().is_ok()).collect();
+            let valid_columns: Vec<_> =
+                columns.iter().zip(&valid).filter(|(_, valid)| **valid).map(|(c, _)| c.clone()).collect();
+            let plan = column_history_plan(&valid_columns);
             let cells = stream::iter(symbols.into_iter().take(200))
                 .map(|symbol| {
                     let plan = &plan;
                     let columns = &columns;
+                    let valid = &valid;
                     async move {
                         let result = tokio::time::timeout(Duration::from_secs(20), async {
                             let mut set = tr_core::conditions::SeriesSet::new();
@@ -844,7 +851,19 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                                     .map_err(|_| format!("No {} history", tf.label()))?;
                                 set.insert(tf, tr_core::Series::new(&symbol, tf, bars));
                             }
-                            Ok::<_, String>(columns.iter().map(|c| c.evaluate(&set)).collect::<Vec<_>>())
+                            Ok::<_, String>(
+                                columns
+                                    .iter()
+                                    .zip(valid)
+                                    .map(|(c, valid)| {
+                                        if *valid {
+                                            c.evaluate(&set)
+                                        } else {
+                                            Cell::Unavailable("Invalid column".into())
+                                        }
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
                         })
                         .await;
                         let values = match result {
@@ -858,6 +877,15 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                                 columns.len()
                             ],
                         };
+                        let values = values
+                            .into_iter()
+                            .zip(valid)
+                            .map(
+                                |(value, valid)| {
+                                    if *valid { value } else { Cell::Unavailable("Invalid column".into()) }
+                                },
+                            )
+                            .collect();
                         (symbol, values)
                     }
                 })
@@ -1376,7 +1404,7 @@ async fn scan(provider: Provider, definition: ScanDefinition, symbols: Vec<Strin
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && seen.insert(s.to_ascii_uppercase()))
         .collect();
-    let invalid = definition.validate().err().or_else(|| {
+    let invalid = definition.validate().err().map(|reason| format!("Invalid scan: {reason}")).or_else(|| {
         (symbols.len() > MAX_SCAN_SYMBOLS)
             .then(|| format!("Scan limit is {MAX_SCAN_SYMBOLS} unique symbols; narrow the universe"))
     });
@@ -1387,7 +1415,7 @@ async fn scan(provider: Provider, definition: ScanDefinition, symbols: Vec<Strin
             .collect();
     }
     // Extra history stabilizes Wilder RSI; indicator evaluation still checks warm-up.
-    let limit = definition.required_bars().saturating_mul(3).max(300);
+    let limit = definition.required_bars().saturating_mul(3).clamp(300, MAX_SCAN_HISTORY_BARS);
     let fetches = symbols.into_iter().map(|symbol| {
         let provider = provider.clone();
         let definition = &definition;
@@ -1404,7 +1432,8 @@ async fn scan(provider: Provider, definition: ScanDefinition, symbols: Vec<Strin
                     let ts = series.bars.last().map(|b| b.ts);
                     let mut set = tr_core::scanner::SeriesSet::from([(definition.timeframe, series)]);
                     for tf in definition.timeframes().into_iter().skip(1) {
-                        let limit = definition.required_bars_for(tf).saturating_mul(3).max(300);
+                        let limit =
+                            definition.required_bars_for(tf).saturating_mul(3).clamp(300, MAX_SCAN_HISTORY_BARS);
                         if let Ok(Ok(extra)) =
                             tokio::time::timeout(timeout, provider.scan_history(&symbol, tf, limit)).await
                         {
@@ -1450,6 +1479,14 @@ mod column_tests {
             ..column(Timeframe::D1)
         };
         assert!(column_history_plan(&[c]).iter().all(|(_, limit)| *limit >= 300));
+        let mut definition = ScanDefinition::default();
+        definition.root.items = vec![tr_core::conditions::ConditionItem::Compare(tr_core::conditions::ScanCondition {
+            right: tr_core::scanner::ScanOperand::Sma { period: 500, source: tr_core::scanner::Source::Close },
+            right_bars_ago: 10_000,
+            ..Default::default()
+        })];
+        let c = ColumnDef { kind: ColumnKind::Condition(definition.root), ..column(Timeframe::D1) };
+        assert_eq!(column_history_plan(&[c]), vec![(Timeframe::D1, MAX_COLUMN_HISTORY_BARS)]);
     }
 }
 
@@ -1458,8 +1495,13 @@ fn column_history_plan(columns: &[tr_core::columns::ColumnDef]) -> Vec<(Timefram
     for column in columns {
         for tf in column.timeframes() {
             if !plan.iter().any(|(existing, _)| *existing == tf) {
-                let limit =
-                    columns.iter().map(|c| c.required_bars_for(tf)).max().unwrap_or(1).saturating_mul(3).max(300);
+                let limit = columns
+                    .iter()
+                    .map(|c| c.required_bars_for(tf))
+                    .max()
+                    .unwrap_or(1)
+                    .saturating_mul(3)
+                    .clamp(300, MAX_COLUMN_HISTORY_BARS);
                 plan.push((tf, limit));
             }
         }
@@ -1521,7 +1563,7 @@ async fn scan_universe(
         }]
     };
     if let Err(e) = definition.validate() {
-        return failed(e);
+        return failed(format!("Invalid scan: {e}"));
     }
     let listings =
         match tr_data::universe::load_or_fetch(&data_dir().join("universe.json"), Duration::from_secs(86_400)).await {
@@ -1532,7 +1574,7 @@ async fn scan_universe(
     let total = symbols.len();
     let done = AtomicUsize::new(0);
     s.send(Response::ScanProgress { pane, generation, done: 0, total });
-    let limit = definition.required_bars().saturating_mul(3).max(300);
+    let limit = definition.required_bars().saturating_mul(3).clamp(300, MAX_SCAN_HISTORY_BARS);
     futures::stream::iter(symbols.into_iter().map(|symbol| {
         let done = &done;
         async move {
@@ -1545,7 +1587,8 @@ async fn scan_universe(
                         let ts = series.bars.last().map(|b| b.ts);
                         let mut set = tr_core::scanner::SeriesSet::from([(definition.timeframe, series)]);
                         for tf in definition.timeframes().into_iter().skip(1) {
-                            let limit = definition.required_bars_for(tf).saturating_mul(3).max(300);
+                            let limit =
+                                definition.required_bars_for(tf).saturating_mul(3).clamp(300, MAX_SCAN_HISTORY_BARS);
                             if let Ok((bars, _)) = universe_history(s, &symbol, tf, limit).await {
                                 set.insert(tf, Series::new(symbol.clone(), tf, bars));
                             }
@@ -2199,6 +2242,24 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let tf = Timeframe::D1;
         let symbol = "AAPL US Equity";
+        let mut invalid = ScanDefinition::default();
+        invalid.root.items.clear();
+        let expected = format!("Invalid scan: {}", invalid.validate().unwrap_err());
+        let rows = rt.block_on(scan(
+            fixture.clone(),
+            invalid.clone(),
+            vec![symbol.into(), "MSFT US Equity".into()],
+            Duration::from_secs(1),
+        ));
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row.error.as_ref() == Some(&expected) && row.evaluation.is_none() && row.ts.is_none())
+        );
+        let rows = rt.block_on(scan_universe(&s, 1, 1, &invalid, Universe::default(), &AtomicBool::new(false)));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].error.as_ref(), Some(&expected));
+        assert!(fixture.requests.lock().unwrap().is_empty(), "Invalid scans must not fetch history");
         let get = |limit| rt.block_on(universe_history(&s, symbol, tf, limit));
         assert!(get(300).unwrap().1);
         assert!(get(300).unwrap().1);
