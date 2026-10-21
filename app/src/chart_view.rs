@@ -307,6 +307,22 @@ impl ChartState {
         self.bars.is_empty()
     }
 
+    fn effective_session(&self) -> tr_core::session::Session {
+        if matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
+            self.data.session
+        } else {
+            tr_core::session::Session::Provider
+        }
+    }
+
+    fn effective_history(&self) -> tr_data::HistoryOptions {
+        if matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
+            self.data.history
+        } else {
+            Default::default()
+        }
+    }
+
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
         if self.compare.is_none() && !self.data.comparisons.is_empty() {
@@ -327,10 +343,6 @@ impl ChartState {
             .collect();
         if let Some(view) = self.viewport {
             self.plot_width = view.width_px;
-        }
-        if !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
-            self.data.session = tr_core::session::Session::Provider;
-            self.data.history = Default::default();
         }
         self.refresh_at = std::time::Instant::now();
         self.local_cursor = None;
@@ -372,7 +384,7 @@ impl ChartState {
             generation: self.generation,
             symbol: self.symbol.clone(),
             tf: self.tf,
-            options: self.data.history,
+            options: self.effective_history(),
             limit: initial_limit(self.tf),
         });
         self.last_live = None;
@@ -396,9 +408,8 @@ impl ChartState {
             self.compare = None;
         }
         self.sec = sec;
-        if !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
-            self.data.session = tr_core::session::Session::Provider;
-        }
+        self.data.analytics.baseline = None;
+        self.data.analytics.renko_size = 0.;
         self.draw = DrawState::default();
         self.load(w);
     }
@@ -542,22 +553,22 @@ impl ChartState {
         let Ok(expression) = crate::chart_workflow::expression(scan) else {
             return;
         };
-        if self
-            .indicators
-            .iter()
-            .any(|s| s.code == "PCF" && s.chart.as_ref().and_then(|s| s.expression.as_ref()) == Some(&expression))
-        {
-            return;
-        }
-        if self.indicators.len() >= 128 {
+        let previous = self.indicators.iter().position(|s| s.chart.as_ref().is_some_and(|c| c.scan_plot));
+        if previous.is_none() && self.indicators.len() >= 128 {
             return;
         }
         let mut spec = IndicatorSpec::new("PCF", &[]).unwrap();
         spec.chart = Some(study::Settings::new(0, &spec));
         let settings = spec.chart.as_mut().unwrap();
         settings.expression = Some(expression);
+        settings.scan_plot = true;
         settings.pane = StudyPane::Own;
-        self.indicators.push(spec);
+        if let Some(index) = previous {
+            spec.chart.as_mut().unwrap().id = self.indicators[index].chart.as_ref().unwrap().id;
+            self.indicators[index] = spec;
+        } else {
+            self.indicators.push(spec);
+        }
         study::assign_ids(&mut self.indicators);
         self.request_indicators(w);
     }
@@ -686,7 +697,7 @@ impl ChartState {
                 tf: self.tf,
                 specs: self.indicators.clone(),
                 palette: theme::palette(),
-                session: self.data.session,
+                session: self.effective_session(),
             });
         }
     }
@@ -716,7 +727,7 @@ impl ChartState {
                     generation: self.generation,
                     symbol: sym,
                     tf: self.tf,
-                    options: self.data.history,
+                    options: self.effective_history(),
                     base: self.bars.clone(),
                 });
             }
@@ -740,9 +751,10 @@ impl ChartState {
         if generation != self.generation {
             return;
         }
-        let filtered = self.data.session != tr_core::session::Session::Provider && self.tf.is_intraday();
+        let session = self.effective_session();
+        let filtered = session != tr_core::session::Session::Provider && self.tf.is_intraday();
         let (bars, gpu, prepended) = if filtered {
-            let filtered = Arc::new(self.data.session.filter(&bars, self.tf));
+            let filtered = Arc::new(session.filter(&bars, self.tf));
             let prepended = if prepended > 0 {
                 self.bars.first().map_or(0, |first| filtered.partition_point(|b| b.ts < first.ts))
             } else {
@@ -819,8 +831,31 @@ impl ChartState {
         }
     }
 
+    fn effective_box_size(&self) -> f64 {
+        if self.data.analytics.renko_size > 0. {
+            self.data.analytics.renko_size
+        } else {
+            let n = self
+                .replay_cutoff
+                .map_or(self.source_bars.len(), |cutoff| self.source_bars.partition_point(|b| b.ts <= cutoff));
+            tr_core::chart_analytics::auto_box_size(&self.source_bars[..n])
+        }
+    }
+
+    fn box_controls(&mut self, ui: &mut Ui) {
+        let mut auto = self.data.analytics.renko_size <= 0.;
+        let effective = self.effective_box_size();
+        if ui.checkbox(&mut auto, "Auto box (ATR 14)").changed() {
+            self.data.analytics.renko_size = if auto { 0. } else { effective };
+        }
+        let mut size = if auto { effective } else { self.data.analytics.renko_size };
+        if ui.add_enabled(!auto, egui::DragValue::new(&mut size).range(0.000001..=1e9).speed(0.1)).changed() {
+            self.data.analytics.renko_size = size;
+        }
+    }
+
     fn refresh_view(&mut self, w: &Worker) {
-        let size = (self.chart_type == ChartType::Renko).then_some(self.data.analytics.renko_size);
+        let size = (self.chart_type == ChartType::Renko).then_some(self.effective_box_size());
         let config = (self.replay_cutoff, size.map(f64::to_bits));
         if self.source_bars.is_empty()
             || self.view_source.as_ref().is_some_and(|s| Arc::ptr_eq(s, &self.source_bars))
@@ -828,21 +863,35 @@ impl ChartState {
         {
             return;
         }
+        if config == self.view_config
+            && let Some(cutoff) = self.replay_cutoff
+            && let Some(old) = &self.view_source
+        {
+            let n = self.source_bars.partition_point(|b| b.ts <= cutoff);
+            let old_n = old.partition_point(|b| b.ts <= cutoff);
+            if n == old_n && self.source_bars[..n] == old[..old_n] {
+                self.view_source = Some(self.source_bars.clone());
+                return;
+            }
+        }
+        let reset = config.1 != self.view_config.1;
         self.view_source = Some(self.source_bars.clone());
         self.view_config = config;
         self.view_revision = self.view_revision.wrapping_add(1);
-        // Invalidate all derived data before a historical cutoff changes. Never flash future studies.
         self.indicator_revision = self.indicator_revision.wrapping_add(1);
         self.compare_revision = self.compare_revision.wrapping_add(1);
-        self.built.clear();
-        self.compare_line = None;
-        self.comparisons.clear();
-        self.bars = Arc::new(vec![]);
-        self.gpu = None;
-        self.ha_gpu = None;
-        self.manual_scale = None;
-        self.shown_scale = None;
-        self.glide = None;
+        if reset {
+            self.built.clear();
+            self.compare_line = None;
+            self.comparisons.clear();
+            self.bars = Arc::new(vec![]);
+            self.gpu = None;
+            self.ha_gpu = None;
+            self.viewport = None;
+            self.manual_scale = None;
+            self.shown_scale = None;
+            self.glide = None;
+        }
         w.send(Request::ChartView {
             pane: self.id,
             generation: self.generation,
@@ -860,13 +909,29 @@ impl ChartState {
         result: Result<(Arc<Vec<Bar>>, SeriesGpu), String>,
         w: &Worker,
     ) {
-        if generation != self.generation || revision != self.view_revision || !Arc::ptr_eq(&source, &self.source_bars) {
+        if generation != self.generation || revision != self.view_revision {
             return;
+        }
+        if !Arc::ptr_eq(&source, &self.source_bars) {
+            let Some(cutoff) = self.replay_cutoff else { return };
+            let n = self.source_bars.partition_point(|b| b.ts <= cutoff);
+            let old_n = source.partition_point(|b| b.ts <= cutoff);
+            // Live tails may change while an identical replay prefix is building.
+            if n != old_n || self.source_bars[..n] != source[..old_n] {
+                return;
+            }
         }
         match result {
             Ok((bars, gpu)) => {
-                self.viewport = None;
+                let viewport = self.viewport;
+                let old_len = self.bars.len();
                 self.apply_view(bars, gpu, 0, false, w);
+                if let Some(mut view) = viewport {
+                    if view.right >= old_len as f64 - 1. {
+                        view.right += self.bars.len() as f64 - old_len as f64;
+                    }
+                    self.viewport = Some(view);
+                }
             }
             Err(e) => self.error = Some(e),
         }
@@ -1142,7 +1207,7 @@ impl ChartState {
                 generation: self.generation,
                 symbol: self.symbol.clone(),
                 tf: self.tf,
-                options: self.data.history,
+                options: self.effective_history(),
                 limit: initial_limit(self.tf).max(self.bars.len()),
             });
         }
@@ -1338,6 +1403,20 @@ impl ChartState {
         let Some(gpu) = display else {
             let msg = self.error.clone().unwrap_or_else(|| format!("Loading {} {}…", self.symbol, self.tf));
             painter.text(plot_all.center(), Align2::CENTER_CENTER, msg, mono(13.0), amber_dim());
+            if self.error.is_some() && self.chart_type == ChartType::Renko {
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(Rect::from_min_size(plot_all.center() + vec2(-230., 24.), vec2(460., 60.))),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            self.box_controls(ui);
+                            if ui.button("Back to candles").clicked() {
+                                self.chart_type = ChartType::Candles;
+                            }
+                        });
+                    },
+                );
+            }
             return clicked;
         };
 
@@ -1499,7 +1578,7 @@ impl ChartState {
                 generation: self.generation,
                 symbol: self.symbol.clone(),
                 tf: self.tf,
-                options: self.data.history,
+                options: self.effective_history(),
                 existing: self.source_bars.clone(),
                 limit: initial_limit(self.tf),
             });
@@ -1930,7 +2009,7 @@ impl ChartState {
             self.paint_price_alerts(ui, price_rect, &scale);
         }
         self.data.analytics.paint_profile(ui, price_rect, &v, &self.bars, (self.tf, us), &scale);
-        self.data.context.paint(ui, price_rect, &scale, &self.bars, (self.tf, us, self.data.session));
+        self.data.context.paint(ui, price_rect, &scale, &self.bars, (self.tf, us, self.effective_session()));
         if self.data.show_events && self.replay_cutoff.is_none() && self.chart_type != ChartType::Renko {
             crate::chart_events::paint(ui, price_rect, &v, &self.bars, self.tf, &self.events);
         }
@@ -2588,9 +2667,6 @@ impl ChartState {
                             self.show_volume = template.show_volume;
                             let old_session = self.data.session;
                             self.data = template.data;
-                            if !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
-                                self.data.session = tr_core::session::Session::Provider;
-                            }
                             if old_session != self.data.session {
                                 self.load(w);
                             }
@@ -2697,7 +2773,11 @@ impl ChartState {
                             self.chart_type.label(),
                             if self.replay_cutoff.is_some() { " · REPLAY" } else { "" }
                         ),
-                        bars: Arc::new(self.bars[a..b].to_vec()),
+                        bars: Arc::new(if self.chart_type == ChartType::HeikinAshi {
+                            tr_core::chart_analytics::heikin_ashi(&self.bars)[a..b].to_vec()
+                        } else {
+                            self.bars[a..b].to_vec()
+                        }),
                         image,
                     });
                     self.export_notice = None;
@@ -2733,12 +2813,7 @@ impl ChartState {
             ui.label("Drawings, account levels and disclosure markers are hidden during replay.");
         });
         if self.chart_type == ChartType::Renko {
-            ui.add(
-                egui::DragValue::new(&mut self.data.analytics.renko_size)
-                    .range(0.000001..=1e9)
-                    .speed(0.1)
-                    .prefix("Renko box "),
-            );
+            self.box_controls(ui);
             ui.label("Close-only, one-box reversal; studies use synthetic bricks.");
             ui.label("Comparisons and drawings are unavailable on repeated brick timestamps.");
         }
@@ -3842,7 +3917,82 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
 mod tests {
     use super::*;
     #[test]
-    fn replay_invalidates_future_derivatives_and_rejects_older_views() {
+    fn symbol_changes_keep_session_preferences_and_reset_prices() {
+        let mut c = ChartState::new(1, "AAPL US Equity", Timeframe::D1);
+        let w = Worker::inert();
+        c.data.session = tr_core::session::Session::UsRegular;
+        c.data.history.extended_hours = true;
+        c.data.analytics.baseline = Some(150.);
+        c.data.analytics.renko_size = 5.;
+        c.set_symbol("BTCUSD Curncy", &w);
+        assert_eq!(c.data.analytics.baseline, None);
+        assert_eq!(c.data.analytics.renko_size, 0.);
+        assert_eq!(c.effective_session(), tr_core::session::Session::Provider);
+        assert_eq!(c.effective_history(), tr_data::HistoryOptions::default());
+        c.set_symbol("AAPL US Equity", &w);
+        assert_eq!(c.data.session, tr_core::session::Session::UsRegular);
+        assert_eq!(c.effective_session(), tr_core::session::Session::UsRegular);
+        assert!(c.data.history.extended_hours);
+    }
+
+    #[test]
+    fn scan_plot_replaces_previous_expression() {
+        let mut c = ChartState::new(1, "AAPL US Equity", Timeframe::D1);
+        let w = Worker::inert();
+        c.indicators.clear();
+        c.data.workflow.scan = Some(Default::default());
+        c.plot_scan(&w);
+        let first = c.indicators[0].clone();
+        c.data.workflow.scan.as_mut().unwrap().conditions[0].right_multiplier = 2.;
+        c.plot_scan(&w);
+        c.plot_scan(&w);
+        assert_eq!(c.indicators.len(), 1);
+        let settings = c.indicators[0].chart.as_ref().unwrap();
+        assert!(settings.scan_plot);
+        assert_eq!(settings.id, first.chart.as_ref().unwrap().id);
+        assert_ne!(settings.expression, first.chart.as_ref().unwrap().expression);
+    }
+
+    #[test]
+    fn replay_keeps_frame_and_viewport_across_ticks_and_steps() {
+        let mut c = ChartState::new(1, "AAPL US Equity", Timeframe::D1);
+        let w = Worker::inert();
+        let source = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 100, 1_790_000_000));
+        c.on_history(c.generation, source.clone(), SeriesGpu::build(&source), 0, false, false, false, &w);
+        c.replay_cutoff = Some(source[49].ts);
+        c.refresh_view(&w);
+        let past = Arc::new(source[..50].to_vec());
+        c.on_view(c.generation, c.view_revision, source.clone(), Ok((past.clone(), SeriesGpu::build(&past))), &w);
+        let frame = c.bars.clone();
+        let mut updated = source.as_ref().clone();
+        updated[99].close += 1.;
+        c.source_bars = Arc::new(updated);
+        let revision = c.view_revision;
+        c.refresh_view(&w);
+        assert_eq!(c.view_revision, revision);
+        assert!(Arc::ptr_eq(&frame, &c.bars));
+        for (step, right) in [30., 54.].into_iter().enumerate() {
+            c.viewport = Some(Viewport { right, bar_px: 8., width_px: 500. });
+            c.replay_cutoff = Some(source[50 + step].ts);
+            c.refresh_view(&w);
+            assert!(Arc::ptr_eq(&frame, &c.bars) || c.bars.len() == 51);
+            let next = Arc::new(source[..51 + step].to_vec());
+            let reveal = c.reveal_key;
+            c.on_view(c.generation, c.view_revision, source.clone(), Ok((next.clone(), SeriesGpu::build(&next))), &w);
+            let view = c.viewport.unwrap();
+            assert_eq!(view.bar_px, 8.);
+            assert_eq!(view.right, if right == 30. { 30. } else { 55. });
+            assert_eq!(c.reveal_key, reveal);
+        }
+        let mut changed = c.source_bars.as_ref().clone();
+        changed[50].close += 1.;
+        c.source_bars = Arc::new(changed);
+        c.refresh_view(&w);
+        assert!(c.view_revision > revision);
+    }
+
+    #[test]
+    fn replay_retains_frame_and_rejects_older_views() {
         let mut c = ChartState::new(1, "AAPL US Equity", Timeframe::D1);
         let w = Worker::inert();
         let source = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 100, 1_790_000_000));
@@ -3851,12 +4001,12 @@ mod tests {
         c.replay_cutoff = Some(source[49].ts);
         c.refresh_view(&w);
         let old_revision = c.view_revision;
-        assert!(c.bars.is_empty() && c.built.is_empty() && c.compare_line.is_none());
+        assert_eq!(c.bars.len(), 100);
         c.replay_cutoff = Some(source[19].ts);
         c.refresh_view(&w);
         let past = Arc::new(source[..50].to_vec());
         c.on_view(c.generation, old_revision, source.clone(), Ok((past.clone(), SeriesGpu::build(&past))), &w);
-        assert!(c.bars.is_empty());
+        assert_eq!(c.bars.len(), 100);
         let past = Arc::new(source[..20].to_vec());
         c.on_view(c.generation, c.view_revision, source.clone(), Ok((past.clone(), SeriesGpu::build(&past))), &w);
         assert_eq!(c.bars.len(), 20);

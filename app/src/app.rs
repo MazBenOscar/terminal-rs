@@ -854,6 +854,10 @@ impl TerminalApp {
             }
             Function::Timeframe(tf) => self.with_chart(|c, w| c.set_timeframe(tf, w)),
             Function::ChartType(t) => self.with_chart(|c, _| c.chart_type = t),
+            Function::RenkoBox(size) => self.with_chart(|c, _| {
+                c.data.analytics.renko_size = size.unwrap_or(0.);
+                c.chart_type = tr_chart::scene::ChartType::Renko;
+            }),
             Function::Indicator(spec) => self.with_chart(|c, w| c.toggle_indicator(spec, w)),
             Function::IndicatorPicker(q) => self.palette.open_scoped(crate::palette::Kind::Indicator, &q),
             Function::ClearIndicators => self.with_chart(|c, _| c.clear_indicators()),

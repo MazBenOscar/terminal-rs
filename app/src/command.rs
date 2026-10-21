@@ -212,6 +212,7 @@ pub enum Function {
     Step(isize),
     Timeframe(Timeframe),
     ChartType(ChartType),
+    RenkoBox(Option<f64>),
     /// Add or remove an indicator (any code from the catalog: `RSI`, `BB 20 2.5`, `ICHIMOKU`).
     Indicator(IndicatorSpec),
     /// Open the indicator picker, pre-filled with a search (`IND`, `IND VOLUME`).
@@ -299,7 +300,18 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "HEIKIN" | "HA" => Function::ChartType(ChartType::HeikinAshi),
         "HOLLOW" => Function::ChartType(ChartType::Hollow),
         "BASELINE" => Function::ChartType(ChartType::Baseline),
-        "RENKO" => Function::ChartType(ChartType::Renko),
+        "RENKO" => Function::RenkoBox(match rest {
+            [] => None,
+            [size] if size.eq_ignore_ascii_case("AUTO") => None,
+            [size] => {
+                let size: f64 = size.parse().ok()?;
+                if !size.is_finite() || size <= 0. {
+                    return None;
+                }
+                Some(size)
+            }
+            _ => return None,
+        }),
         // `IND RSI 21` adds directly; anything else searches the picker.
         "IND" | "INDICATOR" | "INDICATORS" | "STUDY" | "STUDIES" => {
             match rest.split_first().and_then(|(code, args)| IndicatorSpec::parse(code, args)) {
@@ -472,6 +484,7 @@ fn describe(f: &Function) -> String {
             }
         ),
         Function::ChartType(c) => format!("Chart type {}", c.label()),
+        Function::RenkoBox(size) => format!("Renko box {}", size.map_or_else(|| "AUTO".into(), |s| s.to_string())),
         Function::Indicator(i) => format!("Toggle {} — {}", i.label(), i.name()),
         Function::IndicatorPicker(q) if q.is_empty() => "Browse indicators".into(),
         Function::IndicatorPicker(q) => format!("Search indicators for \"{q}\""),
@@ -568,6 +581,16 @@ fn describe(f: &Function) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn renko_box_commands() {
+        for text in ["RENKO", "RENKO AUTO", "renko auto"] {
+            assert_eq!(super::parse(text), Some(super::Command::Function(super::Function::RenkoBox(None))));
+        }
+        assert_eq!(super::parse("RENKO 250"), Some(super::Command::Function(super::Function::RenkoBox(Some(250.)))));
+        for text in ["RENKO 0", "RENKO -1", "RENKO NaN", "RENKO inf", "RENKO 1 2"] {
+            assert!(!matches!(super::parse(text), Some(super::Command::Function(super::Function::RenkoBox(_)))));
+        }
+    }
     use super::*;
 
     #[test]

@@ -97,6 +97,8 @@ pub struct Settings {
     pub timeframe: Option<crate::Timeframe>,
     #[serde(default)]
     pub expression: Option<String>,
+    #[serde(default)]
+    pub scan_plot: bool,
 }
 
 fn yes() -> bool {
@@ -121,6 +123,7 @@ impl Settings {
             outputs: Default::default(),
             fill: None,
             timeframe: None,
+            scan_plot: false,
             expression: (spec.code == "PCF").then(|| "C".into()),
         }
     }
