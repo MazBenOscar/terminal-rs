@@ -2017,6 +2017,7 @@ impl TerminalApp {
             status: String::new(),
             toasts: Vec::new(),
             alert_toasts: Vec::new(),
+            watchlist_undo: None,
             latest: Vec::new(),
             politicians: Vec::new(),
             pol_search: String::new(),
