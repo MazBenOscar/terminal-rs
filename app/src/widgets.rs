@@ -106,6 +106,12 @@ pub enum Icon {
     StepForward,
     Crosshair,
     Trendline,
+    HorizontalRay,
+    ExtendedLine,
+    InfoLine,
+    RegressionTrend,
+    FibChannel,
+    FibTimeZone,
     Ray,
     HorizontalLine,
     VerticalLine,
@@ -132,6 +138,12 @@ pub fn tool_icon(tool: tr_chart::drawings::Tool) -> Icon {
     use tr_chart::drawings::Tool;
     match tool {
         Tool::Trendline => Icon::Trendline,
+        Tool::HorizontalRay => Icon::HorizontalRay,
+        Tool::ExtendedLine => Icon::ExtendedLine,
+        Tool::InfoLine => Icon::InfoLine,
+        Tool::RegressionTrend => Icon::RegressionTrend,
+        Tool::FibChannel => Icon::FibChannel,
+        Tool::FibTimeZone => Icon::FibTimeZone,
         Tool::Ray => Icon::Ray,
         Tool::Horizontal => Icon::HorizontalLine,
         Tool::Vertical => Icon::VerticalLine,
@@ -184,10 +196,19 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
                 p.line_segment([pt(0., d * 2.), pt(0., d * 6.)], s);
             }
         }
-        Icon::Trendline | Icon::Ray | Icon::Channel | Icon::HorizontalLine | Icon::VerticalLine | Icon::Pitchfork => {
-            crate::drawing_paint::lines(p, r, icon, color)
+        Icon::HorizontalRay
+        | Icon::ExtendedLine
+        | Icon::InfoLine
+        | Icon::RegressionTrend
+        | Icon::Trendline
+        | Icon::Ray
+        | Icon::Channel
+        | Icon::HorizontalLine
+        | Icon::VerticalLine
+        | Icon::Pitchfork => crate::drawing_paint::lines(p, r, icon, color),
+        Icon::FibRetracement | Icon::FibExtension | Icon::FibChannel | Icon::FibTimeZone => {
+            crate::drawing_paint::fib(p, r, icon, color)
         }
-        Icon::FibRetracement | Icon::FibExtension => crate::drawing_paint::fib(p, r, icon, color),
         Icon::Rectangle => crate::drawing_paint::shapes(p, r, color),
         Icon::Text => crate::drawing_paint::text(p, r, color),
         Icon::LongPosition | Icon::ShortPosition | Icon::Measure => crate::drawing_paint::measure(p, r, icon, color),

@@ -30,15 +30,29 @@ pub const CATEGORIES: [Category; 5] = [
     Category {
         title: "Trend lines",
         sections: &[
-            Section { title: "Lines", tools: &[Tool::Trendline, Tool::Ray, Tool::Horizontal, Tool::Vertical] },
-            Section { title: "Channels", tools: &[Tool::Channel] },
+            Section {
+                title: "Lines",
+                tools: &[
+                    Tool::Trendline,
+                    Tool::Ray,
+                    Tool::Horizontal,
+                    Tool::Vertical,
+                    Tool::HorizontalRay,
+                    Tool::ExtendedLine,
+                    Tool::InfoLine,
+                ],
+            },
+            Section { title: "Channels", tools: &[Tool::Channel, Tool::RegressionTrend] },
             Section { title: "Pitchforks", tools: &[Tool::Pitchfork] },
         ],
     },
     Category {
         title: "Fibonacci",
         sections: &[
-            Section { title: "Fibonacci", tools: &[Tool::Fib, Tool::FibExtension] },
+            Section {
+                title: "Fibonacci",
+                tools: &[Tool::Fib, Tool::FibExtension, Tool::FibChannel, Tool::FibTimeZone],
+            },
             Section { title: "Volume-based", tools: &[] },
         ],
     },
@@ -135,8 +149,8 @@ const fn category_tools<const N: usize>(index: usize) -> [Tool; N] {
 
 #[cfg(test)]
 pub const GROUPS: [(&str, &[Tool]); 5] = [
-    (CATEGORIES[0].title, &category_tools::<6>(0)),
-    (CATEGORIES[1].title, &category_tools::<2>(1)),
+    (CATEGORIES[0].title, &category_tools::<10>(0)),
+    (CATEGORIES[1].title, &category_tools::<4>(1)),
     (CATEGORIES[2].title, &category_tools::<3>(2)),
     (CATEGORIES[3].title, &category_tools::<1>(3)),
     (CATEGORIES[4].title, &category_tools::<1>(4)),

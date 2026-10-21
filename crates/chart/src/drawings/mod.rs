@@ -26,10 +26,16 @@ pub enum Tool {
     Pitchfork,
     LongPosition,
     ShortPosition,
+    HorizontalRay,
+    ExtendedLine,
+    InfoLine,
+    RegressionTrend,
+    FibChannel,
+    FibTimeZone,
 }
 
 impl Tool {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 19] = [
         Self::Trendline,
         Self::Horizontal,
         Self::Vertical,
@@ -43,6 +49,12 @@ impl Tool {
         Self::Pitchfork,
         Self::LongPosition,
         Self::ShortPosition,
+        Self::HorizontalRay,
+        Self::ExtendedLine,
+        Self::InfoLine,
+        Self::RegressionTrend,
+        Self::FibChannel,
+        Self::FibTimeZone,
     ];
     pub fn points(self) -> usize {
         point_count(self)
@@ -62,6 +74,12 @@ impl Tool {
             Tool::Pitchfork => "Pitchfork",
             Tool::LongPosition => "Long risk/reward",
             Tool::ShortPosition => "Short risk/reward",
+            Tool::HorizontalRay => "Horizontal ray",
+            Tool::ExtendedLine => "Extended line",
+            Tool::InfoLine => "Info line",
+            Tool::RegressionTrend => "Regression trend",
+            Tool::FibChannel => "Fib channel",
+            Tool::FibTimeZone => "Fib time zone",
         }
     }
 }
@@ -140,14 +158,23 @@ pub struct Geometry<'a> {
     pub price_y: &'a dyn Fn(f64) -> f64,
     pub measure_label: String,
     pub text_size: Point,
+    /// Closes in chronological order over the inclusive anchor bar range.
+    pub closes: &'a [f64],
 }
 
 pub fn geometry(context: &Geometry<'_>) -> Vec<LabeledShape> {
     match context.drawing.tool {
-        Tool::Trendline | Tool::Ray | Tool::Horizontal | Tool::Vertical | Tool::Channel | Tool::Pitchfork => {
-            lines::geometry(context)
-        }
-        Tool::Fib | Tool::FibExtension => fib::geometry(context),
+        Tool::HorizontalRay
+        | Tool::ExtendedLine
+        | Tool::InfoLine
+        | Tool::RegressionTrend
+        | Tool::Trendline
+        | Tool::Ray
+        | Tool::Horizontal
+        | Tool::Vertical
+        | Tool::Channel
+        | Tool::Pitchfork => lines::geometry(context),
+        Tool::Fib | Tool::FibExtension | Tool::FibChannel | Tool::FibTimeZone => fib::geometry(context),
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::geometry(context),
         Tool::Rectangle => shapes::geometry(context),
         Tool::Text => text::geometry(context),
@@ -156,10 +183,17 @@ pub fn geometry(context: &Geometry<'_>) -> Vec<LabeledShape> {
 
 pub fn point_count(tool: Tool) -> usize {
     match tool {
-        Tool::Trendline | Tool::Ray | Tool::Horizontal | Tool::Vertical | Tool::Channel | Tool::Pitchfork => {
-            lines::point_count(tool)
-        }
-        Tool::Fib | Tool::FibExtension => fib::point_count(tool),
+        Tool::HorizontalRay
+        | Tool::ExtendedLine
+        | Tool::InfoLine
+        | Tool::RegressionTrend
+        | Tool::Trendline
+        | Tool::Ray
+        | Tool::Horizontal
+        | Tool::Vertical
+        | Tool::Channel
+        | Tool::Pitchfork => lines::point_count(tool),
+        Tool::Fib | Tool::FibExtension | Tool::FibChannel | Tool::FibTimeZone => fib::point_count(tool),
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::point_count(tool),
         Tool::Rectangle => shapes::point_count(),
         Tool::Text => text::point_count(),
@@ -168,10 +202,17 @@ pub fn point_count(tool: Tool) -> usize {
 
 pub fn handles(drawing: &Drawing) -> Vec<Anchor> {
     match drawing.tool {
-        Tool::Trendline | Tool::Ray | Tool::Horizontal | Tool::Vertical | Tool::Channel | Tool::Pitchfork => {
-            lines::handles(drawing)
-        }
-        Tool::Fib | Tool::FibExtension => fib::handles(drawing),
+        Tool::HorizontalRay
+        | Tool::ExtendedLine
+        | Tool::InfoLine
+        | Tool::RegressionTrend
+        | Tool::Trendline
+        | Tool::Ray
+        | Tool::Horizontal
+        | Tool::Vertical
+        | Tool::Channel
+        | Tool::Pitchfork => lines::handles(drawing),
+        Tool::Fib | Tool::FibExtension | Tool::FibChannel | Tool::FibTimeZone => fib::handles(drawing),
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::handles(drawing),
         Tool::Rectangle => shapes::handles(drawing),
         Tool::Text => text::handles(drawing),
@@ -188,10 +229,17 @@ fn distance_to_shapes(shapes: Vec<LabeledShape>, point: Point) -> f64 {
 
 pub fn hit_distance(context: &Geometry<'_>, point: Point) -> f64 {
     match context.drawing.tool {
-        Tool::Trendline | Tool::Ray | Tool::Horizontal | Tool::Vertical | Tool::Channel | Tool::Pitchfork => {
-            lines::hit_distance(context, point)
-        }
-        Tool::Fib | Tool::FibExtension => fib::hit_distance(context, point),
+        Tool::HorizontalRay
+        | Tool::ExtendedLine
+        | Tool::InfoLine
+        | Tool::RegressionTrend
+        | Tool::Trendline
+        | Tool::Ray
+        | Tool::Horizontal
+        | Tool::Vertical
+        | Tool::Channel
+        | Tool::Pitchfork => lines::hit_distance(context, point),
+        Tool::Fib | Tool::FibExtension | Tool::FibChannel | Tool::FibTimeZone => fib::hit_distance(context, point),
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::hit_distance(context, point),
         Tool::Rectangle => shapes::hit_distance(context, point),
         Tool::Text => text::hit_distance(context, point),
@@ -219,6 +267,7 @@ mod dispatch_tests {
                 price_y: &|p| p,
                 measure_label: "Measurement".into(),
                 text_size: [40., 20.],
+                closes: &[100., 90.],
             };
             let shapes = geometry(&g);
             assert!(!shapes.is_empty(), "{tool:?}");

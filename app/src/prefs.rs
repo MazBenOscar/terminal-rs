@@ -933,7 +933,7 @@ mod tests {
         let mut all = Tool::ALL.to_vec();
         toggle_drawing_favorite(&mut all, Tool::Ray);
         toggle_drawing_favorite(&mut all, Tool::Ray);
-        assert_eq!(all.len(), 13);
+        assert_eq!(all.len(), Tool::ALL.len());
         assert_eq!(all.last(), Some(&Tool::Ray));
     }
 

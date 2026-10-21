@@ -19,10 +19,17 @@ pub struct Paint<'a> {
 
 pub fn paint(drawing: &Drawing, paint: &Paint<'_>, shapes: Vec<LabeledShape>) {
     match drawing.tool {
-        Tool::Trendline | Tool::Ray | Tool::Horizontal | Tool::Vertical | Tool::Channel | Tool::Pitchfork => {
-            paint_lines(paint, shapes)
-        }
-        Tool::Fib | Tool::FibExtension => paint_fib(paint, shapes),
+        Tool::HorizontalRay
+        | Tool::ExtendedLine
+        | Tool::InfoLine
+        | Tool::RegressionTrend
+        | Tool::Trendline
+        | Tool::Ray
+        | Tool::Horizontal
+        | Tool::Vertical
+        | Tool::Channel
+        | Tool::Pitchfork => paint_lines(paint, shapes),
+        Tool::Fib | Tool::FibExtension | Tool::FibChannel | Tool::FibTimeZone => paint_fib(paint, shapes),
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => {
             paint_measure(paint, shapes, drawing.tool != Tool::Measure)
         }
@@ -62,8 +69,12 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
                 if let Some(label) = label {
                     label_text(
                         p,
-                        pos2(a[0] as f32 + 3., a[1] as f32 - 1.),
-                        Align2::LEFT_BOTTOM,
+                        if a == b {
+                            pos2(a[0] as f32 - 4., a[1] as f32 - 1.)
+                        } else {
+                            pos2(a[0] as f32 + 3., a[1] as f32 - 1.)
+                        },
+                        if a == b { Align2::RIGHT_BOTTOM } else { Align2::LEFT_BOTTOM },
                         label,
                         mono(10.),
                         color,
@@ -85,6 +96,9 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
             }
             DrawingShape::VLine(x) => {
                 p.vline(x as f32, rect.y_range(), stroke);
+                if let Some(label) = label {
+                    label_text(p, pos2(x as f32 + 3., rect.top() + 3.), Align2::LEFT_TOP, label, mono(10.), color);
+                }
             }
             DrawingShape::Rect(a, b) => {
                 let r = Rect::from_two_pos(pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32));
@@ -142,6 +156,29 @@ pub fn lines(p: &Painter, r: Rect, icon: Icon, color: Color32) {
     let pt = |x, y| g.point(x, y);
     let s = g.stroke;
     match icon {
+        Icon::HorizontalRay => {
+            p.circle_stroke(pt(-5., 0.), g.unit, s);
+            p.line_segment([pt(-4., 0.), pt(6., 0.)], s);
+            p.line_segment([pt(6., -2.), pt(6., 2.)], s);
+        }
+        Icon::ExtendedLine => {
+            p.line_segment([pt(-6., 6.), pt(6., -6.)], s);
+            for (x, y) in [(-2., 2.), (2., -2.)] {
+                p.circle_stroke(pt(x, y), g.unit, s);
+            }
+        }
+        Icon::InfoLine => {
+            p.line_segment([pt(-6., 5.), pt(2., -3.)], s);
+            p.rect_stroke(Rect::from_min_max(pt(0., -6.), pt(6., -1.)), 0., s, StrokeKind::Middle);
+            p.line_segment([pt(2., -3.5), pt(4., -3.5)], s);
+        }
+        Icon::RegressionTrend => {
+            for offset in [-3., 0., 3.] {
+                p.line_segment([pt(-6., 3. + offset), pt(6., -3. + offset)], s);
+            }
+            p.circle_stroke(pt(-2., 0.), g.unit, s);
+            p.circle_stroke(pt(3., -1.), g.unit, s);
+        }
         Icon::Trendline | Icon::Ray | Icon::Channel => {
             p.line_segment([pt(-4., 4.), pt(5., -5.)], s);
             p.circle_stroke(pt(-5., 5.), 1.4 * g.unit, s);
@@ -175,6 +212,18 @@ pub fn lines(p: &Painter, r: Rect, icon: Icon, color: Color32) {
 pub fn fib(p: &Painter, r: Rect, icon: Icon, color: Color32) {
     let g = Glyph::new(r, color);
     let pt = |x, y| g.point(x, y);
+    if icon == Icon::FibTimeZone {
+        for x in [-6., -4., -2., 1., 6.] {
+            p.line_segment([pt(x, -5.), pt(x, 5.)], g.stroke);
+        }
+        return;
+    }
+    if icon == Icon::FibChannel {
+        for offset in [-3., -1., 0., 3.] {
+            p.line_segment([pt(-6., 3. + offset), pt(6., -3. + offset)], g.stroke);
+        }
+        return;
+    }
     let n = if icon == Icon::FibRetracement { 4 } else { 3 };
     for i in 0..n {
         let y = -5. + i as f32 * 3.;

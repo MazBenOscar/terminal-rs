@@ -3665,54 +3665,62 @@ impl ChartState {
     }
 
     fn drawing_tools_menu(&mut self, ui: &mut Ui) {
-        for index in 0..crate::drawing_toolbar::CATEGORIES.len() {
-            self.drawing_category_menu(ui, index);
-        }
+        egui::ScrollArea::vertical()
+            .id_salt((self.id, "draw-menu"))
+            .max_height((ui.ctx().content_rect().height() - theme::dp(80.)).max(theme::dp(80.)))
+            .show(ui, |ui| {
+                for index in 0..crate::drawing_toolbar::CATEGORIES.len() {
+                    self.drawing_category_menu(ui, index);
+                }
+            });
         let mut favorites = crate::prefs::drawing_favorites(ui.ctx());
         ui.checkbox(&mut favorites.1, "Favorites bar");
         crate::prefs::set_drawing_favorites(ui.ctx(), favorites);
+    }
+
+    fn drawing_menu_entries(index: usize) -> impl Iterator<Item = (&'static str, Tool)> {
+        crate::drawing_toolbar::CATEGORIES[index]
+            .visible_sections()
+            .flat_map(|section| section.tools.iter().map(move |&tool| (section.title, tool)))
     }
 
     pub(super) fn drawing_category_menu(&mut self, ui: &mut Ui, index: usize) {
         let category = &crate::drawing_toolbar::CATEGORIES[index];
         ui.label(egui::RichText::new(category.title).small().color(theme::muted()));
         let mut favorites = crate::prefs::drawing_favorites(ui.ctx());
-        for section in category.visible_sections() {
-            ui.label(egui::RichText::new(section.title).small().color(theme::muted()));
-            for &tool in section.tools {
-                ui.push_id(tool, |ui| {
-                    ui.horizontal(|ui| {
-                        if widgets::icon_button(
-                            ui,
-                            widgets::tool_icon(tool),
-                            tool.label(),
-                            self.draw.tool == Some(tool),
+        let mut previous_section = None;
+        for (section, tool) in Self::drawing_menu_entries(index) {
+            if previous_section != Some(section) {
+                ui.label(egui::RichText::new(section).small().color(theme::muted()));
+                previous_section = Some(section);
+            }
+            ui.push_id(tool, |ui| {
+                ui.horizontal(|ui| {
+                    if widgets::icon_button(ui, widgets::tool_icon(tool), tool.label(), self.draw.tool == Some(tool))
+                        .clicked()
+                    {
+                        self.start_tool(tool);
+                        self.drawing_toolbar.open = None;
+                        ui.close();
+                    }
+                    if ui
+                        .add_sized(
+                            vec2(theme::dp(210.), theme::dp(24.)),
+                            egui::Button::new(tool.label()).shortcut_text(Self::tool_shortcut(tool)),
                         )
                         .clicked()
-                        {
-                            self.start_tool(tool);
-                            self.drawing_toolbar.open = None;
-                            ui.close();
-                        }
-                        if ui
-                            .add_sized(
-                                vec2(theme::dp(210.), theme::dp(24.)),
-                                egui::Button::new(tool.label()).shortcut_text(Self::tool_shortcut(tool)),
-                            )
-                            .clicked()
-                        {
-                            self.start_tool(tool);
-                            self.drawing_toolbar.open = None;
-                            ui.close();
-                        }
-                        let active = favorites.0.contains(&tool);
-                        let hint = if active { "Remove from favorites" } else { "Add to favorites" };
-                        if widgets::icon_button(ui, widgets::Icon::Star, hint, active).clicked() {
-                            crate::prefs::toggle_drawing_favorite(&mut favorites.0, tool);
-                        }
-                    });
+                    {
+                        self.start_tool(tool);
+                        self.drawing_toolbar.open = None;
+                        ui.close();
+                    }
+                    let active = favorites.0.contains(&tool);
+                    let hint = if active { "Remove from favorites" } else { "Add to favorites" };
+                    if widgets::icon_button(ui, widgets::Icon::Star, hint, active).clicked() {
+                        crate::prefs::toggle_drawing_favorite(&mut favorites.0, tool);
+                    }
                 });
-            }
+            });
         }
         crate::prefs::set_drawing_favorites(ui.ctx(), favorites);
     }
@@ -4087,17 +4095,25 @@ impl ChartState {
             [0., 0.]
         };
         let bars = (self.index_of_ts(d.b.ts) - self.index_of_ts(d.a.ts)).abs().round() as usize;
+        let closes: Vec<_> = if d.tool == Tool::RegressionTrend {
+            let ia = self.index_of_ts(d.a.ts).round().max(0.) as usize;
+            let ib = self.index_of_ts(d.b.ts).round().max(0.) as usize;
+            self.bars.iter().skip(ia.min(ib)).take(ia.max(ib) - ia.min(ib) + 1).map(|bar| bar.close).collect()
+        } else {
+            Vec::new()
+        };
         drawings::geometry(&drawings::Geometry {
             drawing: d,
             points: [px(&d.a), px(&d.b), px(&d.c.unwrap_or(d.b))],
             bounds: [rect.left() as f64, rect.top() as f64, rect.right() as f64, rect.bottom() as f64],
             price_y: &|price| rect.top() as f64 + s.y_of(price),
-            measure_label: if d.tool == Tool::Measure {
+            measure_label: if matches!(d.tool, Tool::Measure | Tool::InfoLine) {
                 drawings::measure_label(d.a, d.b, bars, self.sec.decimals(d.a.price))
             } else {
                 String::new()
             },
             text_size,
+            closes: &closes,
         })
     }
 
@@ -5531,22 +5547,34 @@ mod tests {
 
     #[test]
     fn draw_submenu_matches_category_table() {
+        let categories = &crate::drawing_toolbar::CATEGORIES;
+        let entries: Vec<_> = (0..categories.len()).flat_map(ChartState::drawing_menu_entries).collect();
+        let expected: Vec<_> = categories
+            .iter()
+            .flat_map(|category| {
+                category
+                    .visible_sections()
+                    .flat_map(|section| section.tools.iter().map(move |&tool| (section.title, tool)))
+            })
+            .collect();
+        assert_eq!(entries, expected);
+
+        // The menu scrolls: only require its first entries to be painted in this viewport.
         let ctx = egui::Context::default();
         let mut chart = sample_chart();
         ui_frame(&ctx, vec![], |ui| chart.drawing_tools_menu(ui));
         let labels = ui_frame(&ctx, vec![], |ui| chart.drawing_tools_menu(ui));
+        let first_section = entries[0].0;
+        let visible = std::iter::once(categories[0].title).chain(std::iter::once(first_section)).chain(
+            entries.iter().take_while(|(section, _)| *section == first_section).take(2).map(|(_, tool)| tool.label()),
+        );
         let mut cursor = 0;
-        for category in &crate::drawing_toolbar::CATEGORIES {
-            let expected = std::iter::once(category.title).chain(category.visible_sections().flat_map(|section| {
-                std::iter::once(section.title).chain(section.tools.iter().map(|tool| tool.label()))
-            }));
-            for title in expected {
-                let offset = labels[cursor..]
-                    .iter()
-                    .position(|(label, _)| label == title)
-                    .unwrap_or_else(|| panic!("missing Draw submenu entry {title}"));
-                cursor += offset + 1;
-            }
+        for title in visible {
+            let offset = labels[cursor..]
+                .iter()
+                .position(|(label, _)| label == title)
+                .unwrap_or_else(|| panic!("missing visible Draw submenu entry {title}"));
+            cursor += offset + 1;
         }
         assert!(!labels.iter().any(|(label, _)| label == "Gann"));
     }
