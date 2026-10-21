@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use egui::{Align2, Color32, RichText, Sense, Ui, pos2};
 use tr_core::Timeframe;
 use tr_core::scanner::{
-    Comparison, MAX_BARS_AGO, MatchMode, ScanCondition, ScanDefinition, ScanOperand, ScanOutcome, Source,
+    Comparison, ConditionGroup, ConditionItem, FormulaCondition, MAX_BARS_AGO, MAX_CONDITIONS, MAX_GROUP_DEPTH,
+    MatchMode, ScanCondition, ScanDefinition, ScanOperand, ScanOutcome, Source,
 };
 
 use crate::congress_view::Action;
@@ -187,6 +188,178 @@ fn field(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
     ui.add_space(dp(8.0));
 }
 
+fn timeframe_editor(ui: &mut Ui, timeframe: &mut Option<Timeframe>) {
+    let selected = match timeframe {
+        Some(tf) => RichText::new(tf.label()),
+        None => RichText::new("Scan timeframe").color(muted()),
+    };
+    egui::ComboBox::from_id_salt("condition-timeframe").width(dp(110.0)).selected_text(selected).show_ui(ui, |ui| {
+        ui.selectable_value(timeframe, None, RichText::new("Scan timeframe").color(muted()));
+        for tf in Timeframe::ALL {
+            ui.selectable_value(timeframe, Some(tf), tf.label());
+        }
+    });
+}
+
+fn mode_editor(ui: &mut Ui, mode: &mut MatchMode) {
+    egui::ComboBox::from_id_salt("scan-mode")
+        .width(dp(90.0))
+        .selected_text(if *mode == MatchMode::All { "Match all" } else { "Match any" })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(mode, MatchMode::All, "Match all");
+            ui.selectable_value(mode, MatchMode::Any, "Match any");
+        });
+}
+
+fn compare_editor(ui: &mut Ui, condition: &mut ScanCondition, index: usize) {
+    ui.label(RichText::new(format!("{}", index + 1)).font(mono(12.0)).color(muted()));
+    operand_editor(ui, &mut condition.left, &mut condition.left_bars_ago, "left");
+    egui::ComboBox::from_id_salt("comparison").width(dp(110.0)).selected_text(condition.comparison.label()).show_ui(
+        ui,
+        |ui| {
+            for comparison in Comparison::ALL {
+                ui.selectable_value(&mut condition.comparison, comparison, comparison.label());
+            }
+        },
+    );
+    operand_editor(ui, &mut condition.right, &mut condition.right_bars_ago, "right");
+    // Scaling a constant is just a different constant.
+    if matches!(condition.right, ScanOperand::Constant(_)) {
+        condition.right_multiplier = 1.0;
+    } else {
+        ui.add(egui::DragValue::new(&mut condition.right_multiplier).speed(0.05).max_decimals(3).prefix("× "))
+            .on_hover_text("Multiplies the right side, e.g. Volume >= EMA(50, Volume) × 2.5");
+    }
+    timeframe_editor(ui, &mut condition.timeframe);
+}
+
+fn run_enabled(definition: &ScanDefinition, running: bool, data_ready: bool) -> bool {
+    !running && data_ready && definition.validate().is_ok()
+}
+
+fn can_add_leaf(leaves: usize) -> bool {
+    leaves < MAX_CONDITIONS
+}
+
+fn can_add_group(depth: usize) -> bool {
+    depth < MAX_GROUP_DEPTH
+}
+
+/// Remove a child by index path, pruning any ancestors left empty except the root.
+fn remove_at(group: &mut ConditionGroup, path: &[usize]) {
+    let Some((&index, rest)) = path.split_first() else { return };
+    if index >= group.items.len() {
+        return;
+    }
+    if rest.is_empty() {
+        group.items.remove(index);
+    } else if let ConditionItem::Group(child) = &mut group.items[index] {
+        remove_at(child, rest);
+        if child.items.is_empty() {
+            group.items.remove(index);
+        }
+    }
+}
+
+fn group_editor(
+    ui: &mut Ui,
+    group: &mut ConditionGroup,
+    depth: usize,
+    leaves: &mut usize,
+    path: &mut Vec<usize>,
+    remove: &mut Option<Vec<usize>>,
+) {
+    for (index, item) in group.items.iter_mut().enumerate() {
+        path.push(index);
+        ui.push_id(index, |ui| {
+            let frame = egui::Frame::new()
+                .fill(theme::header())
+                .corner_radius(theme::CONTROL_RADIUS)
+                .inner_margin(egui::Margin::symmetric(6, 4));
+            let response = frame.show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let full = ui.available_width();
+                let top = ui.cursor().min;
+                ui.scope(|ui| {
+                    ui.set_max_width((full - dp(26.0)).max(0.0));
+                    ui.horizontal_wrapped(|ui| match item {
+                        ConditionItem::Compare(condition) => compare_editor(ui, condition, index),
+                        ConditionItem::Formula(formula) => {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut formula.expression)
+                                    .desired_width(dp(280.0))
+                                    .hint_text("PCF formula, e.g. C > AVGC20"),
+                            );
+                            timeframe_editor(ui, &mut formula.timeframe);
+                        }
+                        ConditionItem::Group(child) => {
+                            ui.label(RichText::new("Group").color(muted()));
+                            mode_editor(ui, &mut child.mode);
+                        }
+                    });
+                });
+                let close =
+                    egui::Rect::from_min_size(pos2(top.x + full - dp(22.0), top.y), egui::vec2(dp(22.0), dp(20.0)));
+                if ui
+                    .put(close, |ui: &mut Ui| widgets::icon_button(ui, Icon::Close, "Remove condition", false))
+                    .clicked()
+                {
+                    *remove = Some(path.clone());
+                }
+                match item {
+                    ConditionItem::Formula(formula) => {
+                        if let Err(error) = formula.validate() {
+                            ui.label(RichText::new(error).small().color(theme::down()));
+                        }
+                    }
+                    ConditionItem::Group(child) => {
+                        ui.scope(|ui| {
+                            ui.spacing_mut().indent = dp(12.0);
+                            ui.indent("group-children", |ui| {
+                                group_editor(ui, child, depth + 1, leaves, path, remove);
+                            });
+                        });
+                    }
+                    ConditionItem::Compare(_) => {}
+                }
+            });
+            if matches!(item, ConditionItem::Group(_)) {
+                let rect = response.response.rect;
+                ui.painter()
+                    .line_segment([rect.left_top(), rect.left_bottom()], egui::Stroke::new(dp(1.0), theme::border()));
+            }
+            ui.add_space(dp(2.0));
+        });
+        path.pop();
+    }
+    if depth == 1 && group.items.is_empty() {
+        ui.label(RichText::new("No conditions yet. Add one to describe what a match looks like.").color(muted()));
+    }
+    ui.horizontal_wrapped(|ui| {
+        for (label, kind) in [("Add condition", 0), ("Add formula", 1), ("Add group", 2)] {
+            if kind == 2 && !can_add_group(depth) {
+                continue;
+            }
+            if ui
+                .add_enabled(can_add_leaf(*leaves), egui::Button::new(label))
+                .on_disabled_hover_text("A scan can have up to 32 conditions")
+                .clicked()
+            {
+                let item = match kind {
+                    0 => ConditionItem::Compare(ScanCondition::default()),
+                    1 => ConditionItem::Formula(FormulaCondition { expression: String::new(), timeframe: None }),
+                    _ => ConditionItem::Group(ConditionGroup::comparisons(
+                        MatchMode::All,
+                        vec![ScanCondition::default()],
+                    )),
+                };
+                group.items.push(item);
+                *leaves += 1;
+            }
+        }
+    });
+}
+
 fn outcome_label(outcome: ScanOutcome) -> (&'static str, Color32) {
     match outcome {
         ScanOutcome::Match => ("Match", theme::up()),
@@ -270,81 +443,10 @@ pub fn show(
                     });
             });
             let mut remove = None;
-            for (i, item) in pane.definition.root.items.iter_mut().enumerate() {
-                let tr_core::scanner::ConditionItem::Compare(condition) = item else {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(item.label()).color(muted()));
-                        if ui.button("Remove").clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                    continue;
-                };
-                ui.push_id(i, |ui| {
-                    egui::Frame::new()
-                        .fill(theme::header())
-                        .corner_radius(theme::CONTROL_RADIUS)
-                        .inner_margin(egui::Margin::symmetric(6, 4))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            let close_w = dp(26.0);
-                            let full = ui.available_width();
-                            let top = ui.cursor().min;
-                            ui.scope(|ui| {
-                                ui.set_max_width((full - close_w).max(0.0));
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(RichText::new(format!("{}", i + 1)).font(mono(12.0)).color(muted()));
-                                    operand_editor(ui, &mut condition.left, &mut condition.left_bars_ago, "left");
-                                    egui::ComboBox::from_id_salt("comparison")
-                                        .width(dp(110.0))
-                                        .selected_text(condition.comparison.label())
-                                        .show_ui(ui, |ui| {
-                                            for comparison in Comparison::ALL {
-                                                ui.selectable_value(
-                                                    &mut condition.comparison,
-                                                    comparison,
-                                                    comparison.label(),
-                                                );
-                                            }
-                                        });
-                                    operand_editor(ui, &mut condition.right, &mut condition.right_bars_ago, "right");
-                                    // Scaling a constant is just a different constant.
-                                    if matches!(condition.right, ScanOperand::Constant(_)) {
-                                        condition.right_multiplier = 1.0;
-                                    } else {
-                                        ui.add(
-                                            egui::DragValue::new(&mut condition.right_multiplier)
-                                                .speed(0.05)
-                                                .max_decimals(3)
-                                                .prefix("× "),
-                                        )
-                                        .on_hover_text(
-                                            "Multiplies the right side, e.g. Volume >= EMA(50, Volume) × 2.5",
-                                        );
-                                    }
-                                });
-                            });
-                            let close = egui::Rect::from_min_size(
-                                pos2(top.x + full - close_w + dp(4.0), top.y),
-                                egui::vec2(dp(22.0), dp(20.0)),
-                            );
-                            let remove_button =
-                                |ui: &mut Ui| widgets::icon_button(ui, Icon::Close, "Remove condition", false);
-                            if ui.put(close, remove_button).clicked() {
-                                remove = Some(i);
-                            }
-                        });
-                    ui.add_space(dp(2.0));
-                });
-            }
-            if let Some(i) = remove {
-                pane.definition.root.items.remove(i);
-            }
-            if pane.definition.root.items.is_empty() {
-                ui.label(RichText::new("No conditions yet. Add one to describe what a match looks like.").color(muted()));
-            }
-            if pane.definition.leaves().len() < 32 && ui.button("Add condition").clicked() {
-                pane.definition.root.items.push(tr_core::scanner::ConditionItem::Compare(ScanCondition::default()));
+            let mut leaves = pane.definition.leaves().len();
+            group_editor(ui, &mut pane.definition.root, 1, &mut leaves, &mut Vec::new(), &mut remove);
+            if let Some(path) = remove {
+                remove_at(&mut pane.definition.root, &path);
             }
         });
         if pane.definition != before {
@@ -352,18 +454,24 @@ pub fn show(
         }
         let validation = pane.definition.validate().err();
         if let Some(error) = &validation {
-            ui.label(RichText::new(error).color(theme::down()));
+            ui.label(RichText::new(error).small().color(muted()));
         }
         ui.add_space(dp(4.0));
         ui.separator();
-        let can_run = !pane.running
-            && validation.is_none()
-            && if market { bulk_ready } else { !symbols.is_empty() && symbols.len() <= 200 };
+        let can_run = run_enabled(
+            &pane.definition,
+            pane.running,
+            if market { bulk_ready } else { !symbols.is_empty() && symbols.len() <= 200 },
+        );
         ui.horizontal_wrapped(|ui| {
             let run = egui::Button::new(RichText::new("Run scan").color(Color32::WHITE))
                 .fill(theme::accent())
                 .min_size(egui::vec2(dp(84.0), 0.0));
-            if ui.add_enabled(can_run, run).clicked() {
+            let mut run_response = ui.add_enabled(can_run, run);
+            if let Some(error) = &validation {
+                run_response = run_response.on_disabled_hover_text(error);
+            }
+            if run_response.clicked() {
                 // Never reuse a generation after restoring a layout or recreating a pane.
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 pane.generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -640,6 +748,96 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_group_editing_keeps_ids_unique() {
+        let compare = ConditionItem::Compare(ScanCondition::default());
+        let formula = ConditionItem::Formula(FormulaCondition {
+            expression: "C > AVGC20".into(),
+            timeframe: Some(Timeframe::W1),
+        });
+        let definition = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![
+                    compare.clone(),
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::Any,
+                        items: vec![compare, formula.clone()],
+                    }),
+                    formula,
+                ],
+            },
+            ..Default::default()
+        };
+        let mut pane = ScannerPane::new(definition.clone());
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                show(ui, &mut pane, 1, &["AAPL US Equity".into()], false, |_| {
+                    panic!("No scan requested during render")
+                });
+            });
+        });
+        assert!(!output.shapes.is_empty());
+        output.textures_delta.clear();
+        assert_eq!(pane.definition, definition);
+    }
+
+    #[test]
+    fn removing_last_child_removes_nested_group() {
+        let compare = ConditionItem::Compare(ScanCondition::default());
+        let mut root = ConditionGroup {
+            mode: MatchMode::All,
+            items: vec![
+                compare.clone(),
+                ConditionItem::Group(ConditionGroup {
+                    mode: MatchMode::Any,
+                    items: vec![
+                        compare.clone(),
+                        ConditionItem::Group(ConditionGroup { mode: MatchMode::All, items: vec![compare.clone()] }),
+                    ],
+                }),
+                compare.clone(),
+            ],
+        };
+        remove_at(&mut root, &[1, 1, 0]);
+        assert_eq!(root.items.len(), 3);
+        let ConditionItem::Group(child) = &root.items[1] else { panic!("Expected group") };
+        assert_eq!(child.items, vec![compare.clone()]);
+        remove_at(&mut root, &[1, 0]);
+        assert_eq!(root.items, vec![compare.clone(), compare]);
+        remove_at(&mut root, &[0]);
+        remove_at(&mut root, &[0]);
+        assert!(root.items.is_empty());
+    }
+
+    #[test]
+    fn add_group_respects_depth_and_leaf_limits() {
+        assert!(can_add_group(1));
+        assert!(can_add_group(MAX_GROUP_DEPTH - 1));
+        assert!(!can_add_group(MAX_GROUP_DEPTH));
+        assert!(!can_add_group(MAX_GROUP_DEPTH + 1));
+        assert!(can_add_leaf(MAX_CONDITIONS - 1));
+        assert!(!can_add_leaf(MAX_CONDITIONS));
+        assert!(!can_add_leaf(MAX_CONDITIONS + 1));
+    }
+
+    #[test]
+    fn run_is_blocked_by_invalid_definition() {
+        let mut definition = ScanDefinition::default();
+        assert!(run_enabled(&definition, false, true));
+        assert!(!run_enabled(&definition, true, true));
+        assert!(!run_enabled(&definition, false, false));
+        for item in [
+            ConditionItem::Group(ConditionGroup { mode: MatchMode::All, items: Vec::new() }),
+            ConditionItem::Formula(FormulaCondition { expression: "C >".into(), timeframe: None }),
+        ] {
+            definition.root.items = vec![item];
+            assert!(definition.validate().is_err());
+            assert!(!run_enabled(&definition, false, true));
+        }
+    }
 
     #[test]
     fn scanner_ui_renders_empty_running_and_result_states() {
