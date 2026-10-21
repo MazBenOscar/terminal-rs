@@ -2,6 +2,9 @@
 
 Open **Indicators…** in a chart's header, or right-click the chart and choose
 **Indicators → Manage Indicators…**. This editor applies to that chart only.
+Click or right-click a study's legend for show/hide, edit and remove actions.
+Hidden studies remain as muted entries on the price pane. Edit opens the same
+editor at that study; removal also removes its calculation descendants.
 Use the search field and picker to add a study. Repeated additions create
 independent instances, including multiple RSI, Bollinger and MACD configurations.
 Commands still toggle the first matching code/parameter combination.
@@ -121,3 +124,6 @@ different output port or a fabricated scalar input for OHLCV-only studies.
 The [research inventory](analysis/tc2000-indicators.md) records the comparison
 baseline and unresolved compatibility questions. Its generated registry snapshot
 predates these changes and remains historical evidence, not current UI behavior.
+
+See the [chart interaction review](chart-interaction-fixes.md) for the comparison
+picker, selected-drawing deletion, header spacing and LIVE badge fixes.

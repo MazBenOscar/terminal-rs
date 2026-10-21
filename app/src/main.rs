@@ -3,9 +3,11 @@
 
 mod anim;
 mod app;
+mod chart_compare;
 mod chart_controls;
 mod chart_data;
 mod chart_fill;
+mod chart_legend;
 mod chart_navigation;
 mod chart_templates;
 mod chart_view;

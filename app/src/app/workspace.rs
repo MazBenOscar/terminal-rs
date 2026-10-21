@@ -1108,7 +1108,7 @@ impl TerminalApp {
         // Trailing buttons: add panel (as tab) and the group menu.
         let btn =
             |i: f32| Rect::from_min_size(pos2(strip.right() - 26.0 * i - 2.0, strip.top() + 2.0), vec2(24.0, th - 4.0));
-        let tabs_right = btn(2.0).left() - 4.0;
+        let tabs_right = btn(2.0).left() - theme::dp(12.0);
         // A chart's interval and type controls share the tab strip when there is room,
         // which saves the chart a whole header row.
         let chart_idx = self.idx(active).filter(|&i| matches!(self.panes[i].kind, PaneKind::Chart(_)));
@@ -1281,6 +1281,7 @@ impl TerminalApp {
                             .layout(egui::Layout::left_to_right(egui::Align::Center))
                             .id_salt(("strip-controls", active)),
                     );
+                    child.set_clip_rect(r.intersect(ui.clip_rect()));
                     if c.controls(&mut child, worker) {
                         self.focus = active;
                     }

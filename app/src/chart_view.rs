@@ -144,6 +144,11 @@ pub struct ChartState {
     /// header row and give the plot the space.
     pub controls_in_strip: bool,
     indicator_editor: bool,
+    indicator_focus: Option<u32>,
+    compare_picker: crate::chart_compare::Picker,
+    compare_revision: u64,
+    compare_error: Option<String>,
+    compare_loading: bool,
     indicator_search: String,
     template_name: String,
     template_names: Option<Vec<String>>,
@@ -210,6 +215,11 @@ impl ChartState {
             hover_enabled: true,
             controls_in_strip: false,
             indicator_editor: false,
+            indicator_focus: None,
+            compare_picker: Default::default(),
+            compare_revision: 0,
+            compare_error: None,
+            compare_loading: false,
             indicator_search: String::new(),
             template_name: String::new(),
             template_names: None,
@@ -252,6 +262,8 @@ impl ChartState {
         self.manual_scale = None;
         self.glide = None;
         self.compare_line = None;
+        self.compare_error = None;
+        self.compare_loading = false;
         self.markers.clear();
         // Never show the previous symbol's bars under the new title.
         self.bars = Arc::new(Vec::new());
@@ -280,6 +292,9 @@ impl ChartState {
             self.chart_type = ChartType::Candles;
         }
         self.symbol = sec.key();
+        if self.compare.as_deref() == Some(&self.symbol) {
+            self.compare = None;
+        }
         self.sec = sec;
         if !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
             self.data.session = tr_core::session::Session::Provider;
@@ -398,8 +413,10 @@ impl ChartState {
     }
 
     pub fn set_compare(&mut self, symbol: Option<String>, w: &Worker) {
-        self.compare = symbol;
+        self.compare = symbol.and_then(|s| crate::chart_compare::parse_key(&s)).filter(|s| *s != self.symbol);
         self.compare_line = None;
+        self.compare_error = None;
+        self.compare_loading = false;
         self.request_compare(w);
     }
 
@@ -537,9 +554,13 @@ impl ChartState {
         }
     }
 
-    fn request_compare(&self, w: &Worker) {
+    fn request_compare(&mut self, w: &Worker) {
         if let (Some(sym), false) = (&self.compare, self.bars.is_empty()) {
+            self.compare_revision += 1;
+            self.compare_loading = true;
+            self.compare_error = None;
             w.send(Request::Compare {
+                revision: self.compare_revision,
                 pane: self.id,
                 generation: self.generation,
                 symbol: sym.clone(),
@@ -654,10 +675,24 @@ impl ChartState {
         }
     }
 
-    pub fn on_compare(&mut self, generation: u64, symbol: &str, line: LineRef) {
-        if generation == self.generation && self.compare.as_deref() == Some(symbol) {
+    pub fn on_compare(&mut self, generation: u64, revision: u64, symbol: &str, line: LineRef) {
+        if generation == self.generation && revision == self.compare_revision && self.compare.as_deref() == Some(symbol)
+        {
             self.compare_line = Some(line);
+            self.compare_loading = false;
+            self.compare_error = None;
         }
+    }
+
+    pub fn on_compare_error(&mut self, generation: u64, revision: u64, symbol: &str, error: String) {
+        if generation == self.generation && revision == self.compare_revision && self.compare.as_deref() == Some(symbol)
+        {
+            self.compare_error = Some(error);
+            self.compare_loading = false;
+        }
+    }
+    pub fn on_compare_search(&mut self, query: &str, result: Result<Vec<tr_data::SearchHit>, String>) {
+        self.compare_picker.on_hits(query, result);
     }
 
     pub fn apply_linked_range(&mut self, range: crate::chart_navigation::DateRange) {
@@ -717,7 +752,42 @@ impl ChartState {
     pub fn controls_width(ui: &Ui) -> f32 {
         let tf: Vec<&str> = Timeframe::ALL.iter().map(|t| t.label()).collect();
         let ct: Vec<&str> = ChartType::ALL.iter().map(|c| c.label()).collect();
-        widgets::segmented_width(ui, &tf, CONTROL_H) + widgets::segmented_width(ui, &ct, CONTROL_H) + 84.0
+        widgets::segmented_width(ui, &tf, CONTROL_H)
+            + widgets::segmented_width(ui, &ct, CONTROL_H)
+            + Self::action_width(ui, "Indicators…")
+            + Self::action_width(ui, "Compare…")
+            + 24.
+            + ui.spacing().item_spacing.x * 5.
+    }
+
+    fn action_width(ui: &Ui, label: &str) -> f32 {
+        ui.painter().layout_no_wrap(label.into(), ui_font(11.), text()).size().x + ui.spacing().button_padding.x * 2.
+    }
+
+    fn chart_actions(&mut self, ui: &mut Ui) -> bool {
+        let mut clicked = false;
+        if ui
+            .add_sized(
+                vec2(Self::action_width(ui, "Indicators…"), CONTROL_H),
+                egui::Button::new(RichText::new("Indicators…").font(ui_font(11.))),
+            )
+            .clicked()
+        {
+            self.indicator_editor = true;
+            clicked = true;
+        }
+        if ui
+            .add_sized(
+                vec2(Self::action_width(ui, "Compare…"), CONTROL_H),
+                egui::Button::new(RichText::new("Compare…").font(ui_font(11.))),
+            )
+            .on_hover_text("Choose or remove the comparison symbol")
+            .clicked()
+        {
+            self.compare_picker.open();
+            clicked = true;
+        }
+        clicked
     }
 
     /// Interval and chart-type controls, laid out left to right in `ui`. Returns whether
@@ -737,10 +807,8 @@ impl ChartState {
             self.chart_type = ChartType::ALL[i];
             clicked = true;
         }
-        if ui.small_button("Indicators…").clicked() {
-            self.indicator_editor = true;
-            clicked = true;
-        }
+        ui.add_space(6.);
+        clicked |= self.chart_actions(ui);
         clicked
     }
 
@@ -765,6 +833,9 @@ impl ChartState {
         }
         study::assign_ids(&mut self.indicators);
         self.show_indicator_editor(ui.ctx(), w);
+        if let Some(chosen) = self.compare_picker.show(ui.ctx(), self.id, &self.symbol, self.compare.as_deref(), w) {
+            self.set_compare(chosen, w);
+        }
         let painter = ui.painter_at(rect);
         // Sits under a tab strip inside a card: square top, rounded bottom.
         let r = theme::CARD_RADIUS.saturating_sub(1);
@@ -806,18 +877,23 @@ impl ChartState {
                         }
                     }
                 });
-                if hui.small_button("Indicators…").clicked() {
-                    self.indicator_editor = true;
+                if hui.available_width()
+                    > Self::action_width(&hui, "Indicators…") + Self::action_width(&hui, "Compare…") + 12.
+                {
+                    clicked |= self.chart_actions(&mut hui);
+                } else {
+                    hui.menu_button("Chart…", |ui| {
+                        if ui.button("Indicators…").clicked() {
+                            self.indicator_editor = true;
+                            ui.close();
+                        }
+                        if ui.button("Compare symbol…").clicked() {
+                            self.compare_picker.open();
+                            ui.close();
+                        }
+                    });
                 }
             }
-        }
-        if self.last_live.is_some_and(|t| t.elapsed().as_secs() < 5) {
-            // Pulsing live dot in the plot's top-right corner (clear of the price axis labels).
-            let pulse = 0.6 + 0.4 * ((ui.input(|i| i.time) * 3.0).sin() as f32).abs();
-            let c = pos2(rect.right() - AXIS_W + 12.0, header.bottom() + 10.0);
-            painter.circle_filled(c, 3.0, theme::up().gamma_multiply(pulse));
-            painter.text(c + vec2(7.0, 0.0), Align2::LEFT_CENTER, "LIVE", ui_font(10.0), theme::up());
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // Bottom quick-range row.
@@ -914,6 +990,25 @@ impl ChartState {
 
         // ---- input ----
         let plot_resp = ui.interact(plot_all, ui.id().with((self.id, "plot")), Sense::click_and_drag());
+        let legend_bar = ui
+            .input(|i| i.pointer.hover_pos())
+            .and_then(|p| v.bar_at((p.x - price_rect.left()) as f64, len))
+            .unwrap_or(len.saturating_sub(1));
+        let mut legend_panes = Vec::new();
+        let mut legend_top = price_rect.bottom();
+        for ((_, members), height) in pane_groups.iter().zip(&heights) {
+            let rect =
+                Rect::from_min_max(pos2(plot_all.left(), legend_top), pos2(plot_all.right(), legend_top + height));
+            legend_top += height;
+            for &index in members {
+                legend_panes.push((rect, index));
+            }
+        }
+        let legend_rows =
+            crate::chart_legend::rows(ui, &self.indicators, &self.built, price_rect, &legend_panes, legend_bar);
+        let over_legend =
+            ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| legend_rows.iter().any(|row| row.rect.contains(p)));
+        let legend_action = crate::chart_legend::interact(ui, self.id, &legend_rows);
         // Register splitters after the plot so their drag target wins hit-testing,
         // including the first mouse-down when arriving from outside the chart.
         let mut divider_dragging = false;
@@ -944,12 +1039,12 @@ impl ChartState {
         if plot_resp.clicked() || plot_resp.drag_started() || axis_resp.clicked() || time_resp.clicked() {
             clicked = true;
         }
-        let hover = plot_resp.hover_pos().filter(|p| self.hover_enabled && plot_all.contains(*p));
-        if self.draw.tool.is_none() {
+        let hover = plot_resp.hover_pos().filter(|p| self.hover_enabled && !over_legend && plot_all.contains(*p));
+        if self.draw.tool.is_none() && !over_legend {
             plot_resp.context_menu(|ui| self.context_menu(ui, w));
         }
 
-        if plot_resp.hovered() || axis_resp.hovered() || time_resp.hovered() {
+        if plot_resp.hovered() && !over_legend || axis_resp.hovered() || time_resp.hovered() {
             let (scroll, zoom_delta) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
             if scroll != egui::Vec2::ZERO || zoom_delta != 1.0 {
                 self.glide = None;
@@ -974,6 +1069,7 @@ impl ChartState {
         if self.draw.tool.is_none()
             && plot_resp.dragged()
             && !divider_dragging
+            && !over_legend
             && self.draw.drag.is_none()
             && self.draw.hover.is_none()
         {
@@ -1195,19 +1291,9 @@ impl ChartState {
             }
         }
         for (at, (r, bi, s)) in sub_rects.iter().enumerate() {
-            let label = self.built[*bi].spec.label();
             let row = sub_rects[..at].iter().filter(|(other, _, _)| other == r).count();
             let separate = self.built[*bi].spec.chart.as_ref().is_some_and(|c| c.scale != StudyScale::Shared);
             let color = self.built[*bi].overlays.first().map_or(muted(), |(_, o)| opaque(o));
-            if *r != price_rect {
-                ui.painter_at(*r).text(
-                    r.left_top() + vec2(6.0, 3.0 + row as f32 * 14.0),
-                    Align2::LEFT_TOP,
-                    label,
-                    mono(10.5),
-                    color,
-                );
-            }
             if row > 0 && !separate {
                 continue;
             }
@@ -1270,7 +1356,12 @@ impl ChartState {
         }
 
         // ---- drawings ----
-        self.paint_drawings(ui, price_rect, &v, &scale, hover, &plot_resp);
+        let drawing_response = if over_legend {
+            ui.interact(Rect::NOTHING, ui.id().with((self.id, "legend-blocks-drawing")), Sense::hover())
+        } else {
+            plot_resp.clone()
+        };
+        self.paint_drawings(ui, price_rect, &v, &scale, hover, &drawing_response);
 
         // ---- congress markers ----
         self.hover_marker = None;
@@ -1331,9 +1422,13 @@ impl ChartState {
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
             }
         }
-        self.paint_legend(ui, price_rect, hovered_bar.unwrap_or(len.saturating_sub(1)), &sub_rects);
+        self.paint_legend(ui, price_rect, hovered_bar.unwrap_or(len.saturating_sub(1)), &legend_rows);
         if matches!(self.sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf) {
             clicked |= self.trade_buttons(ui, plot_all);
+        }
+        self.paint_live_badge(ui, price_rect);
+        if let Some(action) = legend_action {
+            self.apply_legend_action(action, w);
         }
 
         let _ = focused; // the surrounding card shows focus
@@ -1341,6 +1436,44 @@ impl ChartState {
     }
 
     /// Buy / Sell buttons in the plot's top-right corner: they open the order ticket.
+    fn apply_legend_action(&mut self, action: crate::chart_legend::Action, w: &Worker) {
+        use crate::chart_legend::Action;
+        let id = match action {
+            Action::Visibility(id, _) | Action::Edit(id) | Action::Remove(id) => id,
+        };
+        let Some(index) = self.indicators.iter().position(|s| s.chart.as_ref().is_some_and(|c| c.id == id)) else {
+            return;
+        };
+        match action {
+            Action::Edit(_) => {
+                self.indicator_editor = true;
+                self.indicator_focus = Some(id);
+            }
+            Action::Visibility(_, visible) => {
+                self.indicators[index].chart.as_mut().unwrap().visible = visible;
+                self.request_indicators(w);
+            }
+            Action::Remove(_) => {
+                self.remove_study(index);
+                self.request_indicators(w);
+            }
+        }
+    }
+
+    fn paint_live_badge(&self, ui: &Ui, plot: Rect) {
+        if !self.last_live.is_some_and(|t| t.elapsed().as_secs() < 5) || plot.width() < 60. || plot.height() < 50. {
+            return;
+        }
+        let painter = ui.painter_at(plot);
+        let galley = painter.layout_no_wrap("LIVE".into(), ui_font(10.), theme::up());
+        let badge = live_badge_rect(plot, galley.size().x);
+        painter.rect_filled(badge, 2., theme::card());
+        let pulse = 0.6 + 0.4 * ((ui.input(|i| i.time) * 3.).sin() as f32).abs();
+        painter.circle_filled(badge.left_center() + vec2(6., 0.), 2.5, theme::up().gamma_multiply(pulse));
+        painter.galley(badge.left_center() + vec2(12., -galley.size().y / 2.), galley, theme::up());
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
     fn trade_buttons(&mut self, ui: &mut Ui, plot: Rect) -> bool {
         let h = 20.0;
         let mut x = plot.right() - 8.0;
@@ -1370,6 +1503,7 @@ impl ChartState {
             return;
         }
         let mut open = true;
+        let focus = self.indicator_focus.take();
         let before = self.indicators.clone();
         let mut remove = None;
         let mut reorder = None;
@@ -1462,11 +1596,15 @@ impl ChartState {
                             let def = registry::find(&spec.code);
                             let default_rgb: [u8; 3] = theme::series(c.id.saturating_sub(1) as usize).to_array()[..3].try_into().unwrap();
                             let swatch = c.color.unwrap_or(default_rgb);
-                            let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
                                 ui.ctx(),
                                 ui.make_persistent_id("study"),
                                 true,
                             );
+                            if focus==Some(c.id) {
+                                state.set_open(true);
+                                ui.scroll_to_rect(Rect::from_min_size(ui.cursor().min,vec2(10.,24.)),Some(egui::Align::TOP));
+                            }
                             state
                                 .show_header(ui, |ui| {
                                     ui.checkbox(&mut c.visible, "").on_hover_text(
@@ -1934,6 +2072,16 @@ impl ChartState {
             }
         });
         ui.menu_button("Draw", |ui| {
+            if ui
+                .add_enabled(
+                    self.draw.selected.is_some(),
+                    egui::Button::new("Delete Selected Drawing").shortcut_text("Delete"),
+                )
+                .clicked()
+            {
+                self.delete_selected();
+                ui.close();
+            }
             let alt = if cfg!(target_os = "macos") { "⌥" } else { "Alt+" };
             for (tool, key) in
                 [(Tool::Trendline, "T"), (Tool::Horizontal, "H"), (Tool::Vertical, "V"), (Tool::Fib, "F")]
@@ -1983,6 +2131,10 @@ impl ChartState {
             }
         });
         ui.checkbox(&mut self.log, "Log Scale");
+        if ui.button("Compare symbol…").clicked() {
+            self.compare_picker.open();
+            ui.close();
+        }
         ui.checkbox(&mut self.magnet, "Magnet");
         ui.checkbox(&mut self.show_volume, "Volume");
         ui.separator();
@@ -1999,7 +2151,7 @@ impl ChartState {
         }
     }
 
-    fn paint_legend(&self, ui: &Ui, price_rect: Rect, i: usize, sub_rects: &[(Rect, usize, PriceScale)]) {
+    fn paint_legend(&self, ui: &Ui, price_rect: Rect, i: usize, rows: &[crate::chart_legend::Row]) {
         let Some(b) = self.bars.get(i) else { return };
         let p = ui.painter_at(price_rect);
         let prev = if i > 0 { self.bars[i - 1].close } else { b.open };
@@ -2020,30 +2172,8 @@ impl ChartState {
         put(format!("{:+.dec$} ({:+.2}%)", chg, if prev != 0.0 { chg / prev * 100.0 } else { 0.0 }), col, &mut x);
         put(format!("Vol {}", scale::format_volume(b.volume)), muted(), &mut x);
 
-        // Overlay indicator values, one per line.
-        let mut ly = y + 16.0;
-        let value_at = |l: &LineRef| l.pyramid.data.get(i).map(|p| p[1] as f64).filter(|v| v.is_finite());
         let groups = study_groups(&self.built);
-        for bi in groups
-            .iter()
-            .filter(|(key, _)| key.is_none())
-            .flat_map(|(_, members)| members.iter().map(|&index| &self.built[index]))
-        {
-            let vals: Vec<String> = bi
-                .overlays
-                .iter()
-                .filter_map(|(_, o)| value_at(&o.line).map(|v| format!("{v:.prec$}", prec = dec.min(4))))
-                .collect();
-            let c = bi.overlays.get(bi.overlays.len() / 2).map_or(text(), |o| opaque(&o.1));
-            p.text(
-                pos2(price_rect.left() + 6.0, ly),
-                Align2::LEFT_TOP,
-                format!("{}  {}", bi.spec.label(), vals.join(" ")),
-                mono(11.0),
-                c,
-            );
-            ly += 14.0;
-        }
+        let mut ly = y + 16.0 + rows.iter().filter(|row| price_rect.contains(row.rect.center())).count() as f32 * 14.0;
         let hidden = groups.iter().filter(|(key, _)| key.is_some()).count().saturating_sub(MAX_SUB_PANES);
         if hidden > 0 {
             let note =
@@ -2051,13 +2181,24 @@ impl ChartState {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, note, mono(11.0), muted());
             ly += 14.0;
         }
-        if let (Some(sym), Some(line)) = (&self.compare, &self.compare_line) {
+        if let Some(sym) = &self.compare {
             // Raw price plus performance relative to the left edge of the view.
-            let raw = value_at(line);
+            let raw = self
+                .compare_line
+                .as_ref()
+                .and_then(|line| line.pyramid.data.get(i))
+                .map(|point| point[1] as f64)
+                .filter(|v| v.is_finite());
             let rel = raw.zip(self.bars.get(i)).map(|(r, b)| (r * self.compare_scale / b.close - 1.0) * 100.0);
-            let text = match (raw, rel) {
-                (Some(r), Some(rel)) => format!("CMP {sym}  {r:.2}  ({rel:+.2}% vs {})", self.symbol),
-                _ => format!("CMP {sym}"),
+            let text = if let Some(error) = &self.compare_error {
+                format!("CMP {sym} · {error}")
+            } else if self.compare_loading {
+                format!("CMP {sym} · loading…")
+            } else {
+                match (raw, rel) {
+                    (Some(r), Some(rel)) => format!("CMP {sym}  {r:.2}  ({rel:+.2}% vs {})", self.symbol),
+                    _ => format!("CMP {sym}"),
+                }
             };
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, text, mono(11.0), theme::series(5));
             ly += 14.0;
@@ -2076,21 +2217,7 @@ impl ChartState {
                 amber(),
             );
         }
-        for (at, (r, bi, _)) in sub_rects.iter().enumerate().filter(|(_, (r, _, _))| *r != price_rect) {
-            let b = &self.built[*bi];
-            let painter = ui.painter_at(*r);
-            let row = sub_rects[..at].iter().filter(|(other, _, _)| other == r).count();
-            // Values start after the pane's label (drawn with the axes).
-            let mut x = r.left() + 18.0 + painter.layout_no_wrap(b.spec.label(), mono(10.5), muted()).size().x;
-            for (name, o) in &b.overlays {
-                let Some(v) = value_at(&o.line) else { continue };
-                let color = if o.kind == LineKind::Hist { text() } else { opaque(o) };
-                let g = painter.layout_no_wrap(format!("{name} {}", scale::format_value(v)), mono(10.5), color);
-                let w = g.size().x;
-                painter.galley(pos2(x, r.top() + 3.0 + row as f32 * 14.0), g, color);
-                x += w + 10.0;
-            }
-        }
+        crate::chart_legend::paint(ui, rows);
     }
 
     fn drawing_shapes(&self, d: &Drawing, rect: Rect, v: &Viewport, s: &PriceScale) -> Vec<(Shape, Option<String>)> {
@@ -2391,6 +2518,10 @@ impl ChartState {
     }
 }
 
+fn live_badge_rect(plot: Rect, text_width: f32) -> Rect {
+    Rect::from_min_size(pos2(plot.right() - text_width - 22., plot.top() + 30.), vec2(text_width + 16., 14.))
+}
+
 fn study_source_label(source: &StudySource, specs: &[IndicatorSpec]) -> String {
     match source {
         StudySource::Bars => "Original bars".into(),
@@ -2509,6 +2640,221 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ui_frame(ctx: &egui::Context, events: Vec<egui::Event>, mut draw: impl FnMut(&mut Ui)) -> Vec<(String, Rect)> {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900., 560.))),
+                time: Some(ctx.input(|i| i.time) + 0.2),
+                events,
+                ..Default::default()
+            },
+            |ui| draw(ui),
+        );
+        let texts = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    Some((text.galley.job.text.clone(), text.galley.rect.translate(text.pos.to_vec2())))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        output.textures_delta.clear();
+        texts
+    }
+    fn pointer_button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+    fn sample_chart() -> ChartState {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.indicators = vec![IndicatorSpec::new("EMA", &[20.]).unwrap()];
+        study::assign_ids(&mut chart.indicators);
+        chart.bars = Arc::new(tr_core::sample::generate("AAPL", chart.tf, 500, 1_790_000_000));
+        chart.gpu = Some(SeriesGpu::build(&chart.bars));
+        chart.built = crate::worker::build_indicators(&chart.bars, chart.tf, &chart.indicators, &theme::palette());
+        chart
+    }
+    fn chart_frame(ctx: &egui::Context, chart: &mut ChartState, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        ui_frame(ctx, events, |ui| {
+            chart.show(ui, ui.max_rect(), true, &Worker::inert());
+        })
+    }
+    fn click_chart(ctx: &egui::Context, chart: &mut ChartState, pos: Pos2) -> Vec<(String, Rect)> {
+        chart_frame(ctx, chart, vec![egui::Event::PointerMoved(pos)]);
+        chart_frame(ctx, chart, vec![pointer_button(pos, true)]);
+        chart_frame(ctx, chart, vec![pointer_button(pos, false)]);
+        chart_frame(ctx, chart, vec![])
+    }
+
+    #[test]
+    fn legend_clicks_hide_and_restore_without_placing_a_drawing_or_panning() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart.start_tool(Tool::Horizontal);
+        let texts = chart_frame(&ctx, &mut chart, vec![]);
+        let row = texts.iter().find(|(text, _)| text.starts_with("EMA 20")).unwrap().1.center();
+        let right = chart.viewport.unwrap().right;
+        let menu = click_chart(&ctx, &mut chart, row);
+        let show = menu.iter().find(|(text, _)| text == "Show on chart").expect("legend opens study menu").1.center();
+        click_chart(&ctx, &mut chart, show);
+        assert!(!chart.indicators[0].chart.as_ref().unwrap().visible);
+        assert_eq!(chart.viewport.unwrap().right, right);
+        assert!(chart.drawings.is_empty());
+        let texts = chart_frame(&ctx, &mut chart, vec![]);
+        let hidden =
+            texts.iter().find(|(text, _)| text.starts_with("EMA 20") && text.contains("hidden")).unwrap().1.center();
+        let menu = click_chart(&ctx, &mut chart, hidden);
+        let show = menu.iter().find(|(text, _)| text == "Show on chart").unwrap().1.center();
+        click_chart(&ctx, &mut chart, show);
+        assert!(chart.indicators[0].chart.as_ref().unwrap().visible);
+        assert!(chart.drawings.is_empty());
+    }
+
+    #[test]
+    fn oscillator_legend_can_open_its_indicator_editor() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart.indicators.push(IndicatorSpec::new("RSI", &[14.]).unwrap());
+        study::assign_ids(&mut chart.indicators);
+        chart.built = crate::worker::build_indicators(&chart.bars, chart.tf, &chart.indicators, &theme::palette());
+        let texts = chart_frame(&ctx, &mut chart, vec![]);
+        let oscillator = texts
+            .iter()
+            .find(|(text, _)| text.starts_with("RSI 14"))
+            .expect("oscillator has a legend target")
+            .1
+            .center();
+        let menu = click_chart(&ctx, &mut chart, oscillator);
+        let edit = menu.iter().find(|(text, _)| text == "Edit indicator…").unwrap().1.center();
+        // Inspect immediately after release, before the next frame consumes the focus request.
+        chart_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(edit), pointer_button(edit, true)]);
+        chart_frame(&ctx, &mut chart, vec![pointer_button(edit, false)]);
+        assert!(chart.indicator_editor);
+        assert_eq!(chart.indicator_focus, Some(2));
+    }
+
+    #[test]
+    fn comparison_picker_selects_and_removes_a_symbol_without_a_command() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart.compare_picker.open();
+        chart_frame(&ctx, &mut chart, vec![]);
+        let texts = chart_frame(&ctx, &mut chart, vec![]);
+        let candidate = texts
+            .iter()
+            .find(|(text, _)| text.starts_with("SPX Index  ·"))
+            .expect("local catalog is available without provider search")
+            .1
+            .center();
+        click_chart(&ctx, &mut chart, candidate);
+        assert_eq!(chart.compare.as_deref(), Some("SPX Index"));
+        assert!(chart.compare_loading);
+        assert!(!chart.compare_picker.open);
+        chart.compare_picker.open();
+        chart_frame(&ctx, &mut chart, vec![]);
+        let texts = chart_frame(&ctx, &mut chart, vec![]);
+        let remove = texts.iter().find(|(text, _)| text == "Remove").unwrap().1.center();
+        click_chart(&ctx, &mut chart, remove);
+        assert!(chart.compare.is_none());
+        assert!(chart.compare_line.is_none());
+        assert!(!chart.compare_loading);
+    }
+
+    #[test]
+    fn legend_actions_target_stable_instances_and_keep_the_existing_removal_policy() {
+        let mut chart = sample_chart();
+        chart.indicators.push(IndicatorSpec::new("EMA", &[50.]).unwrap());
+        chart.indicators.push(IndicatorSpec::new("EMA", &[9.]).unwrap());
+        study::assign_ids(&mut chart.indicators);
+        chart.indicators[2].chart.as_mut().unwrap().source = StudySource::Output { study: 1, output: "EMA".into() };
+        chart.indicators.swap(0, 1);
+        let worker = Worker::inert();
+        chart.apply_legend_action(crate::chart_legend::Action::Edit(1), &worker);
+        assert_eq!(chart.indicator_focus, Some(1));
+        assert!(chart.indicator_editor);
+        chart.apply_legend_action(crate::chart_legend::Action::Remove(1), &worker);
+        assert_eq!(chart.indicators.len(), 1);
+        assert_eq!(chart.indicators[0].chart.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn context_menu_deletes_only_the_selected_drawing_and_undo_restores_it() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        let drawing = Drawing::new(Tool::Horizontal, Anchor { ts: 0, price: 10. }, Anchor { ts: 0, price: 10. });
+        chart.drawings = vec![drawing.clone(), drawing];
+        chart.draw.selected = Some(1);
+        let worker = Worker::inert();
+        let texts = ui_frame(&ctx, vec![], |ui| chart.context_menu(ui, &worker));
+        let at = texts.iter().find(|(text, _)| text == "Draw").unwrap().1.center();
+        ui_frame(&ctx, vec![egui::Event::PointerMoved(at), pointer_button(at, true)], |ui| {
+            chart.context_menu(ui, &worker)
+        });
+        ui_frame(&ctx, vec![pointer_button(at, false)], |ui| chart.context_menu(ui, &worker));
+        let texts = ui_frame(&ctx, vec![], |ui| chart.context_menu(ui, &worker));
+        let delete = texts
+            .iter()
+            .find(|(text, _)| text == "Delete Selected Drawing")
+            .expect("selected deletion is exposed")
+            .1
+            .center();
+        ui_frame(&ctx, vec![egui::Event::PointerMoved(delete), pointer_button(delete, true)], |ui| {
+            chart.context_menu(ui, &worker)
+        });
+        ui_frame(&ctx, vec![pointer_button(delete, false)], |ui| chart.context_menu(ui, &worker));
+        assert_eq!(chart.drawings.len(), 1);
+        chart.undo_drawings();
+        assert_eq!(chart.drawings.len(), 2);
+    }
+
+    #[test]
+    fn header_controls_fit_their_measured_allocation_and_live_stays_out_of_the_axis() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        ui_frame(&ctx, vec![], |ui| {
+            let width = ChartState::controls_width(ui);
+            let used = ui
+                .horizontal(|ui| {
+                    chart.controls(ui, &Worker::inert());
+                })
+                .response
+                .rect
+                .width();
+            assert!(used <= width, "controls use {used}, reserved {width}");
+        });
+        chart.last_live = Some(std::time::Instant::now());
+        let texts = chart_frame(&ctx, &mut chart, vec![]);
+        let live = texts.iter().find(|(text, _)| text == "LIVE").unwrap().1;
+        assert!(live.right() <= 900. - AXIS_W);
+        assert!(live.top() >= HEADER_H + 30.);
+    }
+
+    #[test]
+    fn stale_comparison_results_and_errors_cannot_replace_a_new_selection() {
+        let mut chart = sample_chart();
+        let worker = Worker::inert();
+        chart.set_compare(Some("MSFT".into()), &worker);
+        let revision = chart.compare_revision;
+        chart.set_compare(Some("NVDA".into()), &worker);
+        chart.on_compare_error(chart.generation, revision, "MSFT US Equity", "old error".into());
+        assert!(chart.compare_error.is_none());
+        chart.on_compare(chart.generation, revision, "MSFT US Equity", tr_chart::scene::line_ref(&[1.]));
+        assert!(chart.compare_line.is_none());
+        chart.on_compare_error(chart.generation, chart.compare_revision, "NVDA US Equity", "offline".into());
+        assert_eq!(chart.compare_error.as_deref(), Some("offline"));
+        assert!(!chart.compare_loading);
+        chart.set_compare(None, &worker);
+        assert!(chart.compare.is_none());
+        assert!(chart.compare_error.is_none());
+    }
 
     #[test]
     fn advanced_studies_build_headless_frames_at_split_pane_width() {

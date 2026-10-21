@@ -130,11 +130,16 @@ pub enum Request {
         session: tr_core::session::Session,
     },
     Compare {
+        revision: u64,
         pane: PaneId,
         generation: u64,
         symbol: String,
         tf: Timeframe,
         base: Arc<Vec<Bar>>,
+    },
+    CompareSearch {
+        pane: PaneId,
+        query: String,
     },
     Markers {
         pane: PaneId,
@@ -307,10 +312,23 @@ pub enum Response {
         built: Vec<BuiltIndicator>,
     },
     Compare {
+        revision: u64,
         pane: PaneId,
         generation: u64,
         symbol: String,
         line: LineRef,
+    },
+    CompareError {
+        pane: PaneId,
+        generation: u64,
+        revision: u64,
+        symbol: String,
+        error: String,
+    },
+    CompareSearch {
+        pane: PaneId,
+        query: String,
+        result: Result<Vec<SearchHit>, String>,
     },
     Markers {
         pane: PaneId,
@@ -790,17 +808,35 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     .unwrap_or_default();
             s.send(Response::Indicators { pane, generation, built, revision });
         }
-        Request::Compare { pane, generation, symbol, tf, base } => {
+        Request::Compare { pane, generation, symbol, tf, base, revision } => {
             let limit = base.len().max(100);
             match s.provider.history(&symbol, tf, None, limit).await {
                 Ok(other) => {
-                    let line = tokio::task::spawn_blocking(move || line_ref(&align_compare(&base, &other))).await;
-                    if let Ok(line) = line {
-                        s.send(Response::Compare { pane, generation, symbol, line });
+                    let line = tokio::task::spawn_blocking(move || {
+                        let values = align_compare(&base, &other);
+                        values.iter().any(|v| v.is_finite()).then(|| line_ref(&values))
+                    })
+                    .await;
+                    if let Ok(Some(line)) = line {
+                        s.send(Response::Compare { pane, generation, symbol, line, revision });
+                    } else {
+                        s.send(Response::CompareError {
+                            pane,
+                            generation,
+                            revision,
+                            symbol,
+                            error: "No overlapping comparison history is available".into(),
+                        });
                     }
                 }
-                Err(e) => s.send(Response::Status(format!("compare {symbol}: {e:#}"))),
+                Err(e) => {
+                    s.send(Response::CompareError { pane, generation, revision, symbol, error: format!("{e:#}") })
+                }
             }
+        }
+        Request::CompareSearch { pane, query } => {
+            let result = s.provider.search(&query).await.map_err(|e| format!("{e:#}"));
+            s.send(Response::CompareSearch { pane, query, result });
         }
         Request::Markers { pane, symbol } => {
             let sec = tr_data::security(&symbol);

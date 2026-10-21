@@ -1014,9 +1014,19 @@ impl TerminalApp {
                         c.on_indicators(generation, revision, built);
                     }
                 }
-                Response::Compare { pane, generation, symbol, line } => {
+                Response::Compare { pane, generation, symbol, line, revision } => {
                     if let Some(c) = self.chart_mut(pane) {
-                        c.on_compare(generation, &symbol, line);
+                        c.on_compare(generation, revision, &symbol, line);
+                    }
+                }
+                Response::CompareError { pane, generation, revision, symbol, error } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_compare_error(generation, revision, &symbol, error);
+                    }
+                }
+                Response::CompareSearch { pane, query, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_compare_search(&query, result);
                     }
                 }
                 Response::Markers { pane, symbol, trades } => {
