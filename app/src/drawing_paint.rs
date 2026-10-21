@@ -53,20 +53,20 @@ pub fn paint(drawing: &Drawing, paint: &Paint<'_>, shapes: Vec<LabeledShape>) {
 }
 
 fn paint_patterns(p: &Paint<'_>, shapes: Vec<LabeledShape>) {
-    for (shape, label) in shapes {
-        if let Some(label) = label {
-            if let DrawingShape::Segment(a, _) = shape {
-                label_text(
-                    p.painter,
-                    pos2(a[0] as f32, a[1] as f32),
-                    Align2::CENTER_CENTER,
-                    label,
-                    mono(10.),
-                    p.stroke.color,
-                );
-            }
-        } else {
-            primitives(p, vec![(shape, None)], RectStyle::Plain);
+    let (labels, geometry): (Vec<_>, Vec<_>) = shapes.into_iter().partition(|(_, label)| label.is_some());
+    primitives(p, geometry, RectStyle::Plain);
+    for (shape, label) in labels {
+        if let Some(label) = label
+            && let DrawingShape::Segment(a, _) = shape
+        {
+            label_text(
+                p.painter,
+                pos2(a[0] as f32, a[1] as f32),
+                Align2::CENTER_CENTER,
+                label,
+                mono(10.),
+                p.stroke.color,
+            );
         }
     }
 }
@@ -126,10 +126,50 @@ enum RectStyle {
 fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) {
     let Paint { painter: p, rect, stroke, selected } = *context;
     let color = stroke.color;
-    for (shape, label) in shapes {
+    // Paint all geometry before labels so later lines and translucent fills cannot
+    // cover a label's plate (notably info/regression lines and Fib levels).
+    for (shape, label) in &shapes {
         match shape {
             DrawingShape::Segment(a, b) => {
                 p.line_segment([pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32)], stroke);
+            }
+            DrawingShape::DashedSegment(a, b) => {
+                let a = pos2(a[0] as f32, a[1] as f32);
+                let b = pos2(b[0] as f32, b[1] as f32);
+                p.extend(Shape::dashed_line(&[a, b], stroke, 4., 4.));
+            }
+            DrawingShape::HLine(y) => {
+                p.hline(rect.x_range(), *y as f32, stroke);
+            }
+            DrawingShape::VLine(x) => {
+                p.vline(*x as f32, rect.y_range(), stroke);
+            }
+            DrawingShape::Rect(a, b) => {
+                let r = Rect::from_two_pos(pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32));
+                if matches!(style, RectStyle::Text | RectStyle::Callout) {
+                    if selected || matches!(style, RectStyle::Callout) {
+                        p.rect_stroke(r, 2., stroke, StrokeKind::Inside);
+                    }
+                } else {
+                    let fill = if matches!(style, RectStyle::RiskReward) {
+                        if label.as_ref().is_some_and(|s| s.starts_with("Risk")) { theme::down() } else { theme::up() }
+                    } else {
+                        color
+                    };
+                    p.rect_filled(r, 0., fill.gamma_multiply(0.12));
+                    p.rect_stroke(r, 0., stroke, StrokeKind::Inside);
+                }
+            }
+            DrawingShape::Polygon(points) => {
+                let points = points.iter().map(|p| pos2(p[0] as f32, p[1] as f32)).collect();
+                p.add(Shape::convex_polygon(points, color.gamma_multiply(0.08), stroke));
+            }
+        }
+    }
+    // label_text uses label_plate too; wrapped labels below use it directly.
+    for (shape, label) in shapes {
+        match shape {
+            DrawingShape::Segment(a, b) => {
                 if let Some(label) = label {
                     label_text(
                         p,
@@ -145,13 +185,7 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
                     );
                 }
             }
-            DrawingShape::DashedSegment(a, b) => {
-                let a = pos2(a[0] as f32, a[1] as f32);
-                let b = pos2(b[0] as f32, b[1] as f32);
-                p.extend(Shape::dashed_line(&[a, b], stroke, 4., 4.));
-            }
             DrawingShape::HLine(y) => {
-                p.hline(rect.x_range(), y as f32, stroke);
                 if let Some(label) = label {
                     label_text(
                         p,
@@ -164,7 +198,6 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
                 }
             }
             DrawingShape::VLine(x) => {
-                p.vline(x as f32, rect.y_range(), stroke);
                 if let Some(label) = label {
                     label_text(p, pos2(x as f32 + 3., rect.top() + 3.), Align2::LEFT_TOP, label, mono(10.), color);
                 }
@@ -172,20 +205,10 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
             DrawingShape::Rect(a, b) => {
                 let r = Rect::from_two_pos(pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32));
                 if matches!(style, RectStyle::Text | RectStyle::Callout) {
-                    if selected || matches!(style, RectStyle::Callout) {
-                        p.rect_stroke(r, 2., stroke, StrokeKind::Inside);
-                    }
                     let galley = p.layout(label.unwrap_or_default(), ui_font(11.5), color, 220.);
                     label_plate(p, Rect::from_min_size(r.min + vec2(4., 2.), galley.size()));
                     p.galley(r.min + vec2(4., 2.), galley, color);
                 } else {
-                    let fill = if matches!(style, RectStyle::RiskReward) {
-                        if label.as_ref().is_some_and(|s| s.starts_with("Risk")) { theme::down() } else { theme::up() }
-                    } else {
-                        color
-                    };
-                    p.rect_filled(r, 0., fill.gamma_multiply(0.12));
-                    p.rect_stroke(r, 0., stroke, StrokeKind::Inside);
                     if let Some(label) = label {
                         let galley = p.layout(label, mono(11.), color, rect.width().min(330.));
                         let size = galley.size() + vec2(8., 4.);
@@ -198,12 +221,60 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
                     }
                 }
             }
-            DrawingShape::Polygon(points) => {
-                let points = points.iter().map(|p| pos2(p[0] as f32, p[1] as f32)).collect();
-                p.add(Shape::convex_polygon(points, color.gamma_multiply(0.08), stroke));
-            }
+            DrawingShape::DashedSegment(..) | DrawingShape::Polygon(_) => {}
         }
     }
+}
+
+#[test]
+fn drawing_labels_have_plates_above_geometry() {
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let painter = ui.ctx().layer_painter(egui::LayerId::background());
+        let paint = Paint {
+            painter: &painter,
+            rect: Rect::from_min_size(pos2(0., 0.), vec2(500., 300.)),
+            stroke: Stroke::new(1., Color32::WHITE),
+            selected: false,
+        };
+        primitives(
+            &paint,
+            vec![
+                (DrawingShape::Segment([20., 60.], [200., 80.]), Some("Info / regression / Fib".into())),
+                (DrawingShape::HLine(100.), Some("Level".into())),
+                (DrawingShape::VLine(150.), Some("Time zone".into())),
+                (DrawingShape::Rect([20., 150.], [200., 200.]), Some("Range / profile".into())),
+            ],
+            RectStyle::Plain,
+        );
+        for style in [RectStyle::Text, RectStyle::Callout] {
+            primitives(
+                &paint,
+                vec![(DrawingShape::Rect([220., 100.], [400., 150.]), Some("Price note / callout".into()))],
+                style,
+            );
+        }
+        paint_patterns(
+            &paint,
+            vec![
+                (DrawingShape::Segment([250., 200.], [250., 200.]), Some("Point / ratio".into())),
+                (DrawingShape::Segment([250., 200.], [350., 250.]), None),
+            ],
+        );
+    });
+    output.textures_delta.clear();
+    let mut labels = 0;
+    for pair in output.shapes.windows(2) {
+        if let Shape::Text(text) = &pair[1].shape {
+            let Shape::Rect(plate) = &pair[0].shape else {
+                panic!("drawing text must be immediately preceded by its plate");
+            };
+            assert!(plate.fill.a() > 0);
+            assert!(plate.rect.contains_rect(Rect::from_min_size(text.pos, text.galley.size())));
+            labels += 1;
+        }
+    }
+    assert_eq!(labels, 7);
 }
 
 struct Glyph {

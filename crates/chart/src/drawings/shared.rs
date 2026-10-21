@@ -99,8 +99,8 @@ mod tests {
     fn measurement_reports_signed_price_percent_intervals_and_calendar_time() {
         let a = Anchor { ts: 100, price: 100. };
         let b = Anchor { ts: 86500, price: 110. };
-        assert_eq!(measure_label(a, b, 12, 2), "+10.00 (+10.00%) · 12 bars · 1d 0h");
-        assert_eq!(measure_label(b, a, 12, 2), "-10.00 (-9.09%) · 12 bars · 1d 0h");
+        assert_eq!(measure_label(a, b, 12, 2), "+10.00 (+10.00%) · 12 bars · 1d");
+        assert_eq!(measure_label(b, a, 12, 2), "-10.00 (-9.09%) · 12 bars · 1d");
         assert!(measure_label(Anchor { price: 0., ..a }, b, 0, 2).contains("(n/a)"));
         assert!(measure_label(Anchor { price: -100., ..a }, Anchor { price: -90., ..b }, 1, 2).contains("(+10.00%)"));
     }

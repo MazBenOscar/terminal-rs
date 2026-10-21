@@ -101,14 +101,23 @@ pub fn label(a: super::Anchor, b: super::Anchor, bar_intervals: usize, decimals:
     let change = b.price - a.price;
     let pct = if a.price == 0. { "n/a".into() } else { format!("{:+.2}%", change / a.price.abs() * 100.) };
     let secs = b.ts.abs_diff(a.ts);
-    let elapsed = if secs >= 86400 {
-        format!("{}d {}h", secs / 86400, secs % 86400 / 3600)
-    } else if secs >= 3600 {
-        format!("{}h {}m", secs / 3600, secs % 3600 / 60)
-    } else {
-        format!("{}m {}s", secs / 60, secs % 60)
-    };
+    let elapsed = format_duration(secs);
     format!("{change:+.decimals$} ({pct}) · {bar_intervals} bars · {elapsed}")
+}
+
+fn format_duration(secs: u64) -> String {
+    let (major, minor, major_unit, minor_unit) = if secs >= 86_400 {
+        (secs / 86_400, secs % 86_400 / 3600, "d", "h")
+    } else if secs >= 3600 {
+        (secs / 3600, secs % 3600 / 60, "h", "m")
+    } else {
+        (secs / 60, secs % 60, "m", "s")
+    };
+    match (major, minor) {
+        (0, _) => format!("{minor}{minor_unit}"),
+        (_, 0) => format!("{major}{major_unit}"),
+        _ => format!("{major}{major_unit} {minor}{minor_unit}"),
+    }
 }
 
 pub fn point_count(tool: Tool) -> usize {
@@ -181,14 +190,35 @@ mod tests {
     }
 
     #[test]
+    fn durations_omit_zero_parts_and_preserve_mixed_units() {
+        for (secs, expected) in [
+            (0, "0s"),
+            (45, "45s"),
+            (60, "1m"),
+            (61, "1m 1s"),
+            (3 * 3600, "3h"),
+            (3 * 3600 + 15 * 60, "3h 15m"),
+            (86_400, "1d"),
+            (350 * 86_400, "350d"),
+            (2 * 86_400 + 3 * 3600, "2d 3h"),
+        ] {
+            assert_eq!(format_duration(secs), expected);
+            let a = Anchor { ts: 0, price: 100. };
+            let b = Anchor { ts: secs as i64, price: 110. };
+            assert!(label(a, b, 1, 2).ends_with(expected));
+            assert!(label(b, a, 1, 2).ends_with(expected));
+        }
+    }
+
+    #[test]
     fn range_labels_delta_percent_bars_elapsed_and_inclusive_volume() {
         let mut d = drawing(Tool::DatePriceRange);
-        assert_eq!(range_label(&d, &bars(), 2, 2), "+10.00 (+10.00%) · 2 bars · 2d 0h · Volume 60.00");
+        assert_eq!(range_label(&d, &bars(), 2, 2), "+10.00 (+10.00%) · 2 bars · 2d · Volume 60.00");
         d.tool = Tool::PriceRange;
         assert_eq!(range_label(&d, &bars(), 2, 2), "+10.00 (+10.00%)");
         d.tool = Tool::DateRange;
         std::mem::swap(&mut d.a, &mut d.b);
-        assert_eq!(range_label(&d, &bars(), 2, 2), "2 bars · 2d 0h · Volume 60.00");
+        assert_eq!(range_label(&d, &bars(), 2, 2), "2 bars · 2d · Volume 60.00");
         d.tool = Tool::DatePriceRange;
         assert!(range_label(&d, &bars(), 2, 2).starts_with("-10.00 (-9.09%)"));
         d.a.price = 0.;
