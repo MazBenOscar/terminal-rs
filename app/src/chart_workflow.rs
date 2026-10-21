@@ -101,6 +101,297 @@ mod tests {
     }
 
     #[test]
+    fn pcf_parenthesises_mixed_and_or_nesting() {
+        use tr_core::scanner::FormulaCondition;
+        let formula = |expression: &str| {
+            ConditionItem::Formula(FormulaCondition { expression: expression.into(), timeframe: None })
+        };
+        // ANY(ALL(a,b), ALL(c,d)) must not collapse into a flat OR of four terms.
+        let scan = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::Any,
+                items: vec![
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::All,
+                        items: vec![formula("C > 1"), formula("C > 2")],
+                    }),
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::All,
+                        items: vec![formula("C > 3"), formula("C > 4")],
+                    }),
+                ],
+            },
+            ..ScanDefinition::default()
+        };
+        assert_eq!(expression(&scan).unwrap(), "((C > 1) AND (C > 2)) OR ((C > 3) AND (C > 4))");
+
+        // ALL(ANY(a,b), ANY(c,d))
+        let scan = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::Any,
+                        items: vec![formula("C > 1"), formula("C > 2")],
+                    }),
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::Any,
+                        items: vec![formula("C > 3"), formula("C > 4")],
+                    }),
+                ],
+            },
+            ..ScanDefinition::default()
+        };
+        assert_eq!(expression(&scan).unwrap(), "((C > 1) OR (C > 2)) AND ((C > 3) OR (C > 4))");
+
+        // Three-level: ALL(a, ANY(b, ALL(c, d)))
+        let scan = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![
+                    formula("C > 1"),
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::Any,
+                        items: vec![
+                            formula("C > 2"),
+                            ConditionItem::Group(ConditionGroup {
+                                mode: MatchMode::All,
+                                items: vec![formula("C > 3"), formula("C > 4")],
+                            }),
+                        ],
+                    }),
+                ],
+            },
+            ..ScanDefinition::default()
+        };
+        assert_eq!(expression(&scan).unwrap(), "(C > 1) AND ((C > 2) OR ((C > 3) AND (C > 4)))");
+
+        // A formula that already contains OR is still isolated by its own parens.
+        let scan = ScanDefinition {
+            root: ConditionGroup { mode: MatchMode::All, items: vec![formula("C > 1 OR C > 2"), formula("C > 3")] },
+            ..ScanDefinition::default()
+        };
+        assert_eq!(expression(&scan).unwrap(), "(C > 1 OR C > 2) AND (C > 3)");
+    }
+
+    #[test]
+    fn pcf_maps_crosses_bars_ago_and_multipliers() {
+        use tr_core::{
+            Timeframe,
+            scanner::{FormulaCondition, ScanCondition},
+        };
+        let mut scan = ScanDefinition::default();
+        scan.root.items = vec![ConditionItem::Compare(ScanCondition {
+            left_bars_ago: 1,
+            right_bars_ago: 2,
+            right_multiplier: 2.5,
+            ..ScanCondition::default()
+        })];
+        let s = expression(&scan).unwrap();
+        assert!(s.contains("REF((C),1)"), "{s}");
+        assert!(s.contains("REF((AVG(C,20)),2)*2.5"), "{s}");
+
+        // CrossedAbove maps to CROSS(left, right); CrossedBelow flips the arguments.
+        if let ConditionItem::Compare(c) = &mut scan.root.items[0] {
+            c.comparison = tr_core::scanner::Comparison::CrossedAbove;
+            c.left_bars_ago = 0;
+            c.right_bars_ago = 0;
+            c.right_multiplier = 1.0;
+        }
+        let above = expression(&scan).unwrap();
+        assert!(
+            above.contains("CROSS((REF((C),0)),(REF((AVG(C,20)),0)*1))")
+                || above.contains("CROSS((REF((C),0)), (REF((AVG(C,20)),0)*1))"),
+            "{above}"
+        );
+        if let ConditionItem::Compare(c) = &mut scan.root.items[0] {
+            c.comparison = tr_core::scanner::Comparison::CrossedBelow;
+        }
+        let below = expression(&scan).unwrap();
+        assert!(
+            below.contains("CROSS((REF((AVG(C,20)),0)*1),(REF((C),0)))")
+                || below.contains("CROSS((REF((AVG(C,20)),0)*1), (REF((C),0)))"),
+            "{below}"
+        );
+
+        // Nested group inside a cross-bearing scan still parenthesises.
+        scan.root.items.push(ConditionItem::Group(ConditionGroup {
+            mode: MatchMode::Any,
+            items: vec![
+                ConditionItem::Formula(FormulaCondition { expression: "C > 1".into(), timeframe: None }),
+                ConditionItem::Formula(FormulaCondition { expression: "C > 2".into(), timeframe: None }),
+            ],
+        }));
+        if let ConditionItem::Compare(c) = &mut scan.root.items[0] {
+            c.comparison = tr_core::scanner::Comparison::CrossedAbove;
+        }
+        let nested = expression(&scan).unwrap();
+        assert!(nested.ends_with(" AND ((C > 1) OR (C > 2))"), "{nested}");
+
+        // Same-timeframe overrides are plottable; other timeframes are not.
+        scan.root.items = vec![ConditionItem::Formula(FormulaCondition {
+            expression: "C > 1".into(),
+            timeframe: Some(Timeframe::D1),
+        })];
+        assert_eq!(expression(&scan).unwrap(), "(C > 1)");
+    }
+
+    #[test]
+    fn generated_crosses_agree_with_model_evaluation() {
+        use tr_core::scanner::{Comparison, ScanCondition, ScanOutcome};
+        // Build a short series where each side's cross state is known at the last bar.
+        let closes = [1.0, 3.0, 2.0, 4.0, 3.0, 5.0];
+        let bars: Vec<_> =
+            closes.iter().enumerate().map(|(i, &c)| tr_core::Bar::new(i as i64, c, c, c, c, 1_000.0)).collect();
+        let series = tr_core::Series::new("TEST", tr_core::Timeframe::D1, bars.clone());
+        for (comparison, left_ago, right_ago, mult) in [
+            (Comparison::CrossedAbove, 0, 0, 1.0),
+            (Comparison::CrossedBelow, 0, 0, 1.0),
+            (Comparison::CrossedAbove, 1, 0, 1.0),
+            (Comparison::CrossedBelow, 0, 1, 1.0),
+            (Comparison::CrossedAbove, 0, 0, 2.0),
+            (Comparison::CrossedBelow, 1, 1, 0.5),
+        ] {
+            let mut scan = ScanDefinition::default();
+            scan.root.items = vec![ConditionItem::Compare(ScanCondition {
+                left: tr_core::scanner::ScanOperand::Price,
+                comparison,
+                right: tr_core::scanner::ScanOperand::Price,
+                left_bars_ago: left_ago,
+                right_bars_ago: right_ago,
+                right_multiplier: mult,
+                ..ScanCondition::default()
+            })];
+            let formula = expression(&scan).unwrap();
+            let values = tr_core::indicators::pcf::evaluate(
+                &formula,
+                &tr_core::indicators::registry::Input::new(&bars, scan.timeframe),
+            )
+            .unwrap();
+            let last = values.last().copied().filter(|v| v.is_finite());
+            match scan.evaluate(&series).outcome {
+                ScanOutcome::Match => {
+                    assert_eq!(last, Some(1.0), "{comparison:?} ago=({left_ago},{right_ago}) x{mult}")
+                }
+                ScanOutcome::NoMatch => {
+                    assert_eq!(last, Some(0.0), "{comparison:?} ago=({left_ago},{right_ago}) x{mult}")
+                }
+                ScanOutcome::Unavailable => {}
+            }
+        }
+    }
+
+    #[test]
+    fn generated_formulas_parse_for_odd_multipliers_and_constants() {
+        use tr_core::scanner::{Comparison, ScanCondition, ScanOperand};
+        for mult in [0.0, -0.0, -1.5, 2.5, 1e-8, 1e8, 0.1] {
+            let mut scan = ScanDefinition::default();
+            scan.root.items = vec![ConditionItem::Compare(ScanCondition {
+                left: ScanOperand::Price,
+                comparison: Comparison::Above,
+                right: ScanOperand::Sma { period: 3, source: tr_core::scanner::Source::Close },
+                right_multiplier: mult,
+                ..ScanCondition::default()
+            })];
+            let formula = expression(&scan).unwrap();
+            let bars: Vec<_> = (0..10)
+                .map(|i| tr_core::Bar::new(i, 1.0 + i as f64, 2.0 + i as f64, i as f64, 1.0 + i as f64, 10.0))
+                .collect();
+            let values = tr_core::indicators::pcf::evaluate(
+                &formula,
+                &tr_core::indicators::registry::Input::new(&bars, scan.timeframe),
+            )
+            .expect(&formula);
+            assert_eq!(values.len(), bars.len(), "{formula}");
+        }
+        // Negative and fractional constants stay parseable inside REF and comparisons.
+        for constant in [-2.5, 0.0, -0.0, 1e-8] {
+            let mut scan = ScanDefinition::default();
+            scan.root.items = vec![ConditionItem::Compare(ScanCondition {
+                left: ScanOperand::Price,
+                comparison: Comparison::Above,
+                right: ScanOperand::Constant(constant),
+                ..ScanCondition::default()
+            })];
+            let formula = expression(&scan).unwrap();
+            let bars: Vec<_> = (0..5).map(|i| tr_core::Bar::new(i, 1.0, 1.0, 1.0, 1.0, 1.0)).collect();
+            tr_core::indicators::pcf::evaluate(
+                &formula,
+                &tr_core::indicators::registry::Input::new(&bars, scan.timeframe),
+            )
+            .unwrap_or_else(|e| panic!("{formula}: {e}"));
+        }
+    }
+
+    #[test]
+    #[ignore = "BUG: chart_workflow::operand(ChangePercent) emits 100*(C/C1-1) which PCF evaluates even when the previous close is zero or negative, but ScanCondition treats previous <= 0 as Unavailable — scan and plot disagree on the same bar"]
+    fn change_percent_translation_rejects_non_positive_previous_close() {
+        use tr_core::scanner::{Comparison, ScanCondition, ScanOperand, ScanOutcome};
+        let mut scan = ScanDefinition::default();
+        scan.root.items = vec![ConditionItem::Compare(ScanCondition {
+            left: ScanOperand::ChangePercent,
+            comparison: Comparison::Above,
+            right: ScanOperand::Constant(0.0),
+            ..ScanCondition::default()
+        })];
+        // Previous close of the last bar is negative: the model refuses to evaluate.
+        let bars: Vec<_> = [10.0, -1.0, 5.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| tr_core::Bar::new(i as i64, c, c, c, c, 1_000.0))
+            .collect();
+        let series = tr_core::Series::new("TEST", tr_core::Timeframe::D1, bars.clone());
+        assert_eq!(scan.evaluate(&series).outcome, ScanOutcome::Unavailable);
+        // The plotted PCF must agree and stay undefined rather than answering.
+        let formula = expression(&scan).unwrap();
+        let values = tr_core::indicators::pcf::evaluate(
+            &formula,
+            &tr_core::indicators::registry::Input::new(&bars, scan.timeframe),
+        )
+        .unwrap();
+        let last = values.last().copied().filter(|v| v.is_finite());
+        assert_eq!(last, None, "PCF produced {last:?} where the scan is unavailable");
+    }
+
+    #[test]
+    fn change_percent_model_matches_pcf_on_valid_prices() {
+        use tr_core::scanner::{Comparison, ScanCondition, ScanOperand, ScanOutcome};
+        let closes = [10.0, 11.0, 10.5, 12.0, 11.0];
+        let bars: Vec<_> =
+            closes.iter().enumerate().map(|(i, &c)| tr_core::Bar::new(i as i64, c, c, c, c, 1_000.0)).collect();
+        let series = tr_core::Series::new("TEST", tr_core::Timeframe::D1, bars.clone());
+        let mut scan = ScanDefinition::default();
+        scan.root.items = vec![ConditionItem::Compare(ScanCondition {
+            left: ScanOperand::ChangePercent,
+            comparison: Comparison::Above,
+            right: ScanOperand::Constant(0.0),
+            ..ScanCondition::default()
+        })];
+        let formula = expression(&scan).unwrap();
+        let values = tr_core::indicators::pcf::evaluate(
+            &formula,
+            &tr_core::indicators::registry::Input::new(&bars, scan.timeframe),
+        )
+        .unwrap();
+        let last = values.last().copied().filter(|v| v.is_finite());
+        match scan.evaluate(&series).outcome {
+            ScanOutcome::Match => assert_eq!(last, Some(1.0)),
+            ScanOutcome::NoMatch => assert_eq!(last, Some(0.0)),
+            ScanOutcome::Unavailable => {}
+        }
+        // Positive previous closes are required by the model; PCF keeps computing.
+        // Lock the model side so a negative close can never become a match.
+        let mut neg = bars.clone();
+        neg[3].close = -1.0;
+        neg[3].open = -1.0;
+        neg[3].high = -1.0;
+        neg[3].low = -1.0;
+        let series = tr_core::Series::new("TEST", tr_core::Timeframe::D1, neg.clone());
+        // Previous close of the last bar is neg[3] which is negative.
+        assert_eq!(scan.evaluate(&series).outcome, ScanOutcome::Unavailable);
+    }
+
+    #[test]
     fn timeframe_override_cannot_be_plotted() {
         use tr_core::{
             Timeframe,

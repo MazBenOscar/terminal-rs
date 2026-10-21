@@ -785,6 +785,176 @@ mod tests {
     }
 
     #[test]
+    fn remove_at_tolerates_stale_and_malformed_paths() {
+        let compare = ConditionItem::Compare(ScanCondition::default());
+        let formula = |n: &str| ConditionItem::Formula(FormulaCondition { expression: n.into(), timeframe: None });
+        let mut root = ConditionGroup {
+            mode: MatchMode::All,
+            items: vec![
+                compare.clone(),
+                ConditionItem::Group(ConditionGroup { mode: MatchMode::Any, items: vec![formula("A"), formula("B")] }),
+                formula("C"),
+            ],
+        };
+        // Empty path is a no-op.
+        remove_at(&mut root, &[]);
+        assert_eq!(root.items.len(), 3);
+        // Out-of-range leaf index is a no-op.
+        remove_at(&mut root, &[9]);
+        assert_eq!(root.items.len(), 3);
+        // Path into a non-group leaf is a no-op (item 0 is a Compare).
+        remove_at(&mut root, &[0, 0]);
+        assert_eq!(root.items.len(), 3);
+        // Out-of-range index inside a valid group is a no-op.
+        remove_at(&mut root, &[1, 9]);
+        assert_eq!(root.items.len(), 3);
+        // Deep path that runs off the tree is a no-op.
+        remove_at(&mut root, &[1, 0, 0, 0]);
+        assert_eq!(root.items.len(), 3);
+        // Valid removal of a nested leaf leaves the group standing.
+        remove_at(&mut root, &[1, 0]);
+        let ConditionItem::Group(child) = &root.items[1] else { panic!("Expected group") };
+        assert_eq!(child.items.len(), 1);
+        // Removing the last nested leaf prunes the now-empty group.
+        remove_at(&mut root, &[1, 0]);
+        assert_eq!(root.items.len(), 2);
+        // Stale path after that pruning must not touch the new neighbours.
+        remove_at(&mut root, &[1, 0]);
+        assert_eq!(root.items.len(), 2);
+        remove_at(&mut root, &[0]);
+        remove_at(&mut root, &[0]);
+        assert!(root.items.is_empty());
+    }
+
+    #[test]
+    fn sibling_group_ids_do_not_collide() {
+        // Two sibling groups and a nested grandchild all render ComboBoxes that share
+        // fixed salts ("scan-mode", "condition-timeframe", "comparison", "left"/"right").
+        // push_id(index) must keep their persistent ids distinct, and editing one
+        // group must not rewrite the other.
+        let compare =
+            |tf: Option<Timeframe>| ConditionItem::Compare(ScanCondition { timeframe: tf, ..ScanCondition::default() });
+        let definition = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::Any,
+                        items: vec![compare(Some(Timeframe::W1)), compare(None)],
+                    }),
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::All,
+                        items: vec![
+                            compare(Some(Timeframe::H1)),
+                            ConditionItem::Group(ConditionGroup {
+                                mode: MatchMode::Any,
+                                items: vec![ConditionItem::Formula(FormulaCondition {
+                                    expression: "C > 1".into(),
+                                    timeframe: Some(Timeframe::W1),
+                                })],
+                            }),
+                        ],
+                    }),
+                ],
+            },
+            ..Default::default()
+        };
+        assert!(definition.validate().is_ok());
+        let mut pane = ScannerPane::new(definition.clone());
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                show(ui, &mut pane, 1, &["AAPL US Equity".into()], false, |_| {
+                    panic!("No scan requested during render")
+                });
+            });
+        });
+        assert!(!output.shapes.is_empty());
+        output.textures_delta.clear();
+        // Rendering alone must never mutate the definition.
+        assert_eq!(pane.definition, definition);
+
+        // Distinct sibling-group leaves report distinct labels and paths, so a
+        // remove aimed at one group cannot land on the other.
+        let mut root = pane.definition.root.clone();
+        remove_at(&mut root, &[0, 0]);
+        assert_eq!(root.items.len(), 2);
+        let ConditionItem::Group(first) = &root.items[0] else { panic!("Expected group") };
+        assert_eq!(first.items.len(), 1);
+        let ConditionItem::Group(second) = &root.items[1] else { panic!("Expected group") };
+        assert_eq!(second.items.len(), 2);
+    }
+
+    #[test]
+    fn leaf_budget_counts_group_defaults_on_add() {
+        // The editor increments the shared leaf counter once per Add, and a new
+        // group contributes exactly one default comparison.
+        assert!(can_add_leaf(MAX_CONDITIONS - 1));
+        assert!(!can_add_leaf(MAX_CONDITIONS));
+        // Depth gate: a new group lands at depth+1, so the button is only offered
+        // while depth < MAX_GROUP_DEPTH.
+        for depth in 1..=MAX_GROUP_DEPTH + 1 {
+            assert_eq!(can_add_group(depth), depth < MAX_GROUP_DEPTH, "depth {depth}");
+        }
+    }
+
+    #[test]
+    fn nested_definition_survives_scan_library_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "tr-scan-nested-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let definition = ScanDefinition {
+            name: "Nested".into(),
+            timeframe: Timeframe::W1,
+            root: ConditionGroup {
+                mode: MatchMode::Any,
+                items: vec![
+                    ConditionItem::Compare(ScanCondition {
+                        timeframe: Some(Timeframe::H1),
+                        left_bars_ago: 2,
+                        right_bars_ago: 3,
+                        right_multiplier: 2.5,
+                        ..ScanCondition::default()
+                    }),
+                    ConditionItem::Formula(FormulaCondition {
+                        expression: "C > AVGC20".into(),
+                        timeframe: Some(Timeframe::W1),
+                    }),
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::All,
+                        items: vec![
+                            ConditionItem::Compare(ScanCondition { right_multiplier: 0.5, ..ScanCondition::default() }),
+                            ConditionItem::Group(ConditionGroup {
+                                mode: MatchMode::Any,
+                                items: vec![ConditionItem::Formula(FormulaCondition {
+                                    expression: "V > 1000".into(),
+                                    timeframe: None,
+                                })],
+                            }),
+                        ],
+                    }),
+                ],
+            },
+        };
+        assert!(definition.validate().is_ok());
+        let settings = ScanSettings { definition: definition.clone(), universe: Universe::Nasdaq };
+        let saved = save_definition_at(&settings, &dir).unwrap();
+        assert_eq!(saved.len(), 1);
+        let loaded = load_saved_at(&dir).unwrap();
+        assert_eq!(loaded[0].definition, definition);
+        assert_eq!(loaded[0].universe, Universe::Nasdaq);
+        // JSON on disk is the version 1 form with root, not the legacy flat form.
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("scans.json")).unwrap()).unwrap();
+        assert_eq!(raw[0]["version"], 1);
+        assert!(raw[0].get("conditions").is_none());
+        assert_eq!(raw[0]["root"]["items"][1]["Formula"]["expression"], "C > AVGC20");
+        assert_eq!(raw[0]["root"]["items"][0]["Compare"]["right_multiplier"], 2.5);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn removing_last_child_removes_nested_group() {
         let compare = ConditionItem::Compare(ScanCondition::default());
         let mut root = ConditionGroup {

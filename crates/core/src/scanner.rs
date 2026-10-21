@@ -695,6 +695,100 @@ mod tests {
     }
 
     #[test]
+    fn bars_ago_multiplier_and_cross_need_exact_history() {
+        // left_bars_ago=1 with a crossover needs current + previous shifted bars.
+        let mut cross = scan(ScanOperand::Price, Comparison::CrossedAbove, ScanOperand::Price);
+        compare(&mut cross).left_bars_ago = 1;
+        assert_eq!(cross.required_bars(), 3);
+        // right_bars_ago=2 with a crossover: max(1+2, 1+0)+1 = 4.
+        let mut cross = scan(ScanOperand::Price, Comparison::CrossedAbove, ScanOperand::Price);
+        compare(&mut cross).right_bars_ago = 2;
+        assert_eq!(cross.required_bars(), 4);
+        // Multiplier does not add history.
+        let mut scaled = scan(ScanOperand::Price, Comparison::Above, ScanOperand::Price);
+        compare(&mut scaled).right_multiplier = 2.5;
+        assert_eq!(scaled.required_bars(), 1);
+        // SMA period and bars-ago add up on the heavier side.
+        let mut heavy =
+            scan(ScanOperand::Price, Comparison::Above, ScanOperand::Sma { period: 5, source: Source::Close });
+        compare(&mut heavy).right_bars_ago = 3;
+        assert_eq!(heavy.required_bars(), 8);
+    }
+
+    #[test]
+    fn evaluate_rejects_foreign_series_and_unordered_bars() {
+        let definition = scan(ScanOperand::Price, Comparison::Above, ScanOperand::Constant(0.0));
+        let mut set = SeriesSet::from([(Timeframe::D1, series(&[1.0, 2.0]))]);
+        assert_eq!(definition.evaluate_set(&set).outcome, ScanOutcome::Match);
+        // An extra series whose stored timeframe does not match its key invalidates the set.
+        set.insert(Timeframe::W1, series(&[1.0]));
+        assert_eq!(definition.evaluate_set(&set).reason.as_deref(), Some("Series timeframe does not match scan"));
+        // Non-increasing timestamps are rejected before any condition runs.
+        let mut bad = series(&[1.0, 2.0, 3.0]);
+        bad.bars[1].ts = bad.bars[0].ts;
+        let set = SeriesSet::from([(Timeframe::D1, bad)]);
+        assert_eq!(
+            definition.evaluate_set(&set).reason.as_deref(),
+            Some("Bars must have strictly increasing timestamps")
+        );
+        assert!(definition.evaluate_set(&set).conditions.is_empty());
+    }
+
+    #[test]
+    fn constant_and_change_percent_operands_reject_invalid_inputs() {
+        // Zero and negative previous closes make ChangePercent unavailable.
+        let change = scan(ScanOperand::ChangePercent, Comparison::Above, ScanOperand::Constant(0.0));
+        assert_eq!(change.evaluate(&series(&[0.0, 1.0])).outcome, ScanOutcome::Unavailable);
+        assert_eq!(change.evaluate(&series(&[-1.0, 1.0])).outcome, ScanOutcome::Unavailable);
+        // Non-finite constants never validate.
+        assert!(
+            scan(ScanOperand::Price, Comparison::Above, ScanOperand::Constant(f64::NEG_INFINITY)).validate().is_err()
+        );
+        // Period bounds are inclusive.
+        assert!(
+            scan(
+                ScanOperand::Sma { period: 500, source: Source::Close },
+                Comparison::Above,
+                ScanOperand::Constant(0.0)
+            )
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            scan(
+                ScanOperand::Sma { period: 501, source: Source::Close },
+                Comparison::Above,
+                ScanOperand::Constant(0.0)
+            )
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn version_1_serialization_omits_legacy_fields() {
+        let definition = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::Any,
+                items: vec![
+                    ConditionItem::Compare(ScanCondition { right_multiplier: 2.5, ..ScanCondition::default() }),
+                    ConditionItem::Group(ConditionGroup::comparisons(MatchMode::All, vec![ScanCondition::default()])),
+                ],
+            },
+            ..ScanDefinition::default()
+        };
+        let json = serde_json::to_value(&definition).unwrap();
+        assert_eq!(json["version"], 1);
+        assert!(json.get("conditions").is_none());
+        assert!(json.get("match_mode").is_none());
+        // Multipliers survive the round trip as exact f64 values.
+        let restored: ScanDefinition = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, definition);
+        let ConditionItem::Compare(c) = &restored.root.items[0] else { panic!("Expected comparison") };
+        assert_eq!(c.right_multiplier, 2.5);
+    }
+
+    #[test]
     fn momentum_ignition_preset() {
         let definition = ScanDefinition::momentum_ignition();
         assert!(ScanDefinition::presets().contains(&definition));
