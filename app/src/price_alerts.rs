@@ -72,7 +72,11 @@ impl State {
         let loaded = match std::fs::read(&path) {
             Ok(bytes) if bytes.len() <= 4_194_304 => serde_json::from_slice::<Book>(&bytes)
                 .map_err(|e| format!("Reading price alerts: {e}"))
-                .and_then(|book| book.validate().map(|()| book)),
+                .and_then(|mut book| {
+                    let now = chrono::Utc::now().timestamp();
+                    book.sanitize_fired_through(now);
+                    book.validate_at(now).map(|()| book)
+                }),
             Ok(_) => Err("Price-alert file exceeds 4 MiB".into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Book::default()),
             Err(e) => Err(format!("Reading price alerts: {e}")),
@@ -511,13 +515,19 @@ impl State {
                         ui.label("Uses up to 1,500 provider bars, including the forming bar.");
                     }
                 }
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("price-alert-direction").selected_text(draft.direction.label()).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut draft.direction, Direction::Above, Direction::Above.label());
-                        ui.selectable_value(&mut draft.direction, Direction::Below, Direction::Below.label());
+                if matches!(draft.rule, Some(Rule::Condition { .. })) {
+                    draft.price = "0.5".into();
+                    draft.direction = Direction::Above;
+                    ui.label("Fires when the condition becomes true");
+                } else {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("price-alert-direction").selected_text(draft.direction.label()).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut draft.direction, Direction::Above, Direction::Above.label());
+                            ui.selectable_value(&mut draft.direction, Direction::Below, Direction::Below.label());
+                        });
+                        ui.add(egui::TextEdit::singleline(&mut draft.price).hint_text("Price").char_limit(30).desired_width(135.));
                     });
-                    ui.add(egui::TextEdit::singleline(&mut draft.price).hint_text("Price").char_limit(30).desired_width(135.));
-                });
+                }
                 ui.add_space(8.);
                 ui.label("Repeat");
                 ui.horizontal(|ui| {
@@ -662,6 +672,34 @@ mod tests {
         let draft = s.editor.as_mut().unwrap();
         draft.formula = true; // A stale formula flag must never overwrite the tree.
         assert_eq!(draft.saved_rule(), Some(rule));
+    }
+
+    #[test]
+    fn condition_save_rearm_and_zero_to_one_crossing_with_rule_error_gap() {
+        let scan = tr_core::scanner::ScanDefinition::default();
+        let rule = Rule::Condition { root: scan.root, timeframe: scan.timeframe };
+        let mut s = state();
+        s.action(Action::Condition { symbol: "AAPL US Equity".into(), level: 0.5, rule: rule.clone() });
+        // The editor must show the tree read-only and still save it.
+        assert_eq!(s.editor.as_ref().unwrap().saved_rule(), Some(rule.clone()));
+        assert!(s.editor.as_ref().unwrap().expression.is_empty());
+        let id = s.book.add("AAPL US Equity".into(), 0.5, Direction::Above, false).unwrap();
+        s.book.set_rule(id, Some(rule.clone())).unwrap();
+        s.book.set_repeat(id, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
+        // Seed at NoMatch, then cross to Match: fires once.
+        for (value, fires) in [(0.0, false), (1.0, true)] {
+            s.pending_rules = Some(s.revision);
+            let fired = s.on_rules(s.revision, vec![(id, Ok(q(value)))]);
+            assert_eq!(fired.len(), usize::from(fires));
+        }
+        // A rule error (missing extra timeframe, timeout, …) resets only that rule's baseline.
+        s.pending_rules = Some(s.revision);
+        assert!(s.on_rules(s.revision, vec![(id, Err("Condition request timed out".into()))]).is_empty());
+        assert!(s.monitor[&format!("rule:{id}")].contains("timed out"));
+        // The next Match after the gap re-seeds under the current conservative policy.
+        s.pending_rules = Some(s.revision);
+        assert!(s.on_rules(s.revision, vec![(id, Ok(q(1.0)))]).is_empty());
+        std::fs::remove_dir_all(s.path.parent().unwrap()).ok();
     }
 
     #[test]
