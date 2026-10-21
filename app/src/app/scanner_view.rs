@@ -269,8 +269,10 @@ fn operand_kind(operand: &ScanOperand) -> usize {
     }
 }
 
-/// ComboBox uses a nested horizontal UI, so reserve its minimum width before
-/// entering it: egui cannot move an already-rendered child onto the next line.
+/// ComboBox uses a nested horizontal UI, so reserve its width before entering it:
+/// egui cannot move an already-rendered child onto the next line. Row combos must
+/// also truncate selected text to this width; otherwise a wider theme font can
+/// expand the combo past this reservation and into the remove column.
 fn wrap_control(ui: &mut Ui, width: f32) {
     if ui.layout().main_wrap() && ui.available_size_before_wrap().x < width {
         ui.end_row();
@@ -281,11 +283,15 @@ fn operand_editor(ui: &mut Ui, operand: &mut ScanOperand, bars_ago: &mut usize, 
     let mut kind = operand_kind(operand);
     let before = kind;
     wrap_control(ui, 95.0);
-    egui::ComboBox::from_id_salt(id).width(95.0).selected_text(OPERAND_KINDS[kind]).show_ui(ui, |ui| {
-        for (i, name) in OPERAND_KINDS.iter().enumerate() {
-            ui.selectable_value(&mut kind, i, *name);
-        }
-    });
+    egui::ComboBox::from_id_salt(id)
+        .width(95.0)
+        .wrap_mode(egui::TextWrapMode::Truncate)
+        .selected_text(OPERAND_KINDS[kind])
+        .show_ui(ui, |ui| {
+            for (i, name) in OPERAND_KINDS.iter().enumerate() {
+                ui.selectable_value(&mut kind, i, *name);
+            }
+        });
     if kind != before {
         *operand = match kind {
             0 => ScanOperand::Price,
@@ -301,11 +307,15 @@ fn operand_editor(ui: &mut Ui, operand: &mut ScanOperand, bars_ago: &mut usize, 
     match operand {
         ScanOperand::Sma { period, source } | ScanOperand::Ema { period, source } => {
             wrap_control(ui, 70.0);
-            egui::ComboBox::from_id_salt((id, "source")).width(70.0).selected_text(source.label()).show_ui(ui, |ui| {
-                for s in Source::ALL {
-                    ui.selectable_value(source, s, s.label());
-                }
-            });
+            egui::ComboBox::from_id_salt((id, "source"))
+                .width(70.0)
+                .wrap_mode(egui::TextWrapMode::Truncate)
+                .selected_text(source.label())
+                .show_ui(ui, |ui| {
+                    for s in Source::ALL {
+                        ui.selectable_value(source, s, s.label());
+                    }
+                });
             ui.add(egui::DragValue::new(period).range(1..=500).prefix("Period "));
         }
         ScanOperand::Rsi { period } | ScanOperand::Atr { period } => {
@@ -340,18 +350,23 @@ fn timeframe_editor(ui: &mut Ui, timeframe: &mut Option<Timeframe>) {
         None => RichText::new("Scan timeframe").color(muted()),
     };
     wrap_control(ui, dp(110.0));
-    egui::ComboBox::from_id_salt("condition-timeframe").width(dp(110.0)).selected_text(selected).show_ui(ui, |ui| {
-        ui.selectable_value(timeframe, None, RichText::new("Scan timeframe").color(muted()));
-        for tf in Timeframe::ALL {
-            ui.selectable_value(timeframe, Some(tf), tf.label());
-        }
-    });
+    egui::ComboBox::from_id_salt("condition-timeframe")
+        .width(dp(110.0))
+        .wrap_mode(egui::TextWrapMode::Truncate)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(timeframe, None, RichText::new("Scan timeframe").color(muted()));
+            for tf in Timeframe::ALL {
+                ui.selectable_value(timeframe, Some(tf), tf.label());
+            }
+        });
 }
 
 fn mode_editor(ui: &mut Ui, mode: &mut MatchMode) {
     wrap_control(ui, dp(90.0));
     egui::ComboBox::from_id_salt("scan-mode")
         .width(dp(90.0))
+        .wrap_mode(egui::TextWrapMode::Truncate)
         .selected_text(if *mode == MatchMode::All { "Match all" } else { "Match any" })
         .show_ui(ui, |ui| {
             ui.selectable_value(mode, MatchMode::All, "Match all");
@@ -363,14 +378,15 @@ fn compare_editor(ui: &mut Ui, condition: &mut ScanCondition, index: usize) {
     ui.label(RichText::new(format!("{}", index + 1)).font(mono(12.0)).color(muted()));
     operand_editor(ui, &mut condition.left, &mut condition.left_bars_ago, "left");
     wrap_control(ui, dp(110.0));
-    egui::ComboBox::from_id_salt("comparison").width(dp(110.0)).selected_text(condition.comparison.label()).show_ui(
-        ui,
-        |ui| {
+    egui::ComboBox::from_id_salt("comparison")
+        .width(dp(110.0))
+        .wrap_mode(egui::TextWrapMode::Truncate)
+        .selected_text(condition.comparison.label())
+        .show_ui(ui, |ui| {
             for comparison in Comparison::ALL {
                 ui.selectable_value(&mut condition.comparison, comparison, comparison.label());
             }
-        },
-    );
+        });
     operand_editor(ui, &mut condition.right, &mut condition.right_bars_ago, "right");
     // Scaling a constant is just a different constant.
     if matches!(condition.right, ScanOperand::Constant(_)) {
@@ -395,6 +411,11 @@ fn condition_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) -> (egui::Rect, egui::R
         let content =
             ui.allocate_ui_with_layout(egui::vec2(remaining, 0.0), egui::Layout::top_down(egui::Align::LEFT), |ui| {
                 ui.set_max_width(remaining);
+                // Child max widths are layout hints, not paint boundaries. Keep
+                // oversized/edited content from painting over the remove column.
+                let mut clip = ui.clip_rect();
+                clip.max.x = clip.max.x.min(ui.max_rect().right());
+                ui.set_clip_rect(clip);
                 ui.horizontal_wrapped(|ui| {
                     ui.set_max_width(remaining);
                     add(ui);
@@ -1695,28 +1716,41 @@ mod tests {
 
     #[test]
     fn narrow_condition_rows_reserve_the_remove_column_on_every_line() {
-        for width in [280.0, 360.0, 530.0, 900.0] {
-            let mut items = [
-                ConditionItem::Compare(ScanCondition { right: ScanOperand::Constant(50.0), ..Default::default() }),
-                ConditionItem::Compare(ScanCondition {
-                    right: ScanOperand::Sma { period: 20, source: Source::Close },
-                    right_multiplier: 2.5,
-                    timeframe: Some(Timeframe::W1),
-                    ..Default::default()
-                }),
-                ConditionItem::Formula(FormulaCondition {
-                    expression: "C > AVGC20".into(),
-                    timeframe: Some(Timeframe::H1),
-                }),
-            ];
-            let ctx = egui::Context::default();
-            let mut output = ctx.run_ui(
+        for theme in crate::themes::builtins() {
+            for enabled in [true, false] {
+                for width in [280.0, 360.0, 530.0, 900.0] {
+                    let mut items = [
+                        ConditionItem::Compare(ScanCondition {
+                            right: ScanOperand::Constant(50.0),
+                            ..Default::default()
+                        }),
+                        ConditionItem::Compare(ScanCondition {
+                            right: ScanOperand::Sma { period: 20, source: Source::Close },
+                            right_multiplier: 2.5,
+                            timeframe: Some(Timeframe::W1),
+                            ..Default::default()
+                        }),
+                        ConditionItem::Formula(FormulaCondition {
+                            expression: "C > AVGC20".into(),
+                            timeframe: Some(Timeframe::H1),
+                        }),
+                        ConditionItem::Group(ConditionGroup::comparisons(MatchMode::All, vec![])),
+                        ConditionItem::Compare(ScanCondition {
+                            left: ScanOperand::ChangePercent,
+                            right: ScanOperand::Ema { period: 500, source: Source::Volume },
+                            ..Default::default()
+                        }),
+                    ];
+                    let ctx = egui::Context::default();
+                    theme::configure(&ctx, &theme, Color32::LIGHT_BLUE);
+                    let mut output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1200.0))),
                     ..Default::default()
                 },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
                         for (index, item) in items.iter_mut().enumerate() {
                             ui.push_id(index, |ui| {
                                 let available = ui.available_rect_before_wrap();
@@ -1732,7 +1766,10 @@ mod tests {
                                                 );
                                                 timeframe_editor(ui, &mut formula.timeframe);
                                             }
-                                            ConditionItem::Group(_) => unreachable!(),
+                                            ConditionItem::Group(child) => {
+                                                ui.label(RichText::new("Group").color(muted()));
+                                                mode_editor(ui, &mut child.mode);
+                                            },
                                         })
                                     });
                                 let (content, close) = row.inner;
@@ -1753,16 +1790,28 @@ mod tests {
                                     "width {width}, row {index}: content {content:?}, close {:?}",
                                     close.rect
                                 );
+                                let close_column = dp(22.0) + ui.spacing().item_spacing.x;
+                                // TextEdit rounds its width to pixels; density-scaled
+                                // column widths can fall between pixels.
+                                assert!(
+                                    content.right() <= frame.right() - 6.0 - close_column + 0.5,
+                                    "theme {}, enabled {enabled}, width {width}, row {index}: content {content:?}, frame {frame:?}, close {:?}, column {close_column}",
+                                    theme.name, close.rect
+                                );
+                                assert!(frame.right() <= available.right() + 0.01, "Frame must stay inside the pane");
                                 assert!(content.right() < close.rect.left());
                                 if width <= 530.0 && matches!(item, ConditionItem::Compare(_)) {
                                     assert!(content.height() > close.rect.height(), "The Compare controls must wrap");
                                 }
                             });
                         }
+                        });
                     });
                 },
             );
-            output.textures_delta.clear();
+                    output.textures_delta.clear();
+                }
+            }
         }
     }
 
