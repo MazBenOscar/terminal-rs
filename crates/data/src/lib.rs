@@ -217,6 +217,10 @@ pub struct OptionChain {
 /// the current (possibly still forming) bar. The feed stops when the receiver is dropped.
 #[derive(Debug, Clone)]
 pub enum LiveUpdate {
+    /// A previously authenticated connection recovered after a failure.
+    Reconnected {
+        since: Option<i64>,
+    },
     Partial(Bar),
     Snapshot(Bar),
     Status(String),
