@@ -255,7 +255,7 @@ impl PaneKind {
                 show_congress: c.show_congress,
                 magnet: c.magnet,
                 navigation: c.navigation,
-                data: c.data.clone(),
+                data: c.saved_data(),
             },
             PaneKind::Feed { filter } => {
                 PaneSettings::Feed((*filter != FeedFilter::default()).then(|| (*filter).into()))
@@ -321,6 +321,7 @@ impl PaneKind {
                 c.magnet = magnet;
                 c.navigation = navigation;
                 c.data = data;
+                c.restore_price_scale();
                 PaneKind::Chart(Box::new(c))
             }
             PaneSettings::Feed(f) => PaneKind::Feed { filter: f.map(Into::into).unwrap_or_default() },
@@ -767,7 +768,10 @@ impl TerminalApp {
             if let Some(name) = &s.active_layout {
                 match app.store.load(name) {
                     Ok(d) => doc = Some(d),
-                    Err(e) => tracing::warn!("restoring layout {name:?}: {e:#}"),
+                    Err(e) => {
+                        tracing::warn!("restoring layout {name:?}: {e:#}");
+                        app.toasts.push((format!("Could not restore layout {name:?}: {e:#}"), Instant::now()));
+                    }
                 }
             }
             if doc.is_none() {
@@ -775,7 +779,18 @@ impl TerminalApp {
             }
         }
         let doc = doc
-            .or_else(|| app.store.list().first().and_then(|n| app.store.load(n).ok()))
+            .or_else(|| {
+                let name = app.store.list().into_iter().next()?;
+                match app.store.load(&name) {
+                    Ok(doc) => Some(doc),
+                    Err(e) => {
+                        if app.toasts.is_empty() {
+                            app.toasts.push((format!("Could not restore layout {name:?}: {e:#}"), Instant::now()));
+                        }
+                        None
+                    }
+                }
+            })
             .unwrap_or_else(|| LayoutDoc::default_workspace("Default", &app.prefs.panels));
         app.apply_doc(doc);
         if !app.store.exists(&app.layout_name) {
@@ -1942,6 +1957,101 @@ impl eframe::App for TerminalApp {
         self.price_alerts.save();
         if self.demo.save_error.is_some() {
             self.demo.save();
+        }
+    }
+}
+
+#[cfg(test)]
+impl TerminalApp {
+    /// Inert workspace with all disk-backed dependencies confined to the fixture.
+    fn test_workspace(root: &std::path::Path) -> Self {
+        Self {
+            broker: broker::BrokerState::with_store(
+                tr_broker::secrets::SecretStore::file(root.join("secrets.json")),
+                true,
+            ),
+            trading: Default::default(),
+            demo: demo::DemoState::load(root.join("demo.json")).0,
+            worker: Worker::inert(),
+            provider: "sample".into(),
+            panes: Vec::new(),
+            dock: Node::default(),
+            focus: 0,
+            next_id: 1,
+            last_opened: None,
+            preset: None,
+            drag: None,
+            dock_motion: Default::default(),
+            renaming_tab: None,
+            store: Store::new(root.join("layouts")),
+            layout_name: "Default".into(),
+            layout_names: Vec::new(),
+            last_saved: Vec::new(),
+            renaming_layout: None,
+            editing_theme: String::new(),
+            themes: Vec::new(),
+            theme_store: crate::themes::ThemeStore::new(root.join("themes")),
+            applied_theme: None,
+            dirty_themes: Vec::new(),
+            themes_changed_at: None,
+            renaming_theme: None,
+            theme_io: String::new(),
+            system_theme: None,
+            layout_theme: false,
+            prefs: Prefs::default(),
+            rebinding: None,
+            hotkey_filter: String::new(),
+            settings_tab: SettingsTab::Appearance,
+            io_path: String::new(),
+            curves: None,
+            last_wei: None,
+            last_curve: None,
+            wei_updated: None,
+            net_hits: (String::new(), Vec::new()),
+            search_pending: None,
+            suggestion: None,
+            cmd: String::new(),
+            cmd_history: Vec::new(),
+            cmd_hist_pos: None,
+            focus_cmd: true,
+            status: String::new(),
+            toasts: Vec::new(),
+            alert_toasts: Vec::new(),
+            latest: Vec::new(),
+            politicians: Vec::new(),
+            pol_search: String::new(),
+            alerts: Vec::new(),
+            price_alerts: crate::price_alerts::State::load(root.join("price-alerts.json"), true),
+            congress_status: String::new(),
+            congress_checked: None,
+            watchlist: Vec::new(),
+            watch_columns: Default::default(),
+            columns_editor: None,
+            column_cells: HashMap::new(),
+            columns_revision: 0,
+            columns_computed_at: 0,
+            columns_requested: None,
+            columns_snapshot: Default::default(),
+            watch_sort: None,
+            quotes: HashMap::new(),
+            last_quotes: None,
+            last_feed: None,
+            last_save: Instant::now(),
+            started: Instant::now(),
+            smoke_done: false,
+            show_perf: false,
+            perf_cpu_ms: 0.,
+            perf_dt_ms: 0.,
+            last_frame: None,
+            sidebar_open: true,
+            system_accent: theme::DEFAULT_ACCENT,
+            last_accent_poll: None,
+            window_styled: false,
+            updater_started: false,
+            vibrancy: false,
+            chrome: None,
+            last_chrome_poll: None,
+            palette: crate::palette::Palette::load(&root.join("palette.json")),
         }
     }
 }

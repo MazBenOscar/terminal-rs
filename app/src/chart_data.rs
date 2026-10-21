@@ -4,6 +4,8 @@ use tr_core::session::{Session, Zone};
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChartData {
+    /// Manual price-axis bounds; absent means autoscale. Pixel height is not persisted.
+    pub manual_price_range: Option<[f64; 2]>,
     pub zone: Zone,
     pub session: Session,
     pub refresh_seconds: u32,

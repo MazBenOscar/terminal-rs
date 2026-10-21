@@ -371,6 +371,7 @@ impl TerminalApp {
             PaneKind::Chart(mut c) => {
                 c.id = id;
                 c.load(&self.worker);
+                c.restore_price_scale();
                 PaneKind::Chart(c)
             }
             PaneKind::Ticker { symbol, .. } => {
@@ -781,23 +782,28 @@ impl TerminalApp {
     // ---- saved layouts -------------------------------------------------------------------
 
     pub(super) fn current_doc(&self) -> LayoutDoc {
+        // Runtime ids are intentionally fresh on restore. Persist stable, document-local
+        // ids instead, including every dock and focus reference.
+        let ids: HashMap<_, _> = self.panes.iter().enumerate().map(|(i, p)| (p.id, i as PaneId + 1)).collect();
+        let mut dock = self.dock.clone();
+        dock.remap(&|id| ids.get(&id).copied());
         LayoutDoc {
             watch_columns: self.watch_columns.clone(),
             version: crate::layouts::FORMAT_VERSION,
             name: self.layout_name.clone(),
-            dock: self.dock.clone(),
+            dock,
             panes: self
                 .panes
                 .iter()
                 .map(|p| SavedPane {
-                    id: p.id,
+                    id: ids[&p.id],
                     settings: p.kind.settings(),
                     link: p.link,
                     title: p.title.clone(),
                     window: p.window,
                 })
                 .collect(),
-            focus: Some(self.focus),
+            focus: ids.get(&self.focus).copied(),
             sidebar_side: Some(self.prefs.appearance.sidebar_side),
             theme: self.layout_theme.then(|| self.prefs.appearance.theme.clone()),
         }
@@ -1615,6 +1621,180 @@ fn tab_menu(ui: &mut Ui, pid: PaneId, link: Option<Link>, cmds: &mut Vec<GroupCm
 mod tests {
     use super::*;
     use crate::dock::Node;
+
+    fn fixture(tag: &str) -> (TerminalApp, PathBuf) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/workspace-audit")
+            .join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        (TerminalApp::test_workspace(&root), root)
+    }
+
+    #[test]
+    fn workspace_save_load_apply_save_is_canonical() {
+        use crate::layouts::{PaneSettings, ScanSettings};
+        use tr_core::{
+            Timeframe,
+            columns::{ColumnDef, ColumnKind},
+            scanner::{ConditionGroup, ConditionItem, MatchMode, ScanCondition, ScanDefinition},
+        };
+        let (mut app, root) = fixture("roundtrip");
+        let mut chart = crate::layouts::chart_settings("AAPL US Equity", &Default::default());
+        if let PaneSettings::Chart { log, indicators, drawings, compare, data, navigation, .. } = &mut chart {
+            *log = true;
+            *indicators = vec![crate::command::IndicatorSpec::new("EMA", &[20.]).unwrap()];
+            tr_core::indicators::study::assign_ids(indicators);
+            indicators[0].chart.as_mut().unwrap().timeframe = Some(Timeframe::W1);
+            *compare = Some("MSFT US Equity".into());
+            data.comparisons = vec!["QQQ US Equity".into(), "NVDA US Equity".into()];
+            data.compare_slots =
+                vec![("MSFT US Equity".into(), 3), ("QQQ US Equity".into(), 1), ("NVDA US Equity".into(), 5)];
+            data.manual_price_range = Some([100., 250.]);
+            navigation.cursor = true;
+            navigation.range = true;
+            let mut drawing = tr_chart::drawings::Drawing::new(
+                tr_chart::drawings::Tool::Trendline,
+                tr_chart::drawings::Anchor { ts: 1000, price: 110. },
+                tr_chart::drawings::Anchor { ts: 2000, price: 150. },
+            );
+            drawing.symbol = Some("AAPL US Equity".into());
+            drawings.push(drawing);
+        }
+        let mut second = crate::layouts::chart_settings("BTCUSD Curncy", &Default::default());
+        if let PaneSettings::Chart { tf, chart_type, indicators, .. } = &mut second {
+            tr_core::indicators::study::assign_ids(indicators);
+            *tf = Timeframe::H1;
+            *chart_type = tr_chart::scene::ChartType::Line;
+        }
+        let definition = ScanDefinition {
+            name: "Nested".into(),
+            timeframe: Timeframe::D1,
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![ConditionItem::Group(ConditionGroup::comparisons(
+                    MatchMode::Any,
+                    vec![ScanCondition::default()],
+                ))],
+            },
+        };
+        let mut doc = LayoutDoc::preset(
+            "Audit",
+            Layout::Grid2x2,
+            vec![
+                chart,
+                second,
+                PaneSettings::Scanner(ScanSettings {
+                    definition,
+                    universe: tr_data::universe::Universe::Nasdaq,
+                    refresh: Some(60),
+                }),
+                PaneSettings::Watchlist,
+                PaneSettings::Alerts,
+            ],
+        );
+        doc.watch_columns.columns = vec![ColumnDef {
+            id: 7,
+            title: "Close".into(),
+            timeframe: Timeframe::W1,
+            kind: ColumnKind::Formula { expression: "C".into() },
+        }];
+        doc.panes[0].link = Some(Link::Red);
+        doc.panes[1].link = Some(Link::Blue);
+        doc.panes[1].title = Some("Crypto".into());
+        doc.panes[1].window = Some(WindowGeometry { x: 40., y: 60., w: 800., h: 600. });
+        doc.dock.remove(2);
+        doc.focus = Some(4);
+        doc.sidebar_side = Some(app.prefs.appearance.sidebar_side);
+        doc.theme = Some(app.prefs.appearance.theme.clone());
+        doc.dock.insert(4, Zone::Center, 5);
+        app.apply_doc(doc.clone());
+        // Check against the input as well: a lossy initial apply must not hide behind
+        // two equally lossy snapshots.
+        let first = app.current_doc();
+        assert_eq!(first, doc);
+        app.price_alerts
+            .book
+            .add("AAPL US Equity".into(), 175., tr_core::price_alerts::Direction::Above, false)
+            .unwrap();
+        let alerts_before = serde_json::to_value(&app.price_alerts.book).unwrap();
+        app.save_layout();
+        let bytes = std::fs::read(app.store.path("Audit")).unwrap();
+        let old_ids: Vec<_> = app.panes.iter().map(|p| p.id).collect();
+        app.apply_doc(app.store.load("Audit").unwrap());
+        assert!(app.panes.iter().all(|p| !old_ids.contains(&p.id)), "runtime ids remain fresh");
+        app.save_layout();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(app.store.path("Audit")).unwrap()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&app.price_alerts.book).unwrap(),
+            alerts_before,
+            "alert book is global, the layout references its Alerts pane"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_or_future_layout_keeps_workspace_and_one_notice() {
+        for (tag, bytes) in [
+            ("truncated", b"{\"name\":".to_vec()),
+            ("future", {
+                let mut doc = LayoutDoc::default_workspace("Broken", &Default::default());
+                doc.version = crate::layouts::FORMAT_VERSION + 1;
+                doc.to_json()
+            }),
+        ] {
+            let (mut app, root) = fixture(tag);
+            app.apply_doc(LayoutDoc::default_workspace("Good", &Default::default()));
+            let before = app.current_doc();
+            std::fs::create_dir_all(&app.store.dir).unwrap();
+            std::fs::write(app.store.path("Broken"), &bytes).unwrap();
+            app.switch_layout("Broken");
+            assert_eq!(app.current_doc(), before);
+            assert!(app.status.contains("preserved"));
+            assert!(app.toasts.is_empty(), "status is the single notice for a manual load");
+            let preserved: Vec<_> = std::fs::read_dir(&app.store.dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+                .collect();
+            assert_eq!(preserved.len(), 1);
+            assert_eq!(std::fs::read(preserved[0].path()).unwrap(), bytes);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn closed_link_member_leaves_no_navigation_or_symbol_references() {
+        let (mut app, root) = fixture("closed");
+        let charts = (0..2).map(|_| crate::layouts::chart_settings("AAPL US Equity", &Default::default())).collect();
+        app.apply_doc(LayoutDoc::preset("Links", Layout::Grid2x2, charts));
+        for pane in &mut app.panes {
+            pane.link = Some(Link::Red);
+        }
+        let closed = app.panes[0].id;
+        if let PaneKind::Chart(c) = &mut app.panes[0].kind {
+            c.navigation.cursor = true;
+            c.local_cursor = Some(1000);
+        }
+        app.sync_chart_navigation();
+        if let PaneKind::Chart(c) = &app.panes[1].kind {
+            assert_eq!(c.shared_cursor, Some(1000));
+        }
+        app.close_pane(closed);
+        app.sync_chart_navigation();
+        app.broadcast(Link::Red, "MSFT", None);
+        assert!(app.idx(closed).is_none());
+        assert!(!app.dock.contains(closed));
+        if let PaneKind::Chart(c) = &app.panes[0].kind {
+            assert_eq!(c.shared_cursor, None);
+            assert_eq!(c.symbol, "MSFT US Equity");
+        }
+        assert_eq!(app.current_doc().panes.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn groups(n: &Node) -> (Rect, Vec<crate::dock::Group>) {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 600.0));

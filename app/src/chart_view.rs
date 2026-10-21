@@ -505,6 +505,20 @@ impl ChartState {
         }
     }
 
+    pub fn saved_data(&self) -> crate::chart_data::ChartData {
+        let mut data = self.data.clone();
+        data.manual_price_range = self.manual_scale.map(|scale| [scale.lo, scale.hi]);
+        data
+    }
+
+    pub fn restore_price_scale(&mut self) {
+        self.manual_scale = self
+            .data
+            .manual_price_range
+            .filter(|[lo, hi]| lo.is_finite() && hi.is_finite() && hi > lo && (!self.log || *lo > 0.))
+            .map(|[lo, hi]| PriceScale::new(lo, hi, self.log, 1.));
+    }
+
     pub fn is_empty(&self) -> bool {
         self.bars.is_empty()
     }
@@ -1470,9 +1484,10 @@ impl ChartState {
     }
 
     pub fn apply_linked_range(&mut self, range: crate::chart_navigation::DateRange) {
-        if self.bars.first().is_none_or(|b| range.start < b.ts) {
-            self.pending_dates = Some(range);
-        }
+        // A newer event supersedes a buffered range even when it is already covered
+        // by the currently loaded bars. Otherwise the next history response replays
+        // the stale range over the newer navigation.
+        self.pending_dates = self.bars.first().is_none_or(|b| range.start < b.ts).then_some(range);
         if let Some(v) = &mut self.viewport {
             crate::chart_navigation::apply(&self.bars, self.tf, range, v);
             self.glide = None;
@@ -5906,6 +5921,108 @@ mod tests {
             "Band fill mesh is present"
         );
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn linked_symbol_during_history_load_rejects_old_generation() {
+        let worker = Worker::inert();
+        let mut leader = ChartState::new(1, "AAPL", Timeframe::D1);
+        let mut follower = ChartState::new(2, "AAPL", Timeframe::D1);
+        follower.load(&worker);
+        let old = follower.generation;
+        leader.set_symbol("MSFT", &worker);
+        follower.set_symbol(&leader.symbol, &worker);
+        let bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 50, 1_790_000_000));
+        follower.on_history(old, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &worker);
+        assert!(follower.bars.is_empty() && follower.loading);
+        assert_eq!(follower.symbol, "MSFT US Equity");
+        let latest = Arc::new(tr_core::sample::generate("MSFT", Timeframe::D1, 50, 1_790_000_000));
+        follower.on_history(
+            follower.generation,
+            latest.clone(),
+            SeriesGpu::build(&latest),
+            0,
+            false,
+            false,
+            false,
+            &worker,
+        );
+        assert_eq!(*follower.bars, *latest);
+        assert!(!follower.loading);
+    }
+
+    #[test]
+    fn linked_symbols_twice_quickly_only_latest_history_applies() {
+        let worker = Worker::inert();
+        let mut follower = ChartState::new(2, "AAPL", Timeframe::D1);
+        follower.set_symbol("MSFT", &worker);
+        let old = follower.generation;
+        follower.set_symbol("NVDA", &worker);
+        let latest = Arc::new(tr_core::sample::generate("NVDA", Timeframe::D1, 50, 1_790_000_000));
+        follower.on_history(
+            follower.generation,
+            latest.clone(),
+            SeriesGpu::build(&latest),
+            0,
+            false,
+            false,
+            false,
+            &worker,
+        );
+        let stale = Arc::new(tr_core::sample::generate("MSFT", Timeframe::D1, 50, 1_790_000_000));
+        follower.on_history(old, stale.clone(), SeriesGpu::build(&stale), 0, false, false, false, &worker);
+        follower.on_history_error(old, "stale failure".into());
+        assert_eq!(follower.symbol, "NVDA US Equity");
+        assert_eq!(*follower.bars, *latest);
+        assert!(follower.error.is_none());
+    }
+
+    #[test]
+    fn newer_linked_range_supersedes_pending_range_after_partial_history() {
+        let worker = Worker::inert();
+        let mut chart = ChartState::new(2, "MSFT", Timeframe::D1);
+        chart.load(&worker);
+        let bars = Arc::new(tr_core::sample::generate("MSFT", Timeframe::D1, 500, 1_790_000_000));
+        let old = crate::chart_navigation::DateRange { start: bars[50].ts, end: bars[100].ts };
+        chart.apply_linked_range(old);
+        let partial = Arc::new(bars[150..].to_vec());
+        chart.on_history(
+            chart.generation,
+            partial.clone(),
+            SeriesGpu::build(&partial),
+            0,
+            false,
+            false,
+            false,
+            &worker,
+        );
+        assert_eq!(chart.pending_dates, Some(old));
+        let latest = crate::chart_navigation::DateRange { start: bars[200].ts, end: bars[300].ts };
+        chart.apply_linked_range(latest);
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 150, false, true, false, &worker);
+        assert_eq!(crate::chart_navigation::date_range(&chart.bars, chart.tf, &chart.viewport.unwrap()), Some(latest));
+        assert!(chart.pending_dates.is_none());
+    }
+
+    #[test]
+    fn linked_range_and_cursor_wait_for_history() {
+        let worker = Worker::inert();
+        let mut chart = ChartState::new(2, "MSFT", Timeframe::D1);
+        chart.load(&worker);
+        chart.navigation = crate::chart_navigation::Navigation { cursor: true, range: true };
+        let bars = Arc::new(tr_core::sample::generate("MSFT", Timeframe::D1, 500, 1_790_000_000));
+        let range = crate::chart_navigation::DateRange { start: bars[100].ts, end: bars[200].ts };
+        chart.shared_cursor = Some(bars[150].ts);
+        chart.apply_linked_range(range);
+        assert_eq!(crate::chart_navigation::index_at(&chart.bars, chart.tf, chart.shared_cursor.unwrap()), None);
+        assert_eq!(chart.pending_dates, Some(range));
+        // A later navigation event supersedes one buffered while empty.
+        let range = crate::chart_navigation::DateRange { start: bars[200].ts, end: bars[300].ts };
+        chart.apply_linked_range(range);
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        assert_eq!(crate::chart_navigation::index_at(&chart.bars, chart.tf, chart.shared_cursor.unwrap()), Some(150));
+        assert_eq!(crate::chart_navigation::date_range(&chart.bars, chart.tf, &chart.viewport.unwrap()), Some(range));
+        assert!(chart.pending_dates.is_none());
     }
 
     #[test]
