@@ -97,11 +97,19 @@ impl ColumnsEditor {
         let mut open = true;
         let mut applied = None;
         let mut cancel = false;
+        let default_size = egui::vec2(dp(520.0), dp(480.0));
+        let mut bounds = ctx.content_rect();
+        bounds.min.y = bounds.min.y.max(dp(super::chrome::TOOLBAR_H));
+        let mut default_pos = bounds.center() - default_size * 0.5;
+        default_pos.y = default_pos.y.max(bounds.top());
         egui::Window::new("Edit columns")
             .id(egui::Id::new("watchlist-column-editor"))
             .open(&mut open)
             .resizable(true)
-            .default_size(egui::vec2(dp(520.0), dp(480.0)))
+            .default_size(default_size)
+            .default_pos(default_pos)
+            .constrain(true)
+            .constrain_to(bounds)
             .show(ctx, |ui| {
                 self.library(ui);
                 ui.separator();

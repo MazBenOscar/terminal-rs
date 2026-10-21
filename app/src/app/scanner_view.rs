@@ -354,6 +354,29 @@ fn compare_editor(ui: &mut Ui, condition: &mut ScanCondition, index: usize) {
     timeframe_editor(ui, &mut condition.timeframe);
 }
 
+/// Keep the remove column outside every line of wrapped condition controls.
+fn condition_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) -> (egui::Rect, egui::Response) {
+    ui.horizontal_top(|ui| {
+        let close_width = dp(22.0);
+        let content_width = (ui.available_width() - close_width - ui.spacing().item_spacing.x).max(0.0);
+        let content = ui.allocate_ui_with_layout(
+            egui::vec2(content_width, 0.0),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.set_width(content_width);
+                ui.horizontal_wrapped(add);
+            },
+        );
+        let close = ui.allocate_ui_with_layout(
+            egui::vec2(close_width, dp(20.0)),
+            egui::Layout::top_down(egui::Align::RIGHT),
+            |ui| widgets::icon_button(ui, Icon::Close, "Remove condition", false),
+        );
+        (content.response.rect, close.inner)
+    })
+    .inner
+}
+
 fn run_enabled(definition: &ScanDefinition, running: bool, data_ready: bool) -> bool {
     !running && data_ready && definition.validate().is_ok()
 }
@@ -420,32 +443,22 @@ fn group_editor(
                 .inner_margin(egui::Margin::symmetric(6, 4));
             let response = frame.show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                let full = ui.available_width();
-                let top = ui.cursor().min;
-                ui.scope(|ui| {
-                    ui.set_max_width((full - dp(26.0)).max(0.0));
-                    ui.horizontal_wrapped(|ui| match item {
-                        ConditionItem::Compare(condition) => compare_editor(ui, condition, index),
-                        ConditionItem::Formula(formula) => {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut formula.expression)
-                                    .desired_width(dp(280.0))
-                                    .hint_text("PCF formula, e.g. C > AVGC20"),
-                            );
-                            timeframe_editor(ui, &mut formula.timeframe);
-                        }
-                        ConditionItem::Group(child) => {
-                            ui.label(RichText::new("Group").color(muted()));
-                            mode_editor(ui, &mut child.mode);
-                        }
-                    });
+                let (_, close) = condition_row(ui, |ui| match item {
+                    ConditionItem::Compare(condition) => compare_editor(ui, condition, index),
+                    ConditionItem::Formula(formula) => {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut formula.expression)
+                                .desired_width(dp(280.0))
+                                .hint_text("PCF formula, e.g. C > AVGC20"),
+                        );
+                        timeframe_editor(ui, &mut formula.timeframe);
+                    }
+                    ConditionItem::Group(child) => {
+                        ui.label(RichText::new("Group").color(muted()));
+                        mode_editor(ui, &mut child.mode);
+                    }
                 });
-                let close =
-                    egui::Rect::from_min_size(pos2(top.x + full - dp(22.0), top.y), egui::vec2(dp(22.0), dp(20.0)));
-                if ui
-                    .put(close, |ui: &mut Ui| widgets::icon_button(ui, Icon::Close, "Remove condition", false))
-                    .clicked()
-                {
+                if close.clicked() {
                     *remove = Some(path.clone());
                 }
                 match item {
@@ -1185,6 +1198,43 @@ mod tests {
             definition.root.items = vec![item];
             assert!(definition.validate().is_err());
             assert!(!run_enabled(&definition, false, true));
+        }
+    }
+
+    #[test]
+    fn narrow_condition_rows_reserve_the_remove_column_on_every_line() {
+        let mut condition =
+            ScanCondition { right: ScanOperand::Sma { period: 20, source: Source::Close }, ..Default::default() };
+        let mut expression = String::from("C > AVGC20");
+        for formula in [false, true] {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 600.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        egui::Frame::new().inner_margin(egui::Margin::symmetric(6, 4)).show(ui, |ui| {
+                            ui.set_width(320.0);
+                            let (content, close) = condition_row(ui, |ui| {
+                                if formula {
+                                    ui.add(egui::TextEdit::singleline(&mut expression).desired_width(dp(280.0)));
+                                    timeframe_editor(ui, &mut None);
+                                } else {
+                                    compare_editor(ui, &mut condition, 0);
+                                }
+                            });
+                            if !formula {
+                                assert!(content.height() > close.rect.height(), "The Compare controls must wrap");
+                            }
+                            assert!(!content.intersects(close.rect), "Content {content:?}, close {:?}", close.rect);
+                            assert!(content.right() < close.rect.left());
+                        });
+                    });
+                },
+            );
+            output.textures_delta.clear();
         }
     }
 

@@ -12,6 +12,16 @@ use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
 use crate::widgets;
 use crate::worker::Request;
 
+/// Match the security's Last price precision without compacting ordinary price levels.
+fn format_column_value(sec: &tr_core::Security, value: f64) -> String {
+    if value.abs() >= 1e6 {
+        tr_chart::scale::format_value(value)
+    } else {
+        let decimals = sec.decimals(value);
+        format!("{value:.decimals$}")
+    }
+}
+
 impl TerminalApp {
     /// Draw pane `i` into `rect`. Returns its actions and whether it was clicked.
     pub(super) fn render_content(&mut self, ui: &mut Ui, i: usize, rect: Rect, focused: bool) -> (Vec<Action>, bool) {
@@ -316,7 +326,7 @@ impl TerminalApp {
                     use tr_core::columns::Cell;
                     let cell = self.column_cells.get(s).and_then(|cells| cells.get(index));
                     let (label, color, reason) = match cell {
-                        Some(Cell::Value(value)) => (tr_chart::scale::format_value(*value), text(), None),
+                        Some(Cell::Value(value)) => (format_column_value(&sec, *value), text(), None),
                         Some(Cell::Check(true)) => ("Yes".into(), theme::up(), None),
                         Some(Cell::Check(false)) => ("No".into(), muted(), None),
                         Some(Cell::Unavailable(reason)) => ("—".into(), muted(), Some(reason.as_str())),
@@ -597,6 +607,19 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn column_values_preserve_security_precision_until_one_million() {
+        let btc = tr_core::Security::new("BTCUSD", tr_core::AssetClass::Crypto);
+        let eur = tr_core::Security::new("EURUSD", tr_core::AssetClass::Fx);
+        assert_eq!(format_column_value(&btc, 81_800.0), "81800.00");
+        assert_eq!(format_column_value(&eur, 1.15), "1.1500");
+        assert_eq!(format_column_value(&btc, -81_800.0), "-81800.00");
+        assert_eq!(format_column_value(&btc, 999_999.0), "999999.00");
+        assert_eq!(format_column_value(&btc, 1e6), "1.00M");
+        assert_eq!(format_column_value(&btc, 2.3e9), "2.30B");
+        assert_eq!(format_column_value(&btc, -2.3e9), "-2.30B");
+    }
 
     #[test]
     fn group_steps_scale_with_price() {
