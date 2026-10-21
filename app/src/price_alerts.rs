@@ -665,6 +665,34 @@ mod tests {
     }
 
     #[test]
+    fn condition_save_rearm_and_zero_to_one_crossing_with_rule_error_gap() {
+        let scan = tr_core::scanner::ScanDefinition::default();
+        let rule = Rule::Condition { root: scan.root, timeframe: scan.timeframe };
+        let mut s = state();
+        s.action(Action::Condition { symbol: "AAPL US Equity".into(), level: 0.5, rule: rule.clone() });
+        // The editor must show the tree read-only and still save it.
+        assert_eq!(s.editor.as_ref().unwrap().saved_rule(), Some(rule.clone()));
+        assert!(s.editor.as_ref().unwrap().expression.is_empty());
+        let id = s.book.add("AAPL US Equity".into(), 0.5, Direction::Above, false).unwrap();
+        s.book.set_rule(id, Some(rule.clone())).unwrap();
+        s.book.set_repeat(id, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
+        // Seed at NoMatch, then cross to Match: fires once.
+        for (value, fires) in [(0.0, false), (1.0, true)] {
+            s.pending_rules = Some(s.revision);
+            let fired = s.on_rules(s.revision, vec![(id, Ok(q(value)))]);
+            assert_eq!(fired.len(), usize::from(fires));
+        }
+        // A rule error (missing extra timeframe, timeout, …) resets only that rule's baseline.
+        s.pending_rules = Some(s.revision);
+        assert!(s.on_rules(s.revision, vec![(id, Err("Condition request timed out".into()))]).is_empty());
+        assert!(s.monitor[&format!("rule:{id}")].contains("timed out"));
+        // The next Match after the gap re-seeds under the current conservative policy.
+        s.pending_rules = Some(s.revision);
+        assert!(s.on_rules(s.revision, vec![(id, Ok(q(1.0)))]).is_empty());
+        std::fs::remove_dir_all(s.path.parent().unwrap()).ok();
+    }
+
+    #[test]
     fn rule_replies_have_separate_baselines_and_ignore_old_configuration() {
         let mut s = state();
         let id = s.book.add("AAPL US Equity".into(), 70., Direction::Above, false).unwrap();

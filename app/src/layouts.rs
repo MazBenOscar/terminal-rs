@@ -478,6 +478,27 @@ mod tests {
     }
 
     #[test]
+    fn scanner_refresh_roundtrips_and_legacy_layouts_default_off() {
+        let definition = tr_core::scanner::ScanDefinition::default();
+        // Legacy scanner settings with no refresh key load as auto-refresh off.
+        let mut legacy = serde_json::to_value(ScanSettings {
+            definition: definition.clone(),
+            universe: tr_data::universe::Universe::Nasdaq,
+            refresh: None,
+        })
+        .unwrap();
+        legacy.as_object_mut().unwrap().remove("refresh");
+        let loaded: ScanSettings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(loaded.refresh, None);
+        // An explicit interval survives the workspace round trip.
+        let mut doc = LayoutDoc::default_workspace("Scanner", &PanelDefaults::default());
+        let settings = ScanSettings { definition, universe: tr_data::universe::Universe::Nyse, refresh: Some(15) };
+        doc.panes[0].settings = PaneSettings::Scanner(settings.clone());
+        let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(restored.panes[0].settings, PaneSettings::Scanner(settings));
+    }
+
+    #[test]
     fn old_layout_without_watch_columns_loads() {
         let raw = br#"{"name":"Old","dock":{"type":"tabs","panes":[1]},"panes":[{"id":1,"Watchlist":null}]}"#;
         let doc = LayoutDoc::from_json(raw).unwrap();

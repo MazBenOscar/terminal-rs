@@ -590,6 +590,71 @@ mod tests {
     }
 
     #[test]
+    fn cooldown_boundary_fires_at_exactly_cooldown_seconds() {
+        let mut b = book(Direction::Above);
+        b.set_repeat(1, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
+        b.observe(quote(99., 1000), 1000);
+        assert_eq!(b.observe(quote(101., 1001), 1001).len(), 1);
+        // Still inside the cooldown window at cooldown-1.
+        b.observe(quote(99., 1050), 1050);
+        assert!(b.observe(quote(101., 1060), 1060).is_empty());
+        b.observe(quote(99., 1061), 1061);
+        // Exactly cooldown_secs after last_fired (1001): the window has expired.
+        assert_eq!(b.observe(quote(101., 1061), 1061).len(), 1);
+    }
+
+    #[test]
+    fn rearm_after_edit_resets_cooldown_for_a_fresh_crossing() {
+        let mut b = book(Direction::Above);
+        b.set_repeat(1, Repeat::Rearm { cooldown_secs: 300 }).unwrap();
+        b.observe(quote(99., 1000), 1000);
+        assert_eq!(b.observe(quote(101., 1001), 1001).len(), 1);
+        // Edit rearms with a fresh baseline and a fresh cooldown window.
+        b.edit(1, 100., Direction::Above).unwrap();
+        assert_eq!(b.alerts[0].last_fired, None);
+        b.observe(quote(99., 1010), 1010);
+        assert_eq!(b.observe(quote(101., 1011), 1011).len(), 1);
+    }
+
+    #[test]
+    #[ignore = "BUG: Book::reset_symbol (also reached from observe_target's invalid-quote path when target is None) drops `previous` for every alert on the symbol — including rule alerts — so one stale price quote wipes a Condition alert's 0/1 baseline and the next 0->1 crossing only re-seeds instead of firing."]
+    fn invalid_price_quote_must_not_reset_rule_alert_baselines() {
+        let mut b = book(Direction::Above);
+        b.edit(1, 0.5, Direction::Above).unwrap();
+        b.set_rule(1, Some(condition(None))).unwrap();
+        b.set_repeat(1, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
+        // Seed the rule baseline at NoMatch.
+        b.observe_rule(1, quote(0., 1000), 1000);
+        // A price-feed failure for the same symbol must not touch the rule baseline.
+        b.reset_symbol("AAPL US Equity");
+        // The 0 -> 1 crossing is still armed and must fire.
+        assert_eq!(b.observe_rule(1, quote(1., 1001), 1001).len(), 1);
+    }
+
+    #[test]
+    #[ignore = "BUG: Book::validate never inspects the v3 `fired_through` map, so a crafted or corrupted book can pin an alert's fired_through to a far-future quote_ts (or foreign alert ids) and permanently suppress every crossing while the file still validates and loads."]
+    fn validate_rejects_fired_through_pins_that_would_permanently_suppress_crossings() {
+        let mut b = book(Direction::Above);
+        b.set_repeat(1, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
+        let mut json = serde_json::to_value(&b).unwrap();
+        // Far-future pin: every quote_ts is <= this sentinel, so nothing may ever fire.
+        json["fired_through"] = serde_json::json!({ "1": 9_999_999_999_i64 });
+        let crafted: Book = serde_json::from_value(json).unwrap();
+        assert!(crafted.validate().is_err(), "fired_through must be bounds-checked like events.quote_ts");
+    }
+
+    #[test]
+    #[ignore = "BUG: Rule::Condition evaluates to only 0.0 (NoMatch) or 1.0 (Match), but Book::validate never couples the alert level to that domain — a Condition rule with level 2.0 (or -1.0) is accepted and the editor's free-form price field will save one, producing an alert whose crosses() threshold can never be reached."]
+    fn validate_rejects_condition_levels_outside_the_zero_one_domain() {
+        let mut b = book(Direction::Above);
+        b.edit(1, 2.0, Direction::Above).unwrap();
+        b.set_rule(1, Some(condition(None))).unwrap();
+        assert!(b.validate().is_err(), "level 2.0 can never be crossed by a 0/1 condition value");
+        b.edit(1, -1.0, Direction::Above).unwrap();
+        assert!(b.validate().is_err(), "level -1.0 can never be crossed by a 0/1 condition value");
+    }
+
+    #[test]
     fn conditions_are_isolated_and_line_math_and_migration_are_valid() {
         let mut b = book(Direction::Above);
         let id = b.add("AAPL US Equity".into(), 70., Direction::Above, false).unwrap();
