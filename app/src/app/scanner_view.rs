@@ -1,6 +1,7 @@
 //! Watchlist and market-wide snapshots: editable conditions, named definitions and explicit
 //! data status.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -35,6 +36,15 @@ pub struct ScannerPane {
     /// Stops the running universe scan.
     pub cancel: Option<Arc<AtomicBool>>,
     show_unavailable: bool,
+    pub refresh: Option<u32>,
+    previous_matches: HashSet<String>,
+    previous_evaluated: HashSet<String>,
+    baseline_ready: bool,
+    entered: HashSet<String>,
+    exited: Vec<String>,
+    started: Option<chrono::DateTime<chrono::Utc>>,
+    run_duration: chrono::Duration,
+    universe_size: Option<usize>,
 }
 
 impl Default for ScannerPane {
@@ -67,13 +77,124 @@ impl ScannerPane {
             progress: None,
             cancel: None,
             show_unavailable: false,
+            refresh: settings.refresh,
+            previous_matches: HashSet::new(),
+            previous_evaluated: HashSet::new(),
+            baseline_ready: false,
+            entered: HashSet::new(),
+            exited: Vec::new(),
+            started: None,
+            run_duration: chrono::Duration::zero(),
+            universe_size: None,
         }
     }
 
     fn invalidate(&mut self) {
         self.rows.clear();
         self.completed = None;
+        self.previous_matches.clear();
+        self.previous_evaluated.clear();
+        self.baseline_ready = false;
+        self.entered.clear();
+        self.exited.clear();
+        self.universe_size = None;
     }
+
+    fn stop(&mut self) {
+        self.refresh = None;
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn partial(&mut self, generation: u64, rows: Vec<ScanRow>) {
+        if self.running && self.generation == generation {
+            self.rows.extend(rows);
+        }
+    }
+
+    pub fn finish(&mut self, generation: u64, rows: Vec<ScanRow>) {
+        if self.generation != generation {
+            return;
+        }
+        let completed = chrono::Utc::now();
+        self.run_duration = self.started.map_or(chrono::Duration::zero(), |start| completed - start);
+        let stopped = self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+        self.entered.clear();
+        self.exited.clear();
+        if !stopped {
+            let (matches, evaluated) = match_sets(&rows);
+            if self.baseline_ready {
+                (self.entered, self.exited) =
+                    match_diff(&self.previous_matches, &self.previous_evaluated, &matches, &evaluated);
+            }
+            self.previous_matches = matches;
+            self.previous_evaluated = evaluated;
+            self.baseline_ready = true;
+        }
+        self.rows = rows;
+        self.running = false;
+        self.progress = None;
+        self.cancel = None;
+        self.completed = Some(completed);
+    }
+
+    pub fn set_progress(&mut self, done: usize, total: usize) {
+        self.progress = Some((done, total));
+        self.universe_size = Some(total);
+        self.restrict_refresh();
+    }
+
+    fn restrict_refresh(&mut self) {
+        // Until the directory arrives, conservatively treat a market universe as large.
+        let size = if self.universe == Universe::Watchlist { 0 } else { self.universe_size.unwrap_or(1001) };
+        if self.refresh.is_some_and(|minutes| !interval_allowed(size, minutes)) {
+            self.refresh = Some(15);
+        }
+    }
+}
+
+fn due_at(
+    completed: chrono::DateTime<chrono::Utc>,
+    interval: u32,
+    run_duration: chrono::Duration,
+) -> chrono::DateTime<chrono::Utc> {
+    let interval = chrono::Duration::minutes(i64::from(interval));
+    completed + if run_duration > interval { interval.max(chrono::Duration::seconds(30)) } else { interval }
+}
+
+fn interval_allowed(symbols: usize, minutes: u32) -> bool {
+    matches!(minutes, 1 | 5 | 15 | 60) && (symbols <= 1000 || minutes >= 15)
+}
+
+fn match_sets(rows: &[ScanRow]) -> (HashSet<String>, HashSet<String>) {
+    let mut matches = HashSet::new();
+    let mut evaluated = HashSet::new();
+    for row in rows {
+        if row.error.is_none()
+            && let Some(evaluation) = &row.evaluation
+        {
+            if evaluation.outcome != ScanOutcome::Unavailable {
+                evaluated.insert(row.symbol.clone());
+            }
+            if evaluation.outcome == ScanOutcome::Match {
+                matches.insert(row.symbol.clone());
+            }
+        }
+    }
+    (matches, evaluated)
+}
+
+fn match_diff(
+    previous: &HashSet<String>,
+    previous_evaluated: &HashSet<String>,
+    current: &HashSet<String>,
+    evaluated: &HashSet<String>,
+) -> (HashSet<String>, Vec<String>) {
+    let entered = current.difference(previous).filter(|s| previous_evaluated.contains(*s)).cloned().collect();
+    let mut exited: Vec<_> = previous.difference(current).filter(|s| evaluated.contains(*s)).cloned().collect();
+    exited.sort();
+    (entered, exited)
 }
 
 impl Drop for ScannerPane {
@@ -399,18 +520,20 @@ pub fn show(
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     let market = pane.universe != Universe::Watchlist;
+    pane.restrict_refresh();
     egui::ScrollArea::vertical().id_salt(("scanner", id)).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
+            let mode = if pane.refresh.is_some() { "auto-refresh" } else { "manual snapshot" };
             let (title, subtitle) = if market {
-                ("MARKET SCANNER", format!("{} · manual snapshot", pane.universe.label()))
+                ("MARKET SCANNER", format!("{} · {mode}", pane.universe.label()))
             } else {
-                ("WATCHLIST SCANNER", format!("{} symbols · manual snapshot", symbols.len()))
+                ("WATCHLIST SCANNER", format!("{} symbols · {mode}", symbols.len()))
             };
             ui.label(RichText::new(title).font(mono(12.0)).color(amber()));
             ui.label(RichText::new(subtitle).font(mono(12.0)).color(muted()));
         });
         ui.label(
-            RichText::new("Uses the latest provider bar, which may still be forming. No automatic refresh.")
+            RichText::new("Uses the latest provider bar, which may still be forming.")
                 .small()
                 .color(muted()),
         );
@@ -479,6 +602,7 @@ pub fn show(
         }
         ui.add_space(dp(4.0));
         ui.separator();
+        let market = pane.universe != Universe::Watchlist;
         let can_run = run_enabled(
             &pane.definition,
             pane.running,
@@ -492,16 +616,43 @@ pub fn show(
             if let Some(error) = &validation {
                 run_response = run_response.on_disabled_hover_text(error);
             }
-            if run_response.clicked() {
+            field(ui, "Refresh", |ui| {
+                let label = pane.refresh.map_or_else(|| "Off".into(), |m| format!("{m} min"));
+                egui::ComboBox::from_id_salt("scan-refresh").selected_text(label).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut pane.refresh, None, "Off");
+                    let size = if market { pane.universe_size.unwrap_or(1001) } else { symbols.len() };
+                    for minutes in [1, 5, 15, 60] {
+                        ui.add_enabled_ui(interval_allowed(size, minutes), |ui| {
+                            ui.selectable_value(&mut pane.refresh, Some(minutes), format!("{minutes} min"))
+                                .on_disabled_hover_text("Large universes refresh at most every 15 minutes");
+                        });
+                    }
+                });
+            });
+            pane.restrict_refresh();
+            let now = chrono::Utc::now();
+            let due = pane.refresh.map(|minutes| {
+                pane.completed.map_or(now, |completed| due_at(completed, minutes, pane.run_duration))
+            });
+            if can_run && !pane.running && let Some(due) = due {
+                ui.ctx().request_repaint_after((due - now).to_std().unwrap_or_default());
+            }
+            if run_response.clicked() || (can_run && due.is_some_and(|due| now >= due)) {
                 // Never reuse a generation after restoring a layout or recreating a pane.
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 pane.generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                pane.invalidate();
+                if !market && pane.snapshot_symbols != symbols {
+                    pane.invalidate();
+                }
+                pane.rows.clear();
+                pane.entered.clear();
+                pane.exited.clear();
+                pane.started = Some(now);
                 pane.running = true;
                 pane.notice = None;
+                let cancel = Arc::new(AtomicBool::new(false));
+                pane.cancel = Some(cancel.clone());
                 if market {
-                    let cancel = Arc::new(AtomicBool::new(false));
-                    pane.cancel = Some(cancel.clone());
                     pane.snapshot_symbols.clear();
                     pane.progress = Some((0, 0));
                     send(Request::ScanUniverse {
@@ -518,11 +669,12 @@ pub fn show(
                         generation: pane.generation,
                         definition: pane.definition.clone(),
                         symbols: symbols.to_vec(),
+                        cancel,
                     });
                 }
             }
             if ui.add_enabled(!pane.running && validation.is_none(), egui::Button::new("Save scan")).clicked() {
-                match save_definition(&ScanSettings { definition: pane.definition.clone(), universe: pane.universe }) {
+                match save_definition(&ScanSettings { definition: pane.definition.clone(), universe: pane.universe, refresh: pane.refresh }) {
                     Ok(saved) => {
                         pane.saved = saved;
                         pane.notice = Some(SAVED_NOTICE.into());
@@ -536,7 +688,7 @@ pub fn show(
                     ui.label(RichText::new("Presets").small().color(muted()));
                     for preset in ScanDefinition::presets() {
                         if ui.selectable_label(false, &preset.name).clicked() {
-                            selected = Some(ScanSettings { definition: preset, universe: pane.universe });
+                            selected = Some(ScanSettings { definition: preset, universe: pane.universe, refresh: pane.refresh });
                         }
                     }
                     ui.separator();
@@ -554,6 +706,7 @@ pub fn show(
             if let Some(settings) = selected {
                 pane.definition = settings.definition;
                 pane.universe = settings.universe;
+                pane.refresh = settings.refresh;
                 pane.invalidate();
             }
             if pane.running && !market {
@@ -574,14 +727,26 @@ pub fn show(
                 let text = if total == 0 { "Loading the US symbol directory…".to_string() } else { format!("{done} / {total}") };
                 ui.add(egui::ProgressBar::new(fraction).text(text).desired_width(dp(260.0)));
                 let stopping = pane.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
-                if ui.add_enabled(!stopping, egui::Button::new(if stopping { "Stopping…" } else { "Stop" })).clicked()
-                    && let Some(cancel) = &pane.cancel
-                {
-                    cancel.store(true, Ordering::Relaxed);
+                if ui.add_enabled(!stopping, egui::Button::new(if stopping { "Stopping…" } else { "Stop" })).clicked() {
+                    pane.stop();
                 }
             });
             ui.label(RichText::new("Fresh snapshots are reused. Stale data, changed sources and larger lookbacks download full history; a market-wide refresh can take 10–15 minutes.").small().color(muted()));
         }
+        if pane.running && !market && ui.button("Stop").clicked() {
+            pane.stop();
+        }
+        let status = if let Some(minutes) = pane.refresh {
+            let now = chrono::Utc::now();
+            let remaining = pane.completed.map_or(0, |completed| {
+                (due_at(completed, minutes, pane.run_duration) - now).num_seconds().max(0)
+            });
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            format!("Auto-refresh every {minutes} min · next in {}:{:02}", remaining / 60, remaining % 60)
+        } else {
+            "Auto-refresh off".into()
+        };
+        ui.label(RichText::new(status).small().color(muted()));
         let warn = |ui: &mut Ui, message: &str| {
             ui.label(RichText::new(message).color(amber()));
         };
@@ -598,7 +763,7 @@ pub fn show(
             let color = if notice == SAVED_NOTICE { theme::up() } else { theme::down() };
             ui.label(RichText::new(notice).color(color));
         }
-        if let Some(completed) = pane.completed {
+        if let Some(completed) = pane.completed.filter(|_| !pane.running) {
             let count = |outcome| {
                 pane.rows.iter().filter(|r| r.evaluation.as_ref().is_some_and(|e| e.outcome == outcome)).count()
             };
@@ -640,6 +805,19 @@ pub fn show(
                 warn(ui, "SIMULATED DATA — these results use generated sample bars.");
             }
             ui.add_space(dp(4.0));
+            if pane.baseline_ready && !pane.running {
+                egui::CollapsingHeader::new(
+                    RichText::new(format!("{} new · {} dropped", pane.entered.len(), pane.exited.len())).color(muted()),
+                ).show(ui, |ui| {
+                    for symbol in &pane.exited {
+                        if ui.selectable_label(false, RichText::new(symbol).color(muted())).clicked() {
+                            actions.push(Action::OpenChart(symbol.clone()));
+                        }
+                    }
+                });
+            }
+            results_table(ui, pane, market, &mut actions);
+        } else if pane.running && !pane.rows.is_empty() {
             results_table(ui, pane, market, &mut actions);
         } else if !pane.running {
             ui.add_space(dp(6.0));
@@ -695,6 +873,9 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
         p.text(pos2(r.left() + x[0], y), Align2::LEFT_CENTER, &ticker, mono(12.5), amber());
         let (label, color) = outcome_label(outcome);
         p.text(pos2(r.left() + x[1], y), Align2::LEFT_CENTER, label, ui_font(12.0), color);
+        if pane.entered.contains(&row.symbol) {
+            p.text(pos2(r.left() + x[1] + dp(60.0), y), Align2::LEFT_CENTER, "New", ui_font(10.0), theme::up());
+        }
         let ts = row.ts.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
         let last = ts.map_or_else(|| "—".into(), |ts| ts.format("%Y-%m-%d %H:%M").to_string());
         p.text(pos2(r.left() + x[2], y), Align2::LEFT_CENTER, last, mono(12.0), text());
@@ -769,6 +950,153 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_due_time_waits_after_completion_with_backpressure() {
+        let completed = chrono::DateTime::from_timestamp(1_000, 0).unwrap();
+        assert_eq!(due_at(completed, 5, chrono::Duration::seconds(10)), completed + chrono::Duration::minutes(5));
+        assert_eq!(due_at(completed, 1, chrono::Duration::minutes(10)), completed + chrono::Duration::minutes(1));
+        assert_eq!(due_at(completed, 0, chrono::Duration::seconds(10)), completed + chrono::Duration::seconds(30));
+    }
+
+    #[test]
+    fn match_changes_require_available_evaluations_in_both_runs() {
+        let set = |symbols: &[&str]| symbols.iter().map(|s| (*s).to_string()).collect::<HashSet<_>>();
+        let previous = set(&["KEEP", "DROP", "UNAVAILABLE"]);
+        let previous_evaluated = set(&["KEEP", "DROP", "UNAVAILABLE", "ENTER"]);
+        let current = set(&["KEEP", "ENTER", "FIRST"]);
+        let evaluated = set(&["KEEP", "DROP", "ENTER", "FIRST"]);
+        let (entered, exited) = match_diff(&previous, &previous_evaluated, &current, &evaluated);
+        assert_eq!(entered, set(&["ENTER"]));
+        assert_eq!(exited, vec!["DROP"]);
+    }
+
+    #[test]
+    fn large_universes_restrict_short_refresh_intervals() {
+        for minutes in [1, 5, 15, 60] {
+            assert!(interval_allowed(1000, minutes));
+            assert_eq!(interval_allowed(1001, minutes), minutes >= 15);
+        }
+        assert!(!interval_allowed(100, 2));
+        let mut pane = ScannerPane::default();
+        pane.universe = Universe::Nasdaq;
+        pane.refresh = Some(1);
+        pane.set_progress(0, 2000);
+        assert_eq!(pane.refresh, Some(15));
+    }
+
+    #[test]
+    fn stop_disables_auto_refresh_and_signals_cancellation() {
+        let mut pane = ScannerPane::default();
+        pane.refresh = Some(5);
+        pane.running = true;
+        let cancel = Arc::new(AtomicBool::new(false));
+        pane.cancel = Some(cancel.clone());
+        pane.stop();
+        assert_eq!(pane.refresh, None);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(pane.running);
+    }
+
+    fn unavailable_row(symbol: &str) -> ScanRow {
+        ScanRow {
+            symbol: symbol.into(),
+            evaluation: None,
+            ts: None,
+            simulated: false,
+            error: Some("Unavailable".into()),
+        }
+    }
+
+    #[test]
+    fn partial_rows_append_then_final_replaces_them() {
+        let mut pane = ScannerPane::default();
+        pane.generation = 42;
+        pane.running = true;
+        pane.partial(42, vec![unavailable_row("A")]);
+        pane.partial(42, vec![unavailable_row("B")]);
+        assert_eq!(pane.rows.iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), vec!["A", "B"]);
+        pane.finish(42, vec![unavailable_row("FINAL")]);
+        assert_eq!(pane.rows.len(), 1);
+        assert_eq!(pane.rows[0].symbol, "FINAL");
+        assert!(!pane.running);
+        assert!(pane.completed.is_some());
+        pane.partial(42, vec![unavailable_row("LATE")]);
+        assert_eq!(pane.rows.len(), 1);
+    }
+
+    #[test]
+    fn completed_runs_track_changes_and_invalidate_resets_baseline() {
+        let row = |symbol: &str, outcome| ScanRow {
+            symbol: symbol.into(),
+            evaluation: Some(tr_core::scanner::ScanEvaluation { outcome, conditions: Vec::new(), reason: None }),
+            ts: None,
+            simulated: false,
+            error: None,
+        };
+        let mut pane = ScannerPane::default();
+        pane.finish(
+            0,
+            vec![row("A", ScanOutcome::Match), row("B", ScanOutcome::NoMatch), row("C", ScanOutcome::Match)],
+        );
+        assert!(pane.entered.is_empty());
+        assert!(pane.exited.is_empty());
+        pane.running = true;
+        pane.partial(0, vec![row("B", ScanOutcome::Match)]);
+        assert!(!pane.previous_matches.contains("B"));
+        pane.finish(0, vec![row("A", ScanOutcome::NoMatch), row("B", ScanOutcome::Match), unavailable_row("C")]);
+        assert_eq!(pane.entered, HashSet::from(["B".into()]));
+        assert_eq!(pane.exited, vec!["A"]);
+        pane.invalidate();
+        assert!(!pane.baseline_ready);
+        assert!(pane.previous_matches.is_empty());
+        pane.finish(0, vec![row("A", ScanOutcome::Match)]);
+        assert!(pane.entered.is_empty());
+        assert!(pane.exited.is_empty());
+    }
+
+    #[test]
+    fn auto_refresh_waits_until_due_and_never_overlaps() {
+        let ctx = egui::Context::default();
+        let mut pane = ScannerPane::default();
+        pane.refresh = Some(1);
+        pane.completed = Some(chrono::Utc::now());
+        let mut requests = 0;
+        for state in 0..3 {
+            if state == 1 {
+                pane.completed = Some(chrono::Utc::now() - chrono::Duration::minutes(2));
+            }
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    show(ui, &mut pane, 1, &["AAPL US Equity".into()], false, |_| requests += 1);
+                });
+            });
+            output.textures_delta.clear();
+            assert_eq!(requests, usize::from(state > 0));
+        }
+        assert!(pane.running);
+    }
+
+    #[test]
+    fn stale_generation_partials_are_dropped() {
+        let mut pane = ScannerPane::default();
+        pane.generation = 42;
+        pane.running = true;
+        pane.partial(41, vec![unavailable_row("STALE")]);
+        assert!(pane.rows.is_empty());
+        pane.finish(41, vec![unavailable_row("STALE")]);
+        assert!(pane.rows.is_empty());
+        assert!(pane.running);
+    }
+
+    #[test]
+    fn scan_settings_without_refresh_load_off() {
+        let legacy = serde_json::to_string(&ScanDefinition::default()).unwrap();
+        let settings: ScanSettings = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(settings.refresh, None);
+        let settings = ScanSettings { refresh: Some(15), ..settings };
+        assert_eq!(serde_json::from_str::<ScanSettings>(&serde_json::to_string(&settings).unwrap()).unwrap(), settings);
+    }
 
     #[test]
     fn nested_group_editing_keeps_ids_unique() {
@@ -877,6 +1205,15 @@ mod tests {
             progress: None,
             cancel: None,
             show_unavailable: false,
+            refresh: None,
+            previous_matches: HashSet::new(),
+            previous_evaluated: HashSet::new(),
+            baseline_ready: false,
+            entered: HashSet::new(),
+            exited: Vec::new(),
+            started: None,
+            run_duration: chrono::Duration::zero(),
+            universe_size: None,
         };
         // Full pane layout, including narrow docks, without a network worker or GPU.
         for width in [280.0, 900.0] {
@@ -922,6 +1259,7 @@ mod tests {
         let mut definition = ScanSettings {
             definition: ScanDefinition { name: "First".into(), ..Default::default() },
             universe: Universe::Nasdaq,
+            refresh: None,
         };
         assert_eq!(save_definition_at(&definition, &dir).unwrap().len(), 1);
         definition.definition.name = "Second".into();

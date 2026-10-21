@@ -95,6 +95,7 @@ pub enum Request {
         generation: u64,
         definition: ScanDefinition,
         symbols: Vec<String>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
     },
     /// Scan a market-wide universe through the scanner's bar store; `cancel` stops it.
     ScanUniverse {
@@ -366,6 +367,11 @@ pub enum Response {
     /// Outcome of a [`QuestradeAction`]: a status line or an error.
     Questrade(Result<String, String>),
     Scan {
+        pane: PaneId,
+        generation: u64,
+        rows: Vec<ScanRow>,
+    },
+    ScanPartial {
         pane: PaneId,
         generation: u64,
         rows: Vec<ScanRow>,
@@ -907,8 +913,16 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let rows = scan_universe(s, pane, generation, &definition, universe, &cancel).await;
             s.send(Response::Scan { pane, generation, rows });
         }
-        Request::Scan { pane, generation, definition, symbols } => {
-            let rows = scan(s.provider.clone(), definition, symbols, Duration::from_secs(15)).await;
+        Request::Scan { pane, generation, definition, symbols, cancel } => {
+            let stopped = async {
+                while !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            let rows = tokio::select! {
+                rows = scan(s.provider.clone(), definition, symbols, Duration::from_secs(15)) => rows,
+                () = stopped => Vec::new(),
+            };
             s.send(Response::Scan { pane, generation, rows });
         }
         Request::History { pane, generation, symbol, tf, limit, options } => {
@@ -1623,7 +1637,7 @@ async fn scan_universe(
     let done = AtomicUsize::new(0);
     s.send(Response::ScanProgress { pane, generation, done: 0, total });
     let limit = definition.required_bars().saturating_mul(3).clamp(300, MAX_SCAN_HISTORY_BARS);
-    futures::stream::iter(symbols.into_iter().map(|symbol| {
+    let mut stream = futures::stream::iter(symbols.into_iter().map(|symbol| {
         let done = &done;
         async move {
             let row = if cancel.load(Ordering::Relaxed) {
@@ -1653,9 +1667,20 @@ async fn scan_universe(
             row
         }
     }))
-    .buffered(4)
-    .collect()
-    .await
+    .buffered(4);
+    let mut rows = Vec::with_capacity(total);
+    let mut batch = Vec::new();
+    while let Some(row) = stream.next().await {
+        batch.push(row.clone());
+        rows.push(row);
+        if batch.len() == 50 {
+            s.send(Response::ScanPartial { pane, generation, rows: std::mem::take(&mut batch) });
+        }
+    }
+    if !batch.is_empty() {
+        s.send(Response::ScanPartial { pane, generation, rows: batch });
+    }
+    rows
 }
 
 async fn trade(t: TradeRequest) -> TradeResponse {

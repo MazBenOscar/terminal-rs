@@ -135,11 +135,13 @@ pub struct ScanSettings {
     pub definition: tr_core::scanner::ScanDefinition,
     #[serde(default)]
     pub universe: tr_data::universe::Universe,
+    #[serde(default)]
+    pub refresh: Option<u32>,
 }
 
 impl From<tr_core::scanner::ScanDefinition> for ScanSettings {
     fn from(definition: tr_core::scanner::ScanDefinition) -> Self {
-        Self { definition, universe: Default::default() }
+        Self { definition, universe: Default::default(), refresh: None }
     }
 }
 
@@ -469,7 +471,7 @@ mod tests {
     fn scanner_conditions_survive_workspace_roundtrip() {
         let definition = tr_core::scanner::ScanDefinition::default();
         let mut doc = LayoutDoc::default_workspace("Scanner", &PanelDefaults::default());
-        let settings = ScanSettings { definition, universe: tr_data::universe::Universe::Nasdaq };
+        let settings = ScanSettings { definition, universe: tr_data::universe::Universe::Nasdaq, refresh: None };
         doc.panes[0].settings = PaneSettings::Scanner(settings.clone());
         let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
         assert_eq!(restored.panes[0].settings, PaneSettings::Scanner(settings));
