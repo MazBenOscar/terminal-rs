@@ -833,7 +833,9 @@ impl ChartState {
         }
         study::assign_ids(&mut self.indicators);
         self.show_indicator_editor(ui.ctx(), w);
-        if let Some(chosen) = self.compare_picker.show(ui.ctx(), self.id, &self.symbol, self.compare.as_deref(), w) {
+        if let Some(chosen) =
+            self.compare_picker.show(ui.ctx(), rect, self.id, &self.symbol, self.compare.as_deref(), w)
+        {
             self.set_compare(chosen, w);
         }
         let painter = ui.painter_at(rect);

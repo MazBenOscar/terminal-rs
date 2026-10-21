@@ -17,6 +17,8 @@ pub struct Picker {
     hits: Vec<SearchHit>,
     error: Option<String>,
     searching: bool,
+    /// Anchor the window under the chart's Compare button on the first frame after opening.
+    place: bool,
 }
 pub fn parse_key(input: &str) -> Option<String> {
     let words: Vec<_> = input.split_whitespace().collect();
@@ -25,7 +27,7 @@ pub fn parse_key(input: &str) -> Option<String> {
 }
 impl Picker {
     pub fn open(&mut self) {
-        *self = Self { open: true, focus: true, ..Default::default() };
+        *self = Self { open: true, focus: true, place: true, ..Default::default() };
     }
     pub fn on_hits(&mut self, query: &str, result: Result<Vec<SearchHit>, String>) {
         if !self.open || self.query.trim() != query || self.requested.as_deref() != Some(query) {
@@ -43,6 +45,7 @@ impl Picker {
     pub fn show(
         &mut self,
         ctx: &egui::Context,
+        chart: egui::Rect,
         pane: PaneId,
         subject: &str,
         current: Option<&str>,
@@ -57,96 +60,103 @@ impl Picker {
         }
         let mut open = true;
         let mut chosen = None;
-        egui::Window::new(RichText::new("Compare symbol").font(ui_font(13.)))
+        let width = theme::dp(360.);
+        let mut window = egui::Window::new(RichText::new("Compare symbol").font(ui_font(13.)))
             .id(egui::Id::new((pane, "compare-picker")))
             .open(&mut open)
-            .default_width(theme::dp(360.))
-            .constrain_to(ctx.content_rect().shrink(theme::dp(24.)))
-            .show(ctx, |ui| {
-                if let Some(current) = current {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Comparing {current}"));
-                        if ui.button("Remove").clicked() {
-                            chosen = Some(None);
-                        }
-                    });
-                }
-                let input = ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("Search name, ticker or market key")
-                        .desired_width(f32::INFINITY)
-                        .char_limit(100),
-                );
-                if self.focus {
-                    input.request_focus();
-                    self.focus = false;
-                }
-                if input.changed() {
-                    self.pending = Some(Instant::now());
-                    self.requested = None;
-                    self.hits.clear();
-                    self.error = None;
-                    self.searching = false;
-                }
-                let key = parse_key(&self.query).filter(|key| key != subject);
-                let enter =
-                    input.has_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-                if ui
-                    .add_enabled(
-                        key.is_some(),
-                        egui::Button::new(
-                            key.as_ref().map_or("Compare entered symbol".into(), |key| format!("Compare {key}")),
-                        ),
-                    )
-                    .clicked()
-                    || enter && key.is_some()
-                {
-                    chosen = Some(key);
-                }
-                if parse_key(&self.query).as_deref() == Some(subject) {
-                    ui.label(RichText::new("Choose a different symbol from the chart.").color(theme::muted()));
-                }
-                ui.separator();
-                let mut seen = std::collections::HashSet::new();
-                egui::ScrollArea::vertical().max_height(theme::dp(260.)).show(ui, |ui| {
-                    let local = if self.query.trim().is_empty() {
-                        ["SPY", "QQQ", "DIA", "IWM", "SPX", "MSFT", "NVDA", "BTCUSD", "ETHUSD"]
-                            .into_iter()
-                            .filter_map(|ticker| tr_core::catalog::lookup(ticker, None))
-                            .collect()
-                    } else {
-                        tr_core::catalog::search(self.query.trim(), 12)
-                    };
-                    for listing in local {
-                        let key = listing.key();
-                        if key != subject && seen.insert(key.clone()) {
-                            result_button(ui, &key, listing.name, current, &mut chosen);
-                        }
-                    }
-                    for hit in &self.hits {
-                        if hit.key != subject && seen.insert(hit.key.clone()) {
-                            result_button(ui, &hit.key, &hit.name, current, &mut chosen);
-                        }
+            .default_width(width)
+            .constrain_to(ctx.content_rect().shrink(theme::dp(24.)));
+        if std::mem::take(&mut self.place) {
+            // Top-right of the plot, under the header's Compare button.
+            let x = (chart.right() - width - theme::dp(12.)).max(chart.left() + theme::dp(6.));
+            window = window.current_pos(egui::pos2(x, chart.top() + theme::dp(52.)));
+        }
+        window.show(ctx, |ui| {
+            if let Some(current) = current {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Comparing {current}"));
+                    if ui.button("Remove").clicked() {
+                        chosen = Some(None);
                     }
                 });
-                if self.searching {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Searching provider…");
-                    });
+            }
+            let input = ui.add(
+                egui::TextEdit::singleline(&mut self.query)
+                    .hint_text("Search name, ticker or market key")
+                    .desired_width(f32::INFINITY)
+                    .char_limit(100),
+            );
+            if self.focus {
+                input.request_focus();
+                self.focus = false;
+            }
+            if input.changed() {
+                self.pending = Some(Instant::now());
+                self.requested = None;
+                self.hits.clear();
+                self.error = None;
+                self.searching = false;
+            }
+            let enter = input.has_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            let mut results: Vec<(String, String)> = Vec::new();
+            let local = if self.query.trim().is_empty() {
+                ["SPY", "QQQ", "DIA", "IWM", "SPX", "MSFT", "NVDA", "BTCUSD", "ETHUSD"]
+                    .into_iter()
+                    .filter_map(|ticker| tr_core::catalog::lookup(ticker, None))
+                    .collect()
+            } else {
+                tr_core::catalog::search(self.query.trim(), 12)
+            };
+            let found = local
+                .into_iter()
+                .map(|listing| (listing.key(), listing.name.to_string()))
+                .chain(self.hits.iter().map(|hit| (hit.key.clone(), hit.name.clone())));
+            for (key, name) in found {
+                if key != subject && !results.iter().any(|(k, _)| *k == key) {
+                    results.push((key, name));
                 }
-                if let Some(error) = &self.error {
-                    ui.label(RichText::new(format!("Search unavailable: {error}")).color(theme::down()));
+            }
+            // A typed key is offered only when no result already is that key, after the results,
+            // so a plain word such as "tesla" is not presented as the ticker TESLA.
+            let typed = parse_key(&self.query).filter(|key| key != subject && !results.iter().any(|(k, _)| k == key));
+            if enter {
+                chosen = results.first().map(|(key, _)| Some(key.clone())).or_else(|| typed.clone().map(Some));
+            }
+            if parse_key(&self.query).as_deref() == Some(subject) {
+                ui.label(RichText::new("Choose a different symbol from the chart.").color(theme::muted()));
+            }
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(theme::dp(260.)).show(ui, |ui| {
+                for (key, name) in &results {
+                    result_button(ui, key, name, current, &mut chosen);
                 }
-                if !self.searching && self.requested.is_some() && seen.is_empty() && self.error.is_none() {
-                    ui.label("No matches. You can enter a market key above.");
+                if let Some(key) = &typed {
+                    let label = RichText::new(format!("Use “{key}” as entered")).color(theme::muted());
+                    if ui.add(egui::Button::selectable(false, label).truncate()).clicked() {
+                        chosen = Some(Some(key.clone()));
+                    }
                 }
-                ui.label(
-                    RichText::new("One comparison at a time · rebased at the visible left edge")
-                        .small()
-                        .color(theme::muted()),
-                );
             });
+            if self.searching {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Searching provider…");
+                });
+            }
+            if let Some(error) = &self.error {
+                ui.label(RichText::new(format!("Search unavailable: {error}")).color(theme::down()));
+            }
+            if !self.searching && self.requested.is_some() && results.is_empty() && self.error.is_none() {
+                ui.label(
+                    RichText::new("No matches. Enter a full market key, e.g. TSLA US Equity.").color(theme::muted()),
+                );
+            }
+            ui.label(
+                RichText::new("One comparison at a time · rebased at the visible left edge")
+                    .small()
+                    .color(theme::muted()),
+            );
+        });
         if let Some(at) = self.pending {
             if at.elapsed() >= Duration::from_millis(250) {
                 self.pending = None;
@@ -165,7 +175,8 @@ impl Picker {
     }
 }
 fn result_button(ui: &mut Ui, key: &str, name: &str, current: Option<&str>, chosen: &mut Option<Option<String>>) {
-    if ui.selectable_label(current == Some(key), format!("{key}  ·  {name}")).clicked() {
+    let text = format!("{key}  ·  {name}");
+    if ui.add(egui::Button::selectable(current == Some(key), text).truncate()).on_hover_text(name).clicked() {
         *chosen = Some(Some(key.into()));
     }
 }

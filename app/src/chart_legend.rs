@@ -37,16 +37,15 @@ pub fn rows(
         let b = built.iter().find(|b| b.spec.chart.as_ref().is_some_and(|c| c.id == settings.id));
         let values = if settings.visible {
             b.map(|b| {
+                // A single output repeats the study name ("SMA 20  SMA 1677.5"), so show only its value.
+                let single = b.overlays.len() == 1;
                 b.overlays
                     .iter()
                     .filter_map(|(name, o)| {
-                        o.line
-                            .pyramid
-                            .data
-                            .get(bar)
-                            .map(|p| p[1] as f64)
-                            .filter(|v| v.is_finite())
-                            .map(|v| format!("{name} {}", tr_chart::scale::format_value(v)))
+                        o.line.pyramid.data.get(bar).map(|p| p[1] as f64).filter(|v| v.is_finite()).map(|v| {
+                            let value = tr_chart::scale::format_value(v);
+                            if single { value } else { format!("{name} {value}") }
+                        })
                     })
                     .collect::<Vec<_>>()
                     .join("  ")
