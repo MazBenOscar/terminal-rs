@@ -263,14 +263,23 @@ pub fn show(
                 ui.label(RichText::new("Conditions").color(muted()));
                 egui::ComboBox::from_id_salt("scan-mode")
                     .width(dp(90.0))
-                    .selected_text(if pane.definition.match_mode == MatchMode::All { "Match all" } else { "Match any" })
+                    .selected_text(if pane.definition.root.mode == MatchMode::All { "Match all" } else { "Match any" })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut pane.definition.match_mode, MatchMode::All, "Match all");
-                        ui.selectable_value(&mut pane.definition.match_mode, MatchMode::Any, "Match any");
+                        ui.selectable_value(&mut pane.definition.root.mode, MatchMode::All, "Match all");
+                        ui.selectable_value(&mut pane.definition.root.mode, MatchMode::Any, "Match any");
                     });
             });
             let mut remove = None;
-            for (i, condition) in pane.definition.conditions.iter_mut().enumerate() {
+            for (i, item) in pane.definition.root.items.iter_mut().enumerate() {
+                let tr_core::scanner::ConditionItem::Compare(condition) = item else {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(item.label()).color(muted()));
+                        if ui.button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    continue;
+                };
                 ui.push_id(i, |ui| {
                     egui::Frame::new()
                         .fill(theme::header())
@@ -329,13 +338,13 @@ pub fn show(
                 });
             }
             if let Some(i) = remove {
-                pane.definition.conditions.remove(i);
+                pane.definition.root.items.remove(i);
             }
-            if pane.definition.conditions.is_empty() {
+            if pane.definition.root.items.is_empty() {
                 ui.label(RichText::new("No conditions yet. Add one to describe what a match looks like.").color(muted()));
             }
-            if pane.definition.conditions.len() < 32 && ui.button("Add condition").clicked() {
-                pane.definition.conditions.push(ScanCondition::default());
+            if pane.definition.leaves().len() < 32 && ui.button("Add condition").clicked() {
+                pane.definition.root.items.push(tr_core::scanner::ConditionItem::Compare(ScanCondition::default()));
             }
         });
         if pane.definition != before {
@@ -579,10 +588,10 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
                     .map(|e| {
                         e.conditions
                             .iter()
-                            .enumerate()
-                            .map(|(i, c)| {
+                            .zip(pane.definition.leaves())
+                            .map(|(c, leaf)| {
                                 let value = |v: Option<f64>| v.map_or_else(|| "—".into(), compact);
-                                format!("{}: {} / {}", i + 1, value(c.left), value(c.right))
+                                format!("{}: {} / {}", leaf.label(), value(c.left), value(c.right))
                             })
                             .collect::<Vec<_>>()
                             .join("   ")

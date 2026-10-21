@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::{Bar, Series, Timeframe, indicators};
 
 pub const MAX_PERIOD: usize = 500;
-pub const MAX_CONDITIONS: usize = 32;
+pub use crate::conditions::{
+    ConditionGroup, ConditionItem, FormulaCondition, MAX_CONDITIONS, MAX_GROUP_DEPTH, ScanCondition, SeriesSet,
+};
 pub const MAX_BARS_AGO: usize = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -95,7 +97,7 @@ impl ScanOperand {
         }
     }
 
-    fn validate(self) -> Result<(), String> {
+    pub(crate) fn validate(self) -> Result<(), String> {
         match self {
             Self::Sma { period, .. } | Self::Ema { period, .. } | Self::Atr { period } | Self::Rsi { period }
                 if !(1..=MAX_PERIOD).contains(&period) =>
@@ -107,7 +109,7 @@ impl ScanOperand {
         }
     }
 
-    fn required_bars(self) -> usize {
+    pub(crate) fn required_bars(self) -> usize {
         match self {
             Self::Sma { period, .. } | Self::Ema { period, .. } => period.clamp(1, MAX_PERIOD),
             // True range needs the previous close.
@@ -117,7 +119,7 @@ impl ScanOperand {
         }
     }
 
-    fn value(self, series: &Series, index: usize) -> Option<f64> {
+    pub(crate) fn value(self, series: &Series, index: usize) -> Option<f64> {
         let bars = &series.bars[..=index];
         if bars.len() < self.required_bars() {
             return None;
@@ -204,143 +206,54 @@ impl Comparison {
         }
     }
 
-    fn is_cross(self) -> bool {
+    pub(crate) fn is_cross(self) -> bool {
         matches!(self, Self::CrossedAbove | Self::CrossedBelow)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ScanCondition {
-    pub left: ScanOperand,
-    pub comparison: Comparison,
-    pub right: ScanOperand,
-    /// Evaluate the left operand this many bars before the latest (0 = latest, 1 = yesterday on 1D).
-    #[serde(default)]
-    pub left_bars_ago: usize,
-    #[serde(default)]
-    pub right_bars_ago: usize,
-    /// Scales the right operand, e.g. `volume >= EMA(50, Volume) × 2.5`.
-    #[serde(default = "one")]
-    pub right_multiplier: f64,
-}
-
-fn one() -> f64 {
-    1.0
-}
-
-impl Default for ScanCondition {
-    fn default() -> Self {
-        Self {
-            left: ScanOperand::Price,
-            comparison: Comparison::Above,
-            right: ScanOperand::Sma { period: 20, source: Source::Close },
-            left_bars_ago: 0,
-            right_bars_ago: 0,
-            right_multiplier: 1.0,
-        }
-    }
-}
-
-fn ago_label(label: String, bars_ago: usize) -> String {
-    match bars_ago {
-        0 => label,
-        1 => format!("{label} [1 bar ago]"),
-        n => format!("{label} [{n} bars ago]"),
-    }
-}
-
-impl ScanCondition {
-    pub fn label(&self) -> String {
-        format!(
-            "{} {} {}",
-            ago_label(self.left.label(), self.left_bars_ago),
-            self.comparison.label(),
-            ago_label(self.right_label(), self.right_bars_ago)
-        )
-    }
-
-    fn right_label(&self) -> String {
-        if self.right_multiplier == 1.0 {
-            self.right.label()
-        } else {
-            format!("{} × {}", self.right.label(), self.right_multiplier)
-        }
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        self.left.validate()?;
-        self.right.validate()?;
-        if !self.right_multiplier.is_finite() {
-            return Err("Multiplier must be finite".into());
-        }
-        if self.left_bars_ago.max(self.right_bars_ago) > MAX_BARS_AGO {
-            return Err(format!("Bars ago must be between 0 and {MAX_BARS_AGO}"));
-        }
-        Ok(())
-    }
-
-    fn required_bars(&self) -> usize {
-        let side = |operand: ScanOperand, ago: usize| operand.required_bars().saturating_add(ago);
-        side(self.left, self.left_bars_ago).max(side(self.right, self.right_bars_ago))
-            + usize::from(self.comparison.is_cross())
-    }
-
-    /// Both operand values for the bar at `index`, each shifted back by its side's bars-ago.
-    ///
-    /// `index` is the bar being evaluated: the latest bar, or the one before it when a
-    /// crossover looks at its previous state. Return `None` for a side whose shifted bar
-    /// would fall before the first bar of the series.
-    fn values_at(&self, series: &Series, index: usize) -> (Option<f64>, Option<f64>) {
-        let side = |operand: ScanOperand, bars_ago: usize| {
-            index.checked_sub(bars_ago).and_then(|shifted| operand.value(series, shifted))
-        };
-        let right = side(self.right, self.right_bars_ago).map(|v| v * self.right_multiplier);
-        (side(self.left, self.left_bars_ago), right.filter(|v| v.is_finite()))
-    }
-
-    fn evaluate(&self, series: &Series) -> ConditionEvaluation {
-        let Some(index) = series.bars.len().checked_sub(1) else {
-            return ConditionEvaluation::unavailable("No bars", None, None);
-        };
-        let (left, right) = self.values_at(series, index);
-        let (Some(a), Some(b)) = (left, right) else {
-            return ConditionEvaluation::unavailable("Insufficient history or invalid input", left, right);
-        };
-        let matched = match self.comparison {
-            Comparison::Above => a > b,
-            Comparison::Below => a < b,
-            Comparison::AtLeast => a >= b,
-            Comparison::AtMost => a <= b,
-            Comparison::CrossedAbove | Comparison::CrossedBelow => {
-                let previous = index.checked_sub(1).and_then(|i| match self.values_at(series, i) {
-                    (Some(a), Some(b)) => Some((a, b)),
-                    _ => None,
-                });
-                let Some((previous_a, previous_b)) = previous else {
-                    return ConditionEvaluation::unavailable("Crossover needs a valid previous bar", left, right);
-                };
-                if self.comparison == Comparison::CrossedAbove {
-                    previous_a <= previous_b && a > b
-                } else {
-                    previous_a >= previous_b && a < b
-                }
-            }
-        };
-        ConditionEvaluation {
-            outcome: if matched { ScanOutcome::Match } else { ScanOutcome::NoMatch },
-            left,
-            right,
-            reason: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "ScanDefinitionRepr", into = "ScanDefinitionRepr")]
 pub struct ScanDefinition {
     pub name: String,
     pub timeframe: Timeframe,
-    pub match_mode: MatchMode,
-    pub conditions: Vec<ScanCondition>,
+    pub root: ConditionGroup,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ScanDefinitionRepr {
+    #[serde(default)]
+    version: u32,
+    name: String,
+    timeframe: Timeframe,
+    #[serde(default, skip_serializing)]
+    match_mode: MatchMode,
+    #[serde(default, skip_serializing)]
+    conditions: Vec<ScanCondition>,
+    #[serde(default)]
+    root: Option<ConditionGroup>,
+}
+
+impl From<ScanDefinitionRepr> for ScanDefinition {
+    fn from(repr: ScanDefinitionRepr) -> Self {
+        Self {
+            name: repr.name,
+            timeframe: repr.timeframe,
+            root: repr.root.unwrap_or_else(|| ConditionGroup::comparisons(repr.match_mode, repr.conditions)),
+        }
+    }
+}
+
+impl From<ScanDefinition> for ScanDefinitionRepr {
+    fn from(scan: ScanDefinition) -> Self {
+        Self {
+            version: 1,
+            name: scan.name,
+            timeframe: scan.timeframe,
+            root: Some(scan.root),
+            match_mode: MatchMode::default(),
+            conditions: Vec::new(),
+        }
+    }
 }
 
 impl Default for ScanDefinition {
@@ -348,16 +261,18 @@ impl Default for ScanDefinition {
         Self {
             name: "Price above SMA 20".into(),
             timeframe: Timeframe::D1,
-            match_mode: MatchMode::All,
-            conditions: vec![
-                ScanCondition::default(),
-                ScanCondition {
-                    left: ScanOperand::Volume,
-                    comparison: Comparison::AtLeast,
-                    right: ScanOperand::Constant(100_000.0),
-                    ..ScanCondition::default()
-                },
-            ],
+            root: ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![
+                    ScanCondition::default(),
+                    ScanCondition {
+                        left: ScanOperand::Volume,
+                        comparison: Comparison::AtLeast,
+                        right: ScanOperand::Constant(100_000.0),
+                        ..ScanCondition::default()
+                    },
+                ],
+            ),
         }
     }
 }
@@ -383,25 +298,27 @@ impl ScanDefinition {
         Self {
             name: "Volume Thrust".into(),
             timeframe: Timeframe::D1,
-            match_mode: MatchMode::All,
-            conditions: vec![
-                condition(
-                    ScanOperand::Sma { period: 1, source: Source::Volume },
-                    Comparison::Above,
-                    ScanOperand::Constant(100_000.0),
-                ),
-                condition(ScanOperand::Rsi { period: 14 }, Comparison::AtLeast, ScanOperand::Constant(69.8)),
-                ScanCondition {
-                    right_multiplier: 2.5,
-                    ..condition(
-                        ScanOperand::Volume,
-                        Comparison::AtLeast,
-                        ScanOperand::Ema { period: 50, source: Source::Volume },
-                    )
-                },
-                condition(ScanOperand::Price, Comparison::AtLeast, ScanOperand::Constant(0.2)),
-                condition(ScanOperand::Atr { period: 1 }, Comparison::Above, ScanOperand::Constant(0.5)),
-            ],
+            root: ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![
+                    condition(
+                        ScanOperand::Sma { period: 1, source: Source::Volume },
+                        Comparison::Above,
+                        ScanOperand::Constant(100_000.0),
+                    ),
+                    condition(ScanOperand::Rsi { period: 14 }, Comparison::AtLeast, ScanOperand::Constant(69.8)),
+                    ScanCondition {
+                        right_multiplier: 2.5,
+                        ..condition(
+                            ScanOperand::Volume,
+                            Comparison::AtLeast,
+                            ScanOperand::Ema { period: 50, source: Source::Volume },
+                        )
+                    },
+                    condition(ScanOperand::Price, Comparison::AtLeast, ScanOperand::Constant(0.2)),
+                    condition(ScanOperand::Atr { period: 1 }, Comparison::Above, ScanOperand::Constant(0.5)),
+                ],
+            ),
         }
     }
 
@@ -417,29 +334,31 @@ impl ScanDefinition {
         Self {
             name: "Momentum Ignition".into(),
             timeframe: Timeframe::D1,
-            match_mode: MatchMode::All,
-            conditions: vec![
-                condition(
-                    ScanOperand::Sma { period: 1, source: Source::Volume },
-                    Comparison::Above,
-                    ScanOperand::Constant(100_000.0),
-                    0,
-                ),
-                condition(
-                    ScanOperand::Sma { period: 1, source: Source::Close },
-                    Comparison::Above,
-                    ScanOperand::Constant(1.0),
-                    0,
-                ),
-                condition(rsi, Comparison::AtLeast, ScanOperand::Constant(70.0), 0),
-                condition(
-                    ScanOperand::Price,
-                    Comparison::AtLeast,
-                    ScanOperand::Ema { period: 4, source: Source::Close },
-                    0,
-                ),
-                condition(rsi, Comparison::Below, ScanOperand::Constant(69.9), 1),
-            ],
+            root: ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![
+                    condition(
+                        ScanOperand::Sma { period: 1, source: Source::Volume },
+                        Comparison::Above,
+                        ScanOperand::Constant(100_000.0),
+                        0,
+                    ),
+                    condition(
+                        ScanOperand::Sma { period: 1, source: Source::Close },
+                        Comparison::Above,
+                        ScanOperand::Constant(1.0),
+                        0,
+                    ),
+                    condition(rsi, Comparison::AtLeast, ScanOperand::Constant(70.0), 0),
+                    condition(
+                        ScanOperand::Price,
+                        Comparison::AtLeast,
+                        ScanOperand::Ema { period: 4, source: Source::Close },
+                        0,
+                    ),
+                    condition(rsi, Comparison::Below, ScanOperand::Constant(69.9), 1),
+                ],
+            ),
         }
     }
 
@@ -447,48 +366,62 @@ impl ScanDefinition {
         if self.name.trim().is_empty() || self.name.chars().count() > 100 {
             return Err("Scan name must contain 1 to 100 characters".into());
         }
-        if self.conditions.is_empty() || self.conditions.len() > MAX_CONDITIONS {
-            return Err(format!("A scan needs between 1 and {MAX_CONDITIONS} conditions"));
-        }
-        for condition in &self.conditions {
-            condition.validate()?;
-        }
-        Ok(())
+        self.root.validate()
     }
 
     /// Minimum history needed for every condition. EMA and RSI may differ with longer
     /// histories because exponential smoothing preserves its initial seed.
     pub fn required_bars(&self) -> usize {
-        self.conditions.iter().map(ScanCondition::required_bars).max().unwrap_or(1)
+        self.required_bars_for(self.timeframe)
+    }
+
+    pub fn leaves(&self) -> Vec<&ConditionItem> {
+        self.root.leaves()
+    }
+
+    pub fn timeframes(&self) -> Vec<Timeframe> {
+        let mut result = vec![self.timeframe];
+        for tf in Timeframe::ALL {
+            if tf != self.timeframe && self.leaves().iter().any(|c| c.timeframe() == Some(tf)) {
+                result.push(tf);
+            }
+        }
+        result
+    }
+
+    pub fn required_bars_for(&self, tf: Timeframe) -> usize {
+        self.leaves()
+            .iter()
+            .filter(|c| c.timeframe().unwrap_or(self.timeframe) == tf)
+            .map(|c| c.required_bars())
+            .max()
+            .unwrap_or(1)
     }
 
     /// Evaluate the last supplied bar, including an in-progress bar if present.
     /// Three-valued logic: a known false settles ALL; a known true settles ANY;
     /// otherwise any unavailable condition makes the result unavailable.
     pub fn evaluate(&self, series: &Series) -> ScanEvaluation {
+        self.evaluate_set(&SeriesSet::from([(self.timeframe, series.clone())]))
+    }
+
+    pub fn evaluate_set(&self, set: &SeriesSet) -> ScanEvaluation {
         let invalid = self.validate().err().or_else(|| {
-            if series.timeframe != self.timeframe {
-                Some("Series timeframe does not match scan".into())
-            } else if series.bars.windows(2).any(|w| w[0].ts >= w[1].ts) {
-                Some("Bars must have strictly increasing timestamps".into())
-            } else {
-                None
-            }
+            set.iter().find_map(|(tf, series)| {
+                if series.timeframe != *tf {
+                    Some("Series timeframe does not match scan".into())
+                } else if series.bars.windows(2).any(|w| w[0].ts >= w[1].ts) {
+                    Some("Bars must have strictly increasing timestamps".into())
+                } else {
+                    None
+                }
+            })
         });
         if let Some(reason) = invalid {
             return ScanEvaluation { outcome: ScanOutcome::Unavailable, conditions: Vec::new(), reason: Some(reason) };
         }
-        let conditions: Vec<_> = self.conditions.iter().map(|c| c.evaluate(series)).collect();
-        let any_match = conditions.iter().any(|c| c.outcome == ScanOutcome::Match);
-        let any_no_match = conditions.iter().any(|c| c.outcome == ScanOutcome::NoMatch);
-        let any_unavailable = conditions.iter().any(|c| c.outcome == ScanOutcome::Unavailable);
-        let outcome = match self.match_mode {
-            MatchMode::All if any_no_match => ScanOutcome::NoMatch,
-            MatchMode::Any if any_match => ScanOutcome::Match,
-            _ if any_unavailable => ScanOutcome::Unavailable,
-            MatchMode::All => ScanOutcome::Match,
-            MatchMode::Any => ScanOutcome::NoMatch,
-        };
+        let mut conditions = Vec::new();
+        let outcome = self.root.evaluate(self.timeframe, set, &mut conditions);
         let reason = (outcome == ScanOutcome::Unavailable).then(|| "One or more conditions lack valid data".into());
         ScanEvaluation { outcome, conditions, reason }
     }
@@ -510,7 +443,7 @@ pub struct ConditionEvaluation {
 }
 
 impl ConditionEvaluation {
-    fn unavailable(reason: &str, left: Option<f64>, right: Option<f64>) -> Self {
+    pub(crate) fn unavailable(reason: &str, left: Option<f64>, right: Option<f64>) -> Self {
         Self { outcome: ScanOutcome::Unavailable, left, right, reason: Some(reason.into()) }
     }
 }
@@ -535,9 +468,17 @@ mod tests {
         )
     }
 
+    fn compare(scan: &mut ScanDefinition) -> &mut ScanCondition {
+        let ConditionItem::Compare(c) = &mut scan.root.items[0] else { panic!("Expected comparison") };
+        c
+    }
+
     fn scan(left: ScanOperand, comparison: Comparison, right: ScanOperand) -> ScanDefinition {
         ScanDefinition {
-            conditions: vec![ScanCondition { left, comparison, right, ..ScanCondition::default() }],
+            root: ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![ScanCondition { left, comparison, right, ..ScanCondition::default() }],
+            ),
             ..ScanDefinition::default()
         }
     }
@@ -596,16 +537,16 @@ mod tests {
     #[test]
     fn three_valued_logic_preserves_known_answers() {
         let mut def = scan(ScanOperand::Price, Comparison::Above, ScanOperand::Constant(1.0));
-        def.conditions.push(ScanCondition {
+        def.root.items.push(ConditionItem::Compare(ScanCondition {
             left: ScanOperand::Price,
             comparison: Comparison::Above,
             right: ScanOperand::Sma { period: 20, source: Source::Close },
             ..ScanCondition::default()
-        });
-        def.match_mode = MatchMode::Any;
+        }));
+        def.root.mode = MatchMode::Any;
         assert_eq!(def.evaluate(&series(&[2.0])).outcome, ScanOutcome::Match);
         assert_eq!(def.evaluate(&series(&[0.0])).outcome, ScanOutcome::Unavailable);
-        def.match_mode = MatchMode::All;
+        def.root.mode = MatchMode::All;
         assert_eq!(def.evaluate(&series(&[0.0])).outcome, ScanOutcome::NoMatch);
         assert_eq!(def.evaluate(&series(&[2.0])).outcome, ScanOutcome::Unavailable);
     }
@@ -647,9 +588,9 @@ mod tests {
             definition
         );
         let mut invalid = definition;
-        invalid.conditions.clear();
+        invalid.root.items.clear();
         assert!(invalid.validate().is_err());
-        invalid.conditions = vec![ScanCondition::default(); MAX_CONDITIONS + 1];
+        invalid.root = ConditionGroup::comparisons(MatchMode::All, vec![ScanCondition::default(); MAX_CONDITIONS + 1]);
         assert!(invalid.validate().is_err());
     }
 
@@ -683,27 +624,27 @@ mod tests {
         let s = series(&[1.0, 2.0, 3.0]);
         let mut yesterday = scan(ScanOperand::Price, Comparison::Below, ScanOperand::Constant(2.5));
         assert_eq!(yesterday.evaluate(&s).outcome, ScanOutcome::NoMatch);
-        yesterday.conditions[0].left_bars_ago = 1;
+        compare(&mut yesterday).left_bars_ago = 1;
         assert_eq!(yesterday.required_bars(), 2);
         let evaluated = yesterday.evaluate(&s);
         assert_eq!((evaluated.outcome, evaluated.conditions[0].left), (ScanOutcome::Match, Some(2.0)));
-        yesterday.conditions[0].left_bars_ago = 3;
+        compare(&mut yesterday).left_bars_ago = 3;
         assert_eq!(yesterday.evaluate(&s).outcome, ScanOutcome::Unavailable);
-        yesterday.conditions[0].left_bars_ago = MAX_BARS_AGO + 1;
+        compare(&mut yesterday).left_bars_ago = MAX_BARS_AGO + 1;
         assert!(yesterday.validate().is_err());
 
         // Today's close against the close two bars earlier.
         let mut rising = scan(ScanOperand::Price, Comparison::Above, ScanOperand::Price);
-        rising.conditions[0].right_bars_ago = 2;
+        compare(&mut rising).right_bars_ago = 2;
         assert_eq!(rising.evaluate(&s).conditions[0].right, Some(1.0));
         assert_eq!(rising.evaluate(&s).outcome, ScanOutcome::Match);
 
         // A shifted crossover compares the shifted bar with the one before it.
         let mut cross = scan(ScanOperand::Price, Comparison::CrossedAbove, ScanOperand::Constant(1.5));
-        cross.conditions[0].left_bars_ago = 1;
+        compare(&mut cross).left_bars_ago = 1;
         assert_eq!(cross.required_bars(), 3);
         assert_eq!(cross.evaluate(&s).outcome, ScanOutcome::Match);
-        assert_eq!(cross.conditions[0].label(), "Close [1 bar ago] crossed above 1.5");
+        assert_eq!(compare(&mut cross).label(), "Close [1 bar ago] crossed above 1.5");
     }
 
     #[test]
@@ -720,13 +661,13 @@ mod tests {
         assert_eq!(tr.evaluate(&s).outcome, ScanOutcome::Unavailable);
 
         let mut doubled = scan(ScanOperand::Price, Comparison::AtLeast, ScanOperand::Price);
-        doubled.conditions[0].right_bars_ago = 1;
-        doubled.conditions[0].right_multiplier = 2.0;
-        assert_eq!(doubled.conditions[0].label(), "Close >= Close × 2 [1 bar ago]");
+        compare(&mut doubled).right_bars_ago = 1;
+        compare(&mut doubled).right_multiplier = 2.0;
+        assert_eq!(compare(&mut doubled).label(), "Close >= Close × 2 [1 bar ago]");
         let evaluated = doubled.evaluate(&series(&[5.0, 10.0]));
         assert_eq!((evaluated.outcome, evaluated.conditions[0].right), (ScanOutcome::Match, Some(10.0)));
         assert_eq!(doubled.evaluate(&series(&[5.0, 9.9])).outcome, ScanOutcome::NoMatch);
-        doubled.conditions[0].right_multiplier = f64::INFINITY;
+        compare(&mut doubled).right_multiplier = f64::INFINITY;
         assert!(doubled.validate().is_err());
     }
 
