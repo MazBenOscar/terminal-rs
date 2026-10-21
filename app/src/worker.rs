@@ -712,11 +712,20 @@ pub(crate) fn build_indicators_session(
     let input = Input::new(bars, tf);
     let colors = palette.series.len();
     let calculated = tr_core::indicators::study::evaluate_with_histories(specs, &input, session, histories);
+    let lookup = specs
+        .iter()
+        .zip(&calculated)
+        .filter_map(|(spec, result)| {
+            let settings = spec.chart.as_ref()?;
+            Some((settings.id, (result.as_ref().ok()?.as_slice(), settings.displacement)))
+        })
+        .collect();
     specs
         .iter()
-        .zip(calculated)
+        .zip(&calculated)
         .enumerate()
-        .map(|(i, (spec, result))| {
+        .map(|(index, (spec, result))| {
+            let i = index;
             let i = spec.chart.as_ref().map_or(i, |c| c.id.saturating_sub(1) as usize);
             let main = spec
                 .chart
@@ -724,15 +733,35 @@ pub(crate) fn build_indicators_session(
                 .and_then(|c| c.color)
                 .map_or(palette.series[i % colors], |[r, g, b]| egui::Color32::from_rgb(r, g, b));
             let error = result.as_ref().err().cloned();
-            let mut outputs = result.unwrap_or_default();
+            let mut outputs = result.clone().unwrap_or_default();
             let ports = outputs.iter().map(|o| o.name.to_string()).collect();
-            let fill = spec.chart.as_ref().and_then(|c| crate::chart_fill::Fill::build(c, &outputs));
+            let fill = spec.chart.as_ref().and_then(|c| {
+                let band = c.fill.as_ref()?;
+                for edge in [&band.upper, &band.lower] {
+                    tr_core::indicators::study::validate_fill_edge(specs, index, edge).ok()?;
+                }
+                crate::chart_fill::Fill::build(c, &outputs, &lookup)
+            });
             let bounds = outputs
                 .iter()
                 .filter(|o| {
                     spec.chart.as_ref().is_some_and(|c| {
-                        c.fill.as_ref().is_some_and(|fill| o.name == fill.upper || o.name == fill.lower)
-                            && c.outputs.get(o.name).is_some_and(|style| !style.visible)
+                        c.outputs.get(o.name).is_some_and(|style| !style.visible)
+                            && specs.iter().enumerate().any(|(owner_index, owner)| {
+                                owner
+                                    .chart
+                                    .as_ref()
+                                    .filter(|owner| owner.visible)
+                                    .and_then(|owner| owner.fill.as_ref().map(|fill| (owner, fill)))
+                                    .is_some_and(|(owner, fill)| {
+                                        [&fill.upper, &fill.lower].iter().all(|edge| {
+                                            tr_core::indicators::study::validate_fill_edge(specs, owner_index, edge)
+                                                .is_ok()
+                                        }) && [&fill.upper, &fill.lower]
+                                            .iter()
+                                            .any(|edge| edge.study.unwrap_or(owner.id) == c.id && edge.output == o.name)
+                                    })
+                            })
                     })
                 })
                 .map(|o| {
@@ -2370,6 +2399,39 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2); // one fresh minute quote and one shared daily history
         assert_eq!(results[0].1.as_ref().unwrap().price, 100.);
         assert_eq!(results[1].1.as_ref().unwrap().price, 101.);
+    }
+
+    #[test]
+    fn cross_study_fills_reject_unavailable_targets_without_suppressing_lines() {
+        use tr_core::indicators::study::{self, BandFill, FillEdge, Pane, Scale};
+        let bars: Vec<_> = (0..30).map(|i| Bar::new(i, i as f64, i as f64, i as f64, i as f64, 1.)).collect();
+        let mut specs = vec![IndicatorSpec::new("EMA", &[2.]).unwrap(), IndicatorSpec::new("BB", &[3., 2.]).unwrap()];
+        study::assign_ids(&mut specs);
+        specs[0].chart.as_mut().unwrap().fill = Some(BandFill {
+            upper: "EMA".into(),
+            lower: FillEdge { study: Some(2), output: "Lower".into() },
+            color: [1, 2, 3],
+            opacity: 35,
+        });
+        let build = |specs: &[IndicatorSpec]| build_indicators(&bars, Timeframe::D1, specs, &theme::palette());
+        let built = build(&specs);
+        assert!(built[0].fill.is_some());
+        assert!(built[1].fill.is_none(), "Only the declaring study owns the fill");
+        specs[1].chart.as_mut().unwrap().outputs.entry("Lower".into()).or_default().visible = false;
+        assert_eq!(build(&specs)[1].bounds.len(), 1, "The referenced edge still contributes to pane autoscale");
+        specs[1].chart.as_mut().unwrap().pane = Pane::Own;
+        assert!(build(&specs)[0].fill.is_none());
+        specs[1].chart.as_mut().unwrap().pane = Pane::Price;
+        specs[1].chart.as_mut().unwrap().scale = Scale::Independent;
+        assert!(build(&specs)[0].fill.is_none());
+        specs[1].chart.as_mut().unwrap().scale = Scale::Shared;
+        specs[1].chart.as_mut().unwrap().visible = false;
+        assert!(build(&specs)[0].fill.is_none());
+        specs.pop();
+        let built = build(&specs);
+        assert!(built[0].fill.is_none());
+        assert!(built[0].error.is_none());
+        assert_eq!(built[0].overlays.len(), 1);
     }
 
     #[test]

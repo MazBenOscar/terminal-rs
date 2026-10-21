@@ -83,8 +83,13 @@ mod study_presets {
 
     impl Preset {
         pub fn new(name: String, mut spec: Spec) -> (Self, bool) {
+            let local_output =
+                tr_core::indicators::formula::compute(&spec, &super::registry::Input::new(&[], Timeframe::D1))
+                    .ok()
+                    .and_then(|outputs| outputs.first().map(|o| o.name.to_string()));
             let mut reset_source = false;
             if let Some(chart) = &mut spec.chart {
+                chart.reset_fill_targets(local_output.as_deref());
                 chart.id = 0;
                 if matches!(chart.source, study::Source::Output { .. }) {
                     chart.source = study::Source::default();
@@ -102,7 +107,7 @@ mod study_presets {
             if self.name.trim() != self.name || self.name.is_empty() || self.name.len() > 100 {
                 return Err("Use a preset name of 1–100 characters without surrounding spaces".into());
             }
-            let mut specs = vec![self.spec.clone()];
+            let mut specs = vec![Self::new(self.name.clone(), self.spec.clone()).0.spec];
             study::assign_ids(&mut specs);
             specs[0].chart.as_mut().unwrap().timeframe = None;
             for result in study::evaluate(&specs, &super::registry::Input::new(&[], Timeframe::D1)) {
@@ -116,7 +121,7 @@ mod study_presets {
             if current.len() >= 128 {
                 return Err("A chart supports at most 128 studies".into());
             }
-            let mut spec = self.spec.clone();
+            let mut spec = Self::new(self.name.clone(), self.spec.clone()).0.spec;
             if let Some(chart) = &mut spec.chart {
                 chart.id = 0;
             }
@@ -739,13 +744,28 @@ impl ChartState {
         }
         self.indicators.retain(|s| s.chart.as_ref().is_none_or(|c| !removed.contains(&c.id)));
         for spec in &mut self.indicators {
-            if let Some(c) = &mut spec.chart
-                && matches!(c.pane, StudyPane::With(id) if removed.contains(&id))
-            {
-                c.pane = StudyPane::Own;
+            if let Some(c) = &mut spec.chart {
+                if matches!(c.pane, StudyPane::With(id) if removed.contains(&id)) {
+                    c.pane = StudyPane::Own;
+                }
+                if c.fill.as_ref().is_some_and(|fill| {
+                    [&fill.upper, &fill.lower].iter().any(|edge| edge.study.is_some_and(|id| removed.contains(&id)))
+                }) {
+                    c.fill = None;
+                }
             }
         }
         self.built.retain(|b| b.spec.chart.as_ref().is_none_or(|c| !removed.contains(&c.id)));
+        for built in &mut self.built {
+            if built.spec.chart.as_ref().and_then(|c| c.fill.as_ref()).is_some_and(|fill| {
+                [&fill.upper, &fill.lower].iter().any(|edge| edge.study.is_some_and(|id| removed.contains(&id)))
+            }) {
+                built.fill = None;
+                if let Some(settings) = &mut built.spec.chart {
+                    settings.fill = None;
+                }
+            }
+        }
     }
 
     /// Remove every instance of the indicator `code` (all moving averages of one kind).
@@ -2827,6 +2847,7 @@ impl ChartState {
                     });
                     ui.add_space(theme::dp(16.0));
                 }
+                let fill_specs = self.indicators.clone();
                 let count = self.indicators.len();
                 egui::ScrollArea::vertical()
                     .id_salt("study-list")
@@ -3121,7 +3142,27 @@ impl ChartState {
                                                 .collect::<Vec<_>>()
                                         })
                                         .unwrap_or_default();
-                                    crate::chart_controls::output_styles(ui, c, &names);
+                                    let targets: Vec<_> = self.built.iter().filter_map(|b| {
+                                        let target = b.spec.chart.as_ref()?;
+                                        if target.id == c.id { return None; }
+                                        Some(b.ports.iter().filter_map(|output| {
+                                            let edge = study::FillEdge { study: Some(target.id), output: output.clone() };
+                                            study::validate_fill_edge(&fill_specs, index, &edge).ok()?;
+                                            Some((edge, format!("{} · {output}", b.spec.label())))
+                                        }))
+                                    }).flatten().collect();
+                                    let fill_error = c.fill.as_ref().and_then(|fill| {
+                                        [&fill.upper, &fill.lower].iter().find_map(|edge| {
+                                            study::validate_fill_edge(&fill_specs, index, edge).err().or_else(|| {
+                                                let ports = match edge.study {
+                                                    None => Some(&names),
+                                                    Some(id) => self.built.iter().find(|b| b.spec.chart.as_ref().is_some_and(|c| c.id == id)).map(|b| &b.ports),
+                                                };
+                                                (!ports.is_some_and(|ports| ports.contains(&edge.output))).then(|| format!("Fill output {} is not available", edge.output))
+                                            })
+                                        })
+                                    });
+                                    crate::chart_controls::output_styles(ui, c, &names, &targets, fill_error.as_deref());
                                     ui.collapsing("Save as preset…", |ui| {
                                         let name_id = ui.make_persistent_id("preset-name");
                                         let mut name = ui.ctx().data(|data| data.get_temp::<String>(name_id)).unwrap_or_default();
@@ -4762,6 +4803,31 @@ mod tests {
         assert_eq!(added.code, def.code);
         assert_eq!(added.params, def.defaults());
         assert_eq!(added.chart, Some(study::Settings::new(added.chart.as_ref().unwrap().id, added)));
+    }
+
+    #[test]
+    fn cross_study_fill_preset_resets_to_local_output_and_removal_clears_fill() {
+        let mut specs = vec![registry::Spec::new("EMA", &[]).unwrap(), registry::Spec::new("BB", &[]).unwrap()];
+        study::assign_ids(&mut specs);
+        specs[0].chart.as_mut().unwrap().fill = Some(study::BandFill {
+            upper: "EMA".into(),
+            lower: study::FillEdge { study: Some(2), output: "Lower".into() },
+            color: [1, 2, 3],
+            opacity: 35,
+        });
+        let (preset, _) = study_presets::Preset::new("Fill".into(), specs[0].clone());
+        let restored: study_presets::Preset = serde_json::from_str(&serde_json::to_string(&preset).unwrap()).unwrap();
+        restored.add_to(&mut specs).unwrap();
+        let fill = specs[2].chart.as_ref().unwrap().fill.as_ref().unwrap();
+        assert_eq!(fill.lower, study::FillEdge::from("EMA"));
+        assert_eq!(fill.upper, study::FillEdge::from("EMA"));
+        assert_eq!(specs[2].chart.as_ref().unwrap().id, 3);
+        let mut chart = ChartState::new(1, "TEST", Timeframe::D1);
+        chart.indicators = specs;
+        chart.remove_study(1);
+        assert_eq!(chart.indicators.len(), 2);
+        assert!(chart.indicators[0].chart.as_ref().unwrap().fill.is_none());
+        assert!(chart.indicators[1].chart.as_ref().unwrap().fill.is_some());
     }
 
     #[test]
