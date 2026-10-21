@@ -29,6 +29,10 @@ Labels used in every note:
 
 ## Notes
 
+- [Crypto features and implementation plan](tradingview-crypto.md) — independent
+  `codex/crypto-study` research: coin/CEX/DEX screeners, derivatives metrics and
+  existing Rust crypto infrastructure at `7de343b`, with implementation scopes.
+
 - [Quick tools and Auto/Log follow-up](toolbar-scale-followup.md) — 2026-10-21
   REA website runtime tests of drawing favorites, reload, scale-state transitions
   and indicator access; includes explicit account/interaction limits.
