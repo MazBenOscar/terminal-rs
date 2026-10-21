@@ -785,6 +785,7 @@ impl TerminalApp {
     fn run_actions(&mut self, actions: Vec<Action>) {
         for a in actions {
             match a {
+                Action::Notice(message) => self.toasts.push((message, Instant::now())),
                 Action::OpenChart(s) => self.open_security(&s),
                 Action::ScanChart { symbol, symbols, definition } => {
                     self.open_security(&symbol);
@@ -1805,12 +1806,18 @@ impl eframe::App for TerminalApp {
             }
         }
         prefs::set_drawing_favorites(&ctx, (self.prefs.drawing_favorites.clone(), self.prefs.show_drawing_favorites));
+        prefs::set_study_favorites(&ctx, self.prefs.study_favorites.clone());
         actions.extend(self.render_dock(ui, area, gap));
         actions.extend(self.render_windows(&ctx));
         let (favorites, shown) = prefs::drawing_favorites(&ctx);
         if favorites != self.prefs.drawing_favorites || shown != self.prefs.show_drawing_favorites {
             self.prefs.drawing_favorites = favorites;
             self.prefs.show_drawing_favorites = shown;
+            self.save_prefs();
+        }
+        let study_favorites = prefs::study_favorites(&ctx);
+        if study_favorites != self.prefs.study_favorites {
+            self.prefs.study_favorites = study_favorites;
             self.save_prefs();
         }
         self.run_actions(actions);

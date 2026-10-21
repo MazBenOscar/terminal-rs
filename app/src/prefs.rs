@@ -691,6 +691,42 @@ pub(crate) fn toggle_drawing_favorite(tools: &mut Vec<tr_chart::drawings::Tool>,
     }
 }
 
+fn default_study_favorites() -> Vec<String> {
+    ["SMA", "EMA", "RSI", "MACD", "BB"].map(String::from).to_vec()
+}
+
+fn deserialize_study_favorites<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    let mut codes = Vec::new();
+    for value in values {
+        if let Some(code) = value.as_str()
+            && tr_core::indicators::registry::all().iter().any(|def| def.code == code)
+            && !codes.iter().any(|favorite| favorite == code)
+        {
+            codes.push(code.to_string());
+        }
+    }
+    Ok(codes)
+}
+
+pub(crate) type StudyFavorites = Vec<String>;
+
+pub(crate) fn study_favorites(ctx: &egui::Context) -> StudyFavorites {
+    ctx.data(|data| data.get_temp(egui::Id::new("study-favorites"))).unwrap_or_else(default_study_favorites)
+}
+
+pub(crate) fn set_study_favorites(ctx: &egui::Context, favorites: StudyFavorites) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("study-favorites"), favorites));
+}
+
+pub(crate) fn toggle_study_favorite(codes: &mut StudyFavorites, code: &str) {
+    if codes.iter().any(|favorite| favorite == code) {
+        codes.retain(|favorite| favorite != code);
+    } else if tr_core::indicators::registry::all().iter().any(|def| def.code == code) {
+        codes.push(code.to_string());
+    }
+}
+
 pub const PREFS_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -705,6 +741,8 @@ pub struct Prefs {
     #[serde(default = "default_drawing_favorites", deserialize_with = "deserialize_drawing_favorites")]
     pub drawing_favorites: Vec<tr_chart::drawings::Tool>,
     pub show_drawing_favorites: bool,
+    #[serde(default = "default_study_favorites", deserialize_with = "deserialize_study_favorites")]
+    pub study_favorites: Vec<String>,
     /// Order entry through SnapTrade (off unless the user turns it on).
     pub trading: TradingPrefs,
     #[serde(default)]
@@ -725,6 +763,7 @@ impl Default for Prefs {
             panels: PanelDefaults::default(),
             drawing_favorites: default_drawing_favorites(),
             show_drawing_favorites: true,
+            study_favorites: default_study_favorites(),
             trading: TradingPrefs::default(),
             alert_sound: false,
             desktop_notification: false,
@@ -814,6 +853,33 @@ impl Prefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn study_favorites_load_deduplicates_and_drops_unknown_codes() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/study-favorites-prefs-test.json");
+        std::fs::write(&path, r#"{"study_favorites":["RSI","RemovedStudy","RSI",null,"EMA"]}"#).unwrap();
+        let prefs = Prefs::load(&path);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(prefs.study_favorites, ["RSI", "EMA"]);
+        let defaults: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.study_favorites, ["SMA", "EMA", "RSI", "MACD", "BB"]);
+        let empty: Prefs = serde_json::from_str(r#"{"study_favorites":[]}"#).unwrap();
+        assert!(empty.study_favorites.is_empty());
+        assert_eq!(serde_json::from_str::<Prefs>(&serde_json::to_string(&prefs).unwrap()).unwrap(), prefs);
+    }
+
+    #[test]
+    fn study_favorite_toggle_removes_and_appends() {
+        let mut codes = default_study_favorites();
+        toggle_study_favorite(&mut codes, "EMA");
+        assert_eq!(codes, ["SMA", "RSI", "MACD", "BB"]);
+        toggle_study_favorite(&mut codes, "EMA");
+        toggle_study_favorite(&mut codes, "RemovedStudy");
+        assert_eq!(codes, ["SMA", "RSI", "MACD", "BB", "EMA"]);
+        let ctx = egui::Context::default();
+        set_study_favorites(&ctx, codes.clone());
+        assert_eq!(study_favorites(&ctx), codes);
+    }
 
     #[test]
     fn drawing_favorites_load_deduplicates_and_drops_unknown_tools() {
