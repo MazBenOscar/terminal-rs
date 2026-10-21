@@ -12,12 +12,13 @@ use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
 use crate::widgets;
 use crate::worker::Request;
 
-/// Match the security's Last price precision without compacting ordinary price levels.
-fn format_column_value(sec: &tr_core::Security, value: f64) -> String {
+/// Use security precision for price-like values and two decimals for other indicators.
+fn format_column_value(sec: &tr_core::Security, value: f64, last_price: Option<f64>) -> String {
     if value.abs() >= 1e6 {
         tr_chart::scale::format_value(value)
     } else {
-        let decimals = sec.decimals(value);
+        let price_like = last_price.is_some_and(|p| p > 0.0 && (0.5 * p..=2.0 * p).contains(&value));
+        let decimals = if price_like { sec.decimals(value) } else { 2 };
         format!("{value:.decimals$}")
     }
 }
@@ -326,7 +327,9 @@ impl TerminalApp {
                     use tr_core::columns::Cell;
                     let cell = self.column_cells.get(s).and_then(|cells| cells.get(index));
                     let (label, color, reason) = match cell {
-                        Some(Cell::Value(value)) => (format_column_value(&sec, *value), text(), None),
+                        Some(Cell::Value(value)) => {
+                            (format_column_value(&sec, *value, self.quotes.get(s).map(|q| q.last)), text(), None)
+                        }
                         Some(Cell::Check(true)) => ("Yes".into(), theme::up(), None),
                         Some(Cell::Check(false)) => ("No".into(), muted(), None),
                         Some(Cell::Unavailable(reason)) => ("—".into(), muted(), Some(reason.as_str())),
@@ -609,16 +612,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn column_values_preserve_security_precision_until_one_million() {
+    fn column_values_use_security_precision_only_for_price_like_values() {
         let btc = tr_core::Security::new("BTCUSD", tr_core::AssetClass::Crypto);
         let eur = tr_core::Security::new("EURUSD", tr_core::AssetClass::Fx);
-        assert_eq!(format_column_value(&btc, 81_800.0), "81800.00");
-        assert_eq!(format_column_value(&eur, 1.15), "1.1500");
-        assert_eq!(format_column_value(&btc, -81_800.0), "-81800.00");
-        assert_eq!(format_column_value(&btc, 999_999.0), "999999.00");
-        assert_eq!(format_column_value(&btc, 1e6), "1.00M");
-        assert_eq!(format_column_value(&btc, 2.3e9), "2.30B");
-        assert_eq!(format_column_value(&btc, -2.3e9), "-2.30B");
+        let jpy = tr_core::Security::new("USDJPY", tr_core::AssetClass::Fx);
+        assert_eq!(format_column_value(&btc, 81_752.27, Some(84_454.0)), "81752.27");
+        assert_eq!(format_column_value(&eur, 1.1457, Some(1.1237)), "1.1457");
+        assert_eq!(format_column_value(&eur, 37.5558, Some(1.1237)), "37.56");
+        assert_eq!(format_column_value(&jpy, 52.066, Some(158.0)), "52.07");
+        for last in [None, Some(0.0), Some(-1.0)] {
+            assert_eq!(format_column_value(&eur, 1.1457, last), "1.15");
+        }
+        // Both price-like boundaries are inclusive.
+        assert_eq!(format_column_value(&eur, 0.56185, Some(1.1237)), "0.5618");
+        assert_eq!(format_column_value(&eur, 2.2474, Some(1.1237)), "2.2474");
+        assert_eq!(format_column_value(&eur, -37.5558, Some(1.1237)), "-37.56");
+        assert_eq!(format_column_value(&btc, 1e6, Some(1e6)), "1.00M");
+        assert_eq!(format_column_value(&btc, 2.3e9, Some(84_454.0)), "2.30B");
+        assert_eq!(format_column_value(&btc, -2.3e9, None), "-2.30B");
     }
 
     #[test]

@@ -254,9 +254,18 @@ fn operand_kind(operand: &ScanOperand) -> usize {
     }
 }
 
+/// ComboBox uses a nested horizontal UI, so reserve its minimum width before
+/// entering it: egui cannot move an already-rendered child onto the next line.
+fn wrap_control(ui: &mut Ui, width: f32) {
+    if ui.layout().main_wrap() && ui.available_size_before_wrap().x < width {
+        ui.end_row();
+    }
+}
+
 fn operand_editor(ui: &mut Ui, operand: &mut ScanOperand, bars_ago: &mut usize, id: &str) {
     let mut kind = operand_kind(operand);
     let before = kind;
+    wrap_control(ui, 95.0);
     egui::ComboBox::from_id_salt(id).width(95.0).selected_text(OPERAND_KINDS[kind]).show_ui(ui, |ui| {
         for (i, name) in OPERAND_KINDS.iter().enumerate() {
             ui.selectable_value(&mut kind, i, *name);
@@ -276,6 +285,7 @@ fn operand_editor(ui: &mut Ui, operand: &mut ScanOperand, bars_ago: &mut usize, 
     }
     match operand {
         ScanOperand::Sma { period, source } | ScanOperand::Ema { period, source } => {
+            wrap_control(ui, 70.0);
             egui::ComboBox::from_id_salt((id, "source")).width(70.0).selected_text(source.label()).show_ui(ui, |ui| {
                 for s in Source::ALL {
                     ui.selectable_value(source, s, s.label());
@@ -314,6 +324,7 @@ fn timeframe_editor(ui: &mut Ui, timeframe: &mut Option<Timeframe>) {
         Some(tf) => RichText::new(tf.label()),
         None => RichText::new("Scan timeframe").color(muted()),
     };
+    wrap_control(ui, dp(110.0));
     egui::ComboBox::from_id_salt("condition-timeframe").width(dp(110.0)).selected_text(selected).show_ui(ui, |ui| {
         ui.selectable_value(timeframe, None, RichText::new("Scan timeframe").color(muted()));
         for tf in Timeframe::ALL {
@@ -323,6 +334,7 @@ fn timeframe_editor(ui: &mut Ui, timeframe: &mut Option<Timeframe>) {
 }
 
 fn mode_editor(ui: &mut Ui, mode: &mut MatchMode) {
+    wrap_control(ui, dp(90.0));
     egui::ComboBox::from_id_salt("scan-mode")
         .width(dp(90.0))
         .selected_text(if *mode == MatchMode::All { "Match all" } else { "Match any" })
@@ -335,6 +347,7 @@ fn mode_editor(ui: &mut Ui, mode: &mut MatchMode) {
 fn compare_editor(ui: &mut Ui, condition: &mut ScanCondition, index: usize) {
     ui.label(RichText::new(format!("{}", index + 1)).font(mono(12.0)).color(muted()));
     operand_editor(ui, &mut condition.left, &mut condition.left_bars_ago, "left");
+    wrap_control(ui, dp(110.0));
     egui::ComboBox::from_id_salt("comparison").width(dp(110.0)).selected_text(condition.comparison.label()).show_ui(
         ui,
         |ui| {
@@ -356,22 +369,22 @@ fn compare_editor(ui: &mut Ui, condition: &mut ScanCondition, index: usize) {
 
 /// Keep the remove column outside every line of wrapped condition controls.
 fn condition_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) -> (egui::Rect, egui::Response) {
-    ui.horizontal_top(|ui| {
-        let close_width = dp(22.0);
-        let content_width = (ui.available_width() - close_width - ui.spacing().item_spacing.x).max(0.0);
-        let content = ui.allocate_ui_with_layout(
-            egui::vec2(content_width, 0.0),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                ui.set_width(content_width);
-                ui.horizontal_wrapped(add);
-            },
-        );
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+        // Allocate from the right before any controls can expand their child UI.
         let close = ui.allocate_ui_with_layout(
-            egui::vec2(close_width, dp(20.0)),
+            egui::vec2(dp(22.0), dp(20.0)),
             egui::Layout::top_down(egui::Align::RIGHT),
             |ui| widgets::icon_button(ui, Icon::Close, "Remove condition", false),
         );
+        let remaining = ui.available_rect_before_wrap().width().max(0.0);
+        let content =
+            ui.allocate_ui_with_layout(egui::vec2(remaining, 0.0), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                ui.set_max_width(remaining);
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_max_width(remaining);
+                    add(ui);
+                });
+            });
         (content.response.rect, close.inner)
     })
     .inner
@@ -1373,34 +1386,70 @@ mod tests {
 
     #[test]
     fn narrow_condition_rows_reserve_the_remove_column_on_every_line() {
-        let mut condition =
-            ScanCondition { right: ScanOperand::Sma { period: 20, source: Source::Close }, ..Default::default() };
-        let mut expression = String::from("C > AVGC20");
-        for formula in [false, true] {
+        for width in [280.0, 360.0, 530.0, 900.0] {
+            let mut items = [
+                ConditionItem::Compare(ScanCondition { right: ScanOperand::Constant(50.0), ..Default::default() }),
+                ConditionItem::Compare(ScanCondition {
+                    right: ScanOperand::Sma { period: 20, source: Source::Close },
+                    right_multiplier: 2.5,
+                    timeframe: Some(Timeframe::W1),
+                    ..Default::default()
+                }),
+                ConditionItem::Formula(FormulaCondition {
+                    expression: "C > AVGC20".into(),
+                    timeframe: Some(Timeframe::H1),
+                }),
+            ];
             let ctx = egui::Context::default();
             let mut output = ctx.run_ui(
                 egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 600.0))),
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1200.0))),
                     ..Default::default()
                 },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        egui::Frame::new().inner_margin(egui::Margin::symmetric(6, 4)).show(ui, |ui| {
-                            ui.set_width(320.0);
-                            let (content, close) = condition_row(ui, |ui| {
-                                if formula {
-                                    ui.add(egui::TextEdit::singleline(&mut expression).desired_width(dp(280.0)));
-                                    timeframe_editor(ui, &mut None);
-                                } else {
-                                    compare_editor(ui, &mut condition, 0);
+                        for (index, item) in items.iter_mut().enumerate() {
+                            ui.push_id(index, |ui| {
+                                let available = ui.available_rect_before_wrap();
+                                let row =
+                                    egui::Frame::new().inner_margin(egui::Margin::symmetric(6, 4)).show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        condition_row(ui, |ui| match item {
+                                            ConditionItem::Compare(condition) => compare_editor(ui, condition, index),
+                                            ConditionItem::Formula(formula) => {
+                                                ui.add(
+                                                    egui::TextEdit::singleline(&mut formula.expression)
+                                                        .desired_width(dp(280.0)),
+                                                );
+                                                timeframe_editor(ui, &mut formula.timeframe);
+                                            }
+                                            ConditionItem::Group(_) => unreachable!(),
+                                        })
+                                    });
+                                let (content, close) = row.inner;
+                                let frame = row.response.rect;
+                                assert!(close.rect.is_positive(), "width {width}, row {index}: empty close button");
+                                assert!(
+                                    frame.contains_rect(close.rect),
+                                    "width {width}, row {index}: frame {frame:?}, close {:?}",
+                                    close.rect
+                                );
+                                assert!(
+                                    available.contains_rect(close.rect),
+                                    "Close button must remain inside the pane"
+                                );
+                                assert!(ui.clip_rect().contains_rect(close.rect), "Close button must not be clipped");
+                                assert!(
+                                    !content.intersects(close.rect),
+                                    "width {width}, row {index}: content {content:?}, close {:?}",
+                                    close.rect
+                                );
+                                assert!(content.right() < close.rect.left());
+                                if width <= 530.0 && matches!(item, ConditionItem::Compare(_)) {
+                                    assert!(content.height() > close.rect.height(), "The Compare controls must wrap");
                                 }
                             });
-                            if !formula {
-                                assert!(content.height() > close.rect.height(), "The Compare controls must wrap");
-                            }
-                            assert!(!content.intersects(close.rect), "Content {content:?}, close {:?}", close.rect);
-                            assert!(content.right() < close.rect.left());
-                        });
+                        }
                     });
                 },
             );
