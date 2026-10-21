@@ -312,9 +312,29 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(tmp, path)
+    write_atomic_with(path, |file| {
+        use std::io::Write;
+        file.write_all(bytes)
+    })
+}
+
+fn write_atomic_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    let result = (|| {
+        write(&mut file)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// The layouts folder and its files.
@@ -388,7 +408,17 @@ impl Store {
 
     pub fn load(&self, name: &str) -> Result<LayoutDoc> {
         let path = self.find_file(name).with_context(|| format!("no saved layout named {name:?}"))?;
-        let mut doc = LayoutDoc::from_json(&std::fs::read(&path)?).with_context(|| format!("{}", path.display()))?;
+        let bytes = std::fs::read(&path)?;
+        let mut doc = match LayoutDoc::from_json(&bytes) {
+            Ok(doc) => doc,
+            Err(error) => {
+                let stamp =
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+                let preserved = path.with_extension(format!("corrupt-{stamp}"));
+                std::fs::rename(&path, &preserved).with_context(|| format!("preserving {}", path.display()))?;
+                return Err(error).with_context(|| format!("Invalid layout preserved at {}", preserved.display()));
+            }
+        };
         if doc.name.trim().is_empty() {
             doc.name = name.to_string();
         }
@@ -493,7 +523,9 @@ mod tests {
     }
 
     fn temp_store(tag: &str) -> Store {
-        let dir = std::env::temp_dir().join(format!("tr-layouts-{tag}-{}", std::process::id()));
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/layout-tests")
+            .join(format!("{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Store::new(dir)
     }
@@ -641,6 +673,26 @@ mod tests {
         assert!(store.load("Trading").is_err());
         assert!(store.delete("Trading").is_err());
         std::fs::remove_dir_all(&store.dir).unwrap();
+    }
+
+    #[test]
+    fn interrupted_atomic_save_keeps_previous_file_and_cleans_temp() {
+        use std::io::{Error, Write};
+        let store = temp_store("interrupted");
+        let doc = rich_doc();
+        let path = store.save(&doc).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let result = write_atomic_with(&path, |file| {
+            file.write_all(b"{\"partial\":")?;
+            Err(Error::other("injected disk-full error"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(store.load(&doc.name).unwrap(), doc);
+        assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 1);
+        store.save(&LayoutDoc { theme: Some("Nord".into()), ..doc }).unwrap();
+        assert_eq!(store.load("Trading").unwrap().theme.as_deref(), Some("Nord"));
+        std::fs::remove_dir_all(store.dir).unwrap();
     }
 
     #[test]
