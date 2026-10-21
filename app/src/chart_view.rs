@@ -314,6 +314,9 @@ pub struct ChartState {
     pub log: bool,
     pub magnet: bool,
     pub drawings_hidden: bool,
+    pub drawings_locked: bool,
+    pub indicators_hidden: bool,
+    pub positions_orders_hidden: bool,
     pub drawing_toolbar: crate::drawing_toolbar::State,
     favorites_plot: Rect,
     pub show_volume: bool,
@@ -427,6 +430,9 @@ impl ChartState {
             log: false,
             magnet: false,
             drawings_hidden: false,
+            drawings_locked: false,
+            indicators_hidden: false,
+            positions_orders_hidden: false,
             drawing_toolbar: Default::default(),
             favorites_plot: Rect::NOTHING,
             show_volume: true,
@@ -875,11 +881,7 @@ impl ChartState {
     pub fn start_tool(&mut self, tool: Tool) {
         self.cancel();
         self.draw = DrawState { tool: Some(tool), ..Default::default() };
-        for (index, (_, tools)) in crate::drawing_toolbar::GROUPS.iter().enumerate() {
-            if tools.contains(&tool) {
-                self.drawing_toolbar.last[index] = tool;
-            }
-        }
+        self.drawing_toolbar.remember(tool);
     }
 
     pub fn jump_to(&mut self, ts: i64) {
@@ -2082,7 +2084,7 @@ impl ChartState {
         // ---- price pane GPU frame ----
         let mut overlays: Vec<Overlay> = groups
             .iter()
-            .filter(|(key, _)| key.is_none())
+            .filter(|(key, _)| !self.indicators_hidden && key.is_none())
             .flat_map(|(_, members)| members.iter().map(|&i| &self.built[i]))
             .filter(|b| b.spec.chart.as_ref().is_none_or(|c| c.scale == StudyScale::Shared))
             .flat_map(|b| b.overlays.iter().map(|o| o.1.clone()).chain(b.bounds.iter().cloned()))
@@ -2253,7 +2255,9 @@ impl ChartState {
                     let fixed = study_fixed_range(&b.spec);
                     let ovs: Vec<_> = b.overlays.iter().map(|o| o.1.clone()).chain(b.bounds.iter().cloned()).collect();
                     let separate = scene::sub_pane(&ovs, &v, price_rect.height() as f64, fixed, style);
-                    out.cmds.extend(separate.cmds);
+                    if !self.indicators_hidden {
+                        out.cmds.extend(separate.cmds);
+                    }
                     price_study_scales.push((price_rect, index, separate.scale));
                 }
             }
@@ -2270,7 +2274,9 @@ impl ChartState {
         if let Some((_, members)) = groups.iter().find(|(key, _)| key.is_none()) {
             for &index in members {
                 let study_scale = price_study_scales.iter().find(|(_, i, _)| *i == index).map_or(scale, |(_, _, s)| *s);
-                if let Some(fill) = &self.built[index].fill {
+                if !self.indicators_hidden
+                    && let Some(fill) = &self.built[index].fill
+                {
                     fill.paint(ui, price_rect, &v, &study_scale);
                 }
             }
@@ -2319,9 +2325,15 @@ impl ChartState {
                     p.hline(r.x_range(), y, Stroke::new(1.0, muted().gamma_multiply(0.35)));
                 }
             }
-            let frame = Frame { pane: self.id * 8 + 1 + k as u64, frame_no, cmds: so.cmds };
+            let frame = Frame {
+                pane: self.id * 8 + 1 + k as u64,
+                frame_no,
+                cmds: if self.indicators_hidden { vec![] } else { so.cmds },
+            };
             for (rect, index, scale) in sub_rects.iter().filter(|(rect, _, _)| *rect == r) {
-                if let Some(fill) = &self.built[*index].fill {
+                if !self.indicators_hidden
+                    && let Some(fill) = &self.built[*index].fill
+                {
                     fill.paint(ui, *rect, &v, scale);
                 }
             }
@@ -2525,6 +2537,7 @@ impl ChartState {
         }
         if self.replay_cutoff.is_none()
             && self.chart_type != ChartType::Renko
+            && !self.positions_orders_hidden
             && (self.data.account.positions || self.data.account.orders)
         {
             self.account_overlay.paint(ui, price_rect, &scale, self.bars.last().map(|b| b.close));
@@ -3652,35 +3665,55 @@ impl ChartState {
     }
 
     fn drawing_tools_menu(&mut self, ui: &mut Ui) {
+        for index in 0..crate::drawing_toolbar::CATEGORIES.len() {
+            self.drawing_category_menu(ui, index);
+        }
         let mut favorites = crate::prefs::drawing_favorites(ui.ctx());
-        for tool in Tool::ALL {
-            ui.push_id(tool, |ui| {
-                ui.horizontal(|ui| {
-                    if widgets::icon_button(ui, widgets::tool_icon(tool), tool.label(), self.draw.tool == Some(tool))
-                        .clicked()
-                    {
-                        self.start_tool(tool);
-                        ui.close();
-                    }
-                    if ui
-                        .add_sized(
-                            vec2(theme::dp(210.), theme::dp(24.)),
-                            egui::Button::new(tool.label()).shortcut_text(Self::tool_shortcut(tool)),
+        ui.checkbox(&mut favorites.1, "Favorites bar");
+        crate::prefs::set_drawing_favorites(ui.ctx(), favorites);
+    }
+
+    pub(super) fn drawing_category_menu(&mut self, ui: &mut Ui, index: usize) {
+        let category = &crate::drawing_toolbar::CATEGORIES[index];
+        ui.label(egui::RichText::new(category.title).small().color(theme::muted()));
+        let mut favorites = crate::prefs::drawing_favorites(ui.ctx());
+        for section in category.visible_sections() {
+            ui.label(egui::RichText::new(section.title).small().color(theme::muted()));
+            for &tool in section.tools {
+                ui.push_id(tool, |ui| {
+                    ui.horizontal(|ui| {
+                        if widgets::icon_button(
+                            ui,
+                            widgets::tool_icon(tool),
+                            tool.label(),
+                            self.draw.tool == Some(tool),
                         )
                         .clicked()
-                    {
-                        self.start_tool(tool);
-                        ui.close();
-                    }
-                    let active = favorites.0.contains(&tool);
-                    let hint = if active { "Remove from favorites" } else { "Add to favorites" };
-                    if widgets::icon_button(ui, widgets::Icon::Star, hint, active).clicked() {
-                        crate::prefs::toggle_drawing_favorite(&mut favorites.0, tool);
-                    }
+                        {
+                            self.start_tool(tool);
+                            self.drawing_toolbar.open = None;
+                            ui.close();
+                        }
+                        if ui
+                            .add_sized(
+                                vec2(theme::dp(210.), theme::dp(24.)),
+                                egui::Button::new(tool.label()).shortcut_text(Self::tool_shortcut(tool)),
+                            )
+                            .clicked()
+                        {
+                            self.start_tool(tool);
+                            self.drawing_toolbar.open = None;
+                            ui.close();
+                        }
+                        let active = favorites.0.contains(&tool);
+                        let hint = if active { "Remove from favorites" } else { "Add to favorites" };
+                        if widgets::icon_button(ui, widgets::Icon::Star, hint, active).clicked() {
+                            crate::prefs::toggle_drawing_favorite(&mut favorites.0, tool);
+                        }
+                    });
                 });
-            });
+            }
         }
-        ui.checkbox(&mut favorites.1, "Favorites bar");
         crate::prefs::set_drawing_favorites(ui.ctx(), favorites);
     }
 
@@ -4047,104 +4080,25 @@ impl ChartState {
         }
         let px =
             |a: &Anchor| [rect.left() as f64 + v.x_of(self.index_of_ts(a.ts)), rect.top() as f64 + s.y_of(a.price)];
-        match d.tool {
-            Tool::Trendline | Tool::Ray => {
-                let (mut a, mut b) = (px(&d.a), px(&d.b));
-                if d.tool == Tool::Trendline && a[0] > b[0] {
-                    std::mem::swap(&mut a, &mut b);
-                }
-                drawings::clip_line(
-                    a,
-                    b,
-                    [rect.left() as f64, rect.top() as f64, rect.right() as f64, rect.bottom() as f64],
-                    d.tool == Tool::Trendline && d.extend_left,
-                    d.tool == Tool::Ray || d.extend_right,
-                )
-                .map(|(a, b)| vec![(Shape::Segment(a, b), None)])
-                .unwrap_or_default()
-            }
-            Tool::Rectangle | Tool::Measure => {
-                let label = if d.tool == Tool::Measure {
-                    let bars = (self.index_of_ts(d.b.ts) - self.index_of_ts(d.a.ts)).abs().round() as usize;
-                    Some(drawings::measure_label(d.a, d.b, bars, self.sec.decimals(d.a.price)))
-                } else {
-                    None
-                };
-                vec![(Shape::Rect(px(&d.a), px(&d.b)), label)]
-            }
-            Tool::Channel => {
-                if let Some(c) = d.c {
-                    vec![(Shape::Polygon(drawings::channel_polygon(px(&d.a), px(&d.b), px(&c))), None)]
-                } else {
-                    vec![(Shape::Segment(px(&d.a), px(&d.b)), None)]
-                }
-            }
-            Tool::Pitchfork => {
-                let (a, b) = (px(&d.a), px(&d.b));
-                let c = px(&d.c.unwrap_or(d.b));
-                let m = [(b[0] + c[0]) / 2., (b[1] + c[1]) / 2.];
-                let delta = [m[0] - a[0], m[1] - a[1]];
-                [a, b, c]
-                    .into_iter()
-                    .filter_map(|start| {
-                        drawings::clip_line(
-                            start,
-                            [start[0] + delta[0], start[1] + delta[1]],
-                            [rect.left() as f64, rect.top() as f64, rect.right() as f64, rect.bottom() as f64],
-                            false,
-                            true,
-                        )
-                        .map(|(a, b)| (Shape::Segment(a, b), None))
-                    })
-                    .collect()
-            }
-            Tool::LongPosition | Tool::ShortPosition => {
-                if let Some((risk, reward, ratio)) = d.risk_reward() {
-                    let a = px(&d.a);
-                    let b = px(&d.b);
-                    let c = px(&d.c.unwrap());
-                    let right = b[0].max(c[0]).max(a[0] + 35.);
-                    vec![
-                        (Shape::Rect(a, [right, b[1]]), Some(format!("Risk {risk:.2} / unit"))),
-                        (Shape::Rect(a, [right, c[1]]), Some(format!("Reward {reward:.2} / unit · R/R {ratio:.2}"))),
-                    ]
-                } else {
-                    vec![(
-                        Shape::Segment(px(&d.a), px(&d.b)),
-                        Some("Set entry, stop, then target on the opposite side".into()),
-                    )]
-                }
-            }
-            Tool::Text => {
-                let a = px(&d.a);
-                let size = ui.painter().layout(d.text.clone(), ui_font(11.5), text(), 220.).size() + vec2(8., 4.);
-                vec![(Shape::Rect(a, [a[0] + size.x as f64, a[1] + size.y as f64]), Some(d.text.clone()))]
-            }
-            Tool::Horizontal => vec![(Shape::HLine(px(&d.a)[1]), Some(format!("{:.2}", d.a.price)))],
-            Tool::Vertical => vec![(Shape::VLine(px(&d.a)[0]), None)],
-            Tool::Fib | Tool::FibExtension => {
-                let (xa, xb) = (px(&d.a)[0], px(&d.b)[0]);
-                let (x0, x1) = if d.tool == Tool::FibExtension {
-                    (px(&d.c.unwrap_or(d.b))[0], rect.right() as f64)
-                } else {
-                    (xa.min(xb), xa.max(xb))
-                };
-                let mut shapes: Vec<_> = (if d.tool == Tool::Fib { d.fib_levels() } else { d.extension_levels() })
-                    .into_iter()
-                    .map(|(r, price)| {
-                        let y = rect.top() as f64 + s.y_of(price);
-                        (Shape::Segment([x0, y], [x1, y]), Some(format!("{r:.3} ({price:.2})")))
-                    })
-                    .collect();
-                if d.tool == Tool::FibExtension {
-                    shapes.extend([
-                        (Shape::Segment(px(&d.a), px(&d.b)), None),
-                        (Shape::Segment(px(&d.b), px(&d.c.unwrap_or(d.b))), None),
-                    ]);
-                }
-                shapes
-            }
-        }
+        let text_size = if d.tool == Tool::Text {
+            let size = ui.painter().layout(d.text.clone(), ui_font(11.5), text(), 220.).size() + vec2(8., 4.);
+            [size.x as f64, size.y as f64]
+        } else {
+            [0., 0.]
+        };
+        let bars = (self.index_of_ts(d.b.ts) - self.index_of_ts(d.a.ts)).abs().round() as usize;
+        drawings::geometry(&drawings::Geometry {
+            drawing: d,
+            points: [px(&d.a), px(&d.b), px(&d.c.unwrap_or(d.b))],
+            bounds: [rect.left() as f64, rect.top() as f64, rect.right() as f64, rect.bottom() as f64],
+            price_y: &|price| rect.top() as f64 + s.y_of(price),
+            measure_label: if d.tool == Tool::Measure {
+                drawings::measure_label(d.a, d.b, bars, self.sec.decimals(d.a.price))
+            } else {
+                String::new()
+            },
+            text_size,
+        })
     }
 
     fn paint_drawings(
@@ -4175,16 +4129,13 @@ impl ChartState {
         // Endpoint handles take precedence over whole-object hit testing. Keep
         // original anchors for absolute drag deltas, including on logarithmic axes.
         let hit = |this: &Self, pos: Pos2| -> Option<(usize, DrawHandle)> {
-            if !rect.contains(pos) {
+            if this.drawings_locked || !rect.contains(pos) {
                 return None;
             }
             for (index, drawing) in this.drawings.iter().enumerate().rev().filter(|(_, d)| d.visible_on(&this.symbol)) {
-                let anchors =
-                    [(Some(drawing.a), DrawHandle::A), (Some(drawing.b), DrawHandle::B), (drawing.c, DrawHandle::C)];
-                for (anchor, handle) in anchors.into_iter().take(drawing.tool.points()) {
-                    let Some(anchor) = anchor else {
-                        continue;
-                    };
+                for (anchor, handle) in
+                    drawings::handles(drawing).into_iter().zip([DrawHandle::A, DrawHandle::B, DrawHandle::C])
+                {
                     let point = pos2(
                         rect.left() + v.x_of(this.index_of_ts(anchor.ts)) as f32,
                         rect.top() + s.y_of(anchor.price) as f32,
@@ -4221,7 +4172,8 @@ impl ChartState {
             });
             self.draw.selected = Some(index);
         }
-        if resp.dragged()
+        if !self.drawings_locked
+            && resp.dragged()
             && let Some(pos) = resp.interact_pointer_pos()
             && self.draw.drag.is_some()
         {
@@ -4338,7 +4290,7 @@ impl ChartState {
                 if selected { amber() } else { d.color.map_or(theme::cyan(), |[r, g, b]| Color32::from_rgb(r, g, b)) };
             let stroke = Stroke::new(if selected { d.width.clamp(2.0, 6.0) } else { d.width.clamp(0.5, 6.0) }, color);
             if selected {
-                for anchor in [Some(d.a), Some(d.b), d.c].into_iter().take(d.tool.points()).flatten() {
+                for anchor in drawings::handles(&d) {
                     let point = pos2(
                         rect.left() + v.x_of(self.index_of_ts(anchor.ts)) as f32,
                         rect.top() + s.y_of(anchor.price) as f32,
@@ -4348,77 +4300,11 @@ impl ChartState {
                     }
                 }
             }
-            for (shape, label) in self.drawing_shapes(ui, &d, rect, v, s) {
-                match shape {
-                    Shape::Segment(a, b) => {
-                        p.line_segment([pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32)], stroke);
-                        if let Some(l) = label {
-                            label_text(
-                                &p,
-                                pos2(a[0] as f32 + 3.0, a[1] as f32 - 1.0),
-                                Align2::LEFT_BOTTOM,
-                                l,
-                                mono(10.0),
-                                color,
-                            );
-                        }
-                    }
-                    Shape::HLine(y) => {
-                        p.hline(rect.x_range(), y as f32, stroke);
-                        if let Some(l) = label {
-                            label_text(
-                                &p,
-                                pos2(rect.right() - 4.0, y as f32 - 1.0),
-                                Align2::RIGHT_BOTTOM,
-                                l,
-                                mono(10.0),
-                                color,
-                            );
-                        }
-                    }
-                    Shape::VLine(x) => {
-                        p.vline(x as f32, rect.y_range(), stroke);
-                    }
-                    Shape::Rect(a, b) => {
-                        let r = Rect::from_two_pos(pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32));
-                        if d.tool == Tool::Text {
-                            // The text gets its own plate below.
-                            if selected {
-                                p.rect_stroke(r, 2., stroke, StrokeKind::Inside);
-                            }
-                            let galley = p.layout(label.unwrap_or_default(), ui_font(11.5), color, 220.);
-                            label_plate(&p, Rect::from_min_size(r.min + vec2(4., 2.), galley.size()));
-                            p.galley(r.min + vec2(4., 2.), galley, color);
-                        } else {
-                            let fill = if matches!(d.tool, Tool::LongPosition | Tool::ShortPosition) {
-                                if label.as_ref().is_some_and(|s| s.starts_with("Risk")) {
-                                    theme::down()
-                                } else {
-                                    theme::up()
-                                }
-                            } else {
-                                color
-                            };
-                            p.rect_filled(r, 0., fill.gamma_multiply(0.12));
-                            p.rect_stroke(r, 0., stroke, StrokeKind::Inside);
-                            if let Some(label) = label {
-                                let galley = p.layout(label, mono(11.), color, rect.width().min(330.));
-                                let size = galley.size() + vec2(8., 4.);
-                                let min = pos2(
-                                    r.left().clamp(rect.left(), (rect.right() - size.x).max(rect.left())),
-                                    (r.top() - size.y - 2.).max(rect.top()),
-                                );
-                                label_plate(&p, Rect::from_min_size(min + vec2(4., 2.), galley.size()));
-                                p.galley(min + vec2(4., 2.), galley, color);
-                            }
-                        }
-                    }
-                    Shape::Polygon(points) => {
-                        let points: Vec<_> = points.iter().map(|p| pos2(p[0] as f32, p[1] as f32)).collect();
-                        p.add(egui::Shape::convex_polygon(points, color.gamma_multiply(0.08), stroke));
-                    }
-                }
-            }
+            crate::drawing_paint::paint(
+                &d,
+                &crate::drawing_paint::Paint { painter: &p, rect, stroke, selected },
+                self.drawing_shapes(ui, &d, rect, v, s),
+            );
         }
     }
 
@@ -5347,6 +5233,118 @@ mod tests {
     }
 
     #[test]
+    fn hide_menu_suppresses_painting_keeps_sources_and_pane_layout_and_shows_all() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart.indicators =
+            vec![IndicatorSpec::new("BB", &[20., 2.]).unwrap(), IndicatorSpec::new("RSI", &[14.]).unwrap()];
+        study::assign_ids(&mut chart.indicators);
+        chart.indicators[0].chart.as_mut().unwrap().fill = Some(study::BandFill {
+            upper: "Upper".into(),
+            lower: "Lower".into(),
+            color: theme::series(0).to_array()[..3].try_into().unwrap(),
+            opacity: 35,
+        });
+        chart.built = crate::worker::build_indicators(&chart.bars, chart.tf, &chart.indicators, &theme::palette());
+        let bar = *chart.bars.last().unwrap();
+        chart.account_overlay.levels.push(crate::chart_account::Level {
+            price: bar.close,
+            label: "Fixture account level".into(),
+            position: None,
+        });
+        let mut note =
+            Drawing::new(Tool::Text, Anchor { ts: bar.ts, price: bar.close }, Anchor { ts: bar.ts, price: bar.close });
+        note.text = "Fixture drawing note".into();
+        chart.drawings.push(note);
+        let account_settings = chart.data.account.clone();
+        let indicators = chart.indicators.clone();
+        let render = |chart: &mut ChartState| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900., 600.))),
+                    ..Default::default()
+                },
+                |ui| {
+                    chart.show(ui, ui.max_rect(), true, &Worker::inert());
+                },
+            );
+            output.textures_delta.clear();
+            output.shapes
+        };
+        render(&mut chart);
+        let visible = render(&mut chart);
+        let price_rect = chart.favorites_plot;
+        assert!(visible.iter().any(|s| matches!(&s.shape, egui::Shape::Mesh(m) if !m.vertices.is_empty())));
+        assert!(
+            visible
+                .iter()
+                .any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == "Fixture account level"))
+        );
+        // Use the real hide menu and checkbox responses, not direct flag assignment.
+        rail_frame(&ctx, &mut chart, vec![]);
+        click_rail(&ctx, &mut chart, rail_point(7));
+        for label in ["Hide drawings", "Hide indicators", "Hide positions and orders"] {
+            let rows = rail_frame(&ctx, &mut chart, vec![]);
+            let at = rows.iter().find(|(text, _)| text == label).unwrap().1.center();
+            click_rail(&ctx, &mut chart, at);
+        }
+        assert!(chart.drawings_hidden && chart.indicators_hidden && chart.positions_orders_hidden);
+        chart.drawing_toolbar.hide_open = false;
+        render(&mut chart);
+        let hidden = render(&mut chart);
+        assert!(!hidden.iter().any(|s| matches!(&s.shape, egui::Shape::Mesh(m) if !m.vertices.is_empty())));
+        assert!(!hidden.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == "Fixture account level" || t.galley.job.text == "Fixture drawing note")));
+        assert_eq!(chart.favorites_plot, price_rect);
+        assert_eq!(chart.indicators, indicators);
+        assert_eq!(chart.built.len(), 2);
+        assert_eq!(chart.account_overlay.levels.len(), 1);
+        assert_eq!(chart.data.account, account_settings);
+        assert_eq!(chart.drawings.len(), 1);
+        rail_frame(&ctx, &mut chart, vec![]);
+        click_rail(&ctx, &mut chart, rail_point(7));
+        let rows = rail_frame(&ctx, &mut chart, vec![]);
+        let at = rows.iter().find(|(text, _)| text == "Show all").unwrap().1.center();
+        click_rail(&ctx, &mut chart, at);
+        assert!(!chart.drawings_hidden && !chart.indicators_hidden && !chart.positions_orders_hidden);
+    }
+
+    #[test]
+    fn locked_drawings_reject_body_and_handle_drags_but_allow_creation_and_explicit_deletion() {
+        for log in [false, true] {
+            let ctx = egui::Context::default();
+            let mut chart = drawing_chart();
+            chart.start_tool(Tool::Channel);
+            for at in [pos2(320., 300.), pos2(480., 100.), pos2(480., 200.)] {
+                click_drawing(&ctx, &mut chart, at, log);
+            }
+            let original = chart.drawings[0].clone();
+            rail_frame(&ctx, &mut chart, vec![]);
+            click_rail(&ctx, &mut chart, rail_point(9));
+            assert!(chart.drawings_locked);
+            for from in [pos2(320., 300.), pos2(480., 100.), pos2(480., 200.), pos2(425., 220.)] {
+                click_drawing(&ctx, &mut chart, from, log);
+                assert!(chart.draw.selected.is_none() && chart.draw.hover.is_none());
+                drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], log);
+                let to = from + vec2(35., 30.);
+                drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], log);
+                drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], log);
+                assert!(chart.draw.drag.is_none());
+                assert_eq!(chart.drawings.as_slice(), std::slice::from_ref(&original));
+            }
+            chart.start_tool(Tool::Rectangle);
+            click_drawing(&ctx, &mut chart, pos2(200., 300.), log);
+            click_drawing(&ctx, &mut chart, pos2(300., 100.), log);
+            assert_eq!(chart.drawings.len(), 2);
+            assert!(chart.delete_selected());
+            assert_eq!(chart.drawings.as_slice(), std::slice::from_ref(&original));
+            click_rail(&ctx, &mut chart, rail_point(8));
+            assert!(chart.drawings.is_empty());
+            chart.undo_drawings();
+            assert_eq!(chart.drawings, [original]);
+        }
+    }
+
+    #[test]
     fn measure_zone_and_ray_place_select_delete_and_undo_without_losing_anchors() {
         for tool in [Tool::Measure, Tool::Rectangle, Tool::Ray] {
             let ctx = egui::Context::default();
@@ -5483,8 +5481,22 @@ mod tests {
     }
 
     fn rail_point(slot: usize) -> Pos2 {
-        let separators = slot.min(6);
-        pos2(28., 10. + theme::dp(19. + 34. * slot as f32 + 8. * separators as f32))
+        use crate::drawing_toolbar::{RailItem, rail_layout};
+        let item = match slot {
+            0 => RailItem::Crosshair,
+            1..=5 => RailItem::Category(slot - 1),
+            6 => RailItem::Magnet,
+            7 => RailItem::Hide,
+            8 => RailItem::RemoveAll,
+            9 => RailItem::Lock,
+            _ => panic!("Unknown rail slot"),
+        };
+        rail_layout(Rect::from_min_size(pos2(10., 10.), vec2(theme::dp(36.), theme::dp(400.))))
+            .into_iter()
+            .find(|(candidate, _)| *candidate == item)
+            .unwrap()
+            .1
+            .center()
     }
 
     fn click_rail(ctx: &egui::Context, chart: &mut ChartState, at: Pos2) -> Vec<(String, Rect)> {
@@ -5492,6 +5504,69 @@ mod tests {
         rail_frame(ctx, chart, vec![pointer_button(at, true)]);
         rail_frame(ctx, chart, vec![pointer_button(at, false)]);
         rail_frame(ctx, chart, vec![])
+    }
+
+    #[test]
+    fn category_flyouts_render_sections_and_rows_in_table_order() {
+        for (index, category) in crate::drawing_toolbar::CATEGORIES.iter().enumerate() {
+            let ctx = egui::Context::default();
+            let mut chart = sample_chart();
+            chart.drawing_toolbar.open = Some(index);
+            rail_frame(&ctx, &mut chart, vec![]);
+            let labels = rail_frame(&ctx, &mut chart, vec![]);
+            let expected = std::iter::once(category.title).chain(category.visible_sections().flat_map(|section| {
+                std::iter::once(section.title).chain(section.tools.iter().map(|tool| tool.label()))
+            }));
+            let mut cursor = 0;
+            for title in expected {
+                let offset = labels[cursor..]
+                    .iter()
+                    .position(|(label, _)| label == title)
+                    .unwrap_or_else(|| panic!("missing {title} in category {index}: {labels:?}"));
+                cursor += offset + 1;
+            }
+            assert!(!labels.iter().any(|(label, _)| label == "Gann"));
+        }
+    }
+
+    #[test]
+    fn draw_submenu_matches_category_table() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        ui_frame(&ctx, vec![], |ui| chart.drawing_tools_menu(ui));
+        let labels = ui_frame(&ctx, vec![], |ui| chart.drawing_tools_menu(ui));
+        let mut cursor = 0;
+        for category in &crate::drawing_toolbar::CATEGORIES {
+            let expected = std::iter::once(category.title).chain(category.visible_sections().flat_map(|section| {
+                std::iter::once(section.title).chain(section.tools.iter().map(|tool| tool.label()))
+            }));
+            for title in expected {
+                let offset = labels[cursor..]
+                    .iter()
+                    .position(|(label, _)| label == title)
+                    .unwrap_or_else(|| panic!("missing Draw submenu entry {title}"));
+                cursor += offset + 1;
+            }
+        }
+        assert!(!labels.iter().any(|(label, _)| label == "Gann"));
+    }
+
+    #[test]
+    fn category_buttons_use_last_tool_with_measure_inside_forecasting() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        let tools = [Tool::Pitchfork, Tool::FibExtension, Tool::Measure, Tool::Rectangle, Tool::Text];
+        for tool in tools {
+            chart.start_tool(tool);
+        }
+        chart.cancel();
+        rail_frame(&ctx, &mut chart, vec![]);
+        for (index, tool) in tools.into_iter().enumerate() {
+            let at = pos2(28., 10. + theme::dp(19. + 34. * (index + 1) as f32));
+            click_rail(&ctx, &mut chart, at);
+            assert_eq!(chart.draw.tool, Some(tool));
+            chart.cancel();
+        }
     }
 
     #[test]
@@ -5559,16 +5634,16 @@ mod tests {
         }
         assert_eq!(chart.drawing_toolbar.open, Some(2));
         chart.drawing_toolbar.open = None;
-        let at = rail_point(4);
+        let at = rail_point(3);
         rail_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(at)]);
         rail_frame(&ctx, &mut chart, vec![pointer_button(at, true)]);
         rail_frame(&ctx, &mut chart, vec![]);
         assert_eq!(chart.drawing_toolbar.open, None);
         rail_frame(&ctx, &mut chart, vec![]);
-        assert_eq!(chart.drawing_toolbar.open, Some(3));
+        assert_eq!(chart.drawing_toolbar.open, Some(2));
         rail_frame(&ctx, &mut chart, vec![pointer_button(at, false)]);
         assert!(chart.draw.tool.is_none());
-        click_rail(&ctx, &mut chart, rail_point(4));
+        click_rail(&ctx, &mut chart, rail_point(3));
         assert_eq!(chart.draw.tool, Some(Tool::LongPosition));
         assert_eq!(chart.drawing_toolbar.open, None);
     }
@@ -5586,6 +5661,9 @@ mod tests {
         click_rail(&ctx, &mut chart, rail_point(6));
         assert!(chart.magnet);
         click_rail(&ctx, &mut chart, rail_point(7));
+        let labels = rail_frame(&ctx, &mut chart, vec![]);
+        let hide = labels.iter().find(|(label, _)| label == "Hide drawings").unwrap().1.center();
+        click_rail(&ctx, &mut chart, hide);
         assert!(chart.drawings_hidden);
         click_drawing(&ctx, &mut chart, pos2(300., 200.), false);
         assert!(chart.draw.selected.is_none() && chart.draw.hover.is_none());
@@ -5593,7 +5671,12 @@ mod tests {
         assert!(chart.drawings.is_empty());
         chart.undo_drawings();
         assert_eq!(chart.drawings.len(), 1);
-        click_rail(&ctx, &mut chart, rail_point(7));
+        if !chart.drawing_toolbar.hide_open {
+            click_rail(&ctx, &mut chart, rail_point(7));
+        }
+        let labels = rail_frame(&ctx, &mut chart, vec![]);
+        let hide = labels.iter().find(|(label, _)| label == "Hide drawings").unwrap().1.center();
+        click_rail(&ctx, &mut chart, hide);
         assert!(!chart.drawings_hidden);
     }
 

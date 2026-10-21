@@ -119,6 +119,8 @@ pub enum Icon {
     ShortPosition,
     Measure,
     Magnet,
+    Lock,
+    Unlock,
     EyeOff,
     Eye,
     Trash,
@@ -182,75 +184,34 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
                 p.line_segment([pt(0., d * 2.), pt(0., d * 6.)], s);
             }
         }
-        Icon::Trendline | Icon::Ray | Icon::Channel => {
-            p.line_segment([pt(-4., 4.), pt(5., -5.)], s);
-            p.circle_stroke(pt(-5., 5.), 1.4 * u, s);
-            if icon != Icon::Ray {
-                p.circle_stroke(pt(5., -5.), 1.4 * u, s);
-            }
-            if icon == Icon::Channel {
-                p.line_segment([pt(-5., 0.), pt(0., -5.)], s);
-            }
-            if icon == Icon::Ray {
-                p.line_segment([pt(5., -5.), pt(7., -7.)], s);
-            }
+        Icon::Trendline | Icon::Ray | Icon::Channel | Icon::HorizontalLine | Icon::VerticalLine | Icon::Pitchfork => {
+            crate::drawing_paint::lines(p, r, icon, color)
         }
-        Icon::HorizontalLine | Icon::VerticalLine => {
-            let (a, b) =
-                if icon == Icon::HorizontalLine { (pt(-6., 0.), pt(6., 0.)) } else { (pt(0., -6.), pt(0., 6.)) };
-            p.line_segment([a, b], s);
-            p.circle_stroke(c, 1.4 * u, s);
-        }
-        Icon::FibRetracement | Icon::FibExtension => {
-            let n = if icon == Icon::FibRetracement { 4 } else { 3 };
-            for i in 0..n {
-                let y = -5. + i as f32 * 3.;
-                p.line_segment([pt(-5., y), pt(6. - i as f32 * 1.5, y)], s);
-            }
-            if icon == Icon::FibRetracement {
-                p.circle_stroke(pt(-5., -5.), 1.4 * u, s);
-                p.circle_stroke(pt(1.5, 4.), 1.4 * u, s);
-            } else {
-                p.line_segment([pt(-6., 5.), pt(-2., -5.)], s);
-            }
-        }
-        Icon::Pitchfork => {
-            p.circle_stroke(pt(-5., 5.), 1.4 * u, s);
-            p.line_segment([pt(-4., 4.), pt(4., -4.)], s);
-            p.add(Shape::line(vec![pt(-5., -1.), pt(-1., 1.), pt(1., 5.)], s));
-            p.line_segment([pt(-5., -1.), pt(0., -6.)], s);
-            p.line_segment([pt(1., 5.), pt(6., 0.)], s);
-        }
-        Icon::Rectangle => {
-            p.rect_stroke(Rect::from_min_max(pt(-5., -5.), pt(5., 5.)), 0., s, StrokeKind::Middle);
-            for (x, y) in [(-5., -5.), (5., -5.), (-5., 5.), (5., 5.)] {
-                p.circle_stroke(pt(x, y), 1.4 * u, s);
-            }
-        }
-        Icon::Text => {
-            p.line_segment([pt(-6., -5.), pt(6., -5.)], s);
-            p.line_segment([pt(0., -5.), pt(0., 6.)], s);
-        }
-        Icon::LongPosition | Icon::ShortPosition => {
-            let d = if icon == Icon::LongPosition { 1. } else { -1. };
-            for (x, y, w, h) in [(-5., -5., 10., 6.), (-3., 1., 6., 4.)] {
-                let a = pt(x, y * d);
-                let b = pt(x + w, (y + h) * d);
-                p.rect_stroke(Rect::from_two_pos(a, b), 0., s, StrokeKind::Middle);
-            }
-            p.add(Shape::line(vec![pt(-2., -d), pt(0., -3. * d), pt(2., -d)], s));
-        }
-        Icon::Measure => {
-            p.add(Shape::line(vec![pt(-6., 3.), pt(3., -6.), pt(6., -3.), pt(-3., 6.), pt(-6., 3.)], s));
-            for i in 0..3 {
-                let x = -3. + i as f32 * 3.;
-                p.line_segment([pt(x, -x - 3.), pt(x + 1.5, -x - 1.5)], s);
-            }
-        }
+        Icon::FibRetracement | Icon::FibExtension => crate::drawing_paint::fib(p, r, icon, color),
+        Icon::Rectangle => crate::drawing_paint::shapes(p, r, color),
+        Icon::Text => crate::drawing_paint::text(p, r, color),
+        Icon::LongPosition | Icon::ShortPosition | Icon::Measure => crate::drawing_paint::measure(p, r, icon, color),
         Icon::Magnet => {
             p.add(Shape::line(vec![pt(-5., -5.), pt(-5., 2.), pt(-3., 5.), pt(3., 5.), pt(5., 2.), pt(5., -5.)], s));
             p.line_segment([pt(-5., -2.), pt(-2., -2.)], s);
             p.line_segment([pt(2., -2.), pt(5., -2.)], s);
+        }
+        Icon::Lock | Icon::Unlock => {
+            p.rect_stroke(Rect::from_min_max(pt(-5., -1.), pt(5., 6.)), 1.5 * u, s, StrokeKind::Middle);
+            let offset = if icon == Icon::Unlock { 4. } else { 0. };
+            p.add(Shape::line(
+                vec![
+                    pt(-3. + offset, -1.),
+                    pt(-3. + offset, -4.),
+                    pt(-1. + offset, -6.),
+                    pt(1. + offset, -6.),
+                    pt(3. + offset, -4.),
+                    pt(3. + offset, -1.),
+                ],
+                s,
+            ));
+            p.circle_stroke(pt(0., 2.), u, s);
+            p.line_segment([pt(0., 3.), pt(0., 4.5)], s);
         }
         Icon::Eye | Icon::EyeOff => {
             p.add(Shape::line(

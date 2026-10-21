@@ -53,8 +53,18 @@ impl Link {
     }
 }
 
-fn default_drawing_tools() -> [tr_chart::drawings::Tool; 4] {
+fn default_drawing_tools() -> [tr_chart::drawings::Tool; 5] {
     crate::drawing_toolbar::State::default().last
+}
+
+fn deserialize_drawing_tools<'de, D>(deserializer: D) -> Result<[tr_chart::drawings::Tool; 5], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let saved = Vec::<tr_chart::drawings::Tool>::deserialize(deserializer)?;
+    let mut state = crate::drawing_toolbar::State::default();
+    state.restore_last(&saved);
+    Ok(state.last)
 }
 
 /// A pane's kind plus its persisted, panel-specific settings.
@@ -78,8 +88,14 @@ pub enum PaneSettings {
         magnet: bool,
         #[serde(default)]
         drawings_hidden: bool,
-        #[serde(default = "default_drawing_tools")]
-        drawing_last_used: [tr_chart::drawings::Tool; 4],
+        #[serde(default)]
+        drawings_locked: bool,
+        #[serde(default)]
+        indicators_hidden: bool,
+        #[serde(default)]
+        positions_orders_hidden: bool,
+        #[serde(default = "default_drawing_tools", deserialize_with = "deserialize_drawing_tools")]
+        drawing_last_used: [tr_chart::drawings::Tool; 5],
         #[serde(default)]
         navigation: crate::chart_navigation::Navigation,
         #[serde(default)]
@@ -311,6 +327,9 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         show_congress: d.congress_markers,
         magnet: false,
         drawings_hidden: false,
+        drawings_locked: false,
+        indicators_hidden: false,
+        positions_orders_hidden: false,
         drawing_last_used: default_drawing_tools(),
         navigation: Default::default(),
         data: Default::default(),
@@ -625,6 +644,29 @@ mod tests {
     }
 
     #[test]
+    fn drawing_category_settings_migrate_and_sanitize_on_load() {
+        use tr_chart::drawings::Tool;
+        for (saved, expected) in [
+            (
+                serde_json::json!(["Ray", "FibExtension", "Text", "ShortPosition"]),
+                [Tool::Ray, Tool::FibExtension, Tool::ShortPosition, Tool::Rectangle, Tool::Text],
+            ),
+            (serde_json::json!(["Text", "Text", "Text", "Text", "Text"]), default_drawing_tools()),
+            (serde_json::json!([]), default_drawing_tools()),
+        ] {
+            let raw = serde_json::json!({"Chart": {
+                "symbol": "AAPL", "tf": "D1", "chart_type": "Line", "log": false,
+                "indicators": [], "drawings": [], "compare": null, "drawing_last_used": saved
+            }});
+            let pane: PaneSettings = serde_json::from_value(raw).unwrap();
+            let PaneSettings::Chart { drawing_last_used, .. } = &pane else { panic!("expected chart") };
+            assert_eq!(*drawing_last_used, expected);
+            let back: PaneSettings = serde_json::from_slice(&serde_json::to_vec(&pane).unwrap()).unwrap();
+            assert_eq!(pane, back);
+        }
+    }
+
+    #[test]
     fn older_pane_settings_still_load() {
         // Chart settings written before volume/congress/magnet were persisted.
         let raw = r#"{"name":"Old","dock":{"type":"tabs","panes":[1]},"panes":[{"id":1,"Chart":{"symbol":"AAPL",
@@ -650,6 +692,62 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(doc.panes[1].settings, PaneSettings::Feed(None));
+    }
+
+    #[test]
+    fn drawing_lock_and_hide_flags_persist_and_legacy_charts_default_false() {
+        let raw = serde_json::json!({"Chart": {
+            "symbol": "AAPL", "tf": "D1", "chart_type": "Line", "log": false,
+            "indicators": [], "drawings": [], "compare": null
+        }});
+        for flags in 0..16 {
+            let mut value = raw.clone();
+            let chart = &mut value["Chart"];
+            for (bit, key) in ["drawings_locked", "drawings_hidden", "indicators_hidden", "positions_orders_hidden"]
+                .into_iter()
+                .enumerate()
+            {
+                if flags & (1 << bit) != 0 {
+                    chart[key] = true.into();
+                }
+            }
+            let pane: PaneSettings = serde_json::from_value(value).unwrap();
+            let PaneSettings::Chart {
+                drawings_locked,
+                drawings_hidden,
+                indicators_hidden,
+                positions_orders_hidden,
+                ..
+            } = &pane
+            else {
+                panic!("Expected chart")
+            };
+            assert_eq!(
+                [*drawings_locked, *drawings_hidden, *indicators_hidden, *positions_orders_hidden],
+                std::array::from_fn(|bit| flags & (1 << bit) != 0)
+            );
+            let loaded: PaneSettings = serde_json::from_slice(&serde_json::to_vec(&pane).unwrap()).unwrap();
+            assert_eq!(pane, loaded);
+        }
+    }
+
+    #[test]
+    fn saved_drawing_fixture_roundtrip_every_tool() {
+        use tr_chart::drawings::{Anchor, Drawing, Tool};
+        let drawings: Vec<_> = Tool::ALL
+            .into_iter()
+            .map(|tool| {
+                let mut drawing = Drawing::new(tool, Anchor { ts: 1, price: 100. }, Anchor { ts: 2, price: 90. });
+                drawing.c = Some(Anchor { ts: 3, price: 120. });
+                drawing.text = "Fixture note".into();
+                drawing
+            })
+            .collect();
+        // Captured from the original shared model before moving its serde types.
+        let fixture = include_str!("../tests/fixtures/drawings_fixture.json").trim();
+        let loaded: Vec<Drawing> = serde_json::from_str(fixture).unwrap();
+        assert_eq!(drawings, loaded);
+        assert_eq!(serde_json::to_string(&loaded).unwrap(), fixture);
     }
 
     #[test]
