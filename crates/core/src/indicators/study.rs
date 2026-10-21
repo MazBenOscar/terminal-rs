@@ -240,6 +240,9 @@ pub fn can_use_source(specs: &[Spec], consumer: u32, mut parent: u32) -> bool {
     }
 }
 
+/// Independently fetched study histories, including load errors.
+pub type StudyHistories = std::collections::HashMap<crate::Timeframe, Result<std::sync::Arc<Vec<crate::Bar>>, String>>;
+
 /// Evaluate in dependency order, retaining independent successes when a node fails.
 /// Missing output ports, cycles and displaced inputs are explicit errors.
 pub fn evaluate(specs: &[Spec], input: &Input<'_>) -> Vec<Result<Vec<Output>, String>> {
@@ -251,10 +254,20 @@ pub fn evaluate_with_session(
     input: &Input<'_>,
     session: crate::session::Session,
 ) -> Vec<Result<Vec<Output>, String>> {
+    evaluate_with_histories(specs, input, session, &StudyHistories::new())
+}
+
+/// Evaluate using independent histories where available, aligned at bar close.
+pub fn evaluate_with_histories(
+    specs: &[Spec],
+    input: &Input<'_>,
+    session: crate::session::Session,
+    histories: &StudyHistories,
+) -> Vec<Result<Vec<Output>, String>> {
     if input.session != session {
-        super::multiframe::evaluate(specs, &Input::new(input.bars, input.tf).with_session(session), session)
+        super::multiframe::evaluate(specs, &Input::new(input.bars, input.tf).with_session(session), session, histories)
     } else {
-        super::multiframe::evaluate(specs, input, session)
+        super::multiframe::evaluate(specs, input, session, histories)
     }
 }
 

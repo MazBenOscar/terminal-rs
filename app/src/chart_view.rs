@@ -722,6 +722,8 @@ impl ChartState {
                 pane: self.id,
                 generation: self.generation,
                 bars: self.bars.clone(),
+                symbol: self.symbol.clone(),
+                options: self.effective_history(),
                 tf: self.tf,
                 specs: self.indicators.clone(),
                 palette: theme::palette(),
@@ -2625,7 +2627,7 @@ impl ChartState {
                                                 .selected_text(c.timeframe.map_or("Chart timeframe", Timeframe::label))
                                                 .show_ui(ui, |ui| {
                                                     ui.selectable_value(&mut c.timeframe, None, "Chart timeframe");
-                                                    for tf in Timeframe::ALL.into_iter().filter(|tf| *tf >= self.tf) {
+                                                    for tf in Timeframe::ALL {
                                                         ui.selectable_value(&mut c.timeframe, Some(tf), tf.label());
                                                     }
                                                 });
@@ -2686,7 +2688,7 @@ impl ChartState {
                                         }
                                         if c.timeframe.is_some_and(|tf| tf != self.tf) {
                                             ui.label(
-                                                RichText::new("Uses completed periods derived from loaded bars; first period omitted.")
+                                                RichText::new("Calculated from this interval's own history; each value appears when its period closes.")
                                                     .small()
                                                     .color(muted()),
                                             );
@@ -4924,6 +4926,40 @@ mod tests {
         assert!((after.start - before.start).abs() <= Timeframe::W1.seconds());
         assert!((after.end - before.end).abs() <= Timeframe::W1.seconds());
         assert!(chart.pending_dates.is_none());
+    }
+
+    #[test]
+    fn daily_chart_builds_lower_timeframe_ema_from_fetched_history() {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.bars = Arc::new((0..30).map(|i| Bar::new(i * 86400, 10., 10., 10., 10., 1.)).collect());
+        chart.indicators = vec![IndicatorSpec::new("EMA", &[3.]).unwrap()];
+        study::assign_ids(&mut chart.indicators);
+        chart.indicators[0].chart.as_mut().unwrap().timeframe = Some(Timeframe::H1);
+        let history = Arc::new(
+            (0..720)
+                .map(|i| {
+                    let price = 100. + i as f64;
+                    Bar::new(i * 3600, price, price, price, price, 1.)
+                })
+                .collect(),
+        );
+        let histories = study::StudyHistories::from([(Timeframe::H1, Ok(history))]);
+        let worker = Worker::inert();
+        chart.request_indicators(&worker);
+        let built = crate::worker::build_indicators_session(
+            &chart.bars,
+            chart.tf,
+            &chart.indicators,
+            &theme::palette(),
+            chart.effective_session(),
+            &histories,
+        );
+        chart.on_indicators(chart.generation, chart.indicator_revision, built);
+        assert_eq!(chart.built.len(), 1);
+        assert!(chart.built[0].error.is_none());
+        let extent = chart.built[0].overlays[0].1.line.pyramid.extent(0, 0, chart.bars.len()).unwrap();
+        assert!(extent.0.is_finite() && extent.1.is_finite());
+        assert!(extent.0 > 100., "EMA must use hourly history, not the daily chart prices");
     }
 
     #[test]

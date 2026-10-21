@@ -212,14 +212,36 @@ and routing. Live authentication, account entitlement and exchange coverage were
 not tested. Protocol references: [Alpaca streaming](https://docs.alpaca.markets/us/docs/streaming-market-data)
 and [stock bars](https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data).
 
+## Independent study histories
+
+Studies with their own interval evaluate from that interval's fetched history and
+align each chart bar to the last study value whose bar end is covered by the chart
+bar. Lower-than-chart intervals are supported. Higher intervals without a fetched
+history still aggregate the loaded chart bars and drop the first partial bucket.
+Provider daily bars on an intraday exchange-session chart map via noon UTC of their
+date to that trading date's session close. History is sorted and duplicate
+timestamps keep the last bar; a source/child chain must share one study interval.
+Unsorted, sparse and replay-cutoff inputs are covered in `tr-core` tests.
+
+On daily-and-above charts, visibility extends to the next loaded chart bar's start
+when later than the current bar's end, proving period closure across weekends and
+holidays; without a successor, open periods stay hidden, and intraday charts are unchanged.
+
+The app worker fetches each study interval's history with 300 warm-up bars, capped
+at 10,000 bars. It caches up to 32 histories keyed by provider route + symbol +
+options + interval, with one in-flight fetch per key, and refreshes live histories
+at most once a minute. The Indicators editor lists every interval. Very long spans
+of low intervals remain capped.
+
 ## Delivery and remaining external validation
 
 The audit's local chart increments are implemented on stacked feature branches;
 `personal/main` collects them for testing. This is not a claim of complete TC2000
 parity. Remaining external work is verified earnings/calendar coverage, entitled
 live-feed testing, matched TC2000 numeric exports/proprietary formulas, and review
-of the visible app on a functioning graphics session. Native independent study
-histories and unrestricted PCF syntax remain separate larger parity work.
+of the visible app on a functioning graphics session. Independent study histories
+are implemented on `codex/chart-study-history` (see above); unrestricted PCF syntax
+remains separate larger parity work.
 
 The visible-app smoke attempt on this machine failed with Wayland `NoCompositor`;
 both Wayland and X11 socket directories were empty. GPU render and headless egui

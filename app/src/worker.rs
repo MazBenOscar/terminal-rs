@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use tr_core::indicators::study::StudyHistories;
 
 use tokio::sync::Mutex;
 use tr_chart::gpu::{LineKind, LineRef};
@@ -151,6 +153,8 @@ pub enum Request {
         pane: PaneId,
         generation: u64,
         bars: Arc<Vec<Bar>>,
+        symbol: String,
+        options: tr_data::HistoryOptions,
         tf: Timeframe,
         specs: Vec<IndicatorSpec>,
         /// Colours are baked into overlays, so the UI passes its current palette.
@@ -472,8 +476,56 @@ pub struct Worker {
 /// Bars per pane tagged with the load generation they belong to.
 type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>, String)>;
 
+const STUDY_WARMUP_BARS: usize = 300;
+const MAX_STUDY_BARS: usize = 10_000;
+const MAX_STUDY_HISTORIES: usize = 32;
+
+struct StudyHistory {
+    bars: Arc<Vec<Bar>>,
+    end: i64,
+    limit: usize,
+    fetched_at: Instant,
+}
+
+/// Evict the oldest fetches until the cache is within its bound.
+fn evict_study_histories(map: &mut HashMap<(String, Timeframe), StudyHistory>) {
+    while map.len() > MAX_STUDY_HISTORIES {
+        let oldest = map.iter().min_by_key(|(_, history)| history.fetched_at).map(|(key, _)| key.clone());
+        if let Some(key) = oldest {
+            map.remove(&key);
+        }
+    }
+}
+
+fn study_timeframes(specs: &[IndicatorSpec], chart_tf: Timeframe) -> Vec<Timeframe> {
+    let mut timeframes: Vec<_> =
+        specs.iter().filter_map(|s| s.chart.as_ref()?.timeframe).filter(|tf| *tf != chart_tf).collect();
+    timeframes.sort_unstable();
+    timeframes.dedup();
+    timeframes
+}
+
+fn study_request(bars: &[Bar], chart_tf: Timeframe, tf: Timeframe) -> Option<(i64, i64, usize)> {
+    let end = tr_core::session::next_bucket(chart_tf, bars.last()?.ts);
+    let start = bars.first()?.ts;
+    let limit = (((end - start).max(0) / tf.seconds().max(1)) as usize + STUDY_WARMUP_BARS)
+        .clamp(STUDY_WARMUP_BARS, MAX_STUDY_BARS);
+    Some((end, start, limit))
+}
+
+fn study_history_fresh(c: &StudyHistory, end: i64, start: i64, limit: usize, now_ts: i64) -> bool {
+    c.end >= end
+        && c.limit >= limit.min(MAX_STUDY_BARS)
+        && (c.bars.len() < c.limit || c.bars.first().is_some_and(|b| b.ts <= start))
+        && (end <= now_ts || c.fetched_at.elapsed() < Duration::from_secs(60))
+}
+
+type StudyFetches = HashMap<(String, Timeframe), Arc<Mutex<()>>>;
+
 struct Shared {
     provider: Provider,
+    study_histories: std::sync::Mutex<HashMap<(String, Timeframe), StudyHistory>>,
+    study_fetches: std::sync::Mutex<StudyFetches>,
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
     /// tagged with the pane's load generation.
     series: std::sync::Mutex<SeriesMap>,
@@ -536,6 +588,8 @@ impl Worker {
         let (out, rx) = mpsc::channel();
         let shared = Arc::new(Shared {
             provider,
+            study_histories: Default::default(),
+            study_fetches: Default::default(),
             series: Default::default(),
             cache: std::sync::Mutex::new(cache),
             scan_store: std::sync::Mutex::new(scan_store),
@@ -610,19 +664,20 @@ pub fn build_indicators(
     specs: &[IndicatorSpec],
     palette: &theme::Palette,
 ) -> Vec<BuiltIndicator> {
-    build_indicators_session(bars, tf, specs, palette, tr_core::session::Session::Provider)
+    build_indicators_session(bars, tf, specs, palette, tr_core::session::Session::Provider, &StudyHistories::new())
 }
 
-fn build_indicators_session(
+pub(crate) fn build_indicators_session(
     bars: &[Bar],
     tf: Timeframe,
     specs: &[IndicatorSpec],
     palette: &theme::Palette,
     session: tr_core::session::Session,
+    histories: &StudyHistories,
 ) -> Vec<BuiltIndicator> {
     let input = Input::new(bars, tf);
     let colors = palette.series.len();
-    let calculated = tr_core::indicators::study::evaluate_with_session(specs, &input, session);
+    let calculated = tr_core::indicators::study::evaluate_with_histories(specs, &input, session, histories);
     specs
         .iter()
         .zip(calculated)
@@ -904,11 +959,57 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
             }
         }
-        Request::Indicators { pane, generation, bars, tf, specs, palette, session, revision } => {
-            let built =
-                tokio::task::spawn_blocking(move || build_indicators_session(&bars, tf, &specs, &palette, session))
-                    .await
-                    .unwrap_or_default();
+        Request::Indicators { pane, generation, bars, symbol, options, tf, specs, palette, session, revision } => {
+            let mut histories = StudyHistories::new();
+            let source = chart_options_key(s.provider.as_ref(), &symbol, options);
+            for study_tf in study_timeframes(&specs, tf) {
+                let Some((end, start, limit)) = study_request(&bars, tf, study_tf) else { continue };
+                let key = (source.clone(), study_tf);
+                let fetch = {
+                    let mut fetches = s.study_fetches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    fetches.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+                };
+                let fetch_guard = fetch.lock().await;
+                // Re-check after waiting: another task may have populated the cache.
+                let cached = s
+                    .study_histories
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&key)
+                    .filter(|c| study_history_fresh(c, end, start, limit, chrono::Utc::now().timestamp()))
+                    .map(|c| c.bars.clone());
+                let history = if let Some(bars) = cached {
+                    Ok(bars)
+                } else {
+                    match s.provider.chart_history(&symbol, study_tf, Some(end), limit, options).await {
+                        Ok(bars) => {
+                            let bars = Arc::new(bars);
+                            let mut map = s.study_histories.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            map.insert(
+                                key.clone(),
+                                StudyHistory { bars: bars.clone(), end, limit, fetched_at: Instant::now() },
+                            );
+                            evict_study_histories(&mut map);
+                            Ok(bars)
+                        }
+                        Err(e) => Err(format!("{e:#}")),
+                    }
+                };
+                drop(fetch_guard);
+                {
+                    let mut fetches = s.study_fetches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // The map lock prevents new waiters from racing the count check.
+                    if Arc::strong_count(&fetch) == 2 {
+                        fetches.remove(&key);
+                    }
+                }
+                histories.insert(study_tf, history);
+            }
+            let built = tokio::task::spawn_blocking(move || {
+                build_indicators_session(&bars, tf, &specs, &palette, session, &histories)
+            })
+            .await
+            .unwrap_or_default();
             s.send(Response::Indicators { pane, generation, built, revision });
         }
         Request::Compare { pane, generation, symbol, tf, base, revision, options } => {
@@ -1570,6 +1671,93 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn study_history_eviction_keeps_the_32_newest_fetches() {
+        let now = Instant::now();
+        let mut map: HashMap<_, _> = (0..40)
+            .rev()
+            .map(|i| {
+                (
+                    (format!("source-{i}"), Timeframe::D1),
+                    StudyHistory {
+                        bars: Arc::new(Vec::new()),
+                        end: 0,
+                        limit: 1,
+                        fetched_at: now - Duration::from_secs(40 - i),
+                    },
+                )
+            })
+            .collect();
+        evict_study_histories(&mut map);
+        assert_eq!(map.len(), MAX_STUDY_HISTORIES);
+        for i in 0..40 {
+            assert_eq!(map.contains_key(&(format!("source-{i}"), Timeframe::D1)), i >= 8);
+        }
+        evict_study_histories(&mut map);
+        assert_eq!(map.len(), MAX_STUDY_HISTORIES);
+    }
+
+    #[test]
+    fn study_history_eviction_leaves_under_capacity_maps_unchanged() {
+        let mut map = HashMap::new();
+        evict_study_histories(&mut map);
+        assert!(map.is_empty());
+        let key = ("source".to_string(), Timeframe::H1);
+        let fetched_at = Instant::now();
+        map.insert(key.clone(), StudyHistory { bars: Arc::new(Vec::new()), end: 0, limit: 1, fetched_at });
+        evict_study_histories(&mut map);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&key].fetched_at, fetched_at);
+    }
+
+    #[test]
+    fn study_timeframes_dedup_sort_and_exclude_chart_and_none() {
+        let specs: Vec<_> = [Some(Timeframe::W1), None, Some(Timeframe::H1), Some(Timeframe::W1), Some(Timeframe::D1)]
+            .into_iter()
+            .map(|tf| {
+                let mut spec = IndicatorSpec::new("EMA", &[]).unwrap();
+                tr_core::indicators::study::assign_ids(std::slice::from_mut(&mut spec));
+                spec.chart.as_mut().unwrap().timeframe = tf;
+                spec
+            })
+            .collect();
+        assert_eq!(study_timeframes(&specs, Timeframe::D1), vec![Timeframe::H1, Timeframe::W1]);
+    }
+
+    #[test]
+    fn study_request_uses_bucket_end_and_clamps_limits() {
+        assert_eq!(study_request(&[], Timeframe::D1, Timeframe::H1), None);
+        let bar = |ts| Bar::new(ts, 1., 1., 1., 1., 1.);
+        let bars = [bar(0), bar(100 * 86400)];
+        let (end, start, limit) = study_request(&bars, Timeframe::D1, Timeframe::M1).unwrap();
+        assert_eq!(end, tr_core::session::next_bucket(Timeframe::D1, bars[1].ts));
+        assert_eq!(start, 0);
+        assert_eq!(limit, MAX_STUDY_BARS);
+        assert_eq!(study_request(&[bar(0)], Timeframe::M1, Timeframe::D1).unwrap().2, STUDY_WARMUP_BARS);
+        let (_, _, limit) = study_request(&[bar(0), bar(86400)], Timeframe::D1, Timeframe::H1).unwrap();
+        assert_eq!(limit, 348);
+    }
+
+    #[test]
+    fn study_history_fresh_requires_coverage_and_refreshes_live_history() {
+        let mut c = StudyHistory {
+            bars: Arc::new(vec![Bar::new(10, 1., 1., 1., 1., 1.)]),
+            end: 100,
+            limit: 1,
+            fetched_at: Instant::now() - Duration::from_secs(61),
+        };
+        assert!(study_history_fresh(&c, 100, 10, 1, 100));
+        assert!(!study_history_fresh(&c, 101, 10, 1, 200));
+        assert!(!study_history_fresh(&c, 100, 9, 1, 200));
+        assert!(!study_history_fresh(&c, 100, 10, 2, 200));
+        assert!(!study_history_fresh(&c, 100, 10, 1, 99));
+        c.fetched_at = Instant::now();
+        assert!(study_history_fresh(&c, 100, 10, 1, 99));
+        c.limit = 2;
+        assert!(study_history_fresh(&c, 100, 0, 2, 200), "exhausted provider covers earlier starts");
+    }
+
     #[test]
     fn condition_rules_share_history_requests_but_keep_their_own_values() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1636,6 +1824,8 @@ mod tests {
         let (out, rx) = mpsc::channel();
         let shared = Arc::new(Shared {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)),
+            study_histories: Default::default(),
+            study_fetches: Default::default(),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),
@@ -1747,6 +1937,8 @@ mod tests {
         let (out, rx) = mpsc::channel();
         let s = Arc::new(Shared {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 20)),
+            study_histories: Default::default(),
+            study_fetches: Default::default(),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),
@@ -1821,6 +2013,8 @@ mod tests {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 400)),
+            study_histories: Default::default(),
+            study_fetches: Default::default(),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
@@ -1890,6 +2084,8 @@ mod tests {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
             provider: fixture.clone(),
+            study_histories: Default::default(),
+            study_fetches: Default::default(),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
@@ -1940,6 +2136,8 @@ mod tests {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
+            study_histories: Default::default(),
+            study_fetches: Default::default(),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),
