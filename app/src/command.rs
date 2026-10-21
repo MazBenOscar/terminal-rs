@@ -295,6 +295,49 @@ fn num<T: std::str::FromStr>(t: Option<&&str>) -> Option<T> {
     t.and_then(|s| s.parse().ok())
 }
 
+fn is_watch_rename(head: &str, rest: &[&str]) -> bool {
+    ["W", "WL", "WATCH", "WATCHLIST", "MON"].iter().any(|s| head.eq_ignore_ascii_case(s))
+        && rest.first().is_some_and(|s| s.eq_ignore_ascii_case("RENAME"))
+}
+
+pub fn parse_error(input: &str) -> String {
+    let tokens: Vec<_> = input.split_whitespace().collect();
+    if tokens.split_first().is_some_and(|(head, rest)| is_watch_rename(head, rest)) {
+        "Usage: WL RENAME <old> TO <new>".into()
+    } else {
+        format!("Unknown command: {input}  (HELP lists functions)")
+    }
+}
+
+fn parse_watch_rename(input: &str) -> Option<(String, String)> {
+    // Quoted tokens cannot serve as separators. Unquoted names split at the last TO.
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    let mut had_quote = false;
+    for c in input.chars().chain(std::iter::once(' ')) {
+        if c == '"' {
+            quoted = !quoted;
+            had_quote = true;
+        } else if c.is_whitespace() && !quoted {
+            if !token.is_empty() || had_quote {
+                tokens.push((std::mem::take(&mut token), had_quote));
+                had_quote = false;
+            }
+        } else {
+            token.push(c);
+        }
+    }
+    if quoted {
+        return None;
+    }
+    let to = tokens.iter().rposition(|(s, quoted)| !quoted && s.eq_ignore_ascii_case("TO"))?;
+    let name = |parts: &[(String, bool)]| parts.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(" ");
+    let old = name(&tokens[..to]);
+    let new = name(&tokens[to + 1..]);
+    (!old.trim().is_empty() && !new.trim().is_empty()).then_some((old, new))
+}
+
 fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
     let up = head.to_ascii_uppercase();
     let words = || rest.iter().map(|s| s.to_ascii_uppercase()).collect::<Vec<_>>();
@@ -393,11 +436,8 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             Some("LISTS") => Function::WatchLists,
             Some("DEL") => Function::WatchDelete(rest[1..].join(" ")),
             Some("RENAME") => {
-                let to = rest.iter().position(|s| s.eq_ignore_ascii_case("TO"))?;
-                if to <= 1 || to + 1 >= rest.len() {
-                    return None;
-                }
-                Function::WatchRename(rest[1..to].join(" "), rest[to + 1..].join(" "))
+                let (old, new) = parse_watch_rename(&rest[1..].join(" "))?;
+                Function::WatchRename(old, new)
             }
             Some("RM") | Some("REMOVE") => Function::WatchRemove(words()[1..].to_vec()),
             _ => Function::Watchlist,
@@ -471,7 +511,7 @@ pub fn parse(input: &str) -> Option<Command> {
         [us, k, ..] if us.eq_ignore_ascii_case("US") && YellowKey::parse(k).is_some() => true,
         _ => false,
     };
-    if !keyed && head.eq_ignore_ascii_case("COL") {
+    if !keyed && (head.eq_ignore_ascii_case("COL") || is_watch_rename(head, rest)) {
         return parse_function(head, rest).map(Command::Function);
     }
     if !keyed && let Some(f) = parse_function(head, rest) {
@@ -503,7 +543,7 @@ pub fn parse(input: &str) -> Option<Command> {
 pub fn hint(input: &str) -> String {
     match parse(input) {
         None if input.trim().is_empty() => "Type a ticker and press <GO> (Enter).  HELP for functions.".into(),
-        None => "Unrecognised command".into(),
+        None => parse_error(input),
         Some(Command::Symbol(s)) => match Security::parse(&s).and_then(|x| x.name()) {
             Some(name) => format!("Load {s} — {name}"),
             None => format!("Load {s}"),
@@ -940,5 +980,43 @@ mod tests {
                 assert_eq!(parse(&format!("IND {code}")), parse(code), "IND {code}");
             }
         }
+    }
+
+    #[test]
+    fn watch_commands_parse_names_with_spaces() {
+        assert_eq!(parse("WL NEW Growth stocks"), Some(Command::Function(Function::WatchNew("Growth stocks".into()))));
+        assert_eq!(
+            parse("WL RENAME Growth stocks TO Technology"),
+            Some(Command::Function(Function::WatchRename("Growth stocks".into(), "Technology".into())))
+        );
+        assert_eq!(
+            parse("WL RENAME SPX Index TO Index"),
+            Some(Command::Function(Function::WatchRename("SPX Index".into(), "Index".into())))
+        );
+        assert_eq!(parse("WL DEL Main (2)"), Some(Command::Function(Function::WatchDelete("Main (2)".into()))));
+    }
+
+    #[test]
+    fn watch_rename_must_support_names_containing_to() {
+        assert_eq!(
+            parse("WL RENAME \"TO DO list\" TO \"Done\""),
+            Some(Command::Function(Function::WatchRename("TO DO list".into(), "Done".into())))
+        );
+        assert_eq!(
+            parse("WL RENAME \"Old\" TO \"Done TO archive\""),
+            Some(Command::Function(Function::WatchRename("Old".into(), "Done TO archive".into())))
+        );
+        assert_eq!(
+            parse("WL RENAME TO DO list TO Done"),
+            Some(Command::Function(Function::WatchRename("TO DO list".into(), "Done".into())))
+        );
+    }
+
+    #[test]
+    fn malformed_watch_rename_must_not_fall_through_to_a_tab_rename() {
+        assert_eq!(parse("WL RENAME TO X"), None);
+        assert_eq!(parse_error("WL RENAME TO X"), "Usage: WL RENAME <old> TO <new>");
+        assert_eq!(hint("WL RENAME no separator"), "Usage: WL RENAME <old> TO <new>");
+        assert_eq!(parse("WL RENAME no separator"), None);
     }
 }

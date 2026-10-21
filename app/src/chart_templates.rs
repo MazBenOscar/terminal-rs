@@ -114,6 +114,11 @@ impl Template {
         let mut merged = current.clone();
         study::assign_ids(&mut merged);
         let mut used: HashSet<_> = merged.iter().filter_map(|s| s.chart.as_ref().map(|c| c.id)).collect();
+        for c in merged.iter().chain(&template.indicators).filter_map(|s| s.chart.as_ref()) {
+            if let Some(fill) = &c.fill {
+                used.extend([fill.upper.study, fill.lower.study].into_iter().flatten());
+            }
+        }
         let mut ids = HashMap::new();
         for spec in &template.indicators {
             let old = spec.chart.as_ref().unwrap().id;
@@ -207,6 +212,28 @@ mod tests {
         t.indicators[0].chart.as_mut().unwrap().fill.as_mut().unwrap().lower.study = Some(999);
         t.merge_into(&mut current).unwrap();
         assert!(current[4].chart.as_ref().unwrap().fill.is_none());
+    }
+
+    #[test]
+    fn merge_must_not_rebind_dangling_fill_targets_with_fresh_ids() {
+        let mut current = vec![Spec::new("EMA", &[]).unwrap()];
+        study::assign_ids(&mut current);
+        let edge = study::FillEdge { study: Some(2), output: "Lower".into() };
+        current[0].chart.as_mut().unwrap().fill =
+            Some(study::BandFill { upper: "EMA".into(), lower: edge.clone(), color: [1, 2, 3], opacity: 35 });
+        let t = template();
+        t.merge_into(&mut current).unwrap();
+        // The dangling edge must stay dangling (or be dropped), never attach to an imported study.
+        match current[0].chart.as_ref().unwrap().fill.as_ref() {
+            None => {}
+            Some(fill) => assert!(
+                fill.lower
+                    .study
+                    .is_none_or(|id| !current.iter().skip(1).any(|s| s.chart.as_ref().is_some_and(|c| c.id == id))),
+                "the imported studies took free id {:?} and the dangling fill edge silently rebinds to one of them",
+                fill.lower.study
+            ),
+        }
     }
 
     #[test]

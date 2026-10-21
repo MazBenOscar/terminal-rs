@@ -260,7 +260,10 @@ impl TerminalApp {
                     (&["POL", "POL PELOSI", "TRACK PELOSI"], "Politicians, profiles and alerts"),
                     (&["WL", "WL ADD SOLUSD CRNCY", "WL RM <key>"], "Active watchlist"),
                     (&["WL NEW <name>", "WL USE <name>", "WL LISTS"], "Named watchlists"),
-                    (&["WL RENAME <old> TO <new>", "WL DEL <name>"], "Rename or delete a watchlist"),
+                    (
+                        &["WL RENAME <old> TO <new>", "WL DEL <name>"],
+                        "Rename or delete a watchlist; quote names containing TO, or split at the last standalone TO",
+                    ),
                     (&["COL ADD <title> = <PCF> [@ <tf>]", "COL DEL <title>", "COL CLEAR"], "Custom watchlist columns"),
                     (&["SCAN", "NEW SCAN", "SPLIT SCAN"], "Watchlist scanner: conditions, snapshots and saved scans"),
                     (&["PREFS"], "Settings: theme, fonts, density, hotkeys, layouts"),

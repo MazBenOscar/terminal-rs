@@ -115,4 +115,41 @@ mod tests {
         assert!(!f.valid(0, 2));
         assert!(f.valid(2, 3));
     }
+
+    #[test]
+    fn cross_study_edges_use_their_own_studies_display_displacement() {
+        use tr_core::{
+            Bar, Timeframe,
+            indicators::{
+                formula::display_values,
+                registry::{Input, Spec},
+                study::{self, BandFill, FillEdge},
+            },
+        };
+        let bars: Vec<_> = (0..20).map(|i| Bar::new(i, i as f64, i as f64 + 2., i as f64 - 1., i as f64, 1.)).collect();
+        let mut specs = vec![Spec::new("EMA", &[2.]).unwrap(), Spec::new("BB", &[3., 2.]).unwrap()];
+        study::assign_ids(&mut specs);
+        let owner = specs[0].chart.as_mut().unwrap();
+        owner.displacement = 4;
+        owner.fill = Some(BandFill {
+            upper: "EMA".into(),
+            lower: FillEdge { study: Some(2), output: "Lower".into() },
+            color: [1, 2, 3],
+            opacity: 35,
+        });
+        specs[1].chart.as_mut().unwrap().displacement = -3;
+        let outputs = study::evaluate(&specs, &Input::new(&bars, Timeframe::D1));
+        let upper = outputs[0].as_ref().unwrap();
+        let lower = outputs[1].as_ref().unwrap();
+        // The lookup carries each target study's own displacement, as the worker builds it.
+        let lookup = OutputLookup::from([(2, (lower.as_slice(), -3i16))]);
+        let fill = Fill::build(specs[0].chart.as_ref().unwrap(), upper, &lookup).unwrap();
+        let upper_line = &display_values(&upper[0].values, 4);
+        let lower_line = display_values(&lower.iter().find(|o| o.name == "Lower").unwrap().values, -3);
+        assert_eq!(fill.points.len(), upper_line.len().min(lower_line.len()));
+        for (i, [a, b]) in fill.points.iter().enumerate() {
+            assert!(a == &upper_line[i] || a.is_nan() && upper_line[i].is_nan(), "upper edge {i}");
+            assert!(b == &lower_line[i] || b.is_nan() && lower_line[i].is_nan(), "lower edge {i}");
+        }
+    }
 }

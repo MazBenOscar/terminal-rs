@@ -232,6 +232,11 @@ pub fn assign_ids(specs: &mut [Spec]) {
     }
     let mut reserved: std::collections::HashSet<_> =
         specs.iter().filter_map(|s| s.chart.as_ref().map(|c| c.id)).filter(|id| *id != 0).collect();
+    for c in specs.iter().filter_map(|s| s.chart.as_ref()) {
+        if let Some(fill) = &c.fill {
+            reserved.extend([fill.upper.study, fill.lower.study].into_iter().flatten());
+        }
+    }
     let mut used = std::collections::HashSet::new();
     for spec in specs.iter_mut() {
         if let Some(c) = &spec.chart
@@ -658,6 +663,29 @@ mod tests {
         assert_eq!(mixed[0].chart.as_ref().unwrap().id, 3);
         assert_eq!(mixed[1].chart.as_ref().unwrap().id, 1);
         assert_eq!(mixed[2].chart.as_ref().unwrap().source, Source::Output { study: 1, output: "RSI".into() });
+    }
+
+    #[test]
+    fn fill_targets_must_not_rebind_when_a_new_study_reuses_a_dangling_id() {
+        let mut specs = vec![Spec::new("EMA", &[]).unwrap()];
+        assign_ids(&mut specs);
+        let edge = FillEdge { study: Some(2), output: "Lower".into() };
+        specs[0].chart.as_mut().unwrap().fill =
+            Some(BandFill { upper: "EMA".into(), lower: edge.clone(), color: [1, 2, 3], opacity: 35 });
+        // Settings::sanitized keeps this dangling target so the editor can explain it.
+        assert_eq!(validate_fill_edge(&specs, 0, &edge).unwrap_err(), "Fill target 2 is not available");
+        specs.push(Spec::new("BB", &[]).unwrap());
+        assign_ids(&mut specs);
+        let added = specs[1].chart.as_ref().unwrap().id;
+        // The new study must not absorb the referenced ID: the edge has to stay dangling
+        // (or be dropped) instead of silently pointing at a different study.
+        match specs[0].chart.as_ref().unwrap().fill.as_ref() {
+            None => {}
+            Some(fill) => assert!(
+                fill.lower.study != Some(added),
+                "the new study took id {added} and the dangling fill edge silently rebinds to it"
+            ),
+        }
     }
 
     #[test]
