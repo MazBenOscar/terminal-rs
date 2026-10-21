@@ -21,6 +21,7 @@ mod chart_workflow;
 mod command;
 mod congress_view;
 mod dock;
+mod drawing_paint;
 mod layout;
 mod layouts;
 mod markets_view;

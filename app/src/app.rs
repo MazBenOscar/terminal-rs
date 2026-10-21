@@ -255,6 +255,9 @@ impl PaneKind {
                 show_congress: c.show_congress,
                 magnet: c.magnet,
                 drawings_hidden: c.drawings_hidden,
+                drawings_locked: c.drawings_locked,
+                indicators_hidden: c.indicators_hidden,
+                positions_orders_hidden: c.positions_orders_hidden,
                 drawing_last_used: c.drawing_toolbar.last,
                 navigation: c.navigation,
                 data: c.saved_data(),
@@ -309,6 +312,9 @@ impl PaneKind {
                 show_congress,
                 magnet,
                 drawings_hidden,
+                drawings_locked,
+                indicators_hidden,
+                positions_orders_hidden,
                 drawing_last_used,
                 navigation,
                 data,
@@ -324,11 +330,10 @@ impl PaneKind {
                 c.show_congress = show_congress;
                 c.magnet = magnet;
                 c.drawings_hidden = drawings_hidden;
-                for (index, (_, tools)) in crate::drawing_toolbar::GROUPS.iter().enumerate() {
-                    if tools.contains(&drawing_last_used[index]) {
-                        c.drawing_toolbar.last[index] = drawing_last_used[index];
-                    }
-                }
+                c.drawings_locked = drawings_locked;
+                c.indicators_hidden = indicators_hidden;
+                c.positions_orders_hidden = positions_orders_hidden;
+                c.drawing_toolbar.restore_last(&drawing_last_used);
                 c.navigation = navigation;
                 c.data = data;
                 c.restore_price_scale();
@@ -1804,9 +1809,12 @@ impl TerminalApp {
                 c.cancel();
             });
         }
-        if pressed(Modifiers::NONE, Key::Delete) || pressed(Modifiers::NONE, Key::Backspace) {
+        let backspace = pressed(Modifiers::NONE, Key::Backspace);
+        if pressed(Modifiers::NONE, Key::Delete) || backspace {
             self.with_chart(|c, _| {
-                c.delete_selected();
+                if !backspace || !c.pattern_backspace() {
+                    c.delete_selected();
+                }
             });
         }
         if pressed(Modifiers { shift: true, ..Modifiers::COMMAND }, Key::Z) {

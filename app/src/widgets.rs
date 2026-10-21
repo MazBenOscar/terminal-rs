@@ -106,6 +106,12 @@ pub enum Icon {
     StepForward,
     Crosshair,
     Trendline,
+    HorizontalRay,
+    ExtendedLine,
+    InfoLine,
+    RegressionTrend,
+    FibChannel,
+    FibTimeZone,
     Ray,
     HorizontalLine,
     VerticalLine,
@@ -114,11 +120,33 @@ pub enum Icon {
     Channel,
     Pitchfork,
     Rectangle,
+    Arrow,
+    ArrowMarkUp,
+    ArrowMarkDown,
+    Brush,
+    Circle,
+    Path,
+    PriceNote,
+    Callout,
+    FlagMark,
     Text,
     LongPosition,
     ShortPosition,
+    Xabcd,
+    Abcd,
+    HeadAndShoulders,
+    TrianglePattern,
+    ElliottImpulse,
+    ElliottCorrection,
     Measure,
+    PriceRange,
+    DateRange,
+    DatePriceRange,
+    AnchoredVwap,
+    FixedRangeVolumeProfile,
     Magnet,
+    Lock,
+    Unlock,
     EyeOff,
     Eye,
     Trash,
@@ -126,10 +154,104 @@ pub enum Icon {
     ChevronSmall,
 }
 
+/// Original measure-family glyphs on a 12-unit grid.
+fn measure_volume_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
+    let unit = r.width().min(r.height()) / 12.;
+    let pt = |x: f32, y: f32| r.center() + vec2((x - 6.) * unit, (y - 6.) * unit);
+    let stroke = Stroke::new(1.4, color);
+    if icon == Icon::AnchoredVwap {
+        p.circle_stroke(pt(2., 9.), unit, stroke);
+        p.add(Shape::line(vec![pt(2., 8.), pt(4., 5.), pt(6., 6.), pt(8., 3.), pt(11., 2.)], stroke));
+    } else if icon == Icon::FixedRangeVolumeProfile {
+        p.line_segment([pt(2., 1.), pt(2., 11.)], stroke);
+        for (y, end) in [(2., 6.), (4., 9.), (6., 11.), (8., 7.), (10., 5.)] {
+            p.line_segment([pt(2., y), pt(end, y)], stroke);
+        }
+    } else {
+        if icon != Icon::DateRange {
+            p.line_segment([pt(3., 1.), pt(3., 11.)], stroke);
+            for y in [1., 11.] {
+                p.line_segment([pt(1., y), pt(5., y)], stroke);
+            }
+        }
+        if icon != Icon::PriceRange {
+            p.line_segment([pt(1., 8.), pt(11., 8.)], stroke);
+            for x in [1., 11.] {
+                p.line_segment([pt(x, 6.), pt(x, 10.)], stroke);
+            }
+        }
+        if icon == Icon::DatePriceRange {
+            p.line_segment([pt(6., 2.), pt(10., 2.)], stroke);
+            p.line_segment([pt(10., 2.), pt(10., 5.)], stroke);
+        }
+    }
+}
+
+// Original annotation glyphs, constructed on a twelve-unit grid.
+fn annotation_point(r: egui::Rect, x: f32, y: f32) -> egui::Pos2 {
+    r.center() + egui::vec2(x - 6., y - 6.) * (r.width().min(r.height()) / 16.)
+}
+fn arrow_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, color: egui::Color32) {
+    let pt = |x, y| annotation_point(r, x, y);
+    let s = egui::Stroke::new(1.4, color);
+    if icon == Icon::Arrow {
+        p.line_segment([pt(1., 11.), pt(11., 1.)], s);
+        p.add(egui::Shape::line(vec![pt(5., 1.), pt(11., 1.), pt(11., 7.)], s));
+    } else {
+        let (tip, base) = if icon == Icon::ArrowMarkUp { (2., 10.) } else { (10., 2.) };
+        p.add(egui::Shape::convex_polygon(vec![pt(6., tip), pt(1., base), pt(11., base)], color, s));
+    }
+}
+fn brush_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
+    let pt = |x, y| annotation_point(r, x, y);
+    p.add(egui::Shape::line(
+        vec![pt(1., 10.), pt(3., 3.), pt(5., 2.), pt(6., 8.), pt(8., 10.), pt(11., 4.)],
+        egui::Stroke::new(1.4, color),
+    ));
+}
+fn shape_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, color: egui::Color32) {
+    let pt = |x, y| annotation_point(r, x, y);
+    let s = egui::Stroke::new(1.4, color);
+    if icon == Icon::Circle {
+        p.circle_stroke(pt(6., 6.), r.width().min(r.height()) * 5. / 16., s);
+    } else {
+        p.add(egui::Shape::line(vec![pt(1., 10.), pt(4., 2.), pt(8., 9.), pt(11., 3.)], s));
+        for (x, y) in [(1., 10.), (4., 2.), (8., 9.), (11., 3.)] {
+            p.circle_filled(pt(x, y), 1., color);
+        }
+    }
+}
+fn note_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, color: egui::Color32) {
+    let pt = |x, y| annotation_point(r, x, y);
+    let s = egui::Stroke::new(1.4, color);
+    match icon {
+        Icon::FlagMark => {
+            p.line_segment([pt(3., 12.), pt(3., 1.)], s);
+            p.add(egui::Shape::line(vec![pt(3., 1.), pt(11., 1.), pt(9., 6.), pt(3., 6.)], s));
+        }
+        Icon::PriceNote => {
+            p.add(egui::Shape::line(vec![pt(1., 10.), pt(5., 4.), pt(11., 4.), pt(11., 9.), pt(5., 9.)], s));
+            p.line_segment([pt(7., 6.), pt(9., 6.)], s);
+        }
+        _ => {
+            p.add(egui::Shape::line(
+                vec![pt(1., 11.), pt(4., 7.), pt(2., 7.), pt(2., 1.), pt(11., 1.), pt(11., 7.), pt(6., 7.)],
+                s,
+            ));
+        }
+    }
+}
+
 pub fn tool_icon(tool: tr_chart::drawings::Tool) -> Icon {
     use tr_chart::drawings::Tool;
     match tool {
         Tool::Trendline => Icon::Trendline,
+        Tool::HorizontalRay => Icon::HorizontalRay,
+        Tool::ExtendedLine => Icon::ExtendedLine,
+        Tool::InfoLine => Icon::InfoLine,
+        Tool::RegressionTrend => Icon::RegressionTrend,
+        Tool::FibChannel => Icon::FibChannel,
+        Tool::FibTimeZone => Icon::FibTimeZone,
         Tool::Ray => Icon::Ray,
         Tool::Horizontal => Icon::HorizontalLine,
         Tool::Vertical => Icon::VerticalLine,
@@ -139,9 +261,29 @@ pub fn tool_icon(tool: tr_chart::drawings::Tool) -> Icon {
         Tool::Pitchfork => Icon::Pitchfork,
         Tool::Rectangle => Icon::Rectangle,
         Tool::Text => Icon::Text,
+        Tool::Arrow => Icon::Arrow,
+        Tool::ArrowMarkUp => Icon::ArrowMarkUp,
+        Tool::ArrowMarkDown => Icon::ArrowMarkDown,
+        Tool::Brush => Icon::Brush,
+        Tool::Circle => Icon::Circle,
+        Tool::Path => Icon::Path,
+        Tool::PriceNote => Icon::PriceNote,
+        Tool::Callout => Icon::Callout,
+        Tool::FlagMark => Icon::FlagMark,
         Tool::LongPosition => Icon::LongPosition,
         Tool::ShortPosition => Icon::ShortPosition,
         Tool::Measure => Icon::Measure,
+        Tool::Xabcd => Icon::Xabcd,
+        Tool::Abcd => Icon::Abcd,
+        Tool::HeadAndShoulders => Icon::HeadAndShoulders,
+        Tool::TrianglePattern => Icon::TrianglePattern,
+        Tool::ElliottImpulse => Icon::ElliottImpulse,
+        Tool::ElliottCorrection => Icon::ElliottCorrection,
+        Tool::PriceRange => Icon::PriceRange,
+        Tool::DateRange => Icon::DateRange,
+        Tool::DatePriceRange => Icon::DatePriceRange,
+        Tool::AnchoredVwap => Icon::AnchoredVwap,
+        Tool::FixedRangeVolumeProfile => Icon::FixedRangeVolumeProfile,
     }
 }
 
@@ -169,6 +311,30 @@ mod drawing_icon_tests {
     }
 }
 
+/// Original pattern glyphs on a centred twelve-unit grid.
+fn pattern_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
+    let points: &[[f32; 2]] = match icon {
+        Icon::Xabcd => &[[-6., 4.], [-3., -5.], [0., 2.], [3., -2.], [6., 5.]],
+        Icon::Abcd => &[[-6., 5.], [-2., -4.], [2., 2.], [6., -5.]],
+        Icon::HeadAndShoulders => &[[-6., 5.], [-4., -1.], [-2., 2.], [0., -6.], [2., 2.], [4., -1.], [6., 5.]],
+        Icon::TrianglePattern => &[[-6., -5.], [-4., 5.], [2., -2.], [5., 2.]],
+        Icon::ElliottImpulse => &[[-6., 6.], [-4., 1.], [-2., 3.], [0., -3.], [3., -1.], [6., -6.]],
+        Icon::ElliottCorrection => &[[-6., -5.], [-2., 3.], [2., -2.], [6., 5.]],
+        _ => unreachable!("Non-pattern icon"),
+    };
+    let unit = r.width().min(r.height()) / 16.;
+    let point = |a: [f32; 2]| r.center() + vec2(a[0] * unit, a[1] * unit);
+    let stroke = Stroke::new(1.4, color);
+    p.add(Shape::line(points.iter().copied().map(point).collect(), stroke));
+    if icon == Icon::Xabcd {
+        p.line_segment([point(points[0]), point(points[4])], stroke);
+    }
+    if icon == Icon::TrianglePattern {
+        p.line_segment([point(points[0]), point([6., 0.])], stroke);
+        p.line_segment([point(points[1]), point([6., 0.])], stroke);
+    }
+}
+
 /// Draw a simple line icon centred in `r`.
 pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
     let s = Stroke::new(1.4, color);
@@ -182,75 +348,58 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
                 p.line_segment([pt(0., d * 2.), pt(0., d * 6.)], s);
             }
         }
-        Icon::Trendline | Icon::Ray | Icon::Channel => {
-            p.line_segment([pt(-4., 4.), pt(5., -5.)], s);
-            p.circle_stroke(pt(-5., 5.), 1.4 * u, s);
-            if icon != Icon::Ray {
-                p.circle_stroke(pt(5., -5.), 1.4 * u, s);
-            }
-            if icon == Icon::Channel {
-                p.line_segment([pt(-5., 0.), pt(0., -5.)], s);
-            }
-            if icon == Icon::Ray {
-                p.line_segment([pt(5., -5.), pt(7., -7.)], s);
-            }
+        Icon::HorizontalRay
+        | Icon::ExtendedLine
+        | Icon::InfoLine
+        | Icon::RegressionTrend
+        | Icon::Trendline
+        | Icon::Ray
+        | Icon::Channel
+        | Icon::HorizontalLine
+        | Icon::VerticalLine
+        | Icon::Pitchfork => crate::drawing_paint::lines(p, r, icon, color),
+        Icon::FibRetracement | Icon::FibExtension | Icon::FibChannel | Icon::FibTimeZone => {
+            crate::drawing_paint::fib(p, r, icon, color)
         }
-        Icon::HorizontalLine | Icon::VerticalLine => {
-            let (a, b) =
-                if icon == Icon::HorizontalLine { (pt(-6., 0.), pt(6., 0.)) } else { (pt(0., -6.), pt(0., 6.)) };
-            p.line_segment([a, b], s);
-            p.circle_stroke(c, 1.4 * u, s);
-        }
-        Icon::FibRetracement | Icon::FibExtension => {
-            let n = if icon == Icon::FibRetracement { 4 } else { 3 };
-            for i in 0..n {
-                let y = -5. + i as f32 * 3.;
-                p.line_segment([pt(-5., y), pt(6. - i as f32 * 1.5, y)], s);
-            }
-            if icon == Icon::FibRetracement {
-                p.circle_stroke(pt(-5., -5.), 1.4 * u, s);
-                p.circle_stroke(pt(1.5, 4.), 1.4 * u, s);
-            } else {
-                p.line_segment([pt(-6., 5.), pt(-2., -5.)], s);
-            }
-        }
-        Icon::Pitchfork => {
-            p.circle_stroke(pt(-5., 5.), 1.4 * u, s);
-            p.line_segment([pt(-4., 4.), pt(4., -4.)], s);
-            p.add(Shape::line(vec![pt(-5., -1.), pt(-1., 1.), pt(1., 5.)], s));
-            p.line_segment([pt(-5., -1.), pt(0., -6.)], s);
-            p.line_segment([pt(1., 5.), pt(6., 0.)], s);
-        }
-        Icon::Rectangle => {
-            p.rect_stroke(Rect::from_min_max(pt(-5., -5.), pt(5., 5.)), 0., s, StrokeKind::Middle);
-            for (x, y) in [(-5., -5.), (5., -5.), (-5., 5.), (5., 5.)] {
-                p.circle_stroke(pt(x, y), 1.4 * u, s);
-            }
-        }
-        Icon::Text => {
-            p.line_segment([pt(-6., -5.), pt(6., -5.)], s);
-            p.line_segment([pt(0., -5.), pt(0., 6.)], s);
-        }
-        Icon::LongPosition | Icon::ShortPosition => {
-            let d = if icon == Icon::LongPosition { 1. } else { -1. };
-            for (x, y, w, h) in [(-5., -5., 10., 6.), (-3., 1., 6., 4.)] {
-                let a = pt(x, y * d);
-                let b = pt(x + w, (y + h) * d);
-                p.rect_stroke(Rect::from_two_pos(a, b), 0., s, StrokeKind::Middle);
-            }
-            p.add(Shape::line(vec![pt(-2., -d), pt(0., -3. * d), pt(2., -d)], s));
-        }
-        Icon::Measure => {
-            p.add(Shape::line(vec![pt(-6., 3.), pt(3., -6.), pt(6., -3.), pt(-3., 6.), pt(-6., 3.)], s));
-            for i in 0..3 {
-                let x = -3. + i as f32 * 3.;
-                p.line_segment([pt(x, -x - 3.), pt(x + 1.5, -x - 1.5)], s);
-            }
-        }
+        Icon::Arrow | Icon::ArrowMarkUp | Icon::ArrowMarkDown => arrow_icon(p, r, icon, color),
+        Icon::Brush => brush_icon(p, r, color),
+        Icon::Circle | Icon::Path => shape_icon(p, r, icon, color),
+        Icon::PriceNote | Icon::Callout | Icon::FlagMark => note_icon(p, r, icon, color),
+        Icon::Rectangle => crate::drawing_paint::shapes(p, r, color),
+        Icon::Text => crate::drawing_paint::text(p, r, color),
+        Icon::LongPosition | Icon::ShortPosition | Icon::Measure => crate::drawing_paint::measure(p, r, icon, color),
+        Icon::Xabcd
+        | Icon::Abcd
+        | Icon::HeadAndShoulders
+        | Icon::TrianglePattern
+        | Icon::ElliottImpulse
+        | Icon::ElliottCorrection => pattern_icon(p, r, icon, color),
+        Icon::PriceRange
+        | Icon::DateRange
+        | Icon::DatePriceRange
+        | Icon::AnchoredVwap
+        | Icon::FixedRangeVolumeProfile => measure_volume_icon(p, r, icon, color),
         Icon::Magnet => {
             p.add(Shape::line(vec![pt(-5., -5.), pt(-5., 2.), pt(-3., 5.), pt(3., 5.), pt(5., 2.), pt(5., -5.)], s));
             p.line_segment([pt(-5., -2.), pt(-2., -2.)], s);
             p.line_segment([pt(2., -2.), pt(5., -2.)], s);
+        }
+        Icon::Lock | Icon::Unlock => {
+            p.rect_stroke(Rect::from_min_max(pt(-5., -1.), pt(5., 6.)), 1.5 * u, s, StrokeKind::Middle);
+            let offset = if icon == Icon::Unlock { 4. } else { 0. };
+            p.add(Shape::line(
+                vec![
+                    pt(-3. + offset, -1.),
+                    pt(-3. + offset, -4.),
+                    pt(-1. + offset, -6.),
+                    pt(1. + offset, -6.),
+                    pt(3. + offset, -4.),
+                    pt(3. + offset, -1.),
+                ],
+                s,
+            ));
+            p.circle_stroke(pt(0., 2.), u, s);
+            p.line_segment([pt(0., 3.), pt(0., 4.5)], s);
         }
         Icon::Eye | Icon::EyeOff => {
             p.add(Shape::line(
