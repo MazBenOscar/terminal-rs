@@ -65,7 +65,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   matches across all asset classes (catalog instantly, plus Yahoo search after a short pause);
   ↑/↓, Tab, Enter; history with ↑/↓. `SECF gold cmdty` opens a full search panel.
 - **Charts** — GPU-rendered candles, OHLC bars, line and area; 1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W,
-  1M plus quick ranges (1D … ALL); volume; 151 indicators; `CMP <SYM>` compare; log scale;
+  1M plus quick ranges (1D … ALL); volume; 151 indicators; `CMP <SYM>` compare on a % change, shared price or own left axis; log scale;
   crosshair with OHLC legend; smooth pan and zoom over a million bars. Live crypto bars from the
   Binance websocket (Coinbase fallback).
 - **Indicators** — 151 built-in studies: 23 moving averages (SMA, EMA, WMA, Hull, DEMA/TEMA, KAMA,

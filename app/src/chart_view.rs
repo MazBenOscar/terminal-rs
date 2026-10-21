@@ -18,6 +18,7 @@ use tr_core::indicators::registry::{self, Category};
 use tr_core::indicators::study::{self, Pane as StudyPane, Scale as StudyScale, Source as StudySource};
 use tr_core::{AssetClass, Bar, Security, Timeframe};
 
+use crate::chart_compare::Axis as CompareAxis;
 use crate::command::{IndicatorSpec, Range};
 use crate::congress_view::Action;
 use crate::theme::{self, amber, amber_dim, mono, muted, text, ui_font};
@@ -99,6 +100,8 @@ pub struct ChartState {
     pub drawings: Vec<Drawing>,
     pub compare: Option<String>,
     pub navigation: crate::chart_navigation::Navigation,
+    /// How a comparison is scaled against the main symbol.
+    pub compare_axis: crate::chart_compare::Axis,
     pub data: crate::chart_data::ChartData,
     refresh_at: std::time::Instant,
     pub local_cursor: Option<i64>,
@@ -178,6 +181,7 @@ impl ChartState {
             indicators,
             drawings: Vec::new(),
             compare: None,
+            compare_axis: Default::default(),
             navigation: Default::default(),
             data: Default::default(),
             refresh_at: std::time::Instant::now(),
@@ -833,9 +837,15 @@ impl ChartState {
         }
         study::assign_ids(&mut self.indicators);
         self.show_indicator_editor(ui.ctx(), w);
-        if let Some(chosen) =
-            self.compare_picker.show(ui.ctx(), rect, self.id, &self.symbol, self.compare.as_deref(), w)
-        {
+        self.compare_picker.chart = Some(rect);
+        if let Some(chosen) = self.compare_picker.show(
+            ui.ctx(),
+            self.id,
+            &self.symbol,
+            self.compare.as_deref(),
+            &mut self.compare_axis,
+            w,
+        ) {
             self.set_compare(chosen, w);
         }
         let painter = ui.painter_at(rect);
@@ -946,7 +956,13 @@ impl ChartState {
         );
 
         let body = Rect::from_min_max(pos2(rect.left(), header.bottom()), pos2(rect.right(), range_row.top()));
-        let plot_all = Rect::from_min_max(body.min, pos2(body.right() - AXIS_W, body.bottom() - TIME_H));
+        let own_axis = self.compare.is_some() && self.compare_axis == CompareAxis::Own;
+        // An own-axis comparison gets a left-hand price axis of the same width.
+        let left_axis = if own_axis { AXIS_W } else { 0.0 };
+        let plot_all = Rect::from_min_max(
+            pos2(body.left() + left_axis, body.top()),
+            pos2(body.right() - AXIS_W, body.bottom() - TIME_H),
+        );
         self.plot_width = plot_all.width().max(1.) as f64;
         if plot_all.width() < 40.0 || plot_all.height() < 40.0 {
             return clicked;
@@ -1125,18 +1141,19 @@ impl ChartState {
             .filter(|b| b.spec.chart.as_ref().is_none_or(|c| c.scale == StudyScale::Shared))
             .flat_map(|b| b.overlays.iter().map(|o| o.1.clone()).chain(b.bounds.iter().cloned()))
             .collect();
+        // Percent mode labels prices relative to the main close at the visible left edge, where
+        // the comparison is rebased too, so both series read as % change from the same bar.
+        let mut percent_base = None;
         if let Some(c) = &self.compare_line {
             let (lo, hi) = self.viewport.as_ref().map(|v| v.visible_range(len)).unwrap_or((0, len));
             let scale = scene::rebase_factor(&gpu.closes, c, lo, hi);
             self.compare_scale = scale;
-            overlays.push(Overlay {
-                line: c.clone(),
-                color: theme::rgba(theme::series(5)),
-                kind: LineKind::Line,
-                scale,
-                width: 1.3,
-                histogram_color: None,
-            });
+            if self.compare_axis != CompareAxis::Own {
+                overlays.push(compare_overlay(c, scale));
+            }
+            if self.compare_axis == CompareAxis::Percent {
+                percent_base = first_finite(&gpu.closes, lo, hi);
+            }
         }
         let reveal_t =
             crate::anim::progress(ui.ctx(), egui::Id::new(("chart-reveal", self.id)), self.reveal_key, REVEAL_SECS);
@@ -1187,9 +1204,25 @@ impl ChartState {
         // Grid first (under the GPU geometry is not possible inside one pass, so draw it
         // faintly; candles are opaque on top visually).
         let price_painter = ui.painter_at(price_rect);
-        let ticks = scale::price_ticks(scale.lo, scale.hi, (price_rect.height() / 42.0).max(2.0) as usize);
-        let step = if ticks.len() > 1 { ticks[1] - ticks[0] } else { 1.0 };
-        let dec = scale::decimals_for(step).max(self.sec.decimals(scale.hi).min(3));
+        let tick_count = (price_rect.height() / 42.0).max(2.0) as usize;
+        let (ticks, tick_labels): (Vec<f64>, Vec<String>) = match percent_base {
+            Some(base) => {
+                let pct = scale::price_ticks(percent(scale.lo, base), percent(scale.hi, base), tick_count);
+                let step = if pct.len() > 1 { pct[1] - pct[0] } else { 1.0 };
+                let dec = scale::decimals_for(step).min(2);
+                pct.into_iter()
+                    .filter(|p| *p > -100.0)
+                    .map(|p| (base * (1.0 + p / 100.0), format_percent(p, dec)))
+                    .unzip()
+            }
+            None => {
+                let ticks = scale::price_ticks(scale.lo, scale.hi, tick_count);
+                let step = if ticks.len() > 1 { ticks[1] - ticks[0] } else { 1.0 };
+                let dec = scale::decimals_for(step).max(self.sec.decimals(scale.hi).min(3));
+                let labels = ticks.iter().map(|t| scale::format_price(*t, dec)).collect();
+                (ticks, labels)
+            }
+        };
         for t in &ticks {
             let y = price_rect.top() + scale.y_of(*t) as f32;
             price_painter.hline(price_rect.x_range(), y, Stroke::new(1.0, theme::grid()));
@@ -1208,6 +1241,12 @@ impl ChartState {
                     price_study_scales.push((price_rect, index, separate.scale));
                 }
             }
+        }
+        let mut own_scale = None;
+        if own_axis && let Some(c) = &self.compare_line {
+            let separate = scene::sub_pane(&[compare_overlay(c, 1.0)], &v, price_rect.height() as f64, None, style);
+            out.cmds.extend(separate.cmds);
+            own_scale = Some(separate.scale);
         }
         let frame = Frame { pane: self.id * 8, frame_no, cmds: out.cmds };
         if let Some((_, members)) = groups.iter().find(|(key, _)| key.is_none()) {
@@ -1276,20 +1315,33 @@ impl ChartState {
         let axis_painter = ui.painter_at(Rect::from_min_max(pos2(plot_all.right(), body.top()), body.max));
         axis_painter.vline(plot_all.right(), body.y_range(), Stroke::new(1.0, theme::border()));
         let positive_prices = self.bars.last().is_some_and(|b| b.low > 0.0);
-        for t in &ticks {
+        for (t, label) in ticks.iter().zip(&tick_labels) {
             let y = price_rect.top() + scale.y_of(*t) as f32;
             // The volume headroom can dip below zero; don't label impossible prices.
             if positive_prices && *t < 0.0 {
                 continue;
             }
             if y > price_rect.top() + 6.0 && y < price_rect.bottom() - 6.0 {
-                axis_painter.text(
-                    pos2(plot_all.right() + 6.0, y),
-                    Align2::LEFT_CENTER,
-                    scale::format_price(*t, dec),
-                    mono(11.0),
-                    muted(),
-                );
+                axis_painter.text(pos2(plot_all.right() + 6.0, y), Align2::LEFT_CENTER, label, mono(11.0), muted());
+            }
+        }
+        let left_painter = ui.painter_at(Rect::from_min_max(body.min, pos2(plot_all.left(), body.bottom())));
+        if let Some(s) = own_scale {
+            left_painter.vline(plot_all.left(), body.y_range(), Stroke::new(1.0, theme::border()));
+            let ticks = scale::price_ticks(s.lo, s.hi, tick_count);
+            let step = if ticks.len() > 1 { ticks[1] - ticks[0] } else { 1.0 };
+            let dec = scale::decimals_for(step).min(4);
+            for t in ticks {
+                let y = price_rect.top() + s.y_of(t) as f32;
+                if y > price_rect.top() + 6.0 && y < price_rect.bottom() - 6.0 {
+                    left_painter.text(
+                        pos2(plot_all.left() - 6.0, y),
+                        Align2::RIGHT_CENTER,
+                        scale::format_price(t, dec),
+                        mono(11.0),
+                        theme::series(5).gamma_multiply(0.8),
+                    );
+                }
             }
         }
         for (at, (r, bi, s)) in sub_rects.iter().enumerate() {
@@ -1347,13 +1399,61 @@ impl ChartState {
                 }
                 let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
                 axis_painter.rect_filled(tag, 0.0, col.gamma_multiply(tag_fade));
+                let text = match percent_base {
+                    Some(base) => format_percent(percent(last.close, base), 2),
+                    None => scale::format_price(last.close, self.sec.decimals(last.close)),
+                };
                 axis_painter.text(
                     tag.left_center() + vec2(5.0, 0.0),
                     Align2::LEFT_CENTER,
-                    scale::format_price(last.close, self.sec.decimals(last.close)),
+                    text,
                     mono(11.0),
                     Color32::BLACK.gamma_multiply(tag_fade),
                 );
+            }
+            // The comparison's last value: on the right axis when it shares it, else on the left one.
+            if let Some(c) = &self.compare_line
+                && let Some(raw) = last_finite(c)
+            {
+                let color = theme::series(5).gamma_multiply(tag_fade);
+                let ink = Color32::BLACK.gamma_multiply(tag_fade);
+                let decimals = scale::decimals_for(raw.abs() / 1000.0).clamp(2, 4);
+                match own_scale {
+                    Some(s) => {
+                        let y = price_rect.top() + s.y_of(raw) as f32;
+                        if price_rect.y_range().contains(y) {
+                            let tag = Rect::from_min_size(pos2(body.left() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
+                            left_painter.rect_filled(tag, 0.0, color);
+                            left_painter.text(
+                                tag.right_center() - vec2(5.0, 0.0),
+                                Align2::RIGHT_CENTER,
+                                scale::format_price(raw, decimals),
+                                mono(11.0),
+                                ink,
+                            );
+                        }
+                    }
+                    None => {
+                        let rebased = raw * self.compare_scale;
+                        let y = price_rect.top() + scale.y_of(rebased) as f32;
+                        if price_rect.y_range().contains(y) {
+                            let tag =
+                                Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
+                            axis_painter.rect_filled(tag, 0.0, color);
+                            let text = match percent_base {
+                                Some(base) => format_percent(percent(rebased, base), 2),
+                                None => scale::format_price(raw, decimals),
+                            };
+                            axis_painter.text(
+                                tag.left_center() + vec2(5.0, 0.0),
+                                Align2::LEFT_CENTER,
+                                text,
+                                mono(11.0),
+                                ink,
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -1405,13 +1505,24 @@ impl ChartState {
                 let price = scale.price_at((p.y - price_rect.top()) as f64);
                 let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, p.y - 8.0), vec2(AXIS_W - 2.0, 16.0));
                 axis_painter.rect_filled(tag, 0.0, Color32::from_gray(70));
-                axis_painter.text(
-                    tag.left_center() + vec2(5.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    scale::format_price(price, self.sec.decimals(price)),
-                    mono(11.0),
-                    text(),
-                );
+                let label = match percent_base {
+                    Some(base) => format_percent(percent(price, base), 2),
+                    None => scale::format_price(price, self.sec.decimals(price)),
+                };
+                axis_painter.text(tag.left_center() + vec2(5.0, 0.0), Align2::LEFT_CENTER, label, mono(11.0), text());
+                if let Some(s) = own_scale {
+                    let own = s.price_at((p.y - price_rect.top()) as f64);
+                    let tag = Rect::from_min_size(pos2(body.left() + 1.0, p.y - 8.0), vec2(AXIS_W - 2.0, 16.0));
+                    left_painter.rect_filled(tag, 0.0, Color32::from_gray(70));
+                    let decimals = scale::decimals_for(own.abs() / 1000.0).clamp(2, 4);
+                    left_painter.text(
+                        tag.right_center() - vec2(5.0, 0.0),
+                        Align2::RIGHT_CENTER,
+                        scale::format_price(own, decimals),
+                        mono(11.0),
+                        text(),
+                    );
+                }
             }
             if let Some(i) = hovered_bar {
                 let label = scale::crosshair_label(self.data.zone.label_timestamp(self.bars[i].ts, self.tf), self.tf);
@@ -2524,6 +2635,36 @@ fn live_badge_rect(plot: Rect, text_width: f32) -> Rect {
     Rect::from_min_size(pos2(plot.right() - text_width - 22., plot.top() + 30.), vec2(text_width + 16., 14.))
 }
 
+fn compare_overlay(line: &LineRef, scale: f64) -> Overlay {
+    Overlay {
+        line: line.clone(),
+        color: theme::rgba(theme::series(5)),
+        kind: LineKind::Line,
+        scale,
+        width: 1.3,
+        histogram_color: None,
+    }
+}
+
+fn first_finite(line: &LineRef, lo: usize, hi: usize) -> Option<f64> {
+    let data = &line.pyramid.data;
+    (lo..hi.min(line.pyramid.level_len(0))).find_map(|i| Some(data[i][1] as f64).filter(|x| x.is_finite() && *x != 0.0))
+}
+
+fn last_finite(line: &LineRef) -> Option<f64> {
+    let data = &line.pyramid.data;
+    (0..line.pyramid.level_len(0)).rev().find_map(|i| Some(data[i][1] as f64).filter(|x| x.is_finite()))
+}
+
+/// `price` as a % change from `base`.
+fn percent(price: f64, base: f64) -> f64 {
+    (price / base - 1.0) * 100.0
+}
+
+fn format_percent(p: f64, decimals: usize) -> String {
+    if p.abs() < 0.5 * 10f64.powi(-(decimals as i32)) { "0%".into() } else { format!("{p:+.decimals$}%") }
+}
+
 fn study_source_label(source: &StudySource, specs: &[IndicatorSpec]) -> String {
     match source {
         StudySource::Bars => "Original bars".into(),
@@ -2642,6 +2783,14 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_axis_labels() {
+        assert!((percent(110.0, 100.0) - 10.0).abs() < 1e-9);
+        assert_eq!(format_percent(10.0, 1), "+10.0%");
+        assert_eq!(format_percent(-2.5, 2), "-2.50%");
+        assert_eq!(format_percent(0.001, 2), "0%");
+    }
 
     fn ui_frame(ctx: &egui::Context, events: Vec<egui::Event>, mut draw: impl FnMut(&mut Ui)) -> Vec<(String, Rect)> {
         let mut output = ctx.run_ui(
