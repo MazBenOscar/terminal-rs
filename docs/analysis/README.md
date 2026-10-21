@@ -51,6 +51,10 @@ Labels used in every note:
 
 ## Headline takeaways for terminal-rs
 
+The independent [MCP study and service design](tradingview-mcp.md) on
+`codex/mcp-study` covers official-service discovery and terminal-rs client/server
+proposals, with authentication and implementation limits recorded separately.
+
 1. **Typing anywhere is a command.** A letter opens symbol search pre-filled with it; a digit opens an
    interval entry pre-filled with it (`5` → "5 minutes"), Enter applies. This maps directly onto a
    Bloomberg-style command line (`AAPL <GO>`, `5 <GO>`).
