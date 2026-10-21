@@ -1291,7 +1291,8 @@ impl ChartState {
         );
 
         let body = Rect::from_min_max(pos2(rect.left(), rect.top() + header_h), pos2(rect.right(), range_row.top()));
-        let own_axis = self.compare.as_ref().is_some_and(|s| !self.data.hidden_comparisons.contains(s))
+        let own_axis = self.chart_type != ChartType::Renko
+            && self.compare.as_ref().is_some_and(|s| !self.data.hidden_comparisons.contains(s))
             && self.compare_axis == CompareAxis::Own;
         // An own-axis comparison gets a left-hand price axis of the same width.
         let left_axis = if own_axis { AXIS_W } else { 0.0 };
@@ -1323,6 +1324,7 @@ impl ChartState {
         };
 
         // Split plot height between the price pane and oscillator sub-panes.
+        let built_len = self.built.len();
         let groups = study_groups(&self.built);
         let pane_groups: Vec<_> = groups.iter().filter(|(key, _)| key.is_some()).take(MAX_SUB_PANES).collect();
         let desired: Vec<f32> = pane_groups
@@ -1499,15 +1501,17 @@ impl ChartState {
         self.analytics.update(&self.bars, self.data.analytics.anchor);
         if let Some(vwap) = &self.analytics.vwap {
             let mut overlay = compare_overlay(vwap, 1.);
-            overlay.color = theme::rgba(theme::series(1));
+            overlay.color = theme::rgba(theme::text());
             overlays.push(overlay);
         }
         let (lo, hi) = v.visible_range(len);
-        let primary_visible = self.compare.as_ref().is_some_and(|s| !self.data.hidden_comparisons.contains(s));
+        let primary_visible = self.chart_type != ChartType::Renko
+            && self.compare.as_ref().is_some_and(|s| !self.data.hidden_comparisons.contains(s));
         let mut lines: Vec<LineRef> = self
             .data
             .comparisons
             .iter()
+            .filter(|_| self.chart_type != ChartType::Renko)
             .filter(|s| !self.data.hidden_comparisons.contains(s))
             .filter_map(|s| self.comparisons.get(s).and_then(|s| s.line.clone()))
             .collect();
@@ -1528,7 +1532,7 @@ impl ChartState {
             }
         }
         for (index, key) in self.data.comparisons.iter().enumerate() {
-            if self.data.hidden_comparisons.contains(key) {
+            if self.chart_type == ChartType::Renko || self.data.hidden_comparisons.contains(key) {
                 continue;
             }
             if let Some(extra) = self.comparisons.get_mut(key)
@@ -1601,6 +1605,10 @@ impl ChartState {
                     .filter(|v| v.is_finite());
             }
             plot_resp.context_menu(|ui| self.context_menu(ui, w));
+        }
+        if self.built.len() != built_len {
+            ui.ctx().request_repaint();
+            return clicked;
         }
         if axis_resp.dragged() {
             let mut s = self.manual_scale.unwrap_or(scale);
@@ -1752,7 +1760,7 @@ impl ChartState {
                         Align2::RIGHT_CENTER,
                         scale::format_price(t, dec),
                         mono(11.0),
-                        theme::series(5).gamma_multiply(0.8),
+                        theme::compare(0).gamma_multiply(0.8),
                     );
                 }
             }
@@ -1798,31 +1806,33 @@ impl ChartState {
         if let Some(last) = self.bars.last()
             && tag_fade > 0.0
         {
-            let y = price_rect.top() + scale.y_of(last.close) as f32;
-            if price_rect.y_range().contains(y) {
-                let col = if last.is_up() { theme::up() } else { theme::down() };
-                let mut xx = price_rect.left();
-                while xx < price_rect.right() {
-                    price_painter.hline(
-                        xx..=(xx + 3.0).min(price_rect.right()),
-                        y,
-                        Stroke::new(1.0, col.gamma_multiply(0.6 * tag_fade)),
+            if self.chart_type != ChartType::Renko && self.compare_axis != CompareAxis::Own && anchor.is_some() {
+                for (index, key) in self.data.comparisons.iter().enumerate() {
+                    if self.data.hidden_comparisons.contains(key) {
+                        continue;
+                    }
+                    let Some(extra) = self.comparisons.get(key) else { continue };
+                    let Some(raw) = extra.line.as_ref().and_then(last_finite) else { continue };
+                    let rebased = raw * extra.factor;
+                    let y = price_rect.top() + scale.y_of(rebased) as f32;
+                    if !price_rect.y_range().contains(y) {
+                        continue;
+                    }
+                    let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
+                    axis_painter.rect_filled(tag, 0.0, crate::chart_compare::color(index + 1).gamma_multiply(tag_fade));
+                    let decimals = scale::decimals_for(raw.abs() / 1000.0).clamp(2, 4);
+                    let text = match percent_base {
+                        Some(base) => axis_value(percent(rebased, base), 2, self.compare_axis),
+                        None => scale::format_price(raw, decimals),
+                    };
+                    axis_painter.text(
+                        tag.left_center() + vec2(5.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        text,
+                        mono(11.0),
+                        Color32::BLACK.gamma_multiply(tag_fade),
                     );
-                    xx += 6.0;
                 }
-                let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
-                axis_painter.rect_filled(tag, 0.0, col.gamma_multiply(tag_fade));
-                let text = match percent_base {
-                    Some(base) => axis_value(percent(last.close, base), 2, self.compare_axis),
-                    None => scale::format_price(last.close, self.sec.decimals(last.close)),
-                };
-                axis_painter.text(
-                    tag.left_center() + vec2(5.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    text,
-                    mono(11.0),
-                    Color32::BLACK.gamma_multiply(tag_fade),
-                );
             }
             // The comparison's last value: on the right axis when it shares it, else on the left one.
             if let Some(c) = &self.compare_line
@@ -1830,7 +1840,7 @@ impl ChartState {
                 && primary_visible
                 && (own_axis || anchor.is_some())
             {
-                let color = theme::series(5).gamma_multiply(tag_fade);
+                let color = theme::compare(0).gamma_multiply(tag_fade);
                 let ink = Color32::BLACK.gamma_multiply(tag_fade);
                 let decimals = scale::decimals_for(raw.abs() / 1000.0).clamp(2, 4);
                 match own_scale {
@@ -1869,6 +1879,32 @@ impl ChartState {
                         }
                     }
                 }
+            }
+            let y = price_rect.top() + scale.y_of(last.close) as f32;
+            if price_rect.y_range().contains(y) {
+                let col = if last.is_up() { theme::up() } else { theme::down() };
+                let mut xx = price_rect.left();
+                while xx < price_rect.right() {
+                    price_painter.hline(
+                        xx..=(xx + 3.0).min(price_rect.right()),
+                        y,
+                        Stroke::new(1.0, col.gamma_multiply(0.6 * tag_fade)),
+                    );
+                    xx += 6.0;
+                }
+                let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
+                axis_painter.rect_filled(tag, 0.0, col.gamma_multiply(tag_fade));
+                let text = match percent_base {
+                    Some(base) => axis_value(percent(last.close, base), 2, self.compare_axis),
+                    None => scale::format_price(last.close, self.sec.decimals(last.close)),
+                };
+                axis_painter.text(
+                    tag.left_center() + vec2(5.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    text,
+                    mono(11.0),
+                    Color32::BLACK.gamma_multiply(tag_fade),
+                );
             }
         }
 
@@ -2670,7 +2706,7 @@ impl ChartState {
                 self.replay_cutoff =
                     self.context_timestamp.or_else(|| self.source_bars.get(self.source_bars.len() / 2).map(|b| b.ts));
                 self.replay_play = false;
-                self.refresh_view(w);
+                ui.ctx().request_repaint();
                 ui.close();
             }
             ui.label("Replay uses loaded bars; live alerts keep monitoring independently.");
@@ -2996,7 +3032,9 @@ impl ChartState {
                 .map(|point| point[1] as f64)
                 .filter(|v| v.is_finite());
             let rel = raw.zip(self.compare_base).map(|(r, base)| percent(r * self.compare_scale, base));
-            let text = if self.data.hidden_comparisons.contains(sym) {
+            let text = if self.chart_type == ChartType::Renko {
+                format!("CMP {sym} · unavailable on Renko")
+            } else if self.data.hidden_comparisons.contains(sym) {
                 format!("CMP {sym} · hidden")
             } else if let Some(error) = &self.compare_error {
                 format!("CMP {sym} · {error}")
@@ -3008,12 +3046,20 @@ impl ChartState {
                     _ => format!("CMP {sym}"),
                 }
             };
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, text, mono(11.0), theme::series(5));
+            p.text(
+                pos2(price_rect.left() + 6.0, ly),
+                Align2::LEFT_TOP,
+                text,
+                mono(11.0),
+                if self.chart_type == ChartType::Renko { muted() } else { theme::compare(0) },
+            );
             ly += 14.0;
         }
         for (index, key) in self.data.comparisons.iter().enumerate() {
             let extra = self.comparisons.get(key);
-            let state = if self.data.hidden_comparisons.contains(key) {
+            let state = if self.chart_type == ChartType::Renko {
+                "unavailable on Renko".to_string()
+            } else if self.data.hidden_comparisons.contains(key) {
                 "hidden".to_string()
             } else if let Some(error) = extra.and_then(|s| s.error.as_ref()) {
                 error.clone()
@@ -3035,7 +3081,7 @@ impl ChartState {
                 Align2::LEFT_TOP,
                 format!("CMP {key} · {state}"),
                 mono(11.),
-                crate::chart_compare::color(index + 1),
+                if self.chart_type == ChartType::Renko { muted() } else { crate::chart_compare::color(index + 1) },
             );
             ly += 14.;
         }
@@ -3078,7 +3124,7 @@ impl ChartState {
                     format!("Anchored VWAP {v:.2}")
                 }),
                 mono(10.),
-                theme::series(1),
+                theme::text(),
             );
             ly += 14.;
         }
@@ -3621,7 +3667,7 @@ fn live_badge_rect(plot: Rect, text_width: f32) -> Rect {
 fn compare_overlay(line: &LineRef, scale: f64) -> Overlay {
     Overlay {
         line: line.clone(),
-        color: theme::rgba(theme::series(5)),
+        color: theme::rgba(theme::compare(0)),
         kind: LineKind::Line,
         scale,
         width: 1.3,
@@ -4124,6 +4170,41 @@ mod tests {
         assert!(chart.compare.is_none());
         assert!(chart.compare_line.is_none());
         assert!(!chart.compare_loading);
+    }
+
+    #[test]
+    fn charts_without_loaded_comparisons_have_no_percent_base() {
+        let ctx = egui::Context::default();
+        for chart_type in [ChartType::Candles, ChartType::Renko] {
+            for anchored in [false, true] {
+                let mut chart = sample_chart();
+                chart.chart_type = chart_type;
+                chart.data.analytics.anchor = anchored.then_some(chart.bars[0].ts);
+                chart_frame(&ctx, &mut chart, vec![]);
+                assert!(chart.compare_base.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn renko_comparison_legend_is_unavailable_even_with_stale_lines() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart.chart_type = ChartType::Renko;
+        chart.compare = Some("SPY US Equity".into());
+        chart.compare_loading = true;
+        chart.data.comparisons.push("QQQ US Equity".into());
+        let line = tr_chart::scene::line_ref(&vec![50.; chart.bars.len()]);
+        chart.compare_line = Some(line.clone());
+        chart.comparisons.insert(
+            "QQQ US Equity".into(),
+            crate::chart_compare::Series { line: Some(line), loading: true, ..Default::default() },
+        );
+        let labels = chart_frame(&ctx, &mut chart, vec![]);
+        for symbol in ["SPY US Equity", "QQQ US Equity"] {
+            assert!(labels.iter().any(|(text, _)| text == &format!("CMP {symbol} · unavailable on Renko")));
+        }
+        assert!(chart.compare_base.is_none());
     }
 
     #[test]

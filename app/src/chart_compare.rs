@@ -51,8 +51,7 @@ pub struct Series {
 }
 
 pub fn color(index: usize) -> egui::Color32 {
-    let base = theme::series(index + 5);
-    if index >= 6 { base.lerp_to_gamma(theme::text(), 0.35) } else { base }
+    theme::compare(index)
 }
 
 pub fn common_anchor(
@@ -61,6 +60,9 @@ pub fn common_anchor(
     lo: usize,
     hi: usize,
 ) -> Option<usize> {
+    if others.is_empty() {
+        return None;
+    }
     let valid = |line: &tr_chart::gpu::LineRef, i: usize| {
         line.pyramid
             .data
@@ -291,6 +293,12 @@ fn result_button(ui: &mut Ui, key: &str, name: &str, current: Option<&str>, chos
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn no_comparisons_have_no_anchor() {
+        let main = tr_chart::scene::line_ref(&[100., 101., 102.]);
+        assert_eq!(common_anchor(&main, &[], 0, 3), None);
+    }
+
     #[test]
     fn all_visible_series_share_one_anchor_and_missing_overlap_stays_unavailable() {
         let line = tr_chart::scene::line_ref;

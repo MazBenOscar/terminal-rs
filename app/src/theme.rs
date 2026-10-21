@@ -132,6 +132,18 @@ pub fn control_hover() -> Color32 {
 pub fn series(i: usize) -> Color32 {
     palette().series[i % 6]
 }
+pub fn compare(i: usize) -> Color32 {
+    [
+        series(5),
+        Color32::from_rgb(0xD9, 0x46, 0xEF),
+        Color32::from_rgb(0x14, 0xB8, 0xA6),
+        Color32::from_rgb(0x84, 0xCC, 0x16),
+        Color32::from_rgb(0xA7, 0x8B, 0xFA),
+        Color32::from_rgb(0xEA, 0xB3, 0x08),
+        Color32::from_rgb(0xB0, 0x89, 0x68),
+        Color32::from_rgb(0x94, 0xA3, 0xB8),
+    ][i % 8]
+}
 /// Selection/highlight wash derived from the accent colour.
 pub fn accent_wash() -> Color32 {
     let a = accent();
@@ -288,6 +300,22 @@ pub fn refresh(ctx: &egui::Context, t: &crate::themes::Theme, system_accent: Col
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comparisons_do_not_clash_with_studies() {
+        let original = palette();
+        for p in [Palette::dark(DEFAULT_ACCENT), crate::themes::terminal_light().palette(DEFAULT_ACCENT)] {
+            set_palette(p);
+            assert_eq!(compare(0), series(5));
+            for i in 0..8 {
+                assert_eq!(compare(i + 8), compare(i));
+                for j in 0..6 {
+                    assert_eq!(compare(i) == series(j), i == 0 && j == 5);
+                }
+            }
+        }
+        set_palette(original);
+    }
 
     #[test]
     fn palettes_are_readable() {
