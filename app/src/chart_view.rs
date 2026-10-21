@@ -199,6 +199,7 @@ pub struct ChartState {
     glide: Option<Glide>,
     /// Shown autoscale bounds (transformed) and whether they are log, easing to the target.
     shown_scale: Option<(f64, f64, bool)>,
+    current_scale: Option<PriceScale>,
     /// Renewed when a load's first bars arrive, which replays the load-in sweep.
     reveal_key: u64,
     /// Renewed when a load's first Congress markers arrive, which pops them in.
@@ -304,6 +305,7 @@ impl ChartState {
             manual_scale: None,
             glide: None,
             shown_scale: None,
+            current_scale: None,
             reveal_key: 0,
             markers_key: 0,
             loading: false,
@@ -601,6 +603,92 @@ impl ChartState {
         self.compare_error = None;
         self.compare_loading = false;
         self.request_compare(w);
+    }
+
+    fn toggle_quick_tool(&mut self, tool: Tool) {
+        if self.draw.tool == Some(tool) {
+            self.cancel();
+        } else {
+            self.start_tool(tool);
+        }
+    }
+
+    fn toggle_auto_scale(&mut self) {
+        if self.manual_scale.is_some() {
+            self.manual_scale = None;
+        } else {
+            self.manual_scale = self.current_scale;
+        }
+    }
+
+    fn log_scale_available(&self) -> bool {
+        let gpu = if self.chart_type == ChartType::HeikinAshi {
+            self.ha_gpu.as_ref().and_then(|(_, gpu)| gpu.as_ref()).or(self.gpu.as_ref())
+        } else {
+            self.gpu.as_ref()
+        };
+        let Some(gpu) = gpu else { return false };
+        let (lo, hi) = self.viewport.map_or((0, gpu.len()), |v| v.visible_range(gpu.len()));
+        gpu.bars.pyramid.extent(0, lo, hi).is_some_and(|(low, _, _)| low > 0.)
+    }
+
+    pub fn toggle_log_scale(&mut self) {
+        if !self.log_scale_available() {
+            return;
+        }
+        self.log = !self.log;
+        if let Some(scale) = self.manual_scale.as_mut() {
+            // PriceScale stores price-space bounds, not transformed bounds.
+            scale.log = self.log && scale.lo > 0.;
+        }
+        if let Some(scale) = self.current_scale.as_mut() {
+            scale.log = self.log && scale.lo > 0.;
+        }
+        self.shown_scale = None;
+    }
+
+    fn scale_menu(&mut self, ui: &mut Ui) {
+        let mut auto = self.manual_scale.is_none();
+        if ui.checkbox(&mut auto, "Auto scale").changed() {
+            self.toggle_auto_scale();
+        }
+        let mut log = self.log;
+        if ui
+            .add_enabled(self.log_scale_available(), egui::Checkbox::new(&mut log, "Log scale"))
+            .on_disabled_hover_text("Log scale needs positive prices")
+            .changed()
+        {
+            self.toggle_log_scale();
+        }
+    }
+
+    fn scale_chips(&mut self, ui: &mut Ui, rect: Rect) {
+        let size = theme::dp(24.).min(rect.width() / 2.);
+        for (index, label, pressed, hint) in [
+            (0, "A", self.manual_scale.is_none(), "Auto scale (fit visible data)"),
+            (1, "L", self.log, "Logarithmic scale"),
+        ] {
+            let chip =
+                Rect::from_min_size(pos2(rect.left() + index as f32 * size, rect.bottom() - size), vec2(size, size));
+            label_plate(ui.painter(), chip);
+            let response = ui
+                .scope_builder(UiBuilder::new().max_rect(chip).id_salt((self.id, label)), |ui| {
+                    ui.add_enabled(
+                        index == 0 || self.log_scale_available(),
+                        egui::Button::new(RichText::new(label).font(mono(11.))).selected(pressed).min_size(chip.size()),
+                    )
+                })
+                .inner
+                .on_hover_text(hint)
+                .on_disabled_hover_text("Log scale needs positive prices");
+            if response.clicked() {
+                if index == 0 {
+                    self.toggle_auto_scale();
+                } else {
+                    self.toggle_log_scale();
+                }
+            }
+        }
     }
 
     pub fn start_tool(&mut self, tool: Tool) {
@@ -1662,8 +1750,10 @@ impl ChartState {
         }
         let legend_rows =
             crate::chart_legend::rows(ui, &self.indicators, &self.built, price_rect, &legend_panes, legend_bar);
-        let over_legend =
-            ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| legend_rows.iter().any(|row| row.rect.contains(p)));
+        let favorites_rect = self.favorites_rect(ui, price_rect, &legend_rows);
+        let over_legend = ui
+            .input(|i| i.pointer.hover_pos())
+            .is_some_and(|p| favorites_rect.contains(p) || legend_rows.iter().any(|row| row.rect.contains(p)));
         let legend_action = crate::chart_legend::interact(ui, self.id, &legend_rows);
         // Register splitters after the plot so their drag target wins hit-testing,
         // including the first mouse-down when arriving from outside the chart.
@@ -1688,7 +1778,9 @@ impl ChartState {
         }
         let axis_rect =
             Rect::from_min_max(pos2(price_rect.right(), price_rect.top()), pos2(body.right(), price_rect.bottom()));
-        let axis_resp = ui.interact(axis_rect, ui.id().with((self.id, "paxis")), Sense::click_and_drag());
+        let chips_height = theme::dp(24.).min(axis_rect.width() / 2.);
+        let axis_drag_rect = Rect::from_min_max(axis_rect.min, axis_rect.max - vec2(0., chips_height));
+        let axis_resp = ui.interact(axis_drag_rect, ui.id().with((self.id, "paxis")), Sense::click_and_drag());
         let time_rect =
             Rect::from_min_max(pos2(plot_all.left(), plot_all.bottom()), pos2(plot_all.right(), body.bottom()));
         let time_resp = ui.interact(time_rect, ui.id().with((self.id, "taxis")), Sense::click_and_drag());
@@ -1877,6 +1969,7 @@ impl ChartState {
         let mut out = scene::price_pane(&pane);
         let mut scale = out.scale;
         scale.height_px = price_rect.height() as f64;
+        self.current_scale = Some(scale);
         if self.draw.tool.is_none() && !over_legend {
             if plot_resp.secondary_clicked() {
                 self.context_timestamp = plot_resp
@@ -2304,6 +2397,8 @@ impl ChartState {
             }
         }
         self.paint_legend(ui, price_rect, hovered_bar.unwrap_or(len.saturating_sub(1)), &legend_rows);
+        self.favorites_strip(ui, favorites_rect);
+        self.scale_chips(ui, axis_rect);
         if matches!(self.sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf) {
             clicked |= self.trade_buttons(ui, plot_all);
         }
@@ -3256,8 +3351,117 @@ impl ChartState {
         });
     }
 
+    fn tool_shortcut(tool: Tool) -> &'static str {
+        match tool {
+            Tool::Trendline => "Alt+T",
+            Tool::Horizontal => "Alt+H",
+            Tool::Vertical => "Alt+V",
+            Tool::Fib => "Alt+F",
+            _ => "",
+        }
+    }
+
+    fn drawing_tools_menu(&mut self, ui: &mut Ui) {
+        let mut favorites = crate::prefs::drawing_favorites(ui.ctx());
+        for tool in Tool::ALL {
+            ui.push_id(tool, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(
+                            vec2(theme::dp(210.), theme::dp(24.)),
+                            egui::Button::new(tool.label()).shortcut_text(Self::tool_shortcut(tool)),
+                        )
+                        .clicked()
+                    {
+                        self.start_tool(tool);
+                        ui.close();
+                    }
+                    let active = favorites.0.contains(&tool);
+                    let hint = if active { "Remove from favorites" } else { "Add to favorites" };
+                    if widgets::icon_button(ui, widgets::Icon::Star, hint, active).clicked() {
+                        crate::prefs::toggle_drawing_favorite(&mut favorites.0, tool);
+                    }
+                });
+            });
+        }
+        ui.checkbox(&mut favorites.1, "Show favorites toolbar");
+        crate::prefs::set_drawing_favorites(ui.ctx(), favorites);
+    }
+
+    fn favorites_rect(&self, ui: &Ui, price: Rect, rows: &[crate::chart_legend::Row]) -> Rect {
+        let (favorites, shown) = crate::prefs::drawing_favorites(ui.ctx());
+        if !shown || favorites.is_empty() || self.replay_cutoff.is_some() || self.chart_type == ChartType::Renko {
+            return Rect::NOTHING;
+        }
+        let top = self.legend_bottom(price, rows) + theme::dp(4.);
+        let size = theme::dp(24.);
+        let slots = ((price.bottom() - top - 2.) / size).floor().max(0.) as usize;
+        Rect::from_min_size(
+            pos2(price.left() + theme::dp(6.), top),
+            vec2(size, size * slots.min(favorites.len()) as f32),
+        )
+    }
+
+    fn favorites_strip(&mut self, ui: &mut Ui, rect: Rect) {
+        if !rect.is_positive() {
+            return;
+        }
+        let (favorites, _) = crate::prefs::drawing_favorites(ui.ctx());
+        let size = theme::dp(24.);
+        let slots = (rect.height() / size).round() as usize;
+        let overflow = favorites.len() > slots;
+        let count = if overflow { slots.saturating_sub(1) } else { slots };
+        label_plate(ui.painter(), rect);
+        for (index, &tool) in favorites.iter().take(count).enumerate() {
+            let button = Rect::from_min_size(rect.min + vec2(0., index as f32 * size), vec2(size, size));
+            let shortcut = Self::tool_shortcut(tool);
+            let hint =
+                if shortcut.is_empty() { tool.label().to_string() } else { format!("{} ({shortcut})", tool.label()) };
+            let response = ui
+                .scope_builder(UiBuilder::new().max_rect(button).id_salt((self.id, "favorite", tool)), |ui| {
+                    ui.spacing_mut().button_padding = vec2(theme::dp(2.), theme::dp(2.));
+                    ui.add_sized(
+                        button.size(),
+                        egui::Button::new(RichText::new(tool.abbrev()).font(mono(10.)))
+                            .selected(self.draw.tool == Some(tool)),
+                    )
+                })
+                .inner
+                .on_hover_text(hint);
+            if response.clicked() {
+                self.toggle_quick_tool(tool);
+            }
+        }
+        if overflow {
+            let button = Rect::from_min_size(rect.min + vec2(0., count as f32 * size), vec2(size, size));
+            ui.scope_builder(UiBuilder::new().max_rect(button).id_salt((self.id, "favorites-overflow")), |ui| {
+                ui.spacing_mut().button_padding = vec2(theme::dp(2.), theme::dp(2.));
+                ui.menu_button(RichText::new(format!("+{}", favorites.len() - count)).font(mono(10.)), |ui| {
+                    self.draw_menu(ui)
+                })
+                .response
+                .on_hover_text("Draw");
+            });
+        }
+    }
+
+    fn legend_study_bottom(price: Rect, rows: &[crate::chart_legend::Row]) -> f32 {
+        price.top() + 20. + rows.iter().filter(|row| price.contains(row.rect.center())).count() as f32 * 14.
+    }
+
+    /// Shared with the favorites layout so every legend line reserves its height.
+    fn legend_bottom(&self, price: Rect, rows: &[crate::chart_legend::Row]) -> f32 {
+        let hidden = study_groups(&self.built).iter().filter(|(key, _)| key.is_some()).count() > MAX_SUB_PANES;
+        Self::legend_study_bottom(price, rows)
+            + 14.
+                * (usize::from(hidden)
+                    + self.compare.iter().count()
+                    + self.data.comparisons.len()
+                    + usize::from(self.data.analytics.anchor.is_some())
+                    + usize::from(self.draw.tool.is_some())) as f32
+    }
+
     fn view_menu(&mut self, ui: &mut Ui, w: &Worker) {
-        use crate::price_alerts::Action as AlertAction;
         ui.menu_button("Chart type", |ui| {
             for ct in ChartType::ALL {
                 if ui.radio(self.chart_type == ct, ct.label()).clicked() {
@@ -3315,114 +3519,93 @@ impl ChartState {
                 ui.close();
             }
         });
-        ui.menu_button("Draw", |ui| {
-            if ui
-                .add_enabled(
-                    self.draw.selected.is_some(),
-                    egui::Button::new("Delete selected drawing").shortcut_text("Delete"),
-                )
-                .clicked()
-            {
-                self.delete_selected();
-                ui.close();
-            }
-            let alt = if cfg!(target_os = "macos") { "⌥" } else { "Alt+" };
-            for (tool, key) in
-                [(Tool::Trendline, "T"), (Tool::Horizontal, "H"), (Tool::Vertical, "V"), (Tool::Fib, "F")]
-            {
-                if ui.add(egui::Button::new(tool.label()).shortcut_text(format!("{alt}{key}"))).clicked() {
-                    self.start_tool(tool);
-                    ui.close();
-                }
-            }
-            for tool in [
-                Tool::Measure,
-                Tool::Rectangle,
-                Tool::Ray,
-                Tool::Channel,
-                Tool::Text,
-                Tool::FibExtension,
-                Tool::Pitchfork,
-                Tool::LongPosition,
-                Tool::ShortPosition,
-            ] {
-                if ui.button(tool.label()).clicked() {
-                    self.start_tool(tool);
-                    ui.close();
-                }
-            }
-            if ui.add_enabled(!self.drawing_undo.is_empty(), egui::Button::new("Undo drawing edit")).clicked() {
-                self.undo_drawings();
-                ui.close();
-            }
-            if ui.add_enabled(!self.drawing_redo.is_empty(), egui::Button::new("Redo drawing edit")).clicked() {
-                self.redo_drawings();
-                ui.close();
-            }
-            if let Some(index) = self.draw.selected.filter(|&i| i < self.drawings.len()) {
-                ui.separator();
-                let mut edited = self.drawings[index].clone();
-                ui.label(format!("Selected {}", edited.tool.label()));
-                if matches!(edited.tool, Tool::Trendline | Tool::Ray | Tool::Horizontal)
-                    && ui.button("Alert on saved line…").clicked()
-                {
-                    let (a, b) = if edited.a.ts <= edited.b.ts { (edited.a, edited.b) } else { (edited.b, edited.a) };
-                    let (start, end, first, last) = if edited.tool == Tool::Horizontal {
-                        (a.ts, a.ts + 60, a.price, a.price)
-                    } else {
-                        (a.ts, b.ts, a.price, b.price)
-                    };
-                    self.price_alert_actions.push(AlertAction::Condition {
-                        symbol: self.symbol.clone(),
-                        level: 0.,
-                        rule: tr_core::price_alerts::Rule::Line { start, end, first, last, logarithmic: self.log },
-                    });
-                    ui.close();
-                }
-                if edited.tool == Tool::Text && ui.button("Edit text…").clicked() {
-                    self.draw.note = Some(NoteDraft {
-                        anchor: edited.a,
-                        text: edited.text.clone(),
-                        existing: Some((index, edited.clone())),
-                    });
-                    ui.close();
-                }
-                ui.add(egui::DragValue::new(&mut edited.width).range(0.5..=6.0).speed(0.1).prefix("Width "));
-                let mut custom = edited.color.is_some();
-                if ui.checkbox(&mut custom, "Custom drawing color").changed() {
-                    edited.color = custom.then_some(theme::cyan().to_array()[..3].try_into().unwrap());
-                }
-                if let Some(color) = &mut edited.color {
-                    ui.color_edit_button_srgb(color);
-                }
-                if ui.checkbox(&mut edited.all_symbols, "Show on all symbols").changed() && !edited.all_symbols {
-                    edited.symbol = Some(self.symbol.clone());
-                }
-                if edited.tool == Tool::Trendline {
-                    ui.checkbox(&mut edited.extend_left, "Extend left");
-                    ui.checkbox(&mut edited.extend_right, "Extend right");
-                }
-                if edited != self.drawings[index] {
-                    self.remember_drawings();
-                    self.drawings[index] = edited;
-                }
-            }
-            if ui.button("Remove drawings on this symbol").clicked() {
-                self.remember_drawings();
-                self.drawings.retain(|d| !d.visible_on(&self.symbol));
-                self.draw = DrawState::default();
-                ui.close();
-            }
-        });
+        ui.menu_button("Draw", |ui| self.draw_menu(ui));
         if ui.button("Compare symbol…").clicked() {
             self.compare_picker.open();
             ui.close();
         }
-        ui.checkbox(&mut self.log, "Log scale");
+        self.scale_menu(ui);
         ui.checkbox(&mut self.show_volume, "Volume");
         ui.checkbox(&mut self.magnet, "Magnet");
         if ui.button("Reset view").clicked() {
             self.reset_view();
+            ui.close();
+        }
+    }
+
+    fn draw_menu(&mut self, ui: &mut Ui) {
+        use crate::price_alerts::Action as AlertAction;
+        if ui
+            .add_enabled(
+                self.draw.selected.is_some(),
+                egui::Button::new("Delete selected drawing").shortcut_text("Delete"),
+            )
+            .clicked()
+        {
+            self.delete_selected();
+            ui.close();
+        }
+        self.drawing_tools_menu(ui);
+        if ui.add_enabled(!self.drawing_undo.is_empty(), egui::Button::new("Undo drawing edit")).clicked() {
+            self.undo_drawings();
+            ui.close();
+        }
+        if ui.add_enabled(!self.drawing_redo.is_empty(), egui::Button::new("Redo drawing edit")).clicked() {
+            self.redo_drawings();
+            ui.close();
+        }
+        if let Some(index) = self.draw.selected.filter(|&i| i < self.drawings.len()) {
+            ui.separator();
+            let mut edited = self.drawings[index].clone();
+            ui.label(format!("Selected {}", edited.tool.label()));
+            if matches!(edited.tool, Tool::Trendline | Tool::Ray | Tool::Horizontal)
+                && ui.button("Alert on saved line…").clicked()
+            {
+                let (a, b) = if edited.a.ts <= edited.b.ts { (edited.a, edited.b) } else { (edited.b, edited.a) };
+                let (start, end, first, last) = if edited.tool == Tool::Horizontal {
+                    (a.ts, a.ts + 60, a.price, a.price)
+                } else {
+                    (a.ts, b.ts, a.price, b.price)
+                };
+                self.price_alert_actions.push(AlertAction::Condition {
+                    symbol: self.symbol.clone(),
+                    level: 0.,
+                    rule: tr_core::price_alerts::Rule::Line { start, end, first, last, logarithmic: self.log },
+                });
+                ui.close();
+            }
+            if edited.tool == Tool::Text && ui.button("Edit text…").clicked() {
+                self.draw.note = Some(NoteDraft {
+                    anchor: edited.a,
+                    text: edited.text.clone(),
+                    existing: Some((index, edited.clone())),
+                });
+                ui.close();
+            }
+            ui.add(egui::DragValue::new(&mut edited.width).range(0.5..=6.0).speed(0.1).prefix("Width "));
+            let mut custom = edited.color.is_some();
+            if ui.checkbox(&mut custom, "Custom drawing color").changed() {
+                edited.color = custom.then_some(theme::cyan().to_array()[..3].try_into().unwrap());
+            }
+            if let Some(color) = &mut edited.color {
+                ui.color_edit_button_srgb(color);
+            }
+            if ui.checkbox(&mut edited.all_symbols, "Show on all symbols").changed() && !edited.all_symbols {
+                edited.symbol = Some(self.symbol.clone());
+            }
+            if edited.tool == Tool::Trendline {
+                ui.checkbox(&mut edited.extend_left, "Extend left");
+                ui.checkbox(&mut edited.extend_right, "Extend right");
+            }
+            if edited != self.drawings[index] {
+                self.remember_drawings();
+                self.drawings[index] = edited;
+            }
+        }
+        if ui.button("Remove drawings on this symbol").clicked() {
+            self.remember_drawings();
+            self.drawings.retain(|d| !d.visible_on(&self.symbol));
+            self.draw = DrawState::default();
             ui.close();
         }
     }
@@ -3450,7 +3633,7 @@ impl ChartState {
         put(format!("Vol {}", scale::format_volume(b.volume)), muted(), &mut x);
 
         let groups = study_groups(&self.built);
-        let mut ly = y + 16.0 + rows.iter().filter(|row| price_rect.contains(row.rect.center())).count() as f32 * 14.0;
+        let mut ly = Self::legend_study_bottom(price_rect, rows);
         let hidden = groups.iter().filter(|(key, _)| key.is_some()).count().saturating_sub(MAX_SUB_PANES);
         if hidden > 0 {
             let note =
@@ -4893,6 +5076,152 @@ mod tests {
             chart.redo_drawings();
             assert_eq!(chart.drawings.len(), 1);
         }
+    }
+
+    #[test]
+    fn favorites_strip_click_starts_and_cancels_without_points_or_pan() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        for expected in [Some(Tool::Trendline), None] {
+            let labels = chart_frame(&ctx, &mut chart, vec![]);
+            let button = labels.iter().find(|(text, _)| text == "TL").unwrap().1.center();
+            let viewport = chart.viewport;
+            click_chart(&ctx, &mut chart, button);
+            assert_eq!(chart.draw.tool, expected);
+            assert!(chart.draw.pending.is_none() && chart.draw.second.is_none());
+            assert!(chart.drawings.is_empty());
+            assert_eq!(chart.viewport, viewport);
+        }
+        chart.start_tool(Tool::Fib);
+        assert!(chart.cancel());
+        assert!(chart.draw.tool.is_none());
+    }
+
+    #[test]
+    fn favorites_strip_reserves_legend_height_and_collapses_with_draw_overflow() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        crate::prefs::set_drawing_favorites(&ctx, (Tool::ALL.to_vec(), true));
+        let price = Rect::from_min_size(pos2(10., 10.), vec2(700., 80.));
+        let labels = ui_frame(&ctx, vec![], |ui| {
+            let rect = chart.favorites_rect(ui, price, &[]);
+            assert!(rect.top() > chart.legend_bottom(price, &[]));
+            assert!(rect.bottom() <= price.bottom());
+            chart.favorites_strip(ui, rect);
+        });
+        let overflow = labels.iter().find(|(text, _)| text == "+12").unwrap().1.center();
+        for event in
+            [egui::Event::PointerMoved(overflow), pointer_button(overflow, true), pointer_button(overflow, false)]
+        {
+            ui_frame(&ctx, vec![event], |ui| {
+                let rect = chart.favorites_rect(ui, price, &[]);
+                chart.favorites_strip(ui, rect);
+            });
+        }
+        let labels = ui_frame(&ctx, vec![], |ui| {
+            let rect = chart.favorites_rect(ui, price, &[]);
+            chart.favorites_strip(ui, rect);
+        });
+        assert!(labels.iter().any(|(text, _)| text == "Show favorites toolbar"));
+        assert!(labels.iter().any(|(text, _)| text == "Trendline"));
+        ui_frame(&ctx, vec![], |ui| {
+            chart.replay_cutoff = Some(1);
+            assert_eq!(chart.favorites_rect(ui, price, &[]), Rect::NOTHING);
+            chart.replay_cutoff = None;
+            chart.chart_type = ChartType::Renko;
+            assert_eq!(chart.favorites_rect(ui, price, &[]), Rect::NOTHING);
+            chart.chart_type = ChartType::Candles;
+            crate::prefs::set_drawing_favorites(ui.ctx(), (Tool::ALL.to_vec(), false));
+            assert_eq!(chart.favorites_rect(ui, price, &[]), Rect::NOTHING);
+        });
+    }
+
+    #[test]
+    fn scale_chips_pin_refit_and_toggle_log_without_changing_time_viewport() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart_frame(&ctx, &mut chart, vec![]);
+        let viewport = chart.viewport;
+        let shown = chart.current_scale.unwrap();
+        let labels = chart_frame(&ctx, &mut chart, vec![]);
+        let auto = labels.iter().find(|(text, _)| text == "A").unwrap().1.center();
+        click_chart(&ctx, &mut chart, auto);
+        assert_eq!(chart.manual_scale, Some(shown));
+        assert_eq!(chart.viewport, viewport);
+        let labels = chart_frame(&ctx, &mut chart, vec![]);
+        let log = labels.iter().find(|(text, _)| text == "L").unwrap().1.center();
+        click_chart(&ctx, &mut chart, log);
+        assert!(chart.log);
+        let manual = chart.manual_scale.unwrap();
+        assert!(manual.log);
+        assert_eq!((manual.lo, manual.hi), (shown.lo, shown.hi));
+        assert!((manual.price_at(0.) - shown.price_at(0.)).abs() < 1e-9);
+        assert!((manual.price_at(manual.height_px) - shown.price_at(shown.height_px)).abs() < 1e-9);
+        click_chart(&ctx, &mut chart, auto);
+        assert!(chart.manual_scale.is_none());
+        assert!(chart.log);
+        assert_eq!(chart.viewport, viewport);
+        click_chart(&ctx, &mut chart, log);
+        assert!(!chart.log);
+        assert!(chart.manual_scale.is_none());
+        assert_eq!(chart.viewport, viewport);
+    }
+
+    #[test]
+    fn log_scale_is_disabled_for_displayed_nonpositive_lows_including_ha_and_renko() {
+        for chart_type in [ChartType::Candles, ChartType::HeikinAshi, ChartType::Renko] {
+            let ctx = egui::Context::default();
+            let mut chart = sample_chart();
+            chart.chart_type = chart_type;
+            chart.viewport = Some(Viewport::fit_last(chart.bars.len(), 160, 800.));
+            let mut bars = chart.bars.as_ref().clone();
+            bars.last_mut().unwrap().low = 0.;
+            let gpu = SeriesGpu::build(&bars);
+            if chart_type == ChartType::HeikinAshi {
+                chart.ha_gpu = Some((chart.bars.clone(), Some(gpu)));
+            } else {
+                chart.gpu = Some(gpu);
+            }
+            assert!(!chart.log_scale_available());
+            chart.toggle_log_scale();
+            assert!(!chart.log);
+            let rect = Rect::from_min_size(pos2(700., 400.), vec2(66., 100.));
+            let labels = ui_frame(&ctx, vec![], |ui| chart.scale_chips(ui, rect));
+            let log = labels.iter().find(|(text, _)| text == "L").unwrap().1.center();
+            for event in [egui::Event::PointerMoved(log), pointer_button(log, true), pointer_button(log, false)] {
+                ui_frame(&ctx, vec![event], |ui| chart.scale_chips(ui, rect));
+            }
+            assert!(!chart.log);
+            chart.viewport = Some(Viewport { right: 100., bar_px: 8., width_px: 500. });
+            assert!(chart.log_scale_available(), "offscreen nonpositive lows do not disable log");
+        }
+    }
+
+    #[test]
+    fn view_scale_checkboxes_share_chip_state_and_preserve_manual_range() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart_frame(&ctx, &mut chart, vec![]);
+        let viewport = chart.viewport;
+        let shown = chart.current_scale.unwrap();
+        for label in ["Auto scale", "Log scale", "Auto scale", "Log scale"] {
+            let labels = ui_frame(&ctx, vec![], |ui| chart.view_menu(ui, &Worker::inert()));
+            let pos = labels.iter().find(|(text, _)| text == label).unwrap().1.center();
+            for event in [egui::Event::PointerMoved(pos), pointer_button(pos, true), pointer_button(pos, false)] {
+                ui_frame(&ctx, vec![event], |ui| chart.view_menu(ui, &Worker::inert()));
+            }
+            match (label, chart.log) {
+                ("Auto scale", false) => assert_eq!(chart.manual_scale, Some(shown)),
+                ("Log scale", true) => {
+                    let manual = chart.manual_scale.unwrap();
+                    assert_eq!((manual.lo, manual.hi), (shown.lo, shown.hi));
+                    assert!(manual.log);
+                }
+                _ => assert!(chart.manual_scale.is_none()),
+            }
+            assert_eq!(chart.viewport, viewport);
+        }
+        assert!(!chart.log && chart.manual_scale.is_none());
     }
 
     #[test]
