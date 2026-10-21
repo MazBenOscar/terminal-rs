@@ -6970,7 +6970,7 @@
     "note": "Output first-finite indexes are illustrative observations; numerical results not TC2000 parity proof",
     "timeframe": "D1"
   },
-  "repository_root": "C:/Users/mbakh/Documents/coding/terminal-rs",
+  "repository_root": ".",
   "summary": {
     "by_category": {
       "Bands & Channels": 8,

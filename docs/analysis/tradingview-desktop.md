@@ -41,13 +41,8 @@ Each selected text's hash was checked against its source-map entry. Nothing from
 the target was executed. Raw sources, assets and the REA evidence bundle are
 kept outside Git; only this independent report is committed.
 
-Local evidence directory:
-
-```text
-C:/Users/mbakh/.codex/visualizations/2026/10/20/01a15a59-5636-72c0-9352-b7a20879886e/tradingview-desktop
-```
-
-It contains `asar-inventory.json`, `expanded-map-provenance.json` (source ordinals,
+The local evidence directory (a session scratch folder, kept off the repository)
+contains `asar-inventory.json`, `expanded-map-provenance.json` (source ordinals,
 paths and hashes), selected source texts, and
 `tradingview-desktop-rea-evidence.json` (332,051,241 bytes; 129 retained records).
 The export's envelope reports zero unknown records; that is **not** a statement

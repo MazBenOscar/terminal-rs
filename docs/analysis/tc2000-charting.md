@@ -40,8 +40,8 @@ Charting assembly SHA-256:
 | P | `ev_65e97e80a8201b7664c47af9fdcefa7bc366cc35235073bcefd5d198fab63bb3` | PlotBase, LinePlotEditor, templates |
 | D | `ev_af008cc9b89af17b0398e123e59b66eb461f453a6500c21a2b92dfb19d18be1e` | Drawing manipulation, style, Pane, ScaleLayer |
 
-Portable evidence is outside Git at the session scratch directory:
-`C:\Users\mbakh\.codex\visualizations\2026\10\20\01a15a59-5636-72c0-9352-b7a20879886e\tc2000-analysis\chart-tools-evidence.json`.
+Portable evidence is outside Git in the session scratch directory, as
+`tc2000-analysis/chart-tools-evidence.json`.
 It contains 57 records, approximately 129 MB. This document contains feature
 descriptions and independent Rust design proposals, not proprietary code/assets.
 
