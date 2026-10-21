@@ -1774,6 +1774,43 @@ mod tests {
         assert!(study_history_fresh(&c, 100, 0, 2, 200), "exhausted provider covers earlier starts");
     }
 
+    /// Replay moves `end` backwards. The cache may keep bars past the cutoff; the
+    /// evaluator must still be fresh to reuse them (causal indicators only read
+    /// past study bars).
+    #[test]
+    fn study_history_fresh_reuses_history_when_replay_moves_end_backwards() {
+        let c = StudyHistory {
+            bars: Arc::new(vec![Bar::new(10, 1., 1., 1., 1., 1.), Bar::new(50, 1., 1., 1., 1., 1.)]),
+            end: 100,
+            limit: 10,
+            fetched_at: Instant::now() - Duration::from_secs(61),
+        };
+        // Historical end (already past) needs no freshness window.
+        assert!(study_history_fresh(&c, 40, 10, 5, 1_000));
+        // Forward still requires a newer end.
+        assert!(!study_history_fresh(&c, 101, 10, 5, 1_000));
+    }
+
+    /// A full page whose oldest bar is still after `start` is not covered. The
+    /// freshness rule must reject it so the worker refetches a wider window
+    /// instead of evaluating studies over a silently truncated history.
+    #[test]
+    fn study_history_fresh_rejects_full_pages_that_do_not_reach_start() {
+        let c = StudyHistory {
+            bars: Arc::new((0..5).map(|i| Bar::new(50 + i, 1., 1., 1., 1., 1.)).collect()),
+            end: 100,
+            limit: 5,
+            fetched_at: Instant::now(),
+        };
+        // Oldest bar (ts=50) is after the requested start (ts=10): no coverage.
+        assert!(!study_history_fresh(&c, 100, 10, 5, 1_000));
+        // Once the chart starts inside the page, coverage is satisfied.
+        assert!(study_history_fresh(&c, 100, 50, 5, 1_000));
+        // A partial page means the provider is exhausted and covers earlier starts.
+        let short = StudyHistory { bars: Arc::new(vec![Bar::new(80, 1., 1., 1., 1., 1.)]), ..c };
+        assert!(study_history_fresh(&short, 100, 10, 5, 1_000));
+    }
+
     #[test]
     fn condition_rules_share_history_requests_but_keep_their_own_values() {
         use std::sync::atomic::{AtomicUsize, Ordering};
