@@ -1982,6 +1982,11 @@ impl ChartState {
             Rect::from_min_max(pos2(price_rect.right(), price_rect.top()), pos2(body.right(), price_rect.bottom()));
         let chips_height = theme::dp(24.).min(axis_rect.width() / 2.);
         let axis_drag_rect = Rect::from_min_max(axis_rect.min, axis_rect.max - vec2(0., chips_height));
+        // Keep labels and tags clear of the scale controls without changing the price transform.
+        let axis_labels_rect = Rect::from_min_max(
+            axis_rect.min,
+            pos2(axis_rect.right(), (axis_rect.bottom() - chips_height - theme::dp(4.)).max(axis_rect.top())),
+        );
         let axis_resp = ui.interact(axis_drag_rect, ui.id().with((self.id, "paxis")), Sense::click_and_drag());
         let time_rect =
             Rect::from_min_max(pos2(plot_all.left(), plot_all.bottom()), pos2(plot_all.right(), body.bottom()));
@@ -2330,7 +2335,7 @@ impl ChartState {
             if positive_prices && *t < 0.0 {
                 continue;
             }
-            if y > price_rect.top() + 6.0 && y < price_rect.bottom() - 6.0 {
+            if y > axis_labels_rect.top() + 6.0 && y < axis_labels_rect.bottom() - 6.0 {
                 axis_painter.text(pos2(plot_all.right() + 6.0, y), Align2::LEFT_CENTER, label, mono(11.0), muted());
             }
         }
@@ -2478,7 +2483,7 @@ impl ChartState {
         }
 
         let desired: Vec<_> = right_tags.iter().map(|(y, _, _)| (*y, 16.)).collect();
-        let positions = spread_tags(&desired, fixed_tag, price_rect.top(), price_rect.bottom());
+        let positions = spread_tags(&desired, fixed_tag, axis_labels_rect.top(), axis_labels_rect.bottom());
         for ((true_y, color, text), y) in right_tags.into_iter().zip(positions) {
             let tag = Rect::from_min_size(pos2(plot_all.right() + 1., y - 8.), vec2(AXIS_W - 2., 16.));
             if (y - true_y).abs() > 3. {
@@ -2569,7 +2574,8 @@ impl ChartState {
             dashed_h(&plot_painter, plot_all.x_range(), p.y, ch);
             if price_rect.contains(p) {
                 let price = scale.price_at((p.y - price_rect.top()) as f64);
-                let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, p.y - 8.0), vec2(AXIS_W - 2.0, 16.0));
+                let y = spread_tags(&[(p.y, 16.)], None, axis_labels_rect.top(), axis_labels_rect.bottom())[0];
+                let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
                 axis_painter.rect_filled(tag, 0.0, Color32::from_gray(70));
                 let label = match percent_base {
                     Some(base) => axis_value(percent(price, base), 2, self.compare_axis),
@@ -4674,6 +4680,7 @@ fn spread_tags(desired: &[(f32, f32)], fixed: Option<usize>, lo: f32, hi: f32) -
     let mut out = vec![0.; desired.len()];
     if let Some((position, i)) = fixed.and_then(|i| indices.iter().position(|&j| j == i).map(|p| (p, i))) {
         let (y, height) = desired[i];
+        let y = y.clamp(lo + height / 2., (hi - height / 2.).max(lo + height / 2.));
         out[i] = y;
         block(&indices[..position], desired, &mut out, lo, y - height / 2. - 1.);
         block(&indices[position + 1..], desired, &mut out, y + height / 2. + 1., hi);
@@ -4863,6 +4870,8 @@ mod tests {
             }
         }
         assert_eq!(spread_tags(&[(20., 16.), (60., 16.)], None, 0., 100.), vec![20., 60.]);
+        assert_eq!(spread_tags(&[(98., 16.)], Some(0), 0., 100.), vec![92.]);
+        assert_eq!(spread_tags(&[(2., 16.)], Some(0), 0., 100.), vec![8.]);
     }
 
     #[test]
@@ -5679,6 +5688,40 @@ mod tests {
             crate::prefs::set_drawing_favorites(ui.ctx(), (Tool::ALL.to_vec(), false));
             assert_eq!(chart.favorites_rect(ui, price, &[]), Rect::NOTHING);
         });
+    }
+
+    #[test]
+    fn price_axis_tick_labels_do_not_overlap_scale_chips() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        // Put the 100 tick near the bottom, where it used to be covered by the chips.
+        chart.manual_scale = Some(PriceScale::new(98., 200., false, 400.));
+        chart_frame(&ctx, &mut chart, vec![]);
+        let labels = chart_frame(&ctx, &mut chart, vec![]);
+        let plot = chart.favorites_plot;
+        let size = theme::dp(24.).min(AXIS_W / 2.);
+        let chips = [0., 1.].map(|index| {
+            Rect::from_min_size(pos2(plot.right() + index * size, plot.bottom() - size), vec2(size, size))
+        });
+        for label in ["A", "L"] {
+            let rect = labels.iter().find(|(text, _)| text == label).unwrap().1;
+            assert!(chips.iter().any(|chip| chip.contains_rect(rect)));
+        }
+        let ticks: Vec<_> = labels
+            .iter()
+            .filter(|(text, rect)| {
+                rect.left() >= plot.right()
+                    && rect.center().y >= plot.top()
+                    && rect.center().y <= plot.bottom()
+                    && text.parse::<f64>().is_ok()
+            })
+            .collect();
+        assert!(!ticks.is_empty(), "the headless frame must paint price-axis labels");
+        for (text, rect) in ticks {
+            for chip in chips {
+                assert!(!rect.intersects(chip), "price-axis label {text} at {rect:?} overlaps chip {chip:?}");
+            }
+        }
     }
 
     #[test]
