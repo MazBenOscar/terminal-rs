@@ -132,6 +132,22 @@ impl TerminalApp {
                 }
             }
             PaneKind::Scanner(s) => {
+                ui.data_mut(|d| d.insert_temp(egui::Id::new("security-names"), self.security_names.clone()));
+                let market = s.universe != tr_data::universe::Universe::Watchlist;
+                let shown = s
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        let outcome = row
+                            .evaluation
+                            .as_ref()
+                            .map(|e| e.outcome)
+                            .unwrap_or(tr_core::scanner::ScanOutcome::Unavailable);
+                        !(s.matches_only && outcome == tr_core::scanner::ScanOutcome::NoMatch
+                            || market && !s.show_unavailable && outcome == tr_core::scanner::ScanOutcome::Unavailable)
+                    })
+                    .map(|r| r.symbol.clone());
+                crate::security_names::request(ui, &self.security_names, &self.worker, &self.provider, shown);
                 let bulk_ready = self.broker.questrade.as_ref().is_some_and(|q| q.is_configured());
                 actions.extend(super::scanner_view::show_named(
                     ui,
@@ -288,12 +304,48 @@ impl TerminalApp {
         let p = ui.painter();
         p.rect_filled(hdr, theme::CONTROL_RADIUS, theme::header());
         let extra = self.watch_columns.columns.len().min(((w - dp(380.0)).max(0.0) / dp(85.0)) as usize);
-        let base = if extra == 0 { 1.0 } else { (dp(380.0) / w).max(0.45) };
+        let show_name =
+            crate::security_names::show_column(w, self.watch_columns.columns.len(), self.watch_columns.show_name);
+        let name_width = if show_name { dp(150.0) } else { 0.0 };
+        let base = if extra == 0 { 1.0 } else { (dp(380.0) / (w - name_width)).max(0.45) };
         let mut cols = vec![0.0, 0.34 * base, 0.58 * base, 0.79 * base, base];
         for i in 0..extra {
             cols.push(base + (1.0 - base) * (i + 1) as f32 / extra as f32);
         }
-        let col = |r: Rect, k: usize| r.left() + 8.0 + (r.width() - 16.0) * cols[k];
+        let col = |r: Rect, k: usize| {
+            r.left() + 8.0 + (r.width() - 16.0 - name_width) * cols[k] + if k > 0 { name_width } else { 0.0 }
+        };
+        let name_left = col(hdr, 1) - name_width;
+        if show_name {
+            let title = match self.watch_sort {
+                Some((usize::MAX, false)) => "Name ▲",
+                Some((usize::MAX, true)) => "Name ▼",
+                _ => "Name",
+            };
+            p.text(pos2(name_left, hdr.center().y), Align2::LEFT_CENTER, title, ui_font(11.5), muted());
+            let hit = Rect::from_min_max(pos2(name_left, hdr.top()), pos2(name_left + name_width, hdr.bottom()));
+            let response = ui.interact(hit, ui.id().with("watch-name-sort"), Sense::click());
+            response.context_menu(|ui| {
+                if ui.button("Edit columns…").clicked() {
+                    out.push(Action::Command("COL EDIT".into()));
+                    ui.close();
+                }
+            });
+            if response.clicked() {
+                self.watch_sort = match self.watch_sort {
+                    Some((usize::MAX, false)) => Some((usize::MAX, true)),
+                    Some((usize::MAX, true)) => None,
+                    _ => Some((usize::MAX, false)),
+                };
+            }
+        }
+        crate::security_names::request(
+            ui,
+            &self.security_names,
+            &self.worker,
+            &self.provider,
+            self.watchlist.iter().cloned(),
+        );
         let mut headers = vec!["Security".to_string(), "Last".into(), "Change".into(), "%".into()];
         headers.extend(self.watch_columns.columns.iter().take(extra).map(|c| c.title.clone()));
         for (index, title) in headers.iter().enumerate() {
@@ -317,7 +369,7 @@ impl TerminalApp {
                 muted(),
             );
             let left = if index == 0 { hdr.left() } else { col(hdr, k - 1) };
-            let right = if index == 0 { col(hdr, 1) } else { col(hdr, k) };
+            let right = if index == 0 { name_left } else { col(hdr, k) };
             let hit = Rect::from_min_max(pos2(left, hdr.top()), pos2(right, hdr.bottom()));
             let response = ui.interact(hit, ui.id().with(("watch-header", index)), Sense::click());
             response.context_menu(|ui| {
@@ -347,6 +399,13 @@ impl TerminalApp {
         let mut symbols = self.watchlist.clone();
         if let Some((index, descending)) = self.watch_sort {
             symbols.sort_by(|a, b| {
+                if index == usize::MAX {
+                    return crate::security_names::order(
+                        self.security_names.name(a),
+                        self.security_names.name(b),
+                        descending,
+                    );
+                }
                 if index == 0 {
                     let order = tr_data::security(a).ticker.cmp(&tr_data::security(b).ticker);
                     return if descending { order.reverse() } else { order };
@@ -381,6 +440,17 @@ impl TerminalApp {
                     ui_font(11.0),
                     muted(),
                 );
+                let name = self.security_names.name(s);
+                let ticker_hit = Rect::from_min_max(r.min, pos2(name_left, r.bottom()));
+                ui.interact(ticker_hit, ui.id().with(("ticker-name", s)), Sense::hover())
+                    .on_hover_text(crate::security_names::hover(&sec.ticker, name));
+                if show_name {
+                    let hit = Rect::from_min_max(
+                        pos2(name_left, r.top()),
+                        pos2(name_left + name_width - dp(6.0), r.bottom()),
+                    );
+                    crate::security_names::paint(ui, hit, name.unwrap_or(""), ("watch-name", s));
+                }
                 match self.quotes.get(s) {
                     Some(q) => {
                         let c = if q.change() >= 0.0 { theme::up() } else { theme::down() };

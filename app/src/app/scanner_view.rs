@@ -29,13 +29,13 @@ pub struct ScannerPane {
     snapshot_symbols: Vec<String>,
     saved: Vec<ScanSettings>,
     notice: Option<String>,
-    matches_only: bool,
+    pub(super) matches_only: bool,
     pub universe: Universe,
     /// Universe scan progress: symbols evaluated and total.
     pub progress: Option<(usize, usize)>,
     /// Stops the running universe scan.
     pub cancel: Option<Arc<AtomicBool>>,
-    show_unavailable: bool,
+    pub(super) show_unavailable: bool,
     pub refresh: Option<u32>,
     previous_matches: HashSet<String>,
     previous_evaluated: HashSet<String>,
@@ -964,12 +964,19 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
     let row_h = dp(22.0);
     let w = ui.available_width();
     // Left edges: security, result, last bar, bar age, details.
-    let x = [8.0, dp(100.0), dp(196.0), dp(320.0), dp(392.0)];
+    let names =
+        ui.data(|d| d.get_temp::<crate::security_names::Names>(egui::Id::new("security-names"))).unwrap_or_default();
+    let show_name = w >= dp(750.0);
+    let shift = if show_name { dp(150.0) } else { 0.0 };
+    let x = [8.0, dp(100.0) + shift, dp(196.0) + shift, dp(320.0) + shift, dp(392.0) + shift];
     let (hdr, _) = ui.allocate_exact_size(egui::vec2(w, row_h), Sense::hover());
     let p = ui.painter_at(hdr);
     p.rect_filled(hdr, theme::CONTROL_RADIUS, theme::header());
     for (k, title) in ["Security", "Result", "Last bar (UTC)", "Bar age", "Details"].into_iter().enumerate() {
         p.text(pos2(hdr.left() + x[k], hdr.center().y), Align2::LEFT_CENTER, title, ui_font(11.5), muted());
+    }
+    if show_name {
+        p.text(pos2(hdr.left() + dp(100.0), hdr.center().y), Align2::LEFT_CENTER, "Name", ui_font(11.5), muted());
     }
     let mut shown = 0;
     for row in &pane.rows {
@@ -987,6 +994,13 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
         let y = r.center().y;
         let ticker = tr_data::security(&row.symbol).ticker;
         p.text(pos2(r.left() + x[0], y), Align2::LEFT_CENTER, &ticker, mono(12.5), amber());
+        if show_name {
+            let hit = egui::Rect::from_min_max(
+                pos2(r.left() + dp(100.0), r.top()),
+                pos2(r.left() + x[1] - dp(6.0), r.bottom()),
+            );
+            crate::security_names::paint(ui, hit, names.name(&row.symbol).unwrap_or(""), ("scan-name", &row.symbol));
+        }
         let (label, color) = outcome_label(outcome);
         p.text(pos2(r.left() + x[1], y), Align2::LEFT_CENTER, label, ui_font(12.0), color);
         if pane.entered.contains(&row.symbol) {

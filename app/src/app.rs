@@ -631,6 +631,7 @@ pub struct TerminalApp {
     active_watchlist: usize,
     watchlist_entry: Option<(Option<usize>, String)>,
     watchlist_delete: bool,
+    security_names: crate::security_names::Names,
     watch_columns: tr_core::columns::ColumnSet,
     columns_editor: Option<columns_view::ColumnsEditor>,
     column_cells: HashMap<String, Vec<tr_core::columns::Cell>>,
@@ -839,6 +840,7 @@ impl TerminalApp {
             active_watchlist: 0,
             watchlist_entry: None,
             watchlist_delete: false,
+            security_names: Default::default(),
             watch_columns: Default::default(),
             columns_editor: None,
             column_cells: HashMap::new(),
@@ -1597,6 +1599,7 @@ impl TerminalApp {
                 }
                 Response::Status(s) => self.status = s,
                 Response::Curves(c) => self.curves = Some(c),
+                Response::SecurityNames(names) => self.security_names = names,
                 Response::SearchHits { query, hits } => self.net_hits = (query, hits),
                 Response::Trade(r) => self.on_trade(*r),
                 Response::CongressRefreshed(summary) => {
@@ -2255,6 +2258,7 @@ impl TerminalApp {
             active_watchlist: 0,
             watchlist_entry: None,
             watchlist_delete: false,
+            security_names: Default::default(),
             watch_columns: Default::default(),
             columns_editor: None,
             column_cells: HashMap::new(),

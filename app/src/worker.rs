@@ -75,6 +75,7 @@ pub enum QuestradeAction {
 }
 
 pub enum Request {
+    SecurityNames(Vec<String>),
     WatchlistColumns {
         revision: u64,
         symbols: Vec<String>,
@@ -328,6 +329,7 @@ pub struct Profile {
 }
 
 pub enum Response {
+    SecurityNames(crate::security_names::Names),
     WatchlistColumns {
         revision: u64,
         cells: std::collections::HashMap<String, Vec<tr_core::columns::Cell>>,
@@ -552,6 +554,7 @@ type StudyFetches = HashMap<(String, Timeframe), Arc<Mutex<()>>>;
 
 struct Shared {
     provider: Provider,
+    names: Mutex<Option<crate::security_names::Names>>,
     study_histories: std::sync::Mutex<HashMap<(String, Timeframe), StudyHistory>>,
     study_fetches: std::sync::Mutex<StudyFetches>,
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
@@ -605,12 +608,27 @@ impl Worker {
             provider,
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(cache),
             scan_store: std::sync::Mutex::new(scan_store),
             db: Mutex::new(db),
             out,
             ctx,
+        });
+
+        // Load cached names on the worker even in sample mode; only lookups require a network.
+        let s = shared.clone();
+        rt.spawn(async move {
+            let names = crate::security_names::Names::load(
+                &data_dir().join("security-names.json"),
+                chrono::Utc::now().timestamp(),
+            );
+            let mut guard = s.names.lock().await;
+            if guard.is_none() {
+                s.send(Response::SecurityNames(names.clone()));
+                *guard = Some(names);
+            }
         });
 
         // Request dispatcher: every request runs as its own task.
@@ -842,6 +860,35 @@ pub fn initial_limit(tf: Timeframe) -> usize {
 
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
+        Request::SecurityNames(symbols) => {
+            use futures::StreamExt;
+            if s.provider.name().eq_ignore_ascii_case("sample") || s.provider.name().eq_ignore_ascii_case("offline") {
+                return;
+            }
+            // Serialize batches so the global concurrency bound is four, not four per pane.
+            let mut guard = s.names.lock().await;
+            let now = chrono::Utc::now().timestamp();
+            let path = data_dir().join("security-names.json");
+            let names = guard.get_or_insert_with(|| crate::security_names::Names::load(&path, now));
+            let symbols: std::collections::BTreeSet<_> =
+                symbols.into_iter().take(5_000).filter(|key| names.needs(key, now)).collect();
+            let results: Vec<_> = futures::stream::iter(symbols.into_iter().map(|key| async move {
+                let ticker = tr_data::security(&key).ticker;
+                let hits = tokio::time::timeout(Duration::from_secs(10), s.provider.search(&ticker)).await;
+                let name =
+                    hits.ok().and_then(Result::ok).and_then(|hits| crate::security_names::exact_name(&key, &hits));
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                (key, name)
+            }))
+            .buffer_unordered(4)
+            .collect()
+            .await;
+            for (key, name) in results {
+                names.insert(key, name, now);
+            }
+            names.save(&path);
+            s.send(Response::SecurityNames(names.clone()));
+        }
         Request::Questrade { handle, action } => {
             let test = async |h: &tr_data::questrade::Questrade| {
                 let bar = h.test("AAPL").await?;
@@ -1902,6 +1949,7 @@ mod tests {
                 provider,
                 study_histories: Default::default(),
                 study_fetches: Default::default(),
+                names: Mutex::new(None),
                 series: Default::default(),
                 cache: std::sync::Mutex::new(None),
                 scan_store: std::sync::Mutex::new(None),
@@ -2331,6 +2379,7 @@ mod tests {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)),
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),
@@ -2470,6 +2519,7 @@ mod tests {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 20)),
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),
@@ -2546,6 +2596,7 @@ mod tests {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 400)),
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
@@ -2617,6 +2668,7 @@ mod tests {
             provider: fixture.clone(),
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
@@ -2687,6 +2739,7 @@ mod tests {
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),

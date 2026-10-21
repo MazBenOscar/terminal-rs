@@ -34,11 +34,17 @@ pub struct ColumnSet {
     version: u32,
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    #[serde(default = "name_default")]
+    pub show_name: bool,
+}
+
+fn name_default() -> bool {
+    true
 }
 
 impl Default for ColumnSet {
     fn default() -> Self {
-        Self { version: 1, name: String::new(), columns: Vec::new() }
+        Self { version: 1, name: String::new(), columns: Vec::new(), show_name: true }
     }
 }
 
@@ -191,6 +197,19 @@ mod tests {
             assert!(matches!(column(expression).evaluate(&set), Cell::Unavailable(_)));
         }
         assert!(matches!(column("C").evaluate(&SeriesSet::new()), Cell::Unavailable(_)));
+    }
+
+    #[test]
+    fn name_toggle_defaults_on_for_legacy_and_persists() {
+        let legacy = r#"{"name":"Legacy","columns":[]}"#;
+        let mut set: ColumnSet = serde_json::from_str(legacy).unwrap();
+        assert!(set.show_name);
+        assert!(ColumnSet::default().show_name);
+        set.show_name = false;
+        let restored: ColumnSet = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert!(!restored.show_name);
+        assert_eq!(restored, set);
+        assert!(!restored.sanitized().0.show_name);
     }
 
     #[test]

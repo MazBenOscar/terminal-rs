@@ -31,6 +31,7 @@ mod theme;
 mod themes;
 mod widgets;
 use chart_view::drawing_toolbar;
+mod security_names;
 mod worker;
 
 use std::time::Instant;
