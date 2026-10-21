@@ -92,12 +92,15 @@ pub(super) fn evaluate(specs: &[Spec], input: &Input<'_>, session: Session, hist
                     .enumerate()
                     .map(|(i, bar)| {
                         let mut as_of = crate::session::next_bucket(input.tf, bar.ts);
-                        // On daily+ charts, a successor proves closure across weekends/holidays.
-                        // Without one, keep open periods hidden; intraday gaps prove nothing.
+                        // A successor can prove closure across weekends/holidays, but
+                        // only for this bar's own study period, never a later gap period.
+                        let aggregation = if input.tf.is_intraday() { session } else { Session::Provider };
+                        let own_end = aggregation.interval(tf, bar.ts).1;
                         if !input.tf.is_intraday()
                             && let Some(next) = input.bars.get(i + 1)
+                            && next.ts >= own_end
                         {
-                            as_of = as_of.max(next.ts);
+                            as_of = as_of.max(own_end);
                         }
                         ends.partition_point(|end| *end <= as_of).checked_sub(1).map_or(f64::NAN, |j| output.values[j])
                     })
@@ -547,6 +550,153 @@ mod tests {
             assert!(a.iter().zip(b).all(|(x, y)| x == y || x.is_nan() && y.is_nan()), "chain changed with input order");
         }
         assert!(clean[1].iter().any(|v| v.is_finite()), "EMA of RSI produced values");
+    }
+
+    /// A chart gap longer than one study period must not leak a later period's
+    /// value onto the bar before the gap. The successor only proves the chart
+    /// bar's own period closed; it is not a license to skip ahead.
+    #[test]
+    fn chart_gap_does_not_leak_the_next_weeks_study_value_onto_the_prior_bar() {
+        // Fri 2026-03-06 then Mon 2026-03-16: the week of Mar 9 is missing entirely.
+        let bars = vec![bar(ts("2026-03-06T00:00:00Z"), 0.), bar(ts("2026-03-16T00:00:00Z"), 0.)];
+        let w1 = vec![bar(ts("2026-03-02T00:00:00Z"), 10.), bar(ts("2026-03-09T00:00:00Z"), 20.)];
+        let out =
+            both(&specs(&[Timeframe::W1]), &bars, Timeframe::D1, Session::UsRegular, &histories(Timeframe::W1, w1));
+        // Fri Mar 6 must show the week of Mar 2 (10). The missing week's close (20)
+        // ends Mar 16 and must never displace backward across the gap.
+        assert_eq!(out[0][0], 10., "a multi-week gap must not leak the next week's W1 value onto Friday");
+        assert_eq!(out[0][1], 20., "Monday shows the week that just closed");
+    }
+
+    #[test]
+    fn chart_gap_does_not_leak_the_next_months_study_value_onto_the_prior_bar() {
+        // Fri 2026-01-30 then Mon 2026-03-02: February's sessions are missing.
+        let bars = vec![bar(ts("2026-01-30T00:00:00Z"), 0.), bar(ts("2026-03-02T00:00:00Z"), 0.)];
+        let mn1 = vec![bar(ts("2026-01-01T00:00:00Z"), 100.), bar(ts("2026-02-01T00:00:00Z"), 200.)];
+        let out =
+            both(&specs(&[Timeframe::MN1]), &bars, Timeframe::D1, Session::UsRegular, &histories(Timeframe::MN1, mn1));
+        assert_eq!(out[0][0], 100., "a missing month must not leak February's MN1 value onto January's last day");
+        assert_eq!(out[0][1], 200., "March's first session shows the month that just closed");
+    }
+
+    /// Week whose Friday is a holiday (Good Friday 2026-04-03): with the next
+    /// session loaded, the W1 value lands on Thursday — the period's last
+    /// trading day — never earlier in the week.
+    #[test]
+    fn holiday_friday_week_shows_weekly_value_on_thursday_when_monday_is_loaded() {
+        // Mon Mar 30 .. Thu Apr 2 (Good Friday Apr 3 closed); successor Mon Apr 6.
+        let week: Vec<i64> = ["2026-03-30", "2026-03-31", "2026-04-01", "2026-04-02", "2026-04-06"]
+            .map(|d| ts(&format!("{d}T00:00:00Z")))
+            .to_vec();
+        let bars: Vec<Bar> = week.iter().map(|&t| bar(t, 0.)).collect();
+        let w1 = vec![bar(ts("2026-03-30T00:00:00Z"), 10.), bar(ts("2026-04-06T00:00:00Z"), 20.)];
+        let out =
+            both(&specs(&[Timeframe::W1]), &bars, Timeframe::D1, Session::UsRegular, &histories(Timeframe::W1, w1));
+        assert!(out[0][..3].iter().all(|v| v.is_nan()), "W1 must not appear before the week's last trading day");
+        assert_eq!(out[0][3], 10., "holiday-Friday week shows W1 on Thursday");
+        assert_eq!(out[0][4], 10., "Monday still shows the closed week until the next week closes");
+    }
+
+    /// EMA 200 seeded with SMA(200) retains ~37% of its seed transient only 100
+    /// bars past the seed. The worker's fixed 300 warm-up bars therefore leave
+    /// EMA 200 on W1 visibly under-converged at the start of a fetched history.
+    #[test]
+    fn warmup_of_300_is_insufficient_for_ema_200_on_weekly_bars() {
+        // Violent swings keep the decaying seed transient large.
+        let specs = [Spec::new("EMA", &[200.]).unwrap()];
+        // Four initialization windows are needed for this test's strict 1e-9
+        // numerical convergence tolerance; the worker requests one such window.
+        let warmup = 4 * study::warmup_bars(&specs);
+        let history_len = 2 * warmup + 50;
+        let closes: Vec<f64> = (0..history_len)
+            .map(|i| {
+                let t = i as f64;
+                100. + 40. * (t * 0.037).sin() + 25. * (t * 0.11).sin() + 15. * (t * 0.41).sin()
+            })
+            .collect();
+        let long: Vec<Bar> = closes.iter().enumerate().map(|(i, &c)| bar(i as i64 * 604_800, c)).collect();
+        let offset = history_len - (warmup + 50);
+        let short = &long[offset..];
+        let ema = |bars: &[Bar]| {
+            let mut specs = vec![Spec::new("EMA", &[200.]).unwrap()];
+            study::assign_ids(&mut specs);
+            specs[0].chart.as_mut().unwrap().timeframe = Some(Timeframe::W1);
+            // Evaluate natively on the study's own bars (same kernel the cache path uses).
+            study::evaluate_native(&specs, &Input::new(bars, Timeframe::W1)).remove(0).unwrap().remove(0).values
+        };
+        let converged = ema(&long);
+        let starved = ema(short);
+        let mut worst = 0.0f64;
+        for i in warmup..short.len() {
+            let a = starved[i];
+            let b = converged[offset + i];
+            worst = worst.max((a - b).abs());
+            assert!(
+                (a - b).abs() < 1e-9,
+                "EMA 200 with {warmup} warm-up diverges at chart bar {}: starved {a} vs converged {b}",
+                i - warmup
+            );
+        }
+        let _ = worst;
+    }
+
+    /// MN3 values must land on the quarter's last trading session once the next
+    /// quarter's first bar proves the quarter closed — including the year-end wrap.
+    #[test]
+    fn quarterly_history_appears_on_the_quarters_last_trading_day_across_year_end() {
+        // Q4-2025 trading days ending Wed 2025-12-31; Q1-2026 opens Fri 2026-01-02
+        // (Jan 1 is a holiday). Also cover a plain quarter boundary: Q1 ends
+        // Tue 2026-03-31, Q2 opens Wed 2026-04-01.
+        let q4_last: Vec<i64> =
+            ["2025-12-29", "2025-12-30", "2025-12-31"].map(|d| ts(&format!("{d}T00:00:00Z"))).to_vec();
+        let q1_2026: Vec<i64> = ["2026-01-02", "2026-01-05"].map(|d| ts(&format!("{d}T00:00:00Z"))).to_vec();
+        let q1_last: Vec<i64> = ["2026-03-30", "2026-03-31"].map(|d| ts(&format!("{d}T00:00:00Z"))).to_vec();
+        let q2_open: Vec<i64> = ["2026-04-01"].map(|d| ts(&format!("{d}T00:00:00Z"))).to_vec();
+        let mut chart: Vec<Bar> =
+            q4_last.iter().chain(&q1_2026).chain(&q1_last).chain(&q2_open).map(|&t| bar(t, 0.)).collect();
+        chart.sort_by_key(|b| b.ts);
+        let mn3 = vec![
+            bar(ts("2025-10-01T00:00:00Z"), 10.), // Q4-2025, ends 2026-01-01
+            bar(ts("2026-01-01T00:00:00Z"), 20.), // Q1-2026, ends 2026-04-01
+        ];
+        let out =
+            both(&specs(&[Timeframe::MN3]), &chart, Timeframe::D1, Session::UsRegular, &histories(Timeframe::MN3, mn3));
+        let at = |t: i64| chart.iter().position(|b| b.ts == t).unwrap();
+        let dec31 = at(ts("2025-12-31T00:00:00Z"));
+        let mar31 = at(ts("2026-03-31T00:00:00Z"));
+        let jan2 = at(ts("2026-01-02T00:00:00Z"));
+        assert!(out[0][..dec31].iter().all(|v| v.is_nan()), "Q4 value must wait for its last trading day");
+        assert_eq!(out[0][dec31], 10., "Q4-2025 value lands on Dec 31");
+        assert_eq!(out[0][jan2], 10., "January sessions still show Q4 until Q1 closes");
+        assert!(out[0][..mar31].iter().skip(jan2).all(|v| *v == 10.), "Q1 must not appear before its last trading day");
+        assert_eq!(out[0][mar31], 20., "Q1-2026 value lands on Mar 31");
+    }
+
+    /// An intraday chart missing its final session bar cannot prove the session
+    /// closed, so the daily value waits for the next session's first bar — it is
+    /// not stalled any further, and the next session's own value stays hidden
+    /// until that session closes.
+    #[test]
+    fn missing_last_intraday_bar_delays_daily_value_only_until_the_next_session() {
+        let open = ts("2026-03-09T13:30:00Z");
+        // Drop the final M5 bar of the session (19:55–20:00), so no bar proves close.
+        let day1: Vec<Bar> = (0..77).map(|i| bar(open + i * 300, 0.)).collect();
+        let next_open = ts("2026-03-10T13:30:00Z");
+        let mut bars = day1;
+        bars.push(bar(next_open, 0.));
+        let history = vec![bar(ts("2026-03-09T00:00:00Z"), 123.), bar(ts("2026-03-10T00:00:00Z"), 200.)];
+        let out = both(
+            &specs(&[Timeframe::D1]),
+            &bars,
+            Timeframe::M5,
+            Session::UsRegular,
+            &histories(Timeframe::D1, history),
+        );
+        assert!(
+            out[0][..77].iter().all(|v| v.is_nan()),
+            "no bar proves the Mar 9 session closed, so its daily value stays hidden on Mar 9"
+        );
+        assert_eq!(out[0][77], 123., "the next session's first bar carries the prior daily close");
     }
 
     /// Day after Thanksgiving 2026: built-in calendar closes at 13:00 New York.
