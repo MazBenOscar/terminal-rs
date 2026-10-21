@@ -661,6 +661,30 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "BUG: assign_ids reserves only IDs already present in the specs, so a newly added study receives the dangling fill-target ID that Settings::sanitized deliberately preserved and validate_fill_edge then silently rebinds the fill to a different study"]
+    fn fill_targets_must_not_rebind_when_a_new_study_reuses_a_dangling_id() {
+        let mut specs = vec![Spec::new("EMA", &[]).unwrap()];
+        assign_ids(&mut specs);
+        let edge = FillEdge { study: Some(2), output: "Lower".into() };
+        specs[0].chart.as_mut().unwrap().fill =
+            Some(BandFill { upper: "EMA".into(), lower: edge.clone(), color: [1, 2, 3], opacity: 35 });
+        // Settings::sanitized keeps this dangling target so the editor can explain it.
+        assert_eq!(validate_fill_edge(&specs, 0, &edge).unwrap_err(), "Fill target 2 is not available");
+        specs.push(Spec::new("BB", &[]).unwrap());
+        assign_ids(&mut specs);
+        let added = specs[1].chart.as_ref().unwrap().id;
+        // The new study must not absorb the referenced ID: the edge has to stay dangling
+        // (or be dropped) instead of silently pointing at a different study.
+        match specs[0].chart.as_ref().unwrap().fill.as_ref() {
+            None => {}
+            Some(fill) => assert!(
+                fill.lower.study != Some(added),
+                "the new study took id {added} and the dangling fill edge silently rebinds to it"
+            ),
+        }
+    }
+
+    #[test]
     fn display_displacement_cannot_introduce_lookahead_into_children() {
         let bars: Vec<_> = (0..20).map(|i| Bar::new(i, i as f64, i as f64, i as f64, (i * i) as f64, 1.)).collect();
         let mut specs = vec![Spec::new("SMA", &[2.]).unwrap(), Spec::new("EMA", &[2.]).unwrap()];

@@ -941,4 +941,34 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn watch_commands_parse_names_with_spaces() {
+        assert_eq!(parse("WL NEW Growth stocks"), Some(Command::Function(Function::WatchNew("Growth stocks".into()))));
+        assert_eq!(
+            parse("WL RENAME Growth stocks TO Technology"),
+            Some(Command::Function(Function::WatchRename("Growth stocks".into(), "Technology".into())))
+        );
+        assert_eq!(
+            parse("WL RENAME SPX Index TO Index"),
+            Some(Command::Function(Function::WatchRename("SPX Index".into(), "Index".into())))
+        );
+        assert_eq!(parse("WL DEL Main (2)"), Some(Command::Function(Function::WatchDelete("Main (2)".into()))));
+    }
+
+    #[test]
+    #[ignore = "BUG: WL RENAME splits at the first token equal to TO and rejects the split when it sits at index ≤1, so any watchlist whose name begins with the word TO cannot be renamed at all, and names containing TO as a word are split at the wrong occurrence"]
+    fn watch_rename_must_support_names_containing_to() {
+        assert_eq!(
+            parse("WL RENAME TO DO list TO Done"),
+            Some(Command::Function(Function::WatchRename("TO DO list".into(), "Done".into())))
+        );
+    }
+
+    #[test]
+    #[ignore = "BUG: when the WL RENAME TO-split fails, parse_function returns None and parse falls through to security resolution, so a malformed watchlist rename is silently reinterpreted as a tab rename on the ticker WL (WL US Equity + TITLE) instead of reporting an unknown command"]
+    fn malformed_watch_rename_must_not_fall_through_to_a_tab_rename() {
+        assert_eq!(parse("WL RENAME TO X"), None);
+        assert_eq!(parse("WL RENAME no separator"), None);
+    }
 }

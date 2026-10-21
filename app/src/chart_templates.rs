@@ -210,6 +210,29 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "BUG: merge_into allocates imported IDs from used (chart IDs already on the current list only), so an imported study receives an ID that a dangling fill edge in the current chart already references and that fill silently rebinds to the imported study"]
+    fn merge_must_not_rebind_dangling_fill_targets_with_fresh_ids() {
+        let mut current = vec![Spec::new("EMA", &[]).unwrap()];
+        study::assign_ids(&mut current);
+        let edge = study::FillEdge { study: Some(2), output: "Lower".into() };
+        current[0].chart.as_mut().unwrap().fill =
+            Some(study::BandFill { upper: "EMA".into(), lower: edge.clone(), color: [1, 2, 3], opacity: 35 });
+        let t = template();
+        t.merge_into(&mut current).unwrap();
+        // The dangling edge must stay dangling (or be dropped), never attach to an imported study.
+        match current[0].chart.as_ref().unwrap().fill.as_ref() {
+            None => {}
+            Some(fill) => assert!(
+                fill.lower
+                    .study
+                    .is_none_or(|id| !current.iter().skip(1).any(|s| s.chart.as_ref().is_some_and(|c| c.id == id))),
+                "the imported studies took free id {:?} and the dangling fill edge silently rebinds to one of them",
+                fill.lower.study
+            ),
+        }
+    }
+
+    #[test]
     fn persistence_and_corrupt_file_protection() {
         let dir = std::env::temp_dir().join(format!(
             "tr-chart-templates-{}-{}",

@@ -2560,4 +2560,122 @@ mod tests {
         let restored = serde_json::from_str(&serde_json::to_string(&before).unwrap()).unwrap();
         assert_eq!(PaneKind::from_settings(restored).settings(), before);
     }
+
+    #[test]
+    #[ignore = "BUG: watchlist name uniqueness and lookup compare String::to_lowercase, which is not Unicode case folding — ß/SS, ſ/s and ς/σ fold together but lowercase differently, so sanitize_watchlists and create_watchlist accept colliding names and WL USE becomes ambiguous"]
+    fn watchlist_names_must_treat_case_fold_equivalent_names_as_duplicates() {
+        let list = |name: &str| NamedWatchlist { name: name.into(), symbols: Vec::new() };
+        // Case folding maps ß to "ss", the long s to "s" and the final sigma to "σ".
+        let out = sanitize_watchlists(vec![list("SS"), list("ß")]);
+        assert_eq!(out.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["SS", "ß (2)"]);
+        let out = sanitize_watchlists(vec![list("s"), list("ſ")]);
+        assert_eq!(out.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["s", "ſ (2)"]);
+        let out = sanitize_watchlists(vec![list("σ"), list("ς")]);
+        assert_eq!(out.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["σ", "ς (2)"]);
+        let root = std::env::temp_dir().join(format!("named-watchlists-casefold-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        app.create_watchlist("SS".into(), Vec::new()).unwrap();
+        app.create_watchlist("Other".into(), Vec::new()).unwrap();
+        assert!(app.create_watchlist("ß".into(), Vec::new()).is_err());
+        assert!(app.rename_watchlist(1, "ß".into()).is_err());
+    }
+
+    #[test]
+    #[ignore = "BUG: valid_watchlist_name only rejects char::is_control (Unicode Cc), so zero-width, bidi and other Cf format characters pass the 1–40 character check and invisible or visually colliding watchlist names survive sanitisation"]
+    fn watchlist_names_must_reject_zero_width_and_bidi_characters() {
+        let list = |name: &str| NamedWatchlist { name: name.into(), symbols: Vec::new() };
+        let invisible = |c: char| matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}');
+        let out = sanitize_watchlists(vec![list("\u{200B}"), list("Main\u{200B}"), list("Main"), list("\u{202E}niam")]);
+        assert!(
+            out.iter().all(|l| !l.name.chars().any(invisible) && !l.name.trim().is_empty()),
+            "invisible characters and blank names must not survive sanitisation: {:?}",
+            out.iter().map(|l| &l.name).collect::<Vec<_>>()
+        );
+        // A name that differs from an existing one only by zero-width characters is a duplicate.
+        let out = sanitize_watchlists(vec![list("Main\u{200B}"), list("Main")]);
+        let visible: Vec<String> =
+            out.iter().map(|l| l.name.chars().filter(|c| !invisible(*c)).collect::<String>()).collect();
+        assert!(
+            visible.iter().filter(|n| n.as_str() == "Main").count() <= 1,
+            "names that differ only by zero-width characters must collide: {visible:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "BUG: create_watchlist rejects colliding names, so Action::SaveMatchesAsWatchlist drops the save whenever the scanner's prefilled name (scan name + date) already exists — every same-day retry — while the Duplicate path uniquifies via unique_watchlist_name"]
+    fn save_matches_as_watchlist_must_uniquify_colliding_names() {
+        let root = std::env::temp_dir().join(format!("named-watchlists-save-collision-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        app.run_actions(vec![Action::SaveMatchesAsWatchlist("Momentum 2026-10-21".into(), vec!["AAPL".into()])]);
+        assert_eq!(app.watchlists.len(), 2);
+        assert_eq!(app.watchlist, vec![tr_data::security("AAPL").key()]);
+        app.run_actions(vec![Action::SaveMatchesAsWatchlist("Momentum 2026-10-21".into(), vec!["NVDA".into()])]);
+        assert_eq!(app.watchlists.len(), 3, "a colliding save-as-new name must be uniquified, not dropped");
+        assert_eq!(app.watchlist, vec![tr_data::security("NVDA").key()]);
+        assert!(app.watchlists[1].name != app.watchlists[2].name);
+    }
+
+    #[test]
+    fn undo_watchlist_is_discarded_across_list_switches_and_cannot_land_on_another_list() {
+        let root = std::env::temp_dir().join(format!("named-watchlists-undo-switch-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        app.add_watchlist_symbols(vec!["AAPL".into()]);
+        let main = app.watchlist.clone();
+        app.create_watchlist("Second".into(), vec!["NVDA".into()]).unwrap();
+        app.run_actions(vec![Action::ReplaceWatchlistWithMatches(vec!["TSLA".into()])]);
+        assert_ne!(app.watchlist, main);
+        app.switch_watchlist(0);
+        assert!(app.watchlist_undo.is_none(), "switching lists must discard the pending undo");
+        app.undo_watchlist();
+        assert_eq!(app.watchlist, main, "undo after a switch must not touch the newly active list");
+        assert_eq!(app.watchlists[1].symbols, vec![tr_data::security("TSLA").key()]);
+    }
+
+    #[test]
+    fn deleting_the_active_watchlist_keeps_the_active_index_in_range() {
+        let root = std::env::temp_dir().join(format!("named-watchlists-delete-active-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        for name in ["A", "B", "C"] {
+            app.create_watchlist(name.into(), vec![name.to_string()]).unwrap();
+        }
+        assert_eq!(app.active_watchlist, 3);
+        app.delete_watchlist(3).unwrap();
+        assert!(app.active_watchlist < app.watchlists.len());
+        assert_eq!(app.watchlist, app.watchlists[app.active_watchlist].symbols);
+        app.switch_watchlist(app.watchlists.len() - 1);
+        app.delete_watchlist(app.watchlists.len() - 1).unwrap();
+        assert!(app.active_watchlist < app.watchlists.len());
+        assert_eq!(app.watchlist, app.watchlists[app.active_watchlist].symbols);
+    }
+
+    #[test]
+    fn switching_watchlists_invalidates_column_replies_for_the_previous_list() {
+        let root = std::env::temp_dir().join(format!("named-watchlists-columns-switch-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        app.create_watchlist("B".into(), vec!["NVDA".into()]).unwrap();
+        app.switch_watchlist(0);
+        let revision = app.columns_revision;
+        app.column_cells.insert("AAPL".into(), Vec::new());
+        app.switch_watchlist(1);
+        assert!(app.columns_revision > revision, "the reply revision must move with the list");
+        assert!(app.column_cells.is_empty(), "cells from the previous list must not survive the switch");
+        assert_eq!(accept_columns(revision, app.columns_revision, "old cells"), None);
+    }
+
+    #[test]
+    #[ignore = "BUG: watchlist_entry stores a raw list index that delete_watchlist never invalidates, so accepting a stale rename entry calls rename_watchlist with the old index — renaming whichever list slid into that slot (or panicking when the index is now out of range)"]
+    fn stale_rename_entry_must_not_rename_the_wrong_list_or_panic() {
+        let root = std::env::temp_dir().join(format!("named-watchlists-stale-rename-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        for name in ["A", "B", "C"] {
+            app.create_watchlist(name.into(), Vec::new()).unwrap();
+        }
+        // The rename entry is open for "B" at index 2; deleting "Main" shifts B to index 1.
+        app.watchlist_entry = Some((Some(2), "B".into()));
+        app.delete_watchlist(0).unwrap();
+        assert_eq!(app.watchlists[1].name, "B");
+        // Accepting the stale entry must be rejected instead of renaming C (now at index 2).
+        assert!(app.rename_watchlist(2, "Zombie".into()).is_err());
+        assert!(app.watchlists.iter().all(|l| l.name != "Zombie"), "the wrong list was renamed");
+    }
 }

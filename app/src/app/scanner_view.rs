@@ -1128,6 +1128,28 @@ mod tests {
         assert!(pane.running);
     }
 
+    #[test]
+    fn switching_watchlists_clears_watchlist_scan_results_but_not_market_scans() {
+        let mut pane = ScannerPane::default();
+        assert_eq!(pane.universe, Universe::Watchlist);
+        pane.rows.push(unavailable_row("AAPL"));
+        pane.completed = Some(chrono::Utc::now());
+        pane.snapshot_symbols = vec!["AAPL".into()];
+        pane.baseline_ready = true;
+        pane.watchlist_changed();
+        assert!(pane.rows.is_empty(), "results from the previous list must not outlive the switch");
+        assert!(pane.completed.is_none());
+        assert!(pane.snapshot_symbols.is_empty());
+        assert!(!pane.baseline_ready);
+        // A market universe is independent of the named watchlists and keeps its results.
+        pane.rows.push(unavailable_row("AAPL"));
+        pane.completed = Some(chrono::Utc::now());
+        pane.universe = Universe::Nasdaq;
+        pane.watchlist_changed();
+        assert_eq!(pane.rows.len(), 1);
+        assert!(pane.completed.is_some());
+    }
+
     fn unavailable_row(symbol: &str) -> ScanRow {
         ScanRow {
             symbol: symbol.into(),
