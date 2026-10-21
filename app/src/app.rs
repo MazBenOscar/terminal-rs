@@ -857,11 +857,7 @@ impl TerminalApp {
                 Action::ScanChart { symbol, symbols, definition } => {
                     self.open_security(&symbol);
                     self.with_chart(|c, w| {
-                        c.set_symbol(&symbol, w);
-                        c.data.workflow.symbols = symbols;
-                        c.data.workflow.scan = Some(definition.clone());
-                        c.set_timeframe(definition.timeframe, w);
-                        c.plot_scan(w);
+                        c.open_scan_chart(&symbol, symbols, definition, w);
                     });
                 }
                 Action::OpenTicker(s) => {
@@ -2023,6 +2019,22 @@ mod tests {
         ] {
             assert_eq!(PaneKind::from_settings(s.clone()).settings(), s);
         }
+    }
+
+    #[test]
+    fn chart_layout_persists_plot_conditions_and_defaults_legacy_field() {
+        let mut chart = ChartState::new(1, "AAPL", tr_core::Timeframe::D1);
+        chart.data.workflow.plot_conditions = true;
+        let before = PaneKind::Chart(Box::new(chart)).settings();
+        let mut saved = serde_json::to_value(&before).unwrap();
+        let restored = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(PaneKind::from_settings(restored).settings(), before);
+        saved["Chart"]["data"]["workflow"].as_object_mut().unwrap().remove("plot_conditions");
+        let restored = serde_json::from_value(saved).unwrap();
+        let PaneKind::Chart(chart) = PaneKind::from_settings(restored) else {
+            panic!("Expected chart");
+        };
+        assert!(!chart.data.workflow.plot_conditions);
     }
 
     #[test]

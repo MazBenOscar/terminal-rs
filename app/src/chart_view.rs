@@ -551,6 +551,9 @@ impl ChartState {
                 break;
             }
         }
+        if self.indicators.iter().any(|s| s.chart.as_ref().is_some_and(|c| c.scan_plot && removed.contains(&c.id))) {
+            self.data.workflow.plot_conditions = false;
+        }
         self.indicators.retain(|s| s.chart.as_ref().is_none_or(|c| !removed.contains(&c.id)));
         for spec in &mut self.indicators {
             if let Some(c) = &mut spec.chart
@@ -612,6 +615,33 @@ impl ChartState {
             end: ts.saturating_add(half.max(self.tf.seconds())),
         });
     }
+    /// Apply a ScanChart action to this chart without changing its plotting preference.
+    pub fn open_scan_chart(
+        &mut self,
+        symbol: &str,
+        symbols: Vec<String>,
+        definition: tr_core::scanner::ScanDefinition,
+        w: &Worker,
+    ) {
+        self.set_symbol(symbol, w);
+        self.data.workflow.symbols = symbols;
+        self.set_timeframe(definition.timeframe, w);
+        self.data.workflow.scan = Some(definition);
+        self.sync_scan_plot(w);
+    }
+
+    fn sync_scan_plot(&mut self, w: &Worker) {
+        if self.data.workflow.plot_conditions {
+            self.plot_scan(w);
+        } else {
+            study::assign_ids(&mut self.indicators);
+            while let Some(index) = self.indicators.iter().position(|s| s.chart.as_ref().is_some_and(|c| c.scan_plot)) {
+                self.remove_study(index);
+            }
+            self.request_indicators(w);
+        }
+    }
+
     pub fn plot_scan(&mut self, w: &Worker) {
         let Some(scan) = &self.data.workflow.scan else {
             return;
@@ -2989,6 +3019,9 @@ impl ChartState {
                 for condition in scan.leaves() {
                     ui.label(RichText::new(condition.label()).font(mono(11.)).color(muted()));
                 }
+                if ui.checkbox(&mut self.data.workflow.plot_conditions, "Show scan conditions on chart").changed() {
+                    self.sync_scan_plot(w);
+                }
                 if ui.button("Plot scan conditions").clicked() {
                     self.plot_scan(w);
                     ui.close();
@@ -4309,6 +4342,89 @@ mod tests {
         assert_eq!(c.data.session, tr_core::session::Session::UsRegular);
         assert_eq!(c.effective_session(), tr_core::session::Session::UsRegular);
         assert!(c.data.history.extended_hours);
+    }
+
+    fn scan_navigation_chart() -> ChartState {
+        let mut c = ChartState::new(1, "AAPL US Equity", Timeframe::D1);
+        c.indicators = vec![IndicatorSpec::new("EMA", &[20.]).unwrap(), IndicatorSpec::new("RSI", &[14.]).unwrap()];
+        study::assign_ids(&mut c.indicators);
+        c
+    }
+
+    fn navigate_scan(c: &mut ChartState, symbol: &str, multiplier: f64, w: &Worker) {
+        let mut scan = tr_core::scanner::ScanDefinition::default();
+        let tr_core::scanner::ConditionItem::Compare(condition) = &mut scan.root.items[0] else {
+            panic!("Expected comparison");
+        };
+        condition.right_multiplier = multiplier;
+        c.open_scan_chart(symbol, vec![symbol.into()], scan, w);
+    }
+
+    #[test]
+    fn scan_chart_flag_off_preserves_user_studies_across_three_tickers() {
+        let mut c = scan_navigation_chart();
+        let w = Worker::inert();
+        let user_studies = c.indicators.clone();
+        for symbol in ["AAPL US Equity", "MSFT US Equity", "NVDA US Equity"] {
+            navigate_scan(&mut c, symbol, 1., &w);
+            assert_eq!(c.symbol, symbol);
+            assert_eq!(c.indicators, user_studies);
+            assert!(!c.data.workflow.plot_conditions);
+        }
+    }
+
+    #[test]
+    fn scan_chart_flag_on_replaces_one_plot_across_three_tickers() {
+        let mut c = scan_navigation_chart();
+        let w = Worker::inert();
+        let user_studies = c.indicators.clone();
+        c.data.workflow.plot_conditions = true;
+        let mut previous_expression = None;
+        let mut plot_id = None;
+        for (i, symbol) in ["AAPL US Equity", "MSFT US Equity", "NVDA US Equity"].into_iter().enumerate() {
+            navigate_scan(&mut c, symbol, (i + 1) as f64, &w);
+            assert_eq!(&c.indicators[..2], &user_studies);
+            let plots: Vec<_> = c.indicators.iter().filter_map(|s| s.chart.as_ref().filter(|s| s.scan_plot)).collect();
+            assert_eq!(plots.len(), 1);
+            assert_ne!(plots[0].expression, previous_expression);
+            if let Some(id) = plot_id {
+                assert_eq!(plots[0].id, id);
+            }
+            plot_id = Some(plots[0].id);
+            previous_expression = plots[0].expression.clone();
+            assert!(c.data.workflow.plot_conditions);
+        }
+    }
+
+    #[test]
+    fn removing_scan_plot_disables_plotting_on_next_scan_chart() {
+        let mut c = scan_navigation_chart();
+        let w = Worker::inert();
+        let user_studies = c.indicators.clone();
+        c.data.workflow.plot_conditions = true;
+        navigate_scan(&mut c, "MSFT US Equity", 1., &w);
+        c.remove_study(2);
+        assert!(!c.data.workflow.plot_conditions);
+        navigate_scan(&mut c, "NVDA US Equity", 2., &w);
+        assert_eq!(c.indicators, user_studies);
+    }
+
+    #[test]
+    fn disabling_scan_plot_cleans_up_immediately_and_on_navigation() {
+        let mut c = scan_navigation_chart();
+        let w = Worker::inert();
+        let user_studies = c.indicators.clone();
+        navigate_scan(&mut c, "AAPL US Equity", 1., &w);
+        c.plot_scan(&w); // One-off plotting does not enable automatic plotting.
+        assert!(!c.data.workflow.plot_conditions);
+        navigate_scan(&mut c, "MSFT US Equity", 2., &w);
+        assert_eq!(c.indicators, user_studies);
+        c.data.workflow.plot_conditions = true;
+        c.sync_scan_plot(&w);
+        assert_eq!(c.indicators.len(), 3);
+        c.data.workflow.plot_conditions = false;
+        c.sync_scan_plot(&w);
+        assert_eq!(c.indicators, user_studies);
     }
 
     #[test]
