@@ -475,6 +475,391 @@ mod tests {
     }
 
     #[test]
+    fn serde_legacy_empty_missing_and_future_versions() {
+        // Legacy flat definition with an empty conditions list becomes an empty root group.
+        let empty = r#"{"name":"Empty","timeframe":"D1","match_mode":"Any","conditions":[]}"#;
+        let scan: ScanDefinition = serde_json::from_str(empty).unwrap();
+        assert_eq!(scan.root, ConditionGroup { mode: MatchMode::Any, items: Vec::new() });
+        assert!(scan.validate().unwrap_err().contains("at least 1"));
+
+        // Missing match_mode defaults to All.
+        let no_mode =
+            r#"{"name":"X","timeframe":"D1","conditions":[{"left":"Price","comparison":"Above","right":"Price"}]}"#;
+        let scan: ScanDefinition = serde_json::from_str(no_mode).unwrap();
+        assert_eq!(scan.root.mode, MatchMode::All);
+        assert_eq!(scan.root.items.len(), 1);
+
+        // Missing conditions and missing root also yields an empty root group.
+        let bare = r#"{"name":"Bare","timeframe":"D1"}"#;
+        let scan: ScanDefinition = serde_json::from_str(bare).unwrap();
+        assert!(scan.root.items.is_empty());
+        assert!(scan.validate().is_err());
+
+        // Any-mode legacy keeps Any and its conditions.
+        let any = r#"{"name":"Any","timeframe":"W1","match_mode":"Any","conditions":[{"left":"Volume","comparison":"AtLeast","right":{"Constant":100000}}]}"#;
+        let scan: ScanDefinition = serde_json::from_str(any).unwrap();
+        assert_eq!(scan.root.mode, MatchMode::Any);
+        assert_eq!(scan.timeframe, Timeframe::W1);
+        assert_eq!(scan.leaves().len(), 1);
+        assert!(scan.validate().is_ok());
+
+        // A missing version is accepted and a future version with a v1 body still loads.
+        for version in [None, Some(0), Some(1), Some(99)] {
+            let mut json = serde_json::to_value(ScanDefinition::default()).unwrap();
+            match version {
+                Some(v) => json["version"] = v.into(),
+                None => {
+                    let obj = json.as_object_mut().unwrap();
+                    obj.remove("version");
+                }
+            }
+            assert_eq!(serde_json::from_value::<ScanDefinition>(json).unwrap(), ScanDefinition::default());
+        }
+
+        // Unknown extra fields are ignored (forward compatible).
+        let mut json = serde_json::to_value(ScanDefinition::default()).unwrap();
+        json["future_field"] = serde_json::json!({"nested": true});
+        assert_eq!(serde_json::from_value::<ScanDefinition>(json).unwrap(), ScanDefinition::default());
+
+        // A v1 body that still carries legacy conditions ignores them when root is present.
+        let mut json = serde_json::to_value(ScanDefinition::default()).unwrap();
+        json["match_mode"] = "Any".into();
+        json["conditions"] = serde_json::json!([{"left":"Volume","comparison":"Below","right":{"Constant":1}}]);
+        let mixed: ScanDefinition = serde_json::from_value(json).unwrap();
+        assert_eq!(mixed, ScanDefinition::default());
+
+        // Explicit null root falls back to legacy fields.
+        let null_root = r#"{"name":"N","timeframe":"D1","root":null,"match_mode":"Any","conditions":[{"left":"Price","comparison":"Below","right":"Price"}]}"#;
+        let scan: ScanDefinition = serde_json::from_str(null_root).unwrap();
+        assert_eq!(scan.root.mode, MatchMode::Any);
+        assert_eq!(scan.leaves().len(), 1);
+    }
+
+    #[test]
+    fn three_valued_logic_any_of_all_and_three_level_nesting() {
+        use ScanOutcome::{Match, NoMatch, Unavailable};
+        let states = [Match, NoMatch, Unavailable];
+        let s = series(Timeframe::D1, &[1.]);
+        let outcome_of = |v: &str| match v {
+            "1" => Match,
+            "0" => NoMatch,
+            _ => Unavailable,
+        };
+        let kleene_and = |a: ScanOutcome, b: ScanOutcome| {
+            if a == NoMatch || b == NoMatch {
+                NoMatch
+            } else if a == Unavailable || b == Unavailable {
+                Unavailable
+            } else {
+                Match
+            }
+        };
+        let kleene_or = |a: ScanOutcome, b: ScanOutcome| {
+            if a == Match || b == Match {
+                Match
+            } else if a == Unavailable || b == Unavailable {
+                Unavailable
+            } else {
+                NoMatch
+            }
+        };
+        let expr = ["1", "0", "AVGC3"];
+        for av in expr {
+            for bv in expr {
+                for cv in expr {
+                    // ANY(av, ALL(bv, cv))
+                    let scan = ScanDefinition {
+                        root: ConditionGroup {
+                            mode: MatchMode::Any,
+                            items: vec![
+                                predicate(av),
+                                ConditionItem::Group(ConditionGroup {
+                                    mode: MatchMode::All,
+                                    items: vec![predicate(bv), predicate(cv)],
+                                }),
+                            ],
+                        },
+                        ..ScanDefinition::default()
+                    };
+                    let expected = kleene_or(outcome_of(av), kleene_and(outcome_of(bv), outcome_of(cv)));
+                    assert_eq!(scan.evaluate(&s).outcome, expected, "{av} OR ({bv} AND {cv})");
+
+                    // Three-level nesting: ALL(av, ANY(bv, ALL(cv, av)))
+                    let scan = ScanDefinition {
+                        root: ConditionGroup {
+                            mode: MatchMode::All,
+                            items: vec![
+                                predicate(av),
+                                ConditionItem::Group(ConditionGroup {
+                                    mode: MatchMode::Any,
+                                    items: vec![
+                                        predicate(bv),
+                                        ConditionItem::Group(ConditionGroup {
+                                            mode: MatchMode::All,
+                                            items: vec![predicate(cv), predicate(av)],
+                                        }),
+                                    ],
+                                }),
+                            ],
+                        },
+                        ..ScanDefinition::default()
+                    };
+                    let expected = kleene_and(
+                        outcome_of(av),
+                        kleene_or(outcome_of(bv), kleene_and(outcome_of(cv), outcome_of(av))),
+                    );
+                    assert_eq!(scan.evaluate(&s).outcome, expected, "{av} AND ({bv} OR ({cv} AND {av}))");
+                }
+            }
+        }
+        for a in states {
+            assert_eq!(combine(MatchMode::All, &[a]), a);
+            assert_eq!(combine(MatchMode::Any, &[a]), a);
+        }
+    }
+
+    #[test]
+    fn depth_and_leaf_counting_are_exact() {
+        // Exactly 32 leaves and exactly depth 3 are valid; one more of either is not.
+        let mut scan = ScanDefinition {
+            root: ConditionGroup { mode: MatchMode::All, items: vec![predicate("1"); MAX_CONDITIONS] },
+            ..ScanDefinition::default()
+        };
+        assert!(scan.validate().is_ok());
+        assert_eq!(scan.leaves().len(), MAX_CONDITIONS);
+        scan.root.items.push(predicate("1"));
+        assert!(scan.validate().unwrap_err().contains("32"));
+
+        // Leaves buried in nested groups still count toward the cap.
+        let scan = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![
+                    predicate("1"),
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::All,
+                        items: vec![predicate("1"); MAX_CONDITIONS],
+                    }),
+                ],
+            },
+            ..ScanDefinition::default()
+        };
+        assert_eq!(scan.leaves().len(), MAX_CONDITIONS + 1);
+        assert!(scan.validate().unwrap_err().contains("32"));
+
+        // Depth: root=1, so two nested wrappers (levels 2 and 3) are fine, a fourth is not.
+        let leaf = ConditionGroup { mode: MatchMode::All, items: vec![predicate("1")] };
+        let depth3 = ConditionGroup {
+            mode: MatchMode::All,
+            items: vec![ConditionItem::Group(ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![ConditionItem::Group(leaf)],
+            })],
+        };
+        let scan = ScanDefinition { root: depth3, ..ScanDefinition::default() };
+        assert!(scan.validate().is_ok());
+        let depth4 = ConditionGroup { mode: MatchMode::All, items: vec![ConditionItem::Group(scan.root.clone())] };
+        let scan = ScanDefinition { root: depth4, ..ScanDefinition::default() };
+        assert!(scan.validate().unwrap_err().contains("depth"));
+
+        // An empty nested group is rejected even when the root has other items.
+        let scan = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![
+                    predicate("1"),
+                    ConditionItem::Group(ConditionGroup { mode: MatchMode::Any, items: Vec::new() }),
+                ],
+            },
+            ..ScanDefinition::default()
+        };
+        assert!(scan.validate().unwrap_err().contains("at least 1"));
+    }
+
+    #[test]
+    fn formula_treats_nan_inf_and_negative_zero() {
+        let formula = |expression: &str| FormulaCondition { expression: expression.into(), timeframe: None };
+        let s = series(Timeframe::D1, &[1., 2., 3., 4., 5.]);
+        // Finiteness: last value NaN is unavailable, never a match or a non-match.
+        assert_eq!(formula("C/0").evaluate(&s).outcome, ScanOutcome::Unavailable);
+        assert_eq!(formula("C/0").validate(), Ok(()));
+        // Overflow collapses to NaN in PCF, so it is unavailable too.
+        assert_eq!(formula("1e308*10").evaluate(&s).outcome, ScanOutcome::Unavailable);
+        // -0.0 == 0.0, so it must be a non-match, not a match.
+        let neg_zero = formula("-0").evaluate(&s);
+        assert_eq!(neg_zero.outcome, ScanOutcome::NoMatch);
+        assert_eq!(neg_zero.left, Some(0.0));
+        assert_eq!(formula("0").evaluate(&s).outcome, ScanOutcome::NoMatch);
+        assert_eq!(formula("0 * -1").evaluate(&s).outcome, ScanOutcome::NoMatch);
+        assert_eq!(formula("1").evaluate(&s).outcome, ScanOutcome::Match);
+        assert_eq!(formula("-1").evaluate(&s).outcome, ScanOutcome::Match);
+        assert_eq!(formula("C - C").evaluate(&s).outcome, ScanOutcome::NoMatch);
+    }
+
+    #[test]
+    fn timeframe_override_equal_to_scan_timeframe_is_not_extra() {
+        let mut scan = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![
+                    predicate("1"),
+                    ConditionItem::Compare(ScanCondition {
+                        timeframe: Some(Timeframe::D1),
+                        right: ScanOperand::Sma { period: 3, source: Source::Close },
+                        ..ScanCondition::default()
+                    }),
+                ],
+            },
+            ..ScanDefinition::default()
+        };
+        // An explicit override matching the scan timeframe must not become a second fetch.
+        assert_eq!(scan.timeframes(), vec![Timeframe::D1]);
+        // It still contributes to the scan timeframe's required history.
+        assert_eq!(scan.required_bars_for(Timeframe::D1), 300);
+        assert_eq!(scan.required_bars(), 300);
+
+        // A real second timeframe is still listed after the scan timeframe.
+        if let ConditionItem::Compare(c) = &mut scan.root.items[1] {
+            c.timeframe = Some(Timeframe::W1);
+        }
+        assert_eq!(scan.timeframes(), vec![Timeframe::D1, Timeframe::W1]);
+        assert_eq!(scan.required_bars_for(Timeframe::W1), 3);
+        assert_eq!(scan.required_bars_for(Timeframe::D1), 300);
+
+        // Several distinct overrides, each listed once; the scan timeframe is first.
+        let scan = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![
+                    ConditionItem::Compare(ScanCondition {
+                        timeframe: Some(Timeframe::W1),
+                        ..ScanCondition::default()
+                    }),
+                    ConditionItem::Compare(ScanCondition {
+                        timeframe: Some(Timeframe::H1),
+                        ..ScanCondition::default()
+                    }),
+                    ConditionItem::Compare(ScanCondition {
+                        timeframe: Some(Timeframe::W1),
+                        ..ScanCondition::default()
+                    }),
+                    predicate("1"),
+                ],
+            },
+            ..ScanDefinition::default()
+        };
+        assert_eq!(scan.timeframes(), vec![Timeframe::D1, Timeframe::H1, Timeframe::W1]);
+    }
+
+    #[test]
+    fn required_bars_for_covers_formulas_in_nested_groups() {
+        let formula_on = |tf: Option<Timeframe>| {
+            ConditionItem::Formula(FormulaCondition { expression: "C > 1".into(), timeframe: tf })
+        };
+        let compare_on = |tf: Option<Timeframe>, period: usize| {
+            ConditionItem::Compare(ScanCondition {
+                timeframe: tf,
+                right: ScanOperand::Sma { period, source: Source::Close },
+                ..ScanCondition::default()
+            })
+        };
+        let scan = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![
+                    formula_on(None),
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::Any,
+                        items: vec![
+                            formula_on(Some(Timeframe::W1)),
+                            compare_on(Some(Timeframe::W1), 10),
+                            compare_on(None, 4),
+                        ],
+                    }),
+                ],
+            },
+            ..ScanDefinition::default()
+        };
+        // Formula on the scan timeframe dominates D1 (300 > SMA(4)).
+        assert_eq!(scan.required_bars_for(Timeframe::D1), 300);
+        // W1 has a formula (300) and SMA(10): the formula wins.
+        assert_eq!(scan.required_bars_for(Timeframe::W1), 300);
+        // A timeframe with no leaves falls back to 1 and is not fetched.
+        assert_eq!(scan.required_bars_for(Timeframe::H1), 1);
+        assert_eq!(scan.timeframes(), vec![Timeframe::D1, Timeframe::W1]);
+
+        // A formula-only override on another timeframe still needs 300 there, 1 on the scan tf
+        // only when no scan-tf leaf remains.
+        let scan = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![ConditionItem::Group(ConditionGroup {
+                    mode: MatchMode::All,
+                    items: vec![formula_on(Some(Timeframe::W1))],
+                })],
+            },
+            ..ScanDefinition::default()
+        };
+        assert_eq!(scan.required_bars_for(Timeframe::W1), 300);
+        assert_eq!(scan.required_bars_for(Timeframe::D1), 1);
+        assert_eq!(scan.timeframes(), vec![Timeframe::D1, Timeframe::W1]);
+    }
+
+    #[test]
+    fn integer_and_fractional_json_numbers_load_as_f64_fields() {
+        // Hand-written scans often store 2 instead of 2.0; both must load.
+        let json = r#"{
+            "version": 1,
+            "name": "Ints",
+            "timeframe": "D1",
+            "root": {
+                "mode": "All",
+                "items": [
+                    {"Compare": {
+                        "left": "Price",
+                        "comparison": "Above",
+                        "right": {"Sma": {"period": 20}},
+                        "right_multiplier": 2,
+                        "left_bars_ago": 1,
+                        "right_bars_ago": 0
+                    }},
+                    {"Formula": {"expression": "C > 1"}}
+                ]
+            }
+        }"#;
+        let scan: ScanDefinition = serde_json::from_str(json).unwrap();
+        assert!(scan.validate().is_ok());
+        let ConditionItem::Compare(c) = &scan.root.items[0] else { panic!("Expected comparison") };
+        assert_eq!(c.right_multiplier, 2.0);
+        assert_eq!(c.left_bars_ago, 1);
+        // Serialising back keeps the numeric value.
+        let again: ScanDefinition = serde_json::from_value(serde_json::to_value(&scan).unwrap()).unwrap();
+        assert_eq!(again, scan);
+    }
+
+    #[test]
+    #[ignore = "BUG: ConditionItem::required_bars hardcodes 300 for every FormulaCondition instead of the expression's window; AVG(C,1000) needs 1000 bars so required_bars_for reports 300, the worker fetches only 900 (300*3), and the predicate stays Unavailable forever"]
+    fn formula_required_bars_must_cover_expression_windows() {
+        let scan = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![ConditionItem::Formula(FormulaCondition {
+                    expression: "AVG(C, 1000) > 0".into(),
+                    timeframe: None,
+                })],
+            },
+            ..ScanDefinition::default()
+        };
+        // The expression needs a full 1000-bar window before it can produce a number.
+        assert!(scan.required_bars() >= 1000, "required_bars() = {}", scan.required_bars());
+        // Whatever the worker fetches from required_bars must be enough to evaluate.
+        let fetched = scan.required_bars().saturating_mul(3).max(300);
+        let bars: Vec<_> = (0..fetched as i64).map(|i| Bar::new(i, 1.0, 1.0, 1.0, 1.0, 1.0)).collect();
+        let series = Series::new("TEST", Timeframe::D1, bars);
+        assert_eq!(scan.evaluate(&series).outcome, ScanOutcome::Match);
+    }
+
+    #[test]
     fn presets_unchanged() {
         let condition = |left, comparison, right, ago, multiplier| ScanCondition {
             left,
