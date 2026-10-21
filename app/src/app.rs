@@ -249,6 +249,7 @@ impl PaneKind {
                 indicators: c.indicators.clone(),
                 drawings: c.drawings.clone(),
                 compare: c.compare.clone(),
+                compare_axis: c.compare_axis,
                 show_volume: c.show_volume,
                 show_congress: c.show_congress,
                 magnet: c.magnet,
@@ -299,6 +300,7 @@ impl PaneKind {
                 indicators,
                 drawings,
                 compare,
+                compare_axis,
                 show_volume,
                 show_congress,
                 magnet,
@@ -311,6 +313,7 @@ impl PaneKind {
                 c.indicators = indicators;
                 c.drawings = drawings;
                 c.compare = compare;
+                c.compare_axis = compare_axis;
                 c.show_volume = show_volume;
                 c.show_congress = show_congress;
                 c.magnet = magnet;

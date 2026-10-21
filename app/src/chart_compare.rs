@@ -7,6 +7,38 @@ use egui::{RichText, Ui};
 use std::time::{Duration, Instant};
 use tr_data::SearchHit;
 
+/// How a comparison is scaled against the chart's own symbol.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Axis {
+    /// Both series rebased at the visible left edge; the axis reads % change.
+    #[default]
+    Percent,
+    /// Rebased onto the main symbol's price axis.
+    Price,
+    /// The comparison in its own prices on a separate left-hand axis.
+    Own,
+}
+
+impl Axis {
+    pub const ALL: [Self; 3] = [Self::Percent, Self::Price, Self::Own];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Percent => "% change",
+            Self::Price => "Price axis",
+            Self::Own => "Own axis",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Percent => "Both symbols rebased at the visible left edge; the axis shows % change",
+            Self::Price => "The comparison rebased onto this chart's price axis",
+            Self::Own => "The comparison in its own prices on a separate left axis",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Picker {
     pub open: bool,
@@ -19,6 +51,8 @@ pub struct Picker {
     searching: bool,
     /// Anchor the window under the chart's Compare button on the first frame after opening.
     place: bool,
+    /// The chart's rect, set before [`Picker::show`] each frame.
+    pub chart: Option<egui::Rect>,
 }
 pub fn parse_key(input: &str) -> Option<String> {
     let words: Vec<_> = input.split_whitespace().collect();
@@ -45,10 +79,10 @@ impl Picker {
     pub fn show(
         &mut self,
         ctx: &egui::Context,
-        chart: egui::Rect,
         pane: PaneId,
         subject: &str,
         current: Option<&str>,
+        axis: &mut Axis,
         worker: &Worker,
     ) -> Option<Option<String>> {
         if !self.open {
@@ -66,6 +100,7 @@ impl Picker {
             .open(&mut open)
             .default_width(width)
             .constrain_to(ctx.content_rect().shrink(theme::dp(24.)));
+        let chart = self.chart.unwrap_or_else(|| ctx.content_rect());
         if std::mem::take(&mut self.place) {
             // Top-right of the plot, under the header's Compare button.
             let x = (chart.right() - width - theme::dp(12.)).max(chart.left() + theme::dp(6.));
@@ -80,6 +115,12 @@ impl Picker {
                     }
                 });
             }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Scale").color(theme::muted()));
+                for option in Axis::ALL {
+                    ui.selectable_value(axis, option, option.label()).on_hover_text(option.hint());
+                }
+            });
             let input = ui.add(
                 egui::TextEdit::singleline(&mut self.query)
                     .hint_text("Search name, ticker or market key")
@@ -152,7 +193,7 @@ impl Picker {
                 );
             }
             ui.label(
-                RichText::new("One comparison at a time · rebased at the visible left edge")
+                RichText::new(format!("One comparison at a time · {}", axis.hint().to_lowercase()))
                     .small()
                     .color(theme::muted()),
             );
@@ -184,6 +225,14 @@ fn result_button(ui: &mut Ui, key: &str, name: &str, current: Option<&str>, chos
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compare_axis_defaults_to_percent_and_round_trips() {
+        assert_eq!(Axis::default(), Axis::Percent);
+        for axis in Axis::ALL {
+            let json = serde_json::to_string(&axis).unwrap();
+            assert_eq!(serde_json::from_str::<Axis>(&json).unwrap(), axis);
+        }
+    }
     #[test]
     fn market_keys_are_fully_parsed_and_canonicalized() {
         assert_eq!(parse_key(" msft "), Some("MSFT US Equity".into()));

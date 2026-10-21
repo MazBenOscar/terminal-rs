@@ -59,3 +59,20 @@ The running Vulkan app was inspected using an isolated sample-data folder at
 wide and split-pane sizes. The header gap, plot-contained LIVE badges, legend
 menu/editor transition, initial comparison choices and selecting a comparison
 line were verified visually. Provider data availability remains source-dependent.
+
+## Comparison scale
+
+Branch `codex/chart-compare-scale` adds a **Scale** choice to the Compare window,
+saved per chart with the layout (older layouts load as % change):
+
+- **% change** (default): both symbols are rebased at the visible left edge, as
+  before, and the price axis, crosshair tag and last-value tags read % change from
+  that bar. Panning moves the base, so 0% is always the left edge.
+- **Price axis**: the previous behaviour; the comparison is rebased onto the main
+  symbol's prices, and its last-value tag shows its own price.
+- **Own axis**: the comparison keeps its own prices, autoscaled independently on a
+  left-hand axis with its own last-value and crosshair tags; the main symbol's
+  autoscale ignores it.
+
+The legend's "vs" figure is unchanged: the comparison's performance relative to the
+main symbol at the hovered bar.

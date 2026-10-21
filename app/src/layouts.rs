@@ -64,6 +64,8 @@ pub enum PaneSettings {
         indicators: Vec<IndicatorSpec>,
         drawings: Vec<Drawing>,
         compare: Option<String>,
+        #[serde(default)]
+        compare_axis: crate::chart_compare::Axis,
         #[serde(default = "yes")]
         show_volume: bool,
         #[serde(default = "yes")]
@@ -291,6 +293,7 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         indicators: crate::command::default_indicators(),
         drawings: Vec::new(),
         compare: None,
+        compare_axis: Default::default(),
         show_volume: d.show_volume,
         show_congress: d.congress_markers,
         magnet: false,
@@ -554,8 +557,9 @@ mod tests {
             {"id":2,"Feed":null}]}"#;
         let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
         match &doc.panes[0].settings {
-            PaneSettings::Chart { show_volume, show_congress, magnet, log, .. } => {
-                assert!(*show_volume && *show_congress && !*magnet && *log)
+            PaneSettings::Chart { show_volume, show_congress, magnet, log, compare_axis, .. } => {
+                assert!(*show_volume && *show_congress && !*magnet && *log);
+                assert_eq!(*compare_axis, crate::chart_compare::Axis::Percent);
             }
             other => panic!("{other:?}"),
         }
