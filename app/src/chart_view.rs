@@ -246,6 +246,7 @@ struct DrawState {
     tool: Option<Tool>,
     pending: Option<Anchor>,
     second: Option<Anchor>,
+    vertices: Vec<Anchor>,
     note: Option<NoteDraft>,
     selected: Option<usize>,
     hover: Option<(usize, DrawHandle)>,
@@ -257,6 +258,7 @@ enum DrawHandle {
     A,
     B,
     C,
+    Vertex(usize),
     Body,
 }
 
@@ -882,6 +884,24 @@ impl ChartState {
         self.cancel();
         self.draw = DrawState { tool: Some(tool), ..Default::default() };
         self.drawing_toolbar.remember(tool);
+    }
+
+    /// Commit a complete sampled annotation as one undoable operation.
+    fn finish_vertices(&mut self) -> bool {
+        if self.draw.vertices.len() < 2 {
+            return false;
+        }
+        let Some(tool) = self.draw.tool else {
+            return false;
+        };
+        let vertices = std::mem::take(&mut self.draw.vertices);
+        let mut drawing = Drawing::new(tool, vertices[0], *vertices.last().unwrap());
+        drawing.vertices = vertices;
+        drawing.symbol = Some(self.symbol.clone());
+        self.remember_drawings();
+        self.drawings.push(drawing);
+        self.draw = DrawState { selected: Some(self.drawings.len() - 1), ..Default::default() };
+        true
     }
 
     pub fn jump_to(&mut self, ts: i64) {
@@ -3665,9 +3685,11 @@ impl ChartState {
     }
 
     fn drawing_tools_menu(&mut self, ui: &mut Ui) {
-        for index in 0..crate::drawing_toolbar::CATEGORIES.len() {
-            self.drawing_category_menu(ui, index);
-        }
+        egui::ScrollArea::vertical().id_salt("draw-tools-menu").max_height(theme::dp(420.)).show(ui, |ui| {
+            for index in 0..crate::drawing_toolbar::CATEGORIES.len() {
+                self.drawing_category_menu(ui, index);
+            }
+        });
         let mut favorites = crate::prefs::drawing_favorites(ui.ctx());
         ui.checkbox(&mut favorites.1, "Favorites bar");
         crate::prefs::set_drawing_favorites(ui.ctx(), favorites);
@@ -3864,7 +3886,7 @@ impl ChartState {
                 });
                 ui.close();
             }
-            if edited.tool == Tool::Text && ui.button("Edit text…").clicked() {
+            if drawings::text::editable(edited.tool) && ui.button("Edit text…").clicked() {
                 self.draw.note = Some(NoteDraft {
                     anchor: edited.a,
                     text: edited.text.clone(),
@@ -3887,7 +3909,10 @@ impl ChartState {
                 ui.checkbox(&mut edited.extend_left, "Extend left");
                 ui.checkbox(&mut edited.extend_right, "Extend right");
             }
-            if edited != self.drawings[index] {
+            if edited.tool == Tool::Path {
+                ui.checkbox(&mut edited.arrow_end, "Arrowhead at end");
+            }
+            if !self.drawings_locked && !self.drawings_hidden && edited != self.drawings[index] {
                 self.remember_drawings();
                 self.drawings[index] = edited;
             }
@@ -3994,7 +4019,11 @@ impl ChartState {
             ly += 14.;
         }
         if let Some(tool) = self.draw.tool {
-            let msg = if self.draw.second.is_some() {
+            let msg = if tool == Tool::Path {
+                "click to add points; double-click or Enter to finish (Esc cancels)"
+            } else if tool == Tool::Brush {
+                "press and drag to draw (Esc cancels)"
+            } else if self.draw.second.is_some() {
                 "click third point / target (Esc cancels)"
             } else if self.draw.pending.is_some() {
                 "click second point (Esc cancels)"
@@ -4033,16 +4062,19 @@ impl ChartState {
                     RichText::new("Up to 500 characters. Double-click the note to edit it.").small().color(muted()),
                 );
                 ui.horizontal(|ui| {
-                    save = ui.add_enabled(!draft.text.trim().is_empty(), egui::Button::new("Save note")).clicked();
+                    let optional = draft.existing.as_ref().is_some_and(|(_, d)| d.tool == Tool::PriceNote);
+                    save = ui
+                        .add_enabled(optional || !draft.text.trim().is_empty(), egui::Button::new("Save note"))
+                        .clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             cancel = true;
         }
-        if save {
+        if save && !self.drawings_locked && !self.drawings_hidden {
             let draft = self.draw.note.take().unwrap();
-            let note = draft.text.trim().to_string();
+            let note = drawings::text::sanitize(draft.text.trim());
             if let Some((index, original)) = draft.existing {
                 // A nonmodal editor must not update a different drawing after undo/delete.
                 if self.drawings.get(index) == Some(&original) && original.text != note {
@@ -4074,14 +4106,15 @@ impl ChartState {
             .into_iter()
             .take(d.tool.points())
             .flatten()
+            .chain(d.vertices.iter().copied())
             .any(|a| !a.price.is_finite() || (s.log && a.price <= 0.))
         {
             return vec![];
         }
         let px =
             |a: &Anchor| [rect.left() as f64 + v.x_of(self.index_of_ts(a.ts)), rect.top() as f64 + s.y_of(a.price)];
-        let text_size = if d.tool == Tool::Text {
-            let size = ui.painter().layout(d.text.clone(), ui_font(11.5), text(), 220.).size() + vec2(8., 4.);
+        let text_size = if drawings::text::editable(d.tool) {
+            let size = ui.painter().layout(drawings::text::label(d), ui_font(11.5), text(), 220.).size() + vec2(8., 4.);
             [size.x as f64, size.y as f64]
         } else {
             [0., 0.]
@@ -4089,7 +4122,20 @@ impl ChartState {
         let bars = (self.index_of_ts(d.b.ts) - self.index_of_ts(d.a.ts)).abs().round() as usize;
         drawings::geometry(&drawings::Geometry {
             drawing: d,
-            points: [px(&d.a), px(&d.b), px(&d.c.unwrap_or(d.b))],
+            points: [
+                {
+                    let mut anchor = d.a;
+                    if matches!(d.tool, Tool::ArrowMarkUp | Tool::ArrowMarkDown | Tool::FlagMark)
+                        && let Some(bar) = self.bars.get(self.index_of_ts(anchor.ts).round().max(0.) as usize)
+                    {
+                        anchor.price = if d.tool == Tool::ArrowMarkUp { bar.low } else { bar.high };
+                    }
+                    px(&anchor)
+                },
+                px(&d.b),
+                px(&d.c.unwrap_or(d.b)),
+            ],
+            project: &|a| px(&a),
             bounds: [rect.left() as f64, rect.top() as f64, rect.right() as f64, rect.bottom() as f64],
             price_y: &|price| rect.top() as f64 + s.y_of(price),
             measure_label: if d.tool == Tool::Measure {
@@ -4133,9 +4179,12 @@ impl ChartState {
                 return None;
             }
             for (index, drawing) in this.drawings.iter().enumerate().rev().filter(|(_, d)| d.visible_on(&this.symbol)) {
-                for (anchor, handle) in
-                    drawings::handles(drawing).into_iter().zip([DrawHandle::A, DrawHandle::B, DrawHandle::C])
-                {
+                for (vertex, anchor) in drawings::handles(drawing).into_iter().enumerate() {
+                    let handle = if drawing.vertices.is_empty() {
+                        [DrawHandle::A, DrawHandle::B, DrawHandle::C][vertex]
+                    } else {
+                        DrawHandle::Vertex(vertex)
+                    };
                     let point = pos2(
                         rect.left() + v.x_of(this.index_of_ts(anchor.ts)) as f32,
                         rect.top() + s.y_of(anchor.price) as f32,
@@ -4184,9 +4233,16 @@ impl ChartState {
                 DrawHandle::A => edited.a = anchor,
                 DrawHandle::B => edited.b = anchor,
                 DrawHandle::C => edited.c = Some(anchor),
+                DrawHandle::Vertex(index) => {
+                    edited.vertices[index] = anchor;
+                    edited.a = edited.vertices[0];
+                    edited.b = *edited.vertices.last().unwrap();
+                }
                 DrawHandle::Body => {
-                    for point in
-                        std::iter::once(&mut edited.a).chain(std::iter::once(&mut edited.b)).chain(edited.c.iter_mut())
+                    for point in std::iter::once(&mut edited.a)
+                        .chain(std::iter::once(&mut edited.b))
+                        .chain(edited.c.iter_mut())
+                        .chain(edited.vertices.iter_mut())
                     {
                         point.ts = point.ts.saturating_add(anchor.ts.saturating_sub(drag.start.ts));
                         point.price = if s.log && drag.start.price > 0. {
@@ -4213,12 +4269,54 @@ impl ChartState {
             self.draw.drag = None;
         }
 
+        // Sample freehand strokes from the press origin, not the drag threshold.
+        if self.draw.tool == Some(Tool::Brush) {
+            if resp.drag_started()
+                && let Some(pos) = ui.input(|i| i.pointer.press_origin())
+            {
+                self.draw.vertices = vec![pointer_anchor(self, pos)];
+            }
+            if (resp.dragged() || resp.drag_stopped())
+                && let Some(pos) = resp.interact_pointer_pos()
+            {
+                let anchor = pointer_anchor(self, pos);
+                if self.draw.vertices.last() != Some(&anchor) {
+                    if self.draw.vertices.len() == drawings::shapes::MAX_POINTS {
+                        // Retain a bounded history while continuing to record the end of the stroke.
+                        self.draw.vertices = self.draw.vertices.iter().step_by(2).copied().collect();
+                    }
+                    self.draw.vertices.push(anchor);
+                }
+            }
+            if resp.drag_stopped() {
+                self.draw.vertices = drawings::shapes::simplify(&self.draw.vertices, &|a| {
+                    [rect.left() as f64 + v.x_of(self.index_of_ts(a.ts)), rect.top() as f64 + s.y_of(a.price)]
+                });
+                self.finish_vertices();
+            }
+        }
+        if self.draw.tool == Some(Tool::Path)
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        {
+            self.finish_vertices();
+        }
+
         // Placement.
         if let (Some(tool), true, Some(pos)) =
             (self.draw.tool, resp.clicked(), resp.interact_pointer_pos().filter(|p| rect.contains(*p)))
         {
             let a = pointer_anchor(self, pos);
-            if tool == Tool::Text {
+            if tool == Tool::Path {
+                if self.draw.vertices.last() != Some(&a) && self.draw.vertices.len() < drawings::shapes::MAX_POINTS {
+                    self.draw.vertices.push(a);
+                }
+                if resp.double_clicked() {
+                    self.finish_vertices();
+                }
+            } else if tool == Tool::Brush {
+                // A stroke needs a drag; clicks alone do not create a drawing.
+            } else if tool == Tool::Text {
                 self.draw = DrawState {
                     note: Some(NoteDraft { anchor: a, existing: None, text: String::new() }),
                     ..Default::default()
@@ -4250,6 +4348,12 @@ impl ChartState {
                 self.drawings.push(drawing);
                 self.draw = DrawState::default();
                 self.draw.selected = Some(self.drawings.len() - 1);
+                if tool == Tool::Callout {
+                    let index = self.drawings.len() - 1;
+                    let original = self.drawings[index].clone();
+                    self.draw.note =
+                        Some(NoteDraft { anchor: original.a, text: String::new(), existing: Some((index, original)) });
+                }
             } else {
                 self.draw.pending = Some(a);
             }
@@ -4257,7 +4361,7 @@ impl ChartState {
             // Selection by proximity.
             self.draw.selected = resp.interact_pointer_pos().and_then(|pos| hit(self, pos).map(|(index, _)| index));
             if resp.double_clicked()
-                && let Some(index) = self.draw.selected.filter(|&i| self.drawings[i].tool == Tool::Text)
+                && let Some(index) = self.draw.selected.filter(|&i| drawings::text::editable(self.drawings[i].tool))
             {
                 let original = self.drawings[index].clone();
                 self.draw.note = Some(NoteDraft {
@@ -4276,6 +4380,18 @@ impl ChartState {
             .filter(|(_, d)| d.visible_on(&self.symbol))
             .map(|(i, d)| (d, self.draw.selected == Some(i)))
             .collect();
+        if let Some(tool @ (Tool::Path | Tool::Brush)) = self.draw.tool
+            && let Some(&first) = self.draw.vertices.first()
+        {
+            let mut preview = Drawing::new(tool, first, *self.draw.vertices.last().unwrap());
+            preview.vertices = self.draw.vertices.clone();
+            if tool == Tool::Path
+                && let Some(h) = hover.filter(|h| rect.contains(*h))
+            {
+                preview.vertices.push(pointer_anchor(self, h));
+            }
+            all.push((preview, true));
+        }
         if let (Some(tool), Some(first), Some(h)) = (self.draw.tool, self.draw.pending, hover)
             && rect.contains(h)
         {
@@ -5230,6 +5346,188 @@ mod tests {
         drawing_frame(ctx, chart, vec![pointer_button(at, true)], log);
         drawing_frame(ctx, chart, vec![pointer_button(at, false)], log);
         drawing_frame(ctx, chart, vec![], log)
+    }
+
+    #[test]
+    fn path_enter_finish_and_escape_cancel_are_transactional() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.start_tool(Tool::Path);
+        for at in [pos2(200., 300.), pos2(350., 100.), pos2(500., 200.)] {
+            click_drawing(&ctx, &mut chart, at, false);
+        }
+        assert!(chart.drawings.is_empty());
+        assert_eq!(chart.draw.vertices.len(), 3);
+        drawing_frame(
+            &ctx,
+            &mut chart,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            false,
+        );
+        assert_eq!(chart.drawings.len(), 1);
+        assert_eq!(chart.drawings[0].vertices.len(), 3);
+        let saved = chart.drawings.clone();
+        chart.undo_drawings();
+        assert!(chart.drawings.is_empty());
+        chart.redo_drawings();
+        assert_eq!(chart.drawings, saved);
+        chart.start_tool(Tool::Path);
+        click_drawing(&ctx, &mut chart, pos2(250., 250.), false);
+        assert!(!chart.finish_vertices());
+        assert!(chart.cancel());
+        assert!(chart.draw.vertices.is_empty());
+        assert_eq!(chart.drawings, saved);
+    }
+
+    #[test]
+    fn path_double_click_finishes_without_duplicate_endpoint() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.start_tool(Tool::Path);
+        click_drawing(&ctx, &mut chart, pos2(200., 300.), false);
+        // Let the initial vertex click age out of egui's triple-click window.
+        drawing_frame(&ctx, &mut chart, vec![], false);
+        drawing_frame(&ctx, &mut chart, vec![], false);
+        let end = pos2(450., 100.);
+        let mut frame = |events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900., 560.))),
+                    time: Some(ctx.input(|i| i.time) + 0.05),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let rect = Rect::from_min_size(Pos2::ZERO, vec2(800., 400.));
+                    let v = Viewport { right: 100., bar_px: 8., width_px: 800. };
+                    let scale = PriceScale::new(100., 200., false, 400.);
+                    let response = ui.interact(rect, egui::Id::new("expanded-drawing-test"), Sense::click_and_drag());
+                    chart.paint_drawings(ui, rect, &v, &scale, ui.input(|i| i.pointer.hover_pos()), &response);
+                },
+            );
+            output.textures_delta.clear();
+        };
+        frame(vec![egui::Event::PointerMoved(end)]);
+        for _ in 0..2 {
+            frame(vec![pointer_button(end, true)]);
+            frame(vec![pointer_button(end, false)]);
+        }
+        assert_eq!(chart.drawings.len(), 1);
+        assert_eq!(chart.drawings[0].vertices.len(), 2);
+        assert!(chart.draw.tool.is_none());
+    }
+
+    #[test]
+    fn brush_drag_records_data_anchors_simplifies_and_undoes() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.start_tool(Tool::Brush);
+        let start = pos2(200., 300.);
+        drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(start)], false);
+        drawing_frame(&ctx, &mut chart, vec![pointer_button(start, true)], false);
+        // Use bar-aligned samples so timestamp quantisation stays collinear.
+        for at in [pos2(304., 248.), pos2(408., 196.), pos2(512., 144.)] {
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(at)], false);
+        }
+        drawing_frame(&ctx, &mut chart, vec![pointer_button(pos2(512., 144.), false)], false);
+        assert_eq!(chart.drawings.len(), 1);
+        let d = &chart.drawings[0];
+        assert_eq!(d.tool, Tool::Brush);
+        assert_eq!(d.vertices, vec![d.a, d.b]);
+        assert!((d.a.price - 125.).abs() < 1e-6);
+        assert!((d.b.price - 164.).abs() < 1e-6);
+        chart.undo_drawings();
+        assert!(chart.drawings.is_empty());
+        chart.redo_drawings();
+        assert_eq!(chart.drawings.len(), 1);
+    }
+
+    #[test]
+    fn callout_uses_existing_editor_sanitises_and_undoes_text() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.start_tool(Tool::Callout);
+        click_drawing(&ctx, &mut chart, pos2(200., 300.), false);
+        click_drawing(&ctx, &mut chart, pos2(450., 100.), false);
+        assert_eq!(chart.drawings.len(), 1);
+        let original = chart.drawings[0].clone();
+        let draft = chart.draw.note.as_mut().unwrap();
+        draft.text = "Callout\u{0}\ntext".into();
+        drawing_frame(&ctx, &mut chart, vec![], false);
+        let labels = drawing_frame(&ctx, &mut chart, vec![], false);
+        let save = labels.iter().find(|(s, _)| s == "Save note").unwrap().1.center();
+        click_drawing(&ctx, &mut chart, save, false);
+        assert_eq!(chart.drawings[0].text, "Callout\ntext");
+        assert_eq!(chart.drawings[0].a, original.a);
+        assert_eq!(chart.drawings[0].b, original.b);
+        chart.undo_drawings();
+        assert_eq!(chart.drawings[0], original);
+        chart.undo_drawings();
+        assert!(chart.drawings.is_empty());
+    }
+
+    #[test]
+    fn path_vertex_handles_edit_snap_lock_hide_and_undo() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.start_tool(Tool::Path);
+        for at in [pos2(200., 300.), pos2(400., 100.), pos2(600., 300.)] {
+            click_drawing(&ctx, &mut chart, at, false);
+        }
+        assert!(chart.finish_vertices());
+        let original = chart.drawings[0].clone();
+        chart.magnet = true;
+        let from = pos2(400., 100.);
+        let to = pos2(416., 190.);
+        for (locked, hidden) in [(true, false), (false, true), (false, false)] {
+            chart.drawings_locked = locked;
+            chart.drawings_hidden = hidden;
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(from)], false);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], false);
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], false);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], false);
+            if locked || hidden {
+                assert_eq!(chart.drawings[0], original);
+            }
+        }
+        let edited = &chart.drawings[0];
+        assert_ne!(edited.vertices[1].ts, original.vertices[1].ts);
+        assert_eq!(edited.vertices[1].price, 150.);
+        assert_eq!(edited.vertices[0], original.vertices[0]);
+        assert_eq!(edited.vertices[2], original.vertices[2]);
+        chart.undo_drawings();
+        assert_eq!(chart.drawings[0], original);
+    }
+
+    #[test]
+    fn annotation_marker_geometry_uses_bar_extremes_without_magnet() {
+        let ctx = egui::Context::default();
+        let chart = drawing_chart();
+        ui_frame(&ctx, vec![], |ui| {
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(800., 400.));
+            let v = Viewport { right: 100., bar_px: 8., width_px: 800. };
+            let scale = PriceScale::new(100., 200., false, 400.);
+            for tool in [Tool::ArrowMarkUp, Tool::ArrowMarkDown, Tool::FlagMark] {
+                let a = Anchor { ts: 50 * 86400, price: 150. };
+                let d = Drawing::new(tool, a, a);
+                let shapes = chart.drawing_shapes(ui, &d, rect, &v, &scale);
+                if let Shape::Polygon(points) = &shapes.last().unwrap().0 {
+                    if tool == Tool::ArrowMarkUp {
+                        assert!(points.iter().all(|p| p[1] > scale.y_of(140.)));
+                    } else {
+                        assert!(points.iter().all(|p| p[1] < scale.y_of(160.)));
+                    }
+                } else {
+                    panic!("Expected marker polygon");
+                }
+            }
+        });
     }
 
     #[test]

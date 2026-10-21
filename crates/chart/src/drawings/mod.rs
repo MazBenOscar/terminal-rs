@@ -26,10 +26,19 @@ pub enum Tool {
     Pitchfork,
     LongPosition,
     ShortPosition,
+    Arrow,
+    ArrowMarkUp,
+    ArrowMarkDown,
+    Brush,
+    Circle,
+    Path,
+    PriceNote,
+    Callout,
+    FlagMark,
 }
 
 impl Tool {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 22] = [
         Self::Trendline,
         Self::Horizontal,
         Self::Vertical,
@@ -43,6 +52,15 @@ impl Tool {
         Self::Pitchfork,
         Self::LongPosition,
         Self::ShortPosition,
+        Self::Arrow,
+        Self::ArrowMarkUp,
+        Self::ArrowMarkDown,
+        Self::Brush,
+        Self::Circle,
+        Self::Path,
+        Self::PriceNote,
+        Self::Callout,
+        Self::FlagMark,
     ];
     pub fn points(self) -> usize {
         point_count(self)
@@ -62,6 +80,15 @@ impl Tool {
             Tool::Pitchfork => "Pitchfork",
             Tool::LongPosition => "Long risk/reward",
             Tool::ShortPosition => "Short risk/reward",
+            Tool::Arrow => "Arrow",
+            Tool::ArrowMarkUp => "Arrow mark up",
+            Tool::ArrowMarkDown => "Arrow mark down",
+            Tool::Brush => "Brush",
+            Tool::Circle => "Circle",
+            Tool::Path => "Path",
+            Tool::PriceNote => "Price note",
+            Tool::Callout => "Callout",
+            Tool::FlagMark => "Flag mark",
         }
     }
 }
@@ -87,8 +114,13 @@ pub struct Drawing {
     /// Third anchor, absent on older drawings.
     #[serde(default)]
     pub c: Option<Anchor>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "text::deserialize_text")]
     pub text: String,
+    /// Additional vertices for brush and path drawings, in data coordinates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "shapes::deserialize_vertices")]
+    pub vertices: Vec<Anchor>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub arrow_end: bool,
 }
 
 fn line_width() -> f32 {
@@ -108,6 +140,8 @@ impl Drawing {
             extend_right: false,
             c: None,
             text: String::new(),
+            vertices: Vec::new(),
+            arrow_end: false,
         }
     }
     pub fn visible_on(&self, symbol: &str) -> bool {
@@ -140,41 +174,60 @@ pub struct Geometry<'a> {
     pub price_y: &'a dyn Fn(f64) -> f64,
     pub measure_label: String,
     pub text_size: Point,
+    pub project: &'a dyn Fn(Anchor) -> Point,
 }
 
 pub fn geometry(context: &Geometry<'_>) -> Vec<LabeledShape> {
     match context.drawing.tool {
-        Tool::Trendline | Tool::Ray | Tool::Horizontal | Tool::Vertical | Tool::Channel | Tool::Pitchfork => {
-            lines::geometry(context)
-        }
+        Tool::Arrow
+        | Tool::ArrowMarkUp
+        | Tool::ArrowMarkDown
+        | Tool::Trendline
+        | Tool::Ray
+        | Tool::Horizontal
+        | Tool::Vertical
+        | Tool::Channel
+        | Tool::Pitchfork => lines::geometry(context),
         Tool::Fib | Tool::FibExtension => fib::geometry(context),
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::geometry(context),
-        Tool::Rectangle => shapes::geometry(context),
-        Tool::Text => text::geometry(context),
+        Tool::Rectangle | Tool::Circle | Tool::Path | Tool::Brush => shapes::geometry(context),
+        Tool::Text | Tool::PriceNote | Tool::Callout | Tool::FlagMark => text::geometry(context),
     }
 }
 
 pub fn point_count(tool: Tool) -> usize {
     match tool {
-        Tool::Trendline | Tool::Ray | Tool::Horizontal | Tool::Vertical | Tool::Channel | Tool::Pitchfork => {
-            lines::point_count(tool)
-        }
+        Tool::Arrow
+        | Tool::ArrowMarkUp
+        | Tool::ArrowMarkDown
+        | Tool::Trendline
+        | Tool::Ray
+        | Tool::Horizontal
+        | Tool::Vertical
+        | Tool::Channel
+        | Tool::Pitchfork => lines::point_count(tool),
         Tool::Fib | Tool::FibExtension => fib::point_count(tool),
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::point_count(tool),
-        Tool::Rectangle => shapes::point_count(),
-        Tool::Text => text::point_count(),
+        Tool::Rectangle | Tool::Circle | Tool::Path | Tool::Brush => shapes::point_count(tool),
+        Tool::Text | Tool::PriceNote | Tool::Callout | Tool::FlagMark => text::point_count(tool),
     }
 }
 
 pub fn handles(drawing: &Drawing) -> Vec<Anchor> {
     match drawing.tool {
-        Tool::Trendline | Tool::Ray | Tool::Horizontal | Tool::Vertical | Tool::Channel | Tool::Pitchfork => {
-            lines::handles(drawing)
-        }
+        Tool::Arrow
+        | Tool::ArrowMarkUp
+        | Tool::ArrowMarkDown
+        | Tool::Trendline
+        | Tool::Ray
+        | Tool::Horizontal
+        | Tool::Vertical
+        | Tool::Channel
+        | Tool::Pitchfork => lines::handles(drawing),
         Tool::Fib | Tool::FibExtension => fib::handles(drawing),
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::handles(drawing),
-        Tool::Rectangle => shapes::handles(drawing),
-        Tool::Text => text::handles(drawing),
+        Tool::Rectangle | Tool::Circle | Tool::Path | Tool::Brush => shapes::handles(drawing),
+        Tool::Text | Tool::PriceNote | Tool::Callout | Tool::FlagMark => text::handles(drawing),
     }
 }
 
@@ -188,13 +241,19 @@ fn distance_to_shapes(shapes: Vec<LabeledShape>, point: Point) -> f64 {
 
 pub fn hit_distance(context: &Geometry<'_>, point: Point) -> f64 {
     match context.drawing.tool {
-        Tool::Trendline | Tool::Ray | Tool::Horizontal | Tool::Vertical | Tool::Channel | Tool::Pitchfork => {
-            lines::hit_distance(context, point)
-        }
+        Tool::Arrow
+        | Tool::ArrowMarkUp
+        | Tool::ArrowMarkDown
+        | Tool::Trendline
+        | Tool::Ray
+        | Tool::Horizontal
+        | Tool::Vertical
+        | Tool::Channel
+        | Tool::Pitchfork => lines::hit_distance(context, point),
         Tool::Fib | Tool::FibExtension => fib::hit_distance(context, point),
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::hit_distance(context, point),
-        Tool::Rectangle => shapes::hit_distance(context, point),
-        Tool::Text => text::hit_distance(context, point),
+        Tool::Rectangle | Tool::Circle | Tool::Path | Tool::Brush => shapes::hit_distance(context, point),
+        Tool::Text | Tool::PriceNote | Tool::Callout | Tool::FlagMark => text::hit_distance(context, point),
     }
 }
 
@@ -219,6 +278,7 @@ mod dispatch_tests {
                 price_y: &|p| p,
                 measure_label: "Measurement".into(),
                 text_size: [40., 20.],
+                project: &|a| [a.ts as f64, a.price],
             };
             let shapes = geometry(&g);
             assert!(!shapes.is_empty(), "{tool:?}");

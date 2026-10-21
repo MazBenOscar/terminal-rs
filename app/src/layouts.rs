@@ -740,10 +740,14 @@ mod tests {
                 let mut drawing = Drawing::new(tool, Anchor { ts: 1, price: 100. }, Anchor { ts: 2, price: 90. });
                 drawing.c = Some(Anchor { ts: 3, price: 120. });
                 drawing.text = "Fixture note".into();
+                if matches!(tool, Tool::Brush | Tool::Path) {
+                    drawing.vertices = vec![drawing.a, drawing.b, drawing.c.unwrap()];
+                    drawing.arrow_end = tool == Tool::Path;
+                }
                 drawing
             })
             .collect();
-        // Captured from the original shared model before moving its serde types.
+        // Original shared-model entries plus annotation tools and sampled vertices.
         let fixture = include_str!("../tests/fixtures/drawings_fixture.json").trim();
         let loaded: Vec<Drawing> = serde_json::from_str(fixture).unwrap();
         assert_eq!(drawings, loaded);
