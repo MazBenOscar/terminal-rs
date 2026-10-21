@@ -152,6 +152,7 @@ pub struct ChartState {
     view_config: (Option<i64>, Option<u64>),
     replay_cutoff: Option<i64>,
     replay_play: bool,
+    replay_speed: usize,
     replay_reanchor: bool,
     replay_tick: std::time::Instant,
     gpu: Option<SeriesGpu>,
@@ -254,6 +255,7 @@ impl ChartState {
             view_config: (None, None),
             replay_cutoff: None,
             replay_play: false,
+            replay_speed: 0,
             replay_reanchor: false,
             replay_tick: std::time::Instant::now(),
             gpu: None,
@@ -352,6 +354,7 @@ impl ChartState {
             .filter(|key| seen.insert(key.clone()))
             .take(7)
             .collect();
+        self.sync_compare_slots();
         if let Some(view) = self.viewport {
             self.plot_width = view.width_px;
         }
@@ -535,6 +538,19 @@ impl ChartState {
         self.built.clear();
     }
 
+    fn sync_compare_slots(&mut self) {
+        let symbols: Vec<_> = self.compare.iter().chain(&self.data.comparisons).cloned().collect();
+        crate::chart_compare::sync_slots(&mut self.data.compare_slots, &symbols);
+    }
+
+    fn compare_color(&self, symbol: &str) -> Color32 {
+        theme::compare(crate::chart_compare::slot(&self.data.compare_slots, symbol))
+    }
+
+    fn primary_compare_color(&self) -> Color32 {
+        self.compare_color(self.compare.as_deref().unwrap_or_default())
+    }
+
     pub fn set_compare(&mut self, symbol: Option<String>, w: &Worker) {
         self.data.comparisons.clear();
         self.data.hidden_comparisons.clear();
@@ -715,6 +731,7 @@ impl ChartState {
     }
 
     fn request_compare(&mut self, w: &Worker) {
+        self.sync_compare_slots();
         self.comparisons.retain(|key, _| self.data.comparisons.contains(key));
         let symbols: Vec<_> = self.compare.iter().chain(self.data.comparisons.iter()).cloned().collect();
         if self.chart_type != ChartType::Renko && !symbols.is_empty() && !self.bars.is_empty() {
@@ -951,6 +968,40 @@ impl ChartState {
             Err(e) => self.error = Some(e),
         }
     }
+    /// Consume replay shortcuts before ordinary chart navigation.
+    pub fn replay_keys(&mut self, ctx: &egui::Context, w: &Worker) -> bool {
+        let Some(cutoff) = self.replay_cutoff else { return false };
+        if ctx.egui_wants_keyboard_input() {
+            return false;
+        }
+        let pressed = |key| ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key));
+        if pressed(egui::Key::Escape) {
+            self.replay_cutoff = None;
+            self.replay_play = false;
+            self.refresh_view(w);
+            return true;
+        }
+        let toggle = pressed(egui::Key::Space);
+        if toggle {
+            self.replay_play = !self.replay_play;
+            self.replay_tick = std::time::Instant::now();
+        }
+        let back = pressed(egui::Key::ArrowLeft);
+        let next = pressed(egui::Key::ArrowRight);
+        if !self.source_bars.is_empty() && (back || next) {
+            let mut index = self.source_bars.partition_point(|b| b.ts <= cutoff).saturating_sub(1);
+            if back {
+                index = index.saturating_sub(1);
+            }
+            if next {
+                index = (index + 1).min(self.source_bars.len() - 1);
+            }
+            self.replay_cutoff = Some(self.source_bars[index].ts);
+            self.refresh_view(w);
+        }
+        toggle || back || next
+    }
+
     fn replay_controls(&mut self, ui: &mut Ui, w: &Worker) {
         let Some(cutoff) = self.replay_cutoff else {
             return;
@@ -960,20 +1011,36 @@ impl ChartState {
             return;
         }
         let mut index = self.source_bars.partition_point(|b| b.ts <= cutoff).saturating_sub(1);
-        ui.label(RichText::new("REPLAY").color(amber()));
-        if ui.button(if self.replay_play { "Pause" } else { "Play" }).clicked() {
+        ui.spacing_mut().item_spacing.x = theme::dp(4.);
+        ui.label(RichText::new("REPLAY").font(mono(10.)).color(amber()));
+        if widgets::icon_button(ui, widgets::Icon::StepBack, "Previous bar (←)", false).clicked() {
+            index = index.saturating_sub(1);
+        }
+        let (icon, hint) = if self.replay_play {
+            (widgets::Icon::Pause, "Pause (Space)")
+        } else {
+            (widgets::Icon::Play, "Play (Space)")
+        };
+        if widgets::icon_button(ui, icon, hint, self.replay_play).clicked() {
             self.replay_play = !self.replay_play;
             self.replay_tick = std::time::Instant::now();
         }
-        if ui.button("Back").on_hover_text("Previous source bar").clicked() {
-            index = index.saturating_sub(1);
-        }
-        if ui.button("Next").on_hover_text("Next source bar").clicked() {
+        if widgets::icon_button(ui, widgets::Icon::StepForward, "Next bar (→)", false).clicked() {
             index = (index + 1).min(len - 1);
         }
+        if let Some(speed) = widgets::segmented(
+            ui,
+            (self.id, "replay-speed"),
+            &["1×", "2×", "5×"],
+            Some(self.replay_speed),
+            theme::dp(22.),
+        ) {
+            self.replay_speed = speed;
+            self.replay_tick = std::time::Instant::now();
+        }
         if self.replay_play {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
-            if self.replay_tick.elapsed().as_secs_f32() >= 1. {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            if self.replay_tick.elapsed().as_secs_f32() >= 1. / [1., 2., 5.][self.replay_speed] {
                 index = (index + 1).min(len - 1);
                 self.replay_tick = std::time::Instant::now();
             }
@@ -981,7 +1048,9 @@ impl ChartState {
                 self.replay_play = false;
             }
         }
-        let slider_width = (ui.available_width() - 215.).clamp(40., 320.);
+        let caption_width =
+            ui.painter().layout_no_wrap(format!("Bar {len} / {len} · 2000-00-00"), ui_font(11.), text()).size().x;
+        let slider_width = (ui.available_width() - caption_width - theme::dp(40.)).max(theme::dp(24.));
         ui.scope(|ui| {
             ui.spacing_mut().slider_width = slider_width;
             // Render after playback advances, using an explicitly linear bar-index range.
@@ -994,9 +1063,9 @@ impl ChartState {
         let date = chrono::DateTime::from_timestamp(self.source_bars[index].ts, 0)
             .map(|date| date.format("%Y-%m-%d").to_string())
             .unwrap_or_default();
-        ui.label(RichText::new(format!("bar {} / {len} · {date}", index + 1)).small());
+        ui.label(RichText::new(format!("Bar {} / {len} · {date}", index + 1)).font(ui_font(11.)));
         self.replay_cutoff = Some(self.source_bars[index].ts);
-        if ui.button("Exit").clicked() {
+        if widgets::icon_button(ui, widgets::Icon::Close, "Exit replay (Esc)", false).clicked() {
             self.replay_cutoff = None;
             self.replay_play = false;
         }
@@ -1196,9 +1265,31 @@ impl ChartState {
             self.chart_type = ChartType::ALL[i];
             clicked = true;
         }
+        self.mode_badge(ui);
         ui.add_space(6.);
         clicked |= self.chart_actions(ui);
         clicked
+    }
+
+    fn mode_badge(&self, ui: &mut Ui) {
+        let mode = if self.replay_cutoff.is_some() {
+            Some(("REPLAY", "REPLAY · historical bars · live alerts independent"))
+        } else if self.chart_type == ChartType::Renko {
+            Some(("RENKO", "RENKO · synthetic bricks · one-box reversal"))
+        } else if self.chart_type == ChartType::HeikinAshi {
+            Some(("HA", "Heikin Ashi display · OHLC/studies/P&L use source bars"))
+        } else {
+            None
+        };
+        if let Some((label, hint)) = mode {
+            egui::Frame::new()
+                .stroke(Stroke::new(1., amber()))
+                .corner_radius(theme::CONTROL_RADIUS)
+                .inner_margin(egui::Margin::symmetric(4, 1))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(label).font(mono(10.)).color(amber())).on_hover_text(hint);
+                });
+        }
     }
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
@@ -1276,6 +1367,7 @@ impl ChartState {
         if !self.data.comparisons.is_empty() && self.compare_axis == CompareAxis::Own {
             self.compare_axis = CompareAxis::Percent;
         }
+        self.sync_compare_slots();
         self.comparisons.retain(|key, _| self.data.comparisons.contains(key));
         let painter = ui.painter_at(rect);
         // Sits under a tab strip inside a card: square top, rounded bottom.
@@ -1333,6 +1425,7 @@ impl ChartState {
                         }
                     }
                 });
+                self.mode_badge(&mut hui);
                 if hui.available_width()
                     > Self::action_width(&hui, "Indicators…") + Self::action_width(&hui, "Compare…") + 12.
                 {
@@ -1652,10 +1745,12 @@ impl ChartState {
                 anchor.map(|i| gpu.closes.pyramid.data[i][1] as f64 / c.pyramid.data[i][1] as f64).unwrap_or(1.);
             self.compare_scale = scale;
             if self.compare_axis != CompareAxis::Own && primary_visible && anchor.is_some() {
-                overlays.push(compare_overlay(c, scale));
+                let mut overlay = compare_overlay(c, scale);
+                overlay.color = theme::rgba(self.primary_compare_color());
+                overlays.push(overlay);
             }
         }
-        for (index, key) in self.data.comparisons.iter().enumerate() {
+        for key in &self.data.comparisons {
             if self.chart_type == ChartType::Renko || self.data.hidden_comparisons.contains(key) {
                 continue;
             }
@@ -1664,7 +1759,7 @@ impl ChartState {
             {
                 extra.factor = gpu.closes.pyramid.data[at][1] as f64 / line.pyramid.data[at][1] as f64;
                 let mut overlay = compare_overlay(line, extra.factor);
-                overlay.color = theme::rgba(crate::chart_compare::color(index + 1));
+                overlay.color = theme::rgba(theme::compare(crate::chart_compare::slot(&self.data.compare_slots, key)));
                 overlays.push(overlay);
             }
         }
@@ -1789,7 +1884,9 @@ impl ChartState {
         }
         let mut own_scale = None;
         if own_axis && let Some(c) = &self.compare_line {
-            let separate = scene::sub_pane(&[compare_overlay(c, 1.0)], &v, price_rect.height() as f64, None, style);
+            let mut overlay = compare_overlay(c, 1.0);
+            overlay.color = theme::rgba(self.primary_compare_color());
+            let separate = scene::sub_pane(&[overlay], &v, price_rect.height() as f64, None, style);
             out.cmds.extend(separate.cmds);
             own_scale = Some(separate.scale);
         }
@@ -1884,7 +1981,7 @@ impl ChartState {
                         Align2::RIGHT_CENTER,
                         scale::format_price(t, dec),
                         mono(11.0),
-                        theme::compare(0).gamma_multiply(0.8),
+                        self.primary_compare_color().gamma_multiply(0.8),
                     );
                 }
             }
@@ -1933,7 +2030,7 @@ impl ChartState {
             && tag_fade > 0.0
         {
             if self.chart_type != ChartType::Renko && self.compare_axis != CompareAxis::Own && anchor.is_some() {
-                for (index, key) in self.data.comparisons.iter().enumerate() {
+                for key in &self.data.comparisons {
                     if self.data.hidden_comparisons.contains(key) {
                         continue;
                     }
@@ -1949,7 +2046,7 @@ impl ChartState {
                         Some(base) => axis_value(percent(rebased, base), 2, self.compare_axis),
                         None => scale::format_price(raw, decimals),
                     };
-                    right_tags.push((y, crate::chart_compare::color(index + 1).gamma_multiply(tag_fade), text));
+                    right_tags.push((y, self.compare_color(key).gamma_multiply(tag_fade), text));
                 }
             }
             // The comparison's last value: on the right axis when it shares it, else on the left one.
@@ -1958,7 +2055,7 @@ impl ChartState {
                 && primary_visible
                 && (own_axis || anchor.is_some())
             {
-                let color = theme::compare(0).gamma_multiply(tag_fade);
+                let color = self.primary_compare_color().gamma_multiply(tag_fade);
                 let ink = Color32::BLACK.gamma_multiply(tag_fade);
                 let decimals = scale::decimals_for(raw.abs() / 1000.0).clamp(2, 4);
                 match own_scale {
@@ -3221,94 +3318,46 @@ impl ChartState {
             label_text(&p, pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, note, mono(11.0), muted());
             ly += 14.0;
         }
-        if let Some(sym) = &self.compare {
-            // Raw price plus performance relative to the left edge of the view.
-            let raw = self
-                .compare_line
-                .as_ref()
-                .and_then(|line| line.pyramid.data.get(i))
-                .map(|point| point[1] as f64)
-                .filter(|v| v.is_finite());
-            let rel = raw.zip(self.compare_base).map(|(r, base)| percent(r * self.compare_scale, base));
-            let text = if self.chart_type == ChartType::Renko {
-                format!("CMP {sym} · unavailable on Renko")
-            } else if self.data.hidden_comparisons.contains(sym) {
-                format!("CMP {sym} · hidden")
-            } else if let Some(error) = &self.compare_error {
-                format!("CMP {sym} · {error}")
-            } else if self.compare_loading {
-                format!("CMP {sym} · loading…")
-            } else {
-                match (raw, rel) {
-                    (Some(r), Some(rel)) => format!("CMP {sym}  {r:.2}  ({rel:+.2}% from shared base)"),
-                    _ => format!("CMP {sym}"),
-                }
-            };
-            label_text(
-                &p,
-                pos2(price_rect.left() + 6.0, ly),
-                Align2::LEFT_TOP,
-                text,
-                mono(11.0),
-                if self.chart_type == ChartType::Renko { muted() } else { theme::compare(0) },
-            );
-            ly += 14.0;
-        }
-        for (index, key) in self.data.comparisons.iter().enumerate() {
+        for key in self.compare.iter().chain(&self.data.comparisons) {
+            let ticker = key.split_whitespace().next().unwrap_or(key);
             let extra = self.comparisons.get(key);
-            let state = if self.chart_type == ChartType::Renko {
-                "unavailable on Renko".to_string()
-            } else if self.data.hidden_comparisons.contains(key) {
-                "hidden".to_string()
-            } else if let Some(error) = extra.and_then(|s| s.error.as_ref()) {
-                error.clone()
-            } else if extra.is_none_or(|s| s.loading) {
-                "loading…".to_string()
+            let (line, factor, loading, error) = if self.compare.as_ref() == Some(key) {
+                (self.compare_line.as_ref(), self.compare_scale, self.compare_loading, self.compare_error.as_deref())
             } else {
-                extra
-                    .and_then(|s| {
-                        s.line.as_ref().and_then(|line| line.pyramid.data.get(i)).map(|p| (p[1] as f64, s.factor))
-                    })
-                    .map_or("unavailable".into(), |(raw, factor)| {
-                        self.compare_base.map_or(format!("{raw:.2} · no common anchor"), |base| {
-                            format!("{raw:.2} ({:+.2}% from shared base)", percent(raw * factor, base))
-                        })
-                    })
+                (
+                    extra.and_then(|s| s.line.as_ref()),
+                    extra.map_or(1., |s| s.factor),
+                    extra.is_none_or(|s| s.loading),
+                    extra.and_then(|s| s.error.as_deref()),
+                )
             };
-            label_text(
-                &p,
-                pos2(price_rect.left() + 6., ly),
-                Align2::LEFT_TOP,
-                format!("CMP {key} · {state}"),
-                mono(11.),
-                if self.chart_type == ChartType::Renko { muted() } else { crate::chart_compare::color(index + 1) },
-            );
-            ly += 14.;
-        }
-        if self.replay_cutoff.is_some() || self.chart_type == ChartType::Renko {
-            label_text(
-                &p,
-                pos2(price_rect.left() + 6., ly),
-                Align2::LEFT_TOP,
-                if self.chart_type == ChartType::Renko {
-                    "RENKO · synthetic bricks · one-box reversal"
-                } else {
-                    "REPLAY · historical bars · live alerts independent"
-                },
-                mono(10.),
-                amber(),
-            );
-            ly += 14.;
-        }
-        if self.chart_type == ChartType::HeikinAshi {
-            label_text(
-                &p,
-                pos2(price_rect.left() + 6., ly),
-                Align2::LEFT_TOP,
-                "Heikin Ashi display · OHLC/studies/P&L use source bars",
-                mono(10.),
-                muted(),
-            );
+            let raw = line.and_then(|line| line.pyramid.data.get(i)).map(|p| p[1] as f64).filter(|v| v.is_finite());
+            let state = if self.chart_type == ChartType::Renko {
+                Some("unavailable on Renko")
+            } else if self.data.hidden_comparisons.contains(key) {
+                Some("hidden")
+            } else if let Some(error) = error {
+                Some(error)
+            } else if loading {
+                Some("loading…")
+            } else {
+                None
+            };
+            let label = if let Some(state) = state {
+                format!("{ticker} · {state}")
+            } else if let Some(raw) = raw {
+                self.compare_base.map_or_else(
+                    || format!("{ticker} {raw:.2}"),
+                    |base| format!("{ticker} {raw:.2} {:+.2}%", percent(raw * factor, base)),
+                )
+            } else {
+                format!("{ticker} · unavailable")
+            };
+            let pos = pos2(price_rect.left() + theme::dp(6.), ly);
+            let size = p.layout_no_wrap(label.clone(), mono(11.), self.compare_color(key)).size();
+            label_text(&p, pos, Align2::LEFT_TOP, label, mono(11.), self.compare_color(key));
+            ui.interact(Rect::from_min_size(pos, size), ui.id().with(("compare-legend", key)), Sense::hover())
+                .on_hover_text(format!("{key}\n% change from the visible left edge"));
             ly += 14.;
         }
         if self.data.analytics.anchor.is_some() {
@@ -4232,6 +4281,60 @@ mod tests {
     }
 
     #[test]
+    fn replay_shortcuts_consume_navigation_only_during_replay() {
+        let ctx = egui::Context::default();
+        let worker = Worker::inert();
+        let mut chart = sample_chart();
+        chart.source_bars = chart.bars.clone();
+        let press = |chart: &mut ChartState, key| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ui| {
+                    let active = chart.replay_cutoff.is_some();
+                    assert_eq!(chart.replay_keys(ui.ctx(), &worker), active);
+                    assert_eq!(ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key)), !active);
+                },
+            );
+            output.textures_delta.clear();
+        };
+        press(&mut chart, egui::Key::ArrowRight);
+        chart.replay_cutoff = Some(chart.source_bars[0].ts);
+        press(&mut chart, egui::Key::ArrowRight);
+        assert_eq!(chart.replay_cutoff, Some(chart.source_bars[1].ts));
+        press(&mut chart, egui::Key::ArrowLeft);
+        assert_eq!(chart.replay_cutoff, Some(chart.source_bars[0].ts));
+        press(&mut chart, egui::Key::Space);
+        assert!(chart.replay_play);
+        press(&mut chart, egui::Key::Escape);
+        assert!(chart.replay_cutoff.is_none());
+        assert!(!chart.replay_play);
+    }
+
+    #[test]
+    fn comparison_slots_migrate_and_round_trip_with_chart_data() {
+        let worker = Worker::inert();
+        let mut chart = sample_chart();
+        chart.data = serde_json::from_str(r#"{"comparisons":["SPY US Equity","QQQ US Equity"]}"#).unwrap();
+        chart.load(&worker);
+        assert_eq!(chart.data.compare_slots, vec![("SPY US Equity".into(), 0), ("QQQ US Equity".into(), 1)]);
+        chart.compare = Some(chart.data.comparisons.remove(0));
+        chart.sync_compare_slots();
+        assert_eq!(crate::chart_compare::slot(&chart.data.compare_slots, "QQQ US Equity"), 1);
+        let json = serde_json::to_string(&chart.data).unwrap();
+        let restored: crate::chart_data::ChartData = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.compare_slots, chart.data.compare_slots);
+    }
+
+    #[test]
     fn replay_slider_knob_tracks_cutoff_across_the_full_source_history() {
         let ctx = egui::Context::default();
         let mut chart = sample_chart();
@@ -4262,12 +4365,12 @@ mod tests {
             assert_eq!(chart.replay_cutoff, Some(chart.source_bars[index].ts));
             assert!(output.shapes.iter().any(|shape| matches!(
                 &shape.shape,
-                egui::Shape::Text(text) if text.galley.job.text.starts_with(&format!("bar {} / {len} · ", index + 1))
+                egui::Shape::Text(text) if text.galley.job.text.starts_with(&format!("Bar {} / {len} · ", index + 1))
             )));
         }
         let fraction = (positions[1] - positions[0]) / (positions[2] - positions[0]);
         assert!((fraction - 0.5).abs() < 0.01, "knob positions: {positions:?}");
-        assert!(positions[2] - positions[0] <= 320.);
+        assert!(positions[2] > positions[0], "flex slider must span the available history");
     }
 
     #[test]
@@ -4634,8 +4737,8 @@ mod tests {
             crate::chart_compare::Series { line: Some(line), loading: true, ..Default::default() },
         );
         let labels = chart_frame(&ctx, &mut chart, vec![]);
-        for symbol in ["SPY US Equity", "QQQ US Equity"] {
-            assert!(labels.iter().any(|(text, _)| text == &format!("CMP {symbol} · unavailable on Renko")));
+        for ticker in ["SPY", "QQQ"] {
+            assert!(labels.iter().any(|(text, _)| text == &format!("{ticker} · unavailable on Renko")));
         }
         assert!(chart.compare_base.is_none());
     }

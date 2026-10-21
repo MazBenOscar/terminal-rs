@@ -1344,6 +1344,13 @@ impl TerminalApp {
         if other_text_focused {
             return;
         }
+        if !cmd_focused && self.cmd.is_empty() && self.focused_is_chart() {
+            let mut handled = false;
+            self.with_chart(|chart, worker| handled = chart.replay_keys(ctx, worker));
+            if handled {
+                return;
+            }
+        }
         // Chorded bindings (⌘, Ctrl, Alt) work even while the command line has text.
         let mut swallow_text = false;
         for &(key, m) in &presses {

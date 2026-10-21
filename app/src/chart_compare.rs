@@ -50,8 +50,28 @@ pub struct Series {
     pub factor: f64,
 }
 
-pub fn color(index: usize) -> egui::Color32 {
-    theme::compare(index)
+/// Preserve identities across promotion and migrate old layouts in comparison order.
+pub fn sync_slots(slots: &mut Vec<(String, u8)>, symbols: &[String]) {
+    let mut used = [false; 8];
+    slots.retain(|(key, slot)| {
+        if !symbols.contains(key) || *slot >= 8 || used[*slot as usize] {
+            return false;
+        }
+        used[*slot as usize] = true;
+        true
+    });
+    for key in symbols {
+        if !slots.iter().any(|(existing, _)| existing == key)
+            && let Some(slot) = used.iter().position(|used| !used)
+        {
+            slots.push((key.clone(), slot as u8));
+            used[slot] = true;
+        }
+    }
+}
+
+pub fn slot(slots: &[(String, u8)], symbol: &str) -> usize {
+    slots.iter().find(|(key, _)| key == symbol).map_or(0, |(_, slot)| *slot as usize)
 }
 
 pub fn common_anchor(
@@ -293,6 +313,18 @@ fn result_button(ui: &mut Ui, key: &str, name: &str, current: Option<&str>, chos
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slots_survive_promotion_and_reuse_the_lowest_free_slot() {
+        let mut slots = Vec::new();
+        sync_slots(&mut slots, &["A".into(), "B".into()]);
+        assert_eq!(slots, vec![("A".into(), 0), ("B".into(), 1)]);
+        sync_slots(&mut slots, &["B".into()]);
+        assert_eq!(slot(&slots, "B"), 1);
+        sync_slots(&mut slots, &["B".into(), "C".into()]);
+        assert_eq!(slot(&slots, "B"), 1);
+        assert_eq!(slot(&slots, "C"), 0);
+    }
+
     #[test]
     fn no_comparisons_have_no_anchor() {
         let main = tr_chart::scene::line_ref(&[100., 101., 102.]);
