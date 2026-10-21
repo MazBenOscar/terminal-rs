@@ -22,6 +22,8 @@ pub enum Action {
     OpenProfile(String),
     Track(String, bool),
     AddToWatchlist(String),
+    AddMatchesToWatchlist(Vec<String>),
+    ReplaceWatchlistWithMatches(Vec<String>),
     /// Load a security into every pane of a colour link group.
     LinkedSymbol(crate::layouts::Link, String),
     /// Run a command line (`AAPL OMON`, `PORT REFRESH`) without adding it to the history.

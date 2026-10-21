@@ -853,6 +853,13 @@ pub fn show(
     actions
 }
 
+fn matching_symbols(rows: &[ScanRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| row.error.is_none() && row.evaluation.as_ref().is_some_and(|e| e.outcome == ScanOutcome::Match))
+        .map(|row| tr_data::security(&row.symbol).key())
+        .collect()
+}
+
 /// Two decimals, with K/M/B for volumes and other large values.
 fn compact(v: f64) -> String {
     let a = v.abs();
@@ -871,6 +878,17 @@ const SAVED_NOTICE: &str = "Scan saved to scans.json";
 
 /// Results drawn like the watchlist: a header band, hover-washed rows, click to chart.
 fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec<Action>) {
+    let matches = matching_symbols(&pane.rows);
+    if !pane.running && !matches.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Add matches to watchlist").clicked() {
+                actions.push(Action::AddMatchesToWatchlist(matches.clone()));
+            }
+            if ui.button("Replace watchlist with matches").clicked() {
+                actions.push(Action::ReplaceWatchlistWithMatches(matches.clone()));
+            }
+        });
+    }
     let row_h = dp(22.0);
     let w = ui.available_width();
     // Left edges: security, result, last bar, bar age, details.
@@ -949,6 +967,12 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
             "{} · {source}\n{detail}\nClick to chart. Bar age is the age of the bar's opening timestamp, not a freshness guarantee.",
             row.symbol
         ));
+        resp.context_menu(|ui| {
+            if ui.button("Add to watchlist").clicked() {
+                actions.push(Action::AddToWatchlist(row.symbol.clone()));
+                ui.close();
+            }
+        });
         if resp.clicked() {
             if outcome == ScanOutcome::Match {
                 actions.push(Action::ScanChart {
@@ -1049,6 +1073,112 @@ mod tests {
         assert!(pane.completed.is_some());
         pane.partial(42, vec![unavailable_row("LATE")]);
         assert_eq!(pane.rows.len(), 1);
+    }
+
+    #[test]
+    fn result_buttons_and_row_context_menu_emit_watchlist_actions() {
+        let ctx = egui::Context::default();
+        let mut pane = ScannerPane::default();
+        pane.rows = vec![ScanRow {
+            symbol: "NVDA".into(),
+            evaluation: Some(tr_core::scanner::ScanEvaluation {
+                outcome: ScanOutcome::Match,
+                conditions: Vec::new(),
+                reason: None,
+            }),
+            ts: None,
+            simulated: false,
+            error: None,
+        }];
+        let mut actions = Vec::new();
+        let mut frame = |pane: &ScannerPane, events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0))),
+                    time: Some(ctx.input(|i| i.time) + 0.2),
+                    events,
+                    ..Default::default()
+                },
+                |ui| results_table(ui, pane, false, &mut actions),
+            );
+            let texts: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        Some((text.galley.job.text.clone(), text.galley.rect.translate(text.pos.to_vec2())))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            output.textures_delta.clear();
+            texts
+        };
+        let labels = frame(&pane, vec![]);
+        let point = |labels: &[(String, egui::Rect)], label: &str| {
+            labels.iter().find(|(text, _)| text == label).unwrap().1.center()
+        };
+        let pointer = |pos, button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for label in ["Add matches to watchlist", "Replace watchlist with matches"] {
+            let at = point(&labels, label);
+            frame(&pane, vec![egui::Event::PointerMoved(at)]);
+            frame(&pane, vec![pointer(at, egui::PointerButton::Primary, true)]);
+            frame(&pane, vec![pointer(at, egui::PointerButton::Primary, false)]);
+        }
+        let at = point(&labels, "NVDA");
+        frame(&pane, vec![egui::Event::PointerMoved(at)]);
+        frame(&pane, vec![pointer(at, egui::PointerButton::Secondary, true)]);
+        frame(&pane, vec![pointer(at, egui::PointerButton::Secondary, false)]);
+        let menu = frame(&pane, vec![]);
+        let at = point(&menu, "Add to watchlist");
+        frame(&pane, vec![egui::Event::PointerMoved(at)]);
+        frame(&pane, vec![pointer(at, egui::PointerButton::Primary, true)]);
+        frame(&pane, vec![pointer(at, egui::PointerButton::Primary, false)]);
+        pane.running = true;
+        assert!(!frame(&pane, vec![]).iter().any(|(text, _)| text == "Add matches to watchlist"));
+        pane.running = false;
+        pane.rows.clear();
+        assert!(!frame(&pane, vec![]).iter().any(|(text, _)| text == "Replace watchlist with matches"));
+        assert_eq!(
+            actions,
+            vec![
+                Action::AddMatchesToWatchlist(vec![tr_data::security("NVDA").key()]),
+                Action::ReplaceWatchlistWithMatches(vec![tr_data::security("NVDA").key()]),
+                Action::AddToWatchlist("NVDA".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn watchlist_matches_filter_errors_and_preserve_result_order() {
+        let row = |symbol: &str, outcome| ScanRow {
+            symbol: symbol.into(),
+            evaluation: Some(tr_core::scanner::ScanEvaluation { outcome, conditions: Vec::new(), reason: None }),
+            ts: None,
+            simulated: false,
+            error: None,
+        };
+        let mut error = row("ERROR", ScanOutcome::Match);
+        error.error = Some("Failed".into());
+        let rows = vec![
+            row("NVDA", ScanOutcome::Match),
+            row("NO", ScanOutcome::NoMatch),
+            row("UNAVAILABLE", ScanOutcome::Unavailable),
+            unavailable_row("MISSING"),
+            error,
+            row("AAPL", ScanOutcome::Match),
+            row("NVDA", ScanOutcome::Match),
+        ];
+        assert_eq!(
+            matching_symbols(&rows),
+            vec![tr_data::security("NVDA").key(), tr_data::security("AAPL").key(), tr_data::security("NVDA").key()]
+        );
     }
 
     #[test]

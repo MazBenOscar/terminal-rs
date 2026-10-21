@@ -516,6 +516,7 @@ pub struct TerminalApp {
     status: String,
     toasts: Vec<(String, Instant)>,
     alert_toasts: Vec<(Instant, tr_core::price_alerts::Event)>,
+    watchlist_undo: Option<(Instant, Vec<String>, Vec<String>)>,
 
     latest: Vec<Trade>,
     politicians: Vec<PoliticianSummary>,
@@ -583,6 +584,43 @@ fn keys_from_words(words: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+/// The single watchlist is capped at 200 symbols; existing lists are never silently shortened.
+fn watchlist_append(current: &[String], symbols: Vec<String>) -> (Vec<String>, usize, bool) {
+    let mut next = current.to_vec();
+    let mut truncated = false;
+    for symbol in symbols {
+        let key = tr_data::security(&symbol).key();
+        if !next.contains(&key) {
+            if next.len() >= 200 {
+                truncated = true;
+            } else {
+                next.push(key);
+            }
+        }
+    }
+    let added = next.len() - current.len();
+    (next, added, truncated)
+}
+
+fn watchlist_restore(
+    current: &[String],
+    undo: &mut Option<(Instant, Vec<String>, Vec<String>)>,
+) -> Option<Vec<String>> {
+    undo.take().and_then(|(_, previous, expected)| (current == expected).then_some(previous))
+}
+
+fn watchlist_add_message(added: usize, truncated: bool) -> String {
+    let mut message = if added == 0 && !truncated {
+        "All matches are already in the watchlist".into()
+    } else {
+        format!("Added {added} symbols to the watchlist")
+    };
+    if truncated {
+        message.push_str(" (truncated to the 200-symbol watchlist cap)");
+    }
+    message
 }
 
 fn settings_path() -> std::path::PathBuf {
@@ -681,6 +719,7 @@ impl TerminalApp {
             status: "Ready. Type a ticker and press <GO> (Enter). F1 for help.".into(),
             toasts: Vec::new(),
             alert_toasts: Vec::new(),
+            watchlist_undo: None,
             latest: Vec::new(),
             politicians: Vec::new(),
             pol_search: String::new(),
@@ -782,6 +821,35 @@ impl TerminalApp {
         }
     }
 
+    fn set_watchlist(&mut self, symbols: Vec<String>) {
+        if self.watchlist != symbols {
+            if let Some((at, _, _)) = self.watchlist_undo.take() {
+                self.toasts.retain(|(_, time)| *time != at);
+            }
+            self.watchlist = symbols;
+            self.last_quotes = None;
+            self.refresh_columns();
+        }
+    }
+
+    fn add_watchlist_symbols(&mut self, symbols: Vec<String>) {
+        let (next, added, truncated) = watchlist_append(&self.watchlist, symbols);
+        self.set_watchlist(next);
+        let message = watchlist_add_message(added, truncated);
+        self.status = message.clone();
+        self.toasts.push((format!("Watchlist: {message}"), Instant::now()));
+    }
+
+    fn undo_watchlist(&mut self) {
+        if let Some((at, _, _)) = &self.watchlist_undo {
+            self.toasts.retain(|(_, time)| time != at);
+        }
+        if let Some(previous) = watchlist_restore(&self.watchlist, &mut self.watchlist_undo) {
+            self.set_watchlist(previous);
+            self.status = "Watchlist restored".into();
+        }
+    }
+
     fn run_actions(&mut self, actions: Vec<Action>) {
         for a in actions {
             match a {
@@ -789,24 +857,30 @@ impl TerminalApp {
                 Action::ScanChart { symbol, symbols, definition } => {
                     self.open_security(&symbol);
                     self.with_chart(|c, w| {
-                        c.set_symbol(&symbol, w);
-                        c.data.workflow.symbols = symbols;
-                        c.data.workflow.scan = Some(definition.clone());
-                        c.set_timeframe(definition.timeframe, w);
-                        c.plot_scan(w);
+                        c.open_scan_chart(&symbol, symbols, definition, w);
                     });
                 }
                 Action::OpenTicker(s) => {
                     self.open_panel(PaneKind::Ticker { symbol: s, trades: Vec::new(), loading: true })
                 }
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
-                Action::AddToWatchlist(s) => {
-                    let key = tr_data::security(&s).key();
-                    if !self.watchlist.contains(&key) {
-                        self.status = format!("Added {key} to the watchlist");
-                        self.watchlist.push(key);
-                        self.last_quotes = None;
+                Action::AddToWatchlist(s) => self.add_watchlist_symbols(vec![s]),
+                Action::AddMatchesToWatchlist(symbols) => self.add_watchlist_symbols(symbols),
+                Action::ReplaceWatchlistWithMatches(symbols) => {
+                    if let Some((at, _, _)) = self.watchlist_undo.take() {
+                        self.toasts.retain(|(_, time)| *time != at);
                     }
+                    let previous = self.watchlist.clone();
+                    let (next, _, truncated) = watchlist_append(&[], symbols);
+                    let mut message = format!("Watchlist replaced with {} matches · Undo", next.len());
+                    if truncated {
+                        message.push_str(" (truncated to the 200-symbol watchlist cap)");
+                    }
+                    self.set_watchlist(next);
+                    let at = Instant::now();
+                    self.watchlist_undo = Some((at, previous, self.watchlist.clone()));
+                    self.status = message.clone();
+                    self.toasts.push((format!("Watchlist: {message}"), at));
                 }
                 Action::LinkedSymbol(link, s) => self.broadcast(link, &s, None),
                 Action::Command(line) => match command::parse(&line) {
@@ -942,17 +1016,11 @@ impl TerminalApp {
                 self.watch_sort = None;
                 self.refresh_columns();
             }
-            Function::WatchAdd(words) => {
-                for key in keys_from_words(&words) {
-                    if !self.watchlist.contains(&key) {
-                        self.watchlist.push(key);
-                    }
-                }
-                self.last_quotes = None;
-            }
+            Function::WatchAdd(words) => self.add_watchlist_symbols(keys_from_words(&words)),
             Function::WatchRemove(words) => {
                 let keys = keys_from_words(&words);
-                self.watchlist.retain(|s| !keys.contains(s));
+                let next = self.watchlist.iter().filter(|s| !keys.contains(s)).cloned().collect();
+                self.set_watchlist(next);
             }
             Function::Layout(arg) => self.layout_command(&arg),
             Function::Layouts => {
@@ -1655,7 +1723,8 @@ impl TerminalApp {
             self.autosave();
             self.last_save = Instant::now();
         }
-        self.toasts.retain(|(_, t)| t.elapsed() < Duration::from_secs(TOAST_SECS));
+        let undo_at = self.watchlist_undo.as_ref().map(|(at, _, _)| *at);
+        self.toasts.retain(|(_, t)| Some(*t) == undo_at || t.elapsed() < Duration::from_secs(TOAST_SECS));
         self.alert_toasts.retain(|(t, _)| t.elapsed() < Duration::from_secs(TOAST_SECS));
     }
 
@@ -1868,6 +1937,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn watchlist_add_replace_dedupe_order_cap_and_undo() {
+        let key = |s: &str| tr_data::security(s).key();
+        let original = vec![key("MSFT"), key("AAPL")];
+        let matches = vec!["NVDA".into(), "AAPL".into(), "NVDA".into(), "TSLA".into()];
+        let (added, count, truncated) = watchlist_append(&original, matches.clone());
+        assert_eq!(added, vec![key("MSFT"), key("AAPL"), key("NVDA"), key("TSLA")]);
+        assert_eq!((count, truncated), (2, false));
+        let (replacement, _, _) = watchlist_append(&[], matches);
+        assert_eq!(replacement, vec![key("NVDA"), key("AAPL"), key("TSLA")]);
+        let mut undo = Some((Instant::now(), original.clone(), replacement.clone()));
+        assert_eq!(watchlist_restore(&replacement, &mut undo), Some(original.clone()));
+        assert!(undo.is_none());
+        let mut undo = Some((Instant::now(), original.clone(), replacement));
+        assert_eq!(watchlist_restore(&added, &mut undo), None);
+        let (full, count, truncated) = watchlist_append(&[], (0..205).map(|n| format!("QA{n}")).collect());
+        assert_eq!((full.len(), count, truncated), (200, 200, true));
+        assert_eq!(
+            watchlist_add_message(count, truncated),
+            "Added 200 symbols to the watchlist (truncated to the 200-symbol watchlist cap)"
+        );
+        assert_eq!(watchlist_append(&original, original.clone()).1, 0);
+        assert_eq!(watchlist_add_message(0, false), "All matches are already in the watchlist");
+        // The row action uses the same single-symbol append path as WL ADD.
+        let (row, count, _) = watchlist_append(&original, vec!["NVDA".into()]);
+        assert_eq!(count, 1);
+        assert_eq!(row.last(), Some(&key("NVDA")));
+    }
+
+    #[test]
     fn stale_column_revision_is_dropped() {
         assert_eq!(accept_columns(3, 4, "old cells"), None);
         assert_eq!(accept_columns(4, 4, "new cells"), Some("new cells"));
@@ -1921,6 +2019,22 @@ mod tests {
         ] {
             assert_eq!(PaneKind::from_settings(s.clone()).settings(), s);
         }
+    }
+
+    #[test]
+    fn chart_layout_persists_plot_conditions_and_defaults_legacy_field() {
+        let mut chart = ChartState::new(1, "AAPL", tr_core::Timeframe::D1);
+        chart.data.workflow.plot_conditions = true;
+        let before = PaneKind::Chart(Box::new(chart)).settings();
+        let mut saved = serde_json::to_value(&before).unwrap();
+        let restored = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(PaneKind::from_settings(restored).settings(), before);
+        saved["Chart"]["data"]["workflow"].as_object_mut().unwrap().remove("plot_conditions");
+        let restored = serde_json::from_value(saved).unwrap();
+        let PaneKind::Chart(chart) = PaneKind::from_settings(restored) else {
+            panic!("Expected chart");
+        };
+        assert!(!chart.data.workflow.plot_conditions);
     }
 
     #[test]

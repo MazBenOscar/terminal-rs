@@ -613,7 +613,7 @@ impl TerminalApp {
                 });
             }
             if let Some(k) = remove {
-                self.watchlist.retain(|x| *x != k);
+                self.set_watchlist(self.watchlist.iter().filter(|x| **x != k).cloned().collect());
             }
             if nav_row(ui, Icon::List, "Open Watchlist Pane", None, is_focused(&PaneKind::Watchlist)).clicked() {
                 out.push(SidebarCmd::Function(Function::Watchlist));
@@ -899,11 +899,14 @@ impl TerminalApp {
 
     pub(super) fn toasts(&mut self, ctx: &egui::Context) {
         let mut clicked = None;
+        let mut undo_watchlist = false;
         let screen = ctx.content_rect();
         let layer = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("toasts")));
         let life = super::TOAST_SECS as f32;
         for (k, (msg, at)) in self.toasts.iter().enumerate() {
             let age = at.elapsed().as_secs_f32();
+            let life =
+                if self.watchlist_undo.as_ref().is_some_and(|(time, _, _)| time == at) { age + life } else { life };
             let enter = anim::ease_out_back(anim::since(ctx, age as f64, 0.55));
             // Reduce Motion skips the fade: the toast stays until it is removed.
             let fade = if anim::reduced() { 0.0 } else { 0.35 };
@@ -929,6 +932,22 @@ impl TerminalApp {
                         }
                     });
             }
+            if self.watchlist_undo.as_ref().is_some_and(|(time, _, expected)| time == at && expected == &self.watchlist)
+            {
+                egui::Area::new(Id::new(("watchlist-toast-click", *at)))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(r.min)
+                    .show(ctx, |ui| {
+                        if ui
+                            .allocate_exact_size(r.size(), Sense::click())
+                            .1
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            undo_watchlist = true;
+                        }
+                    });
+            }
             let mut p = layer.clone();
             p.multiply_opacity(1.0 - leave);
             widgets::card_on(&p, r, 0.0);
@@ -943,7 +962,10 @@ impl TerminalApp {
                     Some(m) => ("Price alert", m, amber()),
                     None => match msg.strip_prefix("Layout: ") {
                         Some(m) => ("Layout", m, amber()),
-                        None => ("Congress Alert", msg.as_str(), amber()),
+                        None => match msg.strip_prefix("Watchlist: ") {
+                            Some(m) => ("Watchlist", m, amber()),
+                            None => ("Congress Alert", msg.as_str(), amber()),
+                        },
                     },
                 },
             };
@@ -962,6 +984,9 @@ impl TerminalApp {
                 ui_font(11.5),
                 muted(),
             );
+        }
+        if undo_watchlist {
+            self.undo_watchlist();
         }
         if let Some(event) = clicked {
             self.open_security(&event.alert.symbol);

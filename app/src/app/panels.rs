@@ -388,7 +388,7 @@ impl TerminalApp {
             );
         });
         if let Some(s) = remove {
-            self.watchlist.retain(|x| *x != s);
+            self.set_watchlist(self.watchlist.iter().filter(|x| **x != s).cloned().collect());
         }
         out
     }

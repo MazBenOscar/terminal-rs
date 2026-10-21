@@ -8,6 +8,7 @@ pub struct Workflow {
     #[serde(deserialize_with = "bounded_symbols")]
     pub symbols: Vec<String>,
     pub scan: Option<ScanDefinition>,
+    pub plot_conditions: bool,
 }
 fn bounded_symbols<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
     let mut symbols = Vec::<String>::deserialize(deserializer)?;
@@ -83,6 +84,17 @@ fn group_expression(group: &ConditionGroup) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_workflow_defaults_plot_conditions_to_false_and_round_trips() {
+        let old = r#"{"symbols":["AAPL US Equity"],"scan":null}"#;
+        let mut workflow: Workflow = serde_json::from_str(old).unwrap();
+        assert!(!workflow.plot_conditions);
+        assert!(!serde_json::from_str::<Workflow>("{}").unwrap().plot_conditions);
+        workflow.plot_conditions = true;
+        let saved = serde_json::to_string(&workflow).unwrap();
+        assert_eq!(serde_json::from_str::<Workflow>(&saved).unwrap(), workflow);
+    }
+
     #[test]
     fn nested_group_expression_has_parens() {
         use tr_core::scanner::FormulaCondition;
