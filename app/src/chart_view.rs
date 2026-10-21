@@ -1384,268 +1384,416 @@ impl ChartState {
                 }
             }
         }
-        egui::Window::new(format!("Indicators · {}", self.sec.ticker))
+        let field_w = theme::dp(220.0);
+        let content = ctx.content_rect();
+        egui::Window::new(RichText::new(format!("Indicators · {}", self.sec.ticker)).font(ui_font(13.0)))
             .id(egui::Id::new((self.id, "indicator-editor")))
             .open(&mut open)
-            .default_width(440.0)
-            .default_height(560.0)
+            .default_width(theme::dp(380.0))
+            .default_height(theme::dp(560.0))
+            .default_pos(content.left_top() + egui::vec2(theme::dp(72.0), theme::dp(72.0)))
+            // Keep the title bar clear of the macOS window buttons.
+            .constrain_to(content.with_min_y(content.top() + theme::dp(34.0)))
             .show(ctx, |ui| {
-                ui.label("Edit inputs, display panes and scales independently.");
+                egui::ComboBox::from_id_salt("add-study")
+                    .selected_text("Add indicator…")
+                    .width(ui.available_width())
+                    .height(theme::dp(320.0))
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show_ui(ui, |ui| {
+                        let search = ui.add(
+                            egui::TextEdit::singleline(&mut self.indicator_search)
+                                .hint_text("Search by name or code")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if ui.memory(|m| m.focused().is_none()) {
+                            search.request_focus();
+                        }
+                        ui.separator();
+                        let query = self.indicator_search.to_ascii_lowercase();
+                        let matches: Vec<_> = registry::all()
+                            .iter()
+                            .filter(|d| {
+                                query.is_empty()
+                                    || d.name.to_ascii_lowercase().contains(&query)
+                                    || d.code.to_ascii_lowercase().contains(&query)
+                            })
+                            .collect();
+                        if matches.is_empty() {
+                            ui.label(RichText::new(format!("No indicator matches “{}”", self.indicator_search)).color(muted()));
+                        }
+                        let code_w = matches.iter().map(|d| d.code.len()).max().unwrap_or(0);
+                        for def in matches {
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append(&format!("{:<code_w$}  ", def.code), 0.0, egui::TextFormat::simple(mono(12.0), amber()));
+                            job.append(def.name, 0.0, egui::TextFormat::simple(ui_font(13.0), text()));
+                            if ui.add(egui::Button::selectable(false, job)).clicked() {
+                                self.indicators.push(IndicatorSpec::of(def));
+                                self.indicator_search.clear();
+                                ui.close();
+                            }
+                        }
+                    });
+                ui.add_space(theme::dp(4.0));
+                if before.is_empty() {
+                    ui.add_space(theme::dp(16.0));
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("No indicators on this chart yet").color(text()));
+                        ui.label(
+                            RichText::new("Add one above, or apply a saved template below.").small().color(muted()),
+                        );
+                    });
+                    ui.add_space(theme::dp(16.0));
+                }
+                let count = self.indicators.len();
+                egui::ScrollArea::vertical()
+                    .id_salt("study-list")
+                    .max_height(theme::dp(470.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                    for (index, spec) in self.indicators.iter_mut().enumerate() {
+                        let Some(c) = &mut spec.chart else { continue };
+                        ui.push_id(c.id, |ui| {
+                            let error = self
+                                .built
+                                .iter()
+                                .find(|b| b.spec.chart.as_ref().is_some_and(|s| s.id == c.id))
+                                .and_then(|b| b.error.clone());
+                            let def = registry::find(&spec.code);
+                            let default_rgb: [u8; 3] = theme::series(c.id.saturating_sub(1) as usize).to_array()[..3].try_into().unwrap();
+                            let swatch = c.color.unwrap_or(default_rgb);
+                            let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                                ui.ctx(),
+                                ui.make_persistent_id("study"),
+                                true,
+                            );
+                            state
+                                .show_header(ui, |ui| {
+                                    ui.checkbox(&mut c.visible, "").on_hover_text(
+                                        "Show on chart. Hidden studies still feed indicators calculated from them.",
+                                    );
+                                    let dim = if c.visible { 1.0 } else { 0.45 };
+                                    let (r, _) = ui.allocate_exact_size(
+                                        egui::vec2(theme::dp(10.0), theme::dp(10.0)),
+                                        egui::Sense::hover(),
+                                    );
+                                    let [red, green, blue] = swatch;
+                                    ui.painter().rect_filled(r, 2.0, Color32::from_rgb(red, green, blue).gamma_multiply(dim));
+                                    let code_color = if error.is_some() { theme::down() } else { amber() };
+                                    ui.label(RichText::new(&spec.code).font(mono(12.0)).color(code_color.gamma_multiply(dim)));
+                                    ui.label(RichText::new(format!("#{}", c.id)).small().color(muted().gamma_multiply(dim)));
+                                    let name_w = (ui.available_width() - theme::dp(56.0)).max(0.0);
+                                    ui.scope(|ui| {
+                                        ui.set_max_width(name_w);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(def.map_or("", |d| d.name)).color(muted().gamma_multiply(dim)),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if widgets::icon_button(
+                                            ui,
+                                            widgets::Icon::Close,
+                                            "Remove. Also removes indicators calculated from this one.",
+                                            false,
+                                        )
+                                        .clicked()
+                                        {
+                                            remove = Some(index);
+                                        }
+                                        ui.add_enabled_ui(index > 0, |ui| {
+                                            if widgets::icon_button(ui, widgets::Icon::ArrowUp, "Move up", false).clicked() {
+                                                reorder = Some(index);
+                                            }
+                                        });
+                                    });
+                                })
+                                .body(|ui| {
+                                    if let Some(error) = &error {
+                                        ui.label(RichText::new(error).color(theme::down()));
+                                    }
+                                    egui::Grid::new("settings")
+                                        .num_columns(2)
+                                        .spacing([theme::dp(12.0), theme::dp(6.0)])
+                                        .show(ui, |ui| {
+                                        if let Some(def) = def {
+                                            for (param, value) in def.params.iter().zip(&mut spec.params) {
+                                                ui.label(RichText::new(param.name).color(muted()));
+                                                let response = ui.add(
+                                                    egui::DragValue::new(value)
+                                                        .range(param.min..=param.max)
+                                                        .speed(if param.int { 1.0 } else { 0.05 }),
+                                                );
+                                                if response.changed() && param.int {
+                                                    *value = value.round();
+                                                }
+                                                ui.end_row();
+                                            }
+                                        }
+                                        if study::accepts_source(&spec.code) {
+                                            ui.label(RichText::new("Input").color(muted()))
+                                                .on_hover_text("Calculation input; independent of display placement");
+                                            egui::ComboBox::from_id_salt("source")
+                                                .selected_text(study_source_label(&c.source, &before))
+                                                .width(field_w)
+                                                .show_ui(ui, |ui| {
+                                                    for (label, source) in [
+                                                        ("Original bars", StudySource::Bars),
+                                                        ("Open", StudySource::Open),
+                                                        ("High", StudySource::High),
+                                                        ("Low", StudySource::Low),
+                                                        ("Close", StudySource::Close),
+                                                        ("Volume", StudySource::Volume),
+                                                        ("Typical price (HLC3)", StudySource::Hlc3),
+                                                    ] {
+                                                        ui.selectable_value(&mut c.source, source, label);
+                                                    }
+                                                    for b in &self.built {
+                                                        let Some(parent) = &b.spec.chart else { continue };
+                                                        if !study::can_use_source(&before, c.id, parent.id) {
+                                                            continue;
+                                                        }
+                                                        for name in &b.ports {
+                                                            ui.selectable_value(
+                                                                &mut c.source,
+                                                                StudySource::Output { study: parent.id, output: name.clone() },
+                                                                format!("{} #{} · {name}", b.spec.label(), parent.id),
+                                                            );
+                                                        }
+                                                    }
+                                                });
+                                            ui.end_row();
+                                        }
+                                        ui.label(RichText::new("Pane").color(muted()));
+                                        egui::ComboBox::from_id_salt("pane")
+                                            .selected_text(match c.pane {
+                                                StudyPane::Price => "Price pane".into(),
+                                                StudyPane::Own => "Own pane".into(),
+                                                StudyPane::With(id) => format!("With #{id}"),
+                                            })
+                                            .width(field_w)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut c.pane, StudyPane::Price, "Price pane");
+                                                ui.selectable_value(&mut c.pane, StudyPane::Own, "Own pane");
+                                                for (other_index, other) in before.iter().enumerate() {
+                                                    if let Some(other_c) = &other.chart
+                                                        && other_c.id != c.id
+                                                        && study::pane_key(&before, other_index).is_ok_and(|key| key != Some(c.id))
+                                                    {
+                                                        ui.selectable_value(
+                                                            &mut c.pane,
+                                                            StudyPane::With(other_c.id),
+                                                            format!("With {} #{}", other.label(), other_c.id),
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        ui.end_row();
+                                        ui.label(RichText::new("Scale").color(muted()));
+                                        egui::ComboBox::from_id_salt("scale")
+                                            .selected_text(match c.scale {
+                                                StudyScale::Shared => "Share pane axis",
+                                                StudyScale::Independent => "Independent axis",
+                                                StudyScale::Fixed { .. } => "Fixed range",
+                                            })
+                                            .width(field_w)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut c.scale, StudyScale::Shared, "Share pane axis");
+                                                ui.selectable_value(&mut c.scale, StudyScale::Independent, "Independent axis");
+                                                if ui
+                                                    .selectable_label(matches!(c.scale, StudyScale::Fixed { .. }), "Fixed range…")
+                                                    .clicked()
+                                                {
+                                                    let (lo, hi) =
+                                                        def.and_then(|d| d.range).unwrap_or((0.0, 100.0));
+                                                    c.scale = StudyScale::Fixed { lo, hi };
+                                                }
+                                            });
+                                        ui.end_row();
+                                        if let StudyScale::Fixed { lo, hi } = &mut c.scale {
+                                            ui.label(RichText::new("Range").color(muted()));
+                                            ui.horizontal(|ui| {
+                                                ui.add(egui::DragValue::new(lo));
+                                                ui.label(RichText::new("to").color(muted()));
+                                                ui.add(egui::DragValue::new(hi));
+                                            });
+                                            ui.end_row();
+                                        }
+                                        ui.label(RichText::new("Color").color(muted()));
+                                        ui.horizontal(|ui| {
+                                            let mut rgb = swatch;
+                                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                                c.color = Some(rgb);
+                                            }
+                                            if c.color.is_some() {
+                                                if ui.small_button("Reset").on_hover_text("Use the default series color").clicked() {
+                                                    c.color = None;
+                                                }
+                                            } else {
+                                                ui.label(RichText::new("Default").small().color(muted()));
+                                            }
+                                        });
+                                        ui.end_row();
+                                    });
+                                    ui.collapsing("Calculation & offsets", |ui| {
+                                        if spec.code == "PCF" {
+                                            ui.label(RichText::new("Formula (documented PCF subset)").color(muted()));
+                                            ui.add(
+                                                egui::TextEdit::multiline(c.expression.get_or_insert_with(|| "C".into()))
+                                                    .font(mono(12.0))
+                                                    .desired_rows(3)
+                                                    .desired_width(ui.available_width()),
+                                            );
+                                            ui.label(
+                                                RichText::new("Example: C > AVGC20 AND V > 2 * AVG(V,50)").small().color(muted()),
+                                            );
+                                        }
+                                        egui::Grid::new("calculation")
+                                            .num_columns(2)
+                                            .spacing([theme::dp(12.0), theme::dp(6.0)])
+                                            .show(ui, |ui| {
+                                            ui.label(RichText::new("Timeframe").color(muted()));
+                                            egui::ComboBox::from_id_salt("study-timeframe")
+                                                .width(field_w - theme::dp(20.0))
+                                                .selected_text(c.timeframe.map_or("Chart timeframe", Timeframe::label))
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(&mut c.timeframe, None, "Chart timeframe");
+                                                    for tf in Timeframe::ALL.into_iter().filter(|tf| *tf >= self.tf) {
+                                                        ui.selectable_value(&mut c.timeframe, Some(tf), tf.label());
+                                                    }
+                                                });
+                                            ui.end_row();
+                                            if matches!(spec.code.as_str(), "BB" | "BBW" | "PCTB" | "ATR" | "MACD" | "ENV") {
+                                                let original = match spec.code.as_str() {
+                                                    "ATR" => "Original: Wilder",
+                                                    "MACD" => "Original: Exponential",
+                                                    _ => "Original: Simple",
+                                                };
+                                                ui.label(RichText::new("Average").color(muted()));
+                                                egui::ComboBox::from_id_salt("average-method")
+                                                    .width(field_w - theme::dp(20.0))
+                                                    .selected_text(c.formula.average.map_or(original, Average::label))
+                                                    .show_ui(ui, |ui| {
+                                                        ui.selectable_value(&mut c.formula.average, None, original);
+                                                        for average in Average::ALL {
+                                                            ui.selectable_value(&mut c.formula.average, Some(average), average.label());
+                                                        }
+                                                    });
+                                                ui.end_row();
+                                            }
+                                            if spec.code == "RSI" {
+                                                ui.label(RichText::new("RSI method").color(muted()));
+                                                ui.horizontal(|ui| {
+                                                    ui.selectable_value(&mut c.formula.rsi_method, RsiMethod::Wilder, "Wilder");
+                                                    ui.selectable_value(&mut c.formula.rsi_method, RsiMethod::Plain, "Plain");
+                                                });
+                                                ui.end_row();
+                                                if c.formula.rsi_method == RsiMethod::Plain {
+                                                    ui.label(RichText::new("Output SMA").color(muted()));
+                                                    ui.add(egui::DragValue::new(&mut c.formula.rsi_smoothing).range(1..=1000));
+                                                    ui.end_row();
+                                                } else {
+                                                    c.formula.rsi_smoothing = 1;
+                                                }
+                                            }
+                                            if spec.code == "BBW" {
+                                                ui.label(RichText::new("Bandwidth").color(muted()));
+                                                ui.horizontal(|ui| {
+                                                    ui.selectable_value(&mut c.formula.bandwidth_units, BandwidthUnits::Ratio, "Ratio");
+                                                    ui.selectable_value(&mut c.formula.bandwidth_units, BandwidthUnits::Percent, "Percent");
+                                                });
+                                                ui.end_row();
+                                            }
+                                            ui.label(RichText::new("Bars ago").color(muted()));
+                                            ui.add(egui::DragValue::new(&mut c.formula.bars_ago).range(0..=1000))
+                                                .on_hover_text("Historical value used by this plot and its calculation children");
+                                            ui.end_row();
+                                            ui.label(RichText::new("Displacement").color(muted()));
+                                            ui.add(egui::DragValue::new(&mut c.displacement).range(-1000..=1000)).on_hover_text(
+                                                "Display only: positive moves right, negative moves left. Does not change child calculations.",
+                                            );
+                                            ui.end_row();
+                                        });
+                                        if matches!(spec.code.as_str(), "BBW" | "PCTB") {
+                                            ui.checkbox(&mut c.formula.undefined_zero_division, "Undefined when denominator is zero");
+                                        }
+                                        if c.timeframe.is_some_and(|tf| tf != self.tf) {
+                                            ui.label(
+                                                RichText::new("Uses completed periods derived from loaded bars; first period omitted.")
+                                                    .small()
+                                                    .color(muted()),
+                                            );
+                                        }
+                                    });
+                                    let names = registry::Spec::new(&spec.code, &spec.params)
+                                        .map(|s| {
+                                            s.compute(&registry::Input::new(&[], self.tf))
+                                                .into_iter()
+                                                .map(|o| o.name.to_string())
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default();
+                                    crate::chart_controls::output_styles(ui, c, &names);
+                                });
+                            if index + 1 < count {
+                                ui.separator();
+                            }
+                        });
+                    }
+                });
+                ui.separator();
                 ui.collapsing("Chart templates", |ui| {
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.template_name)
-                            .hint_text("Template name").desired_width(220.0));
-                        if ui.add_enabled(!self.template_name.trim().is_empty(), egui::Button::new("Save setup")).clicked() {
+                        let save_w = theme::dp(96.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.template_name)
+                                .hint_text("Template name")
+                                .desired_width(ui.available_width() - save_w),
+                        );
+                        if ui
+                            .add_enabled(!self.template_name.trim().is_empty(), egui::Button::new("Save current"))
+                            .clicked()
+                        {
                             save_template = true;
                         }
                     });
                     egui::ComboBox::from_id_salt("chart-template")
-                        .selected_text(if self.template_selected.is_empty() { "Choose saved template…" } else { &self.template_selected })
-                        .width(300.0).show_ui(ui, |ui| {
-                            for name in self.template_names.as_deref().unwrap_or_default() {
+                        .selected_text(if self.template_selected.is_empty() {
+                            "Choose a saved template…"
+                        } else {
+                            &self.template_selected
+                        })
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            let names = self.template_names.as_deref().unwrap_or_default();
+                            if names.is_empty() {
+                                ui.label(RichText::new("No saved templates yet").color(muted()));
+                            }
+                            for name in names {
                                 ui.selectable_value(&mut self.template_selected, name.clone(), name);
                             }
                         });
-                    ui.add_enabled_ui(!self.template_selected.is_empty(), |ui| { ui.horizontal(|ui| {
-                        if ui.button("Replace studies & style").on_hover_text("Keeps this symbol, timeframe and drawings").clicked() {
-                            apply_template = Some(false);
-                        }
-                        if ui.button("Add studies").on_hover_text("Adds studies with remapped IDs; keeps existing style").clicked() {
-                            apply_template = Some(true);
-                        }
-                    }); });
+                    ui.add_enabled_ui(!self.template_selected.is_empty(), |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("Replace studies & style").on_hover_text("Keeps this symbol, timeframe and drawings").clicked() {
+                                apply_template = Some(false);
+                            }
+                            if ui.button("Add studies").on_hover_text("Adds studies with remapped IDs; keeps existing style").clicked() {
+                                apply_template = Some(true);
+                            }
+                        });
+                    });
                     if let Some(status) = &self.template_status {
                         match status {
-                            Ok(message) => { ui.label(RichText::new(message).small().color(theme::up())); }
-                            Err(error) => { ui.label(RichText::new(error).small().color(theme::down())); }
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Add indicator");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.indicator_search)
-                            .hint_text("Search indicators")
-                            .desired_width(ui.available_width()),
-                    );
-                });
-                let query = self.indicator_search.to_ascii_lowercase();
-                egui::ComboBox::from_id_salt("add-study")
-                    .selected_text("Choose an indicator…")
-                    .width(ui.available_width())
-                    .height(220.0)
-                    .show_ui(ui, |ui| {
-                        for def in registry::all().iter().filter(|d| {
-                            query.is_empty()
-                                || d.name.to_ascii_lowercase().contains(&query)
-                                || d.code.to_ascii_lowercase().contains(&query)
-                        }) {
-                            if ui.selectable_label(false, format!("{} · {}", def.code, def.name)).clicked() {
-                                self.indicators.push(IndicatorSpec::of(def));
+                            Ok(message) => {
+                                ui.label(RichText::new(message).small().color(theme::up()));
+                            }
+                            Err(error) => {
+                                ui.label(RichText::new(error).small().color(theme::down()));
                             }
                         }
-                    });
-                ui.separator();
-                if before.is_empty() {
-                    ui.label("Add an indicator to start configuring this chart.");
-                }
-                egui::ScrollArea::vertical().id_salt("study-list").max_height(470.0).show(ui, |ui| {
-                    for (index, spec) in self.indicators.iter_mut().enumerate() {
-                        let Some(c) = &mut spec.chart else { continue };
-                        ui.push_id(c.id, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut c.visible, "Visible")
-                                    .on_hover_text("Show on chart; hidden studies still supply data");
-                                ui.label(RichText::new(format!("{} #{}", spec.code, c.id)).color(amber()));
-                                if ui.add_enabled(index > 0, egui::Button::new("Move up")).clicked() {
-                                    reorder = Some(index);
-                                }
-                                if ui
-                                    .button("Remove")
-                                    .on_hover_text("Also removes indicators calculated from this one")
-                                    .clicked()
-                                {
-                                    remove = Some(index);
-                                }
-                            });
-                            if let Some(def) = registry::find(&spec.code) {
-                                ui.label(RichText::new(def.name).small().color(muted()));
-                                egui::Grid::new("parameters").num_columns(2).show(ui, |ui| {
-                                    for (param, value) in def.params.iter().zip(&mut spec.params) {
-                                        ui.label(param.name);
-                                        let response = ui.add(
-                                            egui::DragValue::new(value)
-                                                .range(param.min..=param.max)
-                                                .speed(if param.int { 1.0 } else { 0.05 }),
-                                        );
-                                        if response.changed() && param.int {
-                                            *value = value.round();
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                            }
-                            if study::accepts_source(&spec.code) {
-                                egui::ComboBox::from_id_salt("source")
-                                    .selected_text(study_source_label(&c.source, &before))
-                                    .width(300.0)
-                                    .show_ui(ui, |ui| {
-                                        for (label, source) in [
-                                            ("Original bars", StudySource::Bars),
-                                            ("Open", StudySource::Open),
-                                            ("High", StudySource::High),
-                                            ("Low", StudySource::Low),
-                                            ("Close", StudySource::Close),
-                                            ("Volume", StudySource::Volume),
-                                            ("Typical price (HLC3)", StudySource::Hlc3),
-                                        ] {
-                                            ui.selectable_value(&mut c.source, source, label);
-                                        }
-                                        for b in &self.built {
-                                            let Some(parent) = &b.spec.chart else { continue };
-                                            if !study::can_use_source(&before, c.id, parent.id) {
-                                                continue;
-                                            }
-                                            for name in &b.ports {
-                                                ui.selectable_value(
-                                                    &mut c.source,
-                                                    StudySource::Output { study: parent.id, output: name.clone() },
-                                                    format!("{} #{} · {name}", b.spec.label(), parent.id),
-                                                );
-                                            }
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text("Calculation input; independent of display placement");
-                            }
-                            ui.collapsing("Calculation & offsets", |ui| {
-                                if spec.code=="PCF" {
-                                    ui.label("Formula (documented PCF subset)");
-                                    ui.add(egui::TextEdit::multiline(c.expression.get_or_insert_with(|| "C".into())).desired_rows(3).desired_width(ui.available_width()));
-                                    ui.label("Example: C > AVGC20 AND V > 2 * AVG(V,50)");
-                                }
-                                egui::ComboBox::from_id_salt("study-timeframe").selected_text(c.timeframe.map_or("Chart timeframe",Timeframe::label)).show_ui(ui,|ui| {
-                                    ui.selectable_value(&mut c.timeframe,None,"Chart timeframe");
-                                    for tf in Timeframe::ALL.into_iter().filter(|tf| *tf>=self.tf) { ui.selectable_value(&mut c.timeframe,Some(tf),tf.label()); }
-                                });
-                                if c.timeframe.is_some_and(|tf| tf!=self.tf) { ui.label("Uses completed periods derived from loaded bars; first period omitted."); }
-                                if matches!(spec.code.as_str(), "BB" | "BBW" | "PCTB" | "ATR" | "MACD" | "ENV") {
-                                    let original = match spec.code.as_str() {
-                                        "ATR" => "Original: Wilder", "MACD" => "Original: Exponential", _ => "Original: Simple",
-                                    };
-                                    egui::ComboBox::from_id_salt("average-method")
-                                        .selected_text(c.formula.average.map_or(original, Average::label))
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(&mut c.formula.average, None, original);
-                                            for average in Average::ALL {
-                                                ui.selectable_value(&mut c.formula.average, Some(average), average.label());
-                                            }
-                                        });
-                                }
-                                if spec.code == "RSI" {
-                                    ui.horizontal(|ui| {
-                                        ui.label("RSI method");
-                                        ui.selectable_value(&mut c.formula.rsi_method, RsiMethod::Wilder, "Wilder");
-                                        ui.selectable_value(&mut c.formula.rsi_method, RsiMethod::Plain, "Plain");
-                                    });
-                                    if c.formula.rsi_method == RsiMethod::Plain {
-                                        ui.horizontal(|ui| {
-                                            ui.label("Output SMA");
-                                            ui.add(egui::DragValue::new(&mut c.formula.rsi_smoothing).range(1..=1000));
-                                        });
-                                    } else { c.formula.rsi_smoothing = 1; }
-                                }
-                                if spec.code == "BBW" {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Bandwidth units");
-                                        ui.selectable_value(&mut c.formula.bandwidth_units, BandwidthUnits::Ratio, "Ratio");
-                                        ui.selectable_value(&mut c.formula.bandwidth_units, BandwidthUnits::Percent, "Percent");
-                                    });
-                                }
-                                if matches!(spec.code.as_str(), "BBW" | "PCTB") {
-                                    ui.checkbox(&mut c.formula.undefined_zero_division, "Undefined when denominator is zero");
-                                }
-                                ui.horizontal(|ui| {
-                                    ui.label("Bars ago");
-                                    ui.add(egui::DragValue::new(&mut c.formula.bars_ago).range(0..=1000))
-                                        .on_hover_text("Historical value used by this plot and its calculation children");
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Plot displacement");
-                                    ui.add(egui::DragValue::new(&mut c.displacement).range(-1000..=1000))
-                                        .on_hover_text("Display only: positive moves right, negative moves left. Does not change child calculations.");
-                                });
-                            });
-                            egui::ComboBox::from_id_salt("pane")
-                                .selected_text(match c.pane {
-                                    StudyPane::Price => "Pane: Price".into(),
-                                    StudyPane::Own => "Pane: Own".into(),
-                                    StudyPane::With(id) => format!("Pane: With #{id}"),
-                                })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut c.pane, StudyPane::Price, "Price pane");
-                                    ui.selectable_value(&mut c.pane, StudyPane::Own, "Own pane");
-                                    for (other_index, other) in before.iter().enumerate() {
-                                        if let Some(other_c) = &other.chart
-                                            && other_c.id != c.id
-                                            && study::pane_key(&before, other_index).is_ok_and(|key| key != Some(c.id))
-                                        {
-                                            ui.selectable_value(
-                                                &mut c.pane,
-                                                StudyPane::With(other_c.id),
-                                                format!("With {} #{}", other.label(), other_c.id),
-                                            );
-                                        }
-                                    }
-                                });
-                            egui::ComboBox::from_id_salt("scale")
-                                .selected_text(match c.scale {
-                                    StudyScale::Shared => "Scale: Share pane axis",
-                                    StudyScale::Independent => "Scale: Independent",
-                                    StudyScale::Fixed { .. } => "Scale: Fixed range",
-                                })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut c.scale, StudyScale::Shared, "Share pane axis");
-                                    ui.selectable_value(&mut c.scale, StudyScale::Independent, "Independent axis");
-                                    if ui
-                                        .selectable_label(matches!(c.scale, StudyScale::Fixed { .. }), "Fixed range…")
-                                        .clicked()
-                                    {
-                                        let (lo, hi) =
-                                            registry::find(&spec.code).and_then(|d| d.range).unwrap_or((0.0, 100.0));
-                                        c.scale = StudyScale::Fixed { lo, hi };
-                                    }
-                                });
-                            if let StudyScale::Fixed { lo, hi } = &mut c.scale {
-                                ui.horizontal(|ui| {
-                                    ui.label("Min");
-                                    ui.add(egui::DragValue::new(lo));
-                                    ui.label("Max");
-                                    ui.add(egui::DragValue::new(hi));
-                                });
-                            }
-                            ui.horizontal(|ui| {
-                                let mut custom = c.color.is_some();
-                                if ui.checkbox(&mut custom, "Custom color").changed() {
-                                    c.color =
-                                        custom.then_some(theme::series(index).to_array()[..3].try_into().unwrap());
-                                }
-                                if let Some(color) = &mut c.color {
-                                    ui.color_edit_button_srgb(color);
-                                }
-                            });
-                            let names = registry::Spec::new(&spec.code, &spec.params).map(|s| s.compute(&registry::Input::new(&[],self.tf)).into_iter().map(|o| o.name.to_string()).collect::<Vec<_>>()).unwrap_or_default();
-                            crate::chart_controls::output_styles(ui,c,&names);
-                            if let Some(error) = self
-                                .built
-                                .iter()
-                                .find(|b| b.spec.chart.as_ref().is_some_and(|s| s.id == c.id))
-                                .and_then(|b| b.error.as_ref())
-                            {
-                                ui.label(RichText::new(error).color(theme::down()));
-                            }
-                            ui.separator();
-                        });
                     }
                 });
                 ui.label(
@@ -2245,15 +2393,20 @@ impl ChartState {
 
 fn study_source_label(source: &StudySource, specs: &[IndicatorSpec]) -> String {
     match source {
-        StudySource::Bars => "Input: Original bars".into(),
+        StudySource::Bars => "Original bars".into(),
+        StudySource::Open => "Open".into(),
+        StudySource::High => "High".into(),
+        StudySource::Low => "Low".into(),
+        StudySource::Close => "Close".into(),
+        StudySource::Volume => "Volume".into(),
+        StudySource::Hlc3 => "Typical price (HLC3)".into(),
         StudySource::Output { study, output } => {
             let label = specs
                 .iter()
                 .find(|s| s.chart.as_ref().is_some_and(|c| c.id == *study))
                 .map_or_else(|| "Missing indicator".into(), IndicatorSpec::label);
-            format!("Input: {label} #{study} · {output}")
+            format!("{label} #{study} · {output}")
         }
-        other => format!("Input: {other:?}"),
     }
 }
 
