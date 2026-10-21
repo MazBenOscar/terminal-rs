@@ -400,13 +400,67 @@ fn eval(expr: &Expr, input: &Input<'_>) -> Result<Vec<f64>, String> {
     };
     Ok(values.into_iter().map(|v| if v.is_finite() { v } else { f64::NAN }).collect())
 }
-pub fn evaluate(source: &str, input: &Input<'_>) -> Result<Vec<f64>, String> {
+fn parse(source: &str) -> Result<Expr, String> {
     let mut parser = Parser { tokens: lex(source)?, at: 0, nodes: 0 };
     let expr = parser.expression(0, 0)?;
     if parser.tokens[parser.at] != Token::End {
         return Err("Unexpected trailing formula input".into());
     }
-    eval(&expr, input)
+    Ok(expr)
+}
+
+/// History needed by an expression, including offsets and recursive smoother warm-up.
+/// Unsupported expressions return an error so callers can use their fallback history.
+pub fn lookback(source: &str) -> Result<usize, String> {
+    expression_lookback(&parse(source)?)
+}
+
+fn expression_lookback(expr: &Expr) -> Result<usize, String> {
+    let bars = match expr {
+        Expr::Number(_) => 1,
+        Expr::Field(_, offset) => offset.saturating_add(1),
+        Expr::Unary(_, value) => expression_lookback(value)?,
+        Expr::Binary(_, a, b) => expression_lookback(a)?.max(expression_lookback(b)?),
+        Expr::Call(name, args) => match (name.as_str(), args.as_slice()) {
+            ("RSI", [n, smoothing]) | ("RSI", [n, smoothing, _]) => {
+                let offset = if args.len() == 3 { period(&args[2], true)? } else { 0 };
+                period(n, false)?.saturating_add(period(smoothing, false)?).saturating_add(offset)
+            }
+            ("WRSI" | "ATR" | "WATR", [n, offset]) => {
+                let base =
+                    expression_lookback(&Expr::Call(name.clone(), vec![Expr::Number(period(n, false)? as f64)]))?;
+                base.saturating_add(period(offset, true)?)
+            }
+            (
+                "AVG" | "SMA" | "XAVG" | "EMA" | "WAVG" | "HAVG" | "RMA" | "SUM" | "MAX" | "MIN" | "STDDEV" | "REF",
+                [value, n],
+            ) => {
+                let n = period(n, name == "REF")?;
+                let extra = match name.as_str() {
+                    "REF" => n,
+                    "XAVG" | "EMA" | "RMA" => n.saturating_mul(4).saturating_sub(1),
+                    "HAVG" => n.saturating_add((n as f64).sqrt() as usize).saturating_sub(2),
+                    _ => n - 1,
+                };
+                expression_lookback(value)?.saturating_add(extra)
+            }
+            ("RSI" | "WRSI" | "ATR" | "WATR", [n]) => {
+                let n = period(n, false)?;
+                if matches!(name.as_str(), "WRSI" | "WATR") { n.saturating_mul(4).saturating_add(1) } else { n + 1 }
+            }
+            ("ABS" | "SQRT" | "LOG" | "EXP", [value]) => expression_lookback(value)?,
+            ("IIF" | "IF", [condition, yes, no]) => {
+                expression_lookback(condition)?.max(expression_lookback(yes)?).max(expression_lookback(no)?)
+            }
+            ("CROSS", [a, b]) => expression_lookback(a)?.max(expression_lookback(b)?).saturating_add(1),
+            _ => return Err(format!("Unsupported function or argument count: {name}")),
+        },
+    };
+    Ok(bars)
+}
+
+pub fn evaluate(source: &str, input: &Input<'_>) -> Result<Vec<f64>, String> {
+    eval(&parse(source)?, input)
 }
 
 #[cfg(test)]
@@ -416,6 +470,29 @@ mod tests {
     fn input(bars: &[Bar]) -> Input<'_> {
         Input::new(bars, Timeframe::D1)
     }
+    #[test]
+    fn lookback_covers_windows_offsets_and_warmup() {
+        for (source, expected) in [
+            ("AVGC20", 20),
+            ("AVG(C,1000)", 1000),
+            ("WRSI(14)", 57),
+            ("XAVGC20.3", 83),
+            ("REF(AVG(C2,20),5)", 27),
+            ("REF(REF(AVGC20.2,3),4)", 29),
+            ("AVG(AVG(C,20),10)", 29),
+            ("RSI14.3.2", 19),
+            ("WATR(14,2)", 59),
+            ("CROSS(C,AVGC20)", 21),
+            ("IF(C1>0,AVG(C,1000),WRSI(14))", 1000),
+            ("1", 1),
+        ] {
+            assert_eq!(lookback(source).unwrap(), expected, "{source}");
+        }
+        for source in ["", "C +", "AVG(C,0)", "REF(C,-1)", "UNKNOWN(C)", "AVG(C,1001)", "C C"] {
+            assert!(lookback(source).is_err(), "{source}");
+        }
+    }
+
     #[test]
     fn arithmetic_compact_fields_and_conditions() {
         let bars: Vec<_> = [1., 2., 4., 2., 8.]

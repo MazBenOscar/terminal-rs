@@ -24,11 +24,16 @@ pub fn next(symbols: &[String], current: &str, delta: isize) -> Option<String> {
 pub fn operand(operand: ScanOperand) -> String {
     match operand {
         ScanOperand::Price => "C".into(),
-        ScanOperand::Volume => "V".into(),
-        ScanOperand::ChangePercent => "100*(C/C1-1)".into(),
+        ScanOperand::Volume => "IF(V>=0,V,0/0)".into(),
+        ScanOperand::ChangePercent => "100*(C/IF(C1>0,C1,0)-1)".into(),
         ScanOperand::Constant(n) => n.to_string(),
         ScanOperand::Sma { period, source } => {
-            format!("AVG({},{period})", if source == Source::Close { "C" } else { "V" })
+            // Check the entire current window, not just its latest volume.
+            if source == Source::Close {
+                format!("AVG(C,{period})")
+            } else {
+                format!("IF(MIN(V,{period})>=0,AVG(V,{period}),0/0)")
+            }
         }
         ScanOperand::Ema { period, source } => {
             format!("XAVG({},{period})", if source == Source::Close { "C" } else { "V" })
@@ -324,7 +329,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: chart_workflow::operand(ChangePercent) emits 100*(C/C1-1) which PCF evaluates even when the previous close is zero or negative, but ScanCondition treats previous <= 0 as Unavailable — scan and plot disagree on the same bar"]
     fn change_percent_translation_rejects_non_positive_previous_close() {
         use tr_core::scanner::{Comparison, ScanCondition, ScanOperand, ScanOutcome};
         let mut scan = ScanDefinition::default();
@@ -354,6 +358,32 @@ mod tests {
     }
 
     #[test]
+    fn translated_operands_preserve_unavailable_inputs() {
+        let bars: Vec<_> = [10., 0., 5., -1., 6., 7.]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| tr_core::Bar::new(i as i64, c, c, c, c, if i == 2 { -1. } else { 10. }))
+            .collect();
+        let input = tr_core::indicators::registry::Input::new(&bars, tr_core::Timeframe::D1);
+        let change = tr_core::indicators::pcf::evaluate(&operand(ScanOperand::ChangePercent), &input).unwrap();
+        assert!(change[0].is_nan());
+        assert!(change[2].is_nan());
+        assert!(change[4].is_nan());
+        assert!(change[5].is_finite());
+        let volume = tr_core::indicators::pcf::evaluate(&operand(ScanOperand::Volume), &input).unwrap();
+        assert!(volume[2].is_nan());
+        assert_eq!(volume[3], 10.);
+        let average = tr_core::indicators::pcf::evaluate(
+            &operand(ScanOperand::Sma { period: 2, source: Source::Volume }),
+            &input,
+        )
+        .unwrap();
+        assert!(average[2].is_nan());
+        assert!(average[3].is_nan());
+        assert_eq!(average[4], 10.);
+    }
+
+    #[test]
     fn change_percent_model_matches_pcf_on_valid_prices() {
         use tr_core::scanner::{Comparison, ScanCondition, ScanOperand, ScanOutcome};
         let closes = [10.0, 11.0, 10.5, 12.0, 11.0];
@@ -379,7 +409,7 @@ mod tests {
             ScanOutcome::NoMatch => assert_eq!(last, Some(0.0)),
             ScanOutcome::Unavailable => {}
         }
-        // Positive previous closes are required by the model; PCF keeps computing.
+        // Positive previous closes are required by both the model and translated PCF.
         // Lock the model side so a negative close can never become a match.
         let mut neg = bars.clone();
         neg[3].close = -1.0;

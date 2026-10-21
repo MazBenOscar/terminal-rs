@@ -1301,7 +1301,7 @@ mod tests {
             },
         };
         assert!(definition.validate().is_ok());
-        let settings = ScanSettings { definition: definition.clone(), universe: Universe::Nasdaq };
+        let settings = ScanSettings { definition: definition.clone(), universe: Universe::Nasdaq, refresh: None };
         let saved = save_definition_at(&settings, &dir).unwrap();
         assert_eq!(saved.len(), 1);
         let loaded = load_saved_at(&dir).unwrap();

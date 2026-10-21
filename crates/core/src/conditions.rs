@@ -210,7 +210,8 @@ impl ConditionItem {
     pub fn required_bars(&self) -> usize {
         match self {
             Self::Compare(c) => c.required_bars(),
-            Self::Formula(_) => 300,
+            // Preserve the historical formula floor while covering larger expression windows.
+            Self::Formula(c) => crate::indicators::pcf::lookback(&c.expression).unwrap_or(300).max(300),
             Self::Group(g) => g.items.iter().map(Self::required_bars).max().unwrap_or(1),
         }
     }
@@ -838,7 +839,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: ConditionItem::required_bars hardcodes 300 for every FormulaCondition instead of the expression's window; AVG(C,1000) needs 1000 bars so required_bars_for reports 300, the worker fetches only 900 (300*3), and the predicate stays Unavailable forever"]
     fn formula_required_bars_must_cover_expression_windows() {
         let scan = ScanDefinition {
             root: ConditionGroup {
