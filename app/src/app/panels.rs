@@ -182,15 +182,81 @@ impl TerminalApp {
         let (hdr, _) = ui.allocate_exact_size(vec2(w, row_h), Sense::hover());
         let p = ui.painter();
         p.rect_filled(hdr, theme::CONTROL_RADIUS, theme::header());
-        let cols = [0.0, 0.34, 0.58, 0.79, 1.0];
-        let col = |r: Rect, k: usize| r.left() + 8.0 + (r.width() - 16.0) * cols[k];
-        p.text(pos2(col(hdr, 0), hdr.center().y), Align2::LEFT_CENTER, "Security", ui_font(11.5), muted());
-        for (k, h) in [(2, "Last"), (3, "Change"), (4, "%")] {
-            p.text(pos2(col(hdr, k), hdr.center().y), Align2::RIGHT_CENTER, h, ui_font(11.5), muted());
+        let extra = self.watch_columns.columns.len().min(((w - dp(380.0)).max(0.0) / dp(85.0)) as usize);
+        let base = if extra == 0 { 1.0 } else { (dp(380.0) / w).max(0.45) };
+        let mut cols = vec![0.0, 0.34 * base, 0.58 * base, 0.79 * base, base];
+        for i in 0..extra {
+            cols.push(base + (1.0 - base) * (i + 1) as f32 / extra as f32);
         }
+        let col = |r: Rect, k: usize| r.left() + 8.0 + (r.width() - 16.0) * cols[k];
+        let mut headers = vec!["Security".to_string(), "Last".into(), "Change".into(), "%".into()];
+        headers.extend(self.watch_columns.columns.iter().take(extra).map(|c| c.title.clone()));
+        for (index, title) in headers.iter().enumerate() {
+            let k = if index == 0 { 0 } else { index + 1 };
+            let suffix = match self.watch_sort {
+                Some((active, descending)) if active == index => {
+                    if descending {
+                        " ▼"
+                    } else {
+                        " ▲"
+                    }
+                }
+                _ => "",
+            };
+            let label = format!("{title}{suffix}");
+            p.text(
+                pos2(col(hdr, k), hdr.center().y),
+                if index == 0 { Align2::LEFT_CENTER } else { Align2::RIGHT_CENTER },
+                label,
+                ui_font(11.5),
+                muted(),
+            );
+            let left = if index == 0 { hdr.left() } else { col(hdr, k - 1) };
+            let right = if index == 0 { col(hdr, 1) } else { col(hdr, k) };
+            let hit = Rect::from_min_max(pos2(left, hdr.top()), pos2(right, hdr.bottom()));
+            if ui.interact(hit, ui.id().with(("watch-header", index)), Sense::click()).clicked() {
+                self.watch_sort = match self.watch_sort {
+                    Some((active, false)) if active == index => Some((index, true)),
+                    Some((active, true)) if active == index => None,
+                    _ => Some((index, false)),
+                };
+            }
+        }
+        let hidden = self.watch_columns.columns.len() - extra;
+        if hidden > 0 {
+            p.text(
+                pos2(col(hdr, 0) + dp(95.0), hdr.center().y),
+                Align2::LEFT_CENTER,
+                format!("+{hidden}"),
+                ui_font(11.0),
+                muted(),
+            );
+        }
+        let mut symbols = self.watchlist.clone();
+        if let Some((index, descending)) = self.watch_sort {
+            symbols.sort_by(|a, b| {
+                if index == 0 {
+                    let order = tr_data::security(a).ticker.cmp(&tr_data::security(b).ticker);
+                    return if descending { order.reverse() } else { order };
+                }
+                let key = |s: &String| {
+                    match index {
+                        1 => self.quotes.get(s).map(|q| q.last),
+                        2 => self.quotes.get(s).map(|q| q.change()),
+                        3 => self.quotes.get(s).map(|q| q.change_pct()),
+                        _ => {
+                            tr_core::columns::sort_key(self.column_cells.get(s).and_then(|cells| cells.get(index - 4)))
+                        }
+                    }
+                    .filter(|v| v.is_finite())
+                };
+                super::watch_value_order(key(a), key(b), descending)
+            });
+        }
+        let stale = chrono::Utc::now().timestamp() - self.columns_computed_at > 180;
         let mut remove = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for s in &self.watchlist {
+            for s in &symbols {
                 let sec = tr_data::security(s);
                 let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
                 widgets::hover_wash(ui, r, &resp, false);
@@ -231,6 +297,29 @@ impl TerminalApp {
                     }
                     None => {
                         p.text(pos2(col(r, 4), r.center().y), Align2::RIGHT_CENTER, "…", mono(12.5), muted());
+                    }
+                }
+                for index in 0..extra {
+                    use tr_core::columns::Cell;
+                    let cell = self.column_cells.get(s).and_then(|cells| cells.get(index));
+                    let (label, color, reason) = match cell {
+                        Some(Cell::Value(value)) => (tr_chart::scale::format_value(*value), text(), None),
+                        Some(Cell::Check(true)) => ("Yes".into(), theme::up(), None),
+                        Some(Cell::Check(false)) => ("No".into(), muted(), None),
+                        Some(Cell::Unavailable(reason)) => ("—".into(), muted(), Some(reason.as_str())),
+                        None => ("—".into(), muted(), Some("Awaiting history")),
+                    };
+                    p.text(
+                        pos2(col(r, index + 5), r.center().y),
+                        Align2::RIGHT_CENTER,
+                        label,
+                        mono(12.5),
+                        if stale { muted() } else { color },
+                    );
+                    if let Some(reason) = reason {
+                        let hit =
+                            Rect::from_min_max(pos2(col(r, index + 4), r.top()), pos2(col(r, index + 5), r.bottom()));
+                        ui.interact(hit, ui.id().with(("watch-cell", s, index)), Sense::hover()).on_hover_text(reason);
                     }
                 }
                 let tradable = matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf);

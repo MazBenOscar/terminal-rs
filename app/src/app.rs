@@ -382,6 +382,25 @@ struct Settings {
     panes: Option<Vec<serde_json::Value>>,
 }
 
+fn accept_columns<T>(revision: u64, current: u64, result: T) -> Option<T> {
+    (revision == current).then_some(result)
+}
+
+fn watch_value_order(a: Option<f64>, b: Option<f64>, descending: bool) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            if descending {
+                b.total_cmp(&a)
+            } else {
+                a.total_cmp(&b)
+            }
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -505,6 +524,13 @@ pub struct TerminalApp {
     congress_checked: Option<chrono::DateTime<chrono::Local>>,
 
     watchlist: Vec<String>,
+    watch_columns: tr_core::columns::ColumnSet,
+    column_cells: HashMap<String, Vec<tr_core::columns::Cell>>,
+    columns_revision: u64,
+    columns_computed_at: i64,
+    columns_requested: Option<Instant>,
+    columns_snapshot: (Vec<String>, tr_core::columns::ColumnSet),
+    watch_sort: Option<(usize, bool)>,
     quotes: HashMap<String, Quote>,
     last_quotes: Option<Instant>,
     last_feed: Option<Instant>,
@@ -658,6 +684,13 @@ impl TerminalApp {
             congress_status: String::new(),
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
+            watch_columns: Default::default(),
+            column_cells: HashMap::new(),
+            columns_revision: 0,
+            columns_computed_at: 0,
+            columns_requested: None,
+            columns_snapshot: Default::default(),
+            watch_sort: None,
             quotes: HashMap::new(),
             last_quotes: None,
             last_feed: None,
@@ -879,6 +912,27 @@ impl TerminalApp {
             Function::Refresh => self.worker.send(Request::RefreshCongress),
             Function::Watchlist => self.open_panel(PaneKind::Watchlist),
             Function::Scanner => self.open_panel(PaneKind::Scanner(Box::default())),
+            Function::ColumnAdd(mut column) => {
+                if self.watch_columns.columns.len() >= tr_core::columns::MAX_COLUMNS {
+                    self.status = "At most 8 columns are supported".into();
+                } else if self.watch_columns.columns.iter().any(|c| c.title.eq_ignore_ascii_case(&column.title)) {
+                    self.status = "A column with that title already exists".into();
+                } else {
+                    column.id = self.watch_columns.columns.iter().map(|c| c.id).max().unwrap_or(0).saturating_add(1);
+                    self.watch_columns.columns.push(column);
+                }
+                self.refresh_columns();
+            }
+            Function::ColumnDelete(title) => {
+                self.watch_columns.columns.retain(|c| !c.title.eq_ignore_ascii_case(&title));
+                self.watch_sort = None;
+                self.refresh_columns();
+            }
+            Function::ColumnClear => {
+                self.watch_columns.columns.clear();
+                self.watch_sort = None;
+                self.refresh_columns();
+            }
             Function::WatchAdd(words) => {
                 for key in keys_from_words(&words) {
                     if !self.watchlist.contains(&key) {
@@ -1005,6 +1059,15 @@ impl TerminalApp {
     fn drain(&mut self) {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
+                Response::WatchlistColumns { revision, cells, computed_at } => {
+                    self.refresh_columns();
+                    if let Some((cells, computed_at)) =
+                        accept_columns(revision, self.columns_revision, (cells, computed_at))
+                    {
+                        self.column_cells = cells;
+                        self.columns_computed_at = computed_at;
+                    }
+                }
                 Response::Scan { pane, generation, rows } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
                         && let PaneKind::Scanner(s) = &mut p.kind
@@ -1513,7 +1576,30 @@ impl TerminalApp {
         }
     }
 
+    fn refresh_columns(&mut self) {
+        let changed = self.columns_snapshot.0 != self.watchlist || self.columns_snapshot.1 != self.watch_columns;
+        if changed {
+            self.columns_revision = self.columns_revision.wrapping_add(1);
+            self.columns_snapshot = (self.watchlist.clone(), self.watch_columns.clone());
+            self.column_cells.clear();
+            self.columns_computed_at = 0;
+            self.columns_requested = None;
+        }
+        if !self.watch_columns.columns.is_empty()
+            && self.columns_requested.is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+        {
+            self.columns_revision = self.columns_revision.wrapping_add(1);
+            self.worker.send(Request::WatchlistColumns {
+                revision: self.columns_revision,
+                symbols: self.watchlist.clone(),
+                columns: self.watch_columns.columns.clone(),
+            });
+            self.columns_requested = Some(Instant::now());
+        }
+    }
+
     fn periodic(&mut self) {
+        self.refresh_columns();
         self.price_alerts.periodic(&self.worker);
         let visible = self.visible_panes();
         let shown = |f: &dyn Fn(&PaneKind) -> bool| visible.iter().any(|&i| f(&self.panes[i].kind));
@@ -1772,6 +1858,27 @@ impl eframe::App for TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_column_revision_is_dropped() {
+        assert_eq!(accept_columns(3, 4, "old cells"), None);
+        assert_eq!(accept_columns(4, 4, "new cells"), Some("new cells"));
+    }
+
+    #[test]
+    fn watch_sort_unavailable_last_both_directions() {
+        use tr_core::columns::{Cell, sort_key};
+        let original =
+            vec![Cell::Value(2.), Cell::Unavailable("No history".into()), Cell::Check(false), Cell::Check(true)];
+        for descending in [false, true] {
+            let mut view = original.clone();
+            view.sort_by(|a, b| watch_value_order(sort_key(Some(a)), sort_key(Some(b)), descending));
+            assert!(matches!(view.last(), Some(Cell::Unavailable(_))));
+            assert_eq!(sort_key(view.first()), Some(if descending { 2. } else { 0. }));
+            assert_eq!(watch_value_order(None, Some(1.), descending), std::cmp::Ordering::Greater);
+        }
+        assert_eq!(original[0], Cell::Value(2.));
+    }
 
     #[test]
     fn legacy_settings_migrate_to_a_layout() {

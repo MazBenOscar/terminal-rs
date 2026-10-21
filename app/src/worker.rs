@@ -78,6 +78,11 @@ pub enum QuestradeAction {
 }
 
 pub enum Request {
+    WatchlistColumns {
+        revision: u64,
+        symbols: Vec<String>,
+        columns: Vec<tr_core::columns::ColumnDef>,
+    },
     Questrade {
         handle: tr_data::questrade::Questrade,
         action: QuestradeAction,
@@ -319,6 +324,11 @@ pub struct Profile {
 }
 
 pub enum Response {
+    WatchlistColumns {
+        revision: u64,
+        cells: std::collections::HashMap<String, Vec<tr_core::columns::Cell>>,
+        computed_at: i64,
+    },
     LiveStatus {
         pane: PaneId,
         generation: u64,
@@ -816,6 +826,45 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 QuestradeAction::Test => test(&handle).await,
             };
             s.send(Response::Questrade(result.map_err(|e| format!("{e:#}"))));
+        }
+        Request::WatchlistColumns { revision, symbols, columns } => {
+            use futures::{StreamExt, stream};
+            use tr_core::columns::Cell;
+            let plan = column_history_plan(&columns);
+            let cells = stream::iter(symbols.into_iter().take(200))
+                .map(|symbol| {
+                    let plan = &plan;
+                    let columns = &columns;
+                    async move {
+                        let result = tokio::time::timeout(Duration::from_secs(20), async {
+                            let mut set = tr_core::conditions::SeriesSet::new();
+                            for &(tf, limit) in plan {
+                                let (bars, _) = universe_history(s, &symbol, tf, limit)
+                                    .await
+                                    .map_err(|_| format!("No {} history", tf.label()))?;
+                                set.insert(tf, tr_core::Series::new(&symbol, tf, bars));
+                            }
+                            Ok::<_, String>(columns.iter().map(|c| c.evaluate(&set)).collect::<Vec<_>>())
+                        })
+                        .await;
+                        let values = match result {
+                            Ok(Ok(values)) => values,
+                            Ok(Err(reason)) => vec![Cell::Unavailable(reason); columns.len()],
+                            Err(_) => vec![
+                                Cell::Unavailable(format!(
+                                    "No {} history",
+                                    plan.first().map_or("1D", |(tf, _)| tf.label())
+                                ));
+                                columns.len()
+                            ],
+                        };
+                        (symbol, values)
+                    }
+                })
+                .buffer_unordered(4)
+                .collect()
+                .await;
+            s.send(Response::WatchlistColumns { revision, cells, computed_at: chrono::Utc::now().timestamp() });
         }
         Request::ScanUniverse { pane, generation, definition, universe, cancel } => {
             let rows = scan_universe(s, pane, generation, &definition, universe, &cancel).await;
@@ -1380,6 +1429,44 @@ async fn scan(provider: Provider, definition: ScanDefinition, symbols: Vec<Strin
 /// Reuse a fresh snapshot only when its provider and requested coverage match.
 /// Fetch a full replacement otherwise: a fixed-size tail cannot prove continuity
 /// after an absence or satisfy a larger indicator lookback.
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+    use tr_core::columns::{ColumnDef, ColumnKind};
+    #[test]
+    fn column_request_distinct_timeframes_and_limits() {
+        let column = |tf| ColumnDef {
+            id: 1,
+            title: "Close".into(),
+            timeframe: tf,
+            kind: ColumnKind::Formula { expression: "C".into() },
+        };
+        assert_eq!(
+            column_history_plan(&[column(Timeframe::D1), column(Timeframe::W1), column(Timeframe::D1)]),
+            vec![(Timeframe::D1, 900), (Timeframe::W1, 900)]
+        );
+        let c = ColumnDef {
+            kind: ColumnKind::Condition(tr_core::scanner::ScanDefinition::default().root),
+            ..column(Timeframe::D1)
+        };
+        assert!(column_history_plan(&[c]).iter().all(|(_, limit)| *limit >= 300));
+    }
+}
+
+fn column_history_plan(columns: &[tr_core::columns::ColumnDef]) -> Vec<(Timeframe, usize)> {
+    let mut plan = Vec::new();
+    for column in columns {
+        for tf in column.timeframes() {
+            if !plan.iter().any(|(existing, _)| *existing == tf) {
+                let limit =
+                    columns.iter().map(|c| c.required_bars_for(tf)).max().unwrap_or(1).saturating_mul(3).max(300);
+                plan.push((tf, limit));
+            }
+        }
+    }
+    plan
+}
+
 async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize) -> Result<(Vec<Bar>, bool), String> {
     let now = chrono::Utc::now().timestamp();
     let source = s.provider.scan_cache_key(symbol);
