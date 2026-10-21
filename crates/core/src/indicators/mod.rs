@@ -14,6 +14,7 @@
 
 use crate::Bar;
 
+pub mod formula;
 mod levels;
 mod ma;
 mod momentum;

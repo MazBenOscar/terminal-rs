@@ -1,0 +1,183 @@
+//! Named local chart setups. Securities, timeframes and drawings are intentionally
+//! excluded: applying a template keeps the current chart's subject and annotations.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use tr_chart::scene::ChartType;
+use tr_core::Timeframe;
+use tr_core::indicators::{
+    registry::{Input, Spec},
+    study,
+};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Template {
+    pub version: u32,
+    pub name: String,
+    pub indicators: Vec<Spec>,
+    pub chart_type: ChartType,
+    pub log: bool,
+    pub show_volume: bool,
+}
+
+fn path(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.trim() != name
+        || name.is_empty()
+        || name.len() > 100
+        || name.starts_with('.')
+        || name.ends_with('.')
+        || !name.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
+    {
+        return Err("Use a template name of 1–100 characters: letters, numbers, spaces, - or _".into());
+    }
+    Ok(dir.join(format!("{name}.json")))
+}
+
+pub fn directory() -> PathBuf {
+    crate::worker::data_dir().join("chart-templates")
+}
+
+pub fn names(dir: &Path) -> Result<Vec<String>, String> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for file in std::fs::read_dir(dir).map_err(|e| format!("Reading chart templates: {e}"))? {
+        let file = file.map_err(|e| e.to_string())?;
+        if file.path().extension().is_some_and(|s| s == "json")
+            && file.file_type().is_ok_and(|t| t.is_file())
+            && let Some(name) = file.path().file_stem().and_then(|s| s.to_str())
+        {
+            names.push(name.to_string());
+        }
+    }
+    names.sort_by_key(|s| s.to_lowercase());
+    Ok(names)
+}
+
+impl Template {
+    pub fn validate(&mut self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err("This chart-template version is not supported".into());
+        }
+        if self.indicators.len() > 128 {
+            return Err("A chart template supports at most 128 studies".into());
+        }
+        study::assign_ids(&mut self.indicators);
+        let input = Input::new(&[], Timeframe::D1);
+        for result in study::evaluate(&self.indicators, &input) {
+            result.map_err(|e| format!("Invalid template: {e}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn load(dir: &Path, name: &str) -> Result<Self, String> {
+        let path = path(dir, name)?;
+        if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > 1_048_576 {
+            return Err("The chart template exceeds the 1 MiB limit".into());
+        }
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let mut template: Self = serde_json::from_slice(&bytes).map_err(|e| format!("Reading template: {e}"))?;
+        template.validate()?;
+        Ok(template)
+    }
+
+    pub fn save(&mut self, dir: &Path) -> Result<(), String> {
+        let destination = path(dir, &self.name)?;
+        self.validate()?;
+        // Preserve corrupt or unsupported files instead of silently replacing them.
+        if destination.exists() {
+            Self::load(dir, &self.name)?;
+        }
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        crate::layouts::write_atomic(&destination, &serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("Saving chart template: {e}"))
+    }
+
+    /// Merge by remapping every imported ID and both calculation and pane edges.
+    /// All validation happens before the caller's current setup changes.
+    pub fn merge_into(&self, current: &mut Vec<Spec>) -> Result<(), String> {
+        if current.len() + self.indicators.len() > 128 {
+            return Err("Merging would exceed 128 studies".into());
+        }
+        let mut template = self.clone();
+        template.validate()?;
+        let mut merged = current.clone();
+        study::assign_ids(&mut merged);
+        let mut used: HashSet<_> = merged.iter().filter_map(|s| s.chart.as_ref().map(|c| c.id)).collect();
+        let mut ids = HashMap::new();
+        for spec in &template.indicators {
+            let old = spec.chart.as_ref().unwrap().id;
+            let id = (1..=u32::MAX).find(|id| !used.contains(id)).ok_or("No free study IDs")?;
+            used.insert(id);
+            ids.insert(old, id);
+        }
+        for spec in &mut template.indicators {
+            let c = spec.chart.as_mut().unwrap();
+            c.id = ids[&c.id];
+            if let study::Source::Output { study, .. } = &mut c.source {
+                *study = ids[study];
+            }
+            if let study::Pane::With(id) = &mut c.pane {
+                *id = ids[id];
+            }
+        }
+        merged.extend(template.indicators);
+        *current = merged;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn template() -> Template {
+        let mut indicators = vec![Spec::new("RSI", &[14.]).unwrap(), Spec::new("EMA", &[9.]).unwrap()];
+        study::assign_ids(&mut indicators);
+        indicators[1].chart.as_mut().unwrap().source = study::Source::Output { study: 1, output: "RSI".into() };
+        indicators[1].chart.as_mut().unwrap().pane = study::Pane::With(1);
+        Template {
+            version: 1,
+            name: "RSI signal".into(),
+            indicators,
+            chart_type: ChartType::Candles,
+            log: false,
+            show_volume: true,
+        }
+    }
+    #[test]
+    fn merging_keeps_existing_ports_and_remaps_all_imported_edges() {
+        let t = template();
+        let mut current = t.indicators.clone();
+        t.merge_into(&mut current).unwrap();
+        assert_eq!(current[0].chart.as_ref().unwrap().id, 1);
+        assert_eq!(current[2].chart.as_ref().unwrap().id, 3);
+        assert_eq!(current[3].chart.as_ref().unwrap().source, study::Source::Output { study: 3, output: "RSI".into() });
+        assert_eq!(current[3].chart.as_ref().unwrap().pane, study::Pane::With(3));
+        let mut bad = t.clone();
+        bad.indicators[0].chart.as_mut().unwrap().pane = study::Pane::With(900);
+        let before = current.clone();
+        assert!(bad.merge_into(&mut current).is_err());
+        assert_eq!(before, current);
+    }
+    #[test]
+    fn persistence_and_corrupt_file_protection() {
+        let dir = std::env::temp_dir().join(format!(
+            "tr-chart-templates-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut t = template();
+        t.save(&dir).unwrap();
+        assert_eq!(Template::load(&dir, &t.name).unwrap(), t);
+        assert_eq!(names(&dir).unwrap(), vec![t.name.clone()]);
+        let file = path(&dir, &t.name).unwrap();
+        std::fs::write(&file, "broken").unwrap();
+        assert!(t.save(&dir).is_err());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "broken");
+        assert!(path(&dir, "../escape").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

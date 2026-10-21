@@ -342,7 +342,7 @@ pub struct Worker {
 }
 
 /// Bars per pane tagged with the load generation they belong to.
-type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>)>;
+type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>, String)>;
 
 struct Shared {
     provider: Provider,
@@ -517,7 +517,11 @@ pub fn build_indicators(
                         Plot::Dots => LineKind::Dots,
                         Plot::Steps => LineKind::Steps,
                     };
-                    (o.name.to_string(), overlay(&o.values, color, kind))
+                    let values = tr_core::indicators::formula::display_values(
+                        &o.values,
+                        spec.chart.as_ref().map_or(0, |c| c.displacement),
+                    );
+                    (o.name.to_string(), overlay(&values, color, kind))
                 })
                 .collect();
             BuiltIndicator { spec: spec.clone(), overlays, error }
@@ -586,11 +590,12 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::Scan { pane, generation, rows });
         }
         Request::History { pane, generation, symbol, tf, limit } => {
-            if !claim_series(s, pane, generation) {
+            let source = chart_cache_key(s.provider.as_ref(), &symbol);
+            if !claim_series(s, pane, generation, &source) {
                 return; // a newer load for this pane is already running
             }
             // Paint from the disk cache immediately, then refresh from the network.
-            let cached = s.cache.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.load(&symbol, tf, limit).ok()));
+            let cached = s.cache.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.load(&source, tf, limit).ok()));
             if let Some(bars) = cached.filter(|b| !b.is_empty()) {
                 let bars = Arc::new(bars);
                 let gpu = build_gpu(bars.clone()).await;
@@ -609,10 +614,18 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             }
             match s.provider.history(&symbol, tf, None, limit).await {
                 Ok(bars) if !bars.is_empty() => {
+                    if chart_cache_key(s.provider.as_ref(), &symbol) != source {
+                        s.send(Response::HistoryError {
+                            pane,
+                            generation,
+                            error: "Data route changed; reload the chart".into(),
+                        });
+                        return;
+                    }
                     if let Ok(mut c) = s.cache.lock()
                         && let Some(c) = c.as_mut()
                     {
-                        let _ = c.store(&symbol, tf, &bars);
+                        let _ = c.store(&source, tf, &bars);
                     }
                     let exhausted = bars.len() < limit / 2;
                     let bars = Arc::new(bars);
@@ -639,16 +652,40 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             }
         }
         Request::MoreHistory { pane, generation, symbol, tf, existing, limit } => {
+            let source = chart_cache_key(s.provider.as_ref(), &symbol);
+            let previous = s
+                .series
+                .lock()
+                .expect("series lock")
+                .get(&pane)
+                .filter(|(g, _, _)| *g == generation)
+                .map(|(_, _, source)| source.clone());
+            if previous.as_ref().is_some_and(|previous| previous != &source) {
+                s.send(Response::HistoryError {
+                    pane,
+                    generation,
+                    error: "Data route changed; reload before paging".into(),
+                });
+                return;
+            }
             // Page from the worker's copy (it may hold newer live bars than the UI's).
             let base = current_series(s, pane, generation).filter(|b| !b.is_empty()).unwrap_or(existing);
             let Some(first) = base.first().copied() else { return };
             match s.provider.history(&symbol, tf, Some(first.ts), limit).await {
                 Ok(older) => {
+                    if chart_cache_key(s.provider.as_ref(), &symbol) != source {
+                        s.send(Response::HistoryError {
+                            pane,
+                            generation,
+                            error: "Data route changed while paging; reload the chart".into(),
+                        });
+                        return;
+                    }
                     let older: Vec<Bar> = older.into_iter().filter(|b| b.ts < first.ts).collect();
                     let prepended = older.len();
                     let bars = {
                         let mut map = s.series.lock().expect("series lock");
-                        let Some((g, cur)) = map.get_mut(&pane).filter(|(g, _)| *g == generation) else { return };
+                        let Some((g, cur, _)) = map.get_mut(&pane).filter(|(g, _, _)| *g == generation) else { return };
                         let _ = g;
                         let mut merged = older;
                         merged.extend_from_slice(cur);
@@ -990,13 +1027,19 @@ async fn trade(t: TradeRequest) -> TradeResponse {
 
 /// Register a load for `generation`; generations only move forward, since request
 /// tasks run concurrently and may start out of order.
-fn claim_series(s: &Shared, pane: PaneId, generation: u64) -> bool {
+fn chart_cache_key(provider: &dyn tr_data::MarketData, symbol: &str) -> String {
+    // Versioned namespace excludes old, ambiguous caches (including legacy samples).
+    let route = provider.scan_cache_key(symbol);
+    format!("chart-v2:{}:{route}:{symbol}", route.len())
+}
+
+fn claim_series(s: &Shared, pane: PaneId, generation: u64, source: &str) -> bool {
     let mut map = s.series.lock().expect("series lock");
     match map.get(&pane) {
-        Some((g, _)) if *g > generation => false,
-        Some((g, _)) if *g == generation => true,
+        Some((g, _, _)) if *g > generation => false,
+        Some((g, _, route)) if *g == generation => route == source,
         _ => {
-            map.insert(pane, (generation, Arc::new(Vec::new())));
+            map.insert(pane, (generation, Arc::new(Vec::new()), source.to_string()));
             true
         }
     }
@@ -1006,16 +1049,17 @@ fn claim_series(s: &Shared, pane: PaneId, generation: u64) -> bool {
 fn store_series(s: &Shared, pane: PaneId, generation: u64, bars: Arc<Vec<Bar>>) -> bool {
     let mut map = s.series.lock().expect("series lock");
     match map.get(&pane) {
-        Some((g, _)) if *g > generation => false,
+        Some((g, _, _)) if *g > generation => false,
         _ => {
-            map.insert(pane, (generation, bars));
+            let source = map.get(&pane).map(|(_, _, source)| source.clone()).unwrap_or_default();
+            map.insert(pane, (generation, bars, source));
             true
         }
     }
 }
 
 fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<Bar>>> {
-    s.series.lock().expect("series lock").get(&pane).filter(|(g, _)| *g == generation).map(|(_, b)| b.clone())
+    s.series.lock().expect("series lock").get(&pane).filter(|(g, _, _)| *g == generation).map(|(_, b, _)| b.clone())
 }
 
 /// Merge the provider's live feed (if any) into the pane's series, publishing at most
@@ -1031,7 +1075,8 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
                     let Some(bar) = bar else { break };
                     let mut map = s.series.lock().expect("series lock");
                     match map.get_mut(&pane) {
-                        Some((g, bars)) if *g == generation => dirty |= Series::apply_live(Arc::make_mut(bars), bar),
+                        Some((g, bars, source)) if *g == generation && *source == chart_cache_key(s.provider.as_ref(),&symbol)
+                            => dirty |= Series::apply_live(Arc::make_mut(bars), bar),
                         _ => break,
                     }
                 }
@@ -1135,6 +1180,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chart_cache_does_not_reuse_legacy_or_other_provider_history() {
+        let provider = tr_data::sample::SampleProvider::at(1_790_000_000, 100);
+        let key = chart_cache_key(&provider, "AAPL US Equity");
+        let mut cache = BarCache::open_in_memory().unwrap();
+        let bars = [Bar::new(100, 10., 11., 9., 10., 1.)];
+        cache.store("AAPL US Equity", Timeframe::D1, &bars).unwrap();
+        cache.store("chart-v2:5:yahoo:AAPL US Equity", Timeframe::D1, &bars).unwrap();
+        assert!(cache.load(&key, Timeframe::D1, 100).unwrap().is_empty());
+        cache.store(&key, Timeframe::D1, &bars).unwrap();
+        assert_eq!(cache.load(&key, Timeframe::D1, 100).unwrap(), bars);
+        assert!(cache.load(&chart_cache_key(&provider, "MSFT US Equity"), Timeframe::D1, 100).unwrap().is_empty());
+    }
 
     #[test]
     fn scan_deduplicates_and_labels_explicit_samples() {
@@ -1327,8 +1386,9 @@ mod tests {
             ctx: egui::Context::default(),
         };
         // The newer load's task starts first; the older one must not take over.
-        assert!(claim_series(&s, 1, 2));
-        assert!(!claim_series(&s, 1, 1));
+        assert!(claim_series(&s, 1, 2, "test-source"));
+        assert!(!claim_series(&s, 1, 1, "test-source"));
+        assert!(!claim_series(&s, 1, 2, "different-source"));
         assert!(!store_series(&s, 1, 1, Arc::new(vec![])));
         assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(0, 1.0, 1.0, 1.0, 1.0, 1.0)])));
         assert_eq!(current_series(&s, 1, 2).unwrap().len(), 1);

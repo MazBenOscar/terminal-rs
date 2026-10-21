@@ -3,6 +3,7 @@
 
 mod anim;
 mod app;
+mod chart_templates;
 mod chart_view;
 mod command;
 mod congress_view;

@@ -13,6 +13,7 @@ use tr_chart::scale;
 use tr_chart::scene::{self, ChartType, Overlay, PricePane, SeriesGpu};
 use tr_chart::viewport::{PriceScale, Viewport};
 use tr_congress::{Trade, TxType};
+use tr_core::indicators::formula::{Average, BandwidthUnits, RsiMethod};
 use tr_core::indicators::registry::{self, Category};
 use tr_core::indicators::study::{self, Pane as StudyPane, Scale as StudyScale, Source as StudySource};
 use tr_core::{AssetClass, Bar, Security, Timeframe};
@@ -67,6 +68,22 @@ struct DrawState {
     tool: Option<Tool>,
     pending: Option<Anchor>,
     selected: Option<usize>,
+    hover: Option<(usize, DrawHandle)>,
+    drag: Option<DrawingDrag>,
+}
+
+#[derive(Clone, Copy)]
+enum DrawHandle {
+    A,
+    B,
+    Body,
+}
+
+struct DrawingDrag {
+    index: usize,
+    handle: DrawHandle,
+    start: Anchor,
+    original: Drawing,
 }
 
 pub struct ChartState {
@@ -95,6 +112,7 @@ pub struct ChartState {
     /// Renewed when a load's first Congress markers arrive, which pops them in.
     markers_key: u64,
     loading: bool,
+    cached_history: bool,
     paging: bool,
     exhausted: bool,
     error: Option<String>,
@@ -118,6 +136,12 @@ pub struct ChartState {
     pub controls_in_strip: bool,
     indicator_editor: bool,
     indicator_search: String,
+    template_name: String,
+    template_names: Option<Vec<String>>,
+    template_selected: String,
+    template_status: Option<Result<String, String>>,
+    drawing_undo: Vec<Vec<Drawing>>,
+    drawing_redo: Vec<Vec<Drawing>>,
 }
 
 impl ChartState {
@@ -150,6 +174,7 @@ impl ChartState {
             reveal_key: 0,
             markers_key: 0,
             loading: false,
+            cached_history: false,
             paging: false,
             exhausted: false,
             error: None,
@@ -168,6 +193,12 @@ impl ChartState {
             controls_in_strip: false,
             indicator_editor: false,
             indicator_search: String::new(),
+            template_name: String::new(),
+            template_names: None,
+            template_selected: String::new(),
+            template_status: None,
+            drawing_undo: Vec::new(),
+            drawing_redo: Vec::new(),
         }
     }
 
@@ -177,9 +208,15 @@ impl ChartState {
 
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
+        if self.draw.drag.is_some() {
+            self.cancel();
+        }
+        self.draw = DrawState::default();
+        self.adopt_legacy_drawings();
         study::assign_ids(&mut self.indicators);
         self.generation += 1;
         self.loading = true;
+        self.cached_history = false;
         self.paging = false;
         self.exhausted = false;
         self.error = None;
@@ -206,6 +243,7 @@ impl ChartState {
     }
 
     pub fn set_symbol(&mut self, symbol: &str, w: &Worker) {
+        self.adopt_legacy_drawings();
         let sec = tr_data::security(symbol);
         if sec.class == AssetClass::Govt {
             self.chart_type = ChartType::Line;
@@ -330,6 +368,12 @@ impl ChartState {
 
     /// Esc: cancel an in-progress drawing, then deselect. Returns whether it consumed the key.
     pub fn cancel(&mut self) -> bool {
+        if let Some(drag) = self.draw.drag.take() {
+            if let Some(drawing) = self.drawings.get_mut(drag.index) {
+                *drawing = drag.original;
+            }
+            self.drawing_undo.pop();
+        }
         if self.draw.tool.is_some() || self.draw.selected.is_some() {
             self.draw = DrawState::default();
             true
@@ -341,10 +385,46 @@ impl ChartState {
     pub fn delete_selected(&mut self) -> bool {
         match self.draw.selected.take() {
             Some(i) if i < self.drawings.len() => {
+                self.remember_drawings();
                 self.drawings.remove(i);
                 true
             }
             _ => false,
+        }
+    }
+
+    fn adopt_legacy_drawings(&mut self) {
+        for drawing in self
+            .drawings
+            .iter_mut()
+            .chain(self.drawing_undo.iter_mut().flatten())
+            .chain(self.drawing_redo.iter_mut().flatten())
+        {
+            if drawing.symbol.is_none() {
+                drawing.symbol = Some(self.symbol.clone());
+            }
+        }
+    }
+
+    fn remember_drawings(&mut self) {
+        if self.drawing_undo.len() >= 64 {
+            self.drawing_undo.remove(0);
+        }
+        self.drawing_undo.push(self.drawings.clone());
+        self.drawing_redo.clear();
+    }
+
+    pub fn undo_drawings(&mut self) {
+        if let Some(previous) = self.drawing_undo.pop() {
+            self.drawing_redo.push(std::mem::replace(&mut self.drawings, previous));
+            self.draw = DrawState::default();
+        }
+    }
+
+    pub fn redo_drawings(&mut self) {
+        if let Some(next) = self.drawing_redo.pop() {
+            self.drawing_undo.push(std::mem::replace(&mut self.drawings, next));
+            self.draw = DrawState::default();
         }
     }
 
@@ -457,6 +537,7 @@ impl ChartState {
             g.to.right += shift;
         }
         self.bars = bars;
+        self.cached_history = from_cache;
         self.gpu = Some(gpu);
         self.paging = false;
         self.exhausted = exhausted || self.exhausted && prepended == 0;
@@ -493,9 +574,8 @@ impl ChartState {
             self.loading = false;
             self.paging = false;
             self.exhausted = true;
-            if self.bars.is_empty() {
-                self.error = Some(error);
-            }
+            self.error =
+                Some(if self.bars.is_empty() { error } else { format!("{error} · previous history retained") });
         }
     }
 
@@ -665,8 +745,9 @@ impl ChartState {
             (_, true, _) => "loading…".into(),
             (_, _, true) => "loading history…".into(),
             _ => format!(
-                "{} bars{}{}",
+                "{} bars{}{}{}",
                 self.bars.len(),
+                if self.cached_history { " · cached" } else { "" },
                 if self.log { "  LOG" } else { "" },
                 if self.magnet { "  MAGNET" } else { "" }
             ),
@@ -782,7 +863,12 @@ impl ChartState {
         if (self.draw.tool.is_none() && plot_resp.dragged()) || time_resp.dragged() {
             self.glide = None;
         }
-        if self.draw.tool.is_none() && plot_resp.dragged() && !divider_dragging {
+        if self.draw.tool.is_none()
+            && plot_resp.dragged()
+            && !divider_dragging
+            && self.draw.drag.is_none()
+            && self.draw.hover.is_none()
+        {
             let d = plot_resp.drag_delta();
             self.viewport.as_mut().expect("viewport").pan_px(d.x as f64);
             if let Some(s) = self.manual_scale.as_mut() {
@@ -1131,6 +1217,17 @@ impl ChartState {
         let before = self.indicators.clone();
         let mut remove = None;
         let mut reorder = None;
+        let mut save_template = false;
+        let mut apply_template = None;
+        if self.template_names.is_none() {
+            match crate::chart_templates::names(&crate::chart_templates::directory()) {
+                Ok(names) => self.template_names = Some(names),
+                Err(error) => {
+                    self.template_names = Some(Vec::new());
+                    self.template_status = Some(Err(error));
+                }
+            }
+        }
         egui::Window::new(format!("Indicators · {}", self.sec.ticker))
             .id(egui::Id::new((self.id, "indicator-editor")))
             .open(&mut open)
@@ -1138,6 +1235,36 @@ impl ChartState {
             .default_height(560.0)
             .show(ctx, |ui| {
                 ui.label("Edit inputs, display panes and scales independently.");
+                ui.collapsing("Chart templates", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.template_name)
+                            .hint_text("Template name").desired_width(220.0));
+                        if ui.add_enabled(!self.template_name.trim().is_empty(), egui::Button::new("Save setup")).clicked() {
+                            save_template = true;
+                        }
+                    });
+                    egui::ComboBox::from_id_salt("chart-template")
+                        .selected_text(if self.template_selected.is_empty() { "Choose saved template…" } else { &self.template_selected })
+                        .width(300.0).show_ui(ui, |ui| {
+                            for name in self.template_names.as_deref().unwrap_or_default() {
+                                ui.selectable_value(&mut self.template_selected, name.clone(), name);
+                            }
+                        });
+                    ui.add_enabled_ui(!self.template_selected.is_empty(), |ui| { ui.horizontal(|ui| {
+                        if ui.button("Replace studies & style").on_hover_text("Keeps this symbol, timeframe and drawings").clicked() {
+                            apply_template = Some(false);
+                        }
+                        if ui.button("Add studies").on_hover_text("Adds studies with remapped IDs; keeps existing style").clicked() {
+                            apply_template = Some(true);
+                        }
+                    }); });
+                    if let Some(status) = &self.template_status {
+                        match status {
+                            Ok(message) => { ui.label(RichText::new(message).small().color(theme::up())); }
+                            Err(error) => { ui.label(RichText::new(error).small().color(theme::down())); }
+                        }
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.label("Add indicator");
                     ui.add(
@@ -1235,6 +1362,54 @@ impl ChartState {
                                     .response
                                     .on_hover_text("Calculation input; independent of display placement");
                             }
+                            ui.collapsing("Calculation & offsets", |ui| {
+                                if matches!(spec.code.as_str(), "BB" | "BBW" | "PCTB" | "ATR" | "MACD" | "ENV") {
+                                    let original = match spec.code.as_str() {
+                                        "ATR" => "Original: Wilder", "MACD" => "Original: Exponential", _ => "Original: Simple",
+                                    };
+                                    egui::ComboBox::from_id_salt("average-method")
+                                        .selected_text(c.formula.average.map_or(original, Average::label))
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut c.formula.average, None, original);
+                                            for average in Average::ALL {
+                                                ui.selectable_value(&mut c.formula.average, Some(average), average.label());
+                                            }
+                                        });
+                                }
+                                if spec.code == "RSI" {
+                                    ui.horizontal(|ui| {
+                                        ui.label("RSI method");
+                                        ui.selectable_value(&mut c.formula.rsi_method, RsiMethod::Wilder, "Wilder");
+                                        ui.selectable_value(&mut c.formula.rsi_method, RsiMethod::Plain, "Plain");
+                                    });
+                                    if c.formula.rsi_method == RsiMethod::Plain {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Output SMA");
+                                            ui.add(egui::DragValue::new(&mut c.formula.rsi_smoothing).range(1..=1000));
+                                        });
+                                    } else { c.formula.rsi_smoothing = 1; }
+                                }
+                                if spec.code == "BBW" {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Bandwidth units");
+                                        ui.selectable_value(&mut c.formula.bandwidth_units, BandwidthUnits::Ratio, "Ratio");
+                                        ui.selectable_value(&mut c.formula.bandwidth_units, BandwidthUnits::Percent, "Percent");
+                                    });
+                                }
+                                if matches!(spec.code.as_str(), "BBW" | "PCTB") {
+                                    ui.checkbox(&mut c.formula.undefined_zero_division, "Undefined when denominator is zero");
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label("Bars ago");
+                                    ui.add(egui::DragValue::new(&mut c.formula.bars_ago).range(0..=1000))
+                                        .on_hover_text("Historical value used by this plot and its calculation children");
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Plot displacement");
+                                    ui.add(egui::DragValue::new(&mut c.displacement).range(-1000..=1000))
+                                        .on_hover_text("Display only: positive moves right, negative moves left. Does not change child calculations.");
+                                });
+                            });
                             egui::ComboBox::from_id_salt("pane")
                                 .selected_text(match c.pane {
                                     StudyPane::Price => "Pane: Price".into(),
@@ -1312,6 +1487,38 @@ impl ChartState {
                 );
             });
         self.indicator_editor = open;
+        if save_template {
+            let name = self.template_name.trim().to_string();
+            let mut template = crate::chart_templates::Template {
+                version: 1,
+                name: name.clone(),
+                indicators: self.indicators.clone(),
+                chart_type: self.chart_type,
+                log: self.log,
+                show_volume: self.show_volume,
+            };
+            self.template_status = Some(template.save(&crate::chart_templates::directory()).map(|()| {
+                self.template_names = None;
+                self.template_selected = name.clone();
+                format!("Saved {name}")
+            }));
+        }
+        if let Some(merge) = apply_template {
+            self.template_status = Some(
+                crate::chart_templates::Template::load(&crate::chart_templates::directory(), &self.template_selected)
+                    .and_then(|template| {
+                        if merge {
+                            template.merge_into(&mut self.indicators)?;
+                        } else {
+                            self.indicators = template.indicators;
+                            self.chart_type = template.chart_type;
+                            self.log = template.log;
+                            self.show_volume = template.show_volume;
+                        }
+                        Ok(format!("Applied {}", self.template_selected))
+                    }),
+            );
+        }
         if let Some(index) = remove {
             self.remove_study(index);
         } else if let Some(index) = reorder {
@@ -1391,8 +1598,42 @@ impl ChartState {
                     ui.close();
                 }
             }
-            if ui.button("Remove All Drawings").clicked() {
-                self.drawings.clear();
+            if ui.add_enabled(!self.drawing_undo.is_empty(), egui::Button::new("Undo drawing edit")).clicked() {
+                self.undo_drawings();
+                ui.close();
+            }
+            if ui.add_enabled(!self.drawing_redo.is_empty(), egui::Button::new("Redo drawing edit")).clicked() {
+                self.redo_drawings();
+                ui.close();
+            }
+            if let Some(index) = self.draw.selected.filter(|&i| i < self.drawings.len()) {
+                ui.separator();
+                let mut edited = self.drawings[index].clone();
+                ui.label(format!("Selected {}", edited.tool.label()));
+                ui.add(egui::DragValue::new(&mut edited.width).range(0.5..=6.0).speed(0.1).prefix("Width "));
+                let mut custom = edited.color.is_some();
+                if ui.checkbox(&mut custom, "Custom drawing color").changed() {
+                    edited.color = custom.then_some(theme::cyan().to_array()[..3].try_into().unwrap());
+                }
+                if let Some(color) = &mut edited.color {
+                    ui.color_edit_button_srgb(color);
+                }
+                if ui.checkbox(&mut edited.all_symbols, "Show on all symbols").changed() && !edited.all_symbols {
+                    edited.symbol = Some(self.symbol.clone());
+                }
+                if edited.tool == Tool::Trendline {
+                    ui.checkbox(&mut edited.extend_left, "Extend left");
+                    ui.checkbox(&mut edited.extend_right, "Extend right");
+                }
+                if edited != self.drawings[index] {
+                    self.remember_drawings();
+                    self.drawings[index] = edited;
+                }
+            }
+            if ui.button("Remove Drawings on This Symbol").clicked() {
+                self.remember_drawings();
+                self.drawings.retain(|d| !d.visible_on(&self.symbol));
+                self.draw = DrawState::default();
                 ui.close();
             }
         });
@@ -1511,7 +1752,24 @@ impl ChartState {
         let px =
             |a: &Anchor| [rect.left() as f64 + v.x_of(self.index_of_ts(a.ts)), rect.top() as f64 + s.y_of(a.price)];
         match d.tool {
-            Tool::Trendline => vec![(Shape::Segment(px(&d.a), px(&d.b)), None)],
+            Tool::Trendline => {
+                let (mut a, mut b) = (px(&d.a), px(&d.b));
+                if (b[0] - a[0]).abs() > 1e-6 && (d.extend_left || d.extend_right) {
+                    if a[0] > b[0] {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    let slope = (b[1] - a[1]) / (b[0] - a[0]);
+                    if d.extend_left {
+                        a[1] += (rect.left() as f64 - a[0]) * slope;
+                        a[0] = rect.left() as f64;
+                    }
+                    if d.extend_right {
+                        b[1] += (rect.right() as f64 - b[0]) * slope;
+                        b[0] = rect.right() as f64;
+                    }
+                }
+                vec![(Shape::Segment(a, b), None)]
+            }
             Tool::Horizontal => vec![(Shape::HLine(px(&d.a)[1]), Some(format!("{:.2}", d.a.price)))],
             Tool::Vertical => vec![(Shape::VLine(px(&d.a)[0]), None)],
             Tool::Fib => {
@@ -1539,6 +1797,7 @@ impl ChartState {
     ) {
         let p = ui.painter_at(rect);
         let pointer_anchor = |this: &Self, pos: Pos2| -> Anchor {
+            let pos = pos.clamp(rect.min, rect.max);
             let idx = v.index_at((pos.x - rect.left()) as f64);
             let mut price = s.price_at((pos.y - rect.top()) as f64);
             if this.magnet
@@ -1549,39 +1808,133 @@ impl ChartState {
             Anchor { ts: this.ts_of_index(idx), price }
         };
 
+        // Endpoint handles take precedence over whole-object hit testing. Keep
+        // original anchors for absolute drag deltas, including on logarithmic axes.
+        let hit = |this: &Self, pos: Pos2| -> Option<(usize, DrawHandle)> {
+            if !rect.contains(pos) {
+                return None;
+            }
+            for (index, drawing) in this.drawings.iter().enumerate().rev().filter(|(_, d)| d.visible_on(&this.symbol)) {
+                for (anchor, handle) in [(&drawing.a, DrawHandle::A), (&drawing.b, DrawHandle::B)] {
+                    let point = pos2(
+                        rect.left() + v.x_of(this.index_of_ts(anchor.ts)) as f32,
+                        rect.top() + s.y_of(anchor.price) as f32,
+                    );
+                    if point.distance(pos) < 8.0 {
+                        return Some((index, handle));
+                    }
+                }
+                if this
+                    .drawing_shapes(drawing, rect, v, s)
+                    .iter()
+                    .any(|(shape, _)| drawings::distance(shape, [pos.x as f64, pos.y as f64]) < 6.0)
+                {
+                    return Some((index, DrawHandle::Body));
+                }
+            }
+            None
+        };
+        if self.draw.tool.is_none() && self.draw.drag.is_none() {
+            self.draw.hover = hover.and_then(|pos| hit(self, pos));
+        }
+        if self.draw.tool.is_none()
+            && resp.drag_started()
+            && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos())
+            && let Some((index, handle)) = hit(self, pos)
+        {
+            self.remember_drawings();
+            self.draw.drag = Some(DrawingDrag {
+                index,
+                handle,
+                start: pointer_anchor(self, pos),
+                original: self.drawings[index].clone(),
+            });
+            self.draw.selected = Some(index);
+        }
+        if resp.dragged()
+            && let Some(pos) = resp.interact_pointer_pos()
+            && self.draw.drag.is_some()
+        {
+            let anchor = pointer_anchor(self, pos);
+            let drag = self.draw.drag.as_ref().unwrap();
+            let mut edited = drag.original.clone();
+            match drag.handle {
+                DrawHandle::A => edited.a = anchor,
+                DrawHandle::B => edited.b = anchor,
+                DrawHandle::Body => {
+                    for point in [&mut edited.a, &mut edited.b] {
+                        point.ts = point.ts.saturating_add(anchor.ts.saturating_sub(drag.start.ts));
+                        point.price = if s.log && drag.start.price > 0. {
+                            point.price * anchor.price / drag.start.price
+                        } else {
+                            point.price + anchor.price - drag.start.price
+                        };
+                    }
+                }
+            }
+            if edited.tool.points() == 1 {
+                if matches!(drag.handle, DrawHandle::B) {
+                    edited.a = edited.b;
+                } else {
+                    edited.b = edited.a;
+                }
+            }
+            self.drawings[drag.index] = edited;
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if self.draw.hover.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
+        if resp.drag_stopped() {
+            self.draw.drag = None;
+        }
+
         // Placement.
         if let (Some(tool), true, Some(pos)) = (self.draw.tool, resp.clicked(), resp.interact_pointer_pos()) {
             let a = pointer_anchor(self, pos);
             if tool.points() == 1 {
-                self.drawings.push(Drawing::new(tool, a, a));
+                self.remember_drawings();
+                let mut drawing = Drawing::new(tool, a, a);
+                drawing.symbol = Some(self.symbol.clone());
+                self.drawings.push(drawing);
                 self.draw = DrawState::default();
             } else if let Some(first) = self.draw.pending.take() {
-                self.drawings.push(Drawing::new(tool, first, a));
+                self.remember_drawings();
+                let mut drawing = Drawing::new(tool, first, a);
+                drawing.symbol = Some(self.symbol.clone());
+                self.drawings.push(drawing);
                 self.draw = DrawState::default();
             } else {
                 self.draw.pending = Some(a);
             }
         } else if self.draw.tool.is_none() && resp.clicked() {
             // Selection by proximity.
-            self.draw.selected = resp.interact_pointer_pos().and_then(|pos| {
-                self.drawings.iter().enumerate().find_map(|(i, d)| {
-                    let near = self
-                        .drawing_shapes(d, rect, v, s)
-                        .iter()
-                        .any(|(sh, _)| drawings::distance(sh, [pos.x as f64, pos.y as f64]) < 6.0);
-                    near.then_some(i)
-                })
-            });
+            self.draw.selected = resp.interact_pointer_pos().and_then(|pos| hit(self, pos).map(|(index, _)| index));
         }
 
-        let mut all: Vec<(Drawing, bool)> =
-            self.drawings.iter().cloned().enumerate().map(|(i, d)| (d, self.draw.selected == Some(i))).collect();
+        let mut all: Vec<(Drawing, bool)> = self
+            .drawings
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, d)| d.visible_on(&self.symbol))
+            .map(|(i, d)| (d, self.draw.selected == Some(i)))
+            .collect();
         if let (Some(tool), Some(first), Some(h)) = (self.draw.tool, self.draw.pending, hover) {
             all.push((Drawing::new(tool, first, pointer_anchor(self, h)), true));
         }
         for (d, selected) in all {
-            let color = if selected { amber() } else { theme::cyan() };
-            let stroke = Stroke::new(if selected { 2.0 } else { 1.3 }, color);
+            let color =
+                if selected { amber() } else { d.color.map_or(theme::cyan(), |[r, g, b]| Color32::from_rgb(r, g, b)) };
+            let stroke = Stroke::new(if selected { d.width.clamp(2.0, 6.0) } else { d.width.clamp(0.5, 6.0) }, color);
+            if selected {
+                for anchor in [d.a, d.b] {
+                    let point = pos2(
+                        rect.left() + v.x_of(self.index_of_ts(anchor.ts)) as f32,
+                        rect.top() + s.y_of(anchor.price) as f32,
+                    );
+                    p.circle_filled(point, 3.5, amber());
+                }
+            }
             for (shape, label) in self.drawing_shapes(&d, rect, v, s) {
                 match shape {
                     Shape::Segment(a, b) => {
@@ -1594,11 +1947,6 @@ impl ChartState {
                                 mono(10.0),
                                 color,
                             );
-                        }
-                        if selected && d.tool == Tool::Trendline {
-                            for q in [a, b] {
-                                p.circle_filled(pos2(q[0] as f32, q[1] as f32), 3.5, amber());
-                            }
                         }
                     }
                     Shape::HLine(y) => {
@@ -1811,6 +2159,79 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drawing_body_drag_preserves_log_ratios_and_supports_undo() {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.bars = Arc::new((0..100).map(|i| Bar::new(i * 86400, 10., 10., 10., 10., 1.)).collect());
+        let mut drawing = Drawing::new(
+            Tool::Trendline,
+            Anchor { ts: 20 * 86400, price: 10. },
+            Anchor { ts: 60 * 86400, price: 100. },
+        );
+        drawing.symbol = Some(chart.symbol.clone());
+        chart.drawings.push(drawing.clone());
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800., 400.));
+        let v = Viewport { right: 100., bar_px: 8., width_px: 800. };
+        let scale = PriceScale::new(1., 1000., true, 400.);
+        let start = pos2(v.x_of(40.) as f32, scale.y_of(1000_f64.sqrt()) as f32);
+        let to = start + vec2(40., -30.);
+        let frame = |chart: &mut ChartState, events| {
+            let mut output =
+                ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events, ..Default::default() }, |ui| {
+                    let response = ui.interact(rect, egui::Id::new("drawing-test"), Sense::click_and_drag());
+                    chart.paint_drawings(ui, rect, &v, &scale, ui.input(|i| i.pointer.hover_pos()), &response);
+                });
+            output.textures_delta.clear();
+        };
+        frame(&mut chart, vec![]);
+        frame(&mut chart, vec![egui::Event::PointerMoved(start)]);
+        frame(
+            &mut chart,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        frame(&mut chart, vec![egui::Event::PointerMoved(to)]);
+        frame(
+            &mut chart,
+            vec![egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let edited = chart.drawings[0].clone();
+        assert_eq!(edited.a.ts - drawing.a.ts, 5 * 86400);
+        assert!((edited.b.price / edited.a.price - 10.).abs() < 1e-9);
+        assert!(edited.a.price > drawing.a.price);
+        chart.undo_drawings();
+        assert_eq!(chart.drawings[0], drawing);
+        chart.redo_drawings();
+        assert_eq!(chart.drawings[0], edited);
+    }
+
+    #[test]
+    fn legacy_drawing_ownership_survives_symbol_changes_and_undo() {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.drawings.push(Drawing::new(Tool::Horizontal, Anchor { ts: 0, price: 10. }, Anchor { ts: 0, price: 10. }));
+        chart.remember_drawings();
+        chart.drawings[0].width = 3.;
+        let owner = chart.symbol.clone();
+        chart.set_symbol("MSFT", &Worker::inert());
+        assert!(!chart.drawings[0].visible_on(&chart.symbol));
+        chart.undo_drawings();
+        assert_eq!(chart.drawings[0].symbol.as_deref(), Some(owner.as_str()));
+        assert!(!chart.drawings[0].visible_on(&chart.symbol));
+        assert!(chart.drawings[0].visible_on(&owner));
+        chart.drawings[0].all_symbols = true;
+        assert!(chart.drawings[0].visible_on(&chart.symbol));
+    }
 
     #[test]
     fn pane_divider_drag_resizes_instead_of_panning() {

@@ -54,6 +54,11 @@ pub struct Settings {
     pub color: Option<[u8; 3]>,
     #[serde(default = "height")]
     pub height: f32,
+    #[serde(default)]
+    pub formula: super::formula::Formula,
+    /// Display-only shift. Calculation consumers always see undisplaced values.
+    #[serde(default)]
+    pub displacement: i16,
 }
 
 fn yes() -> bool {
@@ -73,6 +78,8 @@ impl Settings {
             visible: true,
             color: None,
             height: height(),
+            formula: Default::default(),
+            displacement: 0,
         }
     }
 }
@@ -128,7 +135,7 @@ pub fn pane_key(specs: &[Spec], index: usize) -> Result<Option<u32>, String> {
 /// Only these scalar-input studies currently accept a selectable input. Other
 /// registry studies retain their original OHLCV semantics, never fabricated bars.
 pub fn accepts_source(code: &str) -> bool {
-    matches!(code, "SMA" | "EMA" | "WMA" | "HMA" | "RMA" | "BB" | "RSI" | "MACD")
+    matches!(code, "SMA" | "EMA" | "WMA" | "HMA" | "RMA" | "BB" | "BBW" | "PCTB" | "ENV" | "RSI" | "MACD")
 }
 
 /// Whether adding this source edge would be acyclic. Evaluation also validates
@@ -179,7 +186,7 @@ pub fn evaluate(specs: &[Spec], input: &Input<'_>) -> Vec<Result<Vec<Output>, St
                 return Err(format!("Unknown indicator: {}", spec.code));
             }
             if matches!(source, Source::Bars) {
-                return Ok(spec.compute(input));
+                return super::formula::compute(spec, input);
             }
             if !accepts_source(&spec.code) {
                 return Err("This indicator requires its original OHLCV input".into());
@@ -226,7 +233,7 @@ pub fn evaluate(specs: &[Spec], input: &Input<'_>) -> Vec<Result<Vec<Output>, St
                     b
                 })
                 .collect();
-            Ok(spec.compute(&Input::new(&bars, input.tf)))
+            super::formula::compute(spec, &Input::new(&bars, input.tf))
         })();
         visiting[index] = false;
         done[index] = Some(result.clone());
@@ -330,5 +337,24 @@ mod tests {
         assert_eq!(mixed[0].chart.as_ref().unwrap().id, 3);
         assert_eq!(mixed[1].chart.as_ref().unwrap().id, 1);
         assert_eq!(mixed[2].chart.as_ref().unwrap().source, Source::Output { study: 1, output: "RSI".into() });
+    }
+
+    #[test]
+    fn display_displacement_cannot_introduce_lookahead_into_children() {
+        let bars: Vec<_> = (0..20).map(|i| Bar::new(i, i as f64, i as f64, i as f64, (i * i) as f64, 1.)).collect();
+        let mut specs = vec![Spec::new("SMA", &[2.]).unwrap(), Spec::new("EMA", &[2.]).unwrap()];
+        assign_ids(&mut specs);
+        specs[1].chart.as_mut().unwrap().source = Source::Output { study: 1, output: "SMA".into() };
+        let before = evaluate(&specs, &Input::new(&bars, Timeframe::D1));
+        specs[0].chart.as_mut().unwrap().displacement = -5;
+        let after = evaluate(&specs, &Input::new(&bars, Timeframe::D1));
+        let short = evaluate(&specs, &Input::new(&bars[..12], Timeframe::D1));
+        let a = &before[1].as_ref().unwrap()[0].values;
+        let b = &after[1].as_ref().unwrap()[0].values;
+        assert!(a.iter().zip(b).all(|(a, b)| a == b || a.is_nan() && b.is_nan()));
+        assert!(b.iter().zip(&short[1].as_ref().unwrap()[0].values).all(|(a, b)| a == b || a.is_nan() && b.is_nan()));
+        specs[0].chart.as_mut().unwrap().formula.bars_ago = 1;
+        let lag = evaluate(&specs, &Input::new(&bars, Timeframe::D1));
+        assert_ne!(lag[1].as_ref().unwrap()[0].values[10], b[10]);
     }
 }

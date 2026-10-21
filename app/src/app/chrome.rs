@@ -102,7 +102,7 @@ impl TerminalApp {
 
         // Data source chip (the window title itself is redundant in a compact toolbar).
         let live = !self.provider.eq_ignore_ascii_case("sample");
-        let chip_text = p.layout_no_wrap(if live { "Live" } else { "Offline" }.into(), ui_font(11.0), muted());
+        let chip_text = p.layout_no_wrap(if live { "Provider" } else { "Sample" }.into(), ui_font(11.0), muted());
         let chip = Rect::from_min_size(pos2(x, cy - 9.0), vec2(chip_text.size().x + 20.0, 18.0));
         p.rect_filled(chip, 9.0, theme::control());
         p.circle_filled(pos2(chip.left() + 8.0, cy), 3.0, if live { theme::up() } else { amber() });
@@ -283,7 +283,11 @@ impl TerminalApp {
 
     fn provider_label(&self) -> String {
         let n = self.provider.to_lowercase();
-        if n.contains("sample") { "Offline · sample data".into() } else { format!("Live · {}", self.provider) }
+        if n.contains("sample") {
+            "Simulated sample data".into()
+        } else {
+            format!("Provider · {}. Live chart badges require recent feed updates.", self.provider)
+        }
     }
 
     /// The Bloomberg command line, drawn as a rounded macOS search field.

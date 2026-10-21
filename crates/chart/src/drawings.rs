@@ -42,11 +42,42 @@ pub struct Drawing {
     pub tool: Tool,
     pub a: Anchor,
     pub b: Anchor,
+    /// None is a legacy annotation, adopted by its saved chart's symbol on load.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub all_symbols: bool,
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+    #[serde(default = "line_width")]
+    pub width: f32,
+    #[serde(default)]
+    pub extend_left: bool,
+    #[serde(default)]
+    pub extend_right: bool,
+}
+
+fn line_width() -> f32 {
+    1.3
 }
 
 impl Drawing {
     pub fn new(tool: Tool, a: Anchor, b: Anchor) -> Self {
-        Self { tool, a, b }
+        Self {
+            tool,
+            a,
+            b,
+            symbol: None,
+            all_symbols: false,
+            color: None,
+            width: line_width(),
+            extend_left: false,
+            extend_right: false,
+        }
+    }
+
+    pub fn visible_on(&self, symbol: &str) -> bool {
+        self.all_symbols || self.symbol.as_deref().is_none_or(|owner| owner == symbol)
     }
 
     /// Fib levels as `(ratio, price)`, measured from `b` (0) back to `a` (1), the

@@ -1285,6 +1285,11 @@ impl TerminalApp {
                 c.delete_selected();
             });
         }
+        if pressed(Modifiers { shift: true, ..Modifiers::COMMAND }, Key::Z) {
+            self.with_chart(|c, _| c.redo_drawings());
+        } else if pressed(Modifiers::COMMAND, Key::Z) {
+            self.with_chart(|c, _| c.undo_drawings());
+        }
         if pressed(Modifiers::NONE, Key::ArrowLeft) {
             self.with_chart(|c, _| c.pan_bars(-5.0));
         }

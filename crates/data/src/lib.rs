@@ -9,8 +9,8 @@
 //!   Treasury yields, Yahoo Finance for FX, indices, futures, ETFs and stocks, or Alpaca for
 //!   US stocks/ETFs when `APCA_API_KEY_ID` + `APCA_API_SECRET_KEY` are set.
 //!
-//! The router is wrapped in [`Fallback`], which serves sample data if a source is
-//! unreachable, so the terminal always has something to draw.
+//! The router is wrapped in [`Fallback`] for auxiliary demo views. Chart and scan
+//! history surface provider failures; simulated chart history requires sample mode.
 
 pub mod alpaca;
 pub mod cache;
@@ -335,15 +335,7 @@ impl<P: MarketData> MarketData for Fallback<P> {
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
-        match self.primary.history(symbol, tf, end, limit).await {
-            Ok(b) => Ok(b),
-            // Paging older history: never splice sample bars onto real ones.
-            Err(e) if end.is_some() => Err(e),
-            Err(e) => {
-                tracing::warn!("{} history {symbol} {tf} failed, using sample data: {e:#}", self.name);
-                self.sample.history(symbol, tf, end, limit).await
-            }
-        }
+        self.primary.history(symbol, tf, end, limit).await
     }
 
     async fn quotes(&self, symbols: &[String]) -> Result<Vec<Quote>> {
@@ -501,19 +493,18 @@ mod tests {
     #[tokio::test]
     async fn fallback_serves_sample_data() {
         let p = Fallback::new(Broken);
-        let bars = p.history("AAPL", Timeframe::D1, None, 100).await.unwrap();
-        assert_eq!(bars.len(), 100);
+        assert!(p.history("AAPL", Timeframe::D1, None, 100).await.unwrap_err().to_string().contains("offline"));
         let q = p.quotes(&["AAPL".into()]).await.unwrap();
         assert_eq!(q.len(), 1);
         // Paging must surface the error instead of mixing in synthetic bars.
-        assert!(p.history("AAPL", Timeframe::D1, Some(bars[0].ts), 100).await.is_err());
+        assert!(p.history("AAPL", Timeframe::D1, Some(100), 100).await.is_err());
         assert_eq!(p.name(), "broken");
     }
 
     #[tokio::test]
     async fn scanner_never_silently_uses_chart_fallback() {
         let p = Fallback::new(Broken);
-        assert_eq!(p.history("AAPL", Timeframe::D1, None, 10).await.unwrap().len(), 10);
+        assert!(p.history("AAPL", Timeframe::D1, None, 10).await.is_err());
         assert!(p.scan_history("AAPL", Timeframe::D1, 10).await.unwrap_err().to_string().contains("offline"));
     }
 

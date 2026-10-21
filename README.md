@@ -83,10 +83,14 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   fixed scales. SMA/EMA/WMA/HMA/RMA, Bollinger, RSI and MACD accept selected price/volume fields
   or another indicator's named output (for example EMA of RSI). Hidden studies still supply
   data; cycles are rejected. Up to six additional panes render. Workspace layouts save the
-  complete setup and migrate older indicator labels. See the [chart study guide](docs/chart-studies.md).
+  complete setup and migrate older indicator labels. Calculation options include plain/Wilder RSI,
+  selectable ATR/MACD/Bollinger averages, bandwidth units and historical/visual offsets. Named
+  local templates restore or merge study setups. See the [chart study guide](docs/chart-studies.md).
 - **Drawings** — trendline (Alt+T), horizontal (Alt+H), vertical (Alt+V) and fib retracement
   (Alt+F), stored in (time, price) so they survive zoom and timeframe changes; magnet (Alt+M) snaps
-  to OHLC; click to select, Del to remove.
+  to OHLC; click to select, drag anchors or the body to edit, Del to remove. Drawings belong to
+  their symbol, with an optional all-symbol scope; color, width and trendline extensions are
+  editable. Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z undo and redo drawing edits.
 - **Options** (`AAPL OMON`, ⌘⇧O) — full chains from Yahoo for US equities, ETFs and indices
   (SPX via ^SPX): every expiration, calls and puts by strike with bid/ask/last, change, volume,
   open interest and IV, plus Black-Scholes greeks (Δ, Γ, Θ/day, vega) from each contract's IV, the
@@ -108,8 +112,9 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
 
   No keys are required. `TR_PROVIDER=sample` runs fully offline on deterministic, class-aware sample
   data (BTCUSD near 65,000, EURUSD near 1.09, US10Y near 4.2%) **with simulated live ticks**, and
-  the live router falls back to sample data when a source is unreachable. Bars are cached in SQLite
-  so charts paint from disk on start. Older history pages in as you scroll left.
+  chart history reports source failures without substituting generated bars. Bars are cached in
+  SQLite by configured provider route, with cached history labeled on the chart. Older history
+  pages in as you scroll left. Auxiliary quote/options/book views retain their sample fallbacks.
 - **Congress trades** (key feature)
   - Ingests Periodic Transaction Reports from the **Senate eFD** (efdsearch.senate.gov: agreement
     + CSRF session, DataTables search API, HTML transaction tables) and the **House Clerk**

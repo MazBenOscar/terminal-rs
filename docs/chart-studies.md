@@ -8,16 +8,17 @@ Commands still toggle the first matching code/parameter combination.
 
 Each study has a stable number, numeric parameters, visibility and optional custom
 color. **Move up** changes pane/legend order without changing calculation inputs.
-Settings are saved automatically with the workspace layout. Layout format v2
-retains the original calculations when migrating v1 labels and older enum values;
-older application versions cannot read v2 layouts.
+Settings are saved automatically with the workspace layout. Layout format v3
+retains the original calculations when migrating older labels and settings;
+older application versions cannot read v3 layouts. Back up layouts before switching
+back to an older application build.
 
 ## Inputs, panes and scales
 
 These are separate choices:
 
 - **Input** selects the values used for calculation. SMA, EMA, WMA, HMA, RMA,
-  Bollinger Bands, RSI and MACD accept open/high/low/close, volume, typical price
+  Bollinger Bands, bandwidth, %B, envelopes, RSI and MACD accept open/high/low/close, volume, typical price
   (HLC3), or another study's named output. **Original bars** preserves the study's
   original OHLCV definition. Other studies currently keep that original input.
 - **Pane** chooses Price, Own, or another study's pane. Several studies can occupy
@@ -44,18 +45,65 @@ ports appear as errors in the editor; source choices that create cycles are omit
    moving an ordinary EMA into the RSI pane would not change its calculation.
 4. Add MACD12/26/9 in its own pane. Its line, signal and histogram display together.
 
-## First-version limits and conventions
+## Calculation methods and offsets
 
-This implements the chart study model, not complete TC2000 formula parity.
-RSI and ATR retain Wilder smoothing; BB retains its SMA basis and population
-deviation; BBW retains percentage units. Existing saved values and scanner
-thresholds are not silently reinterpreted. Alternative RSI/ATR methods, configurable
-Bollinger center methods, per-output styles, band fills, independent study
-timeframes and a reusable template library remain future work.
+Expand **Calculation & offsets** within a study:
+
+- RSI offers Wilder and plain RSI. Plain RSI averages gains and losses over the
+  rolling period and supports an optional SMA of the resulting RSI.
+- ATR, MACD, envelopes and Bollinger studies offer simple, exponential, front-weighted,
+  Hull and Wilder averages. Bollinger's selected average changes the center;
+  its population standard deviation remains measured about the arithmetic mean.
+- Bollinger bandwidth offers ratio and percentage units. Bandwidth and %B can
+  leave division by zero undefined instead of using the legacy fallback value.
+- **Bars ago** uses an earlier calculated value at the current bar. This causal
+  lag is also passed to child studies.
+- **Visual displacement** moves the plot left (negative) or right (positive).
+  Children consume the undisplaced values, so a left-shifted parent cannot feed
+  future values into another calculation. Positive displacement can extend into
+  the right margin; pan to see it.
+
+Existing saved setups keep Wilder RSI/ATR, a simple Bollinger basis, and bandwidth
+in percent. The new methods are chart settings; scanner thresholds and calculations
+remain unchanged. These choices follow the [documented conventions](analysis/chart-upgrade.md),
+but exact TC2000 numeric parity still requires exported reference fixtures for
+initialization, rounding and degenerate windows.
+
+## Templates and drawings
+
+In **Chart templates**, enter a name and select **Save setup**. Templates save
+studies, source connections, panes, scales, formula options, chart type, log scale
+and volume visibility in the data directory's `chart-templates` folder. They do
+not save the symbol, timeframe or drawings. **Replace studies & style** restores
+the setup; **Add studies** merges studies and remaps their source and pane links.
+Saving the same valid name replaces that template. Corrupt or unsupported files
+are preserved and reported as errors.
+
+Drawings belong to the symbol on which they were created. Older unowned drawings
+are assigned to their saved chart's symbol. Select and drag an endpoint to reshape
+a drawing, or drag its body to move it. Whole-object movement on a logarithmic axis
+preserves price ratios. Right-click **Draw** to edit the selected drawing's color,
+width, trendline extensions, or visibility on all symbols. Delete removes the
+selection; Ctrl/Cmd+Z undoes and Ctrl/Cmd+Shift+Z redoes drawing edits. This chart's
+undo history is limited to 64 edits and lasts for the running session. Escape
+cancels a drag. **Remove drawings on this symbol** preserves other symbols' drawings.
+
+## History integrity and remaining limits
+
+Chart history failures display an error and retain any already loaded history.
+They never substitute generated bars; sample history requires explicit sample
+mode. Cached history is labeled **cached**, and the cache is separated by configured
+provider route. Older unqualified cache entries are ignored and fetched again.
+A route can still choose among real upstream providers: the cache does not establish
+exchange session, adjustment or actual vendor equivalence.
+
+Per-output styles, band fills, linked chart cursors and independent study timeframes
+remain future work. Exchange calendars, session-aware studies and comparable
+adjusted source data also need further work before claiming full TC2000 parity.
 
 There are at most six additional panes. Hidden panes beyond the limit are noted
 on the chart; their studies still calculate. Source chaining currently supports
-the scalar consumers above. Displaced output arrays are rejected as sources
+the scalar consumers above. Intrinsically displaced output arrays (such as Ichimoku) are rejected as sources
 until timestamp/offset alignment is implemented; ordinary named outputs retain
 the chart's bar alignment. All studies use the chart's symbol/timeframe/history.
 
