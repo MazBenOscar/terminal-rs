@@ -19,9 +19,26 @@ impl TerminalApp {
         let id = self.panes[i].id;
         let dragging = self.drag.is_some_and(|d| d.active);
         if let PaneKind::Chart(c) = &mut self.panes[i].kind {
+            c.price_alerts = self
+                .price_alerts
+                .book
+                .alerts
+                .iter()
+                .filter(|a| a.symbol == c.symbol && a.simulated == self.price_alerts.simulated)
+                .cloned()
+                .collect();
             c.hover_enabled = !dragging;
             let clicked = c.show(ui, rect, focused, &self.worker);
             actions.append(&mut c.actions);
+            let alert_actions = std::mem::take(&mut c.price_alert_actions);
+            for action in alert_actions {
+                if matches!(action, crate::price_alerts::Action::Manage) {
+                    self.price_alerts.action(action);
+                    actions.push(Action::Command("ALRT".into()));
+                } else {
+                    self.price_alerts.action(action);
+                }
+            }
             return (actions, clicked);
         }
         let freshness = self.congress_freshness();
@@ -45,10 +62,20 @@ impl TerminalApp {
                 actions.extend(congress_view::politicians(ui, &self.politicians, &mut self.pol_search))
             }
             PaneKind::Alerts => {
-                let (a, seen) = congress_view::alerts(ui, &self.alerts);
-                actions.extend(a);
-                if seen {
-                    self.worker.send(Request::MarkAlertsSeen);
+                ui.horizontal_wrapped(|ui| {
+                    let unread = self.price_alerts.unread();
+                    ui.selectable_value(&mut self.price_alerts.congress_tab, false, format!("Price alerts ({unread})"));
+                    ui.selectable_value(&mut self.price_alerts.congress_tab, true, "Congress filings");
+                });
+                ui.separator();
+                if self.price_alerts.congress_tab {
+                    let (a, seen) = congress_view::alerts(ui, &self.alerts);
+                    actions.extend(a);
+                    if seen {
+                        self.worker.send(Request::MarkAlertsSeen);
+                    }
+                } else {
+                    self.price_alerts.show(ui);
                 }
             }
             PaneKind::Wei => actions.extend(markets_view::wei(ui, &self.quotes, self.wei_updated.as_deref())),

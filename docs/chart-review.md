@@ -4,6 +4,10 @@ This increment implements the charting priorities with the boundaries below. It
 does not establish complete TC2000 compatibility. Existing layouts migrate to v4;
 new templates use v2 and accept v1. Older builds reject these newer versions.
 
+For local price-level alert creation, monitoring rules and verification steps, see
+[Price alerts](price-alerts.md). Chart interaction controls are covered in
+[Chart interaction fixes](chart-interaction-fixes.md).
+
 ## Output styles and fills
 
 Open **Indicators…**, then expand **Output styles & band fill** on a study.

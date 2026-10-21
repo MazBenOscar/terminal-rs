@@ -5,6 +5,7 @@ pub mod bar;
 pub mod catalog;
 pub mod indicators;
 pub mod options;
+pub mod price_alerts;
 pub mod sample;
 pub mod scanner;
 pub mod security;

@@ -496,6 +496,7 @@ pub struct TerminalApp {
     politicians: Vec<PoliticianSummary>,
     pol_search: String,
     alerts: Vec<Alert>,
+    price_alerts: crate::price_alerts::State,
     congress_status: String,
     /// When the last Congress ingest finished.
     congress_checked: Option<chrono::DateTime<chrono::Local>>,
@@ -594,6 +595,10 @@ impl TerminalApp {
         let mut broker = broker::BrokerState::load(provider.eq_ignore_ascii_case("sample"));
         broker.questrade = questrade;
         let (demo, demo_note) = demo::DemoState::load(demo::demo_path());
+        let price_alerts = crate::price_alerts::State::load(
+            data_dir().join("price-alerts.json"),
+            provider.eq_ignore_ascii_case("sample"),
+        );
         let mut app = Self {
             broker,
             trading: Default::default(),
@@ -646,6 +651,7 @@ impl TerminalApp {
             politicians: Vec::new(),
             pol_search: String::new(),
             alerts: Vec::new(),
+            price_alerts,
             congress_status: String::new(),
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
@@ -700,6 +706,15 @@ impl TerminalApp {
         app.worker.send(Request::Alerts);
         if let Some(note) = demo_note {
             app.trade_toast(note, false);
+        }
+        if let Some(error) = &app.price_alerts.load_error {
+            app.toasts.push((
+                format!(
+                    "{}Could not load price alerts: {error}. Open Alerts for recovery instructions.",
+                    crate::price_alerts::TOAST_PREFIX
+                ),
+                Instant::now(),
+            ));
         }
         app
     }
@@ -1032,6 +1047,19 @@ impl TerminalApp {
                 Response::Markers { pane, symbol, trades } => {
                     if let Some(c) = self.chart_mut(pane) {
                         c.on_markers(&symbol, trades);
+                    }
+                }
+                Response::PriceAlertQuotes { revision, observations } => {
+                    for event in self.price_alerts.on_quotes(revision, observations) {
+                        let note = if self.price_alerts.save_error.is_some() { " · not saved" } else { "" };
+                        self.toasts.push((
+                            format!(
+                                "{}{}{note}",
+                                crate::price_alerts::TOAST_PREFIX,
+                                crate::price_alerts::event_message(&event)
+                            ),
+                            Instant::now(),
+                        ));
                     }
                 }
                 Response::Quotes(q) => {
@@ -1397,6 +1425,7 @@ impl TerminalApp {
     }
 
     fn periodic(&mut self) {
+        self.price_alerts.periodic(&self.worker);
         let visible = self.visible_panes();
         let shown = |f: &dyn Fn(&PaneKind) -> bool| visible.iter().any(|&i| f(&self.panes[i].kind));
         let visible_wl = self.sidebar_open || shown(&|k| matches!(k, PaneKind::Watchlist));
@@ -1606,6 +1635,10 @@ impl eframe::App for TerminalApp {
         actions.extend(self.render_windows(&ctx));
         self.run_actions(actions);
         self.trading_windows(&ctx);
+        self.price_alerts.editor(&ctx);
+        if let Some(notice) = self.price_alerts.notice.take() {
+            self.toasts.push((format!("{}{notice}", crate::price_alerts::TOAST_PREFIX), Instant::now()));
+        }
         self.toasts(&ctx);
 
         // TR_SMOKE_SECS=N: render for N seconds, log frame stats and quit (CI smoke test).
@@ -1640,6 +1673,7 @@ impl eframe::App for TerminalApp {
 
     fn on_exit(&mut self) {
         self.autosave();
+        self.price_alerts.save();
         if self.demo.save_error.is_some() {
             self.demo.save();
         }

@@ -19,6 +19,7 @@ mod layouts;
 mod markets_view;
 mod palette;
 mod prefs;
+mod price_alerts;
 mod theme;
 mod themes;
 mod widgets;

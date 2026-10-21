@@ -144,7 +144,7 @@ impl TerminalApp {
             .on_hover_text(format!("{} UTC", chrono::Utc::now().format("%H:%M:%S")));
         right -= cw + 10.0;
 
-        let unread = self.alerts.iter().filter(|a| !a.seen).count();
+        let unread = self.alerts.iter().filter(|a| !a.seen).count() + self.price_alerts.unread();
         let buttons: [(Icon, &str, bool); 3] = [
             (Icon::Gauge, "Frame Timing (F12)", self.show_perf),
             (Icon::Bell, "Alerts (F4)", unread > 0),
@@ -685,7 +685,7 @@ impl TerminalApp {
             }
 
             section(ui, "Congress");
-            let unread = self.alerts.iter().filter(|a| !a.seen).count();
+            let unread = self.alerts.iter().filter(|a| !a.seen).count() + self.price_alerts.unread();
             if nav_row(
                 ui,
                 Icon::List,
@@ -899,15 +899,17 @@ impl TerminalApp {
             let mut p = layer.clone();
             p.multiply_opacity(1.0 - leave);
             widgets::card_on(&p, r, 0.0);
-            // Order entry prefixes its toasts (`+` filled/ok, `!` rejected); everything else
-            // is a Congress alert.
+            // Price alerts and order entry have distinct titles from Congress filings.
             let (title, msg, color) = match msg.strip_prefix(super::trading::TOAST_PREFIX) {
                 Some(rest) => match rest.split_at_checked(1) {
                     Some(("+", m)) => ("Trading", m, theme::up()),
                     Some(("!", m)) => ("Trading · not done", m, theme::down()),
                     _ => ("Trading", rest, amber()),
                 },
-                None => ("Congress Alert", msg.as_str(), amber()),
+                None => match msg.strip_prefix(crate::price_alerts::TOAST_PREFIX) {
+                    Some(m) => ("Price Alert", m, amber()),
+                    None => ("Congress Alert", msg.as_str(), amber()),
+                },
             };
             p.rect_filled(Rect::from_min_size(r.min + vec2(1.0, 6.0), vec2(3.0, r.height() - 12.0)), 1.5, color);
             widgets::draw_icon(
@@ -917,7 +919,13 @@ impl TerminalApp {
                 color,
             );
             p.text(pos2(r.left() + 42.0, r.top() + 15.0), Align2::LEFT_CENTER, title, ui_font(12.5), text());
-            p.text(pos2(r.left() + 42.0, r.top() + 33.0), Align2::LEFT_CENTER, msg, ui_font(11.5), muted());
+            p.with_clip_rect(r.shrink2(vec2(8., 0.))).text(
+                pos2(r.left() + 42.0, r.top() + 33.0),
+                Align2::LEFT_CENTER,
+                msg,
+                ui_font(11.5),
+                muted(),
+            );
         }
     }
 }

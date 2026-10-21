@@ -1,0 +1,306 @@
+//! One-shot sampled price crossings. Runtime baselines are deliberately not persisted:
+//! reopening, editing or rearming an alert starts with a fresh observation.
+
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
+pub const MAX_ALERTS: usize = 200;
+pub const MAX_EVENTS: usize = 500;
+pub const MAX_SYMBOLS: usize = 32;
+/// Allow delayed feeds, but never silently treat yesterday's close as a live price.
+pub const MAX_QUOTE_AGE: i64 = 20 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    Above,
+    Below,
+}
+
+impl Direction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Above => "Crosses above",
+            Self::Below => "Crosses below",
+        }
+    }
+    fn crosses(self, before: f64, after: f64, level: f64) -> bool {
+        match self {
+            Self::Above => before < level && after >= level,
+            Self::Below => before > level && after <= level,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Status {
+    Armed,
+    Disabled,
+    Triggered,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Alert {
+    pub id: u64,
+    pub symbol: String,
+    pub level: f64,
+    pub direction: Direction,
+    pub status: Status,
+    /// Sample alerts can only be evaluated against explicitly simulated data.
+    pub simulated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Event {
+    pub alert: Alert,
+    pub price: f64,
+    pub quote_ts: i64,
+    pub observed_at: i64,
+    pub source: String,
+    pub seen: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Observation {
+    pub symbol: String,
+    pub price: f64,
+    pub ts: i64,
+    pub simulated: bool,
+    pub source: String,
+}
+
+impl Observation {
+    pub fn valid_at(&self, now: i64) -> bool {
+        self.price.is_finite() && self.ts > 0 && self.ts <= now + 30 && now.saturating_sub(self.ts) <= MAX_QUOTE_AGE
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Book {
+    pub version: u32,
+    pub alerts: Vec<Alert>,
+    pub events: Vec<Event>,
+    next_id: u64,
+    #[serde(skip)]
+    previous: HashMap<u64, Observation>,
+}
+
+impl Default for Book {
+    fn default() -> Self {
+        Self { version: 1, alerts: vec![], events: vec![], next_id: 1, previous: HashMap::new() }
+    }
+}
+
+impl Book {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 || self.next_id == 0 || self.alerts.len() > MAX_ALERTS || self.events.len() > MAX_EVENTS {
+            return Err("Unsupported or oversized price-alert file".into());
+        }
+        let mut ids = HashSet::new();
+        for a in &self.alerts {
+            validate_alert(&a.symbol, a.level)?;
+            if a.id == 0 || a.id >= self.next_id || !ids.insert(a.id) {
+                return Err("Invalid or duplicate price-alert ID".into());
+            }
+        }
+        if self.alerts.iter().map(|a| &a.symbol).collect::<HashSet<_>>().len() > MAX_SYMBOLS {
+            return Err(format!("At most {MAX_SYMBOLS} distinct price-alert symbols"));
+        }
+        for e in &self.events {
+            validate_alert(&e.alert.symbol, e.alert.level)?;
+            if !e.price.is_finite() || e.quote_ts <= 0 || e.observed_at <= 0 || e.source.len() > 500 {
+                return Err("Invalid price-alert history".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn add(&mut self, symbol: String, level: f64, direction: Direction, simulated: bool) -> Result<u64, String> {
+        validate_alert(&symbol, level)?;
+        if self.alerts.len() >= MAX_ALERTS {
+            return Err(format!("At most {MAX_ALERTS} price alerts; delete an old alert first"));
+        }
+        if !self.alerts.iter().any(|a| a.symbol == symbol)
+            && self.alerts.iter().map(|a| &a.symbol).collect::<HashSet<_>>().len() >= MAX_SYMBOLS
+        {
+            return Err(format!("At most {MAX_SYMBOLS} distinct price-alert symbols"));
+        }
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).ok_or("No free alert IDs")?;
+        self.alerts.push(Alert { id, symbol, level, direction, status: Status::Armed, simulated });
+        Ok(id)
+    }
+
+    /// Saving an edited alert rearms it with a fresh baseline, as does enabling it.
+    pub fn edit(&mut self, id: u64, level: f64, direction: Direction) -> Result<(), String> {
+        let a = self.alerts.iter_mut().find(|a| a.id == id).ok_or("Alert no longer exists")?;
+        validate_alert(&a.symbol, level)?;
+        a.level = level;
+        a.direction = direction;
+        a.status = Status::Armed;
+        self.previous.remove(&id);
+        Ok(())
+    }
+
+    pub fn toggle(&mut self, id: u64) {
+        if let Some(a) = self.alerts.iter_mut().find(|a| a.id == id) {
+            a.status = if a.status == Status::Armed { Status::Disabled } else { Status::Armed };
+            self.previous.remove(&id);
+        }
+    }
+
+    pub fn delete(&mut self, id: u64) {
+        self.alerts.retain(|a| a.id != id);
+        self.previous.remove(&id);
+    }
+
+    pub fn reset_symbol(&mut self, symbol: &str) {
+        self.previous.retain(|_, q| q.symbol != symbol);
+    }
+
+    pub fn observe(&mut self, q: Observation, now: i64) -> Vec<Event> {
+        if !q.valid_at(now) {
+            self.reset_symbol(&q.symbol);
+            return vec![];
+        }
+        let mut fired = Vec::new();
+        for a in self.alerts.iter_mut().filter(|a| a.symbol == q.symbol && a.status == Status::Armed) {
+            if a.simulated != q.simulated {
+                self.previous.remove(&a.id);
+                continue;
+            }
+            if let Some(prev) = self.previous.get(&a.id) {
+                // Ignore out-of-order data. Source switches and gaps seed again.
+                if q.ts < prev.ts {
+                    continue;
+                }
+                if prev.source == q.source && q.ts - prev.ts <= 120 && a.direction.crosses(prev.price, q.price, a.level)
+                {
+                    a.status = Status::Triggered;
+                    fired.push(Event {
+                        alert: a.clone(),
+                        price: q.price,
+                        quote_ts: q.ts,
+                        observed_at: now,
+                        source: q.source.clone(),
+                        seen: false,
+                    });
+                }
+            }
+            self.previous.insert(a.id, q.clone());
+        }
+        self.events.extend(fired.iter().cloned());
+        if self.events.len() > MAX_EVENTS {
+            self.events.drain(..self.events.len() - MAX_EVENTS);
+        }
+        fired
+    }
+}
+
+fn validate_alert(symbol: &str, level: f64) -> Result<(), String> {
+    let tokens: Vec<_> = symbol.split_whitespace().collect();
+    if !crate::Security::resolve_tokens(&tokens).is_some_and(|(s, n)| n == tokens.len() && s.key() == symbol) {
+        return Err("Choose a valid market symbol".into());
+    }
+    if !level.is_finite() || level.abs() > 1e15 {
+        return Err("Enter a finite price between -1e15 and 1e15".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn quote(price: f64, ts: i64) -> Observation {
+        Observation { symbol: "AAPL US Equity".into(), price, ts, simulated: false, source: "test".into() }
+    }
+    fn book(direction: Direction) -> Book {
+        let mut b = Book::default();
+        b.add("AAPL US Equity".into(), 100., direction, false).unwrap();
+        b
+    }
+    #[test]
+    fn crossings_fire_once_including_touch_and_gap_and_can_be_rearmed() {
+        for (direction, before, after) in [(Direction::Above, 99., 100.), (Direction::Below, 101., 98.)] {
+            let mut b = book(direction);
+            assert!(b.observe(quote(before, 1000), 1000).is_empty());
+            assert_eq!(b.observe(quote(after, 1001), 1001).len(), 1);
+            assert!(b.observe(quote(after, 1002), 1002).is_empty());
+            assert_eq!(b.events.len(), 1);
+            b.toggle(1);
+            assert!(b.observe(quote(after, 1003), 1003).is_empty());
+            b.observe(quote(before, 1004), 1004);
+            assert_eq!(b.observe(quote(after, 1005), 1005).len(), 1);
+        }
+    }
+    #[test]
+    fn initially_beyond_level_equality_and_opposite_moves_do_not_fire() {
+        let mut b = book(Direction::Above);
+        for (n, price) in [101., 100., 101., 102., 99.].into_iter().enumerate() {
+            assert!(b.observe(quote(price, 1000 + n as i64), 1005).is_empty());
+        }
+        assert_eq!(b.observe(quote(101., 1006), 1006).len(), 1);
+    }
+    #[test]
+    fn rejects_stale_future_invalid_out_of_order_wrong_source_and_simulated_quotes() {
+        let mut b = book(Direction::Above);
+        b.observe(quote(99., 1000), 1000);
+        assert!(b.observe(quote(101., 999), 1000).is_empty());
+        let mut q = quote(101., 1001);
+        q.simulated = true;
+        assert!(b.observe(q, 1001).is_empty());
+        assert!(b.observe(quote(101., 1002), 1002).is_empty());
+        b.observe(quote(99., 1003), 1003);
+        let mut q = quote(101., 1004);
+        q.source = "new source".into();
+        assert!(b.observe(q, 1004).is_empty());
+        for q in [quote(101., 1), quote(101., 9999), quote(f64::NAN, 1005)] {
+            assert!(b.observe(q, 2000).is_empty());
+        }
+        assert!(b.observe(quote(101., 2000), 2000).is_empty());
+    }
+    #[test]
+    fn edit_disable_delete_and_restart_do_not_reuse_baselines() {
+        let mut b = book(Direction::Above);
+        b.observe(quote(99., 1000), 1000);
+        b.edit(1, 100., Direction::Above).unwrap();
+        assert!(b.observe(quote(101., 1001), 1001).is_empty());
+        b.toggle(1);
+        b.observe(quote(99., 1002), 1002);
+        assert!(b.observe(quote(101., 1003), 1003).is_empty());
+        b.toggle(1);
+        b.observe(quote(99., 1004), 1004);
+        let mut restored: Book = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        restored.validate().unwrap();
+        assert!(restored.observe(quote(101., 1005), 1005).is_empty());
+        restored.delete(1);
+        assert!(restored.observe(quote(99., 1006), 1006).is_empty());
+        assert!(restored.alerts.is_empty());
+    }
+    #[test]
+    fn long_gaps_seed_and_same_bar_updates_can_cross() {
+        let mut b = book(Direction::Above);
+        b.observe(quote(99., 1000), 1000);
+        assert!(b.observe(quote(101., 1300), 1300).is_empty());
+        b.observe(quote(99., 1300), 1301);
+        assert_eq!(b.observe(quote(101., 1300), 1302).len(), 1);
+    }
+    #[test]
+    fn validates_configuration_and_limits_history() {
+        let mut b = book(Direction::Above);
+        assert!(b.add("AAPL".into(), 1., Direction::Above, false).is_err());
+        assert!(b.edit(1, f64::INFINITY, Direction::Above).is_err());
+        for n in 0..MAX_EVENTS + 5 {
+            b.toggle(1);
+            // toggle back if currently disabled
+            if b.alerts[0].status != Status::Armed {
+                b.toggle(1);
+            }
+            let ts = 1000 + n as i64 * 2;
+            b.observe(quote(99., ts), ts);
+            b.observe(quote(101., ts + 1), ts + 1);
+        }
+        assert_eq!(b.events.len(), MAX_EVENTS);
+        b.validate().unwrap();
+    }
+}

@@ -146,6 +146,10 @@ pub enum Request {
         symbol: String,
     },
     Quotes(Vec<String>),
+    PriceAlertQuotes {
+        revision: u64,
+        symbols: Vec<String>,
+    },
     Latest {
         limit: usize,
     },
@@ -350,6 +354,10 @@ pub enum Response {
     Politicians(Vec<PoliticianSummary>),
     Alerts(Vec<Alert>),
     NewAlerts(Vec<NewTradeAlert>),
+    PriceAlertQuotes {
+        revision: u64,
+        observations: Vec<(String, Result<tr_core::price_alerts::Observation, String>)>,
+    },
     Status(String),
     CongressRefreshed(String),
     Curves(Box<YieldCurves>),
@@ -846,6 +854,25 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 Vec::new()
             };
             s.send(Response::Markers { pane, symbol, trades });
+        }
+        Request::PriceAlertQuotes { revision, symbols } => {
+            use futures::{StreamExt, stream};
+            let observations =
+                stream::iter(symbols)
+                    .map(|symbol| async move {
+                        let result =
+                            match tokio::time::timeout(Duration::from_secs(20), s.provider.alert_observation(&symbol))
+                                .await
+                            {
+                                Ok(result) => result.map_err(|e| format!("{e:#}")),
+                                Err(_) => Err("Price request timed out; will retry".into()),
+                            };
+                        (symbol, result)
+                    })
+                    .buffer_unordered(4)
+                    .collect()
+                    .await;
+            s.send(Response::PriceAlertQuotes { revision, observations });
         }
         Request::Quotes(symbols) => match s.provider.quotes(&symbols).await {
             Ok(q) => s.send(Response::Quotes(q)),
@@ -1407,6 +1434,36 @@ mod tests {
         ));
         assert_eq!(rows.iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), vec!["AAPL", "MSFT"]);
         assert!(rows.iter().all(|r| r.simulated && r.ts.is_some() && r.evaluation.is_some() && r.error.is_none()));
+    }
+
+    #[test]
+    fn alert_worker_preserves_symbol_revision_and_sample_provenance_without_chart_panes() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let (out, rx) = mpsc::channel();
+        let s = Arc::new(Shared {
+            provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 20)),
+            series: Default::default(),
+            cache: std::sync::Mutex::new(None),
+            scan_store: std::sync::Mutex::new(None),
+            db: Mutex::new(Db::open_in_memory().unwrap()),
+            out,
+            ctx: egui::Context::default(),
+        });
+        rt.block_on(handle(
+            &s,
+            Request::PriceAlertQuotes { revision: 42, symbols: vec!["AAPL US Equity".into(), "BTCUSD Curncy".into()] },
+        ));
+        let Response::PriceAlertQuotes { revision, observations } = rx.recv().unwrap() else {
+            panic!("Expected alert observations");
+        };
+        assert_eq!(revision, 42);
+        assert_eq!(observations.len(), 2);
+        for (symbol, result) in observations {
+            let q = result.unwrap();
+            assert_eq!(q.symbol, symbol);
+            assert!(q.simulated && q.price.is_finite());
+        }
+        assert!(s.series.try_lock().unwrap().is_empty());
     }
 
     #[test]

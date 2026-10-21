@@ -138,6 +138,9 @@ pub struct ChartState {
     indicator_revision: u64,
     /// App-level actions requested from this chart (context menu), drained by the app.
     pub actions: Vec<Action>,
+    pub price_alerts: Vec<tr_core::price_alerts::Alert>,
+    pub price_alert_actions: Vec<crate::price_alerts::Action>,
+    context_price: Option<f64>,
     /// False while a pane is being dragged over the workspace: no crosshair or hover cards.
     pub hover_enabled: bool,
     /// The workspace drew this chart's controls in the pane's tab strip, so skip the
@@ -212,6 +215,9 @@ impl ChartState {
             last_indicator_req: None,
             indicator_revision: 0,
             actions: Vec::new(),
+            price_alerts: Vec::new(),
+            price_alert_actions: Vec::new(),
+            context_price: None,
             hover_enabled: true,
             controls_in_strip: false,
             indicator_editor: false,
@@ -1042,9 +1048,6 @@ impl ChartState {
             clicked = true;
         }
         let hover = plot_resp.hover_pos().filter(|p| self.hover_enabled && !over_legend && plot_all.contains(*p));
-        if self.draw.tool.is_none() && !over_legend {
-            plot_resp.context_menu(|ui| self.context_menu(ui, w));
-        }
 
         if plot_resp.hovered() && !over_legend || axis_resp.hovered() || time_resp.hovered() {
             let (scroll, zoom_delta) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
@@ -1174,6 +1177,20 @@ impl ChartState {
         let mut out = scene::price_pane(&pane);
         let mut scale = out.scale;
         scale.height_px = price_rect.height() as f64;
+        if self.draw.tool.is_none() && !over_legend {
+            if plot_resp.secondary_clicked() {
+                self.context_price = plot_resp
+                    .interact_pointer_pos()
+                    .filter(|p| price_rect.contains(*p))
+                    .map(|p| {
+                        let price = scale.price_at((p.y - price_rect.top()) as f64);
+                        // Seed the editor at the same precision as the chart cursor.
+                        format!("{:.*}", self.sec.decimals(price), price).parse().unwrap_or(price)
+                    })
+                    .filter(|v| v.is_finite());
+            }
+            plot_resp.context_menu(|ui| self.context_menu(ui, w));
+        }
         if axis_resp.dragged() {
             let mut s = self.manual_scale.unwrap_or(scale);
             s.stretch((axis_resp.drag_delta().y as f64 * -0.01).exp());
@@ -1356,6 +1373,8 @@ impl ChartState {
                 );
             }
         }
+
+        self.paint_price_alerts(ui, price_rect, &scale);
 
         // ---- drawings ----
         let drawing_response = if over_legend {
@@ -1995,7 +2014,93 @@ impl ChartState {
         }
     }
 
+    fn paint_price_alerts(&self, ui: &Ui, plot: Rect, scale: &PriceScale) {
+        use tr_core::price_alerts::Status;
+        let painter = ui.painter_at(plot);
+        for alert in self.price_alerts.iter().filter(|a| a.status != Status::Triggered) {
+            if scale.log && alert.level <= 0. {
+                continue;
+            }
+            let y = plot.top() + scale.y_of(alert.level) as f32;
+            if !y.is_finite() || !plot.y_range().contains(y) {
+                continue;
+            }
+            let color = if alert.status == Status::Armed { amber() } else { muted() };
+            let mut x = plot.left();
+            while x < plot.right() {
+                painter.hline(x..=(x + 6.).min(plot.right()), y, Stroke::new(1., color.gamma_multiply(0.65)));
+                x += 11.;
+            }
+            let label = format!(
+                "Alert {} · {}",
+                scale::format_price(alert.level, self.sec.decimals(alert.level)),
+                crate::price_alerts::status(alert)
+            );
+            let galley = painter.layout_no_wrap(label, mono(10.5), color);
+            let rect = Rect::from_min_size(
+                pos2(
+                    (plot.right() - galley.size().x - 8.).max(plot.left()),
+                    (y - galley.size().y - 2.).max(plot.top()),
+                ),
+                galley.size() + vec2(6., 2.),
+            );
+            painter.rect_filled(rect, 0., theme::card());
+            painter.galley(rect.min + vec2(3., 0.), galley, color);
+        }
+    }
+
     fn context_menu(&mut self, ui: &mut Ui, w: &Worker) {
+        use crate::price_alerts::Action as AlertAction;
+        if ui.add_enabled(self.context_price.is_some(), egui::Button::new("Create price alert here…")).clicked() {
+            if let Some(level) = self.context_price {
+                let direction = if self.bars.last().is_some_and(|bar| level < bar.close) {
+                    tr_core::price_alerts::Direction::Below
+                } else {
+                    tr_core::price_alerts::Direction::Above
+                };
+                self.price_alert_actions.push(AlertAction::Create { symbol: self.symbol.clone(), level, direction });
+            }
+            ui.close();
+        }
+        ui.menu_button("Price alerts", |ui| {
+            if ui.button("Manage all alerts…").clicked() {
+                self.price_alert_actions.push(AlertAction::Manage);
+                ui.close();
+            }
+            for alert in &self.price_alerts {
+                ui.separator();
+                ui.label(format!(
+                    "{} {} · {}",
+                    alert.direction.label(),
+                    alert.level,
+                    crate::price_alerts::status(alert)
+                ));
+                ui.push_id(alert.id, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Edit…").clicked() {
+                            self.price_alert_actions.push(AlertAction::Edit(alert.id));
+                            ui.close();
+                        }
+                        if ui
+                            .button(if alert.status == tr_core::price_alerts::Status::Armed {
+                                "Disable"
+                            } else {
+                                "Rearm"
+                            })
+                            .clicked()
+                        {
+                            self.price_alert_actions.push(AlertAction::Toggle(alert.id));
+                            ui.close();
+                        }
+                        if ui.button("Delete").clicked() {
+                            self.price_alert_actions.push(AlertAction::Delete(alert.id));
+                            ui.close();
+                        }
+                    });
+                });
+            }
+        });
+        ui.separator();
         ui.set_min_width(190.0);
         ui.menu_button("Time zone, session & refresh", |ui| {
             let before = self.data;
@@ -2741,6 +2846,47 @@ mod tests {
         chart_frame(&ctx, &mut chart, vec![pointer_button(edit, false)]);
         assert!(chart.indicator_editor);
         assert_eq!(chart.indicator_focus, Some(2));
+    }
+
+    #[test]
+    fn chart_price_context_creates_an_alert_with_the_clicked_level_and_direction() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart.manual_scale = Some(PriceScale::new(50., 250., false, 400.));
+        chart_frame(&ctx, &mut chart, vec![]);
+        let at = pos2(700., 300.);
+        chart_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(at)]);
+        for pressed in [true, false] {
+            chart_frame(
+                &ctx,
+                &mut chart,
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        let texts = chart_frame(&ctx, &mut chart, vec![]);
+        let level = chart.context_price.expect("Price under the context click");
+        assert!(level > 50. && level < 250.);
+        let create = texts.iter().find(|(s, _)| s == "Create price alert here…").unwrap().1.center();
+        click_chart(&ctx, &mut chart, create);
+        assert_eq!(chart.price_alert_actions.len(), 1);
+        let crate::price_alerts::Action::Create { symbol, level: saved, direction } = &chart.price_alert_actions[0]
+        else {
+            panic!("Expected new alert");
+        };
+        assert_eq!(symbol, &chart.symbol);
+        assert_eq!(*saved, level);
+        let expected = if level < chart.bars.last().unwrap().close {
+            tr_core::price_alerts::Direction::Below
+        } else {
+            tr_core::price_alerts::Direction::Above
+        };
+        assert_eq!(*direction, expected);
+        assert!(chart.drawings.is_empty());
     }
 
     #[test]

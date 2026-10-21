@@ -252,6 +252,20 @@ pub trait MarketData: Send + Sync {
         Ok(out)
     }
 
+    /// Alert observations must preserve provenance and never substitute demo data.
+    /// Use the current minute's close, not the daily sparkline's bar-open timestamp.
+    async fn alert_observation(&self, symbol: &str) -> Result<tr_core::price_alerts::Observation> {
+        let history = self.scan_history(symbol, Timeframe::M1, 2).await?;
+        let bar = history.bars.last().ok_or_else(|| anyhow::anyhow!("No price observations available"))?;
+        Ok(tr_core::price_alerts::Observation {
+            symbol: symbol.into(),
+            price: bar.close,
+            ts: bar.ts,
+            simulated: history.simulated,
+            source: self.scan_cache_key(symbol),
+        })
+    }
+
     /// Stream live updates of the current bar, if the source supports it.
     fn live(&self, _symbol: &str, _tf: Timeframe) -> Option<LiveFeed> {
         None
@@ -322,6 +336,9 @@ impl<P: MarketData> Fallback<P> {
 
 #[async_trait]
 impl<P: MarketData> MarketData for Fallback<P> {
+    async fn alert_observation(&self, symbol: &str) -> Result<tr_core::price_alerts::Observation> {
+        self.primary.alert_observation(symbol).await
+    }
     fn scan_cache_key(&self, symbol: &str) -> String {
         self.primary.scan_cache_key(symbol)
     }
@@ -506,6 +523,7 @@ mod tests {
         let p = Fallback::new(Broken);
         assert!(p.history("AAPL", Timeframe::D1, None, 10).await.is_err());
         assert!(p.scan_history("AAPL", Timeframe::D1, 10).await.unwrap_err().to_string().contains("offline"));
+        assert!(p.alert_observation("AAPL US Equity").await.unwrap_err().to_string().contains("offline"));
     }
 
     #[tokio::test]
@@ -514,6 +532,10 @@ mod tests {
         let history = p.scan_history("AAPL", Timeframe::D1, 10).await.unwrap();
         assert!(history.simulated);
         assert_eq!(history.bars.len(), 10);
+        let q = p.alert_observation("AAPL US Equity").await.unwrap();
+        assert!(q.simulated);
+        assert_eq!(q.source, "sample");
+        assert_eq!(q.symbol, "AAPL US Equity");
     }
 
     #[tokio::test]

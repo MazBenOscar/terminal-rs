@@ -143,6 +143,32 @@ impl MarketData for Markets {
         }
     }
 
+    async fn alert_observation(&self, symbol: &str) -> Result<tr_core::price_alerts::Observation> {
+        let sec = security(symbol);
+        // Keep the chosen stock source stable; scanner history may fall back from
+        // Alpaca to Yahoo, which would obscure provenance for a crossing baseline.
+        let (history, source) = match (sec.class, self.questrade(), self.alpaca.as_ref()) {
+            (AssetClass::Equity | AssetClass::Etf, Some(q), _) => {
+                (q.scan_history(&sec.ticker, Timeframe::M1, 2).await?, "questrade".to_string())
+            }
+            (AssetClass::Equity | AssetClass::Etf, None, Some(a)) => {
+                (a.scan_history(&sec.ticker, Timeframe::M1, 2).await?, "alpaca".to_string())
+            }
+            (AssetClass::Equity | AssetClass::Etf, None, None) => {
+                (self.yahoo.scan_history(&yahoo_symbol(&sec), Timeframe::M1, 2).await?, "yahoo".to_string())
+            }
+            _ => (self.scan_history(symbol, Timeframe::M1, 2).await?, self.scan_cache_key(symbol)),
+        };
+        let bar = history.bars.last().ok_or_else(|| anyhow!("No price observations available"))?;
+        Ok(tr_core::price_alerts::Observation {
+            symbol: symbol.into(),
+            price: bar.close,
+            ts: bar.ts,
+            simulated: history.simulated,
+            source,
+        })
+    }
+
     async fn quotes(&self, symbols: &[String]) -> Result<Vec<Quote>> {
         let (mut crypto, mut govt, mut other) = (Vec::new(), Vec::new(), Vec::new());
         for key in symbols {
