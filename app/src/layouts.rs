@@ -200,6 +200,12 @@ pub struct WindowGeometry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayoutDoc {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchlists: Option<Vec<crate::app::NamedWatchlist>>,
+    #[serde(default)]
+    pub active_watchlist: usize,
+    #[serde(default, skip_serializing)]
+    pub watchlist: Option<Vec<String>>,
     #[serde(default)]
     pub watch_columns: tr_core::columns::ColumnSet,
     #[serde(default = "version")]
@@ -225,6 +231,15 @@ impl LayoutDoc {
     /// Make a loaded document self-consistent: unique pane ids, a dock that references
     /// only known docked panes, every docked pane placed, and at least one pane.
     pub fn repair(&mut self) {
+        if self.watchlists.is_none() {
+            self.watchlists =
+                self.watchlist.take().map(|symbols| vec![crate::app::NamedWatchlist { name: "Main".into(), symbols }]);
+        }
+        if let Some(lists) = self.watchlists.take() {
+            let lists = crate::app::sanitize_watchlists(lists);
+            self.active_watchlist = self.active_watchlist.min(lists.len() - 1);
+            self.watchlists = Some(lists);
+        }
         let mut seen = HashSet::new();
         self.panes.retain(|p| seen.insert(p.id));
         let docked: HashSet<PaneId> = self.panes.iter().filter(|p| p.window.is_none()).map(|p| p.id).collect();
@@ -285,6 +300,9 @@ impl LayoutDoc {
             .collect();
         let ids: Vec<PaneId> = panes.iter().map(|p| p.id).collect();
         LayoutDoc {
+            watchlists: None,
+            active_watchlist: 0,
+            watchlist: None,
             watch_columns: Default::default(),
             version: FORMAT_VERSION,
             name: name.into(),

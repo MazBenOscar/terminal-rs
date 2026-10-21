@@ -111,6 +111,7 @@ impl ColumnsEditor {
             .constrain(true)
             .constrain_to(bounds)
             .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Columns are shared across all watchlists.").small().color(muted()));
                 self.library(ui);
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(dp(340.0)).show(ui, |ui| self.rows(ui));

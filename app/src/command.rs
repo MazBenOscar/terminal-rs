@@ -238,6 +238,11 @@ pub enum Function {
     ColumnDelete(String),
     ColumnClear,
     ColumnEdit,
+    WatchNew(String),
+    WatchUse(String),
+    WatchRename(String, String),
+    WatchDelete(String),
+    WatchLists,
     WatchAdd(Vec<String>),
     WatchRemove(Vec<String>),
     /// `LAYOUT 1|2|2H|3|4|6` preset, `LAYOUT <name>` switch, or a layout subcommand
@@ -383,7 +388,18 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         }
         "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => match words().first().map(String::as_str) {
             Some("ADD") => Function::WatchAdd(words()[1..].to_vec()),
-            Some("DEL") | Some("RM") | Some("REMOVE") => Function::WatchRemove(words()[1..].to_vec()),
+            Some("NEW") => Function::WatchNew(rest[1..].join(" ")),
+            Some("USE") => Function::WatchUse(rest[1..].join(" ")),
+            Some("LISTS") => Function::WatchLists,
+            Some("DEL") => Function::WatchDelete(rest[1..].join(" ")),
+            Some("RENAME") => {
+                let to = rest.iter().position(|s| s.eq_ignore_ascii_case("TO"))?;
+                if to <= 1 || to + 1 >= rest.len() {
+                    return None;
+                }
+                Function::WatchRename(rest[1..to].join(" "), rest[to + 1..].join(" "))
+            }
+            Some("RM") | Some("REMOVE") => Function::WatchRemove(words()[1..].to_vec()),
             _ => Function::Watchlist,
         },
         "LAYOUT" | "GRID" | "LP" => Function::Layout(joined()),
@@ -547,6 +563,11 @@ fn describe(f: &Function) -> String {
         Function::ColumnEdit => "Edit watchlist columns".into(),
         Function::Watchlist => "Watchlist".into(),
         Function::Scanner => "Scan the watchlist with saved conditions".into(),
+        Function::WatchNew(s) => format!("New watchlist {s}"),
+        Function::WatchUse(s) => format!("Use watchlist {s}"),
+        Function::WatchRename(a, b) => format!("Rename watchlist {a} to {b}"),
+        Function::WatchDelete(s) => format!("Delete watchlist {s}"),
+        Function::WatchLists => "List watchlists".into(),
         Function::WatchAdd(s) => format!("Add {} to watchlist", s.join(", ")),
         Function::WatchRemove(s) => format!("Remove {} from watchlist", s.join(", ")),
         Function::Layout(l) if l.trim().is_empty() => "Saved layouts".into(),

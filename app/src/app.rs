@@ -378,11 +378,72 @@ impl Pane {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamedWatchlist {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub symbols: Vec<String>,
+}
+
+fn valid_watchlist_name(name: &str) -> bool {
+    (1..=40).contains(&name.chars().count()) && !name.chars().any(char::is_control)
+}
+
+fn unique_watchlist_name(name: &str, lists: &[NamedWatchlist]) -> String {
+    let mut candidate = name.to_owned();
+    let mut n = 2;
+    while lists.iter().any(|list| list.name.to_lowercase() == candidate.to_lowercase()) {
+        let suffix = format!(" ({n})");
+        candidate = format!("{}{}", name.chars().take(40 - suffix.chars().count()).collect::<String>(), suffix);
+        n += 1;
+    }
+    candidate
+}
+
+pub(crate) fn sanitize_watchlists(lists: Vec<NamedWatchlist>) -> Vec<NamedWatchlist> {
+    let mut out = Vec::new();
+    for list in lists {
+        let name = list.name.trim();
+        if list.name.chars().any(char::is_control) || !valid_watchlist_name(name) {
+            continue;
+        }
+        let name = unique_watchlist_name(name, &out);
+        let symbols = watchlist_append(
+            &[],
+            list.symbols
+                .into_iter()
+                .filter_map(|s| {
+                    if s.chars().any(char::is_control) {
+                        return None;
+                    }
+                    let tokens: Vec<_> = s.split_whitespace().collect();
+                    tr_core::Security::resolve_tokens(&tokens)
+                        .and_then(|(security, used)| (used == tokens.len()).then(|| security.key()))
+                })
+                .collect(),
+        )
+        .0;
+        out.push(NamedWatchlist { name, symbols });
+        if out.len() == 50 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push(NamedWatchlist { name: "Main".into(), symbols: Vec::new() });
+    }
+    out
+}
+
 /// App-wide state persisted in `settings.json` (layouts live in their own files).
 #[derive(Serialize, Deserialize)]
 struct Settings {
     #[serde(default)]
     watchlist: Vec<String>,
+    #[serde(default)]
+    watchlists: Vec<NamedWatchlist>,
+    #[serde(default)]
+    active_watchlist: usize,
     #[serde(default = "default_true")]
     sidebar: bool,
     /// Name of the layout to restore on launch.
@@ -393,6 +454,19 @@ struct Settings {
     layout: Option<Layout>,
     #[serde(default, skip_serializing)]
     panes: Option<Vec<serde_json::Value>>,
+}
+
+impl Settings {
+    fn sanitized_watchlists(&self) -> (Vec<NamedWatchlist>, usize) {
+        let lists = if self.watchlists.is_empty() {
+            vec![NamedWatchlist { name: "Main".into(), symbols: self.watchlist.clone() }]
+        } else {
+            self.watchlists.clone()
+        };
+        let lists = sanitize_watchlists(lists);
+        let active = self.active_watchlist.min(lists.len() - 1);
+        (lists, active)
+    }
 }
 
 fn accept_columns<T>(revision: u64, current: u64, result: T) -> Option<T> {
@@ -550,7 +624,13 @@ pub struct TerminalApp {
     /// When the last Congress ingest finished.
     congress_checked: Option<chrono::DateTime<chrono::Local>>,
 
+    /// Active-list projection for panel, scanner and worker snapshots. Updated only by
+    /// set_watchlist and switch_watchlist; persisted ownership lives in watchlists.
     watchlist: Vec<String>,
+    watchlists: Vec<NamedWatchlist>,
+    active_watchlist: usize,
+    watchlist_entry: Option<(Option<usize>, String)>,
+    watchlist_delete: bool,
     watch_columns: tr_core::columns::ColumnSet,
     columns_editor: Option<columns_view::ColumnsEditor>,
     column_cells: HashMap<String, Vec<tr_core::columns::Cell>>,
@@ -610,7 +690,7 @@ fn keys_from_words(words: &[String]) -> Vec<String> {
     out
 }
 
-/// The single watchlist is capped at 200 symbols; existing lists are never silently shortened.
+/// Each watchlist is capped at 200 symbols; appending preserves existing order.
 fn watchlist_append(current: &[String], symbols: Vec<String>) -> (Vec<String>, usize, bool) {
     let mut next = current.to_vec();
     let mut truncated = false;
@@ -752,6 +832,13 @@ impl TerminalApp {
             congress_status: String::new(),
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
+            watchlists: vec![NamedWatchlist {
+                name: "Main".into(),
+                symbols: DEFAULT_WATCHLIST.map(String::from).to_vec(),
+            }],
+            active_watchlist: 0,
+            watchlist_entry: None,
+            watchlist_delete: false,
             watch_columns: Default::default(),
             columns_editor: None,
             column_cells: HashMap::new(),
@@ -783,11 +870,8 @@ impl TerminalApp {
         };
         let mut doc = None;
         if let Some(s) = &settings {
-            if !s.watchlist.is_empty() {
-                // Older settings stored bare tickers; normalise to market keys.
-                app.watchlist = s.watchlist.iter().map(|w| tr_data::security(w).key()).collect();
-                app.watchlist.dedup();
-            }
+            (app.watchlists, app.active_watchlist) = s.sanitized_watchlists();
+            app.watchlist = app.watchlists[app.active_watchlist].symbols.clone();
             app.sidebar_open = s.sidebar;
             if let Some(name) = &s.active_layout {
                 match app.store.load(name) {
@@ -841,7 +925,9 @@ impl TerminalApp {
 
     fn save_settings(&self) {
         let s = Settings {
-            watchlist: self.watchlist.clone(),
+            watchlist: Vec::new(),
+            watchlists: self.watchlists.clone(),
+            active_watchlist: self.active_watchlist,
             sidebar: self.sidebar_open,
             active_layout: Some(self.layout_name.clone()),
             layout: None,
@@ -860,11 +946,84 @@ impl TerminalApp {
         }
     }
 
+    fn switch_watchlist(&mut self, index: usize) {
+        if index >= self.watchlists.len() {
+            return;
+        }
+        if let Some((at, _, _)) = self.watchlist_undo.take() {
+            self.toasts.retain(|(_, time)| *time != at);
+        }
+        self.active_watchlist = index;
+        self.watchlist = self.watchlists[index].symbols.clone();
+        self.watchlist_delete = false;
+        self.last_quotes = None;
+        // Even equal-symbol lists are a new selection: discard cells and invalidate
+        // replies from the previous selection before requesting fresh columns.
+        self.columns_revision = self.columns_revision.wrapping_add(1);
+        self.column_cells.clear();
+        self.columns_computed_at = 0;
+        self.columns_requested = None;
+        for pane in &mut self.panes {
+            if let PaneKind::Scanner(scanner) = &mut pane.kind {
+                scanner.watchlist_changed();
+            }
+        }
+        self.refresh_columns();
+    }
+
+    fn create_watchlist(&mut self, name: String, symbols: Vec<String>) -> Result<(), String> {
+        let name = name.trim().to_owned();
+        self.check_watchlist_name(&name, None)?;
+        if self.watchlists.len() >= 50 {
+            return Err("At most 50 watchlists are allowed".into());
+        }
+        self.watchlists.push(NamedWatchlist { name, symbols: watchlist_append(&[], symbols).0 });
+        self.switch_watchlist(self.watchlists.len() - 1);
+        Ok(())
+    }
+
+    fn check_watchlist_name(&self, name: &str, except: Option<usize>) -> Result<(), String> {
+        if !valid_watchlist_name(name) {
+            return Err("Names must contain 1–40 characters and no control characters".into());
+        }
+        if self
+            .watchlists
+            .iter()
+            .enumerate()
+            .any(|(i, l)| Some(i) != except && l.name.to_lowercase() == name.to_lowercase())
+        {
+            return Err("A watchlist with that name already exists".into());
+        }
+        Ok(())
+    }
+
+    fn rename_watchlist(&mut self, index: usize, name: String) -> Result<(), String> {
+        let name = name.trim().to_owned();
+        self.check_watchlist_name(&name, Some(index))?;
+        self.watchlists[index].name = name;
+        Ok(())
+    }
+
+    fn delete_watchlist(&mut self, index: usize) -> Result<(), String> {
+        if self.watchlists.len() == 1 {
+            return Err("Cannot delete the last watchlist".into());
+        }
+        self.watchlists.remove(index);
+        let active = if index < self.active_watchlist {
+            self.active_watchlist - 1
+        } else {
+            self.active_watchlist.min(self.watchlists.len() - 1)
+        };
+        self.switch_watchlist(active);
+        Ok(())
+    }
+
     fn set_watchlist(&mut self, symbols: Vec<String>) {
         if self.watchlist != symbols {
             if let Some((at, _, _)) = self.watchlist_undo.take() {
                 self.toasts.retain(|(_, time)| *time != at);
             }
+            self.watchlists[self.active_watchlist].symbols = symbols.clone();
             self.watchlist = symbols;
             self.last_quotes = None;
             self.refresh_columns();
@@ -905,6 +1064,10 @@ impl TerminalApp {
                 }
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
                 Action::AddToWatchlist(s) => self.add_watchlist_symbols(vec![s]),
+                Action::SaveMatchesAsWatchlist(name, symbols) => {
+                    let result = self.create_watchlist(name, symbols);
+                    self.status = result.err().unwrap_or_else(|| "Matches saved as new watchlist".into());
+                }
                 Action::AddMatchesToWatchlist(symbols) => self.add_watchlist_symbols(symbols),
                 Action::ReplaceWatchlistWithMatches(symbols) => {
                     if let Some((at, _, _)) = self.watchlist_undo.take() {
@@ -1059,6 +1222,28 @@ impl TerminalApp {
                 self.watch_columns.columns.clear();
                 self.watch_sort = None;
                 self.refresh_columns();
+            }
+            Function::WatchNew(name) => {
+                let result = self.create_watchlist(name, Vec::new());
+                self.status = result.err().unwrap_or_else(|| "Watchlist created".into());
+            }
+            Function::WatchLists => {
+                self.status = self.watchlists.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", ")
+            }
+            Function::WatchUse(ref name) | Function::WatchDelete(ref name) | Function::WatchRename(ref name, _) => {
+                if let Some(index) = self.watchlists.iter().position(|l| l.name.to_lowercase() == name.to_lowercase()) {
+                    let result = match f {
+                        Function::WatchDelete(_) => self.delete_watchlist(index),
+                        Function::WatchRename(_, new) => self.rename_watchlist(index, new),
+                        _ => {
+                            self.switch_watchlist(index);
+                            Ok(())
+                        }
+                    };
+                    self.status = result.err().unwrap_or_else(|| "Watchlist updated".into());
+                } else {
+                    self.status = format!("Watchlist not found: {name}");
+                }
             }
             Function::WatchAdd(words) => self.add_watchlist_symbols(keys_from_words(&words)),
             Function::WatchRemove(words) => {
@@ -2066,6 +2251,10 @@ impl TerminalApp {
             congress_status: String::new(),
             congress_checked: None,
             watchlist: Vec::new(),
+            watchlists: vec![NamedWatchlist { name: "Main".into(), symbols: Vec::new() }],
+            active_watchlist: 0,
+            watchlist_entry: None,
+            watchlist_delete: false,
             watch_columns: Default::default(),
             columns_editor: None,
             column_cells: HashMap::new(),
@@ -2100,6 +2289,129 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_watchlists_legacy_migration_and_settings_round_trip() {
+        let old: Settings =
+            serde_json::from_str(r#"{"watchlist":["AAPL","NVDA","aapl"],"active_watchlist":999}"#).unwrap();
+        let (lists, active) = old.sanitized_watchlists();
+        assert_eq!(active, 0);
+        assert_eq!(lists[0].name, "Main");
+        assert_eq!(lists[0].symbols, vec![tr_data::security("AAPL").key(), tr_data::security("NVDA").key()]);
+        let mut settings = old;
+        settings.watchlists = lists.clone();
+        settings.watchlists.push(NamedWatchlist { name: "Second".into(), symbols: Vec::new() });
+        settings.active_watchlist = 1;
+        let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(restored.sanitized_watchlists(), (settings.watchlists, 1));
+    }
+
+    #[test]
+    fn named_watchlists_layout_legacy_sanitize_and_round_trip() {
+        let mut doc = LayoutDoc::default_workspace("Watchlists", &prefs::PanelDefaults::default());
+        let mut value = serde_json::to_value(&doc).unwrap();
+        value["watchlist"] = serde_json::json!(["NVDA", "AAPL", "NVDA"]);
+        let legacy = LayoutDoc::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let lists = legacy.watchlists.unwrap();
+        assert_eq!(lists[0].name, "Main");
+        assert_eq!(lists[0].symbols.len(), 2);
+        doc.watchlists = Some(vec![
+            NamedWatchlist { name: "Main".into(), symbols: vec!["AAPL".into()] },
+            NamedWatchlist { name: "MAIN".into(), symbols: vec!["NVDA".into()] },
+        ]);
+        doc.active_watchlist = 999;
+        let loaded = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(loaded.active_watchlist, 1);
+        assert_eq!(loaded.watchlists.as_ref().unwrap()[1].name, "MAIN (2)");
+        assert_eq!(LayoutDoc::from_json(&loaded.to_json()).unwrap(), loaded);
+        let root = std::env::temp_dir().join(format!("named-watchlists-layout-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        app.apply_doc(loaded);
+        assert_eq!(app.active_watchlist, 1);
+        assert_eq!(app.watchlist, vec![tr_data::security("NVDA").key()]);
+        assert_eq!(app.current_doc().watchlists, Some(app.watchlists.clone()));
+    }
+
+    #[test]
+    fn named_watchlists_sanitize_names_symbols_and_limits() {
+        let list = |name: &str| NamedWatchlist {
+            name: name.into(),
+            symbols: vec!["aapl".into(), "NVDA".into(), "AAPL".into(), "".into(), "bad!".into(), "AAPL garbage".into()],
+        };
+        let mut input =
+            vec![list(""), list("\nMain"), list(&"x".repeat(41)), list(" Main "), list("main"), list("MAIN")];
+        input.push(NamedWatchlist { name: "Full".into(), symbols: (0..205).map(|n| format!("QA{n}")).collect() });
+        let out = sanitize_watchlists(input);
+        assert_eq!(out.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["Main", "main (2)", "MAIN (3)", "Full"]);
+        assert_eq!(out[0].symbols.len(), 2);
+        assert_eq!(out[3].symbols.len(), 200);
+        let out = sanitize_watchlists((0..60).map(|_| list(&"é".repeat(40))).collect());
+        assert_eq!(out.len(), 50);
+        assert!(out.iter().all(|l| valid_watchlist_name(&l.name)));
+        assert_eq!(sanitize_watchlists(Vec::new())[0].name, "Main");
+    }
+
+    #[test]
+    fn named_watchlists_commands_switch_refresh_duplicate_delete_and_undo() {
+        let root = std::env::temp_dir().join(format!("named-watchlists-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        let run = |app: &mut TerminalApp, text: &str| {
+            let Some(command::Command::Function(f)) = command::parse(text) else {
+                panic!("Command did not parse: {text}");
+            };
+            app.apply(f);
+        };
+        run(&mut app, "WL ADD AAPL");
+        let main = app.watchlist.clone();
+        run(&mut app, "WL NEW Growth stocks");
+        assert_eq!(app.watchlists[1].name, "Growth stocks");
+        assert!(app.watchlist.is_empty());
+        run(&mut app, "WL ADD NVDA");
+        let revision = app.columns_revision;
+        app.panes.push(Pane { id: 1, kind: PaneKind::Scanner(Box::default()), link: None, title: None, window: None });
+        run(&mut app, "WL USE main");
+        assert_eq!(app.watchlist, main);
+        assert!(app.columns_revision > revision);
+        assert_eq!(app.columns_snapshot.0, main);
+        let PaneKind::Scanner(scanner) = &app.panes[0].kind else { panic!() };
+        assert_eq!(scanner.universe, tr_data::universe::Universe::Watchlist);
+        assert_eq!(scanner.generation, 1);
+        run(&mut app, "WL RENAME Growth stocks TO Technology");
+        assert_eq!(app.watchlists[1].name, "Technology");
+        assert!(app.create_watchlist("technology".into(), Vec::new()).is_err());
+        assert!(app.rename_watchlist(1, " ".into()).is_err());
+        let duplicate = unique_watchlist_name("Main", &app.watchlists);
+        app.create_watchlist(duplicate, main.clone()).unwrap();
+        assert_eq!(app.watchlists[2].name, "Main (2)");
+        app.run_actions(vec![Action::ReplaceWatchlistWithMatches(vec!["TSLA".into()])]);
+        app.switch_watchlist(0);
+        app.undo_watchlist();
+        assert_eq!(app.watchlist, main);
+        run(&mut app, "WL DEL Technology");
+        run(&mut app, "WL DEL Main (2)");
+        run(&mut app, "WL DEL Main");
+        assert_eq!(app.watchlists.len(), 1);
+        assert!(app.status.contains("last watchlist"));
+        run(&mut app, "WL LISTS");
+        assert_eq!(app.status, "Main");
+    }
+
+    #[test]
+    fn named_watchlists_save_matches_preserves_order_and_caps() {
+        let root = std::env::temp_dir().join(format!("named-watchlists-save-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        let mut matches = vec!["NVDA".into(), "AAPL".into(), "NVDA".into()];
+        matches.extend((0..205).map(|n| format!("QA{n}")));
+        app.run_actions(vec![Action::SaveMatchesAsWatchlist("Matches".into(), matches)]);
+        assert_eq!(app.active_watchlist, 1);
+        assert_eq!(app.watchlist.len(), 200);
+        assert_eq!(&app.watchlist[..2], &[tr_data::security("NVDA").key(), tr_data::security("AAPL").key()]);
+        assert!(app.watchlists[0].symbols.is_empty());
+        for i in 2..50 {
+            app.create_watchlist(format!("List {i}"), Vec::new()).unwrap();
+        }
+        assert!(app.create_watchlist("Overflow".into(), Vec::new()).is_err());
+    }
 
     #[test]
     fn watchlist_add_replace_dedupe_order_cap_and_undo() {
