@@ -37,10 +37,67 @@ impl Default for OutputStyle {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BandFill {
-    pub upper: String,
-    pub lower: String,
+    pub upper: FillEdge,
+    pub lower: FillEdge,
     pub color: [u8; 3],
     pub opacity: u8,
+}
+
+/// An absent study ID addresses an output of the declaring study.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "SavedFillEdge")]
+pub struct FillEdge {
+    pub study: Option<u32>,
+    pub output: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedFillEdge {
+    Legacy(String),
+    Edge {
+        #[serde(default)]
+        study: Option<u32>,
+        output: String,
+    },
+}
+impl From<SavedFillEdge> for FillEdge {
+    fn from(value: SavedFillEdge) -> Self {
+        match value {
+            SavedFillEdge::Legacy(output) => Self { study: None, output },
+            SavedFillEdge::Edge { study, output } => Self { study, output },
+        }
+    }
+}
+impl From<String> for FillEdge {
+    fn from(output: String) -> Self {
+        Self { study: None, output }
+    }
+}
+impl From<&str> for FillEdge {
+    fn from(output: &str) -> Self {
+        output.to_string().into()
+    }
+}
+
+/// Validate display references independently of calculation dependencies. A bad
+/// fill must never suppress either study's lines or its calculation consumers.
+pub fn validate_fill_edge(specs: &[Spec], owner: usize, edge: &FillEdge) -> Result<(), String> {
+    let Some(id) = edge.study else { return Ok(()) };
+    let target = specs.iter().position(|s| s.chart.as_ref().is_some_and(|c| c.id == id));
+    let label = target.map_or_else(|| id.to_string(), |i| specs[i].label());
+    let target = target
+        .filter(|&i| specs[i].chart.as_ref().is_some_and(|c| c.visible))
+        .ok_or_else(|| format!("Fill target {label} is not available"))?;
+    if pane_key(specs, owner)? != pane_key(specs, target)? {
+        return Err("Fill target must be on the same pane".into());
+    }
+    let owner_scale = specs[owner].chart.as_ref().map_or(Scale::Shared, |c| c.scale);
+    let target_scale = specs[target].chart.as_ref().map_or(Scale::Shared, |c| c.scale);
+    if owner_scale == Scale::Independent || target_scale == Scale::Independent || owner_scale != target_scale {
+        return Err("Fill target must share the price/pane scale (not an Independent scale)".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -116,6 +173,38 @@ fn height() -> f32 {
 }
 
 impl Settings {
+    /// Normalize display settings from untrusted saves. Unavailable external
+    /// references stay intact so the editor can explain them instead of silently
+    /// retargeting a fill to a different study.
+    pub fn sanitized(mut self) -> Self {
+        if let Some(fill) = &mut self.fill {
+            for edge in [&mut fill.upper, &mut fill.lower] {
+                if edge.study == Some(self.id) {
+                    edge.study = None;
+                }
+            }
+        }
+        self
+    }
+
+    /// Standalone presets cannot retain instance IDs. Reset external edges to
+    /// an available local port, or remove the fill if there are no local ports.
+    pub fn reset_fill_targets(&mut self, output: Option<&str>) {
+        if output.is_none()
+            && self.fill.as_ref().is_some_and(|fill| fill.upper.study.is_some() || fill.lower.study.is_some())
+        {
+            self.fill = None;
+            return;
+        }
+        if let (Some(fill), Some(output)) = (&mut self.fill, output) {
+            for edge in [&mut fill.upper, &mut fill.lower] {
+                if edge.study.is_some() {
+                    *edge = output.into();
+                }
+            }
+        }
+    }
+
     pub fn new(id: u32, spec: &Spec) -> Self {
         Self {
             id,
@@ -138,6 +227,9 @@ impl Settings {
 
 /// Give legacy and newly added specs unique IDs without renumbering existing ports.
 pub fn assign_ids(specs: &mut [Spec]) {
+    for spec in specs.iter_mut() {
+        spec.chart = spec.chart.take().map(Settings::sanitized);
+    }
     let mut reserved: std::collections::HashSet<_> =
         specs.iter().filter_map(|s| s.chart.as_ref().map(|c| c.id)).filter(|id| *id != 0).collect();
     let mut used = std::collections::HashSet::new();
@@ -362,7 +454,9 @@ pub(super) fn evaluate_native(specs: &[Spec], input: &Input<'_>) -> Vec<Result<V
                     return Err("Output stroke width must be between 0.5 and 8".into());
                 }
                 if let Some(fill) = &settings.fill
-                    && (!outputs.iter().any(|o| o.name == fill.upper) || !outputs.iter().any(|o| o.name == fill.lower))
+                    && [&fill.upper, &fill.lower]
+                        .iter()
+                        .any(|edge| edge.study.is_none() && !outputs.iter().any(|o| o.name == edge.output))
                 {
                     return Err("Band fill refers to an unavailable output".into());
                 }
@@ -382,6 +476,69 @@ pub(super) fn evaluate_native(specs: &[Spec], input: &Input<'_>) -> Vec<Result<V
 mod tests {
     use super::*;
     use crate::Timeframe;
+
+    #[test]
+    fn legacy_band_fill_loads_and_cross_study_template_round_trips() {
+        let legacy: BandFill =
+            serde_json::from_str(r#"{"upper":"Upper","lower":"Lower","color":[1,2,3],"opacity":35}"#).unwrap();
+        assert_eq!(legacy.upper, FillEdge { study: None, output: "Upper".into() });
+        let mut specs = vec![Spec::new("EMA", &[]).unwrap(), Spec::new("BB", &[]).unwrap()];
+        assign_ids(&mut specs);
+        specs[0].chart.as_mut().unwrap().fill = Some(BandFill {
+            upper: "EMA".into(),
+            lower: FillEdge { study: Some(2), output: "Lower".into() },
+            ..legacy
+        });
+        let json = serde_json::to_string(&specs).unwrap();
+        let mut restored: Vec<Spec> = serde_json::from_str(&json).unwrap();
+        assign_ids(&mut restored);
+        assert_eq!(restored, specs);
+    }
+
+    #[test]
+    fn fill_targets_require_visible_same_pane_shared_scale() {
+        let mut specs = vec![Spec::new("EMA", &[]).unwrap(), Spec::new("BB", &[]).unwrap()];
+        assign_ids(&mut specs);
+        let edge = FillEdge { study: Some(2), output: "Lower".into() };
+        assert_eq!(validate_fill_edge(&specs, 0, &edge), Ok(()));
+        specs[1].chart.as_mut().unwrap().timeframe = Some(Timeframe::H1);
+        assert_eq!(validate_fill_edge(&specs, 0, &edge), Ok(()));
+        specs[1].chart.as_mut().unwrap().pane = Pane::Own;
+        assert_eq!(validate_fill_edge(&specs, 0, &edge).unwrap_err(), "Fill target must be on the same pane");
+        specs[1].chart.as_mut().unwrap().pane = Pane::Price;
+        for index in [0, 1] {
+            specs[index].chart.as_mut().unwrap().scale = Scale::Independent;
+            assert_eq!(
+                validate_fill_edge(&specs, 0, &edge).unwrap_err(),
+                "Fill target must share the price/pane scale (not an Independent scale)"
+            );
+            specs[index].chart.as_mut().unwrap().scale = Scale::Shared;
+        }
+        specs[1].chart.as_mut().unwrap().visible = false;
+        assert_eq!(
+            validate_fill_edge(&specs, 0, &edge).unwrap_err(),
+            format!("Fill target {} is not available", specs[1].label())
+        );
+        specs.pop();
+        assert_eq!(validate_fill_edge(&specs, 0, &edge).unwrap_err(), "Fill target 2 is not available");
+    }
+
+    #[test]
+    fn loaded_fill_settings_are_sanitized_without_retargeting_missing_ids() {
+        let spec = Spec::new("EMA", &[]).unwrap();
+        let mut settings = Settings::new(1, &spec);
+        settings.fill = Some(BandFill {
+            upper: FillEdge { study: Some(1), output: "EMA".into() },
+            lower: FillEdge { study: Some(999), output: "Lower".into() },
+            color: [1, 2, 3],
+            opacity: 255,
+        });
+        let clean = settings.sanitized();
+        let fill = clean.fill.unwrap();
+        assert_eq!(fill.upper.study, None);
+        assert_eq!(fill.lower.study, Some(999));
+        assert_eq!(fill.opacity, 255);
+    }
 
     #[test]
     fn warmup_scales_with_parameters_and_is_bounded() {
