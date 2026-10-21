@@ -1339,7 +1339,10 @@ async fn condition_observations(
     let mut groups = std::collections::BTreeMap::<(String, Timeframe), Vec<tr_core::price_alerts::Alert>>::new();
     for alert in alerts {
         let tf = match &alert.rule {
-            Some(tr_core::price_alerts::Rule::Formula { timeframe, .. }) => *timeframe,
+            Some(
+                tr_core::price_alerts::Rule::Formula { timeframe, .. }
+                | tr_core::price_alerts::Rule::Condition { timeframe, .. },
+            ) => *timeframe,
             _ => Timeframe::M1,
         };
         groups.entry((alert.symbol.clone(), tf)).or_default().push(alert);
@@ -1369,6 +1372,34 @@ async fn condition_observations(
                 match input {
                     Err(e) => alerts.into_iter().map(|a| (a.id, Err(e.clone()))).collect(),
                     Ok((q, bars)) => {
+                        let mut set = tr_core::scanner::SeriesSet::from([(tf, Series::new(symbol.clone(), tf, bars))]);
+                        let extras: std::collections::BTreeSet<_> = alerts
+                            .iter()
+                            .filter_map(|a| a.rule.as_ref())
+                            .flat_map(|rule| rule.timeframes())
+                            .filter(|extra| *extra != tf)
+                            .collect();
+                        let mut errors = std::collections::HashMap::new();
+                        for extra in extras {
+                            let result = tokio::time::timeout(
+                                Duration::from_secs(20),
+                                provider.alert_history(&symbol, extra, 1500),
+                            )
+                            .await;
+                            match result {
+                                Ok(Ok(history)) if history.simulated == q.simulated => {
+                                    set.insert(extra, Series::new(symbol.clone(), extra, history.bars));
+                                }
+                                result => {
+                                    let error = match result {
+                                        Ok(Err(e)) => e.to_string(),
+                                        Err(_) => "Condition request timed out".into(),
+                                        _ => "Condition and price data modes differ".into(),
+                                    };
+                                    errors.insert(extra, error);
+                                }
+                            }
+                        }
                         let ids: Vec<_> = alerts.iter().map(|a| a.id).collect();
                         tokio::task::spawn_blocking(move || {
                             alerts
@@ -1377,7 +1408,15 @@ async fn condition_observations(
                                     let result = (|| {
                                         let rule = a.rule.as_ref().ok_or("Missing condition")?;
                                         let mut observation = q.clone();
-                                        observation.price = rule.value(&bars)?;
+                                        for required in rule.timeframes() {
+                                            if let Some(error) = errors.get(&required) {
+                                                return Err(error.clone());
+                                            }
+                                        }
+                                        observation.price = match rule {
+                                            tr_core::price_alerts::Rule::Condition { .. } => rule.value_set(&set)?,
+                                            _ => rule.value(&set[&tf].bars)?,
+                                        };
                                         observation.source = format!(
                                             "{} · {}",
                                             q.source,
@@ -1968,6 +2007,74 @@ mod tests {
         // A partial page means the provider is exhausted and covers earlier starts.
         let short = StudyHistory { bars: Arc::new(vec![Bar::new(80, 1., 1., 1., 1., 1.)]), ..c };
         assert!(study_history_fresh(&short, 100, 10, 5, 1_000));
+    }
+
+    #[test]
+    fn condition_overrides_fetch_extra_timeframes_and_isolate_missing_history() {
+        use std::sync::Mutex;
+        use tr_core::price_alerts::{Book, Direction, Rule};
+        use tr_core::scanner::{ConditionGroup, MatchMode, ScanCondition, ScanOperand};
+        struct Multi {
+            calls: Arc<Mutex<Vec<Timeframe>>>,
+            missing: bool,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Multi {
+            fn name(&self) -> &str {
+                "fixture"
+            }
+            async fn history(&self, _: &str, tf: Timeframe, _: Option<i64>, limit: usize) -> anyhow::Result<Vec<Bar>> {
+                self.calls.lock().unwrap().push(tf);
+                assert!(limit <= 1500);
+                if self.missing && tf == Timeframe::W1 {
+                    anyhow::bail!("Missing weekly history");
+                }
+                // Extras deliberately need not be fresh relative to the primary quote.
+                let ts = if tf == Timeframe::W1 { 1 } else { tf.bucket_start(chrono::Utc::now().timestamp()) };
+                Ok(vec![Bar::new(ts, 100., 100., 100., 100., 1.)])
+            }
+        }
+        for missing in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut book = Book::default();
+            let rules = [
+                Rule::Formula { expression: "C+1".into(), timeframe: Timeframe::D1 },
+                Rule::Condition {
+                    root: ConditionGroup::comparisons(
+                        MatchMode::All,
+                        vec![ScanCondition {
+                            timeframe: Some(Timeframe::W1),
+                            right: ScanOperand::Constant(99.),
+                            ..ScanCondition::default()
+                        }],
+                    ),
+                    timeframe: Timeframe::D1,
+                },
+                Rule::Condition {
+                    root: ConditionGroup::comparisons(
+                        MatchMode::All,
+                        vec![ScanCondition { right: ScanOperand::Constant(99.), ..ScanCondition::default() }],
+                    ),
+                    timeframe: Timeframe::D1,
+                },
+            ];
+            for rule in rules {
+                let id = book.add("AAPL US Equity".into(), 0.5, Direction::Above, false).unwrap();
+                book.set_rule(id, Some(rule)).unwrap();
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+            let mut results = runtime
+                .block_on(condition_observations(Arc::new(Multi { calls: calls.clone(), missing }), book.alerts));
+            results.sort_by_key(|r| r.0);
+            assert_eq!(*calls.lock().unwrap(), vec![Timeframe::M1, Timeframe::D1, Timeframe::W1]);
+            assert_eq!(results[0].1.as_ref().unwrap().price, 101.);
+            assert_eq!(results[2].1.as_ref().unwrap().price, 1.);
+            if missing {
+                assert!(results[1].1.as_ref().unwrap_err().contains("Missing weekly history"));
+            } else {
+                assert_eq!(results[1].1.as_ref().unwrap().price, 1.);
+            }
+        }
     }
 
     #[test]

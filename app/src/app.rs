@@ -514,6 +514,7 @@ pub struct TerminalApp {
 
     status: String,
     toasts: Vec<(String, Instant)>,
+    alert_toasts: Vec<(Instant, tr_core::price_alerts::Event)>,
 
     latest: Vec<Trade>,
     politicians: Vec<PoliticianSummary>,
@@ -678,6 +679,7 @@ impl TerminalApp {
             focus_cmd: true,
             status: "Ready. Type a ticker and press <GO> (Enter). F1 for help.".into(),
             toasts: Vec::new(),
+            alert_toasts: Vec::new(),
             latest: Vec::new(),
             politicians: Vec::new(),
             pol_search: String::new(),
@@ -1184,27 +1186,12 @@ impl TerminalApp {
                 }
                 Response::PriceAlertQuotes { revision, observations } => {
                     for event in self.price_alerts.on_quotes(revision, observations) {
-                        let note = if self.price_alerts.save_error.is_some() { " · not saved" } else { "" };
-                        self.toasts.push((
-                            format!(
-                                "{}{}{note}",
-                                crate::price_alerts::TOAST_PREFIX,
-                                crate::price_alerts::event_message(&event)
-                            ),
-                            Instant::now(),
-                        ));
+                        self.alert_toast(event);
                     }
                 }
                 Response::PriceAlertRules { revision, observations } => {
                     for event in self.price_alerts.on_rules(revision, observations) {
-                        self.toasts.push((
-                            format!(
-                                "{}{}",
-                                crate::price_alerts::TOAST_PREFIX,
-                                crate::price_alerts::event_message(&event)
-                            ),
-                            Instant::now(),
-                        ));
+                        self.alert_toast(event);
                     }
                 }
                 Response::Quotes(q) => {
@@ -1665,6 +1652,7 @@ impl TerminalApp {
             self.last_save = Instant::now();
         }
         self.toasts.retain(|(_, t)| t.elapsed() < Duration::from_secs(TOAST_SECS));
+        self.alert_toasts.retain(|(t, _)| t.elapsed() < Duration::from_secs(TOAST_SECS));
     }
 
     /// Save the active layout (only when it changed) and app settings.

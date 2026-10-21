@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
-use tr_core::price_alerts::{Alert, Book, Direction, Event, Observation, Rule, Status};
+use tr_core::price_alerts::{Alert, Book, Direction, Event, Observation, Repeat, Rule, Status};
 
 use crate::theme::{amber, mono, muted, text};
 use crate::worker::{Request, Worker};
@@ -28,12 +28,23 @@ struct Draft {
     symbol: String,
     price: String,
     direction: Direction,
+    repeat: Repeat,
     simulated: bool,
     error: Option<String>,
     rule: Option<Rule>,
     formula: bool,
     expression: String,
     timeframe: tr_core::Timeframe,
+}
+
+impl Draft {
+    fn saved_rule(&self) -> Option<Rule> {
+        match &self.rule {
+            Some(Rule::Condition { .. } | Rule::Line { .. }) => self.rule.clone(),
+            _ if self.formula => Some(Rule::Formula { expression: self.expression.clone(), timeframe: self.timeframe }),
+            _ => None,
+        }
+    }
 }
 
 pub struct State {
@@ -91,6 +102,15 @@ impl State {
         }
     }
 
+    pub fn mark_seen(&mut self, id: u64, quote_ts: i64) {
+        for event in &mut self.book.events {
+            if event.alert.id == id && event.quote_ts == quote_ts {
+                event.seen = true;
+            }
+        }
+        self.changed(false);
+    }
+
     pub fn unread(&self) -> usize {
         self.book.events.iter().filter(|e| !e.seen).count()
     }
@@ -100,6 +120,7 @@ impl State {
             return;
         }
         self.last_save = Some(Instant::now());
+        self.book.version = 3;
         let result = self.book.validate().and_then(|()| {
             let bytes = serde_json::to_vec_pretty(&self.book).map_err(|e| e.to_string())?;
             if let Some(parent) = self.path.parent() {
@@ -251,6 +272,7 @@ impl State {
                     symbol,
                     price: level.to_string(),
                     direction,
+                    repeat: Repeat::Once,
                     simulated: self.simulated,
                     error: None,
                     rule: None,
@@ -262,13 +284,15 @@ impl State {
             Action::Condition { symbol, level, rule } => {
                 let (formula, expression, timeframe) = match &rule {
                     Rule::Formula { expression, timeframe } => (true, expression.clone(), *timeframe),
-                    _ => (false, String::new(), tr_core::Timeframe::M1),
+                    Rule::Condition { timeframe, .. } => (false, String::new(), *timeframe),
+                    Rule::Line { .. } => (false, String::new(), tr_core::Timeframe::M1),
                 };
                 self.editor = Some(Draft {
                     id: None,
                     symbol,
                     price: level.to_string(),
                     direction: Direction::Above,
+                    repeat: Repeat::Once,
                     simulated: self.simulated,
                     error: None,
                     rule: Some(rule),
@@ -284,6 +308,7 @@ impl State {
                         symbol: a.symbol.clone(),
                         price: a.level.to_string(),
                         direction: a.direction,
+                        repeat: a.repeat,
                         simulated: a.simulated,
                         error: None,
                         rule: a.rule.clone(),
@@ -293,7 +318,7 @@ impl State {
                             _ => "WRSI(14)".into(),
                         },
                         timeframe: match &a.rule {
-                            Some(Rule::Formula { timeframe, .. }) => *timeframe,
+                            Some(Rule::Formula { timeframe, .. } | Rule::Condition { timeframe, .. }) => *timeframe,
                             _ => tr_core::Timeframe::D1,
                         },
                     });
@@ -329,6 +354,7 @@ impl State {
                     symbol: String::new(),
                     price: String::new(),
                     direction: Direction::Above,
+                    repeat: Repeat::Once,
                     simulated: self.simulated,
                     error: None,
                     rule: None,
@@ -354,7 +380,7 @@ impl State {
             })
             .color(muted()),
         );
-        ui.label(RichText::new("One shot per crossing; the first valid observation sets the baseline.").color(muted()));
+        ui.label(RichText::new("The first valid observation sets the baseline.").color(muted()));
         if let Some(error) = &self.save_error {
             ui.label(
                 RichText::new(format!("Not saved: {error}. Retrying; changes may be lost on exit."))
@@ -410,6 +436,12 @@ impl State {
                                 muted()
                             }));
                         });
+                        if let Repeat::Rearm { cooldown_secs } = a.repeat {
+                            ui.label(
+                                RichText::new(format!("Every time · {} min cooldown", cooldown_secs / 60))
+                                    .color(muted()),
+                            );
+                        }
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Edit…").clicked() {
                                 action = Some(Action::Edit(a.id));
@@ -462,7 +494,10 @@ impl State {
                 ui.label("Symbol");
                 ui.add_enabled(draft.id.is_none(), egui::TextEdit::singleline(&mut draft.symbol).hint_text("AAPL or BTCUSD Curncy").char_limit(100).desired_width(f32::INFINITY));
                 ui.add_space(6.);
-                if matches!(draft.rule, Some(Rule::Line { .. })) {
+                if let Some(rule @ Rule::Condition { .. }) = &draft.rule {
+                    ui.label(rule.label());
+                    ui.label(RichText::new("Edit the scan and re-create the alert to change its conditions").color(muted()));
+                } else if matches!(draft.rule, Some(Rule::Line { .. })) {
                     ui.label("Saved line snapshot · zero = crossing the line");
                     ui.label("Line uses elapsed time, including market closures; edits to the drawing do not alter this alert.");
                 } else {
@@ -484,7 +519,24 @@ impl State {
                     ui.add(egui::TextEdit::singleline(&mut draft.price).hint_text("Price").char_limit(30).desired_width(135.));
                 });
                 ui.add_space(8.);
-                ui.label(RichText::new("Fires once, then stops. Saving rearms the alert.").color(muted()));
+                ui.label("Repeat");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut draft.repeat, Repeat::Once, "Once");
+                    let every = matches!(draft.repeat, Repeat::Rearm { .. });
+                    if ui.radio(every, "Every time").clicked() && !every {
+                        draft.repeat = Repeat::Rearm { cooldown_secs: 300 };
+                    }
+                });
+                if let Repeat::Rearm { cooldown_secs } = &mut draft.repeat {
+                    let mut minutes = *cooldown_secs / 60;
+                    ui.horizontal(|ui| {
+                        ui.label("Cooldown");
+                        if ui.add(egui::DragValue::new(&mut minutes).range(1..=1440).suffix(" min")).changed() {
+                            *cooldown_secs = minutes * 60;
+                        }
+                    });
+                }
+                ui.label(RichText::new("Saving rearms the alert with a fresh baseline.").color(muted()));
                 ui.label(RichText::new("Polls about every 15 seconds while the app runs; slow providers delay checks. Crossings between checks can be missed.").small().color(muted()));
                 if draft.simulated { ui.label(RichText::new("Sample alert · simulated data only").color(amber())); }
                 if let Some(error) = &draft.error { ui.label(RichText::new(error).color(crate::theme::down())); }
@@ -499,13 +551,7 @@ impl State {
         if save {
             let result = (|| {
                 let level: f64 = draft.price.trim().parse().map_err(|_| "Enter a valid price".to_string())?;
-                let rule = if draft.formula {
-                    Some(Rule::Formula { expression: draft.expression.clone(), timeframe: draft.timeframe })
-                } else if matches!(draft.rule, Some(Rule::Line { .. })) {
-                    draft.rule.clone()
-                } else {
-                    None
-                };
+                let rule = draft.saved_rule();
                 if let Some(r) = &rule {
                     r.validate()?;
                 }
@@ -516,6 +562,7 @@ impl State {
                     let symbol = crate::chart_compare::parse_key(&draft.symbol).ok_or("Choose a valid symbol")?;
                     self.book.add(symbol, level, draft.direction, draft.simulated)?
                 };
+                self.book.set_repeat(id, draft.repeat)?;
                 self.book.set_rule(id, rule)
             })();
             match result {
@@ -597,6 +644,24 @@ mod tests {
     fn reply(state: &mut State, price: f64) -> Vec<Event> {
         state.pending = Some(state.revision);
         state.on_quotes(state.revision, vec![("AAPL US Equity".into(), Ok(q(price)))])
+    }
+
+    #[test]
+    fn editor_save_keeps_condition_rule() {
+        let scan = tr_core::scanner::ScanDefinition::default();
+        let rule = Rule::Condition { root: scan.root, timeframe: scan.timeframe };
+        let mut s = State::load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("missing-condition-test.json"), false);
+        s.action(Action::Condition { symbol: "AAPL US Equity".into(), level: 0.5, rule: rule.clone() });
+        let draft = s.editor.as_mut().unwrap();
+        draft.price = "0.75".into();
+        draft.repeat = Repeat::Rearm { cooldown_secs: 60 };
+        assert_eq!(draft.saved_rule(), Some(rule.clone()));
+        let id = s.book.add("AAPL US Equity".into(), 0.5, Direction::Above, false).unwrap();
+        s.book.set_rule(id, Some(rule.clone())).unwrap();
+        s.action(Action::Edit(id));
+        let draft = s.editor.as_mut().unwrap();
+        draft.formula = true; // A stale formula flag must never overwrite the tree.
+        assert_eq!(draft.saved_rule(), Some(rule));
     }
 
     #[test]
@@ -767,6 +832,39 @@ mod tests {
                 }],
             );
         }
+    }
+
+    #[test]
+    fn repeat_editor_round_trip_and_actionable_event_seen() {
+        let ctx = egui::Context::default();
+        let mut s = state();
+        click(&ctx, &mut s, "New price alert…");
+        s.editor.as_mut().unwrap().symbol = "AAPL".into();
+        s.editor.as_mut().unwrap().price = "100".into();
+        click(&ctx, &mut s, "Every time");
+        click(&ctx, &mut s, "Create alert");
+        assert_eq!(s.book.alerts[0].repeat, Repeat::Rearm { cooldown_secs: 300 });
+        let restored = State::load(s.path.clone(), false);
+        assert_eq!(restored.book.alerts[0].repeat, s.book.alerts[0].repeat);
+        click(&ctx, &mut s, "Edit…");
+        assert_eq!(s.editor.as_ref().unwrap().repeat, Repeat::Rearm { cooldown_secs: 300 });
+        click(&ctx, &mut s, "Once");
+        click(&ctx, &mut s, "Save and rearm");
+        assert_eq!(s.book.alerts[0].repeat, Repeat::Once);
+        reply(&mut s, 99.);
+        let event = reply(&mut s, 101.).remove(0);
+        s.mark_seen(event.alert.id, event.quote_ts);
+        assert_eq!(State::load(s.path.clone(), false).unread(), 0);
+        std::fs::remove_dir_all(s.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn delivery_settings_default_off() {
+        let prefs: crate::prefs::Prefs = serde_json::from_str("{}").unwrap();
+        assert!(!prefs.alert_sound);
+        assert!(!prefs.desktop_notification);
+        assert!(!crate::prefs::Prefs::default().alert_sound);
+        assert!(!crate::prefs::Prefs::default().desktop_notification);
     }
 
     #[test]

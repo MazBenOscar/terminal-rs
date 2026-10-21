@@ -3037,13 +3037,8 @@ impl ChartState {
             }
             if let Some(scan) = &self.data.workflow.scan
                 && ui.button("Alert when this symbol matches scan…").clicked()
-                && let Ok(expression) = crate::chart_workflow::expression(scan)
             {
-                self.price_alert_actions.push(AlertAction::Condition {
-                    symbol: self.symbol.clone(),
-                    level: 0.5,
-                    rule: tr_core::price_alerts::Rule::Formula { expression, timeframe: scan.timeframe },
-                });
+                self.price_alert_actions.push(scan_alert_action(&self.symbol, scan));
                 ui.close();
             }
             if ui.button("Manage all alerts…").clicked() {
@@ -4112,9 +4107,37 @@ fn spread_tags(desired: &[(f32, f32)], fixed: Option<usize>, lo: f32, hi: f32) -
     out
 }
 
+fn scan_alert_action(symbol: &str, scan: &tr_core::scanner::ScanDefinition) -> crate::price_alerts::Action {
+    crate::price_alerts::Action::Condition {
+        symbol: symbol.into(),
+        level: 0.5,
+        rule: tr_core::price_alerts::Rule::Condition { root: scan.root.clone(), timeframe: scan.timeframe },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scan_alert_action_preserves_timeframe_overrides() {
+        use tr_core::scanner::{ConditionGroup, MatchMode, ScanCondition, ScanDefinition};
+        let scan = ScanDefinition {
+            root: ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![ScanCondition { timeframe: Some(Timeframe::W1), ..ScanCondition::default() }],
+            ),
+            ..ScanDefinition::default()
+        };
+        assert!(crate::chart_workflow::expression(&scan).is_err());
+        let crate::price_alerts::Action::Condition { symbol, level, rule } = scan_alert_action("AAPL US Equity", &scan)
+        else {
+            panic!("Expected condition action");
+        };
+        assert_eq!(symbol, "AAPL US Equity");
+        assert_eq!(level, 0.5);
+        assert_eq!(rule, tr_core::price_alerts::Rule::Condition { root: scan.root, timeframe: scan.timeframe });
+    }
+
     #[test]
     fn tags_spread_stably_with_variable_heights_and_bounds() {
         for (desired, fixed) in [

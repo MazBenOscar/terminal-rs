@@ -1,9 +1,11 @@
-//! One-shot sampled price crossings. Runtime baselines are deliberately not persisted:
+//! Sampled price crossings with optional cooldown rearming. Runtime baselines are deliberately not persisted:
 //! reopening, editing or rearming an alert starts with a fresh observation.
 
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+
+use crate::scanner::{ConditionGroup, MatchMode, ScanDefinition, ScanOutcome, SeriesSet};
 
 pub const MAX_ALERTS: usize = 200;
 pub const MAX_EVENTS: usize = 500;
@@ -39,6 +41,24 @@ pub enum Status {
     Triggered,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Repeat {
+    #[default]
+    Once,
+    Rearm {
+        cooldown_secs: u32,
+    },
+}
+
+impl Repeat {
+    pub fn validate(self) -> Result<(), String> {
+        if matches!(self, Self::Rearm { cooldown_secs } if !(60..=86_400).contains(&cooldown_secs)) {
+            return Err("Cooldown must be between 1 and 1440 minutes".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Alert {
     pub id: u64,
@@ -50,17 +70,52 @@ pub struct Alert {
     pub simulated: bool,
     #[serde(default)]
     pub rule: Option<Rule>,
+    #[serde(default)]
+    pub repeat: Repeat,
+    #[serde(default)]
+    pub last_fired: Option<i64>,
 }
 
 /// Formula values and line-distance values have their own units, not market prices.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Rule {
     Formula { expression: String, timeframe: crate::Timeframe },
+    Condition { root: ConditionGroup, timeframe: crate::Timeframe },
     Line { start: i64, end: i64, first: f64, last: f64, logarithmic: bool },
 }
 impl Rule {
+    fn scan(root: &ConditionGroup, timeframe: crate::Timeframe) -> ScanDefinition {
+        ScanDefinition { name: "Alert".into(), timeframe, root: root.clone() }
+    }
+
+    pub fn timeframes(&self) -> Vec<crate::Timeframe> {
+        match self {
+            Self::Formula { timeframe, .. } => vec![*timeframe],
+            Self::Line { .. } => vec![crate::Timeframe::M1],
+            Self::Condition { root, timeframe } => Self::scan(root, *timeframe).timeframes(),
+        }
+    }
+
+    pub fn value_set(&self, set: &SeriesSet) -> Result<f64, String> {
+        match self {
+            Self::Condition { root, timeframe } => {
+                let evaluation = Self::scan(root, *timeframe).evaluate_set(set);
+                match evaluation.outcome {
+                    ScanOutcome::Match => Ok(1.0),
+                    ScanOutcome::NoMatch => Ok(0.0),
+                    ScanOutcome::Unavailable => Err(evaluation.reason.unwrap_or("Condition unavailable".into())),
+                }
+            }
+            _ => {
+                let timeframe = self.timeframes()[0];
+                self.value(&set.get(&timeframe).ok_or("No condition history")?.bars)
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::Condition { root, timeframe } => Self::scan(root, *timeframe).validate(),
             Self::Formula { expression, .. } => crate::indicators::pcf::evaluate(
                 expression,
                 &crate::indicators::registry::Input::new(&[], crate::Timeframe::D1),
@@ -82,8 +137,13 @@ impl Rule {
         }
     }
     pub fn value(&self, bars: &[crate::Bar]) -> Result<f64, String> {
-        let bar = bars.last().ok_or("No condition history")?;
         let value = match self {
+            Self::Condition { timeframe, .. } => {
+                return self.value_set(&SeriesSet::from([(
+                    *timeframe,
+                    crate::Series::new("Alert", *timeframe, bars.to_vec()),
+                )]));
+            }
             Self::Formula { expression, timeframe } => *crate::indicators::pcf::evaluate(
                 expression,
                 &crate::indicators::registry::Input::new(bars, *timeframe),
@@ -92,6 +152,7 @@ impl Rule {
             .last()
             .ok_or("No formula value")?,
             Self::Line { start, end, first, last, logarithmic } => {
+                let bar = bars.last().ok_or("No condition history")?;
                 let fraction = (bar.ts - start) as f64 / (end - start) as f64;
                 let line = if *logarithmic {
                     (first.ln() + fraction * (last.ln() - first.ln())).exp()
@@ -107,6 +168,12 @@ impl Rule {
         match self {
             Self::Formula { expression, timeframe } => format!("{expression} · {}", timeframe.label()),
             Self::Line { .. } => "Price minus saved line (time extrapolation)".into(),
+            Self::Condition { root, timeframe } => format!(
+                "Condition: {} conditions (match {}) · {}",
+                root.leaves().len(),
+                if root.mode == MatchMode::All { "all" } else { "any" },
+                timeframe.label()
+            ),
         }
     }
 }
@@ -138,23 +205,38 @@ impl Observation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Book {
+    #[serde(serialize_with = "serialize_version")]
     pub version: u32,
     pub alerts: Vec<Alert>,
     pub events: Vec<Event>,
     next_id: u64,
+    /// Keep duplicate protection even after bounded history has been pruned.
+    #[serde(default)]
+    fired_through: HashMap<u64, i64>,
     #[serde(skip)]
     previous: HashMap<u64, Observation>,
 }
 
+fn serialize_version<S: serde::Serializer>(_: &u32, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u32(3)
+}
+
 impl Default for Book {
     fn default() -> Self {
-        Self { version: 2, alerts: vec![], events: vec![], next_id: 1, previous: HashMap::new() }
+        Self {
+            version: 3,
+            alerts: vec![],
+            events: vec![],
+            next_id: 1,
+            fired_through: HashMap::new(),
+            previous: HashMap::new(),
+        }
     }
 }
 
 impl Book {
     pub fn validate(&self) -> Result<(), String> {
-        if !(1..=2).contains(&self.version)
+        if !(1..=3).contains(&self.version)
             || self.next_id == 0
             || self.alerts.len() > MAX_ALERTS
             || self.events.len() > MAX_EVENTS
@@ -164,6 +246,7 @@ impl Book {
         let mut ids = HashSet::new();
         for a in &self.alerts {
             validate_alert(&a.symbol, a.level)?;
+            a.repeat.validate()?;
             if let Some(rule) = &a.rule {
                 rule.validate()?;
             }
@@ -176,6 +259,7 @@ impl Book {
         }
         for e in &self.events {
             validate_alert(&e.alert.symbol, e.alert.level)?;
+            e.alert.repeat.validate()?;
             if !e.price.is_finite() || e.quote_ts <= 0 || e.observed_at <= 0 || e.source.len() > 500 {
                 return Err("Invalid price-alert history".into());
             }
@@ -195,7 +279,17 @@ impl Book {
         }
         let id = self.next_id;
         self.next_id = id.checked_add(1).ok_or("No free alert IDs")?;
-        self.alerts.push(Alert { id, symbol, level, direction, status: Status::Armed, simulated, rule: None });
+        self.alerts.push(Alert {
+            id,
+            symbol,
+            level,
+            direction,
+            status: Status::Armed,
+            simulated,
+            rule: None,
+            repeat: Repeat::Once,
+            last_fired: None,
+        });
         Ok(id)
     }
 
@@ -206,6 +300,17 @@ impl Book {
         a.level = level;
         a.direction = direction;
         a.status = Status::Armed;
+        a.last_fired = None;
+        self.previous.remove(&id);
+        Ok(())
+    }
+
+    pub fn set_repeat(&mut self, id: u64, repeat: Repeat) -> Result<(), String> {
+        repeat.validate()?;
+        let a = self.alerts.iter_mut().find(|a| a.id == id).ok_or("Alert no longer exists")?;
+        a.repeat = repeat;
+        a.status = Status::Armed;
+        a.last_fired = None;
         self.previous.remove(&id);
         Ok(())
     }
@@ -213,12 +318,14 @@ impl Book {
     pub fn toggle(&mut self, id: u64) {
         if let Some(a) = self.alerts.iter_mut().find(|a| a.id == id) {
             a.status = if a.status == Status::Armed { Status::Disabled } else { Status::Armed };
+            a.last_fired = None;
             self.previous.remove(&id);
         }
     }
 
     pub fn delete(&mut self, id: u64) {
         self.alerts.retain(|a| a.id != id);
+        self.fired_through.remove(&id);
         self.previous.remove(&id);
     }
 
@@ -238,7 +345,7 @@ impl Book {
         }
         let a = self.alerts.iter_mut().find(|a| a.id == id).ok_or("Alert no longer exists")?;
         a.rule = rule;
-        self.version = 2;
+        self.version = 3;
         self.previous.remove(&id);
         Ok(())
     }
@@ -274,7 +381,24 @@ impl Book {
                 }
                 if prev.source == q.source && q.ts - prev.ts <= 120 && a.direction.crosses(prev.price, q.price, a.level)
                 {
-                    a.status = Status::Triggered;
+                    let cooling = match a.repeat {
+                        Repeat::Once => false,
+                        Repeat::Rearm { cooldown_secs } => {
+                            a.last_fired.is_some_and(|last| now.saturating_sub(last) < i64::from(cooldown_secs))
+                        }
+                    };
+                    if cooling
+                        || self.fired_through.get(&a.id).is_some_and(|ts| q.ts <= *ts)
+                        || self.events.iter().any(|e| e.alert.id == a.id && e.quote_ts == q.ts)
+                    {
+                        self.previous.insert(a.id, q.clone());
+                        continue;
+                    }
+                    if a.repeat == Repeat::Once {
+                        a.status = Status::Triggered;
+                    }
+                    a.last_fired = Some(now);
+                    self.fired_through.insert(a.id, q.ts);
                     fired.push(Event {
                         alert: a.clone(),
                         price: q.price,
@@ -309,6 +433,162 @@ fn validate_alert(symbol: &str, level: f64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn condition(timeframe: Option<crate::Timeframe>) -> Rule {
+        Rule::Condition {
+            root: ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![crate::scanner::ScanCondition {
+                    timeframe,
+                    right: crate::scanner::ScanOperand::Constant(100.),
+                    ..crate::scanner::ScanCondition::default()
+                }],
+            ),
+            timeframe: crate::Timeframe::D1,
+        }
+    }
+
+    #[test]
+    fn condition_validate_and_value_set_match_no_match_unavailable() {
+        let rule = condition(Some(crate::Timeframe::W1));
+        rule.validate().unwrap();
+        assert_eq!(rule.timeframes(), vec![crate::Timeframe::D1, crate::Timeframe::W1]);
+        assert_eq!(rule.label(), "Condition: 1 conditions (match all) · 1D");
+        assert!(rule.value_set(&SeriesSet::new()).is_err());
+        for (close, expected) in [(101., 1.), (99., 0.)] {
+            let bars = vec![crate::Bar::new(1000, close, close, close, close, 1.)];
+            let set = SeriesSet::from([(
+                crate::Timeframe::W1,
+                crate::Series::new("AAPL", crate::Timeframe::W1, bars.clone()),
+            )]);
+            assert_eq!(rule.value_set(&set).unwrap(), expected);
+            assert!(rule.value(&bars).is_err());
+            assert_eq!(condition(None).value(&bars).unwrap(), expected);
+        }
+        let invalid = Rule::Condition {
+            root: ConditionGroup::comparisons(MatchMode::All, vec![]),
+            timeframe: crate::Timeframe::D1,
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn condition_v3_book_roundtrip_and_legacy_books_load() {
+        let mut b = book(Direction::Above);
+        b.set_rule(1, Some(condition(Some(crate::Timeframe::W1)))).unwrap();
+        let json = serde_json::to_string(&b).unwrap();
+        let restored: Book = serde_json::from_str(&json).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.version, 3);
+        assert_eq!(restored.alerts, b.alerts);
+        for version in [2, 3] {
+            let mut legacy = serde_json::to_value(book(Direction::Above)).unwrap();
+            legacy["version"] = version.into();
+            legacy["alerts"][0].as_object_mut().unwrap().remove("rule");
+            let restored: Book = serde_json::from_value(legacy).unwrap();
+            restored.validate().unwrap();
+            assert!(restored.alerts[0].rule.is_none());
+        }
+    }
+
+    #[test]
+    fn condition_crossing_fires_once_and_rearm_respects_cooldown() {
+        for repeat in [Repeat::Once, Repeat::Rearm { cooldown_secs: 60 }] {
+            let mut b = book(Direction::Above);
+            b.edit(1, 0.5, Direction::Above).unwrap();
+            b.set_rule(1, Some(condition(None))).unwrap();
+            b.set_repeat(1, repeat).unwrap();
+            for (ts, value, fires) in [
+                (1000, 0., false),
+                (1001, 1., true),
+                (1010, 0., false),
+                (1011, 1., false),
+                (1061, 1., false),
+                (1062, 0., false),
+                (1063, 1., repeat != Repeat::Once),
+            ] {
+                assert_eq!(b.observe_rule(1, quote(value, ts), ts).len(), usize::from(fires));
+            }
+        }
+    }
+
+    #[test]
+    fn rearm_cooldown_consumes_crossings_and_fires_again() {
+        let mut b = book(Direction::Above);
+        b.set_repeat(1, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
+        b.observe(quote(99., 1000), 1000);
+        assert_eq!(b.observe(quote(101., 1001), 1001).len(), 1);
+        assert_eq!(b.alerts[0].status, Status::Armed);
+        assert_eq!(b.alerts[0].last_fired, Some(1001));
+        b.observe(quote(99., 1010), 1010);
+        assert!(b.observe(quote(101., 1011), 1011).is_empty());
+        assert!(b.observe(quote(101., 1061), 1061).is_empty());
+        b.observe(quote(99., 1062), 1062);
+        assert_eq!(b.observe(quote(101., 1063), 1063).len(), 1);
+    }
+
+    #[test]
+    fn duplicate_quote_timestamp_is_suppressed_even_after_rearming() {
+        let mut b = book(Direction::Above);
+        b.set_repeat(1, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
+        b.observe(quote(99., 1000), 1000);
+        assert_eq!(b.observe(quote(101., 1001), 1001).len(), 1);
+        b.observe(quote(99., 1001), 1061);
+        assert!(b.observe(quote(101., 1001), 1061).is_empty());
+        b.edit(1, 100., Direction::Above).unwrap();
+        assert_eq!(b.alerts[0].last_fired, None);
+        b.observe(quote(99., 1001), 1062);
+        assert!(b.observe(quote(101., 1001), 1062).is_empty());
+    }
+
+    #[test]
+    fn duplicate_protection_survives_pruned_history_and_restart() {
+        let mut b = book(Direction::Above);
+        b.set_repeat(1, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
+        b.observe(quote(99., 1000), 1000);
+        b.observe(quote(101., 1001), 1001);
+        b.events.clear();
+        let mut restored: Book = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        restored.observe(quote(99., 1001), 1061);
+        assert!(restored.observe(quote(101., 1001), 1061).is_empty());
+    }
+
+    #[test]
+    fn v2_defaults_to_once_and_serializes_as_v3() {
+        let json = r#"{"version":2,"alerts":[{"id":1,"symbol":"AAPL US Equity","level":100.0,"direction":"Above","status":"Armed","simulated":false}],"events":[],"next_id":2}"#;
+        let b: Book = serde_json::from_str(json).unwrap();
+        b.validate().unwrap();
+        assert_eq!(b.alerts[0].repeat, Repeat::Once);
+        assert_eq!(b.alerts[0].last_fired, None);
+        assert_eq!(serde_json::to_value(b).unwrap()["version"], 3);
+    }
+
+    #[test]
+    fn repeating_restart_first_observation_only_seeds() {
+        let mut b = book(Direction::Above);
+        b.set_repeat(1, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
+        b.observe(quote(99., 1000), 1000);
+        b.observe(quote(101., 1001), 1001);
+        b.observe(quote(99., 1060), 1060);
+        let mut restored: Book = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert!(restored.observe(quote(101., 1061), 1061).is_empty());
+        assert_eq!(restored.events.len(), 1);
+        assert_eq!(restored.alerts[0].last_fired, Some(1001));
+    }
+
+    #[test]
+    fn cooldown_bounds_are_validated_on_edit_and_load() {
+        let mut b = book(Direction::Above);
+        for seconds in [0, 59, 86_401, u32::MAX] {
+            assert!(b.set_repeat(1, Repeat::Rearm { cooldown_secs: seconds }).is_err());
+            b.alerts[0].repeat = Repeat::Rearm { cooldown_secs: seconds };
+            assert!(b.validate().is_err());
+        }
+        for seconds in [60, 86_400] {
+            b.set_repeat(1, Repeat::Rearm { cooldown_secs: seconds }).unwrap();
+            b.validate().unwrap();
+        }
+    }
+
     #[test]
     fn conditions_are_isolated_and_line_math_and_migration_are_valid() {
         let mut b = book(Direction::Above);

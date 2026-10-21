@@ -1,6 +1,7 @@
 //! terminal-rs: a keyboard-driven, Bloomberg-style market terminal with GPU charts and
 //! congressional (STOCK Act) trade tracking.
 
+mod alert_delivery;
 mod anim;
 mod app;
 mod chart_account;
