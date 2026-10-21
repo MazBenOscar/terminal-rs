@@ -241,18 +241,21 @@ pub fn find(code: &str) -> Option<&'static Def> {
 pub struct Spec {
     pub code: String,
     pub params: Vec<f64>,
+    /// Chart-instance settings are separate from calculation parameters. Commands
+    /// and legacy saved labels omit them until attached to a chart.
+    pub chart: Option<super::study::Settings>,
 }
 
 impl Spec {
     /// `def` with its default parameters.
     pub fn of(def: &Def) -> Self {
-        Spec { code: def.code.into(), params: def.defaults() }
+        Spec { code: def.code.into(), params: def.defaults(), chart: None }
     }
 
     /// The indicator `code` (or an alias) with `params`, filled and clamped.
     pub fn new(code: &str, params: &[f64]) -> Option<Self> {
         let def = find(code)?;
-        Some(Spec { code: def.code.into(), params: def.normalize(params) })
+        Some(Spec { code: def.code.into(), params: def.normalize(params), chart: None })
     }
 
     /// A command-line indicator: `head` names it and `rest` holds up to as many numbers as
@@ -264,7 +267,7 @@ impl Spec {
         }
         let params: Vec<f64> =
             rest.iter().map(|s| s.parse::<f64>().ok().filter(|v| v.is_finite())).collect::<Option<_>>()?;
-        Some(Spec { code: def.code.into(), params: def.normalize(&params) })
+        Some(Spec { code: def.code.into(), params: def.normalize(&params), chart: None })
     }
 
     /// Parse a stored label. Unknown codes are kept as they are, so a layout saved by a
@@ -273,7 +276,7 @@ impl Spec {
         let mut words = label.split_whitespace();
         let head = words.next().unwrap_or_default();
         let params: Vec<f64> = words.filter_map(|w| w.parse().ok()).collect();
-        Spec::new(head, &params).unwrap_or_else(|| Spec { code: head.to_ascii_uppercase(), params })
+        Spec::new(head, &params).unwrap_or_else(|| Spec { code: head.to_ascii_uppercase(), params, chart: None })
     }
 
     pub fn def(&self) -> Option<&'static Def> {
@@ -294,7 +297,7 @@ impl Spec {
     }
 
     pub fn is_pane(&self) -> bool {
-        self.def().is_some_and(|d| d.pane)
+        self.chart.as_ref().map_or_else(|| self.def().is_some_and(|d| d.pane), |c| c.pane != super::study::Pane::Price)
     }
 
     /// Whether `other` takes this one's place on a chart: the same indicator, unless it
@@ -310,7 +313,16 @@ impl Spec {
 
 impl Serialize for Spec {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.label())
+        if let Some(chart) = &self.chart {
+            #[derive(Serialize)]
+            struct Instance<'a> {
+                indicator: String,
+                chart: &'a super::study::Settings,
+            }
+            Instance { indicator: self.label(), chart }.serialize(s)
+        } else {
+            s.serialize_str(&self.label())
+        }
     }
 }
 
@@ -330,11 +342,17 @@ impl<'de> Deserialize<'de> for Spec {
         #[serde(untagged)]
         enum Repr {
             Label(String),
+            Instance { indicator: String, chart: super::study::Settings },
             Legacy(Legacy),
         }
         let spec = |code: &str, params: &[f64]| Spec::new(code, params).expect("legacy indicators are in the catalog");
         Ok(match Repr::deserialize(d)? {
             Repr::Label(s) => Spec::from_label(&s),
+            Repr::Instance { indicator, chart } => {
+                let mut spec = Spec::from_label(&indicator);
+                spec.chart = Some(chart);
+                spec
+            }
             Repr::Legacy(Legacy::Sma(n)) => spec("SMA", &[n as f64]),
             Repr::Legacy(Legacy::Ema(n)) => spec("EMA", &[n as f64]),
             Repr::Legacy(Legacy::Vwap) => spec("VWAP", &[]),
@@ -1317,7 +1335,7 @@ mod tests {
 
     #[test]
     fn parse_fills_and_clamps_parameters() {
-        assert_eq!(Spec::parse("rsi", &[]), Some(Spec { code: "RSI".into(), params: vec![14.0] }));
+        assert_eq!(Spec::parse("rsi", &[]), Some(Spec { code: "RSI".into(), params: vec![14.0], chart: None }));
         assert_eq!(Spec::parse("Bollinger", &["10"]).unwrap().params, vec![10.0, 2.0]);
         assert_eq!(Spec::parse("SMA", &["0"]).unwrap().params, vec![1.0]);
         assert_eq!(Spec::parse("SMA", &["20.4"]).unwrap().params, vec![20.0]);

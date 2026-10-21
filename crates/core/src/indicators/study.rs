@@ -1,0 +1,334 @@
+//! Chart study instances. Calculation dependencies, pane membership and scale
+//! policies are independent. Old registry labels remain valid saved studies.
+
+use serde::{Deserialize, Serialize};
+
+use super::registry::{Input, Output, Spec};
+use crate::Bar;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Source {
+    #[default]
+    Bars,
+    Open,
+    High,
+    Low,
+    Close,
+    Volume,
+    Hlc3,
+    Output {
+        study: u32,
+        output: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Pane {
+    Price,
+    Own,
+    With(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum Scale {
+    #[default]
+    Shared,
+    Independent,
+    Fixed {
+        lo: f64,
+        hi: f64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Settings {
+    pub id: u32,
+    #[serde(default)]
+    pub source: Source,
+    pub pane: Pane,
+    #[serde(default)]
+    pub scale: Scale,
+    #[serde(default = "yes")]
+    pub visible: bool,
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+    #[serde(default = "height")]
+    pub height: f32,
+}
+
+fn yes() -> bool {
+    true
+}
+fn height() -> f32 {
+    120.0
+}
+
+impl Settings {
+    pub fn new(id: u32, spec: &Spec) -> Self {
+        Self {
+            id,
+            source: Source::Bars,
+            pane: if spec.def().is_some_and(|d| d.pane) { Pane::Own } else { Pane::Price },
+            scale: Scale::Shared,
+            visible: true,
+            color: None,
+            height: height(),
+        }
+    }
+}
+
+/// Give legacy and newly added specs unique IDs without renumbering existing ports.
+pub fn assign_ids(specs: &mut [Spec]) {
+    let mut reserved: std::collections::HashSet<_> =
+        specs.iter().filter_map(|s| s.chart.as_ref().map(|c| c.id)).filter(|id| *id != 0).collect();
+    let mut used = std::collections::HashSet::new();
+    for spec in specs.iter_mut() {
+        if let Some(c) = &spec.chart
+            && c.id != 0
+            && used.insert(c.id)
+        {
+            continue;
+        }
+        let id = (1..=u32::MAX).find(|id| !reserved.contains(id)).expect("study ID space");
+        reserved.insert(id);
+        used.insert(id);
+        if let Some(c) = &mut spec.chart {
+            c.id = id;
+        } else {
+            spec.chart = Some(Settings::new(id, spec));
+        }
+    }
+}
+
+/// `None` identifies the price pane. Pane links may chain, but must not cycle.
+pub fn pane_key(specs: &[Spec], index: usize) -> Result<Option<u32>, String> {
+    let mut at = index;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(at) {
+            return Err("Pane links form a cycle".into());
+        }
+        let spec = &specs[at];
+        let Some(c) = &spec.chart else {
+            return Ok(spec.def().is_some_and(|d| d.pane).then_some(at as u32 + 1));
+        };
+        match c.pane {
+            Pane::Price => return Ok(None),
+            Pane::Own => return Ok(Some(c.id)),
+            Pane::With(id) => {
+                at = specs
+                    .iter()
+                    .position(|s| s.chart.as_ref().is_some_and(|c| c.id == id))
+                    .ok_or_else(|| "The selected pane no longer exists".to_string())?
+            }
+        }
+    }
+}
+
+/// Only these scalar-input studies currently accept a selectable input. Other
+/// registry studies retain their original OHLCV semantics, never fabricated bars.
+pub fn accepts_source(code: &str) -> bool {
+    matches!(code, "SMA" | "EMA" | "WMA" | "HMA" | "RMA" | "BB" | "RSI" | "MACD")
+}
+
+/// Whether adding this source edge would be acyclic. Evaluation also validates
+/// imported graphs; the editor uses this to omit invalid choices in advance.
+pub fn can_use_source(specs: &[Spec], consumer: u32, mut parent: u32) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if parent == consumer || !seen.insert(parent) {
+            return false;
+        }
+        let Some(settings) = specs.iter().filter_map(|s| s.chart.as_ref()).find(|c| c.id == parent) else {
+            return false;
+        };
+        match settings.source {
+            Source::Output { study, .. } => parent = study,
+            _ => return true,
+        }
+    }
+}
+
+/// Evaluate in dependency order, retaining independent successes when a node fails.
+/// Missing output ports, cycles and displaced inputs are explicit errors.
+pub fn evaluate(specs: &[Spec], input: &Input<'_>) -> Vec<Result<Vec<Output>, String>> {
+    fn node(
+        index: usize,
+        specs: &[Spec],
+        input: &Input<'_>,
+        visiting: &mut [bool],
+        done: &mut [Option<Result<Vec<Output>, String>>],
+    ) -> Result<Vec<Output>, String> {
+        if let Some(value) = &done[index] {
+            return value.clone();
+        }
+        if visiting[index] {
+            return Err("Indicator sources form a cycle".into());
+        }
+        visiting[index] = true;
+        let spec = &specs[index];
+        let source = spec.chart.as_ref().map(|c| &c.source).unwrap_or(&Source::Bars);
+        let result = (|| {
+            pane_key(specs, index)?;
+            if let Some(Settings { scale: Scale::Fixed { lo, hi }, .. }) = &spec.chart
+                && (!lo.is_finite() || !hi.is_finite() || lo >= hi)
+            {
+                return Err("Fixed scale minimum must be smaller than its maximum".into());
+            }
+            if spec.def().is_none() {
+                return Err(format!("Unknown indicator: {}", spec.code));
+            }
+            if matches!(source, Source::Bars) {
+                return Ok(spec.compute(input));
+            }
+            if !accepts_source(&spec.code) {
+                return Err("This indicator requires its original OHLCV input".into());
+            }
+            let values = match source {
+                Source::Output { study, output } => {
+                    let parent = specs
+                        .iter()
+                        .position(|s| s.chart.as_ref().is_some_and(|c| c.id == *study))
+                        .ok_or_else(|| "The source indicator no longer exists".to_string())?;
+                    let outputs = node(parent, specs, input, visiting, done)?;
+                    let values = outputs
+                        .into_iter()
+                        .find(|o| o.name == output)
+                        .ok_or_else(|| format!("Source output {output} is unavailable"))?
+                        .values;
+                    if values.len() != input.bars.len() {
+                        return Err("Displaced source outputs are not supported yet".into());
+                    }
+                    values
+                }
+                _ => input
+                    .bars
+                    .iter()
+                    .map(|b| match source {
+                        Source::Open => b.open,
+                        Source::High => b.high,
+                        Source::Low => b.low,
+                        Source::Volume => b.volume,
+                        Source::Hlc3 => (b.high + b.low + b.close) / 3.0,
+                        _ => b.close,
+                    })
+                    .collect(),
+            };
+            // This adapter is restricted to scalar calculations above. Timestamps
+            // and volume remain intact; scalar values feed the close-based kernels.
+            let bars: Vec<Bar> = input
+                .bars
+                .iter()
+                .zip(values)
+                .map(|(b, value)| {
+                    let mut b = *b;
+                    b.close = value;
+                    b
+                })
+                .collect();
+            Ok(spec.compute(&Input::new(&bars, input.tf)))
+        })();
+        visiting[index] = false;
+        done[index] = Some(result.clone());
+        result
+    }
+    let mut done = vec![None; specs.len()];
+    let mut visiting = vec![false; specs.len()];
+    (0..specs.len()).map(|i| node(i, specs, input, &mut visiting, &mut done)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Timeframe;
+
+    fn specs() -> Vec<Spec> {
+        let mut specs = vec![Spec::new("RSI", &[3.0]).unwrap(), Spec::new("EMA", &[2.0]).unwrap()];
+        assign_ids(&mut specs);
+        specs[1].chart.as_mut().unwrap().source = Source::Output { study: 1, output: "RSI".into() };
+        specs
+    }
+
+    #[test]
+    fn dependencies_are_ordered_and_hidden_sources_still_compute() {
+        let bars: Vec<_> = [1., 3., 2., 4., 3., 6., 4., 7.]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| Bar::new(i as i64, c, c, c, c, 1.))
+            .collect();
+        let input = Input::new(&bars, Timeframe::D1);
+        let mut specs = specs();
+        specs[0].chart.as_mut().unwrap().visible = false;
+        specs.reverse();
+        let got = evaluate(&specs, &input);
+        let expected = super::super::ema(&super::super::rsi(&input.d.close, 3), 2);
+        assert!(
+            got[0].as_ref().unwrap()[0].values.iter().zip(expected).all(|(a, b)| a == &b || a.is_nan() && b.is_nan())
+        );
+    }
+
+    #[test]
+    fn missing_ports_cycles_and_pane_cycles_fail_explicitly() {
+        let bars = [];
+        let input = Input::new(&bars, Timeframe::D1);
+        let mut specs = specs();
+        assert!(!can_use_source(&specs, 1, 2), "RSI cannot consume its own EMA child");
+        assert!(can_use_source(&specs, 2, 1));
+        specs[0].chart.as_mut().unwrap().source = Source::Output { study: 2, output: "EMA".into() };
+        assert!(evaluate(&specs, &input).iter().all(Result::is_err));
+        specs[0].chart.as_mut().unwrap().source = Source::Bars;
+        specs[1].chart.as_mut().unwrap().source = Source::Output { study: 1, output: "missing".into() };
+        assert!(evaluate(&specs, &input)[1].is_err());
+        specs[0].chart.as_mut().unwrap().pane = Pane::With(2);
+        specs[1].chart.as_mut().unwrap().pane = Pane::With(1);
+        assert!(pane_key(&specs, 0).is_err());
+    }
+
+    #[test]
+    fn legacy_and_configured_studies_round_trip() {
+        let mut legacy: Vec<Spec> = serde_json::from_str(r#"["EMA 20",{"Rsi":14}]"#).unwrap();
+        assign_ids(&mut legacy);
+        assert_eq!(legacy[0].chart.as_ref().unwrap().id, 1);
+        legacy[1].chart.as_mut().unwrap().color = Some([20, 40, 60]);
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert_eq!(legacy, serde_json::from_str::<Vec<Spec>>(&json).unwrap());
+    }
+
+    #[test]
+    fn scalar_inputs_and_distinct_instances_do_not_change_price_input() {
+        let bars: Vec<_> = (1..=10).map(|i| Bar::new(i, 10., 12., 8., 11., i as f64)).collect();
+        let input = Input::new(&bars, Timeframe::D1);
+        let mut specs = vec![Spec::new("BB", &[3., 2.]).unwrap(), Spec::new("BB", &[5., 1.]).unwrap()];
+        assign_ids(&mut specs);
+        specs[0].chart.as_mut().unwrap().source = Source::Volume;
+        let outputs = evaluate(&specs, &input);
+        assert_eq!(outputs[0].as_ref().unwrap()[1].values[2], 2.);
+        assert_eq!(outputs[1].as_ref().unwrap()[1].values[4], 11.);
+        assert_ne!(specs[0].chart.as_ref().unwrap().id, specs[1].chart.as_ref().unwrap().id);
+        specs[0].chart.as_mut().unwrap().scale = Scale::Fixed { lo: 100., hi: 0. };
+        assert!(evaluate(&specs, &input)[0].is_err());
+    }
+
+    #[test]
+    fn missing_sources_and_unsupported_scalar_consumers_fail() {
+        let mut specs = specs();
+        let bars = [];
+        let input = Input::new(&bars, Timeframe::D1);
+        specs.remove(0);
+        assert!(evaluate(&specs, &input)[0].is_err());
+        let mut atr = Spec::new("ATR", &[]).unwrap();
+        atr.chart = Some(Settings::new(3, &atr));
+        atr.chart.as_mut().unwrap().source = Source::Volume;
+        assert!(evaluate(&[atr], &input)[0].is_err());
+    }
+
+    #[test]
+    fn migrating_legacy_entries_cannot_steal_existing_port_ids() {
+        let configured = specs();
+        let mut mixed = vec![Spec::new("BB", &[]).unwrap(), configured[0].clone(), configured[1].clone()];
+        assign_ids(&mut mixed);
+        assert_eq!(mixed[0].chart.as_ref().unwrap().id, 3);
+        assert_eq!(mixed[1].chart.as_ref().unwrap().id, 1);
+        assert_eq!(mixed[2].chart.as_ref().unwrap().source, Source::Output { study: 1, output: "RSI".into() });
+    }
+}

@@ -7,34 +7,26 @@ use super::volatility::true_range;
 use super::{NAN, Ohlcv, ago, from_first, ratio, zip};
 
 /// Relative Strength Index with Wilder smoothing (first value at index `n`).
-/// Single pass with no intermediate buffers: on large series the cost is dominated by
-/// first-touch of output memory, so only the output is allocated.
+/// Missing closes blank both the missing difference and the next one; smoothing
+/// retains its prior state and resumes once a finite adjacent pair is available.
 pub fn rsi(closes: &[f64], n: usize) -> Vec<f64> {
-    from_first(closes, |closes| {
-        let mut out = vec![NAN; closes.len()];
-        if n == 0 || closes.len() <= n {
-            return out;
+    let mut gains = vec![NAN; closes.len()];
+    let mut losses = gains.clone();
+    for i in 1..closes.len() {
+        let d = closes[i] - closes[i - 1];
+        if d.is_finite() {
+            gains[i] = d.max(0.0);
+            losses[i] = (-d).max(0.0);
         }
-        let value = |g: f64, l: f64| {
-            if l == 0.0 { if g == 0.0 { 50.0 } else { 100.0 } } else { 100.0 - 100.0 / (1.0 + g / l) }
-        };
-        let (mut ag, mut al) = (0.0, 0.0);
-        for i in 1..=n {
-            let d = closes[i] - closes[i - 1];
-            ag += d.max(0.0);
-            al += (-d).max(0.0);
+    }
+    zip(&rma(&gains, n), &rma(&losses, n), |g, l| {
+        if !g.is_finite() || !l.is_finite() {
+            NAN
+        } else if l == 0.0 {
+            if g == 0.0 { 50.0 } else { 100.0 }
+        } else {
+            100.0 - 100.0 / (1.0 + g / l)
         }
-        ag /= n as f64;
-        al /= n as f64;
-        out[n] = value(ag, al);
-        let alpha = 1.0 / n as f64;
-        for i in (n + 1)..closes.len() {
-            let d = closes[i] - closes[i - 1];
-            ag = alpha * d.max(0.0) + (1.0 - alpha) * ag;
-            al = alpha * (-d).max(0.0) + (1.0 - alpha) * al;
-            out[i] = value(ag, al);
-        }
-        out
     })
 }
 
@@ -60,6 +52,9 @@ impl Ema {
 
     /// Feed one value; returns the EMA once `n` values have been seen.
     fn push(&mut self, v: f64) -> Option<f64> {
+        if !v.is_finite() {
+            return None;
+        }
         self.seen += 1;
         if self.seen < self.n {
             self.acc += v;
@@ -634,6 +629,19 @@ mod tests {
             assert!(finite.len() > 300, "check {k} has {} values", finite.len());
             assert!(finite.iter().all(|x| *x >= lo - 1e-9 && *x <= hi + 1e-9), "check {k} out of range");
         }
+    }
+
+    #[test]
+    fn rsi_and_macd_preserve_gaps_and_recover() {
+        let input = [1., 2., 3., f64::NAN, 5., 6., 7., 8.];
+        let r = rsi(&input, 2);
+        assert!(r[3].is_nan() && r[4].is_nan());
+        assert_eq!(r[5], 100.);
+        let m = macd(&input, 2, 3, 2);
+        assert!(m.macd[3].is_nan() && m.signal[3].is_nan());
+        assert!(m.macd[4].is_finite() && m.signal[5].is_finite());
+        let leading = macd(&[f64::NAN, 1., 2., 3., 4., 5.], 2, 3, 2);
+        assert!(leading.histogram[4].is_finite());
     }
 
     #[test]

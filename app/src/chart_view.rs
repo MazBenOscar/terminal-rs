@@ -14,6 +14,7 @@ use tr_chart::scene::{self, ChartType, Overlay, PricePane, SeriesGpu};
 use tr_chart::viewport::{PriceScale, Viewport};
 use tr_congress::{Trade, TxType};
 use tr_core::indicators::registry::{self, Category};
+use tr_core::indicators::study::{self, Pane as StudyPane, Scale as StudyScale, Source as StudySource};
 use tr_core::{AssetClass, Bar, Security, Timeframe};
 
 use crate::command::{IndicatorSpec, Range};
@@ -115,10 +116,14 @@ pub struct ChartState {
     /// The workspace drew this chart's controls in the pane's tab strip, so skip the
     /// header row and give the plot the space.
     pub controls_in_strip: bool,
+    indicator_editor: bool,
+    indicator_search: String,
 }
 
 impl ChartState {
     pub fn new(id: PaneId, symbol: &str, tf: Timeframe) -> Self {
+        let mut indicators = crate::command::default_indicators();
+        study::assign_ids(&mut indicators);
         Self {
             id,
             symbol: tr_data::security(symbol).key(),
@@ -132,7 +137,7 @@ impl ChartState {
             magnet: false,
             show_volume: true,
             show_congress: true,
-            indicators: crate::command::default_indicators(),
+            indicators,
             drawings: Vec::new(),
             compare: None,
             bars: Arc::new(Vec::new()),
@@ -161,6 +166,8 @@ impl ChartState {
             actions: Vec::new(),
             hover_enabled: true,
             controls_in_strip: false,
+            indicator_editor: false,
+            indicator_search: String::new(),
         }
     }
 
@@ -170,6 +177,7 @@ impl ChartState {
 
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
+        study::assign_ids(&mut self.indicators);
         self.generation += 1;
         self.loading = true;
         self.paging = false;
@@ -255,22 +263,52 @@ impl ChartState {
     }
 
     pub fn toggle_indicator(&mut self, spec: IndicatorSpec, w: &Worker) {
-        if let Some(i) = self.indicators.iter().position(|s| s.same_kind(&spec)) {
-            if self.indicators[i] == spec {
-                self.indicators.remove(i);
-            } else {
-                self.indicators[i] = spec;
-            }
+        study::assign_ids(&mut self.indicators);
+        if let Some(i) = self.indicators.iter().position(|s| s.code == spec.code && s.params == spec.params) {
+            self.remove_study(i);
         } else {
             self.indicators.push(spec);
         }
+        study::assign_ids(&mut self.indicators);
         self.request_indicators(w);
+    }
+
+    /// A removed source also removes its calculation descendants. Pane-only links
+    /// survive in their own panes rather than dangling after the owner disappears.
+    fn remove_study(&mut self, index: usize) {
+        let Some(id) = self.indicators.get(index).and_then(|s| s.chart.as_ref()).map(|c| c.id) else { return };
+        let mut removed = std::collections::HashSet::from([id]);
+        loop {
+            let before = removed.len();
+            for spec in &self.indicators {
+                if let Some(c) = &spec.chart
+                    && let StudySource::Output { study, .. } = c.source
+                    && removed.contains(&study)
+                {
+                    removed.insert(c.id);
+                }
+            }
+            if removed.len() == before {
+                break;
+            }
+        }
+        self.indicators.retain(|s| s.chart.as_ref().is_none_or(|c| !removed.contains(&c.id)));
+        for spec in &mut self.indicators {
+            if let Some(c) = &mut spec.chart
+                && matches!(c.pane, StudyPane::With(id) if removed.contains(&id))
+            {
+                c.pane = StudyPane::Own;
+            }
+        }
+        self.built.retain(|b| b.spec.chart.as_ref().is_none_or(|c| !removed.contains(&c.id)));
     }
 
     /// Remove every instance of the indicator `code` (all moving averages of one kind).
     fn remove_indicator(&mut self, code: &str, w: &Worker) {
-        self.indicators.retain(|s| s.code != code);
-        self.built.retain(|b| b.spec.code != code);
+        study::assign_ids(&mut self.indicators);
+        while let Some(index) = self.indicators.iter().position(|s| s.code == code) {
+            self.remove_study(index);
+        }
         self.request_indicators(w);
     }
 
@@ -462,7 +500,7 @@ impl ChartState {
     }
 
     pub fn on_indicators(&mut self, generation: u64, built: Vec<BuiltIndicator>) {
-        if generation == self.generation {
+        if generation == self.generation && built.iter().map(|b| &b.spec).eq(self.indicators.iter()) {
             self.built = built;
         }
     }
@@ -518,7 +556,7 @@ impl ChartState {
     pub fn controls_width(ui: &Ui) -> f32 {
         let tf: Vec<&str> = Timeframe::ALL.iter().map(|t| t.label()).collect();
         let ct: Vec<&str> = ChartType::ALL.iter().map(|c| c.label()).collect();
-        widgets::segmented_width(ui, &tf, CONTROL_H) + widgets::segmented_width(ui, &ct, CONTROL_H) + 8.0
+        widgets::segmented_width(ui, &tf, CONTROL_H) + widgets::segmented_width(ui, &ct, CONTROL_H) + 84.0
     }
 
     /// Interval and chart-type controls, laid out left to right in `ui`. Returns whether
@@ -538,10 +576,16 @@ impl ChartState {
             self.chart_type = ChartType::ALL[i];
             clicked = true;
         }
+        if ui.small_button("Indicators…").clicked() {
+            self.indicator_editor = true;
+            clicked = true;
+        }
         clicked
     }
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
+        study::assign_ids(&mut self.indicators);
+        self.show_indicator_editor(ui.ctx(), w);
         let painter = ui.painter_at(rect);
         // Sits under a tab strip inside a card: square top, rounded bottom.
         let r = theme::CARD_RADIUS.saturating_sub(1);
@@ -583,6 +627,9 @@ impl ChartState {
                         }
                     }
                 });
+                if hui.small_button("Indicators…").clicked() {
+                    self.indicator_editor = true;
+                }
             }
         }
         if self.last_live.is_some_and(|t| t.elapsed().as_secs() < 5) {
@@ -645,16 +692,23 @@ impl ChartState {
         };
 
         // Split plot height between the price pane and oscillator sub-panes.
-        let pane_specs: Vec<usize> = (0..self.built.len()).filter(|&i| self.built[i].spec.is_pane()).collect();
-        let n_sub = pane_specs.len().min(MAX_SUB_PANES);
-        // Sub-panes share at most 60% of the plot so prices stay readable.
-        let sub_h = if n_sub > 0 {
-            (plot_all.height() * 0.2).clamp(50.0, 160.0).min(plot_all.height() * 0.6 / n_sub as f32)
-        } else {
-            0.0
-        };
+        let groups = study_groups(&self.built);
+        let pane_groups: Vec<_> = groups.iter().filter(|(key, _)| key.is_some()).take(MAX_SUB_PANES).collect();
+        let desired: Vec<f32> = pane_groups
+            .iter()
+            .map(|(key, members)| {
+                self.indicators
+                    .iter()
+                    .find_map(|s| s.chart.as_ref().filter(|c| Some(c.id) == *key).map(|c| c.height))
+                    .unwrap_or_else(|| self.built[members[0]].spec.chart.as_ref().map_or(120.0, |c| c.height))
+                    .clamp(40.0, 600.0)
+            })
+            .collect();
+        let total: f32 = desired.iter().sum();
+        let height_factor = if total > 0.0 { (plot_all.height() * 0.6 / total).min(1.0) } else { 1.0 };
+        let heights: Vec<_> = desired.iter().map(|h| h * height_factor).collect();
         let price_rect =
-            Rect::from_min_max(plot_all.min, pos2(plot_all.right(), plot_all.bottom() - sub_h * n_sub as f32));
+            Rect::from_min_max(plot_all.min, pos2(plot_all.right(), plot_all.bottom() - heights.iter().sum::<f32>()));
 
         let len = self.bars.len();
         if let Some(g) = self.glide.as_mut() {
@@ -671,6 +725,27 @@ impl ChartState {
 
         // ---- input ----
         let plot_resp = ui.interact(plot_all, ui.id().with((self.id, "plot")), Sense::click_and_drag());
+        // Register splitters after the plot so their drag target wins hit-testing,
+        // including the first mouse-down when arriving from outside the chart.
+        let mut divider_dragging = false;
+        let mut top = price_rect.bottom();
+        for ((key, _), height) in pane_groups.iter().zip(&heights) {
+            let hit = Rect::from_min_max(pos2(plot_all.left(), top - 3.0), pos2(plot_all.right(), top + 3.0));
+            let divider = ui.interact(hit, ui.id().with((self.id, "study-divider", key)), Sense::drag());
+            if divider.hovered() || divider.dragged() {
+                ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+            }
+            if divider.dragged() {
+                divider_dragging = true;
+                if let Some(c) =
+                    self.indicators.iter_mut().filter_map(|s| s.chart.as_mut()).find(|c| Some(c.id) == *key)
+                {
+                    c.height = (c.height - divider.drag_delta().y / height_factor.max(0.01)).clamp(40.0, 600.0);
+                }
+                self.request_indicators(w);
+            }
+            top += height;
+        }
         let axis_rect =
             Rect::from_min_max(pos2(price_rect.right(), price_rect.top()), pos2(body.right(), price_rect.bottom()));
         let axis_resp = ui.interact(axis_rect, ui.id().with((self.id, "paxis")), Sense::click_and_drag());
@@ -707,7 +782,7 @@ impl ChartState {
         if (self.draw.tool.is_none() && plot_resp.dragged()) || time_resp.dragged() {
             self.glide = None;
         }
-        if self.draw.tool.is_none() && plot_resp.dragged() {
+        if self.draw.tool.is_none() && plot_resp.dragged() && !divider_dragging {
             let d = plot_resp.drag_delta();
             self.viewport.as_mut().expect("viewport").pan_px(d.x as f64);
             if let Some(s) = self.manual_scale.as_mut() {
@@ -743,10 +818,11 @@ impl ChartState {
         }
 
         // ---- price pane GPU frame ----
-        let mut overlays: Vec<Overlay> = self
-            .built
+        let mut overlays: Vec<Overlay> = groups
             .iter()
-            .filter(|b| !b.spec.is_pane())
+            .filter(|(key, _)| key.is_none())
+            .flat_map(|(_, members)| members.iter().map(|&i| &self.built[i]))
+            .filter(|b| b.spec.chart.as_ref().is_none_or(|c| c.scale == StudyScale::Shared))
             .flat_map(|b| b.overlays.iter().map(|o| o.1.clone()))
             .collect();
         if let Some(c) = &self.compare_line {
@@ -793,7 +869,7 @@ impl ChartState {
             }
             None => self.ease_scale(ui.ctx(), scene::autoscale(&pane)),
         });
-        let out = scene::price_pane(&pane);
+        let mut out = scene::price_pane(&pane);
         let mut scale = out.scale;
         scale.height_px = price_rect.height() as f64;
         if axis_resp.dragged() {
@@ -817,20 +893,55 @@ impl ChartState {
             price_painter.hline(price_rect.x_range(), y, Stroke::new(1.0, theme::grid()));
         }
         let frame_no = ui.ctx().cumulative_frame_nr();
+        // Independent overlays use their own transform without changing price autoscale.
+        let mut price_study_scales = Vec::new();
+        if let Some((_, members)) = groups.iter().find(|(key, _)| key.is_none()) {
+            for &index in members {
+                let b = &self.built[index];
+                if b.spec.chart.as_ref().is_some_and(|c| c.scale != StudyScale::Shared) {
+                    let fixed = study_fixed_range(&b.spec);
+                    let ovs: Vec<_> = b.overlays.iter().map(|o| o.1.clone()).collect();
+                    let separate = scene::sub_pane(&ovs, &v, price_rect.height() as f64, fixed, style);
+                    out.cmds.extend(separate.cmds);
+                    price_study_scales.push((price_rect, index, separate.scale));
+                }
+            }
+        }
         let frame = Frame { pane: self.id * 8, frame_no, cmds: out.cmds };
         ui.painter().add(tr_chart::egui_wgpu::Callback::new_paint_callback(price_rect, ChartCallback(Arc::new(frame))));
 
         // Sub panes.
         let mut sub_rects = Vec::new();
-        for (k, &bi) in pane_specs.iter().take(n_sub).enumerate() {
-            let b = &self.built[bi];
-            let top = price_rect.bottom() + sub_h * k as f32;
-            let r = Rect::from_min_max(pos2(plot_all.left(), top), pos2(plot_all.right(), top + sub_h));
+        let mut top = price_rect.bottom();
+        for (k, ((key, members), &height)) in pane_groups.iter().zip(&heights).enumerate() {
+            let r = Rect::from_min_max(pos2(plot_all.left(), top), pos2(plot_all.right(), top + height));
+            top += height;
+            let b = self
+                .built
+                .iter()
+                .find(|b| b.spec.chart.as_ref().is_some_and(|c| Some(c.id) == *key))
+                .unwrap_or(&self.built[members[0]]);
             let def = b.spec.def();
-            let ovs: Vec<Overlay> = b.overlays.iter().map(|o| o.1.clone()).collect();
+            let ovs: Vec<Overlay> = members
+                .iter()
+                .filter(|&&i| self.built[i].spec.chart.as_ref().is_none_or(|c| c.scale == StudyScale::Shared))
+                .flat_map(|&i| self.built[i].overlays.iter().map(|o| o.1.clone()))
+                .collect();
             let mut s = style;
             s.thickness_px = 1.3;
-            let so = scene::sub_pane(&ovs, &v, r.height() as f64, def.and_then(|d| d.range), s);
+            let mut so = scene::sub_pane(&ovs, &v, r.height() as f64, study_fixed_range(&b.spec), s);
+            for &bi in members {
+                let b = &self.built[bi];
+                let scale = if b.spec.chart.as_ref().is_some_and(|c| c.scale != StudyScale::Shared) {
+                    let ovs: Vec<_> = b.overlays.iter().map(|o| o.1.clone()).collect();
+                    let separate = scene::sub_pane(&ovs, &v, r.height() as f64, study_fixed_range(&b.spec), s);
+                    so.cmds.extend(separate.cmds);
+                    separate.scale
+                } else {
+                    so.scale
+                };
+                sub_rects.push((r, bi, scale));
+            }
             let p = ui.painter_at(r);
             p.hline(r.x_range(), r.top(), Stroke::new(1.0, theme::border()));
             for &lvl in def.map_or(&[][..], |d| d.levels) {
@@ -841,8 +952,8 @@ impl ChartState {
             }
             let frame = Frame { pane: self.id * 8 + 1 + k as u64, frame_no, cmds: so.cmds };
             ui.painter().add(tr_chart::egui_wgpu::Callback::new_paint_callback(r, ChartCallback(Arc::new(frame))));
-            sub_rects.push((r, bi, so.scale));
         }
+        sub_rects.extend(price_study_scales);
 
         // ---- axes ----
         let axis_painter = ui.painter_at(Rect::from_min_max(pos2(plot_all.right(), body.top()), body.max));
@@ -864,19 +975,32 @@ impl ChartState {
                 );
             }
         }
-        for (r, bi, s) in &sub_rects {
+        for (at, (r, bi, s)) in sub_rects.iter().enumerate() {
             let label = self.built[*bi].spec.label();
-            ui.painter_at(*r).text(r.left_top() + vec2(6.0, 3.0), Align2::LEFT_TOP, label, mono(10.5), muted());
+            let row = sub_rects[..at].iter().filter(|(other, _, _)| other == r).count();
+            let separate = self.built[*bi].spec.chart.as_ref().is_some_and(|c| c.scale != StudyScale::Shared);
+            let color = self.built[*bi].overlays.first().map_or(muted(), |(_, o)| opaque(o));
+            if *r != price_rect {
+                ui.painter_at(*r).text(
+                    r.left_top() + vec2(6.0, 3.0 + row as f32 * 14.0),
+                    Align2::LEFT_TOP,
+                    label,
+                    mono(10.5),
+                    color,
+                );
+            }
+            if row > 0 && !separate {
+                continue;
+            }
             for t in scale::price_ticks(s.lo, s.hi, 3) {
                 let y = r.top() + s.y_of(t) as f32;
                 if y > r.top() + 8.0 && y < r.bottom() - 4.0 {
-                    axis_painter.text(
-                        pos2(plot_all.right() + 6.0, y),
-                        Align2::LEFT_CENTER,
-                        scale::format_value(t),
-                        mono(10.5),
-                        muted(),
-                    );
+                    let (painter, x, align) = if separate {
+                        (ui.painter_at(*r), r.left() + 50.0 + row as f32 * 52.0, Align2::RIGHT_CENTER)
+                    } else {
+                        (axis_painter.clone(), plot_all.right() + 6.0, Align2::LEFT_CENTER)
+                    };
+                    painter.text(pos2(x, y), align, scale::format_value(t), mono(10.5), color);
                 }
             }
         }
@@ -999,6 +1123,206 @@ impl ChartState {
         clicked
     }
 
+    fn show_indicator_editor(&mut self, ctx: &egui::Context, w: &Worker) {
+        if !self.indicator_editor {
+            return;
+        }
+        let mut open = true;
+        let before = self.indicators.clone();
+        let mut remove = None;
+        let mut reorder = None;
+        egui::Window::new(format!("Indicators · {}", self.sec.ticker))
+            .id(egui::Id::new((self.id, "indicator-editor")))
+            .open(&mut open)
+            .default_width(440.0)
+            .default_height(560.0)
+            .show(ctx, |ui| {
+                ui.label("Edit inputs, display panes and scales independently.");
+                ui.horizontal(|ui| {
+                    ui.label("Add indicator");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.indicator_search)
+                            .hint_text("Search indicators")
+                            .desired_width(ui.available_width()),
+                    );
+                });
+                let query = self.indicator_search.to_ascii_lowercase();
+                egui::ComboBox::from_id_salt("add-study")
+                    .selected_text("Choose an indicator…")
+                    .width(ui.available_width())
+                    .height(220.0)
+                    .show_ui(ui, |ui| {
+                        for def in registry::all().iter().filter(|d| {
+                            query.is_empty()
+                                || d.name.to_ascii_lowercase().contains(&query)
+                                || d.code.to_ascii_lowercase().contains(&query)
+                        }) {
+                            if ui.selectable_label(false, format!("{} · {}", def.code, def.name)).clicked() {
+                                self.indicators.push(IndicatorSpec::of(def));
+                            }
+                        }
+                    });
+                ui.separator();
+                if before.is_empty() {
+                    ui.label("Add an indicator to start configuring this chart.");
+                }
+                egui::ScrollArea::vertical().id_salt("study-list").max_height(470.0).show(ui, |ui| {
+                    for (index, spec) in self.indicators.iter_mut().enumerate() {
+                        let Some(c) = &mut spec.chart else { continue };
+                        ui.push_id(c.id, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut c.visible, "Visible")
+                                    .on_hover_text("Show on chart; hidden studies still supply data");
+                                ui.label(RichText::new(format!("{} #{}", spec.code, c.id)).color(amber()));
+                                if ui.add_enabled(index > 0, egui::Button::new("Move up")).clicked() {
+                                    reorder = Some(index);
+                                }
+                                if ui
+                                    .button("Remove")
+                                    .on_hover_text("Also removes indicators calculated from this one")
+                                    .clicked()
+                                {
+                                    remove = Some(index);
+                                }
+                            });
+                            if let Some(def) = registry::find(&spec.code) {
+                                ui.label(RichText::new(def.name).small().color(muted()));
+                                egui::Grid::new("parameters").num_columns(2).show(ui, |ui| {
+                                    for (param, value) in def.params.iter().zip(&mut spec.params) {
+                                        ui.label(param.name);
+                                        let response = ui.add(
+                                            egui::DragValue::new(value)
+                                                .range(param.min..=param.max)
+                                                .speed(if param.int { 1.0 } else { 0.05 }),
+                                        );
+                                        if response.changed() && param.int {
+                                            *value = value.round();
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            }
+                            if study::accepts_source(&spec.code) {
+                                egui::ComboBox::from_id_salt("source")
+                                    .selected_text(study_source_label(&c.source, &before))
+                                    .width(300.0)
+                                    .show_ui(ui, |ui| {
+                                        for (label, source) in [
+                                            ("Original bars", StudySource::Bars),
+                                            ("Open", StudySource::Open),
+                                            ("High", StudySource::High),
+                                            ("Low", StudySource::Low),
+                                            ("Close", StudySource::Close),
+                                            ("Volume", StudySource::Volume),
+                                            ("Typical price (HLC3)", StudySource::Hlc3),
+                                        ] {
+                                            ui.selectable_value(&mut c.source, source, label);
+                                        }
+                                        for b in &self.built {
+                                            let Some(parent) = &b.spec.chart else { continue };
+                                            if !study::can_use_source(&before, c.id, parent.id) {
+                                                continue;
+                                            }
+                                            for (name, _) in &b.overlays {
+                                                ui.selectable_value(
+                                                    &mut c.source,
+                                                    StudySource::Output { study: parent.id, output: name.clone() },
+                                                    format!("{} #{} · {name}", b.spec.label(), parent.id),
+                                                );
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("Calculation input; independent of display placement");
+                            }
+                            egui::ComboBox::from_id_salt("pane")
+                                .selected_text(match c.pane {
+                                    StudyPane::Price => "Pane: Price".into(),
+                                    StudyPane::Own => "Pane: Own".into(),
+                                    StudyPane::With(id) => format!("Pane: With #{id}"),
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut c.pane, StudyPane::Price, "Price pane");
+                                    ui.selectable_value(&mut c.pane, StudyPane::Own, "Own pane");
+                                    for (other_index, other) in before.iter().enumerate() {
+                                        if let Some(other_c) = &other.chart
+                                            && other_c.id != c.id
+                                            && study::pane_key(&before, other_index).is_ok_and(|key| key != Some(c.id))
+                                        {
+                                            ui.selectable_value(
+                                                &mut c.pane,
+                                                StudyPane::With(other_c.id),
+                                                format!("With {} #{}", other.label(), other_c.id),
+                                            );
+                                        }
+                                    }
+                                });
+                            egui::ComboBox::from_id_salt("scale")
+                                .selected_text(match c.scale {
+                                    StudyScale::Shared => "Scale: Share pane axis",
+                                    StudyScale::Independent => "Scale: Independent",
+                                    StudyScale::Fixed { .. } => "Scale: Fixed range",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut c.scale, StudyScale::Shared, "Share pane axis");
+                                    ui.selectable_value(&mut c.scale, StudyScale::Independent, "Independent axis");
+                                    if ui
+                                        .selectable_label(matches!(c.scale, StudyScale::Fixed { .. }), "Fixed range…")
+                                        .clicked()
+                                    {
+                                        let (lo, hi) =
+                                            registry::find(&spec.code).and_then(|d| d.range).unwrap_or((0.0, 100.0));
+                                        c.scale = StudyScale::Fixed { lo, hi };
+                                    }
+                                });
+                            if let StudyScale::Fixed { lo, hi } = &mut c.scale {
+                                ui.horizontal(|ui| {
+                                    ui.label("Min");
+                                    ui.add(egui::DragValue::new(lo));
+                                    ui.label("Max");
+                                    ui.add(egui::DragValue::new(hi));
+                                });
+                            }
+                            ui.horizontal(|ui| {
+                                let mut custom = c.color.is_some();
+                                if ui.checkbox(&mut custom, "Custom color").changed() {
+                                    c.color =
+                                        custom.then_some(theme::series(index).to_array()[..3].try_into().unwrap());
+                                }
+                                if let Some(color) = &mut c.color {
+                                    ui.color_edit_button_srgb(color);
+                                }
+                            });
+                            if let Some(error) = self
+                                .built
+                                .iter()
+                                .find(|b| b.spec.chart.as_ref().is_some_and(|s| s.id == c.id))
+                                .and_then(|b| b.error.as_ref())
+                            {
+                                ui.label(RichText::new(error).color(theme::down()));
+                            }
+                            ui.separator();
+                        });
+                    }
+                });
+                ui.label(
+                    RichText::new("Drag a chart pane divider to resize. Settings save with the workspace.")
+                        .small()
+                        .color(muted()),
+                );
+            });
+        self.indicator_editor = open;
+        if let Some(index) = remove {
+            self.remove_study(index);
+        } else if let Some(index) = reorder {
+            self.indicators.swap(index, index - 1);
+        }
+        study::assign_ids(&mut self.indicators);
+        if self.indicators != before {
+            self.request_indicators(w);
+        }
+    }
+
     fn context_menu(&mut self, ui: &mut Ui, w: &Worker) {
         ui.set_min_width(190.0);
         if ui.button("Reset View").clicked() {
@@ -1015,6 +1339,10 @@ impl ChartState {
         });
         ui.menu_button("Indicators", |ui| {
             ui.set_min_width(220.0);
+            if ui.button("Manage Indicators…").clicked() {
+                self.indicator_editor = true;
+                ui.close();
+            }
             if ui.button("Search Indicators…").clicked() {
                 self.actions.push(Action::Command("IND".into()));
                 ui.close();
@@ -1109,7 +1437,12 @@ impl ChartState {
         // Overlay indicator values, one per line.
         let mut ly = y + 16.0;
         let value_at = |l: &LineRef| l.pyramid.data.get(i).map(|p| p[1] as f64).filter(|v| v.is_finite());
-        for bi in self.built.iter().filter(|b| !b.spec.is_pane()) {
+        let groups = study_groups(&self.built);
+        for bi in groups
+            .iter()
+            .filter(|(key, _)| key.is_none())
+            .flat_map(|(_, members)| members.iter().map(|&index| &self.built[index]))
+        {
             let vals: Vec<String> = bi
                 .overlays
                 .iter()
@@ -1125,7 +1458,7 @@ impl ChartState {
             );
             ly += 14.0;
         }
-        let hidden = self.built.iter().filter(|b| b.spec.is_pane()).count().saturating_sub(sub_rects.len());
+        let hidden = groups.iter().filter(|(key, _)| key.is_some()).count().saturating_sub(MAX_SUB_PANES);
         if hidden > 0 {
             let note =
                 format!("+{hidden} more oscillator{} (max {MAX_SUB_PANES} panes)", if hidden == 1 { "" } else { "s" });
@@ -1157,9 +1490,10 @@ impl ChartState {
                 amber(),
             );
         }
-        for (r, bi, _) in sub_rects {
+        for (at, (r, bi, _)) in sub_rects.iter().enumerate().filter(|(_, (r, _, _))| *r != price_rect) {
             let b = &self.built[*bi];
             let painter = ui.painter_at(*r);
+            let row = sub_rects[..at].iter().filter(|(other, _, _)| other == r).count();
             // Values start after the pane's label (drawn with the axes).
             let mut x = r.left() + 18.0 + painter.layout_no_wrap(b.spec.label(), mono(10.5), muted()).size().x;
             for (name, o) in &b.overlays {
@@ -1167,7 +1501,7 @@ impl ChartState {
                 let color = if o.kind == LineKind::Hist { text() } else { opaque(o) };
                 let g = painter.layout_no_wrap(format!("{name} {}", scale::format_value(v)), mono(10.5), color);
                 let w = g.size().x;
-                painter.galley(pos2(x, r.top() + 3.0), g, color);
+                painter.galley(pos2(x, r.top() + 3.0 + row as f32 * 14.0), g, color);
                 x += w + 10.0;
             }
         }
@@ -1364,6 +1698,45 @@ impl ChartState {
     }
 }
 
+fn study_source_label(source: &StudySource, specs: &[IndicatorSpec]) -> String {
+    match source {
+        StudySource::Bars => "Input: Original bars".into(),
+        StudySource::Output { study, output } => {
+            let label = specs
+                .iter()
+                .find(|s| s.chart.as_ref().is_some_and(|c| c.id == *study))
+                .map_or_else(|| "Missing indicator".into(), IndicatorSpec::label);
+            format!("Input: {label} #{study} · {output}")
+        }
+        other => format!("Input: {other:?}"),
+    }
+}
+
+fn study_fixed_range(spec: &IndicatorSpec) -> Option<(f64, f64)> {
+    match spec.chart.as_ref().map(|c| c.scale) {
+        Some(StudyScale::Fixed { lo, hi }) if lo.is_finite() && hi.is_finite() && lo < hi => Some((lo, hi)),
+        _ => spec.def().and_then(|d| d.range),
+    }
+}
+
+/// Group visible studies by stable pane identity, independent of calculation input.
+fn study_groups(built: &[BuiltIndicator]) -> Vec<(Option<u32>, Vec<usize>)> {
+    let specs: Vec<_> = built.iter().map(|b| b.spec.clone()).collect();
+    let mut groups: Vec<(Option<u32>, Vec<usize>)> = Vec::new();
+    for (i, spec) in specs.iter().enumerate() {
+        if spec.chart.as_ref().is_some_and(|c| !c.visible) {
+            continue;
+        }
+        let key = study::pane_key(&specs, i).unwrap_or(Some(i as u32 + 1));
+        if let Some((_, members)) = groups.iter_mut().find(|(group, _)| *group == key) {
+            members.push(i);
+        } else {
+            groups.push((key, vec![i]));
+        }
+    }
+    groups
+}
+
 fn opaque(o: &Overlay) -> Color32 {
     let [r, g, b, _] = o.color.map(|c| (c.clamp(0.0, 1.0) * 255.0) as u8);
     Color32::from_rgb(r, g, b)
@@ -1438,6 +1811,88 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_divider_drag_resizes_instead_of_panning() {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.indicators = vec![IndicatorSpec::new("RSI", &[]).unwrap()];
+        study::assign_ids(&mut chart.indicators);
+        chart.bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 500, 1_790_000_000));
+        chart.gpu = Some(SeriesGpu::build(&chart.bars));
+        chart.built = crate::worker::build_indicators(&chart.bars, chart.tf, &chart.indicators, &theme::palette());
+        let worker = Worker::inert();
+        let ctx = egui::Context::default();
+        let frame = |chart: &mut ChartState, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900., 560.))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    chart.show(ui, ui.max_rect(), true, &worker);
+                },
+            );
+            output.textures_delta.clear();
+        };
+        frame(&mut chart, vec![]);
+        let right = chart.viewport.unwrap().right;
+        let at = pos2(600., 560. - RANGE_H - TIME_H - 120.);
+        frame(&mut chart, vec![egui::Event::PointerMoved(at)]);
+        frame(
+            &mut chart,
+            vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let to = at - vec2(0., 40.);
+        frame(&mut chart, vec![egui::Event::PointerMoved(to)]);
+        frame(
+            &mut chart,
+            vec![egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(chart.indicators[0].chart.as_ref().unwrap().height >= 150.);
+        assert_eq!(chart.viewport.unwrap().right, right);
+    }
+
+    #[test]
+    fn removing_a_source_removes_only_calculation_descendants() {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.indicators =
+            ["RSI", "EMA", "BB", "MACD"].iter().map(|code| IndicatorSpec::new(code, &[]).unwrap()).collect();
+        study::assign_ids(&mut chart.indicators);
+        chart.indicators[1].chart.as_mut().unwrap().source = StudySource::Output { study: 1, output: "RSI".into() };
+        chart.indicators[2].chart.as_mut().unwrap().source = StudySource::Output { study: 2, output: "EMA".into() };
+        chart.indicators[3].chart.as_mut().unwrap().pane = StudyPane::With(1);
+        chart.remove_study(0);
+        assert_eq!(chart.indicators.len(), 1);
+        assert_eq!(chart.indicators[0].code, "MACD");
+        assert_eq!(chart.indicators[0].chart.as_ref().unwrap().pane, StudyPane::Own);
+    }
+
+    #[test]
+    fn grouping_and_stale_results_respect_instance_settings() {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.indicators =
+            ["RSI", "EMA", "BB", "BB"].iter().map(|code| IndicatorSpec::new(code, &[]).unwrap()).collect();
+        study::assign_ids(&mut chart.indicators);
+        chart.indicators[1].chart.as_mut().unwrap().pane = StudyPane::With(1);
+        chart.indicators[2].chart.as_mut().unwrap().visible = false;
+        let bars = tr_core::sample::generate("AAPL", Timeframe::D1, 100, 1_790_000_000);
+        let built = crate::worker::build_indicators(&bars, Timeframe::D1, &chart.indicators, &theme::palette());
+        assert_eq!(study_groups(&built), vec![(Some(1), vec![0, 1]), (None, vec![3])]);
+        chart.indicators[0].params[0] = 2.;
+        chart.on_indicators(chart.generation, built);
+        assert!(chart.built.is_empty(), "a superseded parameter response cannot replace current studies");
+    }
 
     #[test]
     fn glide_pans_linearly_and_zooms_evenly() {

@@ -1,0 +1,7000 @@
+{
+  "gap_probe": {
+    "ema3": [
+      "NaN",
+      "NaN",
+      "2.00000000",
+      "NaN",
+      "3.50000000",
+      "4.75000000",
+      "5.87500000",
+      "6.93750000"
+    ],
+    "input": [
+      "1.00000000",
+      "2.00000000",
+      "3.00000000",
+      "NaN",
+      "5.00000000",
+      "6.00000000",
+      "7.00000000",
+      "8.00000000"
+    ],
+    "macd_2_3_2": {
+      "histogram": [
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN"
+      ],
+      "line": [
+        "NaN",
+        "NaN",
+        "0.50000000",
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN"
+      ],
+      "signal": [
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN",
+        "NaN"
+      ]
+    },
+    "rsi3": [
+      "NaN",
+      "NaN",
+      "NaN",
+      "100.00000000",
+      "100.00000000",
+      "100.00000000",
+      "100.00000000",
+      "100.00000000"
+    ]
+  },
+  "indicators": [
+    {
+      "aliases": [],
+      "category": "Moving Averages",
+      "code": "SMA",
+      "multi": true,
+      "name": "Simple Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "SMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 445
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Moving Averages",
+      "code": "EMA",
+      "multi": true,
+      "name": "Exponential Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "EMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 446
+      }
+    },
+    {
+      "aliases": [
+        "LWMA"
+      ],
+      "category": "Moving Averages",
+      "code": "WMA",
+      "multi": true,
+      "name": "Weighted Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "WMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 449
+      }
+    },
+    {
+      "aliases": [
+        "SMMA",
+        "WILDERS"
+      ],
+      "category": "Moving Averages",
+      "code": "RMA",
+      "multi": true,
+      "name": "Smoothed Moving Average (Wilder)",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "RMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 453
+      }
+    },
+    {
+      "aliases": [
+        "HULL"
+      ],
+      "category": "Moving Averages",
+      "code": "HMA",
+      "multi": true,
+      "name": "Hull Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2990,
+          "first_finite_index_on_probe": 10,
+          "length": 3000,
+          "name": "HMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 457
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Moving Averages",
+      "code": "DEMA",
+      "multi": true,
+      "name": "Double Exponential Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2962,
+          "first_finite_index_on_probe": 38,
+          "length": 3000,
+          "name": "DEMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 461
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Moving Averages",
+      "code": "TEMA",
+      "multi": true,
+      "name": "Triple Exponential Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2943,
+          "first_finite_index_on_probe": 57,
+          "length": 3000,
+          "name": "TEMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 464
+      }
+    },
+    {
+      "aliases": [
+        "TMA"
+      ],
+      "category": "Moving Averages",
+      "code": "TRIMA",
+      "multi": true,
+      "name": "Triangular Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "TRIMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 467
+      }
+    },
+    {
+      "aliases": [
+        "KAUFMAN"
+      ],
+      "category": "Moving Averages",
+      "code": "KAMA",
+      "multi": true,
+      "name": "Kaufman Adaptive Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2991,
+          "first_finite_index_on_probe": 9,
+          "length": 3000,
+          "name": "KAMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 2.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 30.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 471
+      }
+    },
+    {
+      "aliases": [
+        "ZLMA"
+      ],
+      "category": "Moving Averages",
+      "code": "ZLEMA",
+      "multi": true,
+      "name": "Zero-Lag Exponential Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2972,
+          "first_finite_index_on_probe": 28,
+          "length": 3000,
+          "name": "ZLEMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 479
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Moving Averages",
+      "code": "ALMA",
+      "multi": true,
+      "name": "Arnaud Legoux Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2992,
+          "first_finite_index_on_probe": 8,
+          "length": 3000,
+          "name": "ALMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 0.85,
+          "integer": false,
+          "max": 1.0,
+          "min": 0.0,
+          "name": "Offset"
+        },
+        {
+          "default": 6.0,
+          "integer": false,
+          "max": 100.0,
+          "min": 0.1,
+          "name": "Sigma"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 483
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Moving Averages",
+      "code": "VWMA",
+      "multi": true,
+      "name": "Volume-Weighted Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "VWMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 488
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Moving Averages",
+      "code": "EVWMA",
+      "multi": true,
+      "name": "Elastic Volume-Weighted Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "EVWMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 491
+      }
+    },
+    {
+      "aliases": [
+        "TILLSON"
+      ],
+      "category": "Moving Averages",
+      "code": "T3",
+      "multi": true,
+      "name": "Tillson T3 Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2976,
+          "first_finite_index_on_probe": 24,
+          "length": 3000,
+          "name": "T3",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 0.7,
+          "integer": false,
+          "max": 1.0,
+          "min": 0.0,
+          "name": "Volume Factor"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 496
+      }
+    },
+    {
+      "aliases": [
+        "MCG"
+      ],
+      "category": "Moving Averages",
+      "code": "MCGINLEY",
+      "multi": true,
+      "name": "McGinley Dynamic",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "MCGINLEY",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 501
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Moving Averages",
+      "code": "VIDYA",
+      "multi": true,
+      "name": "Variable Index Dynamic Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2991,
+          "first_finite_index_on_probe": 9,
+          "length": 3000,
+          "name": "VIDYA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "CMO Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 505
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Moving Averages",
+      "code": "FRAMA",
+      "multi": true,
+      "name": "Fractal Adaptive Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2985,
+          "first_finite_index_on_probe": 15,
+          "length": 3000,
+          "name": "FRAMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 16.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 509
+      }
+    },
+    {
+      "aliases": [
+        "SSF",
+        "SUPERSMOOTH"
+      ],
+      "category": "Moving Averages",
+      "code": "SUPERSMOOTHER",
+      "multi": true,
+      "name": "Ehlers Super Smoother",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "SSF",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 512
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Moving Averages",
+      "code": "DECYCLER",
+      "multi": true,
+      "name": "Ehlers Simple Decycler",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "Decycler",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 125.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 3.0,
+          "name": "Cutoff"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 516
+      }
+    },
+    {
+      "aliases": [
+        "MESA",
+        "FAMA"
+      ],
+      "category": "Moving Averages",
+      "code": "MAMA",
+      "multi": false,
+      "name": "MESA Adaptive Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2994,
+          "first_finite_index_on_probe": 6,
+          "length": 3000,
+          "name": "MAMA",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2994,
+          "first_finite_index_on_probe": 6,
+          "length": 3000,
+          "name": "FAMA",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 0.5,
+          "integer": false,
+          "max": 0.99,
+          "min": 0.01,
+          "name": "Fast Limit"
+        },
+        {
+          "default": 0.05,
+          "integer": false,
+          "max": 0.99,
+          "min": 0.01,
+          "name": "Slow Limit"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 519
+      }
+    },
+    {
+      "aliases": [
+        "INSTTREND"
+      ],
+      "category": "Moving Averages",
+      "code": "ITREND",
+      "multi": false,
+      "name": "Ehlers Instantaneous Trendline",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "Trend",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2998,
+          "first_finite_index_on_probe": 2,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 0.07,
+          "integer": false,
+          "max": 0.99,
+          "min": 0.01,
+          "name": "Alpha"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 526
+      }
+    },
+    {
+      "aliases": [
+        "LINREG"
+      ],
+      "category": "Moving Averages",
+      "code": "LSMA",
+      "multi": true,
+      "name": "Least Squares Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2976,
+          "first_finite_index_on_probe": 24,
+          "length": 3000,
+          "name": "LSMA",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 25.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 529
+      }
+    },
+    {
+      "aliases": [
+        "GUPPY"
+      ],
+      "category": "Moving Averages",
+      "code": "GMMA",
+      "multi": false,
+      "name": "Guppy Multiple Moving Average",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2998,
+          "first_finite_index_on_probe": 2,
+          "length": 3000,
+          "name": "EMA 3",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2996,
+          "first_finite_index_on_probe": 4,
+          "length": 3000,
+          "name": "EMA 5",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2993,
+          "first_finite_index_on_probe": 7,
+          "length": 3000,
+          "name": "EMA 8",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2991,
+          "first_finite_index_on_probe": 9,
+          "length": 3000,
+          "name": "EMA 10",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2989,
+          "first_finite_index_on_probe": 11,
+          "length": 3000,
+          "name": "EMA 12",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "EMA 15",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2971,
+          "first_finite_index_on_probe": 29,
+          "length": 3000,
+          "name": "EMA 30",
+          "plot": "Line",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2966,
+          "first_finite_index_on_probe": 34,
+          "length": 3000,
+          "name": "EMA 35",
+          "plot": "Line",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2961,
+          "first_finite_index_on_probe": 39,
+          "length": 3000,
+          "name": "EMA 40",
+          "plot": "Line",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2956,
+          "first_finite_index_on_probe": 44,
+          "length": 3000,
+          "name": "EMA 45",
+          "plot": "Line",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2951,
+          "first_finite_index_on_probe": 49,
+          "length": 3000,
+          "name": "EMA 50",
+          "plot": "Line",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2941,
+          "first_finite_index_on_probe": 59,
+          "length": 3000,
+          "name": "EMA 60",
+          "plot": "Line",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 533
+      }
+    },
+    {
+      "aliases": [
+        "BOLL",
+        "BOLLINGER",
+        "BBANDS"
+      ],
+      "category": "Bands & Channels",
+      "code": "BB",
+      "multi": false,
+      "name": "Bollinger Bands",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Upper",
+          "plot": "Line",
+          "tone": "Dim"
+        },
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Basis",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Lower",
+          "plot": "Line",
+          "tone": "Dim"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 2.0,
+          "integer": false,
+          "max": 10.0,
+          "min": 0.1,
+          "name": "StdDev"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 544
+      }
+    },
+    {
+      "aliases": [
+        "KELTNER",
+        "KELT"
+      ],
+      "category": "Bands & Channels",
+      "code": "KC",
+      "multi": false,
+      "name": "Keltner Channels",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Upper",
+          "plot": "Line",
+          "tone": "Dim"
+        },
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Basis",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Lower",
+          "plot": "Line",
+          "tone": "Dim"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 2.0,
+          "integer": false,
+          "max": 10.0,
+          "min": 0.1,
+          "name": "Multiplier"
+        },
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ATR Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 548
+      }
+    },
+    {
+      "aliases": [
+        "DC",
+        "DONCH",
+        "PRICECHANNEL"
+      ],
+      "category": "Bands & Channels",
+      "code": "DONCHIAN",
+      "multi": false,
+      "name": "Donchian Channels",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Upper",
+          "plot": "Line",
+          "tone": "Dim"
+        },
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Basis",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Lower",
+          "plot": "Line",
+          "tone": "Dim"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 553
+      }
+    },
+    {
+      "aliases": [
+        "ENVELOPE",
+        "ENVELOPES"
+      ],
+      "category": "Bands & Channels",
+      "code": "ENV",
+      "multi": false,
+      "name": "Moving Average Envelopes",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Upper",
+          "plot": "Line",
+          "tone": "Dim"
+        },
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Basis",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Lower",
+          "plot": "Line",
+          "tone": "Dim"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 2.5,
+          "integer": false,
+          "max": 50.0,
+          "min": 0.01,
+          "name": "Percent"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 556
+      }
+    },
+    {
+      "aliases": [
+        "ABANDS"
+      ],
+      "category": "Bands & Channels",
+      "code": "ACCBANDS",
+      "multi": false,
+      "name": "Acceleration Bands",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Upper",
+          "plot": "Line",
+          "tone": "Dim"
+        },
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Basis",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Lower",
+          "plot": "Line",
+          "tone": "Dim"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 4.0,
+          "integer": false,
+          "max": 20.0,
+          "min": 0.1,
+          "name": "Factor"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 560
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Bands & Channels",
+      "code": "STARC",
+      "multi": false,
+      "name": "STARC Bands",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "Upper",
+          "plot": "Line",
+          "tone": "Dim"
+        },
+        {
+          "finite_count_on_probe": 2995,
+          "first_finite_index_on_probe": 5,
+          "length": 3000,
+          "name": "Basis",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "Lower",
+          "plot": "Line",
+          "tone": "Dim"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 6.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "SMA Length"
+        },
+        {
+          "default": 15.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ATR Length"
+        },
+        {
+          "default": 2.0,
+          "integer": false,
+          "max": 10.0,
+          "min": 0.1,
+          "name": "Multiplier"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 564
+      }
+    },
+    {
+      "aliases": [
+        "STDERRBANDS"
+      ],
+      "category": "Bands & Channels",
+      "code": "SEB",
+      "multi": false,
+      "name": "Standard Error Bands",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2978,
+          "first_finite_index_on_probe": 22,
+          "length": 3000,
+          "name": "Upper",
+          "plot": "Line",
+          "tone": "Dim"
+        },
+        {
+          "finite_count_on_probe": 2978,
+          "first_finite_index_on_probe": 22,
+          "length": 3000,
+          "name": "Regression",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2978,
+          "first_finite_index_on_probe": 22,
+          "length": 3000,
+          "name": "Lower",
+          "plot": "Line",
+          "tone": "Dim"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 21.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 3.0,
+          "name": "Length"
+        },
+        {
+          "default": 3.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Smoothing"
+        },
+        {
+          "default": 2.0,
+          "integer": false,
+          "max": 10.0,
+          "min": 0.1,
+          "name": "StdErr"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 568
+      }
+    },
+    {
+      "aliases": [
+        "VWAPBANDS"
+      ],
+      "category": "Bands & Channels",
+      "code": "VWAPB",
+      "multi": false,
+      "name": "VWAP Bands",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "Upper",
+          "plot": "Line",
+          "tone": "Dim"
+        },
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "VWAP",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "Lower",
+          "plot": "Line",
+          "tone": "Dim"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 1.0,
+          "integer": false,
+          "max": 10.0,
+          "min": 0.1,
+          "name": "StdDev"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 575
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "RSI",
+      "multi": false,
+      "name": "Relative Strength Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "RSI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        30.0,
+        70.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 579
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "MACD",
+      "multi": false,
+      "name": "Moving Average Convergence Divergence",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2975,
+          "first_finite_index_on_probe": 25,
+          "length": 3000,
+          "name": "MACD",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2967,
+          "first_finite_index_on_probe": 33,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        },
+        {
+          "finite_count_on_probe": 2967,
+          "first_finite_index_on_probe": 33,
+          "length": 3000,
+          "name": "Histogram",
+          "plot": "Hist",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 12.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 26.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        },
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 583
+      }
+    },
+    {
+      "aliases": [
+        "STO",
+        "STOCHASTIC",
+        "KD"
+      ],
+      "category": "Momentum",
+      "code": "STOCH",
+      "multi": false,
+      "name": "Stochastic",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "%K",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2985,
+          "first_finite_index_on_probe": 15,
+          "length": 3000,
+          "name": "%D",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "%K Length"
+        },
+        {
+          "default": 1.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "%K Smoothing"
+        },
+        {
+          "default": 3.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "%D Smoothing"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        20.0,
+        80.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 590
+      }
+    },
+    {
+      "aliases": [
+        "SRSI"
+      ],
+      "category": "Momentum",
+      "code": "STOCHRSI",
+      "multi": false,
+      "name": "Stochastic RSI",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2971,
+          "first_finite_index_on_probe": 29,
+          "length": 3000,
+          "name": "%K",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2969,
+          "first_finite_index_on_probe": 31,
+          "length": 3000,
+          "name": "%D",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "RSI Length"
+        },
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Stoch Length"
+        },
+        {
+          "default": 3.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "%K Smoothing"
+        },
+        {
+          "default": 3.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "%D Smoothing"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        20.0,
+        80.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 600
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "CCI",
+      "multi": false,
+      "name": "Commodity Channel Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "CCI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        -100.0,
+        100.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 611
+      }
+    },
+    {
+      "aliases": [
+        "WPR",
+        "%R",
+        "WR",
+        "WILLIAMS"
+      ],
+      "category": "Momentum",
+      "code": "WILLR",
+      "multi": false,
+      "name": "Williams %R",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "%R",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        -100.0,
+        0.0
+      ],
+      "reference_levels": [
+        -80.0,
+        -20.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 614
+      }
+    },
+    {
+      "aliases": [
+        "ULT",
+        "ULTOSC",
+        "ULTIMATE"
+      ],
+      "category": "Momentum",
+      "code": "UO",
+      "multi": false,
+      "name": "Ultimate Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2973,
+          "first_finite_index_on_probe": 27,
+          "length": 3000,
+          "name": "UO",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 7.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Middle"
+        },
+        {
+          "default": 28.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        30.0,
+        70.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 619
+      }
+    },
+    {
+      "aliases": [
+        "AWESOME"
+      ],
+      "category": "Momentum",
+      "code": "AO",
+      "multi": false,
+      "name": "Awesome Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2967,
+          "first_finite_index_on_probe": 33,
+          "length": 3000,
+          "name": "AO",
+          "plot": "Hist",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 34.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 626
+      }
+    },
+    {
+      "aliases": [
+        "ACCEL",
+        "ACCELERATOR"
+      ],
+      "category": "Momentum",
+      "code": "AC",
+      "multi": false,
+      "name": "Accelerator Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2963,
+          "first_finite_index_on_probe": 37,
+          "length": 3000,
+          "name": "AC",
+          "plot": "Hist",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 34.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        },
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 631
+      }
+    },
+    {
+      "aliases": [
+        "MOMENTUM"
+      ],
+      "category": "Momentum",
+      "code": "MOM",
+      "multi": false,
+      "name": "Momentum",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2990,
+          "first_finite_index_on_probe": 10,
+          "length": 3000,
+          "name": "MOM",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 637
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "ROC",
+      "multi": false,
+      "name": "Rate of Change",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2991,
+          "first_finite_index_on_probe": 9,
+          "length": 3000,
+          "name": "ROC",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 641
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "PPO",
+      "multi": false,
+      "name": "Percentage Price Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2975,
+          "first_finite_index_on_probe": 25,
+          "length": 3000,
+          "name": "PPO",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2967,
+          "first_finite_index_on_probe": 33,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        },
+        {
+          "finite_count_on_probe": 2967,
+          "first_finite_index_on_probe": 33,
+          "length": 3000,
+          "name": "Histogram",
+          "plot": "Hist",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 12.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 26.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        },
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 642
+      }
+    },
+    {
+      "aliases": [
+        "PO"
+      ],
+      "category": "Momentum",
+      "code": "APO",
+      "multi": false,
+      "name": "Absolute Price Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2975,
+          "first_finite_index_on_probe": 25,
+          "length": 3000,
+          "name": "APO",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 12.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 26.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 647
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "TSI",
+      "multi": false,
+      "name": "True Strength Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2963,
+          "first_finite_index_on_probe": 37,
+          "length": 3000,
+          "name": "TSI",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2951,
+          "first_finite_index_on_probe": 49,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 25.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Long"
+        },
+        {
+          "default": 13.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Short"
+        },
+        {
+          "default": 13.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 652
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "TRIX",
+      "multi": false,
+      "name": "TRIX",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2948,
+          "first_finite_index_on_probe": 52,
+          "length": 3000,
+          "name": "TRIX",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2940,
+          "first_finite_index_on_probe": 60,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 18.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 661
+      }
+    },
+    {
+      "aliases": [
+        "PRING"
+      ],
+      "category": "Momentum",
+      "code": "KST",
+      "multi": false,
+      "name": "Know Sure Thing",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2956,
+          "first_finite_index_on_probe": 44,
+          "length": 3000,
+          "name": "KST",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2948,
+          "first_finite_index_on_probe": 52,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ROC 1"
+        },
+        {
+          "default": 15.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ROC 2"
+        },
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ROC 3"
+        },
+        {
+          "default": 30.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ROC 4"
+        },
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "SMA 1"
+        },
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "SMA 2"
+        },
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "SMA 3"
+        },
+        {
+          "default": 15.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "SMA 4"
+        },
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 669
+      }
+    },
+    {
+      "aliases": [
+        "CHANDE"
+      ],
+      "category": "Momentum",
+      "code": "CMO",
+      "multi": false,
+      "name": "Chande Momentum Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2991,
+          "first_finite_index_on_probe": 9,
+          "length": 3000,
+          "name": "CMO",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        -100.0,
+        100.0
+      ],
+      "reference_levels": [
+        -50.0,
+        50.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 684
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "DPO",
+      "multi": false,
+      "name": "Detrended Price Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2969,
+          "first_finite_index_on_probe": 31,
+          "length": 3000,
+          "name": "DPO",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 21.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 689
+      }
+    },
+    {
+      "aliases": [
+        "COPP"
+      ],
+      "category": "Momentum",
+      "code": "COPPOCK",
+      "multi": false,
+      "name": "Coppock Curve",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2977,
+          "first_finite_index_on_probe": 23,
+          "length": 3000,
+          "name": "Coppock",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "WMA Length"
+        },
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Long ROC"
+        },
+        {
+          "default": 11.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Short ROC"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 692
+      }
+    },
+    {
+      "aliases": [
+        "VIGOR"
+      ],
+      "category": "Momentum",
+      "code": "RVGI",
+      "multi": false,
+      "name": "Relative Vigor Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2988,
+          "first_finite_index_on_probe": 12,
+          "length": 3000,
+          "name": "RVGI",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2985,
+          "first_finite_index_on_probe": 15,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 698
+      }
+    },
+    {
+      "aliases": [
+        "FISH"
+      ],
+      "category": "Momentum",
+      "code": "FISHER",
+      "multi": false,
+      "name": "Fisher Transform",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2992,
+          "first_finite_index_on_probe": 8,
+          "length": 3000,
+          "name": "Fisher",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2991,
+          "first_finite_index_on_probe": 9,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        -1.5,
+        0.0,
+        1.5
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 705
+      }
+    },
+    {
+      "aliases": [
+        "STOCHMOMENTUM"
+      ],
+      "category": "Momentum",
+      "code": "STOCHMI",
+      "multi": false,
+      "name": "Stochastic Momentum Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "SMI",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2978,
+          "first_finite_index_on_probe": 22,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "%K Length"
+        },
+        {
+          "default": 3.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "%D Length"
+        },
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        -100.0,
+        100.0
+      ],
+      "reference_levels": [
+        -40.0,
+        40.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 709
+      }
+    },
+    {
+      "aliases": [
+        "SMII",
+        "ERGODIC"
+      ],
+      "category": "Momentum",
+      "code": "SMIERGO",
+      "multi": false,
+      "name": "SMI Ergodic",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2976,
+          "first_finite_index_on_probe": 24,
+          "length": 3000,
+          "name": "SMI",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2972,
+          "first_finite_index_on_probe": 28,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        },
+        {
+          "finite_count_on_probe": 2972,
+          "first_finite_index_on_probe": 28,
+          "length": 3000,
+          "name": "Histogram",
+          "plot": "Hist",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Short"
+        },
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Long"
+        },
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 719
+      }
+    },
+    {
+      "aliases": [
+        "CONNORS",
+        "CONNORSRSI"
+      ],
+      "category": "Momentum",
+      "code": "CRSI",
+      "multi": false,
+      "name": "Connors RSI",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2899,
+          "first_finite_index_on_probe": 101,
+          "length": 3000,
+          "name": "CRSI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 3.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "RSI Length"
+        },
+        {
+          "default": 2.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Streak Length"
+        },
+        {
+          "default": 100.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Rank Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        10.0,
+        90.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 725
+      }
+    },
+    {
+      "aliases": [
+        "LAGUERRE"
+      ],
+      "category": "Momentum",
+      "code": "LRSI",
+      "multi": false,
+      "name": "Laguerre RSI",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "LRSI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 0.5,
+          "integer": false,
+          "max": 0.99,
+          "min": 0.0,
+          "name": "Gamma"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        1.0
+      ],
+      "reference_levels": [
+        0.2,
+        0.8
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 732
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "RMI",
+      "multi": false,
+      "name": "Relative Momentum Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2976,
+          "first_finite_index_on_probe": 24,
+          "length": 3000,
+          "name": "RMI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Momentum"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        30.0,
+        70.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 737
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "PMO",
+      "multi": false,
+      "name": "Price Momentum Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2946,
+          "first_finite_index_on_probe": 54,
+          "length": 3000,
+          "name": "PMO",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2937,
+          "first_finite_index_on_probe": 63,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 35.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "First Smoothing"
+        },
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Second Smoothing"
+        },
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 742
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "BOP",
+      "multi": false,
+      "name": "Balance of Power",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "BOP",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Smoothing"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        -1.0,
+        1.0
+      ],
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 750
+      }
+    },
+    {
+      "aliases": [
+        "ELDERRAY",
+        "ERAY"
+      ],
+      "category": "Momentum",
+      "code": "ELDER",
+      "multi": false,
+      "name": "Elder Ray Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2988,
+          "first_finite_index_on_probe": 12,
+          "length": 3000,
+          "name": "Bull Power",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2988,
+          "first_finite_index_on_probe": 12,
+          "length": 3000,
+          "name": "Bear Power",
+          "plot": "Line",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 13.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 754
+      }
+    },
+    {
+      "aliases": [
+        "BULLBEAR"
+      ],
+      "category": "Momentum",
+      "code": "BBP",
+      "multi": false,
+      "name": "Bull Bear Power",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2988,
+          "first_finite_index_on_probe": 12,
+          "length": 3000,
+          "name": "BBP",
+          "plot": "Hist",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 13.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 761
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "QSTICK",
+      "multi": false,
+      "name": "Qstick",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2993,
+          "first_finite_index_on_probe": 7,
+          "length": 3000,
+          "name": "Qstick",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 8.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 765
+      }
+    },
+    {
+      "aliases": [
+        "PSYCH",
+        "PSYCHOLOGICAL"
+      ],
+      "category": "Momentum",
+      "code": "PSY",
+      "multi": false,
+      "name": "Psychological Line",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2988,
+          "first_finite_index_on_probe": 12,
+          "length": 3000,
+          "name": "PSY",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 12.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        25.0,
+        75.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 766
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "CFO",
+      "multi": false,
+      "name": "Chande Forecast Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "CFO",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 771
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "IMI",
+      "multi": false,
+      "name": "Intraday Momentum Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "IMI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        30.0,
+        70.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 774
+      }
+    },
+    {
+      "aliases": [
+        "SCHAFF"
+      ],
+      "category": "Momentum",
+      "code": "STC",
+      "multi": false,
+      "name": "Schaff Trend Cycle",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2933,
+          "first_finite_index_on_probe": 67,
+          "length": 3000,
+          "name": "STC",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Cycle"
+        },
+        {
+          "default": 23.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 50.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        25.0,
+        75.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 778
+      }
+    },
+    {
+      "aliases": [
+        "CENTERGRAVITY"
+      ],
+      "category": "Momentum",
+      "code": "COG",
+      "multi": false,
+      "name": "Center of Gravity",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2991,
+          "first_finite_index_on_probe": 9,
+          "length": 3000,
+          "name": "COG",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2990,
+          "first_finite_index_on_probe": 10,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 785
+      }
+    },
+    {
+      "aliases": [
+        "IFT"
+      ],
+      "category": "Momentum",
+      "code": "IFTRSI",
+      "multi": false,
+      "name": "Inverse Fisher Transform RSI",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "IFT RSI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "RSI Length"
+        },
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "WMA Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        -1.0,
+        1.0
+      ],
+      "reference_levels": [
+        -0.5,
+        0.5
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 788
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "PGO",
+      "multi": false,
+      "name": "Pretty Good Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "PGO",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        -3.0,
+        3.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 794
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "QQE",
+      "multi": false,
+      "name": "Quantitative Qualitative Estimation",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "QQE",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2929,
+          "first_finite_index_on_probe": 71,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "RSI Length"
+        },
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Smoothing"
+        },
+        {
+          "default": 4.236,
+          "integer": false,
+          "max": 20.0,
+          "min": 0.1,
+          "name": "Factor"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        50.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 797
+      }
+    },
+    {
+      "aliases": [
+        "WAVETREND",
+        "WTO"
+      ],
+      "category": "Momentum",
+      "code": "WT",
+      "multi": false,
+      "name": "WaveTrend",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2962,
+          "first_finite_index_on_probe": 38,
+          "length": 3000,
+          "name": "WT1",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2959,
+          "first_finite_index_on_probe": 41,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Channel Length"
+        },
+        {
+          "default": 21.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Average Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        -60.0,
+        0.0,
+        60.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 804
+      }
+    },
+    {
+      "aliases": [
+        "CYBERCYCLE"
+      ],
+      "category": "Momentum",
+      "code": "CYBER",
+      "multi": false,
+      "name": "Ehlers Cyber Cycle",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "Cycle",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2999,
+          "first_finite_index_on_probe": 1,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 0.07,
+          "integer": false,
+          "max": 0.99,
+          "min": 0.01,
+          "name": "Alpha"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 809
+      }
+    },
+    {
+      "aliases": [
+        "DISPARITY"
+      ],
+      "category": "Momentum",
+      "code": "DISP",
+      "multi": false,
+      "name": "Disparity Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "Disparity",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 813
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Momentum",
+      "code": "PFE",
+      "multi": false,
+      "name": "Polarized Fractal Efficiency",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "PFE",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Smoothing"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        -100.0,
+        100.0
+      ],
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 817
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Trend",
+      "code": "ADX",
+      "multi": false,
+      "name": "Average Directional Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2973,
+          "first_finite_index_on_probe": 27,
+          "length": 3000,
+          "name": "ADX",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "DI Length"
+        },
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ADX Smoothing"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        25.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 823
+      }
+    },
+    {
+      "aliases": [
+        "DX"
+      ],
+      "category": "Trend",
+      "code": "DMI",
+      "multi": false,
+      "name": "Directional Movement Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "+DI",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "-DI",
+          "plot": "Line",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2973,
+          "first_finite_index_on_probe": 27,
+          "length": 3000,
+          "name": "ADX",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "DI Length"
+        },
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ADX Smoothing"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        25.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 828
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Trend",
+      "code": "ADXR",
+      "multi": false,
+      "name": "Average Directional Movement Rating",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2960,
+          "first_finite_index_on_probe": 40,
+          "length": 3000,
+          "name": "ADXR",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2973,
+          "first_finite_index_on_probe": 27,
+          "length": 3000,
+          "name": "ADX",
+          "plot": "Line",
+          "tone": "Dim"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "DI Length"
+        },
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ADX Smoothing"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        25.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 837
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Trend",
+      "code": "AROON",
+      "multi": false,
+      "name": "Aroon",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "Aroon Up",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "Aroon Down",
+          "plot": "Line",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        30.0,
+        70.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 847
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Trend",
+      "code": "AROONOSC",
+      "multi": false,
+      "name": "Aroon Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "Aroon Osc",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        -100.0,
+        100.0
+      ],
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 854
+      }
+    },
+    {
+      "aliases": [
+        "VI"
+      ],
+      "category": "Trend",
+      "code": "VORTEX",
+      "multi": false,
+      "name": "Vortex Indicator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "VI+",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "VI-",
+          "plot": "Line",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        1.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 861
+      }
+    },
+    {
+      "aliases": [
+        "SAR",
+        "PARABOLIC"
+      ],
+      "category": "Trend",
+      "code": "PSAR",
+      "multi": false,
+      "name": "Parabolic SAR",
+      "outputs": [
+        {
+          "finite_count_on_probe": 1514,
+          "first_finite_index_on_probe": 1,
+          "length": 3000,
+          "name": "Up",
+          "plot": "Dots",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 1485,
+          "first_finite_index_on_probe": 12,
+          "length": 3000,
+          "name": "Down",
+          "plot": "Dots",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 0.02,
+          "integer": false,
+          "max": 1.0,
+          "min": 0.001,
+          "name": "Start"
+        },
+        {
+          "default": 0.02,
+          "integer": false,
+          "max": 1.0,
+          "min": 0.001,
+          "name": "Increment"
+        },
+        {
+          "default": 0.2,
+          "integer": false,
+          "max": 1.0,
+          "min": 0.001,
+          "name": "Maximum"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 868
+      }
+    },
+    {
+      "aliases": [
+        "STREND"
+      ],
+      "category": "Trend",
+      "code": "SUPERTREND",
+      "multi": false,
+      "name": "SuperTrend",
+      "outputs": [
+        {
+          "finite_count_on_probe": 1521,
+          "first_finite_index_on_probe": 53,
+          "length": 3000,
+          "name": "Up",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 1470,
+          "first_finite_index_on_probe": 9,
+          "length": 3000,
+          "name": "Down",
+          "plot": "Line",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ATR Length"
+        },
+        {
+          "default": 3.0,
+          "integer": false,
+          "max": 20.0,
+          "min": 0.1,
+          "name": "Factor"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 873
+      }
+    },
+    {
+      "aliases": [
+        "VOLSTOP"
+      ],
+      "category": "Trend",
+      "code": "VSTOP",
+      "multi": false,
+      "name": "Volatility Stop",
+      "outputs": [
+        {
+          "finite_count_on_probe": 1528,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "Up",
+          "plot": "Dots",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 1472,
+          "first_finite_index_on_probe": 21,
+          "length": 3000,
+          "name": "Down",
+          "plot": "Dots",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ATR Length"
+        },
+        {
+          "default": 2.0,
+          "integer": false,
+          "max": 20.0,
+          "min": 0.1,
+          "name": "Multiplier"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 877
+      }
+    },
+    {
+      "aliases": [
+        "HILO",
+        "GANN"
+      ],
+      "category": "Trend",
+      "code": "GANNHILO",
+      "multi": false,
+      "name": "Gann HiLo Activator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 1616,
+          "first_finite_index_on_probe": 20,
+          "length": 3000,
+          "name": "Up",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 1364,
+          "first_finite_index_on_probe": 21,
+          "length": 3000,
+          "name": "Down",
+          "plot": "Line",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 13.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "High Length"
+        },
+        {
+          "default": 21.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Low Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 881
+      }
+    },
+    {
+      "aliases": [
+        "ICHI",
+        "CLOUD",
+        "KUMO"
+      ],
+      "category": "Trend",
+      "code": "ICHIMOKU",
+      "multi": false,
+      "name": "Ichimoku Cloud",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2992,
+          "first_finite_index_on_probe": 8,
+          "length": 3000,
+          "name": "Conversion",
+          "plot": "Line",
+          "tone": "Series(0)"
+        },
+        {
+          "finite_count_on_probe": 2975,
+          "first_finite_index_on_probe": 25,
+          "length": 3000,
+          "name": "Base",
+          "plot": "Line",
+          "tone": "Series(1)"
+        },
+        {
+          "finite_count_on_probe": 2975,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "Lagging",
+          "plot": "Line",
+          "tone": "Series(2)"
+        },
+        {
+          "finite_count_on_probe": 2975,
+          "first_finite_index_on_probe": 50,
+          "length": 3025,
+          "name": "Leading A",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2949,
+          "first_finite_index_on_probe": 76,
+          "length": 3025,
+          "name": "Leading B",
+          "plot": "Line",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Conversion"
+        },
+        {
+          "default": 26.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Base"
+        },
+        {
+          "default": 52.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Span B"
+        },
+        {
+          "default": 26.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Displacement"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 885
+      }
+    },
+    {
+      "aliases": [
+        "GATORLINES"
+      ],
+      "category": "Trend",
+      "code": "ALLIGATOR",
+      "multi": false,
+      "name": "Williams Alligator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2988,
+          "first_finite_index_on_probe": 20,
+          "length": 3008,
+          "name": "Jaw",
+          "plot": "Line",
+          "tone": "Series(0)"
+        },
+        {
+          "finite_count_on_probe": 2993,
+          "first_finite_index_on_probe": 12,
+          "length": 3005,
+          "name": "Teeth",
+          "plot": "Line",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2996,
+          "first_finite_index_on_probe": 7,
+          "length": 3003,
+          "name": "Lips",
+          "plot": "Line",
+          "tone": "Up"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 13.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Jaw"
+        },
+        {
+          "default": 8.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Teeth"
+        },
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Lips"
+        },
+        {
+          "default": 8.0,
+          "integer": true,
+          "max": 100.0,
+          "min": 0.0,
+          "name": "Jaw Offset"
+        },
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 100.0,
+          "min": 0.0,
+          "name": "Teeth Offset"
+        },
+        {
+          "default": 3.0,
+          "integer": true,
+          "max": 100.0,
+          "min": 0.0,
+          "name": "Lips Offset"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 900
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Trend",
+      "code": "GATOR",
+      "multi": false,
+      "name": "Gator Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2980,
+          "first_finite_index_on_probe": 20,
+          "length": 3000,
+          "name": "Upper",
+          "plot": "Hist",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2988,
+          "first_finite_index_on_probe": 12,
+          "length": 3000,
+          "name": "Lower",
+          "plot": "Hist",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 13.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Jaw"
+        },
+        {
+          "default": 8.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Teeth"
+        },
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Lips"
+        },
+        {
+          "default": 8.0,
+          "integer": true,
+          "max": 100.0,
+          "min": 0.0,
+          "name": "Jaw Offset"
+        },
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 100.0,
+          "min": 0.0,
+          "name": "Teeth Offset"
+        },
+        {
+          "default": 3.0,
+          "integer": true,
+          "max": 100.0,
+          "min": 0.0,
+          "name": "Lips Offset"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 911
+      }
+    },
+    {
+      "aliases": [
+        "FRACTAL"
+      ],
+      "category": "Trend",
+      "code": "FRACTALS",
+      "multi": false,
+      "name": "Williams Fractals",
+      "outputs": [
+        {
+          "finite_count_on_probe": 62,
+          "first_finite_index_on_probe": 12,
+          "length": 3000,
+          "name": "High",
+          "plot": "Dots",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 62,
+          "first_finite_index_on_probe": 36,
+          "length": 3000,
+          "name": "Low",
+          "plot": "Dots",
+          "tone": "Up"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 2.0,
+          "integer": true,
+          "max": 50.0,
+          "min": 1.0,
+          "name": "Periods"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 922
+      }
+    },
+    {
+      "aliases": [
+        "ZZ"
+      ],
+      "category": "Trend",
+      "code": "ZIGZAG",
+      "multi": false,
+      "name": "ZigZag",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "ZigZag",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 5.0,
+          "integer": false,
+          "max": 50.0,
+          "min": 0.1,
+          "name": "Deviation %"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 928
+      }
+    },
+    {
+      "aliases": [
+        "CHOPPINESS"
+      ],
+      "category": "Trend",
+      "code": "CHOP",
+      "multi": false,
+      "name": "Choppiness Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "CHOP",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        38.2,
+        61.8
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 934
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Trend",
+      "code": "VHF",
+      "multi": false,
+      "name": "Vertical Horizontal Filter",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2972,
+          "first_finite_index_on_probe": 28,
+          "length": 3000,
+          "name": "VHF",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 28.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 938
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Trend",
+      "code": "RWI",
+      "multi": false,
+      "name": "Random Walk Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "RWI High",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "RWI Low",
+          "plot": "Line",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        1.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 939
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Trend",
+      "code": "TII",
+      "multi": false,
+      "name": "Trend Intensity Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2912,
+          "first_finite_index_on_probe": 88,
+          "length": 3000,
+          "name": "TII",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 60.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "MA Length"
+        },
+        {
+          "default": 30.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        20.0,
+        80.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 945
+      }
+    },
+    {
+      "aliases": [
+        "KER",
+        "EFFICIENCY"
+      ],
+      "category": "Trend",
+      "code": "ER",
+      "multi": false,
+      "name": "Efficiency Ratio",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2990,
+          "first_finite_index_on_probe": 10,
+          "length": 3000,
+          "name": "ER",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        1.0
+      ],
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 950
+      }
+    },
+    {
+      "aliases": [
+        "CHANDEKROLL",
+        "CKS"
+      ],
+      "category": "Trend",
+      "code": "CKSTOP",
+      "multi": false,
+      "name": "Chande Kroll Stop",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2983,
+          "first_finite_index_on_probe": 17,
+          "length": 3000,
+          "name": "Stop Short",
+          "plot": "Line",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2983,
+          "first_finite_index_on_probe": 17,
+          "length": 3000,
+          "name": "Stop Long",
+          "plot": "Line",
+          "tone": "Up"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ATR Length"
+        },
+        {
+          "default": 1.0,
+          "integer": false,
+          "max": 20.0,
+          "min": 0.1,
+          "name": "Multiplier"
+        },
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Stop Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 954
+      }
+    },
+    {
+      "aliases": [
+        "CE",
+        "CHEXIT"
+      ],
+      "category": "Trend",
+      "code": "CHANDELIER",
+      "multi": false,
+      "name": "Chandelier Exit",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2979,
+          "first_finite_index_on_probe": 21,
+          "length": 3000,
+          "name": "Long Exit",
+          "plot": "Line",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2979,
+          "first_finite_index_on_probe": 21,
+          "length": 3000,
+          "name": "Short Exit",
+          "plot": "Line",
+          "tone": "Down"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 22.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 3.0,
+          "integer": false,
+          "max": 20.0,
+          "min": 0.1,
+          "name": "Multiplier"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 962
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volatility",
+      "code": "ATR",
+      "multi": false,
+      "name": "Average True Range",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "ATR",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 970
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volatility",
+      "code": "NATR",
+      "multi": false,
+      "name": "Normalized Average True Range",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "NATR",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 971
+      }
+    },
+    {
+      "aliases": [
+        "TRUERANGE"
+      ],
+      "category": "Volatility",
+      "code": "TRANGE",
+      "multi": false,
+      "name": "True Range",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "TR",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 972
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volatility",
+      "code": "ADR",
+      "multi": false,
+      "name": "Average Day Range",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "ADR",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 973
+      }
+    },
+    {
+      "aliases": [
+        "BANDWIDTH"
+      ],
+      "category": "Volatility",
+      "code": "BBW",
+      "multi": false,
+      "name": "Bollinger BandWidth",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "BBW",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 2.0,
+          "integer": false,
+          "max": 10.0,
+          "min": 0.1,
+          "name": "StdDev"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 975
+      }
+    },
+    {
+      "aliases": [
+        "%B",
+        "PERCENTB",
+        "BBPCT"
+      ],
+      "category": "Volatility",
+      "code": "PCTB",
+      "multi": false,
+      "name": "Bollinger %B",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "%B",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 2.0,
+          "integer": false,
+          "max": 10.0,
+          "min": 0.1,
+          "name": "StdDev"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0,
+        1.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 979
+      }
+    },
+    {
+      "aliases": [
+        "HVOL",
+        "HISTVOL"
+      ],
+      "category": "Volatility",
+      "code": "HV",
+      "multi": false,
+      "name": "Historical Volatility",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2980,
+          "first_finite_index_on_probe": 20,
+          "length": 3000,
+          "name": "HV",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 984
+      }
+    },
+    {
+      "aliases": [
+        "PKV"
+      ],
+      "category": "Volatility",
+      "code": "PARKINSON",
+      "multi": false,
+      "name": "Parkinson Volatility",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Parkinson",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 989
+      }
+    },
+    {
+      "aliases": [
+        "GARMANKLASS"
+      ],
+      "category": "Volatility",
+      "code": "GK",
+      "multi": false,
+      "name": "Garman-Klass Volatility",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Garman-Klass",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 994
+      }
+    },
+    {
+      "aliases": [
+        "ROGERSSATCHELL"
+      ],
+      "category": "Volatility",
+      "code": "RSVOL",
+      "multi": false,
+      "name": "Rogers-Satchell Volatility",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Rogers-Satchell",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 999
+      }
+    },
+    {
+      "aliases": [
+        "YANGZHANG"
+      ],
+      "category": "Volatility",
+      "code": "YZ",
+      "multi": false,
+      "name": "Yang-Zhang Volatility",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2980,
+          "first_finite_index_on_probe": 20,
+          "length": 3000,
+          "name": "Yang-Zhang",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1004
+      }
+    },
+    {
+      "aliases": [
+        "UI"
+      ],
+      "category": "Volatility",
+      "code": "ULCER",
+      "multi": false,
+      "name": "Ulcer Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2887,
+          "first_finite_index_on_probe": 26,
+          "length": 3000,
+          "name": "Ulcer",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1009
+      }
+    },
+    {
+      "aliases": [
+        "CHAIKINVOL"
+      ],
+      "category": "Volatility",
+      "code": "CHV",
+      "multi": false,
+      "name": "Chaikin Volatility",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "CHV",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "EMA Length"
+        },
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "ROC Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1010
+      }
+    },
+    {
+      "aliases": [
+        "MI",
+        "MASSINDEX"
+      ],
+      "category": "Volatility",
+      "code": "MASS",
+      "multi": false,
+      "name": "Mass Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2960,
+          "first_finite_index_on_probe": 40,
+          "length": 3000,
+          "name": "Mass",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "EMA Length"
+        },
+        {
+          "default": 25.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Sum Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        26.5,
+        27.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1015
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volatility",
+      "code": "RVI",
+      "multi": false,
+      "name": "Relative Volatility Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2978,
+          "first_finite_index_on_probe": 22,
+          "length": 3000,
+          "name": "RVI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "StdDev Length"
+        },
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Smoothing"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        50.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1020
+      }
+    },
+    {
+      "aliases": [
+        "SQZ",
+        "SQZMOM",
+        "TTM"
+      ],
+      "category": "Volatility",
+      "code": "SQUEEZE",
+      "multi": false,
+      "name": "Squeeze Momentum",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2962,
+          "first_finite_index_on_probe": 38,
+          "length": 3000,
+          "name": "Momentum",
+          "plot": "Hist",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 1004,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Squeeze On",
+          "plot": "Dots",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 1977,
+          "first_finite_index_on_probe": 26,
+          "length": 3000,
+          "name": "Squeeze Off",
+          "plot": "Dots",
+          "tone": "Up"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "BB Length"
+        },
+        {
+          "default": 2.0,
+          "integer": false,
+          "max": 10.0,
+          "min": 0.1,
+          "name": "BB StdDev"
+        },
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "KC Length"
+        },
+        {
+          "default": 1.5,
+          "integer": false,
+          "max": 10.0,
+          "min": 0.1,
+          "name": "KC Multiplier"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1027
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volume",
+      "code": "VWAP",
+      "multi": false,
+      "name": "Volume-Weighted Average Price",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "VWAP",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1043
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volume",
+      "code": "OBV",
+      "multi": false,
+      "name": "On-Balance Volume",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "OBV",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1044
+      }
+    },
+    {
+      "aliases": [
+        "ADL",
+        "ACCDIST"
+      ],
+      "category": "Volume",
+      "code": "AD",
+      "multi": false,
+      "name": "Accumulation/Distribution",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "A/D",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1045
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volume",
+      "code": "CMF",
+      "multi": false,
+      "name": "Chaikin Money Flow",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "CMF",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1046
+      }
+    },
+    {
+      "aliases": [
+        "CHAIKINOSC"
+      ],
+      "category": "Volume",
+      "code": "CHO",
+      "multi": false,
+      "name": "Chaikin Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2991,
+          "first_finite_index_on_probe": 9,
+          "length": 3000,
+          "name": "CHO",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 3.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1047
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volume",
+      "code": "MFI",
+      "multi": false,
+      "name": "Money Flow Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "MFI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        20.0,
+        80.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1052
+      }
+    },
+    {
+      "aliases": [
+        "FORCE"
+      ],
+      "category": "Volume",
+      "code": "EFI",
+      "multi": false,
+      "name": "Elder Force Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "EFI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 13.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1056
+      }
+    },
+    {
+      "aliases": [
+        "EMV",
+        "EASE"
+      ],
+      "category": "Volume",
+      "code": "EOM",
+      "multi": false,
+      "name": "Ease of Movement",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "EOM",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        },
+        {
+          "default": 10000.0,
+          "integer": false,
+          "max": 1000000000.0,
+          "min": 1.0,
+          "name": "Divisor"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1060
+      }
+    },
+    {
+      "aliases": [
+        "VPT"
+      ],
+      "category": "Volume",
+      "code": "PVT",
+      "multi": false,
+      "name": "Price Volume Trend",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "PVT",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1065
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volume",
+      "code": "NVI",
+      "multi": false,
+      "name": "Negative Volume Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "NVI",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2746,
+          "first_finite_index_on_probe": 254,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 255.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1066
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volume",
+      "code": "PVI",
+      "multi": false,
+      "name": "Positive Volume Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "PVI",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2746,
+          "first_finite_index_on_probe": 254,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 255.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1067
+      }
+    },
+    {
+      "aliases": [
+        "KLINGER"
+      ],
+      "category": "Volume",
+      "code": "KVO",
+      "multi": false,
+      "name": "Klinger Volume Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2945,
+          "first_finite_index_on_probe": 55,
+          "length": 3000,
+          "name": "KVO",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2933,
+          "first_finite_index_on_probe": 67,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 34.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 55.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        },
+        {
+          "default": 13.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1068
+      }
+    },
+    {
+      "aliases": [
+        "VOLOSC"
+      ],
+      "category": "Volume",
+      "code": "VOSC",
+      "multi": false,
+      "name": "Volume Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2991,
+          "first_finite_index_on_probe": 9,
+          "length": 3000,
+          "name": "VOSC",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 5.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 10.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1077
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volume",
+      "code": "PVO",
+      "multi": false,
+      "name": "Percentage Volume Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2975,
+          "first_finite_index_on_probe": 25,
+          "length": 3000,
+          "name": "PVO",
+          "plot": "Line",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2967,
+          "first_finite_index_on_probe": 33,
+          "length": 3000,
+          "name": "Signal",
+          "plot": "Line",
+          "tone": "Signal"
+        },
+        {
+          "finite_count_on_probe": 2967,
+          "first_finite_index_on_probe": 33,
+          "length": 3000,
+          "name": "Histogram",
+          "plot": "Hist",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 12.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Fast"
+        },
+        {
+          "default": 26.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Slow"
+        },
+        {
+          "default": 9.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Signal"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1082
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volume",
+      "code": "VROC",
+      "multi": false,
+      "name": "Volume Rate of Change",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2986,
+          "first_finite_index_on_probe": 14,
+          "length": 3000,
+          "name": "VROC",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1087
+      }
+    },
+    {
+      "aliases": [
+        "RELVOL"
+      ],
+      "category": "Volume",
+      "code": "RVOL",
+      "multi": false,
+      "name": "Relative Volume",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2980,
+          "first_finite_index_on_probe": 20,
+          "length": 3000,
+          "name": "RVOL",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        1.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1090
+      }
+    },
+    {
+      "aliases": [
+        "TWIGGS"
+      ],
+      "category": "Volume",
+      "code": "TMF",
+      "multi": false,
+      "name": "Twiggs Money Flow",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2980,
+          "first_finite_index_on_probe": 20,
+          "length": 3000,
+          "name": "TMF",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 21.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1094
+      }
+    },
+    {
+      "aliases": [
+        "WILLAD"
+      ],
+      "category": "Volume",
+      "code": "WAD",
+      "multi": false,
+      "name": "Williams Accumulation/Distribution",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "WAD",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1098
+      }
+    },
+    {
+      "aliases": [
+        "SWING"
+      ],
+      "category": "Volume",
+      "code": "ASI",
+      "multi": false,
+      "name": "Accumulative Swing Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "ASI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 10000.0,
+          "integer": false,
+          "max": 1000000000.0,
+          "min": 0.01,
+          "name": "Limit Move"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1099
+      }
+    },
+    {
+      "aliases": [
+        "MFACIL"
+      ],
+      "category": "Volume",
+      "code": "BWMFI",
+      "multi": false,
+      "name": "Market Facilitation Index",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "MFI",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1105
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volume",
+      "code": "NETVOL",
+      "multi": false,
+      "name": "Net Volume",
+      "outputs": [
+        {
+          "finite_count_on_probe": 3000,
+          "first_finite_index_on_probe": 0,
+          "length": 3000,
+          "name": "Net Volume",
+          "plot": "Hist",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1106
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volume",
+      "code": "VZO",
+      "multi": false,
+      "name": "Volume Zone Oscillator",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "VZO",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        -100.0,
+        100.0
+      ],
+      "reference_levels": [
+        -40.0,
+        0.0,
+        40.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1107
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Volume",
+      "code": "TSV",
+      "multi": false,
+      "name": "Time Segmented Volume",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "TSV",
+          "plot": "Hist",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 13.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1111
+      }
+    },
+    {
+      "aliases": [
+        "SD",
+        "STD"
+      ],
+      "category": "Statistics",
+      "code": "STDEV",
+      "multi": false,
+      "name": "Standard Deviation",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "StdDev",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1115
+      }
+    },
+    {
+      "aliases": [
+        "VARIANCE"
+      ],
+      "category": "Statistics",
+      "code": "VAR",
+      "multi": false,
+      "name": "Variance",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Variance",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1118
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Statistics",
+      "code": "ZSCORE",
+      "multi": false,
+      "name": "Z-Score",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Z",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        -2.0,
+        0.0,
+        2.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1121
+      }
+    },
+    {
+      "aliases": [
+        "LRS"
+      ],
+      "category": "Statistics",
+      "code": "SLOPE",
+      "multi": false,
+      "name": "Linear Regression Slope",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "Slope",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [
+        0.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1124
+      }
+    },
+    {
+      "aliases": [
+        "RSQ",
+        "RSQUARED"
+      ],
+      "category": "Statistics",
+      "code": "R2",
+      "multi": false,
+      "name": "R-Squared",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "R²",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        1.0
+      ],
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1128
+      }
+    },
+    {
+      "aliases": [
+        "SE"
+      ],
+      "category": "Statistics",
+      "code": "STDERR",
+      "multi": false,
+      "name": "Standard Error",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "StdErr",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 3.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1132
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Statistics",
+      "code": "TSF",
+      "multi": true,
+      "name": "Time Series Forecast",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2987,
+          "first_finite_index_on_probe": 13,
+          "length": 3000,
+          "name": "TSF",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 14.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 2.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1135
+      }
+    },
+    {
+      "aliases": [
+        "MED"
+      ],
+      "category": "Statistics",
+      "code": "MEDIAN",
+      "multi": true,
+      "name": "Moving Median",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Median",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1138
+      }
+    },
+    {
+      "aliases": [
+        "PERCENTRANK",
+        "PCTRANK"
+      ],
+      "category": "Statistics",
+      "code": "PRANK",
+      "multi": false,
+      "name": "Percent Rank",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2950,
+          "first_finite_index_on_probe": 50,
+          "length": 3000,
+          "name": "Rank",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 50.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "subpane",
+      "range": [
+        0.0,
+        100.0
+      ],
+      "reference_levels": [
+        20.0,
+        80.0
+      ],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1142
+      }
+    },
+    {
+      "aliases": [
+        "HHV"
+      ],
+      "category": "Statistics",
+      "code": "HIGHEST",
+      "multi": true,
+      "name": "Highest High",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Highest",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1147
+      }
+    },
+    {
+      "aliases": [
+        "LLV"
+      ],
+      "category": "Statistics",
+      "code": "LOWEST",
+      "multi": true,
+      "name": "Lowest Low",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2981,
+          "first_finite_index_on_probe": 19,
+          "length": 3000,
+          "name": "Lowest",
+          "plot": "Line",
+          "tone": "Main"
+        }
+      ],
+      "parameters": [
+        {
+          "default": 20.0,
+          "integer": true,
+          "max": 1000.0,
+          "min": 1.0,
+          "name": "Length"
+        }
+      ],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1151
+      }
+    },
+    {
+      "aliases": [
+        "PIVOTS",
+        "PP"
+      ],
+      "category": "Levels",
+      "code": "PIVOT",
+      "multi": false,
+      "name": "Pivot Points (Classic)",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "P",
+          "plot": "Steps",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R1",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S1",
+          "plot": "Steps",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R2",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S2",
+          "plot": "Steps",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R3",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S3",
+          "plot": "Steps",
+          "tone": "Up"
+        }
+      ],
+      "parameters": [],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1156
+      }
+    },
+    {
+      "aliases": [],
+      "category": "Levels",
+      "code": "PIVOTFIB",
+      "multi": false,
+      "name": "Pivot Points (Fibonacci)",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "P",
+          "plot": "Steps",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R1",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S1",
+          "plot": "Steps",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R2",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S2",
+          "plot": "Steps",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R3",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S3",
+          "plot": "Steps",
+          "tone": "Up"
+        }
+      ],
+      "parameters": [],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1158
+      }
+    },
+    {
+      "aliases": [
+        "CAMARILLA"
+      ],
+      "category": "Levels",
+      "code": "PIVOTCAM",
+      "multi": false,
+      "name": "Pivot Points (Camarilla)",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "P",
+          "plot": "Steps",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R1",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S1",
+          "plot": "Steps",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R2",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S2",
+          "plot": "Steps",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R3",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S3",
+          "plot": "Steps",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R4",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S4",
+          "plot": "Steps",
+          "tone": "Up"
+        }
+      ],
+      "parameters": [],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1159
+      }
+    },
+    {
+      "aliases": [
+        "WOODIE"
+      ],
+      "category": "Levels",
+      "code": "PIVOTWOODIE",
+      "multi": false,
+      "name": "Pivot Points (Woodie)",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "P",
+          "plot": "Steps",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R1",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S1",
+          "plot": "Steps",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R2",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S2",
+          "plot": "Steps",
+          "tone": "Up"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R3",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S3",
+          "plot": "Steps",
+          "tone": "Up"
+        }
+      ],
+      "parameters": [],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1161
+      }
+    },
+    {
+      "aliases": [
+        "DEMARK"
+      ],
+      "category": "Levels",
+      "code": "PIVOTDM",
+      "multi": false,
+      "name": "Pivot Points (DeMark)",
+      "outputs": [
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "P",
+          "plot": "Steps",
+          "tone": "Main"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "R1",
+          "plot": "Steps",
+          "tone": "Down"
+        },
+        {
+          "finite_count_on_probe": 2982,
+          "first_finite_index_on_probe": 18,
+          "length": 3000,
+          "name": "S1",
+          "plot": "Steps",
+          "tone": "Up"
+        }
+      ],
+      "parameters": [],
+      "placement": "overlay",
+      "range": null,
+      "reference_levels": [],
+      "source": {
+        "file": "crates/core/src/indicators/registry.rs",
+        "line": 1163
+      }
+    }
+  ],
+  "method": "Actual Rust registry evaluated by independent scratch executable; no app launch",
+  "probe": {
+    "bars": 3000,
+    "note": "Output first-finite indexes are illustrative observations; numerical results not TC2000 parity proof",
+    "timeframe": "D1"
+  },
+  "repository_root": "C:/Users/mbakh/Documents/coding/terminal-rs",
+  "summary": {
+    "by_category": {
+      "Bands & Channels": 8,
+      "Levels": 5,
+      "Momentum": 43,
+      "Moving Averages": 23,
+      "Statistics": 11,
+      "Trend": 22,
+      "Volatility": 16,
+      "Volume": 23
+    },
+    "by_placement": {
+      "overlay": 51,
+      "subpane": 100
+    },
+    "default_output_count": 255,
+    "default_output_plot_counts": {
+      "Dots": 8,
+      "Hist": 12,
+      "Line": 202,
+      "Steps": 33
+    },
+    "multi_false": 127,
+    "multi_true": 24,
+    "total": 151
+  }
+}

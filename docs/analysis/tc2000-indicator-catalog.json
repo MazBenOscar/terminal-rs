@@ -1,0 +1,760 @@
+{
+  "checked_date": "2026-10-20",
+  "source": "Official help.tc2000.com only",
+  "category_url": "https://help.tc2000.com/m/69404/c/213565",
+  "category_name": "Technical Indicators",
+  "article_count": 64,
+  "historical_background_article_count": 1,
+  "indicator_or_plot_reference_article_count": 63,
+  "coverage_boundary": "All links in the main Technical Indicators chapter contents, deduplicated structurally by selecting that chapter only. Excludes sidebar repeats, separate Worden T2 market breadth chapter, company fundamentals, PCF example library, software tutorials, and any claimed complete installed-indicator count. Several reference articles cover multiple indicators; article count is not indicator count.",
+  "entries": [
+    {
+      "title": "The Evolution of Balance of Power® & MoneyStream®",
+      "url": "https://help.tc2000.com/m/69404/l/747093-the-evolution-of-balance-of-power-moneystream",
+      "article_id": "747093",
+      "classification": "historical_background",
+      "rust_candidate_codes": [],
+      "assessment": "Background article, not an indicator.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Acceleration Bands",
+      "url": "https://help.tc2000.com/m/69404/l/744688-acceleration-bands",
+      "article_id": "744688",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "ACCBANDS"
+      ],
+      "assessment": "Candidate family; equation/settings parity untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Directional Movement +DI -DI ADX",
+      "url": "https://help.tc2000.com/m/69404/l/744697-directional-movement-di-di-adx",
+      "article_id": "744697",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "DMI",
+        "ADX",
+        "ADXR"
+      ],
+      "assessment": "Smoothing and DI/ADX period relationships need matching.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Aroon & Aroon Oscillator",
+      "url": "https://help.tc2000.com/m/69404/l/744755-aroon-aroon-oscillator",
+      "article_id": "744755",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "AROON",
+        "AROONOSC"
+      ],
+      "assessment": "Candidate family; tie/window conventions untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Average True Range (ATR)",
+      "url": "https://help.tc2000.com/m/69404/l/744766-average-true-range-atr",
+      "article_id": "744766",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "ATR"
+      ],
+      "assessment": "Method mismatch: Rust Wilder; TC formula defaults to simple.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Bid/Ask/Spread Plots",
+      "url": "https://help.tc2000.com/m/69404/l/1220382-bid-ask-spread-plots",
+      "article_id": "1220382",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [],
+      "assessment": "No equivalent chart study in the registry; quote UI is separate.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Bollinger %b",
+      "url": "https://help.tc2000.com/m/69404/l/744914-bollinger-b",
+      "article_id": "744914",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "PCTB"
+      ],
+      "assessment": "Candidate ratio; zero-width behavior and center type need validation.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Bollinger Bands®",
+      "url": "https://help.tc2000.com/m/69404/l/744931-bollinger-bands",
+      "article_id": "744931",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "BB"
+      ],
+      "assessment": "Rust close/SMA only; TC exposes more center/source choices.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Bollinger Bandwidth",
+      "url": "https://help.tc2000.com/m/69404/l/744935-bollinger-bandwidth",
+      "article_id": "744935",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "BBW"
+      ],
+      "assessment": "Units differ: Rust percent; documented TC formula ratio.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Balance of Power® (BOP)",
+      "url": "https://help.tc2000.com/m/69404/l/744980-balance-of-power-bop",
+      "article_id": "744980",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "BOP"
+      ],
+      "assessment": "Same name is insufficient: Worden-specific computation unverified.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Chaikin Money Flow",
+      "url": "https://help.tc2000.com/m/69404/l/745005-chaikin-money-flow",
+      "article_id": "745005",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "CMF"
+      ],
+      "assessment": "Candidate family; full numeric parity untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Commodity Channel Index",
+      "url": "https://help.tc2000.com/m/69404/l/745020-commodity-channel-index",
+      "article_id": "745020",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "CCI"
+      ],
+      "assessment": "Candidate family; source, constants and smoothing need validation.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Coppock Curve",
+      "url": "https://help.tc2000.com/m/69404/l/745024-coppock-curve",
+      "article_id": "745024",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "COPPOCK"
+      ],
+      "assessment": "Candidate family; settings/smoothing parity untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Derivative Oscillator",
+      "url": "https://help.tc2000.com/m/69404/l/745291-derivative-oscillator",
+      "article_id": "745291",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [],
+      "assessment": "No dedicated registry entry.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Detrended Price Oscillator",
+      "url": "https://help.tc2000.com/m/69404/l/745294-detrended-price-oscillator",
+      "article_id": "745294",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "DPO"
+      ],
+      "assessment": "Candidate family; displacement/alignment need validation.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Dollar Volume",
+      "url": "https://help.tc2000.com/m/69404/l/745295-dollar-volume",
+      "article_id": "745295",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [],
+      "assessment": "No dedicated registry entry; price/volume formula would be needed.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Donchian Channels",
+      "url": "https://help.tc2000.com/m/69404/l/745298-donchian-channels",
+      "article_id": "745298",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "DONCHIAN"
+      ],
+      "assessment": "Candidate family; include-current-bar policy untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Ease of Movement",
+      "url": "https://help.tc2000.com/m/69404/l/745315-ease-of-movement",
+      "article_id": "745315",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "EOM"
+      ],
+      "assessment": "Candidate family; scaling/smoothing parity untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Elder Ray Bull & Bear Power",
+      "url": "https://help.tc2000.com/m/69404/l/745402-elder-ray-bull-bear-power",
+      "article_id": "745402",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "ELDER"
+      ],
+      "assessment": "Bull/bear outputs exist; formula parity untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Elder Force Index",
+      "url": "https://help.tc2000.com/m/69404/l/745449-elder-force-index",
+      "article_id": "745449",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "EFI"
+      ],
+      "assessment": "Candidate family; period and smoothing parity untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Elliott Wave Oscillator",
+      "url": "https://help.tc2000.com/m/69404/l/745461-elliott-wave-oscillator",
+      "article_id": "745461",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [],
+      "assessment": "No dedicated entry; AO/MACD are related, not verified replacements.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Envelope Channels",
+      "url": "https://help.tc2000.com/m/69404/l/745462-envelope-channels",
+      "article_id": "745462",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "ENV"
+      ],
+      "assessment": "Rust SMA source fixed; TC source/average choices broader.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Fisher Transform",
+      "url": "https://help.tc2000.com/m/69404/l/756132-fisher-transform",
+      "article_id": "756132",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "FISHER"
+      ],
+      "assessment": "Candidate family; transform/clipping conventions untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Ichimoku",
+      "url": "https://help.tc2000.com/m/69404/l/745488-ichimoku",
+      "article_id": "745488",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "ICHIMOKU"
+      ],
+      "assessment": "Candidate family; displaced outputs need explicit time mapping.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Kaufman Efficiency Ratio",
+      "url": "https://help.tc2000.com/m/69404/l/749623-kaufman-efficiency-ratio",
+      "article_id": "749623",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "ER"
+      ],
+      "assessment": "Candidate family; zero-denominator convention untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Keltner Channels",
+      "url": "https://help.tc2000.com/m/69404/l/745498-keltner-channels",
+      "article_id": "745498",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "KC"
+      ],
+      "assessment": "Candidate family; ATR method/source/settings need validation.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Klinger Volume Oscillator and Histogram",
+      "url": "https://help.tc2000.com/m/69404/l/745499-klinger-volume-oscillator-and-histogram",
+      "article_id": "745499",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "KVO"
+      ],
+      "assessment": "Line/signal/histogram need individual output mapping.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Linear Regression Line & Moving Linear Regression",
+      "url": "https://help.tc2000.com/m/69404/l/745911-linear-regression-line-moving-linear-regression",
+      "article_id": "745911",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "LSMA",
+        "SLOPE",
+        "SEB"
+      ],
+      "assessment": "Related regression studies; not complete line/channel equivalence.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Mass Index",
+      "url": "https://help.tc2000.com/m/69404/l/751728-mass-index",
+      "article_id": "751728",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "MASS"
+      ],
+      "assessment": "Candidate family; smoothing/history parity untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "MACD & MACD Histogram",
+      "url": "https://help.tc2000.com/m/69404/l/745913-macd-macd-histogram",
+      "article_id": "745913",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "MACD"
+      ],
+      "assessment": "One Rust spec emits line/signal/hist; MA method and seeds need validation.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Momentum",
+      "url": "https://help.tc2000.com/m/69404/l/745915-momentum",
+      "article_id": "745915",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "MOM"
+      ],
+      "assessment": "Candidate family; absolute-vs-percent conventions matter.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Money Flow Index",
+      "url": "https://help.tc2000.com/m/69404/l/747053-money-flow-index",
+      "article_id": "747053",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "MFI"
+      ],
+      "assessment": "Candidate family; ties/zero-flow handling untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "MoneyStream®",
+      "url": "https://help.tc2000.com/m/69404/l/747055-moneystream",
+      "article_id": "747055",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [],
+      "assessment": "No dedicated registry entry; Worden-specific formula unresolved.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Moving Average",
+      "url": "https://help.tc2000.com/m/69404/l/747056-moving-average",
+      "article_id": "747056",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "SMA",
+        "EMA",
+        "WMA",
+        "HMA"
+      ],
+      "assessment": "MA families exist; selectable source, plot offset and child studies missing.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "On Balance Volume",
+      "url": "https://help.tc2000.com/m/69404/l/747711-on-balance-volume",
+      "article_id": "747711",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "OBV"
+      ],
+      "assessment": "Candidate family; initialization/flat-close behavior untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Parabolic SAR",
+      "url": "https://help.tc2000.com/m/69404/l/754974-parabolic-sar",
+      "article_id": "754974",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "PSAR"
+      ],
+      "assessment": "Candidate family; initialization and reversal rules untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Percent Volume Oscillator (PVO)",
+      "url": "https://help.tc2000.com/m/69404/l/755038-percent-volume-oscillator-pvo",
+      "article_id": "755038",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "PVO"
+      ],
+      "assessment": "Candidate family; average methods and output mapping untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Pivot Points",
+      "url": "https://help.tc2000.com/m/69404/l/745284-pivot-points",
+      "article_id": "745284",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "PIVOT",
+        "PIVOTFIB",
+        "PIVOTCAM",
+        "PIVOTWOODIE",
+        "PIVOTDM"
+      ],
+      "assessment": "Candidate variants; session boundaries need validation.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Positive Volume Index & Negative Volume Index",
+      "url": "https://help.tc2000.com/m/69404/l/747083-positive-volume-index-negative-volume-index",
+      "article_id": "747083",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "PVI",
+        "NVI"
+      ],
+      "assessment": "Candidate families; seeds/unchanged-volume behavior untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Price Percent Oscillator & Histogram",
+      "url": "https://help.tc2000.com/m/69404/l/747180-price-percent-oscillator-histogram",
+      "article_id": "747180",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "PPO"
+      ],
+      "assessment": "Line/signal/hist outputs exist; period and unit parity untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Price/Volume Trend",
+      "url": "https://help.tc2000.com/m/69404/l/747913-price-volume-trend",
+      "article_id": "747913",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "PVT"
+      ],
+      "assessment": "Candidate family; seed and denominator behavior untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Price Zone Oscillator",
+      "url": "https://help.tc2000.com/m/69404/l/1220413-price-zone-oscillator",
+      "article_id": "1220413",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [],
+      "assessment": "No dedicated registry entry.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Rate of Change & Rate of Change Percent",
+      "url": "https://help.tc2000.com/m/69404/l/755004-rate-of-change-rate-of-change-percent",
+      "article_id": "755004",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "ROC",
+        "MOM"
+      ],
+      "assessment": "Rust ROC percent and MOM difference; explicit absolute/percent mapping needed.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Relative Strength",
+      "url": "https://help.tc2000.com/m/69404/l/747853-relative-strength",
+      "article_id": "747853",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [],
+      "assessment": "Comparison-price overlay exists elsewhere; not a dedicated relative-strength ratio study.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "RSI & Wilder's RSI",
+      "url": "https://help.tc2000.com/m/69404/l/747071-rsi-wilder-s-rsi",
+      "article_id": "747071",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "RSI"
+      ],
+      "assessment": "Rust is Wilder only; plain RSI absent and multiple instances restricted.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "SMI Ergodic Indicator and Oscillator",
+      "url": "https://help.tc2000.com/m/69404/l/1220419-smi-ergodic-indicator-and-oscillator",
+      "article_id": "1220419",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "SMIERGO"
+      ],
+      "assessment": "Candidate family; inspect oscillator/signal/hist outputs before mapping.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Stochastic Oscillator",
+      "url": "https://help.tc2000.com/m/69404/l/747102-stochastic-oscillator",
+      "article_id": "747102",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "STOCH"
+      ],
+      "assessment": "Candidate family; K/D smoothing methods and source graph need validation.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Time Segmented Volume®",
+      "url": "https://help.tc2000.com/m/69404/l/747088-time-segmented-volume",
+      "article_id": "747088",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "TSV"
+      ],
+      "assessment": "Rust delta-close*volume sum; Worden formula parity unverified.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Time Series Forecast",
+      "url": "https://help.tc2000.com/m/69404/l/749805-time-series-forecast",
+      "article_id": "749805",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "TSF"
+      ],
+      "assessment": "Candidate family; forecast horizon/alignment untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "TRIX",
+      "url": "https://help.tc2000.com/m/69404/l/747736-trix",
+      "article_id": "747736",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "TRIX"
+      ],
+      "assessment": "Candidate family; percent scaling and signal parity untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "True Strength Index",
+      "url": "https://help.tc2000.com/m/69404/l/750619-true-strength-index",
+      "article_id": "750619",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "TSI"
+      ],
+      "assessment": "Candidate family; smoothing order/seed parity untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Ultimate Oscillator",
+      "url": "https://help.tc2000.com/m/69404/l/1220427-ultimate-oscillator",
+      "article_id": "1220427",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "UO"
+      ],
+      "assessment": "Candidate family; period/weight and zero-range behavior untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Volatility Stop",
+      "url": "https://help.tc2000.com/m/69404/l/1575824-volatility-stop",
+      "article_id": "1575824",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "VSTOP"
+      ],
+      "assessment": "Candidate family; ATR smoothing/reversal rules untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Volume",
+      "url": "https://help.tc2000.com/m/69404/l/1220430-volume",
+      "article_id": "1220430",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [],
+      "assessment": "Built-in chart volume display, outside the indicator registry.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Volume Surge",
+      "url": "https://help.tc2000.com/m/69404/l/1748470-volume-surge",
+      "article_id": "1748470",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "RVOL"
+      ],
+      "assessment": "Related relative-volume study; normalization/window parity unverified.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Volume at Price",
+      "url": "https://help.tc2000.com/m/69404/l/747119-volume-at-price",
+      "article_id": "747119",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [],
+      "assessment": "No dedicated volume-at-price/profile study in the registry.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Volume Rate of Change/Rate of Change Percent",
+      "url": "https://help.tc2000.com/m/69404/l/1220433-volume-rate-of-change-rate-of-change-percent",
+      "article_id": "1220433",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "VROC"
+      ],
+      "assessment": "Percent variant present; absolute volume change needs explicit mapping.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Volume Zone Oscillator",
+      "url": "https://help.tc2000.com/m/69404/l/1220440-volume-zone-oscillator",
+      "article_id": "1220440",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "VZO"
+      ],
+      "assessment": "Candidate family; smoothing and normalization untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Vortex Indicator",
+      "url": "https://help.tc2000.com/m/69404/l/1220442-vortex-indicator",
+      "article_id": "1220442",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "VORTEX"
+      ],
+      "assessment": "Candidate family; source/window parity untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "VWAP & Moving VWAP",
+      "url": "https://help.tc2000.com/m/69404/l/747794-vwap-moving-vwap",
+      "article_id": "747794",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "VWAP",
+        "VWMA"
+      ],
+      "assessment": "Session VWAP and related rolling VWMA; reset/source semantics need validation.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Williams Alligator",
+      "url": "https://help.tc2000.com/m/69404/l/747130-williams-alligator",
+      "article_id": "747130",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "ALLIGATOR"
+      ],
+      "assessment": "Candidate family; smoothing and forward offsets need validation.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Williams Accumulation/Distribution",
+      "url": "https://help.tc2000.com/m/69404/l/750284-williams-accumulation-distribution",
+      "article_id": "750284",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "WAD"
+      ],
+      "assessment": "Candidate family; tie/seed handling untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "William's %R",
+      "url": "https://help.tc2000.com/m/69404/l/750281-william-s-r",
+      "article_id": "750281",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [
+        "WILLR"
+      ],
+      "assessment": "Candidate family; range and zero-width behavior untested.",
+      "numeric_parity": "not_validated"
+    },
+    {
+      "title": "Worden Stochastics",
+      "url": "https://help.tc2000.com/m/69404/l/747714-worden-stochastics",
+      "article_id": "747714",
+      "classification": "indicator_or_plot_reference",
+      "rust_candidate_codes": [],
+      "assessment": "No dedicated Worden Stochastics entry; STOCH is not a verified substitute.",
+      "numeric_parity": "not_validated"
+    }
+  ],
+  "supporting_sources": [
+    {
+      "url": "https://help.tc2000.com/m/69404/l/747056-moving-average",
+      "topic": "Moving average types, price components, offsets"
+    },
+    {
+      "url": "https://help.tc2000.com/m/69445/l/744790-exponential-moving-average-function",
+      "topic": "EMA function with arbitrary numeric formula input"
+    },
+    {
+      "url": "https://help.tc2000.com/m/69404/l/744931-bollinger-bands",
+      "topic": "Bollinger center and population deviation"
+    },
+    {
+      "url": "https://help.tc2000.com/m/69404/l/744914-bollinger-b",
+      "topic": "Bollinger %b"
+    },
+    {
+      "url": "https://help.tc2000.com/m/69404/l/744935-bollinger-bandwidth",
+      "topic": "Bollinger Bandwidth normalized units"
+    },
+    {
+      "url": "https://help.tc2000.com/m/69404/l/747071-rsi-wilder-s-rsi",
+      "topic": "RSI versus Wilder RSI"
+    },
+    {
+      "url": "https://help.tc2000.com/m/69401/l/325646-how-to-change-the-data-source-for-an-indicator",
+      "topic": "Changing calculation input"
+    },
+    {
+      "url": "https://help.tc2000.com/m/69401/l/1687596-how-to-drag-drop-indicators-to-overlay-on-a-plot",
+      "topic": "Drag overlay and independent or shared scales"
+    },
+    {
+      "url": "https://help.tc2000.com/m/33346/l/335250-how-to-overlay-an-indicator",
+      "topic": "Overlay versus overlay and scale with"
+    },
+    {
+      "url": "https://help.tc2000.com/m/125751/l/1874618-how-to-scale-a-dragged-indicator-pcf-with-price",
+      "topic": "Scale dragged PCF with price"
+    },
+    {
+      "url": "https://help.tc2000.com/m/69401/l/1236908-how-to-use-the-scaling-menu",
+      "topic": "Arithmetic, logarithmic, manual, locking"
+    },
+    {
+      "url": "https://help.tc2000.com/m/69404/l/745462-envelope-channels",
+      "topic": "Envelope source and percentage conventions"
+    }
+  ],
+  "comparison_boundary": "Candidate mapping against registry definitions only; code availability does not establish formula, default, input, placement, style or numeric parity."
+}

@@ -19,6 +19,7 @@ mod ma;
 mod momentum;
 pub mod registry;
 mod stats;
+pub mod study;
 mod trend;
 mod volatility;
 mod volume;

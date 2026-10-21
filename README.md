@@ -78,8 +78,12 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   Mass index, squeeze momentum…), 23 volume studies (OBV, A/D, CMF, MFI, Klinger, NVI/PVI, VZO…),
   11 rolling statistics and five pivot-point families. Type a code with optional parameters
   (`RSI`, `SMA 200`, `BB 20 2.5`), browse and search with `IND`, or right-click the chart.
-  Oscillators get their own panes (up to six) with reference levels; moving averages can be added
-  several times; indicators are saved with the layout.
+  Open **Indicators…** on the chart to add multiple independent instances, edit parameters,
+  hide plots, choose colors, group plots in resizable panes, and select shared, independent or
+  fixed scales. SMA/EMA/WMA/HMA/RMA, Bollinger, RSI and MACD accept selected price/volume fields
+  or another indicator's named output (for example EMA of RSI). Hidden studies still supply
+  data; cycles are rejected. Up to six additional panes render. Workspace layouts save the
+  complete setup and migrate older indicator labels. See the [chart study guide](docs/chart-studies.md).
 - **Drawings** — trendline (Alt+T), horizontal (Alt+H), vertical (Alt+V) and fib retracement
   (Alt+F), stored in (time, price) so they survive zoom and timeframe changes; magnet (Alt+M) snaps
   to OHLC; click to select, Del to remove.
@@ -421,8 +425,8 @@ Measured on Linux with Mesa **llvmpipe (a CPU software rasterizer)** — a real 
   76 fps for the whole window (software rasterization and presentation bound; the chart pass itself
   is the benchmark above).
 - **Indicators over 1M bars** (`cargo bench -p tr-core`): SMA 1.8 ms, EMA 2.2 ms, VWAP 7.0 ms,
-  Bollinger 29 ms; RSI and MACD are single-pass (≈ 12 ms and 26 ms including first-touch of their
-  output memory). The whole 151-indicator catalogue at default parameters over 100k one-minute
+  Bollinger 29 ms; the original RSI/MACD kernels measured approximately 12/26 ms. Those timings
+  predate the chart source graph and RSI gap handling changes. The original 151-indicator catalogue at default parameters over 100k one-minute
   bars takes ≈ 134 ms on macOS (Ichimoku, the slowest, 6.6 ms).
 
 ## Tests

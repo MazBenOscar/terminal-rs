@@ -1,0 +1,1708 @@
+{
+  "schema_version": 1,
+  "research_date": "2026-10-20",
+  "artifact_sha256": "e37d5f30ca71ec0ba8cba4c207b07058d93b729749dde5df41daf43fc8148d7c",
+  "coverage": "116 matched calc-prefixed declaring types from a bounded UTF-8 identifier candidate search, confirmed by REA managed metadata. Includes helpers, price/volume, options and formula wrappers. Not a count of UI-available indicators. Dynamic, obfuscated, non-calc types and entitlement filtering are not enumerated.",
+  "batches": [
+    {
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "selection": {
+        "type_names": [
+          "WBI.Web.Charting.calcAccelBands",
+          "WBI.Web.Charting.calcADX",
+          "WBI.Web.Charting.calcADXR",
+          "WBI.Web.Charting.calcAroon",
+          "WBI.Web.Charting.calcAroonOscillator",
+          "WBI.Web.Charting.calcAsk",
+          "WBI.Web.Charting.calcATR",
+          "WBI.Web.Charting.calcAverage",
+          "WBI.Web.Charting.calcBid",
+          "WBI.Web.Charting.calcBidAskMid",
+          "WBI.Web.Charting.calcBidAskSpread",
+          "WBI.Web.Charting.calcBidAskSpreadPercent",
+          "WBI.Web.Charting.calcBollingerBands",
+          "WBI.Web.Charting.calcBollingerBandWidth",
+          "WBI.Web.Charting.calcBollingerPercentB",
+          "WBI.Web.Charting.calcBOP",
+          "WBI.Web.Charting.calcCCI",
+          "WBI.Web.Charting.calcChaikinMoneyFlow",
+          "WBI.Web.Charting.calcColumnStub",
+          "WBI.Web.Charting.calcComparison",
+          "WBI.Web.Charting.calcCoppock",
+          "WBI.Web.Charting.calcCustomAverageX",
+          "WBI.Web.Charting.calcCustomIndex",
+          "WBI.Web.Charting.calcDerivativeHistory",
+          "WBI.Web.Charting.calcDerivOscillator"
+        ],
+        "unmatched_type_names": [
+          "WBI.Web.Charting.calcAverage"
+        ]
+      }
+    },
+    {
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "selection": {
+        "type_names": [
+          "WBI.Web.Charting.calcDetrendedPriceOscillator",
+          "WBI.Web.Charting.calcDIPlusMinus",
+          "WBI.Web.Charting.calcDMIDiff",
+          "WBI.Web.Charting.calcDollarVolume",
+          "WBI.Web.Charting.calcDonchianChannels",
+          "WBI.Web.Charting.calcEaseOfMovement",
+          "WBI.Web.Charting.calcElderBear",
+          "WBI.Web.Charting.calcElderBull",
+          "WBI.Web.Charting.calcEldersForceIndex",
+          "WBI.Web.Charting.calcElliotWaveOsc",
+          "WBI.Web.Charting.calcEnvelopeChannel",
+          "WBI.Web.Charting.calcErgodic",
+          "WBI.Web.Charting.calcErgodicOsc",
+          "WBI.Web.Charting.calcFishTrans",
+          "WBI.Web.Charting.calcFundamentalPlot",
+          "WBI.Web.Charting.calcIchimoku",
+          "WBI.Web.Charting.calcKaufmanEfficiencyRatio",
+          "WBI.Web.Charting.calcKeltnerChannel",
+          "WBI.Web.Charting.calcKlingerVolHist",
+          "WBI.Web.Charting.calcKlingerVolOsc",
+          "WBI.Web.Charting.calcLinearRegressionTrendLine",
+          "WBI.Web.Charting.calcMACD",
+          "WBI.Web.Charting.calcMACDHistogram",
+          "WBI.Web.Charting.calcMassIndex",
+          "WBI.Web.Charting.calcMomentum"
+        ],
+        "unmatched_type_names": []
+      }
+    },
+    {
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "selection": {
+        "type_names": [
+          "WBI.Web.Charting.calcMoneyFlowIndex",
+          "WBI.Web.Charting.calcMoneyStream",
+          "WBI.Web.Charting.calcMovingAverage",
+          "WBI.Web.Charting.calcMovingLinearRegression",
+          "WBI.Web.Charting.calcMovingLinearRegressionChannel",
+          "WBI.Web.Charting.calcMovingVWAP",
+          "WBI.Web.Charting.calcNegativeVolumeIndex",
+          "WBI.Web.Charting.calcOBV",
+          "WBI.Web.Charting.calcOptionAsPercentStock",
+          "WBI.Web.Charting.calcOptionBlackScholes",
+          "WBI.Web.Charting.calcOptionDelta",
+          "WBI.Web.Charting.calcOptionGamma",
+          "WBI.Web.Charting.calcOptionGreekBase",
+          "WBI.Web.Charting.calcOptionImpliedVolatility",
+          "WBI.Web.Charting.calcOptionRho",
+          "WBI.Web.Charting.calcOptionsIntrinsic",
+          "WBI.Web.Charting.calcOptionsTimeValue",
+          "WBI.Web.Charting.calcOptionTheta",
+          "WBI.Web.Charting.calcOptionVega",
+          "WBI.Web.Charting.calcParabolicSAR",
+          "WBI.Web.Charting.calcPassThrough",
+          "WBI.Web.Charting.calcPCFChannel",
+          "WBI.Web.Charting.calcPCFChild",
+          "WBI.Web.Charting.calcPCFCumulative",
+          "WBI.Web.Charting.calcPCFPercentTrue"
+        ],
+        "unmatched_type_names": []
+      }
+    },
+    {
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "selection": {
+        "type_names": [
+          "WBI.Web.Charting.calcPCFSimple",
+          "WBI.Web.Charting.calcPercentVolumeOscillator",
+          "WBI.Web.Charting.calcPivotPoints",
+          "WBI.Web.Charting.calcPositiveVolumeIndex",
+          "WBI.Web.Charting.calcPPOHistogram",
+          "WBI.Web.Charting.calcPriceHistory",
+          "WBI.Web.Charting.calcPricePercentOscillator",
+          "WBI.Web.Charting.calcPriceVolumeTrend",
+          "WBI.Web.Charting.calcPriceZoneOsc",
+          "WBI.Web.Charting.calcRateOfChange",
+          "WBI.Web.Charting.calcRateOfChangePercent",
+          "WBI.Web.Charting.calcRelativePattern",
+          "WBI.Web.Charting.calcRelativeStrength",
+          "WBI.Web.Charting.calcRSI",
+          "WBI.Web.Charting.calcScanCount",
+          "WBI.Web.Charting.calcScanForecasting",
+          "WBI.Web.Charting.calcSeasonCast",
+          "WBI.Web.Charting.calcSimpleChartOverlay",
+          "WBI.Web.Charting.calcStdDev",
+          "WBI.Web.Charting.calcStochastics",
+          "WBI.Web.Charting.calcStochasticsMACD",
+          "WBI.Web.Charting.calcStochasticsRSI",
+          "WBI.Web.Charting.calcSymbolViewsPlot",
+          "WBI.Web.Charting.calcTimeSeriesForecast",
+          "WBI.Web.Charting.calcTimeValAsPercentStock"
+        ],
+        "unmatched_type_names": [
+          "WBI.Web.Charting.calcStdDev"
+        ]
+      }
+    },
+    {
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "selection": {
+        "type_names": [
+          "WBI.Web.Charting.calcTRIX",
+          "WBI.Web.Charting.calcTrueStrengthIndex",
+          "WBI.Web.Charting.calcTSV",
+          "WBI.Web.Charting.calcUltimateOscillator",
+          "WBI.Web.Charting.calcUnderlyingSymbol",
+          "WBI.Web.Charting.calcVolatilityStop",
+          "WBI.Web.Charting.calcVolROC",
+          "WBI.Web.Charting.calcVolROCPercent",
+          "WBI.Web.Charting.calcVolume",
+          "WBI.Web.Charting.calcVolumeAtPrice",
+          "WBI.Web.Charting.calcVolZoneOsc",
+          "WBI.Web.Charting.calcVortex",
+          "WBI.Web.Charting.calcVWAP",
+          "WBI.Web.Charting.calcWildersRSI",
+          "WBI.Web.Charting.calcWillAlligator",
+          "WBI.Web.Charting.calcWilliamsAccDist",
+          "WBI.Web.Charting.calcWilliamsPercentR",
+          "WBI.Web.Charting.calcWordenStochastics"
+        ],
+        "unmatched_type_names": []
+      }
+    }
+  ],
+  "types": [
+    {
+      "name": "calcAccelBands",
+      "token": "0x0200000c",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "Period",
+        "Width"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcADX",
+      "token": "0x0200000d",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "SmoothPeriod",
+        "DIPeriod"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcADXR",
+      "token": "0x0200000e",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcAroon",
+      "token": "0x0200000f",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcAroonOscillator",
+      "token": "0x02000010",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcAsk",
+      "token": "0x02000011",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcATR",
+      "token": "0x02000012",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcBid",
+      "token": "0x02000013",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcBidAskMid",
+      "token": "0x02000014",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcBidAskSpread",
+      "token": "0x02000015",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcBidAskSpreadPercent",
+      "token": "0x02000016",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcBollingerBands",
+      "token": "0x02000017",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "Period",
+        "AvgType",
+        "StandardDeviations"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcBollingerBandWidth",
+      "token": "0x02000018",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "Period",
+        "AvgType",
+        "StandardDeviations"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcBollingerPercentB",
+      "token": "0x02000019",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "Period",
+        "AvgType",
+        "StandardDeviations"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcBOP",
+      "token": "0x0200001a",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "ColorPrice",
+        "UpColor",
+        "MidColor",
+        "DownColor"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcCCI",
+      "token": "0x0200001c",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcChaikinMoneyFlow",
+      "token": "0x0200001d",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcColumnStub",
+      "token": "0x0200001e",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcComparison",
+      "token": "0x0200001f",
+      "abstract": false,
+      "extends_token": "0x02000058",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcCoppock",
+      "token": "0x02000020",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "AvgPeriod",
+        "ROCPeriodS",
+        "ROCPeriodL"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcCustomAverageX",
+      "token": "0x02000021",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "InitDone",
+        "PCFFormulaXML",
+        "TimeFrame"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcCustomIndex",
+      "token": "0x02000022",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "InitDone",
+        "TimeFrame",
+        "Weighting"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcDerivativeHistory",
+      "token": "0x02000024",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "ShowBidAsk",
+        "BidAskColor",
+        "TodaysOpenColor",
+        "YesterdaysCloseColor",
+        "BidAskOpacity",
+        "ScaleOnlyPrice",
+        "ShowTodaysOpenLine",
+        "ShowYesterdaysCloseLine",
+        "UpColor",
+        "DownColor",
+        "UpFilled",
+        "DownFilled",
+        "ColorMode",
+        "FillMode"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcDerivOscillator",
+      "token": "0x02000026",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_0db41f7689d257c342a17848e2fff8ce25015e51cfd16edae537b1a3b79feed6",
+      "declared_settings": [
+        "RSIPeriod",
+        "AvgPeriod1",
+        "AvgPeriod2",
+        "AvgPeriod3"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcDetrendedPriceOscillator",
+      "token": "0x02000027",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcDIPlusMinus",
+      "token": "0x02000028",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcDMIDiff",
+      "token": "0x02000029",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "SmoothPeriod",
+        "DIPeriod"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcDollarVolume",
+      "token": "0x0200002a",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "UpColor",
+        "DownColor",
+        "ColorByPrice"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcDonchianChannels",
+      "token": "0x0200002c",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period",
+        "BasedOn",
+        "Offset"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcEaseOfMovement",
+      "token": "0x0200002e",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcElderBear",
+      "token": "0x0200002f",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcElderBull",
+      "token": "0x02000030",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcEldersForceIndex",
+      "token": "0x02000031",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcElliotWaveOsc",
+      "token": "0x02000032",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcEnvelopeChannel",
+      "token": "0x02000033",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period",
+        "AvgType",
+        "StandardDeviations"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcErgodic",
+      "token": "0x02000034",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "PeriodShort",
+        "PeriodLong"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcErgodicOsc",
+      "token": "0x02000035",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "PeriodSignal",
+        "PeriodShort",
+        "PeriodLong"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcFishTrans",
+      "token": "0x02000036",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcFundamentalPlot",
+      "token": "0x02000037",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "CriteriaID"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcIchimoku",
+      "token": "0x02000038",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "StandardColor",
+        "StandardVisible",
+        "TurningColor",
+        "TurningVisible",
+        "DelayedColor",
+        "DelayedVisible",
+        "SpanAColor",
+        "SpanAVisible",
+        "SpanBColor",
+        "SpanBVisible",
+        "CloudColor",
+        "CloudOpacity",
+        "CloudVisible",
+        "StandardPeriod",
+        "TurningPeriod",
+        "SpanBPeriod"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcKaufmanEfficiencyRatio",
+      "token": "0x0200003a",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcKeltnerChannel",
+      "token": "0x0200003b",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "TypicalPricePeriod",
+        "ATRMultiplier",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcKlingerVolHist",
+      "token": "0x0200003c",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "PeriodTrigger",
+        "PeriodShort",
+        "PeriodLong"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcKlingerVolOsc",
+      "token": "0x0200003d",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "PeriodShort",
+        "PeriodLong"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcLinearRegressionTrendLine",
+      "token": "0x0200003e",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcMACD",
+      "token": "0x0200003f",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "PeriodShort",
+        "PeriodLong",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcMACDHistogram",
+      "token": "0x02000040",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "PeriodShort",
+        "PeriodLong",
+        "PeriodTrigger",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcMassIndex",
+      "token": "0x02000041",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcMomentum",
+      "token": "0x02000042",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_45c5f13c0d78227c22fa1b4cd0f0f1b2c037580ea7b5c99e1e80da9668573ceb",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcOptionsTimeValue",
+      "token": "0x0200000b",
+      "abstract": false,
+      "extends_token": "0x02000051",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": false
+    },
+    {
+      "name": "calcMoneyFlowIndex",
+      "token": "0x02000043",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcMoneyStream",
+      "token": "0x02000044",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "RegressionColor",
+        "AffectPrice"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcMovingAverage",
+      "token": "0x02000045",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "DataToAverage",
+        "Period",
+        "Offset",
+        "AvgType",
+        "PeriodStartPlotType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcMovingLinearRegression",
+      "token": "0x02000048",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcMovingLinearRegressionChannel",
+      "token": "0x02000049",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "Period",
+        "StandardDeviations"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcMovingVWAP",
+      "token": "0x0200004a",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcNegativeVolumeIndex",
+      "token": "0x0200004b",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcOBV",
+      "token": "0x0200004c",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcOptionAsPercentStock",
+      "token": "0x0200004d",
+      "abstract": false,
+      "extends_token": "0x02000051",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": false
+    },
+    {
+      "name": "calcOptionBlackScholes",
+      "token": "0x0200004e",
+      "abstract": false,
+      "extends_token": "0x02000051",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": false
+    },
+    {
+      "name": "calcOptionDelta",
+      "token": "0x0200004f",
+      "abstract": false,
+      "extends_token": "0x02000051",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": false
+    },
+    {
+      "name": "calcOptionGamma",
+      "token": "0x02000050",
+      "abstract": false,
+      "extends_token": "0x02000051",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": false
+    },
+    {
+      "name": "calcOptionGreekBase",
+      "token": "0x02000051",
+      "abstract": true,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "OptionDataSource",
+        "ValueCanBeNegative"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcOptionImpliedVolatility",
+      "token": "0x02000052",
+      "abstract": false,
+      "extends_token": "0x02000051",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": false
+    },
+    {
+      "name": "calcOptionRho",
+      "token": "0x02000053",
+      "abstract": false,
+      "extends_token": "0x02000051",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": false
+    },
+    {
+      "name": "calcOptionsIntrinsic",
+      "token": "0x02000054",
+      "abstract": false,
+      "extends_token": "0x02000051",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": false
+    },
+    {
+      "name": "calcOptionTheta",
+      "token": "0x02000055",
+      "abstract": false,
+      "extends_token": "0x02000051",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": false
+    },
+    {
+      "name": "calcOptionVega",
+      "token": "0x02000056",
+      "abstract": false,
+      "extends_token": "0x02000051",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": false
+    },
+    {
+      "name": "calcParabolicSAR",
+      "token": "0x02000057",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "AFIncrease",
+        "AFMax"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPassThrough",
+      "token": "0x02000058",
+      "abstract": true,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPCFChannel",
+      "token": "0x02000059",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "Period",
+        "WidthMultiplier",
+        "PCFFormulaMainXML",
+        "PCFFormulaWidthXML",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPCFChild",
+      "token": "0x0200005a",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "PCFFormulaXML"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPCFCumulative",
+      "token": "0x0200005b",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "Period",
+        "PCFFormulaUpXML",
+        "PCFFormulaDownXML",
+        "PCFFormulaValXML",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPCFPercentTrue",
+      "token": "0x0200005c",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_bb679934a9d16468461eb52019a24009490cc0c6cc9fac50523f215071486a88",
+      "declared_settings": [
+        "Period",
+        "PCFFormulaXML",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPCFSimple",
+      "token": "0x0200005d",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "Period",
+        "PCFFormulaXML",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPercentVolumeOscillator",
+      "token": "0x0200005e",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "PeriodShort",
+        "PeriodLong",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPivotPoints",
+      "token": "0x0200005f",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "ShowMidPoints",
+        "ShowLabels",
+        "MidPointColor",
+        "R3Color",
+        "R2Color",
+        "R1Color",
+        "PivotColor",
+        "S1Color",
+        "S2Color",
+        "S3Color",
+        "R3Visible",
+        "R2Visible",
+        "R1Visible",
+        "PivotVisible",
+        "S1Visible",
+        "S2Visible",
+        "S3Visible"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPositiveVolumeIndex",
+      "token": "0x02000060",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPPOHistogram",
+      "token": "0x02000061",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "PeriodShort",
+        "PeriodLong",
+        "PeriodTrigger",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPriceHistory",
+      "token": "0x02000062",
+      "abstract": false,
+      "extends_token": "0x02000058",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "OptionDataSource",
+        "ShowBidAsk",
+        "BidAskValueMode",
+        "BidAskColor",
+        "TodaysOpenColor",
+        "YesterdaysCloseColor",
+        "YesterdaysHighColor",
+        "YesterdaysLowColor",
+        "BidAskOpacity",
+        "ScaleOnlyPrice",
+        "ShowTodaysOpenLine",
+        "TodaysOpenOpacity",
+        "TodaysOpenDashStyle",
+        "ShowYesterdaysCloseLine",
+        "YesterdaysCloseOpacity",
+        "YestCloseDashStyle",
+        "ShowYesterdaysHighLine",
+        "YesterdaysHighOpacity",
+        "YestHighDashStyle",
+        "ShowYesterdaysLowLine",
+        "YesterdaysLowOpacity",
+        "YestLowDashStyle",
+        "UpColor",
+        "DownColor",
+        "UpFilled",
+        "DownFilled",
+        "ColorMode",
+        "FillMode"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPricePercentOscillator",
+      "token": "0x02000066",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "PeriodShort",
+        "PeriodLong",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPriceVolumeTrend",
+      "token": "0x02000067",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcPriceZoneOsc",
+      "token": "0x02000068",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcRateOfChange",
+      "token": "0x02000069",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcRateOfChangePercent",
+      "token": "0x0200006a",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcRelativePattern",
+      "token": "0x0200006b",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "Period",
+        "Mode",
+        "CompSym"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcRelativeStrength",
+      "token": "0x0200006d",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "CompSym"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcRSI",
+      "token": "0x0200006e",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcScanCount",
+      "token": "0x0200006f",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "InitDone",
+        "TimeFrame",
+        "IndexTarget",
+        "CountType",
+        "BlendNewBar",
+        "BlendSeconds",
+        "Scan1",
+        "Scan1Name",
+        "Scan2",
+        "PCFFormulaXML"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcScanForecasting",
+      "token": "0x02000071",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "Scan",
+        "ShowAverage",
+        "ShowMaxMin",
+        "CombineInRow",
+        "OnlyPlotIfRecentPass",
+        "RecentPassBarsAgo",
+        "MaxToShow",
+        "AvgColor",
+        "MaxMinColor"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcSeasonCast",
+      "token": "0x02000074",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "Season",
+        "ShowAverage",
+        "ShowMaxMin",
+        "MaxToShow",
+        "AvgColor",
+        "MaxMinColor"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcSimpleChartOverlay",
+      "token": "0x02000078",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "ChannelColor",
+        "ChannelWidth"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcStochastics",
+      "token": "0x02000079",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "Period",
+        "KPeriod",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcStochasticsMACD",
+      "token": "0x0200007a",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "PeriodShort",
+        "PeriodLong",
+        "StochasticsPeriod",
+        "KPeriod",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcStochasticsRSI",
+      "token": "0x0200007b",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "Period",
+        "StochasticsPeriod",
+        "KPeriod",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcSymbolViewsPlot",
+      "token": "0x0200007c",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "DataType",
+        "MarketHoursOnly"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcTimeSeriesForecast",
+      "token": "0x0200007d",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [
+        "Period",
+        "ForeCast"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcTimeValAsPercentStock",
+      "token": "0x0200007e",
+      "abstract": false,
+      "extends_token": "0x02000051",
+      "evidence_id": "ev_f9960e65066b9682803a60b0baf6ce9c4697cf604cf1ea680612a53ffb753613",
+      "declared_settings": [],
+      "declares_calculate": false,
+      "declares_default_add_mode": false
+    },
+    {
+      "name": "calcTRIX",
+      "token": "0x0200007f",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcTrueStrengthIndex",
+      "token": "0x02000080",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "PeriodShort",
+        "PeriodLong"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcTSV",
+      "token": "0x02000081",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "Period",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcUltimateOscillator",
+      "token": "0x02000082",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "PeriodShort",
+        "PeriodMedium",
+        "PeriodLong"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcUnderlyingSymbol",
+      "token": "0x02000083",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "OptionDataSource",
+        "AutoPin",
+        "ShowBidAsk",
+        "ShowBidAskValues",
+        "BidAskColor",
+        "BidAskOpacity"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcVolatilityStop",
+      "token": "0x02000084",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "UpColor",
+        "DownColor",
+        "TRPeriod",
+        "TRMult"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcVolROC",
+      "token": "0x02000085",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcVolROCPercent",
+      "token": "0x02000086",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcVolume",
+      "token": "0x02000087",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "UpColor",
+        "DownColor",
+        "TruncationColor",
+        "ColorByPrice",
+        "TruncateVolume",
+        "TruncateMult"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcVolumeAtPrice",
+      "token": "0x02000089",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "PosColor",
+        "NegColor"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcVolZoneOsc",
+      "token": "0x0200008c",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcVortex",
+      "token": "0x0200008d",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcVWAP",
+      "token": "0x0200008e",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcWildersRSI",
+      "token": "0x0200008f",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcWillAlligator",
+      "token": "0x02000090",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "JawColor",
+        "TeethColor",
+        "LipsColor"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcWilliamsAccDist",
+      "token": "0x02000092",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcWilliamsPercentR",
+      "token": "0x02000093",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "Period"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    },
+    {
+      "name": "calcWordenStochastics",
+      "token": "0x02000094",
+      "abstract": false,
+      "extends_token": "0x0200000a",
+      "evidence_id": "ev_50188ab913cf79ea4bcebd9bbe9daf53923e286104c338f58a03e18983a9e26a",
+      "declared_settings": [
+        "Period",
+        "KPeriod",
+        "AvgType"
+      ],
+      "declares_calculate": true,
+      "declares_default_add_mode": true
+    }
+  ]
+}

@@ -228,6 +228,7 @@ pub struct CapsError {
 pub struct BuiltIndicator {
     pub spec: IndicatorSpec,
     pub overlays: Vec<(String, Overlay)>,
+    pub error: Option<String>,
 }
 
 pub struct Profile {
@@ -378,6 +379,14 @@ pub fn data_dir() -> PathBuf {
 }
 
 impl Worker {
+    #[cfg(test)]
+    pub fn inert() -> Self {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_, rx) = mpsc::channel();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        Self { tx, rx, _rt: rt }
+    }
+
     pub fn spawn(ctx: egui::Context, provider: Provider) -> anyhow::Result<Self> {
         let dir = data_dir();
         std::fs::create_dir_all(&dir)?;
@@ -474,12 +483,20 @@ pub fn build_indicators(
 ) -> Vec<BuiltIndicator> {
     let input = Input::new(bars, tf);
     let colors = palette.series.len();
+    let calculated = tr_core::indicators::study::evaluate(specs, &input);
     specs
         .iter()
+        .zip(calculated)
         .enumerate()
-        .map(|(i, spec)| {
-            let main = palette.series[i % colors];
-            let mut outputs = spec.compute(&input);
+        .map(|(i, (spec, result))| {
+            let i = spec.chart.as_ref().map_or(i, |c| c.id.saturating_sub(1) as usize);
+            let main = spec
+                .chart
+                .as_ref()
+                .and_then(|c| c.color)
+                .map_or(palette.series[i % colors], |[r, g, b]| egui::Color32::from_rgb(r, g, b));
+            let error = result.as_ref().err().cloned();
+            let mut outputs = result.unwrap_or_default();
             // Columns first, so lines and markers draw over them.
             outputs.sort_by_key(|o| o.plot != Plot::Hist);
             let overlays = outputs
@@ -503,7 +520,7 @@ pub fn build_indicators(
                     (o.name.to_string(), overlay(&o.values, color, kind))
                 })
                 .collect();
-            BuiltIndicator { spec: spec.clone(), overlays }
+            BuiltIndicator { spec: spec.clone(), overlays, error }
         })
         .collect()
 }
