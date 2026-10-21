@@ -744,10 +744,14 @@ mod tests {
                     drawing.pattern_points =
                         (0..tool.points()).map(|i| Anchor { ts: i as i64 + 1, price: 100. - i as f64 * 10. }).collect();
                 }
+                if matches!(tool, Tool::Brush | Tool::Path) {
+                    drawing.vertices = vec![drawing.a, drawing.b, drawing.c.unwrap()];
+                    drawing.arrow_end = tool == Tool::Path;
+                }
                 drawing
             })
             .collect();
-        // Captured from the original shared model before moving its serde types.
+        // Original shared-model entries plus annotation tools and sampled vertices.
         let fixture = include_str!("../tests/fixtures/drawings_fixture.json").trim();
         let loaded: Vec<Drawing> = serde_json::from_str(fixture).unwrap();
         assert_eq!(drawings, loaded);

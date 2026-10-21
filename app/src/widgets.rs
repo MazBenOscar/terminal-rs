@@ -120,6 +120,15 @@ pub enum Icon {
     Channel,
     Pitchfork,
     Rectangle,
+    Arrow,
+    ArrowMarkUp,
+    ArrowMarkDown,
+    Brush,
+    Circle,
+    Path,
+    PriceNote,
+    Callout,
+    FlagMark,
     Text,
     LongPosition,
     ShortPosition,
@@ -178,6 +187,61 @@ fn measure_volume_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
     }
 }
 
+// Original annotation glyphs, constructed on a twelve-unit grid.
+fn annotation_point(r: egui::Rect, x: f32, y: f32) -> egui::Pos2 {
+    r.center() + egui::vec2(x - 6., y - 6.) * (r.width().min(r.height()) / 16.)
+}
+fn arrow_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, color: egui::Color32) {
+    let pt = |x, y| annotation_point(r, x, y);
+    let s = egui::Stroke::new(1.4, color);
+    if icon == Icon::Arrow {
+        p.line_segment([pt(1., 11.), pt(11., 1.)], s);
+        p.add(egui::Shape::line(vec![pt(5., 1.), pt(11., 1.), pt(11., 7.)], s));
+    } else {
+        let (tip, base) = if icon == Icon::ArrowMarkUp { (2., 10.) } else { (10., 2.) };
+        p.add(egui::Shape::convex_polygon(vec![pt(6., tip), pt(1., base), pt(11., base)], color, s));
+    }
+}
+fn brush_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
+    let pt = |x, y| annotation_point(r, x, y);
+    p.add(egui::Shape::line(
+        vec![pt(1., 10.), pt(3., 3.), pt(5., 2.), pt(6., 8.), pt(8., 10.), pt(11., 4.)],
+        egui::Stroke::new(1.4, color),
+    ));
+}
+fn shape_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, color: egui::Color32) {
+    let pt = |x, y| annotation_point(r, x, y);
+    let s = egui::Stroke::new(1.4, color);
+    if icon == Icon::Circle {
+        p.circle_stroke(pt(6., 6.), r.width().min(r.height()) * 5. / 16., s);
+    } else {
+        p.add(egui::Shape::line(vec![pt(1., 10.), pt(4., 2.), pt(8., 9.), pt(11., 3.)], s));
+        for (x, y) in [(1., 10.), (4., 2.), (8., 9.), (11., 3.)] {
+            p.circle_filled(pt(x, y), 1., color);
+        }
+    }
+}
+fn note_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, color: egui::Color32) {
+    let pt = |x, y| annotation_point(r, x, y);
+    let s = egui::Stroke::new(1.4, color);
+    match icon {
+        Icon::FlagMark => {
+            p.line_segment([pt(3., 12.), pt(3., 1.)], s);
+            p.add(egui::Shape::line(vec![pt(3., 1.), pt(11., 1.), pt(9., 6.), pt(3., 6.)], s));
+        }
+        Icon::PriceNote => {
+            p.add(egui::Shape::line(vec![pt(1., 10.), pt(5., 4.), pt(11., 4.), pt(11., 9.), pt(5., 9.)], s));
+            p.line_segment([pt(7., 6.), pt(9., 6.)], s);
+        }
+        _ => {
+            p.add(egui::Shape::line(
+                vec![pt(1., 11.), pt(4., 7.), pt(2., 7.), pt(2., 1.), pt(11., 1.), pt(11., 7.), pt(6., 7.)],
+                s,
+            ));
+        }
+    }
+}
+
 pub fn tool_icon(tool: tr_chart::drawings::Tool) -> Icon {
     use tr_chart::drawings::Tool;
     match tool {
@@ -197,6 +261,15 @@ pub fn tool_icon(tool: tr_chart::drawings::Tool) -> Icon {
         Tool::Pitchfork => Icon::Pitchfork,
         Tool::Rectangle => Icon::Rectangle,
         Tool::Text => Icon::Text,
+        Tool::Arrow => Icon::Arrow,
+        Tool::ArrowMarkUp => Icon::ArrowMarkUp,
+        Tool::ArrowMarkDown => Icon::ArrowMarkDown,
+        Tool::Brush => Icon::Brush,
+        Tool::Circle => Icon::Circle,
+        Tool::Path => Icon::Path,
+        Tool::PriceNote => Icon::PriceNote,
+        Tool::Callout => Icon::Callout,
+        Tool::FlagMark => Icon::FlagMark,
         Tool::LongPosition => Icon::LongPosition,
         Tool::ShortPosition => Icon::ShortPosition,
         Tool::Measure => Icon::Measure,
@@ -288,6 +361,10 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
         Icon::FibRetracement | Icon::FibExtension | Icon::FibChannel | Icon::FibTimeZone => {
             crate::drawing_paint::fib(p, r, icon, color)
         }
+        Icon::Arrow | Icon::ArrowMarkUp | Icon::ArrowMarkDown => arrow_icon(p, r, icon, color),
+        Icon::Brush => brush_icon(p, r, color),
+        Icon::Circle | Icon::Path => shape_icon(p, r, icon, color),
+        Icon::PriceNote | Icon::Callout | Icon::FlagMark => note_icon(p, r, icon, color),
         Icon::Rectangle => crate::drawing_paint::shapes(p, r, color),
         Icon::Text => crate::drawing_paint::text(p, r, color),
         Icon::LongPosition | Icon::ShortPosition | Icon::Measure => crate::drawing_paint::measure(p, r, icon, color),

@@ -38,9 +38,11 @@ pub fn paint(drawing: &Drawing, paint: &Paint<'_>, shapes: Vec<LabeledShape>) {
         | Tool::ShortPosition => {
             paint_measure(paint, shapes, matches!(drawing.tool, Tool::LongPosition | Tool::ShortPosition))
         }
+        Tool::Arrow | Tool::ArrowMarkUp | Tool::ArrowMarkDown => paint_arrows(paint, shapes, drawing.tool),
         Tool::AnchoredVwap | Tool::FixedRangeVolumeProfile => paint_volume(paint, shapes),
-        Tool::Rectangle => paint_shapes(paint, shapes),
-        Tool::Text => paint_text(paint, shapes),
+        Tool::Rectangle | Tool::Circle | Tool::Path => paint_shapes(paint, shapes),
+        Tool::Brush => paint_brush(paint, shapes),
+        Tool::Text | Tool::PriceNote | Tool::Callout | Tool::FlagMark => paint_text(paint, shapes, drawing.tool),
         Tool::Xabcd
         | Tool::Abcd
         | Tool::HeadAndShoulders
@@ -69,6 +71,22 @@ fn paint_patterns(p: &Paint<'_>, shapes: Vec<LabeledShape>) {
     }
 }
 
+fn paint_arrows(p: &Paint<'_>, shapes: Vec<LabeledShape>, tool: Tool) {
+    if tool == Tool::Arrow {
+        primitives(p, shapes, RectStyle::Plain);
+        return;
+    }
+    let color = if tool == Tool::ArrowMarkUp { theme::up() } else { theme::down() };
+    for (shape, _) in shapes {
+        if let DrawingShape::Polygon(points) = shape {
+            let points = points[..3].iter().map(|a| pos2(a[0] as f32, a[1] as f32)).collect();
+            p.painter.add(Shape::convex_polygon(points, color, Stroke::new(p.stroke.width, color)));
+        }
+    }
+}
+fn paint_brush(p: &Paint<'_>, shapes: Vec<LabeledShape>) {
+    primitives(p, shapes, RectStyle::Plain);
+}
 fn paint_lines(p: &Paint<'_>, shapes: Vec<LabeledShape>) {
     primitives(p, shapes, RectStyle::Plain);
 }
@@ -95,14 +113,15 @@ fn paint_volume(p: &Paint<'_>, shapes: Vec<LabeledShape>) {
         primitives(&context, vec![(shape, if poc { label } else { None })], RectStyle::Plain);
     }
 }
-fn paint_text(p: &Paint<'_>, shapes: Vec<LabeledShape>) {
-    primitives(p, shapes, RectStyle::Text);
+fn paint_text(p: &Paint<'_>, shapes: Vec<LabeledShape>, tool: Tool) {
+    primitives(p, shapes, if tool == Tool::Callout { RectStyle::Callout } else { RectStyle::Text });
 }
 
 enum RectStyle {
     Plain,
     RiskReward,
     Text,
+    Callout,
 }
 fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) {
     let Paint { painter: p, rect, stroke, selected } = *context;
@@ -152,8 +171,8 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
             }
             DrawingShape::Rect(a, b) => {
                 let r = Rect::from_two_pos(pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32));
-                if matches!(style, RectStyle::Text) {
-                    if selected {
+                if matches!(style, RectStyle::Text | RectStyle::Callout) {
+                    if selected || matches!(style, RectStyle::Callout) {
                         p.rect_stroke(r, 2., stroke, StrokeKind::Inside);
                     }
                     let galley = p.layout(label.unwrap_or_default(), ui_font(11.5), color, 220.);

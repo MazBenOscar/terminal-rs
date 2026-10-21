@@ -70,12 +70,18 @@ pub const CATEGORIES: [Category; 6] = [
     Category {
         title: "Annotation",
         sections: &[
-            Section { title: "Arrows", tools: &[] },
-            Section { title: "Brushes", tools: &[] },
-            Section { title: "Shapes", tools: &[Tool::Rectangle] },
+            Section { title: "Arrows", tools: &[Tool::Arrow, Tool::ArrowMarkUp, Tool::ArrowMarkDown] },
+            Section { title: "Brushes", tools: &[Tool::Brush] },
+            Section { title: "Shapes", tools: &[Tool::Rectangle, Tool::Circle, Tool::Path] },
         ],
     },
-    Category { title: "Text & notes", sections: &[Section { title: "Text and notes", tools: &[Tool::Text] }] },
+    Category {
+        title: "Text & notes",
+        sections: &[Section {
+            title: "Text and notes",
+            tools: &[Tool::Text, Tool::PriceNote, Tool::Callout, Tool::FlagMark],
+        }],
+    },
     PATTERNS,
 ];
 
@@ -166,8 +172,8 @@ pub const GROUPS: [(&str, &[Tool]); 5] = [
     (CATEGORIES[0].title, &category_tools::<10>(0)),
     (CATEGORIES[1].title, &category_tools::<4>(1)),
     (CATEGORIES[2].title, &category_tools::<8>(2)),
-    (CATEGORIES[3].title, &category_tools::<1>(3)),
-    (CATEGORIES[4].title, &category_tools::<1>(4)),
+    (CATEGORIES[3].title, &category_tools::<7>(3)),
+    (CATEGORIES[4].title, &category_tools::<4>(4)),
 ];
 
 #[derive(Clone, Debug)]

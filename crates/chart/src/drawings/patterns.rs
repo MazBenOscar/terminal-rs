@@ -165,6 +165,7 @@ mod tests {
                 measure_label: String::new(),
                 text_size: [0., 0.],
                 closes: &[],
+                project: &|a| [a.ts as f64 * 20., a.price],
             };
             assert_eq!(super::super::handles(&d).len(), tool.points());
             let shapes = super::super::geometry(&context);

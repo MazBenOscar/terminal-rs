@@ -43,10 +43,19 @@ pub enum Tool {
     DatePriceRange,
     AnchoredVwap,
     FixedRangeVolumeProfile,
+    Arrow,
+    ArrowMarkUp,
+    ArrowMarkDown,
+    Brush,
+    Circle,
+    Path,
+    PriceNote,
+    Callout,
+    FlagMark,
 }
 
 impl Tool {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 39] = [
         Self::Trendline,
         Self::Horizontal,
         Self::Vertical,
@@ -77,6 +86,15 @@ impl Tool {
         Self::DatePriceRange,
         Self::AnchoredVwap,
         Self::FixedRangeVolumeProfile,
+        Self::Arrow,
+        Self::ArrowMarkUp,
+        Self::ArrowMarkDown,
+        Self::Brush,
+        Self::Circle,
+        Self::Path,
+        Self::PriceNote,
+        Self::Callout,
+        Self::FlagMark,
     ];
     pub fn points(self) -> usize {
         point_count(self)
@@ -113,6 +131,15 @@ impl Tool {
             Tool::TrianglePattern => "Triangle pattern",
             Tool::ElliottImpulse => "Elliott impulse",
             Tool::ElliottCorrection => "Elliott correction",
+            Tool::Arrow => "Arrow",
+            Tool::ArrowMarkUp => "Arrow mark up",
+            Tool::ArrowMarkDown => "Arrow mark down",
+            Tool::Brush => "Brush",
+            Tool::Circle => "Circle",
+            Tool::Path => "Path",
+            Tool::PriceNote => "Price note",
+            Tool::Callout => "Callout",
+            Tool::FlagMark => "Flag mark",
         }
     }
 }
@@ -138,13 +165,18 @@ pub struct Drawing {
     /// Third anchor, absent on older drawings.
     #[serde(default)]
     pub c: Option<Anchor>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "text::deserialize_text")]
     pub text: String,
     /// Ordered anchors for the pattern family; absent in legacy saves.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pattern_points: Vec<Anchor>,
     #[serde(default = "profile_rows", deserialize_with = "deserialize_rows", skip_serializing_if = "is_default_rows")]
     pub profile_rows: usize,
+    /// Additional vertices for brush and path drawings, in data coordinates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "shapes::deserialize_vertices")]
+    pub vertices: Vec<Anchor>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub arrow_end: bool,
 }
 
 fn deserialize_rows<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<usize, D::Error> {
@@ -176,6 +208,8 @@ impl Drawing {
             text: String::new(),
             pattern_points: Vec::new(),
             profile_rows: profile_rows(),
+            vertices: Vec::new(),
+            arrow_end: false,
         }
     }
     pub fn visible_on(&self, symbol: &str) -> bool {
@@ -212,6 +246,7 @@ pub struct Geometry<'a> {
     pub text_size: Point,
     /// Closes in chronological order over the inclusive anchor bar range.
     pub closes: &'a [f64],
+    pub project: &'a dyn Fn(Anchor) -> Point,
 }
 
 pub fn geometry(context: &Geometry<'_>) -> Vec<LabeledShape> {
@@ -220,6 +255,9 @@ pub fn geometry(context: &Geometry<'_>) -> Vec<LabeledShape> {
         | Tool::ExtendedLine
         | Tool::InfoLine
         | Tool::RegressionTrend
+        | Tool::Arrow
+        | Tool::ArrowMarkUp
+        | Tool::ArrowMarkDown
         | Tool::Trendline
         | Tool::Ray
         | Tool::Horizontal
@@ -235,8 +273,8 @@ pub fn geometry(context: &Geometry<'_>) -> Vec<LabeledShape> {
         | Tool::FixedRangeVolumeProfile
         | Tool::LongPosition
         | Tool::ShortPosition => measure::geometry(context),
-        Tool::Rectangle => shapes::geometry(context),
-        Tool::Text => text::geometry(context),
+        Tool::Rectangle | Tool::Circle | Tool::Path | Tool::Brush => shapes::geometry(context),
+        Tool::Text | Tool::PriceNote | Tool::Callout | Tool::FlagMark => text::geometry(context),
         Tool::Xabcd
         | Tool::Abcd
         | Tool::HeadAndShoulders
@@ -252,6 +290,9 @@ pub fn point_count(tool: Tool) -> usize {
         | Tool::ExtendedLine
         | Tool::InfoLine
         | Tool::RegressionTrend
+        | Tool::Arrow
+        | Tool::ArrowMarkUp
+        | Tool::ArrowMarkDown
         | Tool::Trendline
         | Tool::Ray
         | Tool::Horizontal
@@ -267,8 +308,8 @@ pub fn point_count(tool: Tool) -> usize {
         | Tool::FixedRangeVolumeProfile
         | Tool::LongPosition
         | Tool::ShortPosition => measure::point_count(tool),
-        Tool::Rectangle => shapes::point_count(),
-        Tool::Text => text::point_count(),
+        Tool::Rectangle | Tool::Circle | Tool::Path | Tool::Brush => shapes::point_count(tool),
+        Tool::Text | Tool::PriceNote | Tool::Callout | Tool::FlagMark => text::point_count(tool),
         Tool::Xabcd
         | Tool::Abcd
         | Tool::HeadAndShoulders
@@ -284,6 +325,9 @@ pub fn handles(drawing: &Drawing) -> Vec<Anchor> {
         | Tool::ExtendedLine
         | Tool::InfoLine
         | Tool::RegressionTrend
+        | Tool::Arrow
+        | Tool::ArrowMarkUp
+        | Tool::ArrowMarkDown
         | Tool::Trendline
         | Tool::Ray
         | Tool::Horizontal
@@ -299,8 +343,8 @@ pub fn handles(drawing: &Drawing) -> Vec<Anchor> {
         | Tool::FixedRangeVolumeProfile
         | Tool::LongPosition
         | Tool::ShortPosition => measure::handles(drawing),
-        Tool::Rectangle => shapes::handles(drawing),
-        Tool::Text => text::handles(drawing),
+        Tool::Rectangle | Tool::Circle | Tool::Path | Tool::Brush => shapes::handles(drawing),
+        Tool::Text | Tool::PriceNote | Tool::Callout | Tool::FlagMark => text::handles(drawing),
         Tool::Xabcd
         | Tool::Abcd
         | Tool::HeadAndShoulders
@@ -324,6 +368,9 @@ pub fn hit_distance(context: &Geometry<'_>, point: Point) -> f64 {
         | Tool::ExtendedLine
         | Tool::InfoLine
         | Tool::RegressionTrend
+        | Tool::Arrow
+        | Tool::ArrowMarkUp
+        | Tool::ArrowMarkDown
         | Tool::Trendline
         | Tool::Ray
         | Tool::Horizontal
@@ -339,8 +386,8 @@ pub fn hit_distance(context: &Geometry<'_>, point: Point) -> f64 {
         | Tool::FixedRangeVolumeProfile
         | Tool::LongPosition
         | Tool::ShortPosition => measure::hit_distance(context, point),
-        Tool::Rectangle => shapes::hit_distance(context, point),
-        Tool::Text => text::hit_distance(context, point),
+        Tool::Rectangle | Tool::Circle | Tool::Path | Tool::Brush => shapes::hit_distance(context, point),
+        Tool::Text | Tool::PriceNote | Tool::Callout | Tool::FlagMark => text::hit_distance(context, point),
         Tool::Xabcd
         | Tool::Abcd
         | Tool::HeadAndShoulders
@@ -376,6 +423,7 @@ mod dispatch_tests {
                 measure_label: "Measurement".into(),
                 text_size: [40., 20.],
                 closes: &[100., 90.],
+                project: &|a| [a.ts as f64, a.price],
             };
             let shapes = geometry(&g);
             assert!(!shapes.is_empty(), "{tool:?}");
