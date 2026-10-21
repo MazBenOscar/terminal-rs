@@ -43,14 +43,8 @@ mod freshness_tests {
     }
 }
 
-fn history_is_stale(tf: Timeframe, last: i64, quote: i64) -> bool {
-    let boundary = if matches!(tf, Timeframe::MN1 | Timeframe::MN3) {
-        tr_core::session::next_bucket(tf, last)
-    } else {
-        last.saturating_add(tf.seconds())
-    };
-    last > quote.saturating_add(30) || quote > boundary.saturating_add(120)
-}
+#[cfg(test)]
+use tr_alerts::history_is_stale;
 
 pub type PaneId = u64;
 
@@ -577,20 +571,7 @@ impl Shared {
     }
 }
 
-pub fn data_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("TR_DATA_DIR") {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/terminal-rs")
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"))
-            .join("terminal-rs")
-    }
-}
+pub use tr_alerts::data_dir;
 
 impl Worker {
     #[cfg(test)]
@@ -1213,22 +1194,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::Markers { pane, symbol, trades });
         }
         Request::PriceAlertQuotes { revision, symbols } => {
-            use futures::{StreamExt, stream};
-            let observations =
-                stream::iter(symbols)
-                    .map(|symbol| async move {
-                        let result =
-                            match tokio::time::timeout(Duration::from_secs(20), s.provider.alert_observation(&symbol))
-                                .await
-                            {
-                                Ok(result) => result.map_err(|e| format!("{e:#}")),
-                                Err(_) => Err("Price request timed out; will retry".into()),
-                            };
-                        (symbol, result)
-                    })
-                    .buffer_unordered(4)
-                    .collect()
-                    .await;
+            let observations = tr_alerts::price_observations(s.provider.clone(), symbols).await;
             s.send(Response::PriceAlertQuotes { revision, observations });
         }
         Request::PriceAlertRules { revision, alerts } => {
@@ -1388,118 +1354,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
     }
 }
 
-/// Share provider requests across rules on the same symbol/interval. CPU evaluation
-/// stays off the async network executor, with at most four groups in flight.
-async fn condition_observations(
-    provider: Provider,
-    alerts: Vec<tr_core::price_alerts::Alert>,
-) -> Vec<(u64, Result<tr_core::price_alerts::Observation, String>)> {
-    use futures::{StreamExt, stream};
-    let mut groups = std::collections::BTreeMap::<(String, Timeframe), Vec<tr_core::price_alerts::Alert>>::new();
-    for alert in alerts {
-        let tf = match &alert.rule {
-            Some(
-                tr_core::price_alerts::Rule::Formula { timeframe, .. }
-                | tr_core::price_alerts::Rule::Condition { timeframe, .. },
-            ) => *timeframe,
-            _ => Timeframe::M1,
-        };
-        groups.entry((alert.symbol.clone(), tf)).or_default().push(alert);
-    }
-    let batches: Vec<_> = stream::iter(groups)
-        .map(|((symbol, tf), alerts)| {
-            let provider = provider.clone();
-            async move {
-                let input: Result<(tr_core::price_alerts::Observation, Vec<Bar>), String> =
-                    tokio::time::timeout(Duration::from_secs(20), async {
-                        let q = provider.alert_observation(&symbol).await.map_err(|e| e.to_string())?;
-                        if !q.valid_at(chrono::Utc::now().timestamp()) {
-                            return Err("Stale price observation".into());
-                        }
-                        let history = provider.alert_history(&symbol, tf, 1500).await.map_err(|e| e.to_string())?;
-                        if history.simulated != q.simulated {
-                            return Err("Condition and price data modes differ".into());
-                        }
-                        let last = history.bars.last().ok_or("No condition history")?;
-                        if history_is_stale(tf, last.ts, q.ts) {
-                            return Err("Condition history is stale relative to price".into());
-                        }
-                        Ok((q, history.bars))
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err("Condition request timed out".into()));
-                match input {
-                    Err(e) => alerts.into_iter().map(|a| (a.id, Err(e.clone()))).collect(),
-                    Ok((q, bars)) => {
-                        let mut set = tr_core::scanner::SeriesSet::from([(tf, Series::new(symbol.clone(), tf, bars))]);
-                        let extras: std::collections::BTreeSet<_> = alerts
-                            .iter()
-                            .filter_map(|a| a.rule.as_ref())
-                            .flat_map(|rule| rule.timeframes())
-                            .filter(|extra| *extra != tf)
-                            .collect();
-                        let mut errors = std::collections::HashMap::new();
-                        for extra in extras {
-                            let result = tokio::time::timeout(
-                                Duration::from_secs(20),
-                                provider.alert_history(&symbol, extra, 1500),
-                            )
-                            .await;
-                            match result {
-                                Ok(Ok(history)) if history.simulated == q.simulated => {
-                                    set.insert(extra, Series::new(symbol.clone(), extra, history.bars));
-                                }
-                                result => {
-                                    let error = match result {
-                                        Ok(Err(e)) => e.to_string(),
-                                        Err(_) => "Condition request timed out".into(),
-                                        _ => "Condition and price data modes differ".into(),
-                                    };
-                                    errors.insert(extra, error);
-                                }
-                            }
-                        }
-                        let ids: Vec<_> = alerts.iter().map(|a| a.id).collect();
-                        tokio::task::spawn_blocking(move || {
-                            alerts
-                                .into_iter()
-                                .map(|a| {
-                                    let result = (|| {
-                                        let rule = a.rule.as_ref().ok_or("Missing condition")?;
-                                        let mut observation = q.clone();
-                                        for required in rule.timeframes() {
-                                            if let Some(error) = errors.get(&required) {
-                                                return Err(error.clone());
-                                            }
-                                        }
-                                        observation.price = match rule {
-                                            tr_core::price_alerts::Rule::Condition { .. } => rule.value_set(&set)?,
-                                            _ => rule.value(&set[&tf].bars)?,
-                                        };
-                                        observation.source = format!(
-                                            "{} · {}",
-                                            q.source,
-                                            rule.label().chars().take(200).collect::<String>()
-                                        );
-                                        Ok(observation)
-                                    })();
-                                    (a.id, result)
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .await
-                        .unwrap_or_else(|_| {
-                            ids.into_iter().map(|id| (id, Err("Condition evaluation failed".into()))).collect()
-                        })
-                    }
-                }
-            }
-        })
-        .buffer_unordered(4)
-        .collect()
-        .await;
-    batches.into_iter().flatten().collect()
-}
+use tr_alerts::condition_observations;
 
 /// Fetch a snapshot directly from the provider, independently of chart caches/live feeds.
 /// Input order is retained even when fetches complete out of order.

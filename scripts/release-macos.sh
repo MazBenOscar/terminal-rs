@@ -78,13 +78,15 @@ notarize() {
 }
 
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
-  cargo build --release --locked --target "$target" -p terminal-rs
+  cargo build --release --locked --target "$target" -p terminal-rs -p terminal-rs-alertd
 done
 out=target/universal-apple-darwin/release
 mkdir -p "$out"
 rm -f "$out"/Terminal-*.zip "$out/appcast.xml"
 lipo -create -output "$out/terminal-rs" \
   target/aarch64-apple-darwin/release/terminal-rs target/x86_64-apple-darwin/release/terminal-rs
+lipo -create -output "$out/terminal-rs-alertd" \
+  target/aarch64-apple-darwin/release/terminal-rs-alertd target/x86_64-apple-darwin/release/terminal-rs-alertd
 scripts/bundle-macos.sh "$out/terminal-rs"
 app=$out/Terminal.app
 framework=$app/Contents/Frameworks/Sparkle.framework
@@ -92,7 +94,7 @@ framework=$app/Contents/Frameworks/Sparkle.framework
 echo "signing as $identity"
 # Inside out, Sparkle's helpers first. The hardened runtime loads Sparkle.framework only when it
 # is signed by the app's own team.
-for code in "$framework/Versions/B/Autoupdate" "$framework/Versions/B/Updater.app" "$framework" "$app"; do
+for code in "$framework/Versions/B/Autoupdate" "$framework/Versions/B/Updater.app" "$framework" "$app/Contents/MacOS/terminal-rs-alertd" "$app"; do
   codesign --force --options runtime --timestamp --sign "$identity" "$code"
 done
 codesign --verify --deep --strict --verbose=2 "$app"

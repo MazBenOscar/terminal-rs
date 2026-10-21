@@ -36,6 +36,8 @@ mod worker;
 use std::time::Instant;
 
 fn main() -> eframe::Result {
+    let _app_lock = tr_alerts::storage::Lock::acquire(&tr_alerts::data_dir().join("app.lock"))
+        .map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
     let t0 = Instant::now();
     tracing_subscriber::fmt()
         .with_env_filter(

@@ -6,6 +6,7 @@ edition.workspace = true
 default-run = "terminal-rs"
 
 [dependencies]
+tr-alerts.workspace = true
 tr-core.workspace = true
 tr-broker.workspace = true
 tr-congress.workspace = true
