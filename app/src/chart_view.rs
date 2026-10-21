@@ -5820,6 +5820,8 @@ mod tests {
     fn hide_menu_suppresses_painting_keeps_sources_and_pane_layout_and_shows_all() {
         let ctx = egui::Context::default();
         let mut chart = sample_chart();
+        chart.data.account.positions = true;
+        chart.data.account.orders = true;
         chart.indicators =
             vec![IndicatorSpec::new("BB", &[20., 2.]).unwrap(), IndicatorSpec::new("RSI", &[14.]).unwrap()];
         study::assign_ids(&mut chart.indicators);
