@@ -139,14 +139,23 @@ indicators, positions and orders, all), link and remove all. Icons are original
 line icons in the app's stroke style, never traced from third-party artwork.
 Post and Idea entries (social-platform features) are out of scope.
 
+Scope is limited to the tools professional traders use routinely (2026-10-21
+decision): marking levels, measuring moves, planning trades and annotating
+setups. Categories with no tools are not shown.
+
 | Phase | Scope | Notes |
 |---|---|---|
-| D0 | Category rail matching the reference structure (data-driven table, sectioned flyouts, Patterns category, Hide menu, Lock drawings), then refactor drawings into one module per tool family (own enum, geometry, hit-testing, handles, rendering, icons) | Sequential; unblocks parallel work |
-| D1 | Lines, channels, pitchforks: info line, extended line, trend angle, horizontal ray, cross line, regression trend, flat top/bottom, disjoint channel, Schiff, modified Schiff, inside pitchfork | Parallel after D0 |
-| D2 | Fibonacci and Gann: fib channel, time zone, speed resistance fan and arcs, trend-based fib time, circles, spiral, wedge, pitchfan; Gann box, square fixed, square, fan | Parallel after D0 |
-| D3 | Patterns: XABCD, Cypher, head and shoulders, ABCD, triangle, three drives; Elliott impulse, correction, triangle, double and triple combo; cyclic lines, time cycles, sine line | Parallel after D0 |
-| D4 | Brushes (brush, highlighter), arrows (marker, arrow, mark up, mark down), shapes (rotated rectangle, path, circle, ellipse, polyline, triangle, arc, curve, double curve) | Parallel after D0 |
-| D5 | Text and notes (note, price note, pin, table, callout, comment, price label, signpost, flag mark), local image drawing, emoji/sticker/icon picker | Parallel after D0 |
+| D0 | Category rail (data-driven table, sectioned flyouts, Patterns category, Hide menu for drawings/indicators/positions and orders/all, Lock drawings), then refactor drawings into one module per tool family (own enum, geometry, hit-testing, handles, rendering, icons) | Sequential; unblocks parallel work |
+| D1 | Lines and Fib: horizontal ray, extended line, info line (Δprice, Δ%, bars), regression trend (with deviation bands); Fib channel, Fib time zone | Parallel after D0 |
+| D2 | Patterns on one labelled multi-point engine: XABCD, ABCD, head and shoulders, triangle, Elliott impulse (1–5), Elliott correction (A–B–C) | Parallel after D0 |
+| D3 | Measure and volume: price range, date range, date and price range; anchored VWAP and fixed-range volume profile as placeable tools reusing the existing calculations | Parallel after D0 |
+| D4 | Annotation: arrow, arrow mark up/down, brush, circle, path, price note, callout, flag mark | Parallel after D0 |
+
+Deferred as niche or covered by the above: Gann tools; Fib speed fans and
+arcs, circles, spiral, wedge, pitchfan, trend-based time; Schiff variants;
+disjoint and flat-top channels; trend angle; cross line; Cypher, three
+drives, Elliott triangle and combos; cycles; highlighter and remaining
+shapes; table, pin, comment, signpost; image; emoji and stickers.
 
 Each phase ships with adversarial review, persistence round trips, undo,
 hit-testing and replay/Renko visibility rules matching existing drawings.
