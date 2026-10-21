@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::scanner::{ConditionGroup, MatchMode, ScanDefinition, ScanOutcome, SeriesSet};
+
 pub const MAX_ALERTS: usize = 200;
 pub const MAX_EVENTS: usize = 500;
 pub const MAX_SYMBOLS: usize = 32;
@@ -78,11 +80,42 @@ pub struct Alert {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Rule {
     Formula { expression: String, timeframe: crate::Timeframe },
+    Condition { root: ConditionGroup, timeframe: crate::Timeframe },
     Line { start: i64, end: i64, first: f64, last: f64, logarithmic: bool },
 }
 impl Rule {
+    fn scan(root: &ConditionGroup, timeframe: crate::Timeframe) -> ScanDefinition {
+        ScanDefinition { name: "Alert".into(), timeframe, root: root.clone() }
+    }
+
+    pub fn timeframes(&self) -> Vec<crate::Timeframe> {
+        match self {
+            Self::Formula { timeframe, .. } => vec![*timeframe],
+            Self::Line { .. } => vec![crate::Timeframe::M1],
+            Self::Condition { root, timeframe } => Self::scan(root, *timeframe).timeframes(),
+        }
+    }
+
+    pub fn value_set(&self, set: &SeriesSet) -> Result<f64, String> {
+        match self {
+            Self::Condition { root, timeframe } => {
+                let evaluation = Self::scan(root, *timeframe).evaluate_set(set);
+                match evaluation.outcome {
+                    ScanOutcome::Match => Ok(1.0),
+                    ScanOutcome::NoMatch => Ok(0.0),
+                    ScanOutcome::Unavailable => Err(evaluation.reason.unwrap_or("Condition unavailable".into())),
+                }
+            }
+            _ => {
+                let timeframe = self.timeframes()[0];
+                self.value(&set.get(&timeframe).ok_or("No condition history")?.bars)
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::Condition { root, timeframe } => Self::scan(root, *timeframe).validate(),
             Self::Formula { expression, .. } => crate::indicators::pcf::evaluate(
                 expression,
                 &crate::indicators::registry::Input::new(&[], crate::Timeframe::D1),
@@ -104,8 +137,13 @@ impl Rule {
         }
     }
     pub fn value(&self, bars: &[crate::Bar]) -> Result<f64, String> {
-        let bar = bars.last().ok_or("No condition history")?;
         let value = match self {
+            Self::Condition { timeframe, .. } => {
+                return self.value_set(&SeriesSet::from([(
+                    *timeframe,
+                    crate::Series::new("Alert", *timeframe, bars.to_vec()),
+                )]));
+            }
             Self::Formula { expression, timeframe } => *crate::indicators::pcf::evaluate(
                 expression,
                 &crate::indicators::registry::Input::new(bars, *timeframe),
@@ -114,6 +152,7 @@ impl Rule {
             .last()
             .ok_or("No formula value")?,
             Self::Line { start, end, first, last, logarithmic } => {
+                let bar = bars.last().ok_or("No condition history")?;
                 let fraction = (bar.ts - start) as f64 / (end - start) as f64;
                 let line = if *logarithmic {
                     (first.ln() + fraction * (last.ln() - first.ln())).exp()
@@ -129,6 +168,12 @@ impl Rule {
         match self {
             Self::Formula { expression, timeframe } => format!("{expression} · {}", timeframe.label()),
             Self::Line { .. } => "Price minus saved line (time extrapolation)".into(),
+            Self::Condition { root, timeframe } => format!(
+                "Condition: {} conditions (match {}) · {}",
+                root.leaves().len(),
+                if root.mode == MatchMode::All { "all" } else { "any" },
+                timeframe.label()
+            ),
         }
     }
 }
@@ -388,6 +433,84 @@ fn validate_alert(symbol: &str, level: f64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn condition(timeframe: Option<crate::Timeframe>) -> Rule {
+        Rule::Condition {
+            root: ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![crate::scanner::ScanCondition {
+                    timeframe,
+                    right: crate::scanner::ScanOperand::Constant(100.),
+                    ..crate::scanner::ScanCondition::default()
+                }],
+            ),
+            timeframe: crate::Timeframe::D1,
+        }
+    }
+
+    #[test]
+    fn condition_validate_and_value_set_match_no_match_unavailable() {
+        let rule = condition(Some(crate::Timeframe::W1));
+        rule.validate().unwrap();
+        assert_eq!(rule.timeframes(), vec![crate::Timeframe::D1, crate::Timeframe::W1]);
+        assert_eq!(rule.label(), "Condition: 1 conditions (match all) · 1D");
+        assert!(rule.value_set(&SeriesSet::new()).is_err());
+        for (close, expected) in [(101., 1.), (99., 0.)] {
+            let bars = vec![crate::Bar::new(1000, close, close, close, close, 1.)];
+            let set = SeriesSet::from([(
+                crate::Timeframe::W1,
+                crate::Series::new("AAPL", crate::Timeframe::W1, bars.clone()),
+            )]);
+            assert_eq!(rule.value_set(&set).unwrap(), expected);
+            assert!(rule.value(&bars).is_err());
+            assert_eq!(condition(None).value(&bars).unwrap(), expected);
+        }
+        let invalid = Rule::Condition {
+            root: ConditionGroup::comparisons(MatchMode::All, vec![]),
+            timeframe: crate::Timeframe::D1,
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn condition_v3_book_roundtrip_and_legacy_books_load() {
+        let mut b = book(Direction::Above);
+        b.set_rule(1, Some(condition(Some(crate::Timeframe::W1)))).unwrap();
+        let json = serde_json::to_string(&b).unwrap();
+        let restored: Book = serde_json::from_str(&json).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.version, 3);
+        assert_eq!(restored.alerts, b.alerts);
+        for version in [2, 3] {
+            let mut legacy = serde_json::to_value(book(Direction::Above)).unwrap();
+            legacy["version"] = version.into();
+            legacy["alerts"][0].as_object_mut().unwrap().remove("rule");
+            let restored: Book = serde_json::from_value(legacy).unwrap();
+            restored.validate().unwrap();
+            assert!(restored.alerts[0].rule.is_none());
+        }
+    }
+
+    #[test]
+    fn condition_crossing_fires_once_and_rearm_respects_cooldown() {
+        for repeat in [Repeat::Once, Repeat::Rearm { cooldown_secs: 60 }] {
+            let mut b = book(Direction::Above);
+            b.edit(1, 0.5, Direction::Above).unwrap();
+            b.set_rule(1, Some(condition(None))).unwrap();
+            b.set_repeat(1, repeat).unwrap();
+            for (ts, value, fires) in [
+                (1000, 0., false),
+                (1001, 1., true),
+                (1010, 0., false),
+                (1011, 1., false),
+                (1061, 1., false),
+                (1062, 0., false),
+                (1063, 1., repeat != Repeat::Once),
+            ] {
+                assert_eq!(b.observe_rule(1, quote(value, ts), ts).len(), usize::from(fires));
+            }
+        }
+    }
+
     #[test]
     fn rearm_cooldown_consumes_crossings_and_fires_again() {
         let mut b = book(Direction::Above);

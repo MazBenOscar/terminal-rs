@@ -37,6 +37,16 @@ struct Draft {
     timeframe: tr_core::Timeframe,
 }
 
+impl Draft {
+    fn saved_rule(&self) -> Option<Rule> {
+        match &self.rule {
+            Some(Rule::Condition { .. } | Rule::Line { .. }) => self.rule.clone(),
+            _ if self.formula => Some(Rule::Formula { expression: self.expression.clone(), timeframe: self.timeframe }),
+            _ => None,
+        }
+    }
+}
+
 pub struct State {
     pub book: Book,
     path: PathBuf,
@@ -274,7 +284,8 @@ impl State {
             Action::Condition { symbol, level, rule } => {
                 let (formula, expression, timeframe) = match &rule {
                     Rule::Formula { expression, timeframe } => (true, expression.clone(), *timeframe),
-                    _ => (false, String::new(), tr_core::Timeframe::M1),
+                    Rule::Condition { timeframe, .. } => (false, String::new(), *timeframe),
+                    Rule::Line { .. } => (false, String::new(), tr_core::Timeframe::M1),
                 };
                 self.editor = Some(Draft {
                     id: None,
@@ -307,7 +318,7 @@ impl State {
                             _ => "WRSI(14)".into(),
                         },
                         timeframe: match &a.rule {
-                            Some(Rule::Formula { timeframe, .. }) => *timeframe,
+                            Some(Rule::Formula { timeframe, .. } | Rule::Condition { timeframe, .. }) => *timeframe,
                             _ => tr_core::Timeframe::D1,
                         },
                     });
@@ -483,7 +494,10 @@ impl State {
                 ui.label("Symbol");
                 ui.add_enabled(draft.id.is_none(), egui::TextEdit::singleline(&mut draft.symbol).hint_text("AAPL or BTCUSD Curncy").char_limit(100).desired_width(f32::INFINITY));
                 ui.add_space(6.);
-                if matches!(draft.rule, Some(Rule::Line { .. })) {
+                if let Some(rule @ Rule::Condition { .. }) = &draft.rule {
+                    ui.label(rule.label());
+                    ui.label(RichText::new("Edit the scan and re-create the alert to change its conditions").color(muted()));
+                } else if matches!(draft.rule, Some(Rule::Line { .. })) {
                     ui.label("Saved line snapshot · zero = crossing the line");
                     ui.label("Line uses elapsed time, including market closures; edits to the drawing do not alter this alert.");
                 } else {
@@ -537,13 +551,7 @@ impl State {
         if save {
             let result = (|| {
                 let level: f64 = draft.price.trim().parse().map_err(|_| "Enter a valid price".to_string())?;
-                let rule = if draft.formula {
-                    Some(Rule::Formula { expression: draft.expression.clone(), timeframe: draft.timeframe })
-                } else if matches!(draft.rule, Some(Rule::Line { .. })) {
-                    draft.rule.clone()
-                } else {
-                    None
-                };
+                let rule = draft.saved_rule();
                 if let Some(r) = &rule {
                     r.validate()?;
                 }
@@ -636,6 +644,24 @@ mod tests {
     fn reply(state: &mut State, price: f64) -> Vec<Event> {
         state.pending = Some(state.revision);
         state.on_quotes(state.revision, vec![("AAPL US Equity".into(), Ok(q(price)))])
+    }
+
+    #[test]
+    fn editor_save_keeps_condition_rule() {
+        let scan = tr_core::scanner::ScanDefinition::default();
+        let rule = Rule::Condition { root: scan.root, timeframe: scan.timeframe };
+        let mut s = State::load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("missing-condition-test.json"), false);
+        s.action(Action::Condition { symbol: "AAPL US Equity".into(), level: 0.5, rule: rule.clone() });
+        let draft = s.editor.as_mut().unwrap();
+        draft.price = "0.75".into();
+        draft.repeat = Repeat::Rearm { cooldown_secs: 60 };
+        assert_eq!(draft.saved_rule(), Some(rule.clone()));
+        let id = s.book.add("AAPL US Equity".into(), 0.5, Direction::Above, false).unwrap();
+        s.book.set_rule(id, Some(rule.clone())).unwrap();
+        s.action(Action::Edit(id));
+        let draft = s.editor.as_mut().unwrap();
+        draft.formula = true; // A stale formula flag must never overwrite the tree.
+        assert_eq!(draft.saved_rule(), Some(rule));
     }
 
     #[test]
