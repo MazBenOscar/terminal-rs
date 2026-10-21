@@ -44,6 +44,7 @@ pub enum PriceBasis {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HistoryOptions {
+    pub session: tr_core::session::Session,
     pub extended_hours: bool,
     pub price_basis: PriceBasis,
 }

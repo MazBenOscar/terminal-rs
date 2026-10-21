@@ -91,7 +91,11 @@ pub(super) fn evaluate(specs: &[Spec], input: &Input<'_>, session: Session, hist
                     .iter()
                     .enumerate()
                     .map(|(i, bar)| {
-                        let mut as_of = crate::session::next_bucket(input.tf, bar.ts);
+                        let mut as_of = if input.tf.session_aligned(session) {
+                            session.interval(input.tf, bar.ts).1
+                        } else {
+                            crate::session::next_bucket(input.tf, bar.ts)
+                        };
                         // A successor can prove closure across weekends/holidays, but
                         // only for this bar's own study period, never a later gap period.
                         let aggregation = if input.tf.is_intraday() { session } else { Session::Provider };
@@ -176,6 +180,33 @@ mod tests {
 
     fn histories(tf: Timeframe, bars: Vec<Bar>) -> StudyHistories {
         HashMap::from([(tf, Ok(std::sync::Arc::new(bars)))])
+    }
+
+    #[test]
+    fn regular_multi_hour_studies_complete_on_session_grid_and_early_close() {
+        let open = chrono::DateTime::parse_from_rfc3339("2026-03-09T13:30:00Z").unwrap().timestamp();
+        let bars: Vec<_> = (0..4).map(|i| bar(open + i * 7200, 1.)).collect();
+        let result = evaluate(
+            &specs(&[Timeframe::H4]),
+            &Input::new(&bars, Timeframe::H2),
+            Session::UsRegular,
+            &histories(Timeframe::H4, vec![bar(open, 100.), bar(open + 14400, 200.)]),
+        );
+        let values = &result[0].as_ref().unwrap()[0].values;
+        assert!(values[0].is_nan());
+        assert_eq!(&values[1..], &[100., 100., 200.]);
+
+        let open = chrono::DateTime::parse_from_rfc3339("2026-11-27T14:30:00Z").unwrap().timestamp();
+        let bars = vec![bar(open, 1.), bar(open + 7200, 1.)];
+        let result = evaluate(
+            &specs(&[Timeframe::H4]),
+            &Input::new(&bars, Timeframe::H2),
+            Session::UsRegular,
+            &histories(Timeframe::H4, vec![bar(open, 100.)]),
+        );
+        let values = &result[0].as_ref().unwrap()[0].values;
+        assert!(values[0].is_nan());
+        assert_eq!(values[1], 100.);
     }
 
     #[test]
