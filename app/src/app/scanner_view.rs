@@ -4,14 +4,15 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use egui::{RichText, Ui};
+use egui::{Align2, Color32, RichText, Sense, Ui, pos2};
 use tr_core::Timeframe;
 use tr_core::scanner::{
     Comparison, MAX_BARS_AGO, MatchMode, ScanCondition, ScanDefinition, ScanOperand, ScanOutcome, Source,
 };
 
 use crate::congress_view::Action;
-use crate::theme::{amber, mono, muted};
+use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
+use crate::widgets::{self, Icon};
 use tr_data::universe::Universe;
 
 use crate::layouts::ScanSettings;
@@ -177,6 +178,23 @@ fn operand_editor(ui: &mut Ui, operand: &mut ScanOperand, bars_ago: &mut usize, 
     }
 }
 
+/// A muted label and its control, kept together when the row wraps.
+fn field(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(muted()));
+        add(ui);
+    });
+    ui.add_space(dp(8.0));
+}
+
+fn outcome_label(outcome: ScanOutcome) -> (&'static str, Color32) {
+    match outcome {
+        ScanOutcome::Match => ("Match", theme::up()),
+        ScanOutcome::NoMatch => ("No match", muted()),
+        ScanOutcome::Unavailable => ("Unavailable", theme::down()),
+    }
+}
+
 pub fn show(
     ui: &mut Ui,
     pane: &mut ScannerPane,
@@ -189,42 +207,62 @@ pub fn show(
     let market = pane.universe != Universe::Watchlist;
     egui::ScrollArea::vertical().id_salt(("scanner", id)).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            if market {
-                ui.label(RichText::new("MARKET SCANNER").font(mono(12.0)).color(amber()));
-                ui.label(format!("{} · manual snapshot", pane.universe.label()));
+            let (title, subtitle) = if market {
+                ("MARKET SCANNER", format!("{} · manual snapshot", pane.universe.label()))
             } else {
-                ui.label(RichText::new("WATCHLIST SCANNER").font(mono(12.0)).color(amber()));
-                ui.label(format!("{} symbols · manual snapshot", symbols.len()));
-            }
+                ("WATCHLIST SCANNER", format!("{} symbols · manual snapshot", symbols.len()))
+            };
+            ui.label(RichText::new(title).font(mono(12.0)).color(amber()));
+            ui.label(RichText::new(subtitle).font(mono(12.0)).color(muted()));
         });
-        ui.label(RichText::new("Uses the latest provider bar, which may still be forming. No automatic refresh.").small().color(muted()));
+        ui.label(
+            RichText::new("Uses the latest provider bar, which may still be forming. No automatic refresh.")
+                .small()
+                .color(muted()),
+        );
+        ui.add_space(dp(6.0));
         let before = pane.definition.clone();
         ui.add_enabled_ui(!pane.running, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Name");
-                ui.add(egui::TextEdit::singleline(&mut pane.definition.name).desired_width(160.0).char_limit(80));
-                ui.label("Timeframe");
-                egui::ComboBox::from_id_salt("scan-timeframe")
-                    .selected_text(pane.definition.timeframe.label()).show_ui(ui, |ui| {
-                    for tf in Timeframe::ALL {
-                        ui.selectable_value(&mut pane.definition.timeframe, tf, tf.label());
-                    }
+                field(ui, "Name", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut pane.definition.name).desired_width(dp(160.0)).char_limit(80));
                 });
-                ui.label("Universe");
-                let before = pane.universe;
-                egui::ComboBox::from_id_salt("scan-universe").selected_text(pane.universe.label()).show_ui(ui, |ui| {
-                    for universe in Universe::ALL {
-                        let enabled = universe == Universe::Watchlist || bulk_ready;
-                        ui.add_enabled_ui(enabled, |ui| {
-                            ui.selectable_value(&mut pane.universe, universe, universe.label())
-                                .on_disabled_hover_text("Market-wide scans need a bulk data source: set up Questrade in Settings › Brokerage");
+                field(ui, "Timeframe", |ui| {
+                    egui::ComboBox::from_id_salt("scan-timeframe")
+                        .width(dp(64.0))
+                        .selected_text(pane.definition.timeframe.label())
+                        .show_ui(ui, |ui| {
+                            for tf in Timeframe::ALL {
+                                ui.selectable_value(&mut pane.definition.timeframe, tf, tf.label());
+                            }
                         });
+                });
+                field(ui, "Universe", |ui| {
+                    let before = pane.universe;
+                    egui::ComboBox::from_id_salt("scan-universe")
+                        .width(dp(120.0))
+                        .selected_text(pane.universe.label())
+                        .show_ui(ui, |ui| {
+                            for universe in Universe::ALL {
+                                let enabled = universe == Universe::Watchlist || bulk_ready;
+                                ui.add_enabled_ui(enabled, |ui| {
+                                    ui.selectable_value(&mut pane.universe, universe, universe.label())
+                                        .on_disabled_hover_text(
+                                            "Market-wide scans need a bulk data source: set up Questrade in Settings › Brokerage",
+                                        );
+                                });
+                            }
+                        });
+                    if pane.universe != before {
+                        pane.invalidate();
                     }
                 });
-                if pane.universe != before {
-                    pane.invalidate();
-                }
+            });
+            ui.add_space(dp(6.0));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Conditions").color(muted()));
                 egui::ComboBox::from_id_salt("scan-mode")
+                    .width(dp(90.0))
                     .selected_text(if pane.definition.match_mode == MatchMode::All { "Match all" } else { "Match any" })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut pane.definition.match_mode, MatchMode::All, "Match all");
@@ -234,40 +272,89 @@ pub fn show(
             let mut remove = None;
             for (i, condition) in pane.definition.conditions.iter_mut().enumerate() {
                 ui.push_id(i, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        operand_editor(ui, &mut condition.left, &mut condition.left_bars_ago, "left");
-                        egui::ComboBox::from_id_salt("comparison").width(115.0)
-                            .selected_text(condition.comparison.label()).show_ui(ui, |ui| {
-                            for comparison in Comparison::ALL {
-                                ui.selectable_value(&mut condition.comparison, comparison, comparison.label());
+                    egui::Frame::new()
+                        .fill(theme::header())
+                        .corner_radius(theme::CONTROL_RADIUS)
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            let close_w = dp(26.0);
+                            let full = ui.available_width();
+                            let top = ui.cursor().min;
+                            ui.scope(|ui| {
+                                ui.set_max_width((full - close_w).max(0.0));
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(format!("{}", i + 1)).font(mono(12.0)).color(muted()));
+                                    operand_editor(ui, &mut condition.left, &mut condition.left_bars_ago, "left");
+                                    egui::ComboBox::from_id_salt("comparison")
+                                        .width(dp(110.0))
+                                        .selected_text(condition.comparison.label())
+                                        .show_ui(ui, |ui| {
+                                            for comparison in Comparison::ALL {
+                                                ui.selectable_value(
+                                                    &mut condition.comparison,
+                                                    comparison,
+                                                    comparison.label(),
+                                                );
+                                            }
+                                        });
+                                    operand_editor(ui, &mut condition.right, &mut condition.right_bars_ago, "right");
+                                    // Scaling a constant is just a different constant.
+                                    if matches!(condition.right, ScanOperand::Constant(_)) {
+                                        condition.right_multiplier = 1.0;
+                                    } else {
+                                        ui.add(
+                                            egui::DragValue::new(&mut condition.right_multiplier)
+                                                .speed(0.05)
+                                                .max_decimals(3)
+                                                .prefix("× "),
+                                        )
+                                        .on_hover_text(
+                                            "Multiplies the right side, e.g. Volume >= EMA(50, Volume) × 2.5",
+                                        );
+                                    }
+                                });
+                            });
+                            let close = egui::Rect::from_min_size(
+                                pos2(top.x + full - close_w + dp(4.0), top.y),
+                                egui::vec2(dp(22.0), dp(20.0)),
+                            );
+                            let remove_button =
+                                |ui: &mut Ui| widgets::icon_button(ui, Icon::Close, "Remove condition", false);
+                            if ui.put(close, remove_button).clicked() {
+                                remove = Some(i);
                             }
                         });
-                        operand_editor(ui, &mut condition.right, &mut condition.right_bars_ago, "right");
-                        // Scaling a constant is just a different constant.
-                        if matches!(condition.right, ScanOperand::Constant(_)) {
-                            condition.right_multiplier = 1.0;
-                        } else {
-                            ui.add(egui::DragValue::new(&mut condition.right_multiplier).speed(0.05).max_decimals(3).prefix("× "))
-                                .on_hover_text("Multiplies the right side, e.g. Volume >= EMA(50, Volume) × 2.5");
-                        }
-                        if ui.small_button("Remove").clicked() { remove = Some(i); }
-                    });
+                    ui.add_space(dp(2.0));
                 });
             }
-            if let Some(i) = remove { pane.definition.conditions.remove(i); }
+            if let Some(i) = remove {
+                pane.definition.conditions.remove(i);
+            }
+            if pane.definition.conditions.is_empty() {
+                ui.label(RichText::new("No conditions yet. Add one to describe what a match looks like.").color(muted()));
+            }
             if pane.definition.conditions.len() < 32 && ui.button("Add condition").clicked() {
                 pane.definition.conditions.push(ScanCondition::default());
             }
         });
-        if pane.definition != before { pane.invalidate(); }
-        ui.separator();
+        if pane.definition != before {
+            pane.invalidate();
+        }
         let validation = pane.definition.validate().err();
-        if let Some(error) = &validation { ui.label(error); }
+        if let Some(error) = &validation {
+            ui.label(RichText::new(error).color(theme::down()));
+        }
+        ui.add_space(dp(4.0));
+        ui.separator();
         let can_run = !pane.running
             && validation.is_none()
             && if market { bulk_ready } else { !symbols.is_empty() && symbols.len() <= 200 };
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(can_run, egui::Button::new("Run scan")).clicked() {
+            let run = egui::Button::new(RichText::new("Run scan").color(Color32::WHITE))
+                .fill(theme::accent())
+                .min_size(egui::vec2(dp(84.0), 0.0));
+            if ui.add_enabled(can_run, run).clicked() {
                 // Never reuse a generation after restoring a layout or recreating a pane.
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 pane.generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -280,45 +367,74 @@ pub fn show(
                     pane.snapshot_symbols.clear();
                     pane.progress = Some((0, 0));
                     send(Request::ScanUniverse {
-                        pane: id, generation: pane.generation, definition: pane.definition.clone(), universe: pane.universe, cancel,
+                        pane: id,
+                        generation: pane.generation,
+                        definition: pane.definition.clone(),
+                        universe: pane.universe,
+                        cancel,
                     });
                 } else {
                     pane.snapshot_symbols = symbols.to_vec();
                     send(Request::Scan {
-                        pane: id, generation: pane.generation, definition: pane.definition.clone(), symbols: symbols.to_vec(),
+                        pane: id,
+                        generation: pane.generation,
+                        definition: pane.definition.clone(),
+                        symbols: symbols.to_vec(),
                     });
                 }
             }
             if ui.add_enabled(!pane.running && validation.is_none(), egui::Button::new("Save scan")).clicked() {
                 match save_definition(&ScanSettings { definition: pane.definition.clone(), universe: pane.universe }) {
-                    Ok(saved) => { pane.saved = saved; pane.notice = Some("Scan saved to scans.json".into()); }
+                    Ok(saved) => {
+                        pane.saved = saved;
+                        pane.notice = Some(SAVED_NOTICE.into());
+                    }
                     Err(e) => pane.notice = Some(e),
                 }
             }
             let mut selected = None;
             ui.add_enabled_ui(!pane.running, |ui| {
                 egui::ComboBox::from_id_salt("saved-scans").selected_text("Load scan").show_ui(ui, |ui| {
-                    ui.label(RichText::new("PRESETS").small().color(muted()));
+                    ui.label(RichText::new("Presets").small().color(muted()));
                     for preset in ScanDefinition::presets() {
-                        if ui.selectable_label(false, &preset.name).clicked() { selected = Some(ScanSettings { definition: preset, universe: pane.universe }); }
+                        if ui.selectable_label(false, &preset.name).clicked() {
+                            selected = Some(ScanSettings { definition: preset, universe: pane.universe });
+                        }
                     }
                     ui.separator();
-                    ui.label(RichText::new("SAVED").small().color(muted()));
-                    if pane.saved.is_empty() { ui.label("No saved scans yet"); }
+                    ui.label(RichText::new("Saved").small().color(muted()));
+                    if pane.saved.is_empty() {
+                        ui.label(RichText::new("No saved scans yet").color(muted()));
+                    }
                     for saved in &pane.saved {
-                        if ui.selectable_label(false, &saved.definition.name).clicked() { selected = Some(saved.clone()); }
+                        if ui.selectable_label(false, &saved.definition.name).clicked() {
+                            selected = Some(saved.clone());
+                        }
                     }
                 });
             });
-            if let Some(settings) = selected { pane.definition = settings.definition; pane.universe = settings.universe; pane.invalidate(); }
-            if pane.running && !market { ui.spinner(); ui.label(format!("Scanning {} symbols… up to 15 seconds per symbol, four at a time", pane.snapshot_symbols.len())); }
+            if let Some(settings) = selected {
+                pane.definition = settings.definition;
+                pane.universe = settings.universe;
+                pane.invalidate();
+            }
+            if pane.running && !market {
+                ui.spinner();
+                ui.label(
+                    RichText::new(format!(
+                        "Scanning {} symbols… up to 15 seconds per symbol, four at a time",
+                        pane.snapshot_symbols.len()
+                    ))
+                    .color(muted()),
+                );
+            }
         });
         if pane.running && market {
             let (done, total) = pane.progress.unwrap_or((0, 0));
             ui.horizontal(|ui| {
                 let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
                 let text = if total == 0 { "Loading the US symbol directory…".to_string() } else { format!("{done} / {total}") };
-                ui.add(egui::ProgressBar::new(fraction).text(text).desired_width(260.0));
+                ui.add(egui::ProgressBar::new(fraction).text(text).desired_width(dp(260.0)));
                 let stopping = pane.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
                 if ui.add_enabled(!stopping, egui::Button::new(if stopping { "Stopping…" } else { "Stop" })).clicked()
                     && let Some(cancel) = &pane.cancel
@@ -328,16 +444,41 @@ pub fn show(
             });
             ui.label(RichText::new("Fresh snapshots are reused. Stale data, changed sources and larger lookbacks download full history; a market-wide refresh can take 10–15 minutes.").small().color(muted()));
         }
-        if market && !bulk_ready { ui.label("Market-wide scans need a bulk data source: set up Questrade in Settings › Brokerage."); }
-        if !market && symbols.is_empty() { ui.label("Your watchlist is empty. Add symbols with WL ADD <KEY>, then run the scan."); }
-        if !market && symbols.len() > 200 { ui.label("This version supports up to 200 watchlist symbols. Reduce the list before running."); }
-        if let Some(notice) = &pane.notice { ui.label(notice); }
+        let warn = |ui: &mut Ui, message: &str| {
+            ui.label(RichText::new(message).color(amber()));
+        };
+        if market && !bulk_ready {
+            warn(ui, "Market-wide scans need a bulk data source: set up Questrade in Settings › Brokerage.");
+        }
+        if !market && symbols.is_empty() {
+            warn(ui, "Your watchlist is empty. Add symbols with WL ADD <KEY>, then run the scan.");
+        }
+        if !market && symbols.len() > 200 {
+            warn(ui, "This version supports up to 200 watchlist symbols. Reduce the list before running.");
+        }
+        if let Some(notice) = &pane.notice {
+            let color = if notice == SAVED_NOTICE { theme::up() } else { theme::down() };
+            ui.label(RichText::new(notice).color(color));
+        }
         if let Some(completed) = pane.completed {
-            let count = |outcome| pane.rows.iter().filter(|r| r.evaluation.as_ref().is_some_and(|e| e.outcome == outcome)).count();
-            let unavailable = pane.rows.iter().filter(|r| r.error.is_some() || r.evaluation.as_ref().is_none_or(|e| e.outcome == ScanOutcome::Unavailable)).count();
-            ui.separator();
+            let count = |outcome| {
+                pane.rows.iter().filter(|r| r.evaluation.as_ref().is_some_and(|e| e.outcome == outcome)).count()
+            };
+            let unavailable = pane
+                .rows
+                .iter()
+                .filter(|r| r.error.is_some() || r.evaluation.as_ref().is_none_or(|e| e.outcome == ScanOutcome::Unavailable))
+                .count();
+            ui.add_space(dp(6.0));
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!("{} matches · {} non-matches · {} unavailable", count(ScanOutcome::Match), count(ScanOutcome::NoMatch), unavailable));
+                let matches = count(ScanOutcome::Match);
+                ui.label(RichText::new(format!("{matches} matches")).color(if matches > 0 { theme::up() } else { text() }));
+                ui.label(RichText::new(format!("· {} non-matches", count(ScanOutcome::NoMatch))).color(muted()));
+                ui.label(
+                    RichText::new(format!("· {unavailable} unavailable"))
+                        .color(if unavailable > 0 { theme::down() } else { muted() }),
+                );
+                ui.add_space(dp(12.0));
                 if market {
                     ui.checkbox(&mut pane.matches_only, "Matches only");
                     ui.checkbox(&mut pane.show_unavailable, "Show unavailable");
@@ -346,44 +487,131 @@ pub fn show(
                 }
             });
             let scanned = if market { pane.rows.len() } else { pane.snapshot_symbols.len() };
-            ui.label(RichText::new(format!("Scanned {scanned} symbols · finished {} UTC · click a symbol to chart it", completed.format("%Y-%m-%d %H:%M:%S"))).small().color(muted()));
+            ui.label(
+                RichText::new(format!(
+                    "Scanned {scanned} symbols · finished {} UTC · click a row to chart it",
+                    completed.format("%Y-%m-%d %H:%M:%S")
+                ))
+                .small()
+                .color(muted()),
+            );
             if !market && pane.snapshot_symbols != symbols {
-                ui.label("The watchlist has changed since this snapshot. Run again to scan the current list.");
+                warn(ui, "The watchlist has changed since this snapshot. Run again to scan the current list.");
             }
-            if pane.rows.iter().any(|r| r.simulated) { ui.label(RichText::new("SIMULATED DATA — these results use generated sample bars.").color(amber())); }
-            egui::ScrollArea::horizontal().id_salt("scan-results").show(ui, |ui| {
-                egui::Grid::new("scan-grid").striped(true).min_col_width(90.0).show(ui, |ui| {
-                    for title in ["Security", "Result", "Data", "Last bar (UTC)", "Bar age", "Details"] { ui.strong(title); }
-                    ui.end_row();
-                    for row in &pane.rows {
-                        let outcome = row.evaluation.as_ref().map(|e| e.outcome).unwrap_or(ScanOutcome::Unavailable);
-                        if pane.matches_only && outcome == ScanOutcome::NoMatch { continue; }
-                        if market && !pane.show_unavailable && outcome == ScanOutcome::Unavailable { continue; }
-                        if ui.link(&row.symbol).clicked() { actions.push(Action::OpenChart(row.symbol.clone())); }
-                        ui.label(match outcome { ScanOutcome::Match => "Match", ScanOutcome::NoMatch => "No match", ScanOutcome::Unavailable => "Unavailable" });
-                        ui.label(if row.simulated { "Simulated" } else if row.error.is_some() { "Unavailable" } else if market { "Stored bars" } else { "Provider snapshot" });
-                        let ts = row.ts.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
-                        ui.label(ts.map_or_else(|| "—".into(), |ts| ts.format("%Y-%m-%d %H:%M").to_string()));
-                        ui.label(row.ts.map_or_else(|| "—".into(), |ts| {
-                            let minutes = chrono::Utc::now().timestamp().saturating_sub(ts).max(0) / 60;
-                            if minutes >= 1440 { format!("{}d {}h", minutes / 1440, minutes % 1440 / 60) }
-                            else { format!("{}h {}m", minutes / 60, minutes % 60) }
-                        })).on_hover_text("Age of the bar's opening timestamp, not a freshness guarantee. Closed markets and longer timeframes naturally have older bars.");
-                        let detail = row.error.clone().or_else(|| row.evaluation.as_ref().and_then(|e| e.reason.clone()))
-                            .unwrap_or_else(|| row.evaluation.as_ref().map(|e| e.conditions.iter().enumerate().map(|(i,c)| {
-                                let value = |v: Option<f64>| v.map_or_else(|| "—".into(), |v| format!("{v:.2}"));
-                                format!("{}: {} / {}", i+1, value(c.left), value(c.right))
-                            }).collect::<Vec<_>>().join("; ")).unwrap_or_default());
-                        ui.label(detail);
-                        ui.end_row();
-                    }
-                });
-            });
+            if pane.rows.iter().any(|r| r.simulated) {
+                warn(ui, "SIMULATED DATA — these results use generated sample bars.");
+            }
+            ui.add_space(dp(4.0));
+            results_table(ui, pane, market, &mut actions);
         } else if !pane.running {
+            ui.add_space(dp(6.0));
             ui.label(RichText::new("Choose conditions and run a scan. Definitions are saved with the workspace; Save scan also adds them to your library.").color(muted()));
         }
     });
     actions
+}
+
+/// Two decimals, with K/M/B for volumes and other large values.
+fn compact(v: f64) -> String {
+    let a = v.abs();
+    if a >= 1e9 {
+        format!("{:.2}B", v / 1e9)
+    } else if a >= 1e6 {
+        format!("{:.2}M", v / 1e6)
+    } else if a >= 1e5 {
+        format!("{:.1}K", v / 1e3)
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+const SAVED_NOTICE: &str = "Scan saved to scans.json";
+
+/// Results drawn like the watchlist: a header band, hover-washed rows, click to chart.
+fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec<Action>) {
+    let row_h = dp(22.0);
+    let w = ui.available_width();
+    // Left edges: security, result, last bar, bar age, details.
+    let x = [8.0, dp(100.0), dp(196.0), dp(320.0), dp(392.0)];
+    let (hdr, _) = ui.allocate_exact_size(egui::vec2(w, row_h), Sense::hover());
+    let p = ui.painter_at(hdr);
+    p.rect_filled(hdr, theme::CONTROL_RADIUS, theme::header());
+    for (k, title) in ["Security", "Result", "Last bar (UTC)", "Bar age", "Details"].into_iter().enumerate() {
+        p.text(pos2(hdr.left() + x[k], hdr.center().y), Align2::LEFT_CENTER, title, ui_font(11.5), muted());
+    }
+    let mut shown = 0;
+    for row in &pane.rows {
+        let outcome = row.evaluation.as_ref().map(|e| e.outcome).unwrap_or(ScanOutcome::Unavailable);
+        if pane.matches_only && outcome == ScanOutcome::NoMatch {
+            continue;
+        }
+        if market && !pane.show_unavailable && outcome == ScanOutcome::Unavailable {
+            continue;
+        }
+        shown += 1;
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(w, row_h), Sense::click());
+        widgets::hover_wash(ui, r, &resp, false);
+        let p = ui.painter_at(r);
+        let y = r.center().y;
+        let ticker = tr_data::security(&row.symbol).ticker;
+        p.text(pos2(r.left() + x[0], y), Align2::LEFT_CENTER, &ticker, mono(12.5), amber());
+        let (label, color) = outcome_label(outcome);
+        p.text(pos2(r.left() + x[1], y), Align2::LEFT_CENTER, label, ui_font(12.0), color);
+        let ts = row.ts.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
+        let last = ts.map_or_else(|| "—".into(), |ts| ts.format("%Y-%m-%d %H:%M").to_string());
+        p.text(pos2(r.left() + x[2], y), Align2::LEFT_CENTER, last, mono(12.0), text());
+        let age = row.ts.map_or_else(
+            || "—".into(),
+            |ts| {
+                let minutes = chrono::Utc::now().timestamp().saturating_sub(ts).max(0) / 60;
+                if minutes >= 1440 {
+                    format!("{}d {}h", minutes / 1440, minutes % 1440 / 60)
+                } else {
+                    format!("{}h {}m", minutes / 60, minutes % 60)
+                }
+            },
+        );
+        p.text(pos2(r.left() + x[3], y), Align2::LEFT_CENTER, age, mono(12.0), muted());
+        let detail =
+            row.error.clone().or_else(|| row.evaluation.as_ref().and_then(|e| e.reason.clone())).unwrap_or_else(|| {
+                row.evaluation
+                    .as_ref()
+                    .map(|e| {
+                        e.conditions
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| {
+                                let value = |v: Option<f64>| v.map_or_else(|| "—".into(), compact);
+                                format!("{}: {} / {}", i + 1, value(c.left), value(c.right))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("   ")
+                    })
+                    .unwrap_or_default()
+            });
+        let detail_color = if row.error.is_some() { theme::down() } else { muted() };
+        p.text(pos2(r.left() + x[4], y), Align2::LEFT_CENTER, &detail, mono(12.0), detail_color);
+        let source = if row.simulated {
+            "Simulated data"
+        } else if row.error.is_some() {
+            "Data unavailable"
+        } else if market {
+            "Stored bars"
+        } else {
+            "Provider snapshot"
+        };
+        let resp = resp.on_hover_text(format!(
+            "{} · {source}\n{detail}\nClick to chart. Bar age is the age of the bar's opening timestamp, not a freshness guarantee.",
+            row.symbol
+        ));
+        if resp.clicked() {
+            actions.push(Action::OpenChart(row.symbol.clone()));
+        }
+    }
+    if shown == 0 {
+        ui.add_space(dp(6.0));
+        ui.label(RichText::new("No rows to show with the current filters.").color(muted()));
+    }
 }
 
 #[cfg(test)]
@@ -469,6 +697,15 @@ mod tests {
         assert!(save_definition_at(&definition, &dir).is_err());
         assert_eq!(std::fs::read(dir.join("scans.json")).unwrap(), b"broken JSON");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn large_values_are_compact() {
+        assert_eq!(compact(339.5), "339.50");
+        assert_eq!(compact(99_999.0), "99999.00");
+        assert_eq!(compact(100_000.0), "100.0K");
+        assert_eq!(compact(35_851_382.0), "35.85M");
+        assert_eq!(compact(-2.5e9), "-2.50B");
     }
 
     #[test]
