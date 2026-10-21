@@ -3,6 +3,7 @@
 
 mod anim;
 mod app;
+mod chart_account;
 mod chart_compare;
 mod chart_controls;
 mod chart_data;

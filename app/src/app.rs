@@ -254,7 +254,7 @@ impl PaneKind {
                 show_congress: c.show_congress,
                 magnet: c.magnet,
                 navigation: c.navigation,
-                data: c.data,
+                data: c.data.clone(),
             },
             PaneKind::Feed { filter } => {
                 PaneSettings::Feed((*filter != FeedFilter::default()).then(|| (*filter).into()))
@@ -1728,6 +1728,7 @@ mod tests {
         let mut chart = ChartState::new(1, "AAPL", Timeframe::H1);
         chart.navigation = crate::chart_navigation::Navigation { cursor: true, range: true };
         chart.data = crate::chart_data::ChartData {
+            account: Default::default(),
             zone: tr_core::session::Zone::NewYork,
             session: tr_core::session::Session::UsRegular,
             refresh_seconds: 60,

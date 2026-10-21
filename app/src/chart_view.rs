@@ -152,6 +152,7 @@ pub struct ChartState {
     pub actions: Vec<Action>,
     pub price_alerts: Vec<tr_core::price_alerts::Alert>,
     pub price_alert_actions: Vec<crate::price_alerts::Action>,
+    pub account_overlay: crate::chart_account::Snapshot,
     context_price: Option<f64>,
     /// False while a pane is being dragged over the workspace: no crosshair or hover cards.
     pub hover_enabled: bool,
@@ -230,6 +231,7 @@ impl ChartState {
             actions: Vec::new(),
             price_alerts: Vec::new(),
             price_alert_actions: Vec::new(),
+            account_overlay: Default::default(),
             context_price: None,
             hover_enabled: true,
             controls_in_strip: false,
@@ -1485,6 +1487,9 @@ impl ChartState {
         }
 
         self.paint_price_alerts(ui, price_rect, &scale);
+        if self.data.account.positions || self.data.account.orders {
+            self.account_overlay.paint(ui, price_rect, &scale, self.bars.last().map(|b| b.close));
+        }
 
         // ---- drawings ----
         let drawing_response = if over_legend {
@@ -2092,7 +2097,7 @@ impl ChartState {
                 chart_type: self.chart_type,
                 log: self.log,
                 show_volume: self.show_volume,
-                data: self.data,
+                data: self.data.clone(),
             };
             self.template_status = Some(template.save(&crate::chart_templates::directory()).map(|()| {
                 self.template_names = None;
@@ -2171,6 +2176,7 @@ impl ChartState {
     }
 
     fn context_menu(&mut self, ui: &mut Ui, w: &Worker) {
+        ui.menu_button("Positions and orders", |ui| self.account_overlay.menu(ui, &mut self.data.account));
         use crate::price_alerts::Action as AlertAction;
         if ui.add_enabled(self.context_price.is_some(), egui::Button::new("Create price alert here…")).clicked() {
             if let Some(level) = self.context_price {
@@ -2224,7 +2230,7 @@ impl ChartState {
         ui.separator();
         ui.set_min_width(190.0);
         ui.menu_button("Time zone, session & refresh", |ui| {
-            let before = self.data;
+            let before = self.data.clone();
             self.data.edit(ui, matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf));
             if self.data.session != before.session {
                 self.pending_dates =

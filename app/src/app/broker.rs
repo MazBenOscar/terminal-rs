@@ -221,7 +221,11 @@ impl TerminalApp {
 
     /// Periodic portfolio and quote refresh while a portfolio pane is visible.
     pub(super) fn broker_periodic(&mut self, visible: &[usize]) {
-        let shown = visible.iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Portfolio(_)));
+        let shown = visible.iter().any(|&i| match &self.panes[i].kind {
+            PaneKind::Portfolio(_) => true,
+            PaneKind::Chart(c) => c.data.account.positions || c.data.account.orders,
+            _ => false,
+        });
         if !shown {
             return;
         }

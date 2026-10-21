@@ -18,7 +18,20 @@ impl TerminalApp {
         let mut actions = Vec::new();
         let id = self.panes[i].id;
         let dragging = self.drag.is_some_and(|d| d.active);
+        let account_overlay = if let PaneKind::Chart(c) = &self.panes[i].kind {
+            Some(crate::chart_account::Snapshot::build(
+                self.shown_portfolio(),
+                &c.symbol,
+                &c.data.account,
+                self.demo_mode(),
+                self.broker.error.as_deref(),
+                self.provider.eq_ignore_ascii_case("sample"),
+            ))
+        } else {
+            None
+        };
         if let PaneKind::Chart(c) = &mut self.panes[i].kind {
+            c.account_overlay = account_overlay.unwrap_or_default();
             c.price_alerts = self
                 .price_alerts
                 .book

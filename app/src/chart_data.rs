@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 use tr_core::session::{Session, Zone};
 
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChartData {
     pub zone: Zone,
     pub session: Session,
     pub refresh_seconds: u32,
+    pub account: crate::chart_account::Settings,
 }
 impl ChartData {
     pub fn edit(&mut self, ui: &mut egui::Ui, us_equity: bool) {
