@@ -1,6 +1,6 @@
 //! Saved scan/watchlist traversal and chart-side scan explanations.
 use serde::{Deserialize, Serialize};
-use tr_core::scanner::{Comparison, MatchMode, ScanDefinition, ScanOperand, Source};
+use tr_core::scanner::{Comparison, ConditionGroup, ConditionItem, MatchMode, ScanDefinition, ScanOperand, Source};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -39,34 +39,94 @@ pub fn operand(operand: ScanOperand) -> String {
 }
 pub fn expression(scan: &ScanDefinition) -> Result<String, String> {
     scan.validate()?;
-    let terms: Vec<_> = scan
-        .conditions
+    if scan.leaves().iter().any(|c| c.timeframe().is_some_and(|tf| tf != scan.timeframe)) {
+        return Err("Conditions with their own timeframe can't be plotted yet".into());
+    }
+    Ok(group_expression(&scan.root))
+}
+
+fn group_expression(group: &ConditionGroup) -> String {
+    let terms: Vec<_> = group
+        .items
         .iter()
-        .map(|c| {
-            let left = format!("REF(({}),{})", operand(c.left), c.left_bars_ago);
-            let right = format!("REF(({}),{})*{}", operand(c.right), c.right_bars_ago, c.right_multiplier);
-            match c.comparison {
-                Comparison::CrossedAbove => format!("CROSS(({left}),({right}))"),
-                Comparison::CrossedBelow => format!("CROSS(({right}),({left}))"),
-                other => format!(
-                    "(({left}) {} ({right}))",
-                    match other {
-                        Comparison::Above => ">",
-                        Comparison::Below => "<",
-                        Comparison::AtLeast => ">=",
-                        Comparison::AtMost => "<=",
-                        _ => unreachable!(),
-                    }
-                ),
+        .map(|item| match item {
+            ConditionItem::Group(group) => format!("({})", group_expression(group)),
+            ConditionItem::Formula(c) => format!("({})", c.expression),
+            ConditionItem::Compare(c) => {
+                let left = format!("REF(({}),{})", operand(c.left), c.left_bars_ago);
+                let right = format!("REF(({}),{})*{}", operand(c.right), c.right_bars_ago, c.right_multiplier);
+                match c.comparison {
+                    Comparison::CrossedAbove => format!("CROSS(({left}),({right}))"),
+                    Comparison::CrossedBelow => format!("CROSS(({right}),({left}))"),
+                    other => format!(
+                        "(({left}) {} ({right}))",
+                        match other {
+                            Comparison::Above => ">",
+                            Comparison::Below => "<",
+                            Comparison::AtLeast => ">=",
+                            Comparison::AtMost => "<=",
+                            _ => unreachable!(),
+                        }
+                    ),
+                }
             }
         })
         .collect();
-    Ok(terms.join(if scan.match_mode == MatchMode::All { " AND " } else { " OR " }))
+    terms.join(if group.mode == MatchMode::All { " AND " } else { " OR " })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nested_group_expression_has_parens() {
+        use tr_core::scanner::FormulaCondition;
+        let formula = |expression: &str| {
+            ConditionItem::Formula(FormulaCondition { expression: expression.into(), timeframe: None })
+        };
+        let scan = ScanDefinition {
+            root: ConditionGroup {
+                mode: MatchMode::All,
+                items: vec![
+                    formula("C > 1"),
+                    ConditionItem::Group(ConditionGroup {
+                        mode: MatchMode::Any,
+                        items: vec![formula("V > 2"), formula("C < 3")],
+                    }),
+                ],
+            },
+            ..ScanDefinition::default()
+        };
+        assert_eq!(expression(&scan).unwrap(), "(C > 1) AND ((V > 2) OR (C < 3))");
+    }
+
+    #[test]
+    fn timeframe_override_cannot_be_plotted() {
+        use tr_core::{
+            Timeframe,
+            scanner::{FormulaCondition, ScanCondition},
+        };
+        let mut scan = ScanDefinition::default();
+        scan.root.items = vec![ConditionItem::Group(ConditionGroup {
+            mode: MatchMode::All,
+            items: vec![ConditionItem::Compare(ScanCondition {
+                timeframe: Some(Timeframe::W1),
+                ..ScanCondition::default()
+            })],
+        })];
+        assert_eq!(expression(&scan).unwrap_err(), "Conditions with their own timeframe can't be plotted yet");
+        scan.root.items = vec![ConditionItem::Formula(FormulaCondition {
+            expression: "C > 1".into(),
+            timeframe: Some(Timeframe::H1),
+        })];
+        assert_eq!(expression(&scan).unwrap_err(), "Conditions with their own timeframe can't be plotted yet");
+        scan.root.items = vec![ConditionItem::Formula(FormulaCondition {
+            expression: "C > 1".into(),
+            timeframe: Some(Timeframe::D1),
+        })];
+        assert_eq!(expression(&scan).unwrap(), "(C > 1)");
+    }
+
     #[test]
     fn restored_queue_is_capped() {
         let json = serde_json::json!({"symbols": (0..5_010).map(|i| i.to_string()).collect::<Vec<_>>()});
@@ -83,8 +143,9 @@ mod tests {
         assert_eq!(next(&symbols, "missing", 1), Some("A".into()));
         assert!(next(&[], "A", 1).is_none());
         let mut scan = ScanDefinition::default();
-        scan.conditions[0].right_multiplier = 2.;
-        scan.conditions[0].left_bars_ago = 3;
+        let ConditionItem::Compare(c) = &mut scan.root.items[0] else { panic!("Expected comparison") };
+        c.right_multiplier = 2.;
+        c.left_bars_ago = 3;
         let s = expression(&scan).unwrap();
         assert!(s.contains("REF((C),3)"));
         assert!(s.contains("*2"));

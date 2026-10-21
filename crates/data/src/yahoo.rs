@@ -579,16 +579,21 @@ mod tests {
         let mut definition = ScanDefinition {
             name: "Volume below ten".into(),
             timeframe: Timeframe::D1,
-            match_mode: MatchMode::All,
-            conditions: vec![ScanCondition {
-                left: ScanOperand::Volume,
-                comparison: Comparison::Below,
-                right: ScanOperand::Constant(10.0),
-                ..ScanCondition::default()
-            }],
+            root: tr_core::scanner::ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![ScanCondition {
+                    left: ScanOperand::Volume,
+                    comparison: Comparison::Below,
+                    right: ScanOperand::Constant(10.0),
+                    ..ScanCondition::default()
+                }],
+            ),
         };
         assert_eq!(definition.evaluate(&series).outcome, ScanOutcome::Unavailable);
-        definition.conditions[0].left = ScanOperand::Price;
+        let tr_core::scanner::ConditionItem::Compare(condition) = &mut definition.root.items[0] else {
+            panic!("Expected comparison")
+        };
+        condition.left = ScanOperand::Price;
         assert_eq!(definition.evaluate(&series).outcome, ScanOutcome::Match);
         // Missing volume inside an aggregate must also stay unknown.
         assert!(Timeframe::W1.resample(&series.bars)[0].volume.is_nan());

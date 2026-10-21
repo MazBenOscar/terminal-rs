@@ -2930,7 +2930,7 @@ impl ChartState {
                         .small()
                         .color(muted()),
                 );
-                for condition in &scan.conditions {
+                for condition in scan.leaves() {
                     ui.label(RichText::new(condition.label()).font(mono(11.)).color(muted()));
                 }
                 if ui.button("Plot scan conditions").clicked() {
@@ -4186,7 +4186,12 @@ mod tests {
         c.data.workflow.scan = Some(Default::default());
         c.plot_scan(&w);
         let first = c.indicators[0].clone();
-        c.data.workflow.scan.as_mut().unwrap().conditions[0].right_multiplier = 2.;
+        let tr_core::scanner::ConditionItem::Compare(condition) =
+            &mut c.data.workflow.scan.as_mut().unwrap().root.items[0]
+        else {
+            panic!("Expected comparison")
+        };
+        condition.right_multiplier = 2.;
         c.plot_scan(&w);
         c.plot_scan(&w);
         assert_eq!(c.indicators.len(), 1);

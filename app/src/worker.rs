@@ -1353,9 +1353,18 @@ async fn scan(provider: Provider, definition: ScanDefinition, symbols: Vec<Strin
                 Ok(history) => {
                     let series = Series::new(symbol.clone(), definition.timeframe, history.bars);
                     let ts = series.bars.last().map(|b| b.ts);
+                    let mut set = tr_core::scanner::SeriesSet::from([(definition.timeframe, series)]);
+                    for tf in definition.timeframes().into_iter().skip(1) {
+                        let limit = definition.required_bars_for(tf).saturating_mul(3).max(300);
+                        if let Ok(Ok(extra)) =
+                            tokio::time::timeout(timeout, provider.scan_history(&symbol, tf, limit)).await
+                        {
+                            set.insert(tf, Series::new(symbol.clone(), tf, extra.bars));
+                        }
+                    }
                     ScanRow {
                         symbol,
-                        evaluation: Some(definition.evaluate(&series)),
+                        evaluation: Some(definition.evaluate_set(&set)),
                         ts,
                         simulated: history.simulated,
                         error: None,
@@ -1447,7 +1456,14 @@ async fn scan_universe(
                     Ok((bars, simulated)) => {
                         let series = Series::new(symbol.clone(), definition.timeframe, bars);
                         let ts = series.bars.last().map(|b| b.ts);
-                        ScanRow { symbol, evaluation: Some(definition.evaluate(&series)), ts, simulated, error: None }
+                        let mut set = tr_core::scanner::SeriesSet::from([(definition.timeframe, series)]);
+                        for tf in definition.timeframes().into_iter().skip(1) {
+                            let limit = definition.required_bars_for(tf).saturating_mul(3).max(300);
+                            if let Ok((bars, _)) = universe_history(s, &symbol, tf, limit).await {
+                                set.insert(tf, Series::new(symbol.clone(), tf, bars));
+                            }
+                        }
+                        ScanRow { symbol, evaluation: Some(definition.evaluate_set(&set)), ts, simulated, error: None }
                     }
                     Err(error) => ScanRow { symbol, evaluation: None, ts: None, simulated: false, error: Some(error) },
                 }
