@@ -146,6 +146,14 @@ pub enum Request {
         generation: u64,
         bars: Arc<Vec<Bar>>,
     },
+    ChartView {
+        pane: PaneId,
+        generation: u64,
+        revision: u64,
+        source: Arc<Vec<Bar>>,
+        cutoff: Option<i64>,
+        renko: Option<f64>,
+    },
     Markers {
         pane: PaneId,
         symbol: String,
@@ -154,6 +162,13 @@ pub enum Request {
     PriceAlertQuotes {
         revision: u64,
         symbols: Vec<String>,
+    },
+    ExportChart {
+        pane: PaneId,
+        symbol: String,
+        title: String,
+        bars: Arc<Vec<Bar>>,
+        image: bool,
     },
     PriceAlertRules {
         revision: u64,
@@ -264,6 +279,17 @@ pub struct Profile {
 }
 
 pub enum Response {
+    ExportChart {
+        pane: PaneId,
+        result: Result<PathBuf, String>,
+    },
+    ChartView {
+        pane: PaneId,
+        generation: u64,
+        revision: u64,
+        source: Arc<Vec<Bar>>,
+        result: Result<(Arc<Vec<Bar>>, SeriesGpu), String>,
+    },
     Heikin {
         pane: PaneId,
         generation: u64,
@@ -652,11 +678,11 @@ pub fn align_compare(base: &[Bar], other: &[Bar]) -> Vec<f64> {
 
 fn default_limit(tf: Timeframe) -> usize {
     match tf {
-        Timeframe::M1 => 5_000,
+        Timeframe::M1 | Timeframe::M2 | Timeframe::M3 => 5_000,
         Timeframe::M5 | Timeframe::M15 | Timeframe::M30 => 5_000,
-        Timeframe::H1 | Timeframe::H4 => 4_000,
+        Timeframe::H1 | Timeframe::H2 | Timeframe::H4 => 4_000,
         Timeframe::D1 => 6_000,
-        Timeframe::W1 | Timeframe::MN1 => 2_000,
+        Timeframe::W1 | Timeframe::MN1 | Timeframe::MN3 => 2_000,
     }
 }
 
@@ -928,6 +954,37 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 .collect()
                 .await;
             s.send(Response::PriceAlertRules { revision, observations });
+        }
+        Request::ExportChart { pane, symbol, title, bars, image } => {
+            let result = tokio::task::spawn_blocking(move || {
+                let content =
+                    if image { crate::chart_export::svg(&title, &bars) } else { crate::chart_export::csv(&bars) };
+                crate::chart_export::save(
+                    &data_dir().join("exports"),
+                    &symbol,
+                    &content,
+                    if image { "svg" } else { "csv" },
+                )
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            s.send(Response::ExportChart { pane, result });
+        }
+        Request::ChartView { pane, generation, revision, source, cutoff, renko } => {
+            let input = source.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let end = cutoff.map_or(input.len(), |ts| input.partition_point(|b| b.ts <= ts));
+                let bars = if let Some(size) = renko {
+                    tr_core::chart_analytics::renko(&input[..end], size)?
+                } else {
+                    input[..end].to_vec()
+                };
+                let gpu = SeriesGpu::build(&bars);
+                Ok((Arc::new(bars), gpu))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Chart transformation failed: {e}")));
+            s.send(Response::ChartView { pane, generation, revision, source, result });
         }
         Request::Heikin { pane, generation, bars } => {
             let input = bars.clone();

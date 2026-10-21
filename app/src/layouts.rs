@@ -17,7 +17,7 @@ use crate::congress_view::FeedFilter;
 use crate::dock::{Node, PaneId};
 use crate::layout::Layout;
 
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 
 /// Colour link groups: panes in the same group follow one security.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

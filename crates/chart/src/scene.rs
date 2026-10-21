@@ -40,10 +40,11 @@ pub enum ChartType {
     HeikinAshi,
     Hollow,
     Baseline,
+    Renko,
 }
 
 impl ChartType {
-    pub const ALL: [ChartType; 7] = [
+    pub const ALL: [ChartType; 8] = [
         ChartType::Candles,
         ChartType::Bars,
         ChartType::Line,
@@ -51,6 +52,7 @@ impl ChartType {
         ChartType::HeikinAshi,
         ChartType::Hollow,
         ChartType::Baseline,
+        ChartType::Renko,
     ];
 
     pub fn label(self) -> &'static str {
@@ -62,6 +64,7 @@ impl ChartType {
             ChartType::HeikinAshi => "Heikin Ashi",
             ChartType::Hollow => "Hollow",
             ChartType::Baseline => "Baseline",
+            ChartType::Renko => "Renko",
         }
     }
 }
@@ -218,13 +221,12 @@ pub fn price_pane(p: &PricePane<'_>) -> PaneOutput {
         });
     }
     match p.chart_type {
-        ChartType::Candles | ChartType::Bars | ChartType::HeikinAshi | ChartType::Hollow => {
-            cmds.push(DrawCmd::Candles {
+        ChartType::Candles | ChartType::Bars | ChartType::HeikinAshi | ChartType::Hollow | ChartType::Renko => cmds
+            .push(DrawCmd::Candles {
                 data: p.series.bars.clone(),
                 range: pyr.instance_range(k, lo, hi),
                 uniforms: Uniforms::new(&t, &style),
-            })
-        }
+            }),
         ChartType::Line | ChartType::Area | ChartType::Baseline => {
             let lp = &p.series.closes.pyramid;
             let kk = level_for(v.bar_px, lp.levels());

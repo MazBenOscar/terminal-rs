@@ -1056,6 +1056,18 @@ impl TerminalApp {
                         c.on_indicators(generation, revision, built);
                     }
                 }
+                Response::ExportChart { pane, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.export_notice = Some(result);
+                    }
+                }
+                Response::ChartView { pane, generation, revision, source, result } => {
+                    let worker = &self.worker;
+                    if let Some(PaneKind::Chart(c)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        c.on_view(generation, revision, source, result, worker);
+                    }
+                }
                 Response::Heikin { pane, generation, bars, gpu } => {
                     if let Some(c) = self.chart_mut(pane) {
                         c.on_heikin(generation, bars, gpu);

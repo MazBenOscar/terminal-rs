@@ -18,7 +18,7 @@ pub struct DateRange {
 pub fn index_at(bars: &[Bar], tf: Timeframe, ts: i64) -> Option<usize> {
     let i = bars.partition_point(|b| b.ts <= ts).checked_sub(1)?;
     // Never carry a Friday intraday pointer into a missing weekend session.
-    (ts < if tf == Timeframe::MN1 {
+    (ts < if matches!(tf, Timeframe::MN1 | Timeframe::MN3) {
         tr_core::session::next_bucket(tf, bars[i].ts)
     } else {
         bars[i].ts.saturating_add(tf.seconds())

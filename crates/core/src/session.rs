@@ -102,9 +102,10 @@ impl Session {
 }
 pub fn next_bucket(tf: Timeframe, ts: i64) -> i64 {
     let start = tf.bucket_start(ts);
-    if tf == Timeframe::MN1 {
+    if matches!(tf, Timeframe::MN1 | Timeframe::MN3) {
         let d = DateTime::from_timestamp(start, 0).unwrap().date_naive();
-        let (y, m) = if d.month() == 12 { (d.year() + 1, 1) } else { (d.year(), d.month() + 1) };
+        let month = d.month0() + if tf == Timeframe::MN3 { 3 } else { 1 };
+        let (y, m) = (d.year() + (month / 12) as i32, month % 12 + 1);
         NaiveDate::from_ymd_opt(y, m, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp()
     } else {
         start + tf.seconds()

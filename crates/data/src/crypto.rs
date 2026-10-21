@@ -43,6 +43,9 @@ pub fn coinbase_product(sec: &Security) -> String {
 
 pub fn binance_interval(tf: Timeframe) -> &'static str {
     match tf {
+        Timeframe::M2 | Timeframe::M3 => "1m",
+        Timeframe::H2 => "1h",
+        Timeframe::MN3 => "1M",
         Timeframe::M1 => "1m",
         Timeframe::M5 => "5m",
         Timeframe::M15 => "15m",
@@ -128,6 +131,9 @@ pub fn parse_coinbase_ws(text: &str) -> Option<(i64, f64, f64)> {
 /// Coinbase granularity used to build `tf` bars, and whether resampling is needed.
 fn coinbase_granularity(tf: Timeframe) -> (i64, bool) {
     match tf {
+        Timeframe::M2 | Timeframe::M3 => (60, true),
+        Timeframe::H2 => (3600, true),
+        Timeframe::MN3 => (86_400, true),
         Timeframe::M1 => (60, false),
         Timeframe::M5 => (300, false),
         Timeframe::M15 => (900, false),
@@ -302,6 +308,10 @@ impl CryptoProvider {
     }
 
     pub async fn history(&self, sec: &Security, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        if let Some((base, factor)) = tf.source_interval() {
+            let bars = Box::pin(self.history(sec, base, end, limit.saturating_add(1).saturating_mul(factor))).await?;
+            return Ok(crate::clip(tf.resample(&bars), end, limit));
+        }
         let symbol = binance_symbol(sec);
         let mut last_err = None;
         for host in BINANCE_REST {

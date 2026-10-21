@@ -10,56 +10,72 @@ use crate::Bar;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub enum Timeframe {
     M1,
+    M2,
+    M3,
     M5,
     M15,
     M30,
     H1,
+    H2,
     H4,
     #[default]
     D1,
     W1,
     MN1,
+    MN3,
 }
 
 impl Timeframe {
-    pub const ALL: [Timeframe; 9] = [
+    pub const ALL: [Timeframe; 13] = [
         Timeframe::M1,
+        Timeframe::M2,
+        Timeframe::M3,
         Timeframe::M5,
         Timeframe::M15,
         Timeframe::M30,
         Timeframe::H1,
+        Timeframe::H2,
         Timeframe::H4,
         Timeframe::D1,
         Timeframe::W1,
         Timeframe::MN1,
+        Timeframe::MN3,
     ];
 
     /// Nominal duration in seconds (months count as 30 days).
     pub fn seconds(self) -> i64 {
         match self {
             Timeframe::M1 => 60,
+            Timeframe::M2 => 120,
+            Timeframe::M3 => 180,
             Timeframe::M5 => 300,
             Timeframe::M15 => 900,
             Timeframe::M30 => 1800,
             Timeframe::H1 => 3600,
+            Timeframe::H2 => 7200,
             Timeframe::H4 => 14_400,
             Timeframe::D1 => 86_400,
             Timeframe::W1 => 604_800,
             Timeframe::MN1 => 2_592_000,
+            Timeframe::MN3 => 7_776_000,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Timeframe::M1 => "1m",
+            Timeframe::M2 => "2m",
+            Timeframe::M3 => "3m",
             Timeframe::M5 => "5m",
             Timeframe::M15 => "15m",
             Timeframe::M30 => "30m",
             Timeframe::H1 => "1H",
+            Timeframe::H2 => "2H",
             Timeframe::H4 => "4H",
             Timeframe::D1 => "1D",
             Timeframe::W1 => "1W",
             Timeframe::MN1 => "1M",
+            Timeframe::MN3 => "3M",
         }
     }
 
@@ -75,11 +91,29 @@ impl Timeframe {
                 let monday = d - Duration::days(d.weekday().num_days_from_monday() as i64);
                 midnight(monday)
             }
-            Timeframe::MN1 => {
+            Timeframe::MN1 | Timeframe::MN3 => {
                 let d = day_of(ts);
-                midnight(NaiveDate::from_ymd_opt(d.year(), d.month(), 1).expect("valid month start"))
+                midnight(
+                    NaiveDate::from_ymd_opt(
+                        d.year(),
+                        if self == Self::MN3 { (d.month0() / 3) * 3 + 1 } else { d.month() },
+                        1,
+                    )
+                    .expect("valid month start"),
+                )
             }
             tf => ts.div_euclid(tf.seconds()) * tf.seconds(),
+        }
+    }
+
+    /// New intervals use existing provider intervals, then calendar-aligned aggregation.
+    pub fn source_interval(self) -> Option<(Self, usize)> {
+        match self {
+            Self::M2 => Some((Self::M1, 2)),
+            Self::M3 => Some((Self::M1, 3)),
+            Self::H2 => Some((Self::H1, 2)),
+            Self::MN3 => Some((Self::MN1, 3)),
+            _ => None,
         }
     }
 
@@ -123,11 +157,17 @@ impl FromStr for Timeframe {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let t = s.trim();
         // A bare or trailing uppercase `M` means month; lowercase `m` means minute.
+        if t == "3M" || t.eq_ignore_ascii_case("3mo") || t.eq_ignore_ascii_case("quarter") {
+            return Ok(Self::MN3);
+        }
         if t == "M" || t == "1M" || t.eq_ignore_ascii_case("1mo") || t.eq_ignore_ascii_case("mo") {
             return Ok(Timeframe::MN1);
         }
         Ok(match t.to_ascii_lowercase().as_str() {
             "1" | "1m" | "1min" => Timeframe::M1,
+            "2" | "2m" | "2min" => Self::M2,
+            "3" | "3m" | "3min" => Self::M3,
+            "120" | "2h" => Self::H2,
             "5" | "5m" | "5min" => Timeframe::M5,
             "15" | "15m" | "15min" => Timeframe::M15,
             "30" | "30m" | "30min" => Timeframe::M30,
@@ -147,6 +187,10 @@ mod tests {
 
     #[test]
     fn parse_spellings() {
+        assert_eq!("2".parse::<Timeframe>().unwrap(), Timeframe::M2);
+        assert_eq!("3m".parse::<Timeframe>().unwrap(), Timeframe::M3);
+        assert_eq!("2H".parse::<Timeframe>().unwrap(), Timeframe::H2);
+        assert_eq!("3M".parse::<Timeframe>().unwrap(), Timeframe::MN3);
         assert_eq!("1m".parse::<Timeframe>().unwrap(), Timeframe::M1);
         assert_eq!("1M".parse::<Timeframe>().unwrap(), Timeframe::MN1);
         assert_eq!("4H".parse::<Timeframe>().unwrap(), Timeframe::H4);
@@ -157,6 +201,13 @@ mod tests {
 
     #[test]
     fn week_and_month_buckets() {
+        let may = NaiveDate::from_ymd_opt(2026, 5, 12).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let april = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let july = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        assert_eq!(Timeframe::MN3.bucket_start(may), april);
+        assert_eq!(crate::session::next_bucket(Timeframe::MN3, may), july);
+        let quarter = crate::sample::generate("AAPL", Timeframe::MN3, 120, july);
+        assert!(quarter.windows(2).all(|w| w[0].ts < w[1].ts));
         // 2026-10-07 is a Wednesday.
         let wed = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap().and_hms_opt(15, 30, 0).unwrap().and_utc().timestamp();
         let mon = NaiveDate::from_ymd_opt(2026, 10, 5).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();

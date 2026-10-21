@@ -22,10 +22,11 @@ pub struct Settings {
     pub profile: ProfileMode,
     pub bins: usize,
     pub baseline: Option<f64>,
+    pub renko_size: f64,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { anchor: None, profile: ProfileMode::Off, bins: 48, baseline: None }
+        Self { anchor: None, profile: ProfileMode::Off, bins: 48, baseline: None, renko_size: 1. }
     }
 }
 #[derive(Default)]

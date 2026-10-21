@@ -29,6 +29,8 @@ impl AlpacaProvider {
 
 fn timeframe(tf: Timeframe) -> &'static str {
     match tf {
+        Timeframe::M2 | Timeframe::M3 => unreachable!("resampled interval"),
+        Timeframe::H2 | Timeframe::MN3 => unreachable!("resampled interval"),
         Timeframe::M1 => "1Min",
         Timeframe::M5 => "5Min",
         Timeframe::M15 => "15Min",
@@ -73,6 +75,10 @@ impl MarketData for AlpacaProvider {
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        if let Some((base, factor)) = tf.source_interval() {
+            let bars = self.history(symbol, base, end, limit.saturating_add(1).saturating_mul(factor)).await?;
+            return Ok(crate::clip(tf.resample(&bars), end, limit));
+        }
         // Alpaca free data has a 15 minute delay for the latest bars on the SIP feed;
         // IEX is real-time. Walk backwards from `end` with sort=desc.
         let end_ts = end.unwrap_or_else(|| Utc::now().timestamp());

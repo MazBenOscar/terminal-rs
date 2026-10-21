@@ -8,6 +8,7 @@ mod chart_compare;
 mod chart_context;
 mod chart_controls;
 mod chart_data;
+mod chart_export;
 mod chart_fill;
 mod chart_legend;
 mod chart_navigation;

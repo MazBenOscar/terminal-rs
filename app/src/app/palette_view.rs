@@ -83,6 +83,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("HEIKIN", "Heikin Ashi candles", "synthetic chart type", None),
     ("HOLLOW", "Hollow candles", "chart type", None),
     ("BASELINE", "Baseline chart", "chart type reference return", None),
+    ("RENKO", "Close-only Renko chart", "chart type synthetic bricks", None),
     ("DATE", "Jump to a date: DATE YYYY-MM-DD", "goto calendar history", None),
     ("NEXT", "Next scan match or watchlist symbol", "chart next down scanner", None),
     ("PREV", "Previous scan match or watchlist symbol", "chart previous up scanner", None),

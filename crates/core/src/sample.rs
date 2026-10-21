@@ -82,7 +82,14 @@ pub fn generate_with(
     for i in 0..count {
         let ts = match tf {
             // Calendar buckets: step back roughly then snap so weeks/months align.
-            Timeframe::W1 | Timeframe::MN1 => tf.bucket_start(end - (count - 1 - i) as i64 * step),
+            Timeframe::MN1 | Timeframe::MN3 => chrono::DateTime::from_timestamp(end, 0)
+                .unwrap()
+                .checked_sub_months(chrono::Months::new(
+                    (count - 1 - i) as u32 * if tf == Timeframe::MN3 { 3 } else { 1 },
+                ))
+                .unwrap()
+                .timestamp(),
+            Timeframe::W1 => end - (count - 1 - i) as i64 * step,
             _ => end - (count - 1 - i) as i64 * step,
         };
         let open = price;

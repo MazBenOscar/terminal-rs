@@ -299,6 +299,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "HEIKIN" | "HA" => Function::ChartType(ChartType::HeikinAshi),
         "HOLLOW" => Function::ChartType(ChartType::Hollow),
         "BASELINE" => Function::ChartType(ChartType::Baseline),
+        "RENKO" => Function::ChartType(ChartType::Renko),
         // `IND RSI 21` adds directly; anything else searches the picker.
         "IND" | "INDICATOR" | "INDICATORS" | "STUDY" | "STUDIES" => {
             match rest.split_first().and_then(|(code, args)| IndicatorSpec::parse(code, args)) {
@@ -456,14 +457,18 @@ fn describe(f: &Function) -> String {
             "Interval {}",
             match tf {
                 Timeframe::M1 => "1 minute",
+                Timeframe::M2 => "2 minutes",
+                Timeframe::M3 => "3 minutes",
                 Timeframe::M5 => "5 minutes",
                 Timeframe::M15 => "15 minutes",
                 Timeframe::M30 => "30 minutes",
                 Timeframe::H1 => "1 hour",
+                Timeframe::H2 => "2 hours",
                 Timeframe::H4 => "4 hours",
                 Timeframe::D1 => "1 day",
                 Timeframe::W1 => "1 week",
                 Timeframe::MN1 => "1 month",
+                Timeframe::MN3 => "3 months (quarter)",
             }
         ),
         Function::ChartType(c) => format!("Chart type {}", c.label()),

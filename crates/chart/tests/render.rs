@@ -58,7 +58,7 @@ fn renders_candles_volume_lines_and_hist() {
         eprintln!("{ct:?}: green {green} red {red} blue {blue}");
         assert!(blue > 300, "{ct:?}: SMA overlay not drawn");
         match ct {
-            ChartType::Candles | ChartType::Bars | ChartType::HeikinAshi | ChartType::Hollow => {
+            ChartType::Candles | ChartType::Bars | ChartType::HeikinAshi | ChartType::Hollow | ChartType::Renko => {
                 assert!(green > 500 && red > 500, "{ct:?}")
             }
             ChartType::Baseline => assert!(green > 500, "Baseline positive region missing"),

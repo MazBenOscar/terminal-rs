@@ -1,5 +1,43 @@
 //! Causal bar-derived chart analytics; profiles are OHLCV estimates, not trade prints.
 use crate::Bar;
+
+/// Fixed-box, close-only Renko with a one-box reversal. Timestamps are source times;
+/// multiple bricks may share one time. Volume is apportioned, not tick-volume.
+pub fn renko(bars: &[Bar], size: f64) -> Result<Vec<Bar>, String> {
+    if !size.is_finite() || size <= 0. {
+        return Err("Renko brick size must be positive".into());
+    }
+    let Some(first) = bars.first() else {
+        return Ok(vec![]);
+    };
+    if !first.close.is_finite() {
+        return Err("Invalid initial Renko price".into());
+    }
+    let mut level = first.close;
+    let mut volume = 0.;
+    let mut out = Vec::new();
+    for bar in bars {
+        if !bar.close.is_finite() {
+            return Err("Invalid Renko source price".into());
+        }
+        volume += bar.volume;
+        let count = ((bar.close - level).abs() / size).floor();
+        if count > (100_000usize.saturating_sub(out.len())) as f64 {
+            return Err("Renko exceeds 100,000 bricks; increase brick size".into());
+        }
+        let n = count as usize;
+        let step = if bar.close >= level { size } else { -size };
+        for _ in 0..n {
+            let next = level + step;
+            out.push(Bar::new(bar.ts, level, level.max(next), level.min(next), next, volume / n as f64));
+            level = next;
+        }
+        if n > 0 {
+            volume = 0.;
+        }
+    }
+    Ok(out)
+}
 pub fn anchored_vwap(bars: &[Bar], anchor: i64) -> Vec<f64> {
     let mut out = vec![f64::NAN; bars.len()];
     if bars.first().is_none_or(|b| anchor < b.ts) || bars.last().is_none_or(|b| anchor > b.ts) {
@@ -93,6 +131,26 @@ pub fn heikin_ashi(bars: &[Bar]) -> Vec<Bar> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn renko_builds_multiple_bricks_without_future_values_and_bounds_work() {
+        let b = [
+            Bar::new(1, 100., 100., 100., 100., 10.),
+            Bar::new(2, 100., 126., 99., 125., 20.),
+            Bar::new(3, 125., 125., 99., 100., 30.),
+        ];
+        let bricks = renko(&b[..2], 10.).unwrap();
+        assert_eq!(bricks.len(), 2);
+        assert_eq!(bricks[0].close, 110.);
+        assert_eq!(bricks[1].close, 120.);
+        assert!(bricks.iter().all(|b| b.ts == 2));
+        assert_eq!(bricks.iter().map(|b| b.volume).sum::<f64>(), 30.);
+        let full = renko(&b, 10.).unwrap();
+        assert_eq!(full.len(), 4);
+        assert_eq!(full[3].close, 100.);
+        assert_eq!(full[..2], bricks);
+        assert!(renko(&b, 0.).is_err());
+        assert!(renko(&b, 0.00000001).is_err());
+    }
     #[test]
     fn anchored_vwap_is_causal_and_never_substitutes_missing_volume_or_anchor_history() {
         let b = [

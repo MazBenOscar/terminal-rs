@@ -110,3 +110,32 @@ re-seed. Indicator values are labeled as values and never drawn as dollar levels
 The app must remain running; crossings between polls may be missed. Scan alerts
 monitor selected symbols, not an unattended universe-wide rescan. Alert storage v2
 accepts v1 files; keep a backup before opening with an older build.
+
+## Replay, exports and intervals
+
+The chart's **Replay and exports** menu starts replay at the clicked loaded bar
+(or the middle of loaded history). The toolbar steps source bars, scrubs and plays
+at one bar per second. Studies and comparisons rebuild from the cutoff; stale
+responses are rejected. Drawings, account levels and Congress markers are hidden,
+so saved annotations and present-day positions cannot reveal a future state.
+Independent live alerts continue normally. Replay is transient and uses loaded
+history; it is not a simulated execution or corporate-action point-in-time engine.
+
+`RENKO` uses a fixed positive box size, close-only construction and one-box reversal.
+Multiple bricks can share a source timestamp. Studies use these synthetic bricks;
+volume is apportioned OHLCV volume. Comparisons, drawings and account/alert levels
+are unavailable on brick charts. The box size is in the chart context menu and
+persists. Construction is bounded at 100,000 bricks and errors ask for a larger box.
+
+Exports save the **visible displayed bars** under the app data directory's `exports`
+folder. CSV preserves OHLCV values and Unix UTC timestamps. SVG is a portable OHLC
+price-chart image with axes and mode labeling, not a screenshot: it excludes
+studies, drawings and other UI panes. Replay exports contain only displayed history;
+Renko CSV contains synthetic bricks. Files use unique names and never overwrite.
+
+Intervals now include 2m, 3m, 2H and calendar quarters (`3M` or `quarter`). They
+aggregate supported base intervals rather than request unsupported provider codes.
+Quarter boundaries and completion use actual calendar months. Crypto streaming is
+disabled for these aggregated intervals; history refresh remains available. Provider
+depth limits still apply, including the minute-history limit for 2m/3m. Layout v8
+accepts older layouts and protects the new interval/type settings from old builds.

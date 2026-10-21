@@ -110,6 +110,7 @@ pub fn periods_per_year(tf: Timeframe) -> f64 {
         Timeframe::D1 => 252.0,
         Timeframe::W1 => 52.0,
         Timeframe::MN1 => 12.0,
+        Timeframe::MN3 => 4.0,
         intraday => 252.0 * 23_400.0 / intraday.seconds() as f64,
     }
 }

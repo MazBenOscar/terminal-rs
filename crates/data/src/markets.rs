@@ -216,7 +216,7 @@ impl MarketData for Markets {
 
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
         let sec = security(symbol);
-        (sec.class == AssetClass::Crypto).then(|| CryptoProvider::live(&sec, tf))
+        (sec.class == AssetClass::Crypto && tf.source_interval().is_none()).then(|| CryptoProvider::live(&sec, tf))
     }
 
     async fn search(&self, query: &str) -> Result<Vec<SearchHit>> {

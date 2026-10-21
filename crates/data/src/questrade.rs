@@ -153,6 +153,8 @@ fn api_error(body: &str) -> String {
 
 fn interval(tf: Timeframe) -> &'static str {
     match tf {
+        Timeframe::M2 | Timeframe::M3 => unreachable!("resampled interval"),
+        Timeframe::H2 | Timeframe::MN3 => unreachable!("resampled interval"),
         Timeframe::M1 => "OneMinute",
         Timeframe::M5 => "FiveMinutes",
         Timeframe::M15 => "FifteenMinutes",
@@ -322,6 +324,10 @@ impl MarketData for Questrade {
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        if let Some((base, factor)) = tf.source_interval() {
+            let bars = self.history(symbol, base, end, limit.saturating_add(1).saturating_mul(factor)).await?;
+            return Ok(crate::clip(tf.resample(&bars), end, limit));
+        }
         let id = self.symbol_id(symbol).await?;
         let mut until = end.unwrap_or_else(|| Utc::now().timestamp());
         let mut out: Vec<Bar> = Vec::with_capacity(limit);
