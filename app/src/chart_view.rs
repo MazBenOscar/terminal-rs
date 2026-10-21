@@ -25,6 +25,153 @@ use crate::theme::{self, amber, amber_dim, mono, muted, text, ui_font};
 use crate::widgets;
 use crate::worker::{BuiltIndicator, PaneId, Request, Worker, initial_limit};
 
+/// A library of configured single studies, independent of multi-study chart templates.
+mod study_presets {
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Serialize};
+    use tr_core::Timeframe;
+    use tr_core::indicators::{registry::Spec, study};
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct Preset {
+        pub name: String,
+        #[serde(with = "settings")]
+        pub spec: Spec,
+    }
+
+    // Instance IDs never belong in the on-disk preset. Keep the rest of Spec's
+    // serialization intact so new chart settings also round-trip automatically.
+    mod settings {
+        use super::*;
+
+        pub fn serialize<S: serde::Serializer>(spec: &Spec, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut value = serde_json::to_value(spec).map_err(serde::ser::Error::custom)?;
+            if let Some(chart) = value.get_mut("chart").and_then(|v| v.as_object_mut()) {
+                chart.remove("id");
+            }
+            value.serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Spec, D::Error> {
+            let mut value = serde_json::Value::deserialize(deserializer)?;
+            if let Some(chart) = value.get_mut("chart").and_then(|v| v.as_object_mut()) {
+                chart.insert("id".into(), 0.into());
+            }
+            serde_json::from_value(value).map_err(serde::de::Error::custom)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct Library {
+        version: u32,
+        pub presets: Vec<Preset>,
+    }
+
+    impl Default for Library {
+        fn default() -> Self {
+            Self { version: 1, presets: Vec::new() }
+        }
+    }
+
+    pub fn path() -> PathBuf {
+        crate::worker::data_dir().join("study-presets.json")
+    }
+
+    impl Preset {
+        pub fn new(name: String, mut spec: Spec) -> (Self, bool) {
+            let mut reset_source = false;
+            if let Some(chart) = &mut spec.chart {
+                chart.id = 0;
+                if matches!(chart.source, study::Source::Output { .. }) {
+                    chart.source = study::Source::default();
+                    reset_source = true;
+                }
+                // A standalone preset cannot retain a pane edge to another instance.
+                if matches!(chart.pane, study::Pane::With(_)) {
+                    chart.pane = study::Pane::Own;
+                }
+            }
+            (Self { name, spec }, reset_source)
+        }
+
+        fn validate(&self) -> Result<(), String> {
+            if self.name.trim() != self.name || self.name.is_empty() || self.name.len() > 100 {
+                return Err("Use a preset name of 1–100 characters without surrounding spaces".into());
+            }
+            let mut specs = vec![self.spec.clone()];
+            study::assign_ids(&mut specs);
+            specs[0].chart.as_mut().unwrap().timeframe = None;
+            for result in study::evaluate(&specs, &super::registry::Input::new(&[], Timeframe::D1)) {
+                result.map_err(|e| format!("Invalid preset: {e}"))?;
+            }
+            Ok(())
+        }
+
+        pub fn add_to(&self, current: &mut Vec<Spec>) -> Result<(), String> {
+            self.validate()?;
+            if current.len() >= 128 {
+                return Err("A chart supports at most 128 studies".into());
+            }
+            let mut spec = self.spec.clone();
+            if let Some(chart) = &mut spec.chart {
+                chart.id = 0;
+            }
+            study::assign_ids(current);
+            current.push(spec);
+            study::assign_ids(current);
+            Ok(())
+        }
+    }
+
+    impl Library {
+        pub fn load(path: &Path) -> Result<Self, String> {
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+                Err(e) => return Err(format!("Reading study presets: {e}")),
+            };
+            if bytes.len() > 1_048_576 {
+                return Err("The study preset library exceeds the 1 MiB limit".into());
+            }
+            let library: Self = serde_json::from_slice(&bytes).map_err(|e| format!("Reading study presets: {e}"))?;
+            if library.version != 1 {
+                return Err("This study-preset version is not supported".into());
+            }
+            let mut names = std::collections::HashSet::new();
+            for preset in &library.presets {
+                preset.validate()?;
+                if !names.insert(&preset.name) {
+                    return Err("Duplicate study preset name".into());
+                }
+            }
+            Ok(library)
+        }
+
+        /// Reload before merging by name so independent chart editors do not
+        /// overwrite each other's presets. Never replace a corrupt library.
+        pub fn save(path: &Path, preset: Preset) -> Result<(), String> {
+            preset.validate()?;
+            let mut library = Self::load(path)?;
+            library.presets.retain(|entry| entry.name != preset.name);
+            library.presets.push(preset);
+            library.presets.sort_by_key(|entry| entry.name.to_lowercase());
+            let bytes = serde_json::to_vec_pretty(&library).map_err(|e| e.to_string())?;
+            if bytes.len() > 1_048_576 {
+                return Err("The study preset library exceeds the 1 MiB limit".into());
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            crate::layouts::write_atomic(path, &bytes).map_err(|e| format!("Saving study preset: {e}"))
+        }
+    }
+}
+
+fn favorite_studies(codes: &[String]) -> Vec<&'static registry::Def> {
+    codes.iter().filter_map(|code| registry::all().iter().find(|def| def.code == code)).collect()
+}
+
 fn menu_section(ui: &mut Ui, title: &str) {
     ui.add_space(theme::dp(3.));
     ui.label(RichText::new(title).small().color(theme::muted()));
@@ -249,6 +396,7 @@ pub struct ChartState {
     compare_error: Option<String>,
     compare_loading: bool,
     indicator_search: String,
+    preset_status: Option<Result<String, String>>,
     template_name: String,
     template_names: Option<Vec<String>>,
     template_selected: String,
@@ -347,6 +495,7 @@ impl ChartState {
             compare_error: None,
             compare_loading: false,
             indicator_search: String::new(),
+            preset_status: None,
             template_name: String::new(),
             template_names: None,
             template_selected: String::new(),
@@ -521,6 +670,15 @@ impl ChartState {
             self.range_event = crate::chart_navigation::date_range(&self.bars, self.tf, v);
         }
         self.manual_scale = None;
+    }
+
+    fn add_favorite_study(&mut self, code: &str, w: &Worker) {
+        if let Some(def) = registry::all().iter().find(|def| def.code == code) {
+            study::assign_ids(&mut self.indicators);
+            self.indicators.push(IndicatorSpec::of(def));
+            study::assign_ids(&mut self.indicators);
+            self.request_indicators(w);
+        }
     }
 
     pub fn toggle_indicator(&mut self, spec: IndicatorSpec, w: &Worker) {
@@ -2501,6 +2659,8 @@ impl ChartState {
         let before = self.indicators.clone();
         let mut remove = None;
         let mut reorder = None;
+        let mut save_preset = None;
+        let preset_library = study_presets::Library::load(&study_presets::path());
         let mut save_template = false;
         let mut apply_template = None;
         if self.template_names.is_none() {
@@ -2551,15 +2711,51 @@ impl ChartState {
                             ui.label(RichText::new(format!("No indicator matches “{}”", self.indicator_search)).color(muted()));
                         }
                         let code_w = matches.iter().map(|d| d.code.len()).max().unwrap_or(0);
-                        for def in matches {
-                            let mut job = egui::text::LayoutJob::default();
-                            job.append(&format!("{:<code_w$}  ", def.code), 0.0, egui::TextFormat::simple(mono(12.0), amber()));
-                            job.append(def.name, 0.0, egui::TextFormat::simple(ui_font(13.0), text()));
-                            if ui.add(egui::Button::selectable(false, job)).clicked() {
-                                self.indicators.push(IndicatorSpec::of(def));
-                                self.indicator_search.clear();
-                                ui.close();
+                        let mut favorites = crate::prefs::study_favorites(ui.ctx());
+                        let favorite_defs = favorite_studies(&favorites);
+                        for (group, defs) in [("Favorites", favorite_defs), ("All indicators", matches)] {
+                            menu_section(ui, group);
+                            ui.push_id(group, |ui| {
+                                for def in defs.into_iter().filter(|d| query.is_empty()
+                                    || d.name.to_ascii_lowercase().contains(&query)
+                                    || d.code.to_ascii_lowercase().contains(&query)) {
+                                    ui.push_id(def.code, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let mut job = egui::text::LayoutJob::default();
+                                            job.append(&format!("{:<code_w$}  ", def.code), 0.0, egui::TextFormat::simple(mono(12.0), amber()));
+                                            job.append(def.name, 0.0, egui::TextFormat::simple(ui_font(13.0), text()));
+                                            if ui.add(egui::Button::selectable(false, job)).clicked() {
+                                                self.indicators.push(IndicatorSpec::of(def));
+                                                self.indicator_search.clear();
+                                                ui.close();
+                                            }
+                                            let active = favorites.iter().any(|code| code == def.code);
+                                            let hint = if active { "Remove from favorites" } else { "Add to favorites" };
+                                            if widgets::icon_button(ui, widgets::Icon::Star, hint, active).clicked() {
+                                                crate::prefs::toggle_study_favorite(&mut favorites, def.code);
+                                            }
+                                        });
+                                    });
+                                }
+                            });
+                        }
+                        crate::prefs::set_study_favorites(ui.ctx(), favorites);
+                        menu_section(ui, "Add from preset");
+                        match &preset_library {
+                            Ok(library) => {
+                                if library.presets.is_empty() {
+                                    menu_note(ui, "No saved presets yet");
+                                }
+                                for preset in &library.presets {
+                                    if (query.is_empty() || preset.name.to_ascii_lowercase().contains(&query))
+                                        && ui.button(&preset.name).on_hover_text(preset.spec.label()).clicked() {
+                                        self.preset_status = Some(preset.add_to(&mut self.indicators)
+                                            .map(|()| format!("Added preset {}", preset.name)));
+                                        ui.close();
+                                    }
+                                }
                             }
+                            Err(error) => { menu_note(ui, error); }
                         }
                     });
                 ui.add_space(theme::dp(4.0));
@@ -2868,6 +3064,20 @@ impl ChartState {
                                         })
                                         .unwrap_or_default();
                                     crate::chart_controls::output_styles(ui, c, &names);
+                                    ui.collapsing("Save as preset…", |ui| {
+                                        let name_id = ui.make_persistent_id("preset-name");
+                                        let mut name = ui.ctx().data(|data| data.get_temp::<String>(name_id)).unwrap_or_default();
+                                        ui.horizontal(|ui| {
+                                            ui.add(egui::TextEdit::singleline(&mut name)
+                                                .hint_text("Preset name")
+                                                .desired_width((ui.available_width() - theme::dp(64.0)).max(theme::dp(80.0))));
+                                            if ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Save")).clicked() {
+                                                save_preset = Some((index, name.trim().to_string()));
+                                            }
+                                        });
+                                        ui.ctx().data_mut(|data| data.insert_temp(name_id, name));
+                                        menu_note(ui, "Saves one study, not a chart template. Linked study inputs use original bars; linked panes become an own pane.");
+                                    });
                                 });
                             if index + 1 < count {
                                 ui.separator();
@@ -2876,6 +3086,13 @@ impl ChartState {
                     }
                 });
                 ui.separator();
+                if let Some(status) = &self.preset_status {
+                    let (message, color) = match status {
+                        Ok(message) => (message, theme::up()),
+                        Err(error) => (error, theme::down()),
+                    };
+                    ui.label(RichText::new(message).small().color(color));
+                }
                 ui.collapsing("Chart templates", |ui| {
                     save_template = self.template_save_controls(ui).clicked();
                     egui::ComboBox::from_id_salt("chart-template")
@@ -2922,6 +3139,21 @@ impl ChartState {
                 );
             });
         self.indicator_editor = open;
+        if let Some((index, name)) = save_preset {
+            let (preset, reset_source) = study_presets::Preset::new(name.clone(), self.indicators[index].clone());
+            let status = study_presets::Library::save(&study_presets::path(), preset).map(|()| {
+                if reset_source {
+                    "Preset saved with original-bars input".to_string()
+                } else {
+                    format!("Preset saved: {name}")
+                }
+            });
+            self.actions.push(Action::Notice(match &status {
+                Ok(message) => message.clone(),
+                Err(error) => error.clone(),
+            }));
+            self.preset_status = Some(status);
+        }
         if save_template {
             self.save_template(&crate::chart_templates::directory());
         }
@@ -3480,6 +3712,18 @@ impl ChartState {
                 self.actions.push(Action::Command("IND".into()));
                 ui.close();
             }
+            ui.menu_button("Favorites", |ui| {
+                let favorites = crate::prefs::study_favorites(ui.ctx());
+                if favorites.is_empty() {
+                    menu_note(ui, "Choose favorites in Add indicator…");
+                }
+                for def in favorite_studies(&favorites) {
+                    if ui.button(def.name).on_hover_text(IndicatorSpec::of(def).label()).clicked() {
+                        self.add_favorite_study(def.code, w);
+                        ui.close();
+                    }
+                }
+            });
             if !self.indicators.is_empty() {
                 ui.separator();
                 ui.label(RichText::new("On this chart").small().color(muted()));
@@ -4444,6 +4688,129 @@ fn scan_alert_action(symbol: &str, scan: &tr_core::scanner::ScanDefinition) -> c
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn picker_favorites_follow_preference_order() {
+        let codes = ["RSI", "EMA", "RemovedStudy", "SMA"].map(String::from);
+        assert_eq!(favorite_studies(&codes).iter().map(|def| def.code).collect::<Vec<_>>(), ["RSI", "EMA", "SMA"]);
+    }
+
+    #[test]
+    fn context_favorite_adds_exactly_one_default_study_even_when_present() {
+        let mut chart = ChartState::new(1, "AAPL US Equity", Timeframe::D1);
+        let worker = Worker::inert();
+        chart.add_favorite_study("RSI", &worker);
+        let before = chart.indicators.clone();
+        chart.add_favorite_study("RSI", &worker);
+        assert_eq!(chart.indicators.len(), before.len() + 1);
+        assert_eq!(&chart.indicators[..before.len()], &before);
+        let added = chart.indicators.last().unwrap();
+        let expected = IndicatorSpec::of(registry::find("RSI").unwrap());
+        assert_eq!(added.code, expected.code);
+        assert_eq!(added.params, expected.params);
+        let id = added.chart.as_ref().unwrap().id;
+        assert_eq!(added.chart, Some(study::Settings::new(id, &expected)));
+        assert!(!before.iter().any(|spec| spec.chart.as_ref().unwrap().id == id));
+    }
+
+    #[test]
+    fn context_favorites_submenu_click_adds_one_default_study() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        let worker = Worker::inert();
+        crate::prefs::set_study_favorites(&ctx, vec!["RSI".into()]);
+        let labels = ui_frame(&ctx, vec![], |ui| chart.view_menu(ui, &worker));
+        let indicators = labels.iter().find(|(text, _)| text == "Indicators").unwrap().1.center();
+        for event in
+            [egui::Event::PointerMoved(indicators), pointer_button(indicators, true), pointer_button(indicators, false)]
+        {
+            ui_frame(&ctx, vec![event], |ui| chart.view_menu(ui, &worker));
+        }
+        let labels = ui_frame(&ctx, vec![], |ui| chart.view_menu(ui, &worker));
+        let favorites = labels.iter().find(|(text, _)| text == "Favorites").unwrap().1.center();
+        for event in
+            [egui::Event::PointerMoved(favorites), pointer_button(favorites, true), pointer_button(favorites, false)]
+        {
+            ui_frame(&ctx, vec![event], |ui| chart.view_menu(ui, &worker));
+        }
+        let labels = ui_frame(&ctx, vec![], |ui| chart.view_menu(ui, &worker));
+        let def = registry::find("RSI").unwrap();
+        let rsi = labels.iter().find(|(text, _)| text == def.name).expect("favorite type in submenu").1.center();
+        let before = chart.indicators.clone();
+        for event in [egui::Event::PointerMoved(rsi), pointer_button(rsi, true), pointer_button(rsi, false)] {
+            ui_frame(&ctx, vec![event], |ui| chart.view_menu(ui, &worker));
+        }
+        assert_eq!(chart.indicators.len(), before.len() + 1);
+        assert_eq!(&chart.indicators[..before.len()], &before);
+        let added = chart.indicators.last().unwrap();
+        assert_eq!(added.code, def.code);
+        assert_eq!(added.params, def.defaults());
+        assert_eq!(added.chart, Some(study::Settings::new(added.chart.as_ref().unwrap().id, added)));
+    }
+
+    #[test]
+    fn preset_round_trip_preserves_settings_with_fresh_ids_and_resets_source() {
+        let mut specs = vec![IndicatorSpec::new("EMA", &[27.]).unwrap()];
+        study::assign_ids(&mut specs);
+        let settings = specs[0].chart.as_mut().unwrap();
+        settings.timeframe = Some(Timeframe::W1);
+        settings.source = StudySource::Output { study: 99, output: "RSI".into() };
+        settings.pane = StudyPane::With(99);
+        settings.scale = StudyScale::Independent;
+        settings.color = Some([1, 2, 3]);
+        settings.displacement = 4;
+        settings.outputs.insert("EMA".into(), study::OutputStyle { width: 2.5, ..Default::default() });
+        settings.formula.undefined_zero_division = true;
+        let (preset, reset) = study_presets::Preset::new("Weekly EMA".into(), specs[0].clone());
+        assert!(reset);
+        let json = serde_json::to_string(&preset).unwrap();
+        assert!(!json.contains("\"id\""));
+        let restored: study_presets::Preset = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, preset);
+        let old_id = specs[0].chart.as_ref().unwrap().id;
+        restored.add_to(&mut specs).unwrap();
+        restored.add_to(&mut specs).unwrap();
+        assert_eq!(specs.len(), 3);
+        let mut settings = specs[1].chart.clone().unwrap();
+        assert_ne!(settings.id, old_id);
+        assert_ne!(settings.id, specs[2].chart.as_ref().unwrap().id);
+        settings.id = 0;
+        assert_eq!(Some(settings), restored.spec.chart);
+        assert_eq!(specs[1].chart.as_ref().unwrap().source, StudySource::Bars);
+        assert_eq!(specs[1].chart.as_ref().unwrap().pane, StudyPane::Own);
+        let mut close = specs[1].clone();
+        close.chart.as_mut().unwrap().source = StudySource::Close;
+        let (close, reset) = study_presets::Preset::new("Close".into(), close);
+        assert!(!reset);
+        assert_eq!(close.spec.chart.unwrap().source, StudySource::Close);
+    }
+
+    #[test]
+    fn preset_library_merges_names_and_preserves_corrupt_files() {
+        use study_presets::{Library, Preset};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target")
+            .join(format!("study-presets-test-{}", std::process::id()));
+        let path = dir.join("study-presets.json");
+        assert!(Library::load(&path).unwrap().presets.is_empty());
+        let (a, _) = Preset::new("A".into(), IndicatorSpec::new("EMA", &[12.]).unwrap());
+        let (b, _) = Preset::new("B".into(), IndicatorSpec::new("RSI", &[18.]).unwrap());
+        Library::save(&path, a.clone()).unwrap();
+        Library::save(&path, b.clone()).unwrap();
+        assert_eq!(Library::load(&path).unwrap().presets, [a.clone(), b.clone()]);
+        let mut updated = a.clone();
+        updated.spec.params[0] = 30.;
+        Library::save(&path, updated.clone()).unwrap();
+        assert_eq!(Library::load(&path).unwrap().presets, [updated, b]);
+        std::fs::write(&path, "broken").unwrap();
+        assert!(Library::load(&path).is_err());
+        assert!(Library::save(&path, a.clone()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
+        std::fs::write(&path, r#"{"version":99,"presets":[]}"#).unwrap();
+        assert!(Library::save(&path, a).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"version":99,"presets":[]}"#);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn scan_alert_action_preserves_timeframe_overrides() {
         use tr_core::scanner::{ConditionGroup, MatchMode, ScanCondition, ScanDefinition};

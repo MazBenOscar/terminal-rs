@@ -12,6 +12,7 @@ use crate::worker::Profile;
 /// What a click inside a panel asks the app to do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    Notice(String),
     OpenChart(String),
     ScanChart {
         symbol: String,
