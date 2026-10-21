@@ -29,6 +29,13 @@ Labels used in every note:
 
 ## Notes
 
+- [Crypto features and implementation plan](tradingview-crypto.md) — 2026-10-21
+  REA observations of coin/CEX/DEX screeners and derivatives metrics, compared
+  with the Rust crypto providers at `7de343b`; includes scoped branches and tests.
+- [MCP investigation and service design](tradingview-mcp.md) — official service
+  discovery/authentication boundary and independent terminal-rs client/server
+  proposals; documented capabilities are distinguished from authenticated tests.
+
 - [Quick tools and Auto/Log follow-up](toolbar-scale-followup.md) — 2026-10-21
   REA website runtime tests of drawing favorites, reload, scale-state transitions
   and indicator access; includes explicit account/interaction limits.
