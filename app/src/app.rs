@@ -267,6 +267,7 @@ impl PaneKind {
             PaneKind::Scanner(s) => PaneSettings::Scanner(crate::layouts::ScanSettings {
                 definition: s.definition.clone(),
                 universe: s.universe,
+                refresh: s.refresh,
             }),
             PaneKind::Help => PaneSettings::Help,
             PaneKind::Wei => PaneSettings::Wei,
@@ -1010,11 +1011,14 @@ impl TerminalApp {
                         && let PaneKind::Scanner(s) = &mut p.kind
                         && s.generation == generation
                     {
-                        s.rows = rows;
-                        s.running = false;
-                        s.progress = None;
-                        s.cancel = None;
-                        s.completed = Some(chrono::Utc::now());
+                        s.finish(generation, rows);
+                    }
+                }
+                Response::ScanPartial { pane, generation, rows } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::Scanner(s) = &mut p.kind
+                    {
+                        s.partial(generation, rows);
                     }
                 }
                 Response::ScanProgress { pane, generation, done, total } => {
@@ -1022,7 +1026,7 @@ impl TerminalApp {
                         && let PaneKind::Scanner(s) = &mut p.kind
                         && s.generation == generation
                     {
-                        s.progress = Some((done, total));
+                        s.set_progress(done, total);
                     }
                 }
                 Response::History {
