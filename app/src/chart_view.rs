@@ -2752,20 +2752,7 @@ impl ChartState {
                 });
                 ui.separator();
                 ui.collapsing("Chart templates", |ui| {
-                    ui.horizontal(|ui| {
-                        let save_w = theme::dp(96.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.template_name)
-                                .hint_text("Template name")
-                                .desired_width(ui.available_width() - save_w),
-                        );
-                        if ui
-                            .add_enabled(!self.template_name.trim().is_empty(), egui::Button::new("Save current"))
-                            .clicked()
-                        {
-                            save_template = true;
-                        }
-                    });
+                    save_template = self.template_save_controls(ui).clicked();
                     egui::ComboBox::from_id_salt("chart-template")
                         .selected_text(if self.template_selected.is_empty() {
                             "Choose a saved template…"
@@ -2811,21 +2798,7 @@ impl ChartState {
             });
         self.indicator_editor = open;
         if save_template {
-            let name = self.template_name.trim().to_string();
-            let mut template = crate::chart_templates::Template {
-                version: 2,
-                name: name.clone(),
-                indicators: self.indicators.clone(),
-                chart_type: self.chart_type,
-                log: self.log,
-                show_volume: self.show_volume,
-                data: self.data.clone(),
-            };
-            self.template_status = Some(template.save(&crate::chart_templates::directory()).map(|()| {
-                self.template_names = None;
-                self.template_selected = name.clone();
-                format!("Saved {name}")
-            }));
+            self.save_template(&crate::chart_templates::directory());
         }
         if let Some(merge) = apply_template {
             self.template_status = Some(
@@ -2857,6 +2830,49 @@ impl ChartState {
         if self.indicators != before {
             self.request_indicators(w);
         }
+    }
+
+    fn template_save_controls(&mut self, ui: &mut Ui) -> egui::Response {
+        if self.template_name.is_empty() {
+            self.template_name = format!("{} {} studies", self.sec.ticker, self.tf.label());
+        }
+        ui.horizontal(|ui| {
+            let save_w = theme::dp(96.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.template_name)
+                    .frame(
+                        egui::Frame::new()
+                            .fill(theme::control())
+                            .stroke(Stroke::new(1.0, theme::border()))
+                            .corner_radius(theme::CONTROL_RADIUS)
+                            .inner_margin(theme::dp(4.0)),
+                    )
+                    .font(ui_font(12.5))
+                    .hint_text("Template name")
+                    .desired_width((ui.available_width() - save_w).max(theme::dp(40.0))),
+            );
+            ui.add_enabled(!self.template_name.trim().is_empty(), egui::Button::new("Save current"))
+                .on_disabled_hover_text("Enter a template name")
+        })
+        .inner
+    }
+
+    fn save_template(&mut self, dir: &std::path::Path) {
+        let name = self.template_name.trim().to_string();
+        let mut template = crate::chart_templates::Template {
+            version: 2,
+            name: name.clone(),
+            indicators: self.indicators.clone(),
+            chart_type: self.chart_type,
+            log: self.log,
+            show_volume: self.show_volume,
+            data: self.data.clone(),
+        };
+        self.template_status = Some(template.save(dir).and_then(|()| {
+            self.template_names = Some(crate::chart_templates::names(dir)?);
+            self.template_selected = name.clone();
+            Ok(format!("Saved template {name}"))
+        }));
     }
 
     fn paint_price_alerts(&self, ui: &Ui, plot: Rect, scale: &PriceScale) {
@@ -4537,6 +4553,52 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         }
     }
+    #[test]
+    fn template_controls_prefill_enable_save_and_overwrite_existing_name() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target")
+            .join(format!("qa-template-{}", std::process::id()));
+        let mut button = None;
+        ui_frame(&ctx, vec![], |ui| {
+            let response = chart.template_save_controls(ui);
+            assert!(response.enabled());
+            button = Some(response.rect.center());
+        });
+        assert_eq!(chart.template_name, format!("AAPL {} studies", chart.tf.label()));
+        let at = button.unwrap();
+        for event in [egui::Event::PointerMoved(at), pointer_button(at, true), pointer_button(at, false)] {
+            ui_frame(&ctx, vec![event], |ui| {
+                if chart.template_save_controls(ui).clicked() {
+                    chart.save_template(&dir);
+                }
+            });
+        }
+        assert_eq!(chart.template_status, Some(Ok(format!("Saved template {}", chart.template_name))));
+        chart.indicators.push(IndicatorSpec::new("RSI", &[14.]).unwrap());
+        for event in [pointer_button(at, true), pointer_button(at, false)] {
+            ui_frame(&ctx, vec![event], |ui| {
+                if chart.template_save_controls(ui).clicked() {
+                    chart.save_template(&dir);
+                }
+            });
+        }
+        let saved = crate::chart_templates::Template::load(&dir, &chart.template_name).unwrap();
+        assert_eq!(saved.indicators.len(), 2);
+        assert_eq!(chart.template_names, Some(vec![chart.template_name.clone()]));
+        chart.template_name = "My studies".into();
+        ui_frame(&ctx, vec![], |ui| {
+            chart.template_save_controls(ui);
+        });
+        assert_eq!(chart.template_name, "My studies");
+        chart.template_name = " ".into();
+        ui_frame(&ctx, vec![], |ui| {
+            assert!(!chart.template_save_controls(ui).enabled());
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn sample_chart() -> ChartState {
         let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
         chart.indicators = vec![IndicatorSpec::new("EMA", &[20.]).unwrap()];
