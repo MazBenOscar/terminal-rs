@@ -68,10 +68,7 @@ pub fn renko(bars: &[Bar], size: f64) -> Result<Vec<Bar>, String> {
 }
 pub fn anchored_vwap(bars: &[Bar], anchor: i64) -> Vec<f64> {
     let mut out = vec![f64::NAN; bars.len()];
-    if bars.first().is_none_or(|b| anchor < b.ts) || bars.last().is_none_or(|b| anchor > b.ts) {
-        return out;
-    }
-    let start = bars.partition_point(|b| b.ts < anchor);
+    let start = bars.partition_point(|b| b.ts <= anchor).saturating_sub(1);
     let (mut pv, mut volume) = (0., 0.);
     for (i, b) in bars.iter().enumerate().skip(start) {
         if !b.volume.is_finite() || b.volume < 0. || ![b.high, b.low, b.close].iter().all(|p| p.is_finite()) {
@@ -191,7 +188,7 @@ mod tests {
         assert!(renko(&b, 0.00000001).is_err());
     }
     #[test]
-    fn anchored_vwap_is_causal_and_never_substitutes_missing_volume_or_anchor_history() {
+    fn anchored_vwap_snaps_to_containing_bar_and_never_substitutes_missing_volume() {
         let b = [
             Bar::new(1, 10., 10., 10., 10., 2.),
             Bar::new(2, 20., 20., 20., 20., 1.),
@@ -200,7 +197,14 @@ mod tests {
         assert_eq!(anchored_vwap(&b, 1), vec![10., 40. / 3., 40. / 3.]);
         assert!(anchored_vwap(&b, 2)[0].is_nan());
         assert_eq!(anchored_vwap(&b, 2)[1], 20.);
-        assert!(anchored_vwap(&b, 0).iter().all(|v| v.is_nan()));
+        assert_eq!(anchored_vwap(&b, 0), anchored_vwap(&b, 1));
+        let daily = [Bar::new(86_400, 10., 10., 10., 10., 1.), Bar::new(172_800, 20., 20., 20., 20., 1.)];
+        for anchor in [172_800, 180_000] {
+            let values = anchored_vwap(&daily, anchor);
+            assert!(values[0].is_nan());
+            assert_eq!(values[1], 20.);
+        }
+        assert_eq!(anchored_vwap(&daily, 0), vec![10., 15.]);
         let mut broken = b;
         broken[1].volume = f64::NAN;
         assert!(anchored_vwap(&broken, 1)[2].is_nan());

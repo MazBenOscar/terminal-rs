@@ -337,6 +337,17 @@ mod scanner_cache_tests {
     use super::*;
 
     #[tokio::test]
+    async fn extended_history_routes_to_alpaca_without_silent_fallback() {
+        let alpaca = AlpacaProvider::new("fixture-key".into(), "fixture-secret".into(), "iex".into()).unwrap();
+        let markets = Markets::new(Some(alpaca)).unwrap();
+        let options = crate::HistoryOptions { extended_hours: true, ..Default::default() };
+        let error = markets.chart_history("AAPL US Equity", Timeframe::D1, None, 10, options).await.unwrap_err();
+        assert!(error.to_string().contains("Alpaca history does not support extended hours"));
+        let error = markets.chart_history("BTCUSD Crypto", Timeframe::M1, None, 10, options).await.unwrap_err();
+        assert!(error.to_string().contains("do not apply"));
+    }
+
+    #[tokio::test]
     async fn cache_identity_tracks_active_routing_through_fallback() {
         let q = Questrade::new(None, Box::new(|_| Ok(()))).unwrap();
         let provider = crate::Fallback::new(Markets::with_questrade(None, Some(q.clone())).unwrap());

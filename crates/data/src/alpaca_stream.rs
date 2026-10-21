@@ -14,6 +14,22 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tr_core::Bar;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    Retry,
+    Fatal(u16),
+}
+fn classify(code: u16) -> Failure {
+    if matches!(code, 401 | 402 | 403 | 406 | 409) { Failure::Fatal(code) } else { Failure::Retry }
+}
+fn next_delay(delay: u64) -> u64 {
+    (delay * 2).min(60)
+}
+fn server_error(row: &serde_json::Value, authenticating: bool) -> Failure {
+    let code = row["code"].as_u64().and_then(|code| u16::try_from(code).ok()).unwrap_or(0);
+    if authenticating { Failure::Fatal(code) } else { classify(code) }
+}
+
 #[derive(Default)]
 pub struct Hub {
     channels: Mutex<BTreeMap<String, broadcast::Sender<LiveUpdate>>>,
@@ -82,40 +98,49 @@ impl Hub {
                 self.changed.notified().await;
                 continue;
             }
-            let result = self.connection(&url, &key, &secret).await;
-            if result.is_err() {
-                // Never include server payloads or authentication material in logs/status.
-                self.status("Alpaca minute stream unavailable; reconnecting. Check feed entitlement/connection limits and refresh history after a gap.");
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-                delay = (delay * 2).min(60);
-            } else {
-                delay = 1;
+            match self.connection(&url, &key, &secret, &mut delay).await {
+                Err(Failure::Fatal(code)) => {
+                    self.status(&format!("Alpaca minute stream permanent error (code {code}); retries stopped. Check authentication, subscription and connection limits."));
+                    return;
+                }
+                Err(Failure::Retry) => {
+                    // Never include server payloads or authentication material in logs/status.
+                    self.status("Alpaca minute stream unavailable; reconnecting. Refresh history after a gap.");
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    delay = next_delay(delay);
+                }
+                Ok(()) => delay = 1,
             }
         }
     }
-    async fn connection(&self, url: &str, key: &str, secret: &str) -> Result<(), ()> {
+    async fn connection(&self, url: &str, key: &str, secret: &str, delay: &mut u64) -> Result<(), Failure> {
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(15), tokio_tungstenite::connect_async(url))
             .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
+            .map_err(|_| Failure::Retry)?
+            .map_err(|error| match error {
+                tokio_tungstenite::tungstenite::Error::Http(response) => classify(response.status().as_u16()),
+                _ => Failure::Retry,
+            })?;
         let auth = serde_json::json!({"action":"auth","key":key,"secret":secret});
-        socket.send(Message::Text(auth.to_string().into())).await.map_err(|_| ())?;
+        socket.send(Message::Text(auth.to_string().into())).await.map_err(|_| Failure::Retry)?;
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(message) = socket.next().await {
-                if let Message::Text(text) = message.map_err(|_| ())? {
-                    let rows: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|_| ())?;
-                    if rows.iter().any(|r| r["T"] == "error") {
-                        return Err(());
+                if let Message::Text(text) = message.map_err(|_| Failure::Retry)? {
+                    let rows: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|_| Failure::Retry)?;
+                    if let Some(row) = rows.iter().find(|r| r["T"] == "error") {
+                        return Err(server_error(row, true));
                     }
                     if rows.iter().any(|r| r["T"] == "success" && r["msg"] == "authenticated") {
                         return Ok(());
                     }
                 }
             }
-            Err(())
+            Err(Failure::Retry)
         })
         .await
-        .map_err(|_| ())??;
+        .map_err(|_| Failure::Retry)??;
+        *delay = 1;
+        self.status("Alpaca minute stream authenticated; waiting for minute bars");
         let mut subscribed = BTreeSet::<String>::new();
         let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
         let mut received = std::time::Instant::now();
@@ -130,30 +155,30 @@ impl Hub {
             for (action, list) in [("subscribe", added), ("unsubscribe", removed)] {
                 if !list.is_empty() {
                     let request = serde_json::json!({"action":action,"bars":list,"updatedBars":list});
-                    socket.send(Message::Text(request.to_string().into())).await.map_err(|_| ())?;
+                    socket.send(Message::Text(request.to_string().into())).await.map_err(|_| Failure::Retry)?;
                 }
             }
             subscribed = symbols;
             tokio::select! {
                 _ = self.changed.notified() => {},
                 _ = heartbeat.tick() => {
-                    if received.elapsed() > Duration::from_secs(90) { return Err(()); }
-                    socket.send(Message::Ping(Vec::new().into())).await.map_err(|_|())?;
+                    if received.elapsed() > Duration::from_secs(90) { return Err(Failure::Retry); }
+                    socket.send(Message::Ping(Vec::new().into())).await.map_err(|_| Failure::Retry)?;
                 }
                 message = socket.next() => {
                     received = std::time::Instant::now();
-                    match message.ok_or(())?.map_err(|_|())? {
+                    match message.ok_or(Failure::Retry)?.map_err(|_| Failure::Retry)? {
                         Message::Text(text) => {
-                            let rows: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|_|())?;
+                            let rows: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|_| Failure::Retry)?;
                             for row in rows {
-                                if row["T"]=="error" { return Err(()); }
+                                if row["T"]=="error" { return Err(server_error(&row, false)); }
                                 if let Some((symbol,bar)) = parse_bar(&row)
                                     && let Ok(channels) = self.channels.lock()
                                     && let Some(tx) = channels.get(&symbol) { let _ = tx.send(LiveUpdate::Snapshot(bar)); }
                             }
                         }
-                        Message::Ping(bytes) => { socket.send(Message::Pong(bytes)).await.map_err(|_|())?; }
-                        Message::Close(_) => return Err(()),
+                        Message::Ping(bytes) => { socket.send(Message::Pong(bytes)).await.map_err(|_| Failure::Retry)?; }
+                        Message::Close(_) => return Err(Failure::Retry),
                         _ => {},
                     }
                 }
@@ -195,6 +220,18 @@ fn parse_bar(value: &serde_json::Value) -> Option<(String, Bar)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn permanent_failures_stop_retries_and_transient_backoff_is_bounded() {
+        for code in [401, 402, 403, 406, 409] {
+            assert_eq!(classify(code), Failure::Fatal(code));
+            assert_eq!(server_error(&serde_json::json!({"code":code}), false), Failure::Fatal(code));
+        }
+        assert_eq!(classify(500), Failure::Retry);
+        assert_eq!(server_error(&serde_json::json!({"code":400}), true), Failure::Fatal(400));
+        assert_eq!(next_delay(1), 2);
+        assert_eq!(next_delay(32), 60);
+        assert_eq!(next_delay(60), 60);
+    }
     #[tokio::test]
     async fn one_connection_authenticates_and_routes_multiple_symbols_without_cross_talk() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -224,7 +261,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = ws.close(None).await;
         });
-        let connection = tokio::spawn(async move { hub.connection(&url, "fixture-key", "fixture-secret").await });
+        let connection = tokio::spawn(async move {
+            let mut delay = 60;
+            let result = hub.connection(&url, "fixture-key", "fixture-secret", &mut delay).await;
+            assert_eq!(delay, 1);
+            result
+        });
+        let status = tokio::time::timeout(Duration::from_secs(3), a_rx.recv()).await.unwrap().unwrap();
+        assert!(
+            matches!(status, LiveUpdate::Status(message) if message.contains("authenticated") && !message.contains("reconnecting"))
+        );
+        assert!(matches!(b_rx.recv().await.unwrap(), LiveUpdate::Status(_)));
         let update = tokio::time::timeout(Duration::from_secs(3), a_rx.recv()).await.unwrap().unwrap();
         assert!(matches!(update,LiveUpdate::Snapshot(bar) if bar.close==101.));
         assert!(b_rx.try_recv().is_err());

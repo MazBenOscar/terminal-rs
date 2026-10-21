@@ -24,6 +24,32 @@ use tr_data::{BarCache, Provider, Quote, SearchHit, YieldCurves};
 use crate::command::IndicatorSpec;
 use crate::theme;
 
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    #[test]
+    fn calendar_periods_stay_fresh_through_the_final_day() {
+        let ts = |s| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        for (tf, start, final_day, boundary) in [
+            (Timeframe::MN1, "2026-01-01T00:00:00Z", "2026-01-31T23:59:00Z", "2026-02-01T00:00:00Z"),
+            (Timeframe::MN3, "2026-07-01T00:00:00Z", "2026-09-30T23:59:00Z", "2026-10-01T00:00:00Z"),
+        ] {
+            assert!(!history_is_stale(tf, ts(start), ts(final_day)));
+            assert!(!history_is_stale(tf, ts(start), ts(boundary) + 120));
+            assert!(history_is_stale(tf, ts(start), ts(boundary) + 121));
+        }
+    }
+}
+
+fn history_is_stale(tf: Timeframe, last: i64, quote: i64) -> bool {
+    let boundary = if matches!(tf, Timeframe::MN1 | Timeframe::MN3) {
+        tr_core::session::next_bucket(tf, last)
+    } else {
+        last.saturating_add(tf.seconds())
+    };
+    last > quote.saturating_add(30) || quote > boundary.saturating_add(120)
+}
+
 pub type PaneId = u64;
 
 /// Minutes between Congress disclosure checks (`TR_CONGRESS_REFRESH_MIN`; 0 disables).
@@ -1146,7 +1172,7 @@ async fn condition_observations(
                             return Err("Condition and price data modes differ".into());
                         }
                         let last = history.bars.last().ok_or("No condition history")?;
-                        if last.ts > q.ts + 30 || q.ts.saturating_sub(last.ts) > tf.seconds() + 120 {
+                        if history_is_stale(tf, last.ts, q.ts) {
                             return Err("Condition history is stale relative to price".into());
                         }
                         Ok((q, history.bars))

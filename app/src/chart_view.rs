@@ -1182,7 +1182,7 @@ impl ChartState {
             && self.chart_type != ChartType::Renko
             && let (Some(first), Some(last)) = (self.source_bars.first(), self.source_bars.last())
         {
-            let range = (first.ts.saturating_sub(86_400), tr_core::session::next_bucket(self.tf, last.ts));
+            let range = (first.ts.div_euclid(86_400) * 86_400, (last.ts.div_euclid(86_400) + 1) * 86_400);
             if self.events_range != Some(range) {
                 self.events_range = Some(range);
                 self.events_notice = "Loading corporate events…".into();

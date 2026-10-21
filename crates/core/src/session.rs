@@ -73,13 +73,6 @@ impl Session {
             return (tf.bucket_start(ts), next_bucket(tf, ts));
         }
         let date = Zone::NewYork.local(ts).date();
-        let local_ts = |day: NaiveDate, minute: u32| {
-            chrono_tz::America::New_York
-                .from_local_datetime(&day.and_hms_opt(minute / 60, minute % 60, 0).unwrap())
-                .single()
-                .unwrap()
-                .timestamp()
-        };
         if tf.is_intraday() {
             let open = local_ts(date, if self == Self::UsRegular { open_minute(date) } else { 240 });
             let end = local_ts(date, if self == Self::UsRegular { close_minute(date) } else { 1200 });
@@ -99,6 +92,13 @@ impl Session {
             (local_ts(start, 0), local_ts(end, 0))
         }
     }
+}
+fn local_ts(day: NaiveDate, minute: u32) -> i64 {
+    let local = day.and_time(chrono::NaiveTime::MIN) + Duration::minutes(i64::from(minute));
+    chrono_tz::America::New_York
+        .from_local_datetime(&local)
+        .earliest()
+        .map_or_else(|| local.and_utc().timestamp(), |dt| dt.timestamp())
 }
 pub fn next_bucket(tf: Timeframe, ts: i64) -> i64 {
     let start = tf.bucket_start(ts);
@@ -197,6 +197,11 @@ mod tests {
     use super::*;
     fn ts(s: &str) -> i64 {
         DateTime::parse_from_rfc3339(s).unwrap().timestamp()
+    }
+    #[test]
+    fn local_conversion_does_not_panic_at_dst_transitions() {
+        assert_eq!(local_ts(date(2026, 3, 8), 150), ts("2026-03-08T02:30:00Z"));
+        assert_eq!(local_ts(date(2026, 11, 1), 90), ts("2026-11-01T05:30:00Z"));
     }
     #[test]
     fn dst_and_regular_session_edges() {
