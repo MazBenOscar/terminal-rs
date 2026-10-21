@@ -1732,6 +1732,8 @@ mod tests {
             zone: tr_core::session::Zone::NewYork,
             session: tr_core::session::Session::UsRegular,
             refresh_seconds: 60,
+            comparisons: vec![],
+            hidden_comparisons: vec![],
         };
         chart.indicators = vec![crate::command::IndicatorSpec::new("PCF", &[]).unwrap()];
         tr_core::indicators::study::assign_ids(&mut chart.indicators);

@@ -17,16 +17,18 @@ pub enum Axis {
     Price,
     /// The comparison in its own prices on a separate left-hand axis.
     Own,
+    Indexed,
 }
 
 impl Axis {
-    pub const ALL: [Self; 3] = [Self::Percent, Self::Price, Self::Own];
+    pub const ALL: [Self; 4] = [Self::Percent, Self::Indexed, Self::Price, Self::Own];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Percent => "% change",
             Self::Price => "Price axis",
             Self::Own => "Own axis",
+            Self::Indexed => "Index 100",
         }
     }
 
@@ -35,8 +37,38 @@ impl Axis {
             Self::Percent => "Both symbols rebased at the visible left edge; the axis shows % change",
             Self::Price => "The comparison rebased onto this chart's price axis",
             Self::Own => "The comparison in its own prices on a separate left axis",
+            Self::Indexed => "All series indexed to 100 at the first common visible bar",
         }
     }
+}
+
+#[derive(Default)]
+pub struct Series {
+    pub line: Option<tr_chart::gpu::LineRef>,
+    pub error: Option<String>,
+    pub loading: bool,
+    pub factor: f64,
+}
+
+pub fn color(index: usize) -> egui::Color32 {
+    let base = theme::series(index + 5);
+    if index >= 6 { base.lerp_to_gamma(theme::text(), 0.35) } else { base }
+}
+
+pub fn common_anchor(
+    main: &tr_chart::gpu::LineRef,
+    others: &[tr_chart::gpu::LineRef],
+    lo: usize,
+    hi: usize,
+) -> Option<usize> {
+    let valid = |line: &tr_chart::gpu::LineRef, i: usize| {
+        line.pyramid
+            .data
+            .get(i)
+            .filter(|_| i < line.pyramid.level_len(0))
+            .is_some_and(|p| p[1].is_finite() && p[1] > 0.)
+    };
+    (lo..hi.min(main.pyramid.level_len(0))).find(|&i| valid(main, i) && others.iter().all(|line| valid(line, i)))
 }
 
 #[derive(Default)]
@@ -82,9 +114,10 @@ impl Picker {
         pane: PaneId,
         subject: &str,
         current: Option<&str>,
-        axis: &mut Axis,
+        controls: (&mut Axis, &mut Vec<String>, &mut Vec<String>),
         worker: &Worker,
     ) -> Option<Option<String>> {
+        let (axis, extra, hidden) = controls;
         if !self.open {
             return None;
         }
@@ -110,15 +143,45 @@ impl Picker {
             if let Some(current) = current {
                 ui.horizontal(|ui| {
                     ui.label(format!("Comparing {current}"));
+                    let mut visible = !hidden.iter().any(|s| s == current);
+                    if ui.checkbox(&mut visible, "Show").changed() {
+                        hidden.retain(|s| s != current);
+                        if !visible {
+                            hidden.push(current.to_string());
+                        }
+                    }
                     if ui.button("Remove").clicked() {
                         chosen = Some(None);
                     }
                 });
             }
+            let mut remove = None;
+            for (index, key) in extra.iter().enumerate() {
+                ui.push_id(key, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut visible = !hidden.contains(key);
+                        if ui.checkbox(&mut visible, key).changed() {
+                            hidden.retain(|s| s != key);
+                            if !visible {
+                                hidden.push(key.clone());
+                            }
+                        }
+                        if ui.button("Remove").clicked() {
+                            remove = Some(index);
+                        }
+                    })
+                });
+            }
+            if let Some(index) = remove {
+                let key = extra.remove(index);
+                hidden.retain(|s| s != &key);
+            }
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Scale").color(theme::muted()));
                 for option in Axis::ALL {
-                    ui.selectable_value(axis, option, option.label()).on_hover_text(option.hint());
+                    ui.add_enabled_ui(option != Axis::Own || extra.is_empty(), |ui| {
+                        ui.selectable_value(axis, option, option.label()).on_hover_text(option.hint())
+                    });
                 }
             });
             let input = ui.add(
@@ -167,6 +230,9 @@ impl Picker {
                 ui.label(RichText::new("Choose a different symbol from the chart.").color(theme::muted()));
             }
             ui.separator();
+            if extra.len() >= 7 {
+                ui.label("Eight comparisons selected. Remove one before adding another.");
+            }
             egui::ScrollArea::vertical().max_height(theme::dp(260.)).show(ui, |ui| {
                 for (key, name) in &results {
                     result_button(ui, key, name, current, &mut chosen);
@@ -193,7 +259,7 @@ impl Picker {
                 );
             }
             ui.label(
-                RichText::new(format!("One comparison at a time · {}", axis.hint().to_lowercase()))
+                RichText::new(format!("Up to 8 comparisons · {}", axis.hint().to_lowercase()))
                     .small()
                     .color(theme::muted()),
             );
@@ -225,6 +291,16 @@ fn result_button(ui: &mut Ui, key: &str, name: &str, current: Option<&str>, chos
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn all_visible_series_share_one_anchor_and_missing_overlap_stays_unavailable() {
+        let line = tr_chart::scene::line_ref;
+        let main = line(&[100., 101., 102., 103.]);
+        let early = line(&[50., 51., 52., 53.]);
+        let late = line(&[f64::NAN, f64::NAN, 10., 11.]);
+        assert_eq!(common_anchor(&main, &[early.clone(), late], 0, 4), Some(2));
+        assert_eq!(common_anchor(&main, &[early], 1, 4), Some(1));
+        assert_eq!(common_anchor(&main, &[line(&[f64::NAN; 4])], 0, 4), None);
+    }
     #[test]
     fn compare_axis_defaults_to_percent_and_round_trips() {
         assert_eq!(Axis::default(), Axis::Percent);

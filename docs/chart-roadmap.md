@@ -31,3 +31,18 @@ does not include commissions, FX conversion or realized P/L. Stale/undated portf
 snapshots and refresh failures are labeled. A chart with overlays enabled participates
 in the normal read-only portfolio refresh schedule even if PORT is closed. No order
 placement, cancellation or modification is performed by these overlays.
+
+## Multiple comparisons and scales
+
+The chart picker adds up to eight comparison symbols. Each extra row can be hidden
+or removed; removing the original comparison promotes the next one. `CMP` retains
+its original replace/clear behavior. All visible, successfully loaded comparison
+lines use the first common positive finite bar in the visible range as their anchor.
+There is no invented value before a symbol's available history. Loading and errors
+are per symbol; generation/revision guards reject responses for older chart data.
+
+The scale options include percent change, indexed-to-100, rebased price and the
+existing single-comparison own axis. Multiple comparisons use a shared axis; own-axis
+mode is unavailable with extra series. Legend values identify the symbol and its
+return from the shared baseline. Hidden series do not affect autoscale or the anchor.
+Series/visibility settings persist in layouts (format v6, accepting earlier versions).

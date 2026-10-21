@@ -138,7 +138,9 @@ pub struct ChartState {
     error: Option<String>,
     built: Vec<BuiltIndicator>,
     compare_line: Option<LineRef>,
+    comparisons: std::collections::HashMap<String, crate::chart_compare::Series>,
     compare_scale: f64,
+    compare_base: Option<f64>,
     markers: Vec<Trade>,
     pending_range: Option<Range>,
     draw: DrawState,
@@ -219,7 +221,9 @@ impl ChartState {
             error: None,
             built: Vec::new(),
             compare_line: None,
+            comparisons: Default::default(),
             compare_scale: 1.0,
+            compare_base: None,
             markers: Vec::new(),
             pending_range: None,
             draw: DrawState::default(),
@@ -257,6 +261,22 @@ impl ChartState {
 
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
+        if self.compare.is_none() && !self.data.comparisons.is_empty() {
+            self.compare = Some(self.data.comparisons.remove(0));
+        }
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(self.symbol.clone());
+        if let Some(primary) = &self.compare {
+            seen.insert(primary.clone());
+        }
+        self.data.comparisons = self
+            .data
+            .comparisons
+            .iter()
+            .filter_map(|key| crate::chart_compare::parse_key(key))
+            .filter(|key| seen.insert(key.clone()))
+            .take(7)
+            .collect();
         if let Some(view) = self.viewport {
             self.plot_width = view.width_px;
         }
@@ -283,6 +303,7 @@ impl ChartState {
         self.manual_scale = None;
         self.glide = None;
         self.compare_line = None;
+        self.comparisons.clear();
         self.compare_error = None;
         self.compare_loading = false;
         self.markers.clear();
@@ -434,6 +455,9 @@ impl ChartState {
     }
 
     pub fn set_compare(&mut self, symbol: Option<String>, w: &Worker) {
+        self.data.comparisons.clear();
+        self.data.hidden_comparisons.clear();
+        self.comparisons.clear();
         self.compare = symbol.and_then(|s| crate::chart_compare::parse_key(&s)).filter(|s| *s != self.symbol);
         self.compare_line = None;
         self.compare_error = None;
@@ -576,18 +600,33 @@ impl ChartState {
     }
 
     fn request_compare(&mut self, w: &Worker) {
-        if let (Some(sym), false) = (&self.compare, self.bars.is_empty()) {
+        self.comparisons.retain(|key, _| self.data.comparisons.contains(key));
+        let symbols: Vec<_> = self.compare.iter().chain(self.data.comparisons.iter()).cloned().collect();
+        if !symbols.is_empty() && !self.bars.is_empty() {
             self.compare_revision += 1;
             self.compare_loading = true;
             self.compare_error = None;
-            w.send(Request::Compare {
-                revision: self.compare_revision,
-                pane: self.id,
-                generation: self.generation,
-                symbol: sym.clone(),
-                tf: self.tf,
-                base: self.bars.clone(),
-            });
+            if self.compare_line.as_ref().is_some_and(|l| l.pyramid.level_len(0) != self.bars.len()) {
+                self.compare_line = None;
+            }
+            for sym in symbols {
+                if self.compare.as_ref() != Some(&sym) {
+                    let extra = self.comparisons.entry(sym.clone()).or_default();
+                    extra.loading = true;
+                    extra.error = None;
+                    if extra.line.as_ref().is_some_and(|l| l.pyramid.level_len(0) != self.bars.len()) {
+                        extra.line = None;
+                    }
+                }
+                w.send(Request::Compare {
+                    revision: self.compare_revision,
+                    pane: self.id,
+                    generation: self.generation,
+                    symbol: sym,
+                    tf: self.tf,
+                    base: self.bars.clone(),
+                });
+            }
         }
     }
 
@@ -697,6 +736,16 @@ impl ChartState {
     }
 
     pub fn on_compare(&mut self, generation: u64, revision: u64, symbol: &str, line: LineRef) {
+        if generation == self.generation
+            && revision == self.compare_revision
+            && self.data.comparisons.iter().any(|s| s == symbol)
+        {
+            let extra = self.comparisons.entry(symbol.to_string()).or_default();
+            extra.line = Some(line);
+            extra.loading = false;
+            extra.error = None;
+            return;
+        }
         if generation == self.generation && revision == self.compare_revision && self.compare.as_deref() == Some(symbol)
         {
             self.compare_line = Some(line);
@@ -706,6 +755,15 @@ impl ChartState {
     }
 
     pub fn on_compare_error(&mut self, generation: u64, revision: u64, symbol: &str, error: String) {
+        if generation == self.generation
+            && revision == self.compare_revision
+            && self.data.comparisons.iter().any(|s| s == symbol)
+        {
+            let extra = self.comparisons.entry(symbol.to_string()).or_default();
+            extra.error = Some(error);
+            extra.loading = false;
+            return;
+        }
         if generation == self.generation && revision == self.compare_revision && self.compare.as_deref() == Some(symbol)
         {
             self.compare_error = Some(error);
@@ -861,11 +919,34 @@ impl ChartState {
             self.id,
             &self.symbol,
             self.compare.as_deref(),
-            &mut self.compare_axis,
+            (&mut self.compare_axis, &mut self.data.comparisons, &mut self.data.hidden_comparisons),
             w,
         ) {
-            self.set_compare(chosen, w);
+            if let Some(symbol) = chosen {
+                self.data.hidden_comparisons.retain(|s| s != &symbol);
+                if self.compare.is_none() {
+                    self.set_compare(Some(symbol), w);
+                } else if self.compare.as_ref() != Some(&symbol)
+                    && !self.data.comparisons.contains(&symbol)
+                    && self.data.comparisons.len() < 7
+                {
+                    self.data.hidden_comparisons.retain(|s| s != &symbol);
+                    self.data.comparisons.push(symbol);
+                    self.request_compare(w);
+                }
+            } else if self.data.comparisons.is_empty() {
+                self.set_compare(None, w);
+            } else {
+                let next = self.data.comparisons.remove(0);
+                self.compare_line = self.comparisons.remove(&next).and_then(|s| s.line);
+                self.compare = Some(next);
+                self.request_compare(w);
+            }
         }
+        if !self.data.comparisons.is_empty() && self.compare_axis == CompareAxis::Own {
+            self.compare_axis = CompareAxis::Percent;
+        }
+        self.comparisons.retain(|key, _| self.data.comparisons.contains(key));
         let painter = ui.painter_at(rect);
         // Sits under a tab strip inside a card: square top, rounded bottom.
         let r = theme::CARD_RADIUS.saturating_sub(1);
@@ -974,7 +1055,8 @@ impl ChartState {
         );
 
         let body = Rect::from_min_max(pos2(rect.left(), header.bottom()), pos2(rect.right(), range_row.top()));
-        let own_axis = self.compare.is_some() && self.compare_axis == CompareAxis::Own;
+        let own_axis = self.compare.as_ref().is_some_and(|s| !self.data.hidden_comparisons.contains(s))
+            && self.compare_axis == CompareAxis::Own;
         // An own-axis comparison gets a left-hand price axis of the same width.
         let left_axis = if own_axis { AXIS_W } else { 0.0 };
         let plot_all = Rect::from_min_max(
@@ -1159,15 +1241,42 @@ impl ChartState {
         // Percent mode labels prices relative to the main close at the visible left edge, where
         // the comparison is rebased too, so both series read as % change from the same bar.
         let mut percent_base = None;
+        let (lo, hi) = v.visible_range(len);
+        let primary_visible = self.compare.as_ref().is_some_and(|s| !self.data.hidden_comparisons.contains(s));
+        let mut lines: Vec<LineRef> = self
+            .data
+            .comparisons
+            .iter()
+            .filter(|s| !self.data.hidden_comparisons.contains(s))
+            .filter_map(|s| self.comparisons.get(s).and_then(|s| s.line.clone()))
+            .collect();
+        if primary_visible && let Some(line) = &self.compare_line {
+            lines.push(line.clone());
+        }
+        let anchor = crate::chart_compare::common_anchor(&gpu.closes, &lines, lo, hi);
+        self.compare_base = anchor.map(|i| gpu.closes.pyramid.data[i][1] as f64);
+        if matches!(self.compare_axis, CompareAxis::Percent | CompareAxis::Indexed) {
+            percent_base = anchor.map(|i| gpu.closes.pyramid.data[i][1] as f64);
+        }
         if let Some(c) = &self.compare_line {
-            let (lo, hi) = self.viewport.as_ref().map(|v| v.visible_range(len)).unwrap_or((0, len));
-            let scale = scene::rebase_factor(&gpu.closes, c, lo, hi);
+            let scale =
+                anchor.map(|i| gpu.closes.pyramid.data[i][1] as f64 / c.pyramid.data[i][1] as f64).unwrap_or(1.);
             self.compare_scale = scale;
-            if self.compare_axis != CompareAxis::Own {
+            if self.compare_axis != CompareAxis::Own && primary_visible && anchor.is_some() {
                 overlays.push(compare_overlay(c, scale));
             }
-            if self.compare_axis == CompareAxis::Percent {
-                percent_base = first_finite(&gpu.closes, lo, hi);
+        }
+        for (index, key) in self.data.comparisons.iter().enumerate() {
+            if self.data.hidden_comparisons.contains(key) {
+                continue;
+            }
+            if let Some(extra) = self.comparisons.get_mut(key)
+                && let (Some(line), Some(at)) = (&extra.line, anchor)
+            {
+                extra.factor = gpu.closes.pyramid.data[at][1] as f64 / line.pyramid.data[at][1] as f64;
+                let mut overlay = compare_overlay(line, extra.factor);
+                overlay.color = theme::rgba(crate::chart_compare::color(index + 1));
+                overlays.push(overlay);
             }
         }
         let reveal_t =
@@ -1241,7 +1350,7 @@ impl ChartState {
                 let dec = scale::decimals_for(step).min(2);
                 pct.into_iter()
                     .filter(|p| *p > -100.0)
-                    .map(|p| (base * (1.0 + p / 100.0), format_percent(p, dec)))
+                    .map(|p| (base * (1.0 + p / 100.0), axis_value(p, dec, self.compare_axis)))
                     .unzip()
             }
             None => {
@@ -1429,7 +1538,7 @@ impl ChartState {
                 let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
                 axis_painter.rect_filled(tag, 0.0, col.gamma_multiply(tag_fade));
                 let text = match percent_base {
-                    Some(base) => format_percent(percent(last.close, base), 2),
+                    Some(base) => axis_value(percent(last.close, base), 2, self.compare_axis),
                     None => scale::format_price(last.close, self.sec.decimals(last.close)),
                 };
                 axis_painter.text(
@@ -1443,6 +1552,8 @@ impl ChartState {
             // The comparison's last value: on the right axis when it shares it, else on the left one.
             if let Some(c) = &self.compare_line
                 && let Some(raw) = last_finite(c)
+                && primary_visible
+                && (own_axis || anchor.is_some())
             {
                 let color = theme::series(5).gamma_multiply(tag_fade);
                 let ink = Color32::BLACK.gamma_multiply(tag_fade);
@@ -1470,7 +1581,7 @@ impl ChartState {
                                 Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
                             axis_painter.rect_filled(tag, 0.0, color);
                             let text = match percent_base {
-                                Some(base) => format_percent(percent(rebased, base), 2),
+                                Some(base) => axis_value(percent(rebased, base), 2, self.compare_axis),
                                 None => scale::format_price(raw, decimals),
                             };
                             axis_painter.text(
@@ -1540,7 +1651,7 @@ impl ChartState {
                 let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, p.y - 8.0), vec2(AXIS_W - 2.0, 16.0));
                 axis_painter.rect_filled(tag, 0.0, Color32::from_gray(70));
                 let label = match percent_base {
-                    Some(base) => format_percent(percent(price, base), 2),
+                    Some(base) => axis_value(percent(price, base), 2, self.compare_axis),
                     None => scale::format_price(price, self.sec.decimals(price)),
                 };
                 axis_painter.text(tag.left_center() + vec2(5.0, 0.0), Align2::LEFT_CENTER, label, mono(11.0), text());
@@ -2437,19 +2548,49 @@ impl ChartState {
                 .and_then(|line| line.pyramid.data.get(i))
                 .map(|point| point[1] as f64)
                 .filter(|v| v.is_finite());
-            let rel = raw.zip(self.bars.get(i)).map(|(r, b)| (r * self.compare_scale / b.close - 1.0) * 100.0);
-            let text = if let Some(error) = &self.compare_error {
+            let rel = raw.zip(self.compare_base).map(|(r, base)| percent(r * self.compare_scale, base));
+            let text = if self.data.hidden_comparisons.contains(sym) {
+                format!("CMP {sym} · hidden")
+            } else if let Some(error) = &self.compare_error {
                 format!("CMP {sym} · {error}")
             } else if self.compare_loading {
                 format!("CMP {sym} · loading…")
             } else {
                 match (raw, rel) {
-                    (Some(r), Some(rel)) => format!("CMP {sym}  {r:.2}  ({rel:+.2}% vs {})", self.symbol),
+                    (Some(r), Some(rel)) => format!("CMP {sym}  {r:.2}  ({rel:+.2}% from shared base)"),
                     _ => format!("CMP {sym}"),
                 }
             };
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, text, mono(11.0), theme::series(5));
             ly += 14.0;
+        }
+        for (index, key) in self.data.comparisons.iter().enumerate() {
+            let extra = self.comparisons.get(key);
+            let state = if self.data.hidden_comparisons.contains(key) {
+                "hidden".to_string()
+            } else if let Some(error) = extra.and_then(|s| s.error.as_ref()) {
+                error.clone()
+            } else if extra.is_none_or(|s| s.loading) {
+                "loading…".to_string()
+            } else {
+                extra
+                    .and_then(|s| {
+                        s.line.as_ref().and_then(|line| line.pyramid.data.get(i)).map(|p| (p[1] as f64, s.factor))
+                    })
+                    .map_or("unavailable".into(), |(raw, factor)| {
+                        self.compare_base.map_or(format!("{raw:.2} · no common anchor"), |base| {
+                            format!("{raw:.2} ({:+.2}% from shared base)", percent(raw * factor, base))
+                        })
+                    })
+            };
+            p.text(
+                pos2(price_rect.left() + 6., ly),
+                Align2::LEFT_TOP,
+                format!("CMP {key} · {state}"),
+                mono(11.),
+                crate::chart_compare::color(index + 1),
+            );
+            ly += 14.;
         }
         if let Some(tool) = self.draw.tool {
             let msg = if self.draw.second.is_some() {
@@ -2942,11 +3083,6 @@ fn compare_overlay(line: &LineRef, scale: f64) -> Overlay {
     }
 }
 
-fn first_finite(line: &LineRef, lo: usize, hi: usize) -> Option<f64> {
-    let data = &line.pyramid.data;
-    (lo..hi.min(line.pyramid.level_len(0))).find_map(|i| Some(data[i][1] as f64).filter(|x| x.is_finite() && *x != 0.0))
-}
-
 fn last_finite(line: &LineRef) -> Option<f64> {
     let data = &line.pyramid.data;
     (0..line.pyramid.level_len(0)).rev().find_map(|i| Some(data[i][1] as f64).filter(|x| x.is_finite()))
@@ -2959,6 +3095,10 @@ fn percent(price: f64, base: f64) -> f64 {
 
 fn format_percent(p: f64, decimals: usize) -> String {
     if p.abs() < 0.5 * 10f64.powi(-(decimals as i32)) { "0%".into() } else { format!("{p:+.decimals$}%") }
+}
+
+fn axis_value(p: f64, decimals: usize, axis: CompareAxis) -> String {
+    if axis == CompareAxis::Indexed { format!("{:.*}", decimals, 100. + p) } else { format_percent(p, decimals) }
 }
 
 fn study_source_label(source: &StudySource, specs: &[IndicatorSpec]) -> String {
@@ -3392,6 +3532,38 @@ mod tests {
         assert!(chart.compare.is_none());
         assert!(chart.compare_line.is_none());
         assert!(!chart.compare_loading);
+    }
+
+    #[test]
+    fn picker_adds_multiple_series_removes_individually_and_ignores_old_responses() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        for symbol in ["SPY US Equity", "QQQ US Equity", "DIA US Equity"] {
+            chart.compare_picker.open();
+            chart_frame(&ctx, &mut chart, vec![]);
+            let labels = chart_frame(&ctx, &mut chart, vec![]);
+            let at = labels.iter().find(|(s, _)| s.starts_with(&format!("{symbol}  ·"))).unwrap().1.center();
+            click_chart(&ctx, &mut chart, at);
+        }
+        assert_eq!(chart.compare.as_deref(), Some("SPY US Equity"));
+        assert_eq!(chart.data.comparisons, vec!["QQQ US Equity", "DIA US Equity"]);
+        let line = tr_chart::scene::line_ref(&vec![50.; chart.bars.len()]);
+        chart.on_compare(chart.generation, chart.compare_revision - 1, "QQQ US Equity", line.clone());
+        assert!(chart.comparisons["QQQ US Equity"].line.is_none());
+        for symbol in ["SPY US Equity", "QQQ US Equity", "DIA US Equity"] {
+            chart.on_compare(chart.generation, chart.compare_revision, symbol, line.clone());
+        }
+        chart.compare_axis = CompareAxis::Indexed;
+        chart_frame(&ctx, &mut chart, vec![]);
+        assert!(chart.compare_base.is_some());
+        assert_eq!(axis_value(10., 2, CompareAxis::Indexed), "110.00");
+        chart.compare_picker.open();
+        chart_frame(&ctx, &mut chart, vec![]);
+        let labels = chart_frame(&ctx, &mut chart, vec![]);
+        let at = labels.iter().find(|(s, _)| s == "Remove").unwrap().1.center();
+        click_chart(&ctx, &mut chart, at);
+        assert_eq!(chart.compare.as_deref(), Some("QQQ US Equity"));
+        assert_eq!(chart.data.comparisons, vec!["DIA US Equity"]);
     }
 
     #[test]

@@ -8,6 +8,8 @@ pub struct ChartData {
     pub session: Session,
     pub refresh_seconds: u32,
     pub account: crate::chart_account::Settings,
+    pub comparisons: Vec<String>,
+    pub hidden_comparisons: Vec<String>,
 }
 impl ChartData {
     pub fn edit(&mut self, ui: &mut egui::Ui, us_equity: bool) {

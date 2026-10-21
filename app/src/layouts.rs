@@ -17,7 +17,7 @@ use crate::congress_view::FeedFilter;
 use crate::dock::{Node, PaneId};
 use crate::layout::Layout;
 
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Colour link groups: panes in the same group follow one security.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -585,7 +585,7 @@ mod tests {
             drawings.push(d);
         }
         let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
-        assert_eq!(restored.version, 5);
+        assert_eq!(restored.version, FORMAT_VERSION);
         assert_eq!(restored.panes[0].settings, doc.panes[0].settings);
     }
 
