@@ -901,7 +901,7 @@ impl TerminalApp {
             Function::IndicatorPicker(q) => self.palette.open_scoped(crate::palette::Kind::Indicator, &q),
             Function::ClearIndicators => self.with_chart(|c, _| c.clear_indicators()),
             Function::Compare(s) => self.with_chart(|c, w| c.set_compare(s, w)),
-            Function::LogScale => self.with_chart(|c, _| c.log = !c.log),
+            Function::LogScale => self.with_chart(|c, _| c.toggle_log_scale()),
             Function::Range(r) => self.with_chart(|c, w| c.set_range(r, w)),
             Function::Draw(t) => self.with_chart(|c, _| c.start_tool(t)),
             Function::ClearDrawings => self.with_chart(|c, _| c.drawings.clear()),
@@ -1561,7 +1561,7 @@ impl TerminalApp {
             A::DrawVertical => self.with_chart(|c, _| c.start_tool(Tool::Vertical)),
             A::DrawFib => self.with_chart(|c, _| c.start_tool(Tool::Fib)),
             A::ResetView => self.with_chart(|c, _| c.reset_view()),
-            A::LogScale => self.with_chart(|c, _| c.log = !c.log),
+            A::LogScale => self.with_chart(|c, _| c.toggle_log_scale()),
             A::Magnet => self.with_chart(|c, _| c.magnet = !c.magnet),
             a => {
                 if let Some(spec) = a.panel_spec() {
@@ -1804,8 +1804,15 @@ impl eframe::App for TerminalApp {
                 SidebarCmd::Layout(op) => self.layout_op(op),
             }
         }
+        prefs::set_drawing_favorites(&ctx, (self.prefs.drawing_favorites.clone(), self.prefs.show_drawing_favorites));
         actions.extend(self.render_dock(ui, area, gap));
         actions.extend(self.render_windows(&ctx));
+        let (favorites, shown) = prefs::drawing_favorites(&ctx);
+        if favorites != self.prefs.drawing_favorites || shown != self.prefs.show_drawing_favorites {
+            self.prefs.drawing_favorites = favorites;
+            self.prefs.show_drawing_favorites = shown;
+            self.save_prefs();
+        }
         self.run_actions(actions);
         if let Some(editor) = &mut self.columns_editor {
             let (applied, open) = editor.show(&ctx);

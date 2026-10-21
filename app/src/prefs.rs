@@ -651,6 +651,46 @@ impl Keymap {
     }
 }
 
+fn default_drawing_favorites() -> Vec<tr_chart::drawings::Tool> {
+    use tr_chart::drawings::Tool;
+    vec![Tool::Trendline, Tool::Horizontal, Tool::Fib]
+}
+
+fn deserialize_drawing_favorites<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<tr_chart::drawings::Tool>, D::Error> {
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    let mut tools = Vec::new();
+    for value in values {
+        if let Ok(tool) = serde_json::from_value(value)
+            && !tools.contains(&tool)
+            && tools.len() < tr_chart::drawings::Tool::ALL.len()
+        {
+            tools.push(tool);
+        }
+    }
+    Ok(tools)
+}
+
+pub(crate) type DrawingFavorites = (Vec<tr_chart::drawings::Tool>, bool);
+
+pub(crate) fn drawing_favorites(ctx: &egui::Context) -> DrawingFavorites {
+    ctx.data(|data| data.get_temp(egui::Id::new("drawing-favorites")))
+        .unwrap_or_else(|| (default_drawing_favorites(), true))
+}
+
+pub(crate) fn set_drawing_favorites(ctx: &egui::Context, favorites: DrawingFavorites) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("drawing-favorites"), favorites));
+}
+
+pub(crate) fn toggle_drawing_favorite(tools: &mut Vec<tr_chart::drawings::Tool>, tool: tr_chart::drawings::Tool) {
+    if tools.contains(&tool) {
+        tools.retain(|&favorite| favorite != tool);
+    } else if tools.len() < tr_chart::drawings::Tool::ALL.len() {
+        tools.push(tool);
+    }
+}
+
 pub const PREFS_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -662,6 +702,9 @@ pub struct Prefs {
     pub appearance: Appearance,
     pub hotkeys: Keymap,
     pub panels: PanelDefaults,
+    #[serde(default = "default_drawing_favorites", deserialize_with = "deserialize_drawing_favorites")]
+    pub drawing_favorites: Vec<tr_chart::drawings::Tool>,
+    pub show_drawing_favorites: bool,
     /// Order entry through SnapTrade (off unless the user turns it on).
     pub trading: TradingPrefs,
     #[serde(default)]
@@ -680,6 +723,8 @@ impl Default for Prefs {
             appearance: Appearance::default(),
             hotkeys: Keymap::default(),
             panels: PanelDefaults::default(),
+            drawing_favorites: default_drawing_favorites(),
+            show_drawing_favorites: true,
             trading: TradingPrefs::default(),
             alert_sound: false,
             desktop_notification: false,
@@ -769,6 +814,45 @@ impl Prefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drawing_favorites_load_deduplicates_and_drops_unknown_tools() {
+        use tr_chart::drawings::Tool;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/drawing-favorites-prefs-test.json");
+        std::fs::write(
+            &path,
+            r#"{"drawing_favorites":["Fib","RemovedTool","Fib","Ray",null],"show_drawing_favorites":false}"#,
+        )
+        .unwrap();
+        let prefs = Prefs::load(&path);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(prefs.drawing_favorites, vec![Tool::Fib, Tool::Ray]);
+        assert!(!prefs.show_drawing_favorites);
+        let defaults: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.drawing_favorites, vec![Tool::Trendline, Tool::Horizontal, Tool::Fib]);
+        assert!(defaults.show_drawing_favorites);
+        let all = Tool::ALL.repeat(3);
+        let json = serde_json::json!({"drawing_favorites": all});
+        let prefs: Prefs = serde_json::from_value(json).unwrap();
+        assert_eq!(prefs.drawing_favorites, Tool::ALL);
+        assert_eq!(serde_json::from_str::<Prefs>(&serde_json::to_string(&prefs).unwrap()).unwrap(), prefs);
+    }
+
+    #[test]
+    fn drawing_favorite_toggle_removes_and_appends_without_duplicates() {
+        use tr_chart::drawings::Tool;
+        let mut favorites = default_drawing_favorites();
+        toggle_drawing_favorite(&mut favorites, Tool::Horizontal);
+        assert_eq!(favorites, vec![Tool::Trendline, Tool::Fib]);
+        toggle_drawing_favorite(&mut favorites, Tool::Ray);
+        toggle_drawing_favorite(&mut favorites, Tool::Horizontal);
+        assert_eq!(favorites, vec![Tool::Trendline, Tool::Fib, Tool::Ray, Tool::Horizontal]);
+        let mut all = Tool::ALL.to_vec();
+        toggle_drawing_favorite(&mut all, Tool::Ray);
+        toggle_drawing_favorite(&mut all, Tool::Ray);
+        assert_eq!(all.len(), 13);
+        assert_eq!(all.last(), Some(&Tool::Ray));
+    }
 
     #[test]
     fn chords_parse_and_round_trip() {
