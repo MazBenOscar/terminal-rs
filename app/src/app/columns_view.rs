@@ -309,6 +309,14 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_titles_disable_apply_with_a_clear_validation_error() {
+        let mut set = sample();
+        set.columns[1].title = set.columns[0].title.to_ascii_lowercase();
+        assert!(!apply_enabled(&set));
+        assert!(set.validate().unwrap_err().contains("Duplicate column title"));
+    }
+
+    #[test]
     fn column_sets_library_merges_updates_and_preserves_corrupt_files() {
         // Keep all test writes within this worktree.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
@@ -335,5 +343,50 @@ mod tests {
         assert!(save_definition_at(&definition, &dir).is_err());
         assert_eq!(std::fs::read(dir.join("column-sets.json")).unwrap(), b"broken JSON");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn column_set_names_cannot_escape_the_library_directory() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "target/column-library-path-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let mut definition = sample();
+        definition.name = "../../evil".into();
+        let saved = save_definition_at(&definition, &dir).unwrap();
+        assert_eq!(saved.len(), 1);
+        // The name lives inside column-sets.json; no file is created outside `dir`.
+        assert!(dir.join("column-sets.json").exists());
+        assert!(!dir.parent().unwrap().join("evil").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn column_set_name_must_be_non_empty_and_is_trimmed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "target/column-library-name-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let mut definition = sample();
+        for name in ["", "   ", "\t\n"] {
+            definition.name = name.into();
+            assert!(save_definition_at(&definition, &dir).is_err(), "name {name:?} must be rejected");
+        }
+        definition.name = "  Spaced  ".into();
+        let saved = save_definition_at(&definition, &dir).unwrap();
+        assert_eq!(saved[0].name, "Spaced");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_column_ids_never_collide_with_existing_ones() {
+        let mut set = sample();
+        set.columns[0].id = 100;
+        set.columns[1].id = 3;
+        assert_eq!(new_column(&set, false).id, 101);
+        set.columns.clear();
+        assert_eq!(new_column(&set, true).id, 1);
     }
 }

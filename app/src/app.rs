@@ -399,6 +399,18 @@ fn accept_columns<T>(revision: u64, current: u64, result: T) -> Option<T> {
     (revision == current).then_some(result)
 }
 
+fn finish_columns_reply<T>(in_flight: &mut Option<u64>, revision: u64, current: u64, result: T) -> Option<T> {
+    let accepted = accept_columns(revision, current, result);
+    if *in_flight == Some(revision) {
+        *in_flight = None;
+    }
+    accepted
+}
+
+fn columns_refresh_due(in_flight: Option<u64>, requested: Option<Instant>, now: Instant) -> bool {
+    in_flight.is_none() && requested.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60))
+}
+
 fn watch_value_order(a: Option<f64>, b: Option<f64>, descending: bool) -> std::cmp::Ordering {
     match (a, b) {
         (Some(a), Some(b)) => {
@@ -545,6 +557,7 @@ pub struct TerminalApp {
     columns_revision: u64,
     columns_computed_at: i64,
     columns_requested: Option<Instant>,
+    columns_in_flight: Option<u64>,
     columns_snapshot: (Vec<String>, tr_core::columns::ColumnSet),
     watch_sort: Option<(usize, bool)>,
     quotes: HashMap<String, Quote>,
@@ -745,6 +758,7 @@ impl TerminalApp {
             columns_revision: 0,
             columns_computed_at: 0,
             columns_requested: None,
+            columns_in_flight: None,
             columns_snapshot: Default::default(),
             watch_sort: None,
             quotes: HashMap::new(),
@@ -1167,13 +1181,16 @@ impl TerminalApp {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
                 Response::WatchlistColumns { revision, cells, computed_at } => {
-                    self.refresh_columns();
-                    if let Some((cells, computed_at)) =
-                        accept_columns(revision, self.columns_revision, (cells, computed_at))
-                    {
+                    if let Some((cells, computed_at)) = finish_columns_reply(
+                        &mut self.columns_in_flight,
+                        revision,
+                        self.columns_revision,
+                        (cells, computed_at),
+                    ) {
                         self.column_cells = cells;
                         self.columns_computed_at = computed_at;
                     }
+                    self.refresh_columns();
                 }
                 Response::Scan { pane, generation, rows } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
@@ -1681,7 +1698,7 @@ impl TerminalApp {
             self.columns_requested = None;
         }
         if !self.watch_columns.columns.is_empty()
-            && self.columns_requested.is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+            && columns_refresh_due(self.columns_in_flight, self.columns_requested, Instant::now())
         {
             self.columns_revision = self.columns_revision.wrapping_add(1);
             self.worker.send(Request::WatchlistColumns {
@@ -1690,6 +1707,7 @@ impl TerminalApp {
                 columns: self.watch_columns.columns.clone(),
             });
             self.columns_requested = Some(Instant::now());
+            self.columns_in_flight = Some(self.columns_revision);
         }
     }
 
@@ -2039,6 +2057,7 @@ impl TerminalApp {
             toasts: Vec::new(),
             alert_toasts: Vec::new(),
             watchlist_undo: None,
+            columns_in_flight: None,
             latest: Vec::new(),
             politicians: Vec::new(),
             pol_search: String::new(),
@@ -2109,6 +2128,25 @@ mod tests {
         let (row, count, _) = watchlist_append(&original, vec!["NVDA".into()]);
         assert_eq!(count, 1);
         assert_eq!(row.last(), Some(&key("NVDA")));
+    }
+
+    #[test]
+    fn slow_column_reply_is_accepted_before_overdue_refresh() {
+        let requested = Instant::now();
+        let now = requested + Duration::from_secs(61);
+        let mut in_flight = Some(4);
+        assert!(!columns_refresh_due(in_flight, Some(requested), now));
+        let cells = finish_columns_reply(&mut in_flight, 4, 4, "slow cells");
+        assert_eq!(cells, Some("slow cells"));
+        assert_eq!(in_flight, None);
+        assert!(columns_refresh_due(in_flight, Some(requested), now));
+        in_flight = Some(5);
+        assert!(!columns_refresh_due(in_flight, Some(now), now));
+        assert_eq!(finish_columns_reply(&mut in_flight, 4, 5, "stale"), None);
+        assert_eq!(in_flight, Some(5));
+        assert_eq!(finish_columns_reply(&mut in_flight, 5, 6, "changed inputs"), None);
+        assert_eq!(in_flight, None);
+        assert!(columns_refresh_due(in_flight, None, now));
     }
 
     #[test]

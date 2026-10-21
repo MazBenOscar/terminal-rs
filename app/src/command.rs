@@ -663,6 +663,48 @@ mod tests {
     }
 
     #[test]
+    fn column_add_parses_formula_equals_at_and_spacing() {
+        // The first '=' separates title from expression; later '=' belongs to the formula.
+        let Some(Command::Function(Function::ColumnAdd(c))) = parse("COL ADD Diff = C - C1 = 0") else {
+            panic!("equals in formula");
+        };
+        assert_eq!(c.title, "Diff");
+        assert_eq!(c.kind, tr_core::columns::ColumnKind::Formula { expression: "C - C1 = 0".into() });
+
+        // The last '@' is the timeframe; no spaces required.
+        let Some(Command::Function(Function::ColumnAdd(c))) = parse("COL ADD Avg=AVGC20@1W") else {
+            panic!("compact separators");
+        };
+        assert_eq!(c.title, "Avg");
+        assert_eq!(c.timeframe, Timeframe::W1);
+        assert_eq!(c.kind, tr_core::columns::ColumnKind::Formula { expression: "AVGC20".into() });
+
+        // Empty / whitespace titles and empty expressions are rejected.
+        for input in [
+            "COL ADD    = C",
+            "COL ADD Title =",
+            "COL ADD Title = C @",
+            "COL ADD Title = C @ 1W extra",
+            "COL ADD Title = X @ Y @ 1W",
+            "COL ADD Title = C @ 1 W",
+            "COL ADD",
+            "COL ADD Title",
+        ] {
+            assert_eq!(parse(input), None, "{input}");
+        }
+
+        // Month vs minute is case-sensitive, matching Timeframe::from_str.
+        let Some(Command::Function(Function::ColumnAdd(mo))) = parse("COL ADD M = C @ 1M") else {
+            panic!("month");
+        };
+        assert_eq!(mo.timeframe, Timeframe::MN1);
+        let Some(Command::Function(Function::ColumnAdd(mi))) = parse("COL ADD m = C @ 1m") else {
+            panic!("minute");
+        };
+        assert_eq!(mi.timeframe, Timeframe::M1);
+    }
+
+    #[test]
     fn scanner_commands_and_panel_specs() {
         for command in ["SCAN", "scanner", "EASYSCAN"] {
             assert_eq!(parse(command), Some(Command::Function(Function::Scanner)));

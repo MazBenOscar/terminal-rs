@@ -81,15 +81,36 @@ pub fn save_bytes(
     bytes: &[u8],
     extension: &str,
 ) -> Result<std::path::PathBuf, String> {
-    use std::io::Write;
+    if !(1..=8).contains(&extension.len()) || !extension.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+        return Err("Export extension must contain 1 to 8 lowercase ASCII letters or digits".into());
+    }
     std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
     let symbol: String = symbol.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(40).collect();
     let stamp =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
-    let path = directory.join(format!("{symbol}-{stamp}.{extension}"));
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
-    file.write_all(bytes).and_then(|()| file.sync_all()).map_err(|e| e.to_string())?;
-    Ok(path)
+    save_unique(directory, &format!("{symbol}-{stamp}"), bytes, extension)
+}
+
+fn save_unique(
+    directory: &std::path::Path,
+    stem: &str,
+    bytes: &[u8],
+    extension: &str,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    for attempt in 1..=100 {
+        let suffix = if attempt == 1 { String::new() } else { format!("-{attempt}") };
+        let path = directory.join(format!("{stem}{suffix}.{extension}"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(bytes).and_then(|()| file.sync_all()).map_err(|e| e.to_string())?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("Export name collisions exhausted 100 attempts".into())
 }
 /// Encodes a screenshot crop, clamping its bounds to the source image.
 pub fn crop_png(image: &egui::ColorImage, rect_px: [usize; 4]) -> Result<Vec<u8>, String> {
@@ -166,6 +187,24 @@ mod tests {
     }
 
     #[test]
+    fn same_name_collisions_retry_suffixes_and_stop_at_100() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target")
+            .join(format!("export-collision-{stamp}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        for attempt in 1..=100 {
+            let path = save_unique(&directory, "fixed", &[attempt], "png").unwrap();
+            let name = if attempt == 1 { "fixed.png".into() } else { format!("fixed-{attempt}.png") };
+            assert_eq!(path, directory.join(name));
+            assert_eq!(std::fs::read(path).unwrap(), [attempt]);
+        }
+        assert!(save_unique(&directory, "fixed", &[0], "png").is_err());
+        assert_eq!(std::fs::read(directory.join("fixed.png")).unwrap(), [1]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn exports_preserve_values_and_escape_labels() {
         let b = [Bar::new(123, 1., 3., 0.5, 2., 123.45)];
         assert!(csv(&b).contains("123,1,3,0.5,2,123.45\n"));
@@ -173,5 +212,59 @@ mod tests {
         assert!(image.contains("A&lt;B &amp; C"));
         assert!(image.contains("<rect x="));
         assert!(!image.contains("NaN"));
+    }
+
+    #[test]
+    fn crop_png_rounds_up_partial_pixels_and_clamps_offscreen_rects() {
+        // 4x3 image, crop that starts at x=1 and asks for 3 px but only 3 remain.
+        let image = egui::ColorImage::filled([4, 3], egui::Color32::from_rgb(1, 2, 3));
+        let bytes = crop_png(&image, [1, 1, 3, 5]).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height), (3, 2), "clamped to remaining pixels");
+
+        // Fully off-screen right / bottom yields an empty crop error, not a panic.
+        assert!(crop_png(&image, [10, 1, 2, 2]).is_err());
+        assert!(crop_png(&image, [1, 10, 2, 2]).is_err());
+        // Zero-area after clamp is empty.
+        assert!(crop_png(&image, [4, 0, 2, 2]).is_err());
+    }
+
+    #[test]
+    fn crop_png_preserves_corner_pixels_when_rect_is_one_pixel() {
+        let mut image = egui::ColorImage::filled([3, 3], egui::Color32::from_rgb(0, 0, 0));
+        image.pixels[8] = egui::Color32::from_rgb(9, 8, 7); // bottom-right
+        let bytes = crop_png(&image, [2, 2, 1, 1]).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut pixels).unwrap();
+        assert_eq!(&pixels[..4], &[9, 8, 7, 255]);
+    }
+
+    #[test]
+    fn save_bytes_sanitises_extension_and_colliding_names() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target").join(format!("export-ext-{stamp}"));
+        // Reject path-like extensions rather than allowing directory traversal.
+        for extension in ["png/../../evil", "", "PNG", "abcdefghi", "p.ng", "é"] {
+            assert!(save_bytes(&directory, "AAPL", &[1], extension).is_err());
+        }
+        let path = save_bytes(&directory, "../../AAPL", &[1], "png").unwrap();
+        assert!(path.file_name().unwrap().to_str().unwrap().starts_with("AAPL-"));
+        assert_eq!(path.parent(), Some(directory.as_path()), "extension must not introduce path segments");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_bytes_rejects_empty_symbol_becomes_dash_only_and_still_lands_in_directory() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target").join(format!("export-empty-{stamp}"));
+        let path = save_bytes(&directory, "///", &[0], "png").unwrap();
+        assert_eq!(path.parent(), Some(directory.as_path()));
+        assert!(path.file_name().unwrap().to_str().unwrap().starts_with('-'));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

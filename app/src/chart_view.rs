@@ -1637,9 +1637,13 @@ impl ChartState {
         }
     }
 
+    pub(crate) fn set_export_pane_rect(&mut self, rect: Rect) {
+        self.export_pane_rect = Some(rect);
+    }
+
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
         self.capture_export(ui.ctx(), w);
-        self.export_pane_rect = Some(self.export_pane_rect.unwrap_or(rect).union(rect));
+        self.set_export_pane_rect(rect);
         self.refresh_view(w);
         if self.data.show_events
             && self.replay_cutoff.is_none()
@@ -4822,6 +4826,18 @@ mod tests {
         assert!(Library::save(&path, a).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"version":99,"presets":[]}"#);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_pane_rect_tracks_only_the_latest_frame() {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        let first = Rect::from_min_size(egui::pos2(0., 0.), egui::vec2(800., 600.));
+        let second = Rect::from_min_size(egui::pos2(20., 30.), egui::vec2(200., 100.));
+        chart.set_export_pane_rect(first);
+        assert_eq!(chart.export_pane_rect, Some(first));
+        chart.set_export_pane_rect(second);
+        assert_eq!(chart.export_pane_rect, Some(second));
+        assert_ne!(chart.export_pane_rect, Some(first.union(second)));
     }
 
     #[test]
