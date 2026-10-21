@@ -66,8 +66,8 @@ impl Settings {
             }
         }
     }
-    pub fn paint(&self, ui: &Ui, plot: Rect, s: &PriceScale, bars: &[Bar], scope: (Timeframe, bool, Session)) {
-        let (tf, us, session) = scope;
+    pub fn paint(&self, ui: &Ui, plot: Rect, s: &PriceScale, bars: &[Bar], scope: (Timeframe, bool, Session, bool)) {
+        let (tf, us, session, live_time_bars) = scope;
         let p = ui.painter_at(plot);
         if let Some((previous, high, low)) = session_levels(bars, tf, us) {
             let mut levels = Vec::new();
@@ -104,6 +104,7 @@ impl Settings {
             }
         }
         if self.countdown
+            && live_time_bars
             && let Some(last) = bars.last()
         {
             let now = chrono::Utc::now().timestamp();
@@ -149,6 +150,31 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn countdown_only_renders_for_live_time_bars() {
+        let ctx = egui::Context::default();
+        let bars = [Bar::new(86400, 10., 12., 9., 11., 1.)];
+        for live in [false, true] {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let plot = Rect::from_min_size(pos2(0., 0.), vec2(500., 300.));
+                Settings::default().paint(
+                    ui,
+                    plot,
+                    &PriceScale::new(9., 13., false, 300.),
+                    &bars,
+                    (Timeframe::D1, false, Session::Provider, live),
+                );
+            });
+            output.textures_delta.clear();
+            let closed = output.shapes.iter().any(|shape| {
+                matches!(
+                    &shape.shape, egui::Shape::Text(text) if text.galley.job.text == "Bar closed"
+                )
+            });
+            assert_eq!(closed, live);
+        }
+    }
+
     #[test]
     fn levels_use_loaded_dates_and_do_not_reuse_todays_close_as_previous() {
         let b = vec![

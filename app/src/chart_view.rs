@@ -143,6 +143,7 @@ pub struct ChartState {
     view_config: (Option<i64>, Option<u64>),
     replay_cutoff: Option<i64>,
     replay_play: bool,
+    replay_reanchor: bool,
     replay_tick: std::time::Instant,
     gpu: Option<SeriesGpu>,
     ha_gpu: Option<(Arc<Vec<Bar>>, Option<SeriesGpu>)>,
@@ -244,6 +245,7 @@ impl ChartState {
             view_config: (None, None),
             replay_cutoff: None,
             replay_play: false,
+            replay_reanchor: false,
             replay_tick: std::time::Instant::now(),
             gpu: None,
             ha_gpu: None,
@@ -377,6 +379,7 @@ impl ChartState {
         self.view_source = None;
         self.replay_cutoff = None;
         self.replay_play = false;
+        self.replay_reanchor = false;
         self.gpu = None;
         self.built.clear();
         w.send(Request::History {
@@ -874,6 +877,7 @@ impl ChartState {
                 return;
             }
         }
+        self.replay_reanchor |= config.0.is_some() != self.view_config.0.is_some();
         let reset = config.1 != self.view_config.1;
         self.view_source = Some(self.source_bars.clone());
         self.view_config = config;
@@ -926,12 +930,14 @@ impl ChartState {
                 let viewport = self.viewport;
                 let old_len = self.bars.len();
                 self.apply_view(bars, gpu, 0, false, w);
+                if self.replay_reanchor {
+                    self.glide = None;
+                }
                 if let Some(mut view) = viewport {
-                    if view.right >= old_len as f64 - 1. {
-                        view.right += self.bars.len() as f64 - old_len as f64;
-                    }
+                    view = replay_viewport(view, old_len, self.bars.len(), self.replay_reanchor);
                     self.viewport = Some(view);
                 }
+                self.replay_reanchor = false;
             }
             Err(e) => self.error = Some(e),
         }
@@ -956,9 +962,6 @@ impl ChartState {
         if ui.button("Next").on_hover_text("Next source bar").clicked() {
             index = (index + 1).min(len - 1);
         }
-        if ui.available_width() > 240. {
-            ui.add(egui::Slider::new(&mut index, 0..=len - 1).show_value(false));
-        }
         if self.replay_play {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
             if self.replay_tick.elapsed().as_secs_f32() >= 1. {
@@ -969,6 +972,20 @@ impl ChartState {
                 self.replay_play = false;
             }
         }
+        let slider_width = (ui.available_width() - 215.).clamp(40., 320.);
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = slider_width;
+            // Render after playback advances, using an explicitly linear bar-index range.
+            let mut position = index as f64;
+            ui.add(
+                egui::Slider::new(&mut position, 0.0..=(len - 1) as f64).integer().logarithmic(false).show_value(false),
+            );
+            index = (position.round() as usize).min(len - 1);
+        });
+        let date = chrono::DateTime::from_timestamp(self.source_bars[index].ts, 0)
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        ui.label(RichText::new(format!("bar {} / {len} · {date}", index + 1)).small());
         self.replay_cutoff = Some(self.source_bars[index].ts);
         if ui.button("Exit").clicked() {
             self.replay_cutoff = None;
@@ -1553,7 +1570,8 @@ impl ChartState {
         }
         let v = *self.viewport.as_ref().expect("viewport");
         let mut v = v;
-        v.clamp(len);
+        // Replay truncates the displayed prefix, not the user's zoom range.
+        v.clamp(if self.replay_cutoff.is_some() { self.source_bars.len() } else { len });
         self.viewport = Some(v);
 
         let changed_by_user = plot_resp.dragged()
@@ -1900,6 +1918,8 @@ impl ChartState {
 
         // Last price line + axis tag, fading in as the sweep reaches the last bar.
         let tag_fade = crate::anim::span(reveal_t, 0.8, 1.0);
+        let mut right_tags = Vec::new();
+        let mut fixed_tag = None;
         if let Some(last) = self.bars.last()
             && tag_fade > 0.0
         {
@@ -1915,20 +1935,12 @@ impl ChartState {
                     if !price_rect.y_range().contains(y) {
                         continue;
                     }
-                    let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
-                    axis_painter.rect_filled(tag, 0.0, crate::chart_compare::color(index + 1).gamma_multiply(tag_fade));
                     let decimals = scale::decimals_for(raw.abs() / 1000.0).clamp(2, 4);
                     let text = match percent_base {
                         Some(base) => axis_value(percent(rebased, base), 2, self.compare_axis),
                         None => scale::format_price(raw, decimals),
                     };
-                    axis_painter.text(
-                        tag.left_center() + vec2(5.0, 0.0),
-                        Align2::LEFT_CENTER,
-                        text,
-                        mono(11.0),
-                        Color32::BLACK.gamma_multiply(tag_fade),
-                    );
+                    right_tags.push((y, crate::chart_compare::color(index + 1).gamma_multiply(tag_fade), text));
                 }
             }
             // The comparison's last value: on the right axis when it shares it, else on the left one.
@@ -1959,20 +1971,11 @@ impl ChartState {
                         let rebased = raw * self.compare_scale;
                         let y = price_rect.top() + scale.y_of(rebased) as f32;
                         if price_rect.y_range().contains(y) {
-                            let tag =
-                                Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
-                            axis_painter.rect_filled(tag, 0.0, color);
                             let text = match percent_base {
                                 Some(base) => axis_value(percent(rebased, base), 2, self.compare_axis),
                                 None => scale::format_price(raw, decimals),
                             };
-                            axis_painter.text(
-                                tag.left_center() + vec2(5.0, 0.0),
-                                Align2::LEFT_CENTER,
-                                text,
-                                mono(11.0),
-                                ink,
-                            );
+                            right_tags.push((y, color, text));
                         }
                     }
                 }
@@ -1989,27 +1992,49 @@ impl ChartState {
                     );
                     xx += 6.0;
                 }
-                let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
-                axis_painter.rect_filled(tag, 0.0, col.gamma_multiply(tag_fade));
                 let text = match percent_base {
                     Some(base) => axis_value(percent(last.close, base), 2, self.compare_axis),
                     None => scale::format_price(last.close, self.sec.decimals(last.close)),
                 };
-                axis_painter.text(
-                    tag.left_center() + vec2(5.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    text,
-                    mono(11.0),
-                    Color32::BLACK.gamma_multiply(tag_fade),
-                );
+                fixed_tag = Some(right_tags.len());
+                right_tags.push((y, col.gamma_multiply(tag_fade), text));
             }
+        }
+
+        let desired: Vec<_> = right_tags.iter().map(|(y, _, _)| (*y, 16.)).collect();
+        let positions = spread_tags(&desired, fixed_tag, price_rect.top(), price_rect.bottom());
+        for ((true_y, color, text), y) in right_tags.into_iter().zip(positions) {
+            let tag = Rect::from_min_size(pos2(plot_all.right() + 1., y - 8.), vec2(AXIS_W - 2., 16.));
+            if (y - true_y).abs() > 3. {
+                let x = tag.left() + 2.;
+                axis_painter.line_segment([pos2(x, true_y), pos2(x + 3., y)], Stroke::new(1., color));
+            }
+            axis_painter.rect_filled(tag, 0., color);
+            axis_painter.text(
+                tag.left_center() + vec2(5., 0.),
+                Align2::LEFT_CENTER,
+                text,
+                mono(11.),
+                Color32::BLACK.gamma_multiply(tag_fade),
+            );
         }
 
         if self.replay_cutoff.is_none() && self.chart_type != ChartType::Renko {
             self.paint_price_alerts(ui, price_rect, &scale);
         }
         self.data.analytics.paint_profile(ui, price_rect, &v, &self.bars, (self.tf, us), &scale);
-        self.data.context.paint(ui, price_rect, &scale, &self.bars, (self.tf, us, self.effective_session()));
+        self.data.context.paint(
+            ui,
+            price_rect,
+            &scale,
+            &self.bars,
+            (
+                self.tf,
+                us,
+                self.effective_session(),
+                self.replay_cutoff.is_none() && self.chart_type != ChartType::Renko,
+            ),
+        );
         if self.data.show_events && self.replay_cutoff.is_none() && self.chart_type != ChartType::Renko {
             crate::chart_events::paint(ui, price_rect, &v, &self.bars, self.tf, &self.events);
         }
@@ -3913,9 +3938,99 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
     }
 }
 
+/// Follow the newest bar without changing zoom. A paused manual pan is retained
+/// while the new bar remains visible; start/exit always return to the right edge.
+fn replay_viewport(mut view: Viewport, old_len: usize, new_len: usize, reanchor: bool) -> Viewport {
+    if old_len == new_len && !reanchor {
+        return view;
+    }
+    let newest = new_len as f64 - 0.5;
+    if reanchor || view.right >= old_len as f64 - 1. || newest < view.left() || newest > view.right {
+        view.right = new_len as f64 + 3.;
+    }
+    view
+}
+
+/// Return tag centres in input order, using a stable vertical sort and 1px gaps.
+/// The fixed tag divides the sweep into two independent blocks. Bounds and gaps
+/// are guaranteed when each block fits; otherwise fixed position and gaps win.
+fn spread_tags(desired: &[(f32, f32)], fixed: Option<usize>, lo: f32, hi: f32) -> Vec<f32> {
+    fn block(indices: &[usize], desired: &[(f32, f32)], out: &mut [f32], lo: f32, hi: f32) {
+        let mut edge = lo;
+        for &i in indices {
+            let half = desired[i].1 / 2.;
+            out[i] = desired[i].0.max(edge + half);
+            edge = out[i] + half + 1.;
+        }
+        // Shift overflowing tags up, propagating only as far as necessary.
+        edge = hi;
+        for &i in indices.iter().rev() {
+            let half = desired[i].1 / 2.;
+            out[i] = out[i].min(edge - half);
+            edge = out[i] - half - 1.;
+        }
+    }
+    let mut indices: Vec<_> = (0..desired.len()).collect();
+    indices.sort_by(|&a, &b| desired[a].0.total_cmp(&desired[b].0));
+    let mut out = vec![0.; desired.len()];
+    if let Some((position, i)) = fixed.and_then(|i| indices.iter().position(|&j| j == i).map(|p| (p, i))) {
+        let (y, height) = desired[i];
+        out[i] = y;
+        block(&indices[..position], desired, &mut out, lo, y - height / 2. - 1.);
+        block(&indices[position + 1..], desired, &mut out, y + height / 2. + 1., hi);
+    } else {
+        block(&indices, desired, &mut out, lo, hi);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tags_spread_stably_with_variable_heights_and_bounds() {
+        for (desired, fixed) in [
+            (vec![(80., 16.), (20., 16.), (50., 16.)], None),
+            (vec![(90., 16.), (90., 20.), (91., 12.)], None),
+            (vec![(2., 16.), (3., 20.), (4., 12.)], None),
+            (vec![(50., 16.), (50., 16.), (50., 16.)], Some(1)),
+            (vec![(45., 20.), (50., 16.), (51., 12.)], Some(1)),
+            (vec![], None),
+        ] {
+            let out = spread_tags(&desired, fixed, 0., 100.);
+            let mut sorted: Vec<_> = (0..desired.len()).collect();
+            sorted.sort_by(|&a, &b| desired[a].0.total_cmp(&desired[b].0));
+            for &i in &sorted {
+                assert!(out[i] - desired[i].1 / 2. >= 0.);
+                assert!(out[i] + desired[i].1 / 2. <= 100.);
+            }
+            for pair in sorted.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                assert!(out[b] - out[a] >= (desired[a].1 + desired[b].1) / 2. + 1.);
+            }
+            if let Some(i) = fixed {
+                assert_eq!(out[i], desired[i].0);
+            }
+        }
+        assert_eq!(spread_tags(&[(20., 16.), (60., 16.)], None, 0., 100.), vec![20., 60.]);
+    }
+
+    #[test]
+    fn replay_viewport_follows_transitions_and_offscreen_bars_but_keeps_manual_pan() {
+        let view = Viewport { right: 103., bar_px: 8., width_px: 400. };
+        let start = replay_viewport(view, 100, 50, true);
+        assert_eq!(start.right, 53.);
+        assert_eq!(start.visible_bars(), view.visible_bars());
+        assert_eq!(replay_viewport(start, 50, 51, false).right, 54.);
+        assert_eq!(replay_viewport(start, 50, 10, false).right, 13.);
+        assert_eq!(replay_viewport(start, 50, 100, true).right, 103.);
+        let panned = Viewport { right: 70., ..view };
+        assert_eq!(replay_viewport(panned, 100, 60, false), panned);
+        assert_eq!(replay_viewport(panned, 100, 100, false), panned);
+        assert_eq!(replay_viewport(panned, 100, 101, false).right, 104.);
+        assert_eq!(replay_viewport(panned, 100, 10, false).right, 13.);
+    }
+
     #[test]
     fn symbol_changes_keep_session_preferences_and_reset_prices() {
         let mut c = ChartState::new(1, "AAPL US Equity", Timeframe::D1);
@@ -3981,7 +4096,7 @@ mod tests {
             c.on_view(c.generation, c.view_revision, source.clone(), Ok((next.clone(), SeriesGpu::build(&next))), &w);
             let view = c.viewport.unwrap();
             assert_eq!(view.bar_px, 8.);
-            assert_eq!(view.right, if right == 30. { 30. } else { 55. });
+            assert_eq!(view.right, if right == 30. { 54. } else { 55. });
             assert_eq!(c.reveal_key, reveal);
         }
         let mut changed = c.source_bars.as_ref().clone();
@@ -4015,6 +4130,67 @@ mod tests {
         c.refresh_view(&w);
         c.on_view(c.generation, c.view_revision, source.clone(), Ok((source.clone(), SeriesGpu::build(&source))), &w);
         assert_eq!(c.bars.len(), 100);
+    }
+
+    #[test]
+    fn short_replay_preserves_zoom_when_the_chart_is_drawn() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        let w = Worker::inert();
+        let source = chart.bars.clone();
+        chart.source_bars = source.clone();
+        chart.viewport = Some(Viewport { right: 503., bar_px: 2., width_px: 700. });
+        chart.replay_cutoff = Some(source[9].ts);
+        chart.refresh_view(&w);
+        let past = Arc::new(source[..10].to_vec());
+        chart.on_view(chart.generation, chart.view_revision, source, Ok((past.clone(), SeriesGpu::build(&past))), &w);
+        chart_frame(&ctx, &mut chart, vec![]);
+        let view = chart.viewport.unwrap();
+        assert_eq!(view.bar_px, 2.);
+        assert_eq!(view.right, 13.);
+        // A paused user pan survives subsequent frames with no cutoff movement.
+        chart.viewport.as_mut().unwrap().right = 8.;
+        chart_frame(&ctx, &mut chart, vec![]);
+        assert_eq!(chart.viewport.unwrap().right, 8.);
+    }
+
+    #[test]
+    fn replay_slider_knob_tracks_cutoff_across_the_full_source_history() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart.source_bars = chart.bars.clone();
+        let len = chart.source_bars.len();
+        let mut positions = Vec::new();
+        for index in [0, len / 2, len - 1] {
+            chart.replay_cutoff = Some(chart.source_bars[index].ts);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900., 560.))),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.horizontal(|ui| chart.replay_controls(ui, &Worker::inert()));
+                },
+            );
+            output.textures_delta.clear();
+            let knob = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect) if rect.stroke.width > 0. => Some(rect.rect.center().x),
+                    _ => None,
+                })
+                .expect("slider knob");
+            positions.push(knob);
+            assert_eq!(chart.replay_cutoff, Some(chart.source_bars[index].ts));
+            assert!(output.shapes.iter().any(|shape| matches!(
+                &shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text.starts_with(&format!("bar {} / {len} · ", index + 1))
+            )));
+        }
+        let fraction = (positions[1] - positions[0]) / (positions[2] - positions[0]);
+        assert!((fraction - 0.5).abs() < 0.01, "knob positions: {positions:?}");
+        assert!(positions[2] - positions[0] <= 320.);
     }
 
     #[test]
