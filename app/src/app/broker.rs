@@ -174,17 +174,7 @@ impl BrokerState {
 /// `QUESTRADE_REFRESH_TOKEN` when nothing is stored: tokens rotate on every use, so the
 /// stored (latest) token always wins over the environment.
 pub fn questrade_handle() -> Option<tr_data::questrade::Questrade> {
-    let store = SecretStore::platform_for(&data_dir(), tr_broker::secrets::QUESTRADE_ACCOUNT);
-    let stored = store.load_text().unwrap_or_else(|e| {
-        tracing::warn!("Questrade token unavailable: {e:#}");
-        None
-    });
-    let token = stored.or_else(|| std::env::var("QUESTRADE_REFRESH_TOKEN").ok());
-    let sink: tr_data::questrade::TokenSink = Box::new(move |token| match token {
-        Some(t) => store.save_text(t),
-        None => store.clear(),
-    });
-    tr_data::questrade::Questrade::new(token, sink).map_err(|e| tracing::warn!("questrade init failed: {e:#}")).ok()
+    tr_alerts::questrade_handle()
 }
 
 pub fn open_external(target: &str) -> std::io::Result<()> {
