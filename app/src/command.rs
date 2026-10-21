@@ -222,6 +222,7 @@ pub enum Function {
     LogScale,
     Range(Range),
     Draw(Tool),
+    DrawingBar(bool),
     ClearDrawings,
     Magnet,
     /// Congress trades: feed when used alone, per-ticker list after a symbol.
@@ -329,6 +330,11 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         },
         "CMP" | "COMPARE" | "COMP" => Function::Compare(rest.first().map(|s| s.to_ascii_uppercase())),
         "LOG" => Function::LogScale,
+        "DRAW" => match words().as_slice() {
+            [bar, value] if bar == "BAR" && value == "ON" => Function::DrawingBar(true),
+            [bar, value] if bar == "BAR" && value == "OFF" => Function::DrawingBar(false),
+            _ => return None,
+        },
         "TL" | "TREND" | "TRENDLINE" => Function::Draw(Tool::Trendline),
         "HL" | "HLINE" => Function::Draw(Tool::Horizontal),
         "VL" | "VLINE" => Function::Draw(Tool::Vertical),
@@ -526,6 +532,7 @@ fn describe(f: &Function) -> String {
         Function::LogScale => "Toggle log scale".into(),
         Function::Range(r) => format!("Show {} at {}", r.label(), r.timeframe()),
         Function::Draw(t) => format!("Draw {}", t.label()),
+        Function::DrawingBar(shown) => format!("Drawing toolbar {}", if *shown { "on" } else { "off" }),
         Function::ClearDrawings => "Remove all drawings".into(),
         Function::Magnet => "Toggle magnet (snap to OHLC)".into(),
         Function::Congress => "Congressional trades".into(),
@@ -716,6 +723,8 @@ mod tests {
         assert_eq!(parse("CMP msft"), Some(Command::Function(Function::Compare(Some("MSFT".into())))));
         assert_eq!(parse("CMP"), Some(Command::Function(Function::Compare(None))));
         assert_eq!(parse("FIB"), Some(Command::Function(Function::Draw(Tool::Fib))));
+        assert_eq!(parse("DRAW BAR ON"), Some(Command::Function(Function::DrawingBar(true))));
+        assert_eq!(parse("draw bar off"), Some(Command::Function(Function::DrawingBar(false))));
         assert_eq!(parse("CLEAR DRAW"), Some(Command::Function(Function::ClearDrawings)));
         assert_eq!(parse("POL Nancy Pelosi"), Some(Command::Function(Function::Politician("Nancy Pelosi".into()))));
         assert_eq!(

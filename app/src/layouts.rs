@@ -53,6 +53,10 @@ impl Link {
     }
 }
 
+fn default_drawing_tools() -> [tr_chart::drawings::Tool; 4] {
+    crate::drawing_toolbar::State::default().last
+}
+
 /// A pane's kind plus its persisted, panel-specific settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PaneSettings {
@@ -72,6 +76,10 @@ pub enum PaneSettings {
         show_congress: bool,
         #[serde(default)]
         magnet: bool,
+        #[serde(default)]
+        drawings_hidden: bool,
+        #[serde(default = "default_drawing_tools")]
+        drawing_last_used: [tr_chart::drawings::Tool; 4],
         #[serde(default)]
         navigation: crate::chart_navigation::Navigation,
         #[serde(default)]
@@ -302,6 +310,8 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         show_volume: d.show_volume,
         show_congress: d.congress_markers,
         magnet: false,
+        drawings_hidden: false,
+        drawing_last_used: default_drawing_tools(),
         navigation: Default::default(),
         data: Default::default(),
     }
@@ -601,7 +611,18 @@ mod tests {
             {"id":2,"Feed":null}]}"#;
         let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
         match &doc.panes[0].settings {
-            PaneSettings::Chart { show_volume, show_congress, magnet, log, compare_axis, .. } => {
+            PaneSettings::Chart {
+                show_volume,
+                show_congress,
+                magnet,
+                log,
+                compare_axis,
+                drawings_hidden,
+                drawing_last_used,
+                ..
+            } => {
+                assert!(!drawings_hidden);
+                assert_eq!(*drawing_last_used, default_drawing_tools());
                 assert!(*show_volume && *show_congress && !*magnet && *log);
                 assert_eq!(*compare_axis, crate::chart_compare::Axis::Percent);
             }
