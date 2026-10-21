@@ -89,6 +89,20 @@ impl ScannerPane {
         }
     }
 
+    pub fn watchlist_changed(&mut self) {
+        if self.universe != Universe::Watchlist {
+            return;
+        }
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.running = false;
+        self.progress = None;
+        self.snapshot_symbols.clear();
+        self.invalidate();
+    }
+
     fn invalidate(&mut self) {
         self.rows.clear();
         self.completed = None;
@@ -537,13 +551,26 @@ fn outcome_label(outcome: ScanOutcome) -> (&'static str, Color32) {
     }
 }
 
+#[cfg(test)]
 pub fn show(
     ui: &mut Ui,
     pane: &mut ScannerPane,
     id: PaneId,
     symbols: &[String],
     bulk_ready: bool,
+    send: impl FnMut(Request),
+) -> Vec<Action> {
+    show_named(ui, pane, id, symbols, bulk_ready, send, "Main")
+}
+
+pub fn show_named(
+    ui: &mut Ui,
+    pane: &mut ScannerPane,
+    id: PaneId,
+    symbols: &[String],
+    bulk_ready: bool,
     mut send: impl FnMut(Request),
+    watchlist_name: &str,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     let market = pane.universe != Universe::Watchlist;
@@ -585,12 +612,12 @@ pub fn show(
                     let before = pane.universe;
                     egui::ComboBox::from_id_salt("scan-universe")
                         .width(dp(120.0))
-                        .selected_text(pane.universe.label())
+                        .selected_text(if pane.universe == Universe::Watchlist { format!("Watchlist: {watchlist_name}") } else { pane.universe.label().into() })
                         .show_ui(ui, |ui| {
                             for universe in Universe::ALL {
                                 let enabled = universe == Universe::Watchlist || bulk_ready;
                                 ui.add_enabled_ui(enabled, |ui| {
-                                    ui.selectable_value(&mut pane.universe, universe, universe.label())
+                                    ui.selectable_value(&mut pane.universe, universe, if universe == Universe::Watchlist { format!("Watchlist: {watchlist_name}") } else { universe.label().into() })
                                         .on_disabled_hover_text(
                                             "Market-wide scans need a bulk data source: set up Questrade in Settings › Brokerage",
                                         );
@@ -888,6 +915,29 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
             if ui.button("Replace watchlist with matches").clicked() {
                 actions.push(Action::ReplaceWatchlistWithMatches(matches.clone()));
             }
+            ui.menu_button("Save matches as new list…", |ui| {
+                let id = ui.id().with("save-matches-name");
+                let mut name = ui.data_mut(|data| data.get_temp::<String>(id)).unwrap_or_else(|| {
+                    format!(
+                        "{} {}",
+                        pane.definition.name.chars().take(29).collect::<String>(),
+                        chrono::Local::now().format("%Y-%m-%d")
+                    )
+                });
+                egui::Frame::new()
+                    .fill(theme::header())
+                    .stroke(egui::Stroke::new(1.0, muted()))
+                    .inner_margin(dp(4.0))
+                    .show(ui, |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut name).frame(egui::Frame::NONE).char_limit(40));
+                    });
+                ui.data_mut(|data| data.insert_temp(id, name.clone()));
+                if ui.button("Save").clicked() {
+                    actions.push(Action::SaveMatchesAsWatchlist(name, matches.clone()));
+                    ui.data_mut(|data| data.remove::<String>(id));
+                    ui.close();
+                }
+            });
         });
     }
     let row_h = dp(22.0);
@@ -1182,6 +1232,105 @@ mod tests {
                 Action::ReplaceWatchlistWithMatches(vec![tr_data::security("NVDA").key()]),
                 Action::AddToWatchlist("NVDA".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn named_watchlist_picker_label_and_switch_cancel_stale_results() {
+        let ctx = egui::Context::default();
+        let mut pane = ScannerPane::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            show_named(ui, &mut pane, 1, &["NVDA US Equity".into()], false, |_| {}, "Technology");
+        });
+        output.textures_delta.clear();
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "Watchlist: Technology")
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
+        pane.cancel = Some(cancel.clone());
+        pane.running = true;
+        pane.rows.push(unavailable_row("OLD"));
+        let old = pane.generation;
+        pane.watchlist_changed();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!pane.running);
+        assert!(pane.rows.is_empty());
+        pane.finish(old, vec![unavailable_row("STALE")]);
+        assert!(pane.rows.is_empty());
+        pane.universe = Universe::Nasdaq;
+        pane.rows.push(unavailable_row("MARKET"));
+        pane.watchlist_changed();
+        assert_eq!(pane.rows.len(), 1);
+    }
+
+    #[test]
+    fn save_matches_menu_prefills_name_and_emits_matches_only() {
+        let ctx = egui::Context::default();
+        let mut pane = ScannerPane::default();
+        pane.definition.name = "Momentum".into();
+        let row = |symbol: &str, outcome| ScanRow {
+            symbol: symbol.into(),
+            evaluation: Some(tr_core::scanner::ScanEvaluation { outcome, conditions: Vec::new(), reason: None }),
+            ts: None,
+            simulated: false,
+            error: None,
+        };
+        pane.rows = vec![
+            row("NVDA", ScanOutcome::Match),
+            row("NO", ScanOutcome::NoMatch),
+            unavailable_row("ERROR"),
+            row("AAPL", ScanOutcome::Match),
+        ];
+        let mut actions = Vec::new();
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 600.0))),
+                    time: Some(ctx.input(|i| i.time) + 0.2),
+                    events,
+                    ..Default::default()
+                },
+                |ui| results_table(ui, &pane, false, &mut actions),
+            );
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        Some((text.galley.job.text.clone(), text.galley.rect.translate(text.pos.to_vec2())))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let point = |labels: &[(String, egui::Rect)], name: &str| {
+            labels.iter().find(|(text, _)| text == name).unwrap().1.center()
+        };
+        let pointer = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let at = point(&frame(vec![]), "Save matches as new list…");
+        frame(vec![egui::Event::PointerMoved(at)]);
+        frame(vec![pointer(at, true)]);
+        frame(vec![pointer(at, false)]);
+        let labels = frame(vec![]);
+        let name = format!("Momentum {}", chrono::Local::now().format("%Y-%m-%d"));
+        assert!(labels.iter().any(|(text, _)| text == &name));
+        let at = point(&labels, "Save");
+        frame(vec![egui::Event::PointerMoved(at)]);
+        frame(vec![pointer(at, true)]);
+        frame(vec![pointer(at, false)]);
+        assert_eq!(
+            actions,
+            vec![Action::SaveMatchesAsWatchlist(
+                name,
+                vec![tr_data::security("NVDA").key(), tr_data::security("AAPL").key()]
+            )]
         );
     }
 

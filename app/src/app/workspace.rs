@@ -788,6 +788,9 @@ impl TerminalApp {
         let mut dock = self.dock.clone();
         dock.remap(&|id| ids.get(&id).copied());
         LayoutDoc {
+            watchlists: Some(self.watchlists.clone()),
+            active_watchlist: self.active_watchlist,
+            watchlist: None,
             watch_columns: self.watch_columns.clone(),
             version: crate::layouts::FORMAT_VERSION,
             name: self.layout_name.clone(),
@@ -824,7 +827,12 @@ impl TerminalApp {
             }
         }
         self.watch_columns = doc.watch_columns;
-        self.refresh_columns();
+        if let Some(lists) = doc.watchlists {
+            self.watchlists = lists;
+            self.switch_watchlist(doc.active_watchlist);
+        } else {
+            self.refresh_columns();
+        }
         for p in std::mem::take(&mut self.panes) {
             self.worker.send(Request::Forget(p.id));
         }
@@ -1693,6 +1701,17 @@ mod tests {
                 PaneSettings::Alerts,
             ],
         );
+        doc.watchlists = Some(vec![
+            crate::app::NamedWatchlist {
+                name: "Technology".into(),
+                symbols: vec!["AAPL US Equity".into(), "MSFT US Equity".into()],
+            },
+            crate::app::NamedWatchlist {
+                name: "Crypto".into(),
+                symbols: vec!["BTCUSD Curncy".into(), "ETHUSD Curncy".into()],
+            },
+        ]);
+        doc.active_watchlist = 1;
         doc.watch_columns.columns = vec![ColumnDef {
             id: 7,
             title: "Close".into(),

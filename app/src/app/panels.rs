@@ -133,9 +133,15 @@ impl TerminalApp {
             }
             PaneKind::Scanner(s) => {
                 let bulk_ready = self.broker.questrade.as_ref().is_some_and(|q| q.is_configured());
-                actions.extend(super::scanner_view::show(ui, s, id, &self.watchlist, bulk_ready, |request| {
-                    self.worker.send(request)
-                }));
+                actions.extend(super::scanner_view::show_named(
+                    ui,
+                    s,
+                    id,
+                    &self.watchlist,
+                    bulk_ready,
+                    |request| self.worker.send(request),
+                    &self.watchlists[self.active_watchlist].name,
+                ));
             }
             PaneKind::Portfolio(pp) => {
                 let demo =
@@ -188,6 +194,88 @@ impl TerminalApp {
 
     fn watchlist(&mut self, ui: &mut Ui) -> Vec<Action> {
         let mut out = Vec::new();
+        ui.horizontal(|ui| {
+            let mut active = self.active_watchlist;
+            egui::ComboBox::from_id_salt("watchlist-picker").selected_text(&self.watchlists[active].name).show_ui(
+                ui,
+                |ui| {
+                    for (i, list) in self.watchlists.iter().enumerate() {
+                        ui.selectable_value(&mut active, i, &list.name);
+                    }
+                },
+            );
+            if active != self.active_watchlist {
+                self.switch_watchlist(active);
+            }
+            let response = widgets::icon_button(ui, widgets::Icon::More, "Watchlist options", false);
+            egui::Popup::menu(&response).show(|ui| {
+                if ui.button("New list…").clicked() {
+                    self.watchlist_entry = Some((None, String::new()));
+                    ui.close();
+                }
+                if ui.button("Rename…").clicked() {
+                    self.watchlist_entry = Some((Some(active), self.watchlists[active].name.clone()));
+                    ui.close();
+                }
+                if ui.add_enabled(self.watchlists.len() < 50, egui::Button::new("Duplicate")).clicked() {
+                    let name = super::unique_watchlist_name(&self.watchlists[active].name, &self.watchlists);
+                    if let Err(e) = self.create_watchlist(name, self.watchlist.clone()) {
+                        self.status = e;
+                    }
+                    ui.close();
+                }
+                let label = if self.watchlist_delete {
+                    format!("Delete {}?", self.watchlists[active].name)
+                } else {
+                    "Delete".into()
+                };
+                if ui.add_enabled(self.watchlists.len() > 1, egui::Button::new(label)).clicked() {
+                    if self.watchlist_delete {
+                        if let Err(e) = self.delete_watchlist(active) {
+                            self.status = e;
+                        }
+                        ui.close();
+                    } else {
+                        self.watchlist_delete = true;
+                    }
+                }
+            });
+        });
+        let mut accept = false;
+        let mut cancel = false;
+        if let Some((_, name)) = &mut self.watchlist_entry {
+            ui.horizontal(|ui| {
+                egui::Frame::new()
+                    .fill(theme::header())
+                    .stroke(egui::Stroke::new(1.0, muted()))
+                    .inner_margin(dp(4.0))
+                    .show(ui, |ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(name)
+                                .frame(egui::Frame::NONE)
+                                .hint_text("List name")
+                                .char_limit(40),
+                        );
+                        accept = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    });
+                accept |= ui.button("Save").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        }
+        if accept {
+            if let Some((index, name)) = self.watchlist_entry.clone() {
+                let result = match index {
+                    Some(i) => self.rename_watchlist(i, name),
+                    None => self.create_watchlist(name, Vec::new()),
+                };
+                match result {
+                    Ok(()) => self.watchlist_entry = None,
+                    Err(e) => self.status = e,
+                }
+            }
+        } else if cancel {
+            self.watchlist_entry = None;
+        }
         let row_h = dp(22.0);
         let w = ui.available_width();
         let (hdr, header_response) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
@@ -610,6 +698,39 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switching_watchlists_updates_panel_rows_and_column_snapshot() {
+        let root = std::env::temp_dir().join(format!("named-watchlists-panel-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        app.add_watchlist_symbols(vec!["AAPL".into()]);
+        app.create_watchlist("Technology".into(), vec!["NVDA".into()]).unwrap();
+        let ctx = egui::Context::default();
+        let draw = |app: &mut TerminalApp| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.watchlist(ui);
+            });
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let labels = draw(&mut app);
+        assert!(labels.iter().any(|text| text == "Technology"));
+        assert!(labels.iter().any(|text| text == "NVDA"));
+        assert!(!labels.iter().any(|text| text == "AAPL"));
+        app.switch_watchlist(0);
+        let labels = draw(&mut app);
+        assert!(labels.iter().any(|text| text == "Main"));
+        assert!(labels.iter().any(|text| text == "AAPL"));
+        assert!(!labels.iter().any(|text| text == "NVDA"));
+        assert_eq!(app.columns_snapshot.0, vec![tr_data::security("AAPL").key()]);
+    }
 
     #[test]
     fn column_values_use_security_precision_only_for_price_like_values() {
