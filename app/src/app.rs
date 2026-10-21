@@ -747,6 +747,16 @@ impl TerminalApp {
         for a in actions {
             match a {
                 Action::OpenChart(s) => self.open_security(&s),
+                Action::ScanChart { symbol, symbols, definition } => {
+                    self.open_security(&symbol);
+                    self.with_chart(|c, w| {
+                        c.set_symbol(&symbol, w);
+                        c.data.workflow.symbols = symbols;
+                        c.data.workflow.scan = Some(definition.clone());
+                        c.set_timeframe(definition.timeframe, w);
+                        c.plot_scan(w);
+                    });
+                }
                 Action::OpenTicker(s) => {
                     self.open_panel(PaneKind::Ticker { symbol: s, trades: Vec::new(), loading: true })
                 }
@@ -828,6 +838,20 @@ impl TerminalApp {
 
     fn apply_with_symbol(&mut self, f: Function, symbol: Option<String>) {
         match f {
+            Function::Date(date) => match chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
+                Ok(date) => self.with_chart(|c, _| c.jump_to(date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp())),
+                Err(_) => self.status = "Use DATE YYYY-MM-DD".into(),
+            },
+            Function::Step(delta) => {
+                let watchlist = self.watchlist.clone();
+                self.with_chart(|c, w| {
+                    let symbols =
+                        if c.data.workflow.symbols.is_empty() { &watchlist } else { &c.data.workflow.symbols };
+                    if let Some(symbol) = crate::chart_workflow::next(symbols, &c.symbol, delta) {
+                        c.set_symbol(&symbol, w);
+                    }
+                });
+            }
             Function::Timeframe(tf) => self.with_chart(|c, w| c.set_timeframe(tf, w)),
             Function::ChartType(t) => self.with_chart(|c, _| c.chart_type = t),
             Function::Indicator(spec) => self.with_chart(|c, w| c.toggle_indicator(spec, w)),
@@ -1343,6 +1367,12 @@ impl TerminalApp {
         if pressed(Modifiers::NONE, Key::ArrowRight) {
             self.with_chart(|c, _| c.pan_bars(5.0));
         }
+        if pressed(Modifiers::NONE, Key::ArrowDown) {
+            self.apply(Function::Step(1));
+        }
+        if pressed(Modifiers::NONE, Key::ArrowUp) {
+            self.apply(Function::Step(-1));
+        }
         if pressed(Modifiers::COMMAND, Key::ArrowUp)
             || pressed(Modifiers::NONE, Key::Plus)
             || pressed(Modifiers::NONE, Key::Equals)
@@ -1734,6 +1764,7 @@ mod tests {
             refresh_seconds: 60,
             comparisons: vec![],
             hidden_comparisons: vec![],
+            ..Default::default()
         };
         chart.indicators = vec![crate::command::IndicatorSpec::new("PCF", &[]).unwrap()];
         tr_core::indicators::study::assign_ids(&mut chart.indicators);

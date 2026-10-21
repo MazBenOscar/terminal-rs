@@ -470,6 +470,40 @@ impl ChartState {
         self.draw = DrawState { tool: Some(tool), ..Default::default() };
     }
 
+    pub fn jump_to(&mut self, ts: i64) {
+        let half = (self.viewport.map_or(100., |v| v.visible_bars() / 2.) * self.tf.seconds() as f64) as i64;
+        self.apply_linked_range(crate::chart_navigation::DateRange {
+            start: ts.saturating_sub(half),
+            end: ts.saturating_add(half.max(self.tf.seconds())),
+        });
+    }
+    pub fn plot_scan(&mut self, w: &Worker) {
+        let Some(scan) = &self.data.workflow.scan else {
+            return;
+        };
+        let Ok(expression) = crate::chart_workflow::expression(scan) else {
+            return;
+        };
+        if self
+            .indicators
+            .iter()
+            .any(|s| s.code == "PCF" && s.chart.as_ref().and_then(|s| s.expression.as_ref()) == Some(&expression))
+        {
+            return;
+        }
+        if self.indicators.len() >= 128 {
+            return;
+        }
+        let mut spec = IndicatorSpec::new("PCF", &[]).unwrap();
+        spec.chart = Some(study::Settings::new(0, &spec));
+        let settings = spec.chart.as_mut().unwrap();
+        settings.expression = Some(expression);
+        settings.pane = StudyPane::Own;
+        self.indicators.push(spec);
+        study::assign_ids(&mut self.indicators);
+        self.request_indicators(w);
+    }
+
     /// Esc: cancel an in-progress drawing, then deselect. Returns whether it consumed the key.
     pub fn cancel(&mut self) -> bool {
         if let Some(drag) = self.draw.drag.take() {
@@ -1342,6 +1376,8 @@ impl ChartState {
         // Grid first (under the GPU geometry is not possible inside one pass, so draw it
         // faintly; candles are opaque on top visually).
         let price_painter = ui.painter_at(price_rect);
+        let us = matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf);
+        self.data.context.shade(ui, price_rect, &v, &self.bars, self.tf, us);
         let tick_count = (price_rect.height() / 42.0).max(2.0) as usize;
         let (ticks, tick_labels): (Vec<f64>, Vec<String>) = match percent_base {
             Some(base) => {
@@ -1598,6 +1634,7 @@ impl ChartState {
         }
 
         self.paint_price_alerts(ui, price_rect, &scale);
+        self.data.context.paint(ui, price_rect, &scale, &self.bars, (self.tf, us, self.data.session));
         if self.data.account.positions || self.data.account.orders {
             self.account_overlay.paint(ui, price_rect, &scale, self.bars.last().map(|b| b.close));
         }
@@ -2287,6 +2324,33 @@ impl ChartState {
     }
 
     fn context_menu(&mut self, ui: &mut Ui, w: &Worker) {
+        ui.menu_button("Price and session context", |ui| self.data.context.menu(ui));
+        ui.menu_button("Chart navigation", |ui| {
+            ui.label("DATE YYYY-MM-DD jumps to a date; provider history limits apply.");
+            if ui.button("Previous symbol (Up)").clicked() {
+                self.actions.push(Action::Command("PREV".into()));
+                ui.close();
+            }
+            if ui.button("Next symbol (Down)").clicked() {
+                self.actions.push(Action::Command("NEXT".into()));
+                ui.close();
+            }
+            if ui.button("Use watchlist for traversal").clicked() {
+                *self.data.workflow = Default::default();
+                ui.close();
+            }
+            if let Some(scan) = &self.data.workflow.scan {
+                ui.label(format!("{} · {} matched symbols", scan.name, self.data.workflow.symbols.len()));
+                for condition in &scan.conditions {
+                    ui.label(condition.label());
+                }
+                if ui.button("Plot scan conditions (1 = match)").clicked() {
+                    self.plot_scan(w);
+                    ui.close();
+                }
+                ui.label("The plot evaluates loaded chart bars, not the earlier scanner snapshot.");
+            }
+        });
         ui.menu_button("Positions and orders", |ui| self.account_overlay.menu(ui, &mut self.data.account));
         use crate::price_alerts::Action as AlertAction;
         if ui.add_enabled(self.context_price.is_some(), egui::Button::new("Create price alert here…")).clicked() {

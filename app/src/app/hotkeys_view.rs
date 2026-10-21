@@ -305,6 +305,7 @@ impl TerminalApp {
                     (&["CANDLE", "BAR", "LINE", "AREA", "LOG"], "Chart type and log scale"),
                     (&["SMA 50", "RSI", "IND"], "Indicators (see below)"),
                     (&["CMP MSFT"], "Compare, rebased to the main symbol"),
+                    (&["DATE 2026-01-15", "NEXT", "PREV"], "Date jump and scan/watchlist traversal (Up/Down)"),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
                     (
                         &["MEASURE", "RECT", "RAY", "CHANNEL", "NOTE"],

@@ -605,7 +605,21 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
             row.symbol
         ));
         if resp.clicked() {
-            actions.push(Action::OpenChart(row.symbol.clone()));
+            if outcome == ScanOutcome::Match {
+                actions.push(Action::ScanChart {
+                    symbol: row.symbol.clone(),
+                    symbols: pane
+                        .rows
+                        .iter()
+                        .filter(|r| r.evaluation.as_ref().is_some_and(|e| e.outcome == ScanOutcome::Match))
+                        .map(|r| tr_data::security(&r.symbol).key())
+                        .take(5000)
+                        .collect(),
+                    definition: pane.definition.clone(),
+                });
+            } else {
+                actions.push(Action::OpenChart(row.symbol.clone()));
+            }
         }
     }
     if shown == 0 {

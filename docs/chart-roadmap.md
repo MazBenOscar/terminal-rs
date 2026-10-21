@@ -46,3 +46,24 @@ existing single-comparison own axis. Multiple comparisons use a shared axis; own
 mode is unavailable with extra series. Legend values identify the symbol and its
 return from the shared baseline. Hidden series do not affect autoscale or the anchor.
 Series/visibility settings persist in layouts (format v6, accepting earlier versions).
+
+## Chart and scanner workflow
+
+`DATE YYYY-MM-DD` / `GOTO` centers a date and pages older history when available.
+Up/Down or `PREV`/`NEXT` traverses the chart's scan-match queue, or the watchlist
+when there is no queue. Traversal wraps. Existing `5` + Enter, left/right pan and
++/- zoom remain available. Text editors retain their keys while editing.
+
+Clicking a matched scanner row captures that result list and scan definition, selects
+the scan timeframe and adds a PCF condition plot (1 = match, 0 = no match). The chart
+navigation menu exposes the definition and can re-add the plot or switch traversal
+back to the watchlist. The plot is evaluated on the chart's loaded bars; it is not the
+earlier scanner snapshot. Formula size limits and startup/missing-data conventions
+still apply and errors are visible in the study legend. A fresh scan is required for
+a current match list. Queues are capped at 5,000 symbols and persist with layouts.
+
+Price/session context controls expose a bar-close countdown, previous loaded session
+close, loaded-session high/low and shading of available US pre/post-market bars.
+These are derived from loaded bars, not fabricated official exchange prices or extra
+history. The countdown says Bar closed for an expired last bar. Context visibility
+persists with the layout; exchange/session/provider limitations remain explicit.

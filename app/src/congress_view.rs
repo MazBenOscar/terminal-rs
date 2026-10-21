@@ -13,6 +13,11 @@ use crate::worker::Profile;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     OpenChart(String),
+    ScanChart {
+        symbol: String,
+        symbols: Vec<String>,
+        definition: tr_core::scanner::ScanDefinition,
+    },
     OpenTicker(String),
     OpenProfile(String),
     Track(String, bool),

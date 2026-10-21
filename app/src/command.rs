@@ -208,6 +208,8 @@ impl Range {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Function {
+    Date(String),
+    Step(isize),
     Timeframe(Timeframe),
     ChartType(ChartType),
     /// Add or remove an indicator (any code from the catalog: `RSI`, `BB 20 2.5`, `ICHIMOKU`).
@@ -287,6 +289,9 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
     let words = || rest.iter().map(|s| s.to_ascii_uppercase()).collect::<Vec<_>>();
     let joined = || rest.join(" ");
     Some(match up.as_str() {
+        "DATE" | "GOTO" => Function::Date(joined()),
+        "NEXT" => Function::Step(1),
+        "PREV" => Function::Step(-1),
         "CANDLE" | "CANDLES" => Function::ChartType(ChartType::Candles),
         "BAR" | "BARS" | "OHLC" => Function::ChartType(ChartType::Bars),
         "LINE" => Function::ChartType(ChartType::Line),
@@ -436,6 +441,10 @@ pub fn hint(input: &str) -> String {
 
 fn describe(f: &Function) -> String {
     match f {
+        Function::Date(date) => format!("Jump chart to {date} (YYYY-MM-DD)"),
+        Function::Step(delta) => {
+            format!("{} symbol in scan results or watchlist", if *delta > 0 { "Next" } else { "Previous" })
+        }
         Function::Timeframe(tf) => format!(
             "Interval {}",
             match tf {
