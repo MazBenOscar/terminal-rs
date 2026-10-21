@@ -214,7 +214,10 @@ impl TerminalApp {
                     ui.close();
                 }
                 if ui.button("Rename…").clicked() {
-                    self.watchlist_entry = Some((Some(active), self.watchlists[active].name.clone()));
+                    self.watchlist_entry = Some((
+                        Some(super::watchlist_name_key(&self.watchlists[active].name)),
+                        self.watchlists[active].name.clone(),
+                    ));
                     ui.close();
                 }
                 if ui.add_enabled(self.watchlists.len() < 50, egui::Button::new("Duplicate")).clicked() {
@@ -263,15 +266,8 @@ impl TerminalApp {
             });
         }
         if accept {
-            if let Some((index, name)) = self.watchlist_entry.clone() {
-                let result = match index {
-                    Some(i) => self.rename_watchlist(i, name),
-                    None => self.create_watchlist(name, Vec::new()),
-                };
-                match result {
-                    Ok(()) => self.watchlist_entry = None,
-                    Err(e) => self.status = e,
-                }
+            if let Err(e) = self.apply_watchlist_entry() {
+                self.status = e;
             }
         } else if cancel {
             self.watchlist_entry = None;

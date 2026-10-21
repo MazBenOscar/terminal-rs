@@ -386,14 +386,23 @@ pub struct NamedWatchlist {
     pub symbols: Vec<String>,
 }
 
+fn watchlist_name_key(name: &str) -> String {
+    name.to_uppercase().to_lowercase()
+}
+
 fn valid_watchlist_name(name: &str) -> bool {
-    (1..=40).contains(&name.chars().count()) && !name.chars().any(char::is_control)
+    (1..=40).contains(&name.trim().chars().count())
+        && !name.chars().any(|c| {
+            c.is_control()
+                || matches!(c, '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+        })
 }
 
 fn unique_watchlist_name(name: &str, lists: &[NamedWatchlist]) -> String {
     let mut candidate = name.to_owned();
     let mut n = 2;
-    while lists.iter().any(|list| list.name.to_lowercase() == candidate.to_lowercase()) {
+    while lists.iter().any(|list| watchlist_name_key(&list.name) == watchlist_name_key(&candidate)) {
         let suffix = format!(" ({n})");
         candidate = format!("{}{}", name.chars().take(40 - suffix.chars().count()).collect::<String>(), suffix);
         n += 1;
@@ -629,7 +638,7 @@ pub struct TerminalApp {
     watchlist: Vec<String>,
     watchlists: Vec<NamedWatchlist>,
     active_watchlist: usize,
-    watchlist_entry: Option<(Option<usize>, String)>,
+    watchlist_entry: Option<(Option<String>, String)>,
     watchlist_delete: bool,
     watch_columns: tr_core::columns::ColumnSet,
     columns_editor: Option<columns_view::ColumnsEditor>,
@@ -972,8 +981,8 @@ impl TerminalApp {
     }
 
     fn create_watchlist(&mut self, name: String, symbols: Vec<String>) -> Result<(), String> {
-        let name = name.trim().to_owned();
         self.check_watchlist_name(&name, None)?;
+        let name = name.trim().to_owned();
         if self.watchlists.len() >= 50 {
             return Err("At most 50 watchlists are allowed".into());
         }
@@ -984,22 +993,44 @@ impl TerminalApp {
 
     fn check_watchlist_name(&self, name: &str, except: Option<usize>) -> Result<(), String> {
         if !valid_watchlist_name(name) {
-            return Err("Names must contain 1–40 characters and no control characters".into());
+            return Err("Names must contain 1–40 characters and no control or invisible format characters".into());
         }
         if self
             .watchlists
             .iter()
             .enumerate()
-            .any(|(i, l)| Some(i) != except && l.name.to_lowercase() == name.to_lowercase())
+            .any(|(i, l)| Some(i) != except && watchlist_name_key(&l.name) == watchlist_name_key(name.trim()))
         {
             return Err("A watchlist with that name already exists".into());
         }
         Ok(())
     }
 
+    fn apply_watchlist_entry(&mut self) -> Result<(), String> {
+        let Some((target, name)) = self.watchlist_entry.clone() else {
+            return Ok(());
+        };
+        match target {
+            Some(key) => {
+                let index = self
+                    .watchlists
+                    .iter()
+                    .position(|l| watchlist_name_key(&l.name) == key)
+                    .ok_or_else(|| "The watchlist being renamed no longer exists".to_string())?;
+                self.rename_watchlist(index, name)?;
+            }
+            None => self.create_watchlist(name, Vec::new())?,
+        }
+        self.watchlist_entry = None;
+        Ok(())
+    }
+
     fn rename_watchlist(&mut self, index: usize, name: String) -> Result<(), String> {
-        let name = name.trim().to_owned();
+        if index >= self.watchlists.len() {
+            return Err("The watchlist being renamed no longer exists".into());
+        }
         self.check_watchlist_name(&name, Some(index))?;
+        let name = name.trim().to_owned();
         self.watchlists[index].name = name;
         Ok(())
     }
@@ -1065,6 +1096,7 @@ impl TerminalApp {
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
                 Action::AddToWatchlist(s) => self.add_watchlist_symbols(vec![s]),
                 Action::SaveMatchesAsWatchlist(name, symbols) => {
+                    let name = unique_watchlist_name(name.trim(), &self.watchlists);
                     let result = self.create_watchlist(name, symbols);
                     self.status = result.err().unwrap_or_else(|| "Matches saved as new watchlist".into());
                 }
@@ -1105,7 +1137,7 @@ impl TerminalApp {
 
     fn execute(&mut self, input: &str) {
         let Some(cmd) = command::parse(input) else {
-            self.status = format!("Unknown command: {input}  (HELP lists functions)");
+            self.status = command::parse_error(input);
             return;
         };
         self.cmd_history.push(input.trim().to_string());
@@ -1231,7 +1263,9 @@ impl TerminalApp {
                 self.status = self.watchlists.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", ")
             }
             Function::WatchUse(ref name) | Function::WatchDelete(ref name) | Function::WatchRename(ref name, _) => {
-                if let Some(index) = self.watchlists.iter().position(|l| l.name.to_lowercase() == name.to_lowercase()) {
+                if let Some(index) =
+                    self.watchlists.iter().position(|l| watchlist_name_key(&l.name) == watchlist_name_key(name.trim()))
+                {
                     let result = match f {
                         Function::WatchDelete(_) => self.delete_watchlist(index),
                         Function::WatchRename(_, new) => self.rename_watchlist(index, new),
@@ -2562,7 +2596,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: watchlist name uniqueness and lookup compare String::to_lowercase, which is not Unicode case folding — ß/SS, ſ/s and ς/σ fold together but lowercase differently, so sanitize_watchlists and create_watchlist accept colliding names and WL USE becomes ambiguous"]
     fn watchlist_names_must_treat_case_fold_equivalent_names_as_duplicates() {
         let list = |name: &str| NamedWatchlist { name: name.into(), symbols: Vec::new() };
         // Case folding maps ß to "ss", the long s to "s" and the final sigma to "σ".
@@ -2577,12 +2610,31 @@ mod tests {
         app.create_watchlist("SS".into(), Vec::new()).unwrap();
         app.create_watchlist("Other".into(), Vec::new()).unwrap();
         assert!(app.create_watchlist("ß".into(), Vec::new()).is_err());
-        assert!(app.rename_watchlist(1, "ß".into()).is_err());
+        assert!(app.rename_watchlist(2, "ß".into()).is_err());
+        app.execute("WL USE ß");
+        assert_eq!(app.active_watchlist, 1);
     }
 
     #[test]
-    #[ignore = "BUG: valid_watchlist_name only rejects char::is_control (Unicode Cc), so zero-width, bidi and other Cf format characters pass the 1–40 character check and invisible or visually colliding watchlist names survive sanitisation"]
     fn watchlist_names_must_reject_zero_width_and_bidi_characters() {
+        let root = std::env::temp_dir().join(format!("named-watchlists-format-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        for code in [0xAD, 0xFEFF]
+            .into_iter()
+            .chain(0x200B..=0x200F)
+            .chain(0x202A..=0x202E)
+            .chain(0x2060..=0x2064)
+            .chain(0x2066..=0x2069)
+            .chain([0, 0x7F])
+        {
+            let name = format!("Main{}", char::from_u32(code).unwrap());
+            assert!(app.create_watchlist(name.clone(), Vec::new()).is_err());
+            assert!(app.rename_watchlist(0, name.clone()).is_err());
+            assert!(!valid_watchlist_name(&name));
+        }
+        assert!(app.create_watchlist("   ".into(), Vec::new()).is_err());
+        app.create_watchlist("  Trimmed  ".into(), Vec::new()).unwrap();
+        assert_eq!(app.watchlists[1].name, "Trimmed");
         let list = |name: &str| NamedWatchlist { name: name.into(), symbols: Vec::new() };
         let invisible = |c: char| matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}');
         let out = sanitize_watchlists(vec![list("\u{200B}"), list("Main\u{200B}"), list("Main"), list("\u{202E}niam")]);
@@ -2602,7 +2654,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: create_watchlist rejects colliding names, so Action::SaveMatchesAsWatchlist drops the save whenever the scanner's prefilled name (scan name + date) already exists — every same-day retry — while the Duplicate path uniquifies via unique_watchlist_name"]
     fn save_matches_as_watchlist_must_uniquify_colliding_names() {
         let root = std::env::temp_dir().join(format!("named-watchlists-save-collision-{}", std::process::id()));
         let mut app = TerminalApp::test_workspace(&root);
@@ -2663,7 +2714,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: watchlist_entry stores a raw list index that delete_watchlist never invalidates, so accepting a stale rename entry calls rename_watchlist with the old index — renaming whichever list slid into that slot (or panicking when the index is now out of range)"]
     fn stale_rename_entry_must_not_rename_the_wrong_list_or_panic() {
         let root = std::env::temp_dir().join(format!("named-watchlists-stale-rename-{}", std::process::id()));
         let mut app = TerminalApp::test_workspace(&root);
@@ -2671,11 +2721,17 @@ mod tests {
             app.create_watchlist(name.into(), Vec::new()).unwrap();
         }
         // The rename entry is open for "B" at index 2; deleting "Main" shifts B to index 1.
-        app.watchlist_entry = Some((Some(2), "B".into()));
+        app.watchlist_entry = Some((Some(watchlist_name_key("B")), "Renamed B".into()));
         app.delete_watchlist(0).unwrap();
         assert_eq!(app.watchlists[1].name, "B");
-        // Accepting the stale entry must be rejected instead of renaming C (now at index 2).
-        assert!(app.rename_watchlist(2, "Zombie".into()).is_err());
+        // Apply by name, not the old index: C must remain untouched.
+        app.apply_watchlist_entry().unwrap();
+        assert_eq!(app.watchlists[1].name, "Renamed B");
+        assert_eq!(app.watchlists[2].name, "C");
+        app.watchlist_entry = Some((Some(watchlist_name_key("Renamed B")), "Zombie".into()));
+        app.delete_watchlist(1).unwrap();
+        assert!(app.apply_watchlist_entry().is_err());
+        assert!(app.rename_watchlist(app.watchlists.len(), "Zombie".into()).is_err());
         assert!(app.watchlists.iter().all(|l| l.name != "Zombie"), "the wrong list was renamed");
     }
 }

@@ -114,6 +114,11 @@ impl Template {
         let mut merged = current.clone();
         study::assign_ids(&mut merged);
         let mut used: HashSet<_> = merged.iter().filter_map(|s| s.chart.as_ref().map(|c| c.id)).collect();
+        for c in merged.iter().chain(&template.indicators).filter_map(|s| s.chart.as_ref()) {
+            if let Some(fill) = &c.fill {
+                used.extend([fill.upper.study, fill.lower.study].into_iter().flatten());
+            }
+        }
         let mut ids = HashMap::new();
         for spec in &template.indicators {
             let old = spec.chart.as_ref().unwrap().id;
@@ -210,7 +215,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: merge_into allocates imported IDs from used (chart IDs already on the current list only), so an imported study receives an ID that a dangling fill edge in the current chart already references and that fill silently rebinds to the imported study"]
     fn merge_must_not_rebind_dangling_fill_targets_with_fresh_ids() {
         let mut current = vec![Spec::new("EMA", &[]).unwrap()];
         study::assign_ids(&mut current);

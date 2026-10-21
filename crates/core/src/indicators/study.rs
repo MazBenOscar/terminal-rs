@@ -232,6 +232,11 @@ pub fn assign_ids(specs: &mut [Spec]) {
     }
     let mut reserved: std::collections::HashSet<_> =
         specs.iter().filter_map(|s| s.chart.as_ref().map(|c| c.id)).filter(|id| *id != 0).collect();
+    for c in specs.iter().filter_map(|s| s.chart.as_ref()) {
+        if let Some(fill) = &c.fill {
+            reserved.extend([fill.upper.study, fill.lower.study].into_iter().flatten());
+        }
+    }
     let mut used = std::collections::HashSet::new();
     for spec in specs.iter_mut() {
         if let Some(c) = &spec.chart
@@ -661,7 +666,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: assign_ids reserves only IDs already present in the specs, so a newly added study receives the dangling fill-target ID that Settings::sanitized deliberately preserved and validate_fill_edge then silently rebinds the fill to a different study"]
     fn fill_targets_must_not_rebind_when_a_new_study_reuses_a_dangling_id() {
         let mut specs = vec![Spec::new("EMA", &[]).unwrap()];
         assign_ids(&mut specs);
