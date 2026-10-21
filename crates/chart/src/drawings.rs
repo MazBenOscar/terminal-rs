@@ -45,24 +45,6 @@ impl Tool {
         Self::ShortPosition,
     ];
 
-    pub fn abbrev(self) -> &'static str {
-        match self {
-            Self::Trendline => "TL",
-            Self::Horizontal => "H",
-            Self::Vertical => "V",
-            Self::Fib => "FIB",
-            Self::Measure => "M",
-            Self::Rectangle => "R",
-            Self::Ray => "RAY",
-            Self::Channel => "CH",
-            Self::Text => "T",
-            Self::FibExtension => "FX",
-            Self::Pitchfork => "PF",
-            Self::LongPosition => "L",
-            Self::ShortPosition => "S",
-        }
-    }
-
     pub fn points(self) -> usize {
         match self {
             Tool::Horizontal | Tool::Vertical | Tool::Text => 1,

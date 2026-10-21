@@ -254,6 +254,8 @@ impl PaneKind {
                 show_volume: c.show_volume,
                 show_congress: c.show_congress,
                 magnet: c.magnet,
+                drawings_hidden: c.drawings_hidden,
+                drawing_last_used: c.drawing_toolbar.last,
                 navigation: c.navigation,
                 data: c.saved_data(),
             },
@@ -306,6 +308,8 @@ impl PaneKind {
                 show_volume,
                 show_congress,
                 magnet,
+                drawings_hidden,
+                drawing_last_used,
                 navigation,
                 data,
             } => {
@@ -319,6 +323,12 @@ impl PaneKind {
                 c.show_volume = show_volume;
                 c.show_congress = show_congress;
                 c.magnet = magnet;
+                c.drawings_hidden = drawings_hidden;
+                for (index, (_, tools)) in crate::drawing_toolbar::GROUPS.iter().enumerate() {
+                    if tools.contains(&drawing_last_used[index]) {
+                        c.drawing_toolbar.last[index] = drawing_last_used[index];
+                    }
+                }
                 c.navigation = navigation;
                 c.data = data;
                 c.restore_price_scale();
@@ -994,6 +1004,10 @@ impl TerminalApp {
             Function::LogScale => self.with_chart(|c, _| c.toggle_log_scale()),
             Function::Range(r) => self.with_chart(|c, w| c.set_range(r, w)),
             Function::Draw(t) => self.with_chart(|c, _| c.start_tool(t)),
+            Function::DrawingBar(shown) => {
+                self.prefs.show_drawing_rail = shown;
+                self.save_prefs();
+            }
             Function::ClearDrawings => self.with_chart(|c, _| c.drawings.clear()),
             Function::Magnet => self.with_chart(|c, _| c.magnet = !c.magnet),
             Function::Congress => self.open_panel(PaneKind::Feed { filter: FeedFilter::default() }),
@@ -1890,6 +1904,7 @@ impl eframe::App for TerminalApp {
             }
         }
         prefs::set_drawing_favorites(&ctx, (self.prefs.drawing_favorites.clone(), self.prefs.show_drawing_favorites));
+        prefs::set_drawing_toolbar(&ctx, (self.prefs.show_drawing_rail, self.prefs.drawing_favorites_pos));
         prefs::set_study_favorites(&ctx, self.prefs.study_favorites.clone());
         actions.extend(self.render_dock(ui, area, gap));
         actions.extend(self.render_windows(&ctx));
@@ -1897,6 +1912,12 @@ impl eframe::App for TerminalApp {
         if favorites != self.prefs.drawing_favorites || shown != self.prefs.show_drawing_favorites {
             self.prefs.drawing_favorites = favorites;
             self.prefs.show_drawing_favorites = shown;
+            self.save_prefs();
+        }
+        let (rail, position) = prefs::drawing_toolbar(&ctx);
+        if rail != self.prefs.show_drawing_rail || position != self.prefs.drawing_favorites_pos {
+            self.prefs.show_drawing_rail = rail;
+            self.prefs.drawing_favorites_pos = position;
             self.save_prefs();
         }
         let study_favorites = prefs::study_favorites(&ctx);

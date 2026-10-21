@@ -1,6 +1,9 @@
 //! Chart pane: GPU-rendered price/volume/indicator panes with egui-drawn axes, legend,
 //! crosshair, drawings and congressional trade markers.
 
+#[path = "drawing_toolbar.rs"]
+pub(crate) mod drawing_toolbar;
+
 use std::sync::Arc;
 
 use egui::{
@@ -310,6 +313,9 @@ pub struct ChartState {
     pub chart_type: ChartType,
     pub log: bool,
     pub magnet: bool,
+    pub drawings_hidden: bool,
+    pub drawing_toolbar: crate::drawing_toolbar::State,
+    favorites_plot: Rect,
     pub show_volume: bool,
     pub show_congress: bool,
     pub indicators: Vec<IndicatorSpec>,
@@ -420,6 +426,9 @@ impl ChartState {
             },
             log: false,
             magnet: false,
+            drawings_hidden: false,
+            drawing_toolbar: Default::default(),
+            favorites_plot: Rect::NOTHING,
             show_volume: true,
             show_congress: true,
             indicators,
@@ -866,6 +875,11 @@ impl ChartState {
     pub fn start_tool(&mut self, tool: Tool) {
         self.cancel();
         self.draw = DrawState { tool: Some(tool), ..Default::default() };
+        for (index, (_, tools)) in crate::drawing_toolbar::GROUPS.iter().enumerate() {
+            if tools.contains(&tool) {
+                self.drawing_toolbar.last[index] = tool;
+            }
+        }
     }
 
     pub fn jump_to(&mut self, ts: i64) {
@@ -1831,8 +1845,20 @@ impl ChartState {
             && self.compare_axis == CompareAxis::Own;
         // An own-axis comparison gets a left-hand price axis of the same width.
         let left_axis = if own_axis { AXIS_W } else { 0.0 };
+        let rail_visible = crate::drawing_toolbar::rail_visible(
+            body.width(),
+            crate::prefs::drawing_toolbar(ui.ctx()).0,
+            self.drawing_available(),
+        );
+        let rail_width = if rail_visible { theme::dp(36.) } else { 0. };
+        if rail_visible {
+            self.drawing_rail(ui, Rect::from_min_size(body.min, vec2(rail_width, body.height())));
+        } else {
+            self.drawing_toolbar.open = None;
+            self.drawing_toolbar.flyout = Rect::NOTHING;
+        }
         let plot_all = Rect::from_min_max(
-            pos2(body.left() + left_axis, body.top()),
+            pos2(body.left() + left_axis + rail_width, body.top()),
             pos2(body.right() - AXIS_W, body.bottom() - TIME_H),
         );
         self.plot_width = plot_all.width().max(1.) as f64;
@@ -1924,9 +1950,12 @@ impl ChartState {
         let legend_rows =
             crate::chart_legend::rows(ui, &self.indicators, &self.built, price_rect, &legend_panes, legend_bar);
         let favorites_rect = self.favorites_rect(ui, price_rect, &legend_rows);
-        let over_legend = ui
-            .input(|i| i.pointer.hover_pos())
-            .is_some_and(|p| favorites_rect.contains(p) || legend_rows.iter().any(|row| row.rect.contains(p)));
+        let over_legend = self.drawing_toolbar.favorites_dragging
+            || ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
+                favorites_rect.contains(p)
+                    || self.drawing_toolbar.flyout.contains(p)
+                    || legend_rows.iter().any(|row| row.rect.contains(p))
+            });
         let legend_action = crate::chart_legend::interact(ui, self.id, &legend_rows);
         // Register splitters after the plot so their drag target wins hit-testing,
         // including the first mouse-down when arriving from outside the chart.
@@ -2400,7 +2429,10 @@ impl ChartState {
                     Some(s) => {
                         let y = price_rect.top() + s.y_of(raw) as f32;
                         if price_rect.y_range().contains(y) {
-                            let tag = Rect::from_min_size(pos2(body.left() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
+                            let tag = Rect::from_min_size(
+                                pos2(body.left() + rail_width + 1.0, y - 8.0),
+                                vec2(AXIS_W - 2.0, 16.0),
+                            );
                             left_painter.rect_filled(tag, 0.0, color);
                             left_painter.text(
                                 tag.right_center() - vec2(5.0, 0.0),
@@ -2546,7 +2578,8 @@ impl ChartState {
                 axis_painter.text(tag.left_center() + vec2(5.0, 0.0), Align2::LEFT_CENTER, label, mono(11.0), text());
                 if let Some(s) = own_scale {
                     let own = s.price_at((p.y - price_rect.top()) as f64);
-                    let tag = Rect::from_min_size(pos2(body.left() + 1.0, p.y - 8.0), vec2(AXIS_W - 2.0, 16.0));
+                    let tag =
+                        Rect::from_min_size(pos2(body.left() + rail_width + 1.0, p.y - 8.0), vec2(AXIS_W - 2.0, 16.0));
                     left_painter.rect_filled(tag, 0.0, Color32::from_gray(70));
                     let decimals = scale::decimals_for(own.abs() / 1000.0).clamp(2, 4);
                     left_painter.text(
@@ -2570,7 +2603,7 @@ impl ChartState {
             }
         }
         self.paint_legend(ui, price_rect, hovered_bar.unwrap_or(len.saturating_sub(1)), &legend_rows);
-        self.favorites_strip(ui, favorites_rect);
+        self.favorites_bar(ui, favorites_rect);
         self.scale_chips(ui, axis_rect);
         if matches!(self.sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf) {
             clicked |= self.trade_buttons(ui, plot_all);
@@ -3613,6 +3646,12 @@ impl ChartState {
         for tool in Tool::ALL {
             ui.push_id(tool, |ui| {
                 ui.horizontal(|ui| {
+                    if widgets::icon_button(ui, widgets::tool_icon(tool), tool.label(), self.draw.tool == Some(tool))
+                        .clicked()
+                    {
+                        self.start_tool(tool);
+                        ui.close();
+                    }
                     if ui
                         .add_sized(
                             vec2(theme::dp(210.), theme::dp(24.)),
@@ -3631,65 +3670,8 @@ impl ChartState {
                 });
             });
         }
-        ui.checkbox(&mut favorites.1, "Show favorites toolbar");
+        ui.checkbox(&mut favorites.1, "Favorites bar");
         crate::prefs::set_drawing_favorites(ui.ctx(), favorites);
-    }
-
-    fn favorites_rect(&self, ui: &Ui, price: Rect, rows: &[crate::chart_legend::Row]) -> Rect {
-        let (favorites, shown) = crate::prefs::drawing_favorites(ui.ctx());
-        if !shown || favorites.is_empty() || self.replay_cutoff.is_some() || self.chart_type == ChartType::Renko {
-            return Rect::NOTHING;
-        }
-        let top = self.legend_bottom(price, rows) + theme::dp(4.);
-        let size = theme::dp(24.);
-        let slots = ((price.bottom() - top - 2.) / size).floor().max(0.) as usize;
-        Rect::from_min_size(
-            pos2(price.left() + theme::dp(6.), top),
-            vec2(size, size * slots.min(favorites.len()) as f32),
-        )
-    }
-
-    fn favorites_strip(&mut self, ui: &mut Ui, rect: Rect) {
-        if !rect.is_positive() {
-            return;
-        }
-        let (favorites, _) = crate::prefs::drawing_favorites(ui.ctx());
-        let size = theme::dp(24.);
-        let slots = (rect.height() / size).round() as usize;
-        let overflow = favorites.len() > slots;
-        let count = if overflow { slots.saturating_sub(1) } else { slots };
-        label_plate(ui.painter(), rect);
-        for (index, &tool) in favorites.iter().take(count).enumerate() {
-            let button = Rect::from_min_size(rect.min + vec2(0., index as f32 * size), vec2(size, size));
-            let shortcut = Self::tool_shortcut(tool);
-            let hint =
-                if shortcut.is_empty() { tool.label().to_string() } else { format!("{} ({shortcut})", tool.label()) };
-            let response = ui
-                .scope_builder(UiBuilder::new().max_rect(button).id_salt((self.id, "favorite", tool)), |ui| {
-                    ui.spacing_mut().button_padding = vec2(theme::dp(2.), theme::dp(2.));
-                    ui.add_sized(
-                        button.size(),
-                        egui::Button::new(RichText::new(tool.abbrev()).font(mono(10.)))
-                            .selected(self.draw.tool == Some(tool)),
-                    )
-                })
-                .inner
-                .on_hover_text(hint);
-            if response.clicked() {
-                self.toggle_quick_tool(tool);
-            }
-        }
-        if overflow {
-            let button = Rect::from_min_size(rect.min + vec2(0., count as f32 * size), vec2(size, size));
-            ui.scope_builder(UiBuilder::new().max_rect(button).id_salt((self.id, "favorites-overflow")), |ui| {
-                ui.spacing_mut().button_padding = vec2(theme::dp(2.), theme::dp(2.));
-                ui.menu_button(RichText::new(format!("+{}", favorites.len() - count)).font(mono(10.)), |ui| {
-                    self.draw_menu(ui)
-                })
-                .response
-                .on_hover_text("Draw");
-            });
-        }
     }
 
     fn legend_study_bottom(price: Rect, rows: &[crate::chart_legend::Row]) -> f32 {
@@ -3784,6 +3766,12 @@ impl ChartState {
             ui.close();
         }
         self.scale_menu(ui);
+        let mut toolbar = crate::prefs::drawing_toolbar(ui.ctx());
+        ui.checkbox(&mut toolbar.0, "Drawing toolbar");
+        crate::prefs::set_drawing_toolbar(ui.ctx(), toolbar);
+        let mut favorites = crate::prefs::drawing_favorites(ui.ctx());
+        ui.checkbox(&mut favorites.1, "Favorites bar");
+        crate::prefs::set_drawing_favorites(ui.ctx(), favorites);
         ui.checkbox(&mut self.show_volume, "Volume");
         ui.checkbox(&mut self.magnet, "Magnet");
         if ui.button("Reset view").clicked() {
@@ -4158,6 +4146,9 @@ impl ChartState {
         hover: Option<Pos2>,
         resp: &egui::Response,
     ) {
+        if self.drawings_hidden {
+            return;
+        }
         let p = ui.painter_at(rect);
         let pointer_anchor = |this: &Self, pos: Pos2| -> Anchor {
             let pos = pos.clamp(rect.min, rect.max);
@@ -5460,13 +5451,202 @@ mod tests {
         }
     }
 
+    fn rail_frame(ctx: &egui::Context, chart: &mut ChartState, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        ui_frame(ctx, events, |ui| {
+            chart.drawing_rail(ui, Rect::from_min_size(pos2(10., 10.), vec2(theme::dp(36.), theme::dp(400.))))
+        })
+    }
+
+    fn rail_point(slot: usize) -> Pos2 {
+        let separators = slot.min(6);
+        pos2(28., 10. + theme::dp(19. + 34. * slot as f32 + 8. * separators as f32))
+    }
+
+    fn click_rail(ctx: &egui::Context, chart: &mut ChartState, at: Pos2) -> Vec<(String, Rect)> {
+        rail_frame(ctx, chart, vec![egui::Event::PointerMoved(at)]);
+        rail_frame(ctx, chart, vec![pointer_button(at, true)]);
+        rail_frame(ctx, chart, vec![pointer_button(at, false)]);
+        rail_frame(ctx, chart, vec![])
+    }
+
     #[test]
-    fn favorites_strip_click_starts_and_cancels_without_points_or_pan() {
+    fn rail_groups_use_last_tool_and_flyouts_select_and_star() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart.start_tool(Tool::Ray);
+        chart.cancel();
+        rail_frame(&ctx, &mut chart, vec![]);
+        click_rail(&ctx, &mut chart, rail_point(1));
+        assert_eq!(chart.draw.tool, Some(Tool::Ray));
+        click_rail(&ctx, &mut chart, rail_point(1));
+        assert_eq!(chart.draw.tool, None);
+        for group in 0..4 {
+            chart.drawing_toolbar.open = None;
+            click_rail(&ctx, &mut chart, rail_point(group + 1));
+            assert_eq!(chart.draw.tool, Some(chart.drawing_toolbar.last[group]));
+            chart.cancel();
+            chart.drawing_toolbar.open = Some(group);
+            rail_frame(&ctx, &mut chart, vec![]);
+            let labels = rail_frame(&ctx, &mut chart, vec![]);
+            assert!(labels.iter().any(|(label, _)| label == crate::drawing_toolbar::GROUPS[group].0));
+            for tool in crate::drawing_toolbar::GROUPS[group].1 {
+                assert!(labels.iter().any(|(label, _)| label == tool.label()));
+            }
+        }
+        chart.drawing_toolbar.open = Some(0);
+        rail_frame(&ctx, &mut chart, vec![]);
+        let labels = rail_frame(&ctx, &mut chart, vec![]);
+        let row = labels.iter().find(|(label, _)| label == Tool::Vertical.label()).unwrap().1;
+        let star = pos2(chart.drawing_toolbar.flyout.right() - theme::dp(20.), row.center().y);
+        assert!(!crate::prefs::drawing_favorites(&ctx).0.contains(&Tool::Vertical));
+        click_rail(&ctx, &mut chart, star);
+        assert!(crate::prefs::drawing_favorites(&ctx).0.contains(&Tool::Vertical));
+        click_rail(&ctx, &mut chart, row.center());
+        assert_eq!(chart.draw.tool, Some(Tool::Vertical));
+        assert_eq!(chart.drawing_toolbar.last[0], Tool::Vertical);
+        assert_eq!(chart.drawing_toolbar.open, None);
+        assert!(chart.drawings.is_empty() && chart.draw.pending.is_none());
+    }
+
+    #[test]
+    fn rail_chevron_secondary_click_and_hold_open_group_flyouts() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        rail_frame(&ctx, &mut chart, vec![]);
+        let at = rail_point(2) + vec2(theme::dp(10.), theme::dp(10.));
+        click_rail(&ctx, &mut chart, at);
+        assert_eq!(chart.drawing_toolbar.open, Some(1));
+        assert!(chart.draw.tool.is_none());
+        chart.drawing_toolbar.open = None;
+        let at = rail_point(3);
+        rail_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(at)]);
+        for pressed in [true, false] {
+            rail_frame(
+                &ctx,
+                &mut chart,
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        assert_eq!(chart.drawing_toolbar.open, Some(2));
+        chart.drawing_toolbar.open = None;
+        let at = rail_point(4);
+        rail_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(at)]);
+        rail_frame(&ctx, &mut chart, vec![pointer_button(at, true)]);
+        rail_frame(&ctx, &mut chart, vec![]);
+        assert_eq!(chart.drawing_toolbar.open, None);
+        rail_frame(&ctx, &mut chart, vec![]);
+        assert_eq!(chart.drawing_toolbar.open, Some(3));
+        rail_frame(&ctx, &mut chart, vec![pointer_button(at, false)]);
+        assert!(chart.draw.tool.is_none());
+        click_rail(&ctx, &mut chart, rail_point(4));
+        assert_eq!(chart.draw.tool, Some(Tool::LongPosition));
+        assert_eq!(chart.drawing_toolbar.open, None);
+    }
+
+    #[test]
+    fn rail_magnet_hide_and_remove_all_are_undoable_and_hidden_drawings_ignore_hits() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.drawings.push(Drawing::new(
+            Tool::Horizontal,
+            Anchor { ts: 0, price: 150. },
+            Anchor { ts: 0, price: 150. },
+        ));
+        rail_frame(&ctx, &mut chart, vec![]);
+        click_rail(&ctx, &mut chart, rail_point(6));
+        assert!(chart.magnet);
+        click_rail(&ctx, &mut chart, rail_point(7));
+        assert!(chart.drawings_hidden);
+        click_drawing(&ctx, &mut chart, pos2(300., 200.), false);
+        assert!(chart.draw.selected.is_none() && chart.draw.hover.is_none());
+        click_rail(&ctx, &mut chart, rail_point(8));
+        assert!(chart.drawings.is_empty());
+        chart.undo_drawings();
+        assert_eq!(chart.drawings.len(), 1);
+        click_rail(&ctx, &mut chart, rail_point(7));
+        assert!(!chart.drawings_hidden);
+    }
+
+    #[test]
+    fn rail_visibility_shrinks_plot_only_when_enabled_and_wide() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart_frame(&ctx, &mut chart, vec![]);
+        let with = chart.favorites_plot;
+        let viewport = chart.viewport;
+        let rail = pos2(with.left() - theme::dp(18.), with.top() + theme::dp(61.));
+        click_chart(&ctx, &mut chart, rail);
+        assert_eq!(chart.draw.tool, Some(Tool::Trendline));
+        assert_eq!(chart.viewport, viewport);
+        assert!(chart.draw.pending.is_none() && chart.drawings.is_empty());
+        crate::prefs::set_drawing_toolbar(&ctx, (false, None));
+        chart_frame(&ctx, &mut chart, vec![]);
+        assert_eq!(chart.favorites_plot.left(), with.left() - theme::dp(36.));
+        assert_eq!(chart.favorites_plot.width(), with.width() + theme::dp(36.));
+        assert!(!crate::drawing_toolbar::rail_visible(theme::dp(419.), true, true));
+        assert!(crate::drawing_toolbar::rail_visible(theme::dp(420.), true, true));
+        assert!(!crate::drawing_toolbar::rail_visible(theme::dp(800.), false, true));
+        assert!(!crate::drawing_toolbar::rail_visible(theme::dp(800.), true, false));
+        ui_frame(&ctx, vec![], |ui| {
+            chart.show(ui, Rect::from_min_size(pos2(0., 0.), vec2(theme::dp(400.), 560.)), true, &Worker::inert());
+        });
+        let narrow = chart.favorites_plot;
+        crate::prefs::set_drawing_toolbar(&ctx, (true, None));
+        ui_frame(&ctx, vec![], |ui| {
+            chart.show(ui, Rect::from_min_size(pos2(0., 0.), vec2(theme::dp(400.), 560.)), true, &Worker::inert());
+        });
+        assert_eq!(chart.favorites_plot, narrow);
+    }
+
+    #[test]
+    fn favorites_bar_drag_clamps_and_double_click_resets_without_pan_or_points() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart_frame(&ctx, &mut chart, vec![]);
+        let plot = chart.favorites_plot;
+        crate::prefs::set_drawing_toolbar(&ctx, (true, Some([0.1, 0.5])));
+        chart_frame(&ctx, &mut chart, vec![]);
+        let rect = crate::drawing_toolbar::favorites_rect(plot, 3, Some([0.1, 0.5]), plot.top());
+        let grip = pos2(rect.left() + theme::dp(10.), rect.center().y);
+        let viewport = chart.viewport;
+        chart_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(grip)]);
+        chart_frame(&ctx, &mut chart, vec![pointer_button(grip, true)]);
+        let far = plot.max - vec2(1., 1.);
+        chart_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(far)]);
+        chart_frame(&ctx, &mut chart, vec![pointer_button(far, false)]);
+        let saved = crate::prefs::drawing_toolbar(&ctx).1.unwrap();
+        assert_ne!(saved, [0.1, 0.5]);
+        let moved = crate::drawing_toolbar::favorites_rect(plot, 3, Some(saved), plot.top());
+        assert!(plot.contains_rect(moved));
+        assert_eq!(chart.viewport, viewport);
+        assert!(chart.drawings.is_empty() && chart.draw.pending.is_none());
+        let grip = pos2(moved.left() + theme::dp(10.), moved.center().y);
+        for _ in 0..2 {
+            chart_frame(
+                &ctx,
+                &mut chart,
+                vec![egui::Event::PointerMoved(grip), pointer_button(grip, true), pointer_button(grip, false)],
+            );
+        }
+        assert_eq!(crate::prefs::drawing_toolbar(&ctx).1, None);
+        assert_eq!(chart.viewport, viewport);
+    }
+
+    #[test]
+    fn favorites_bar_click_starts_and_cancels_without_points_or_pan() {
         let ctx = egui::Context::default();
         let mut chart = sample_chart();
         for expected in [Some(Tool::Trendline), None] {
-            let labels = chart_frame(&ctx, &mut chart, vec![]);
-            let button = labels.iter().find(|(text, _)| text == "TL").unwrap().1.center();
+            chart_frame(&ctx, &mut chart, vec![]);
+            let price = chart.favorites_plot;
+            let rect =
+                crate::drawing_toolbar::favorites_rect(price, 3, None, chart.legend_bottom(price, &[]) + theme::dp(4.));
+            let button = pos2(rect.left() + theme::dp(34.), rect.center().y);
             let viewport = chart.viewport;
             click_chart(&ctx, &mut chart, button);
             assert_eq!(chart.draw.tool, expected);
@@ -5480,33 +5660,16 @@ mod tests {
     }
 
     #[test]
-    fn favorites_strip_reserves_legend_height_and_collapses_with_draw_overflow() {
+    fn favorites_bar_reserves_legend_height_and_hides_when_unavailable() {
         let ctx = egui::Context::default();
         let mut chart = sample_chart();
         crate::prefs::set_drawing_favorites(&ctx, (Tool::ALL.to_vec(), true));
-        let price = Rect::from_min_size(pos2(10., 10.), vec2(700., 80.));
-        let labels = ui_frame(&ctx, vec![], |ui| {
+        let price = Rect::from_min_size(pos2(10., 10.), vec2(700., 180.));
+        ui_frame(&ctx, vec![], |ui| {
             let rect = chart.favorites_rect(ui, price, &[]);
             assert!(rect.top() > chart.legend_bottom(price, &[]));
-            assert!(rect.bottom() <= price.bottom());
-            chart.favorites_strip(ui, rect);
-        });
-        let overflow = labels.iter().find(|(text, _)| text == "+12").unwrap().1.center();
-        for event in
-            [egui::Event::PointerMoved(overflow), pointer_button(overflow, true), pointer_button(overflow, false)]
-        {
-            ui_frame(&ctx, vec![event], |ui| {
-                let rect = chart.favorites_rect(ui, price, &[]);
-                chart.favorites_strip(ui, rect);
-            });
-        }
-        let labels = ui_frame(&ctx, vec![], |ui| {
-            let rect = chart.favorites_rect(ui, price, &[]);
-            chart.favorites_strip(ui, rect);
-        });
-        assert!(labels.iter().any(|(text, _)| text == "Show favorites toolbar"));
-        assert!(labels.iter().any(|(text, _)| text == "Trendline"));
-        ui_frame(&ctx, vec![], |ui| {
+            assert!(price.contains_rect(rect));
+            chart.favorites_bar(ui, rect);
             chart.replay_cutoff = Some(1);
             assert_eq!(chart.favorites_rect(ui, price, &[]), Rect::NOTHING);
             chart.replay_cutoff = None;

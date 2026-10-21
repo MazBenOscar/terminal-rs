@@ -104,6 +104,69 @@ pub enum Icon {
     Pause,
     StepBack,
     StepForward,
+    Crosshair,
+    Trendline,
+    Ray,
+    HorizontalLine,
+    VerticalLine,
+    FibRetracement,
+    FibExtension,
+    Channel,
+    Pitchfork,
+    Rectangle,
+    Text,
+    LongPosition,
+    ShortPosition,
+    Measure,
+    Magnet,
+    EyeOff,
+    Eye,
+    Trash,
+    Grip,
+    ChevronSmall,
+}
+
+pub fn tool_icon(tool: tr_chart::drawings::Tool) -> Icon {
+    use tr_chart::drawings::Tool;
+    match tool {
+        Tool::Trendline => Icon::Trendline,
+        Tool::Ray => Icon::Ray,
+        Tool::Horizontal => Icon::HorizontalLine,
+        Tool::Vertical => Icon::VerticalLine,
+        Tool::Fib => Icon::FibRetracement,
+        Tool::FibExtension => Icon::FibExtension,
+        Tool::Channel => Icon::Channel,
+        Tool::Pitchfork => Icon::Pitchfork,
+        Tool::Rectangle => Icon::Rectangle,
+        Tool::Text => Icon::Text,
+        Tool::LongPosition => Icon::LongPosition,
+        Tool::ShortPosition => Icon::ShortPosition,
+        Tool::Measure => Icon::Measure,
+    }
+}
+
+#[cfg(test)]
+mod drawing_icon_tests {
+    use super::*;
+
+    #[test]
+    fn every_tool_has_a_distinct_nonempty_line_icon() {
+        let ctx = egui::Context::default();
+        let mut signatures = Vec::new();
+        for tool in tr_chart::drawings::Tool::ALL {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let painter =
+                    ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("icons")));
+                draw_icon(&painter, Rect::from_min_size(Pos2::ZERO, vec2(24., 24.)), tool_icon(tool), theme::text());
+            });
+            assert!(!output.shapes.is_empty(), "{tool:?}");
+            assert!(output.shapes.iter().any(|s| s.shape.visual_bounding_rect().is_positive()));
+            output.textures_delta.clear();
+            let signature = format!("{:?}", output.shapes);
+            assert!(!signatures.contains(&signature), "Duplicate geometry for {tool:?}");
+            signatures.push(signature);
+        }
+    }
 }
 
 /// Draw a simple line icon centred in `r`.
@@ -113,6 +176,110 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
     let u = r.height().min(r.width()) / 16.0;
     let pt = |x: f32, y: f32| pos2(c.x + x * u, c.y + y * u);
     match icon {
+        Icon::Crosshair => {
+            for d in [-1., 1.] {
+                p.line_segment([pt(d * 2., 0.), pt(d * 6., 0.)], s);
+                p.line_segment([pt(0., d * 2.), pt(0., d * 6.)], s);
+            }
+        }
+        Icon::Trendline | Icon::Ray | Icon::Channel => {
+            p.line_segment([pt(-4., 4.), pt(5., -5.)], s);
+            p.circle_stroke(pt(-5., 5.), 1.4 * u, s);
+            if icon != Icon::Ray {
+                p.circle_stroke(pt(5., -5.), 1.4 * u, s);
+            }
+            if icon == Icon::Channel {
+                p.line_segment([pt(-5., 0.), pt(0., -5.)], s);
+            }
+            if icon == Icon::Ray {
+                p.line_segment([pt(5., -5.), pt(7., -7.)], s);
+            }
+        }
+        Icon::HorizontalLine | Icon::VerticalLine => {
+            let (a, b) =
+                if icon == Icon::HorizontalLine { (pt(-6., 0.), pt(6., 0.)) } else { (pt(0., -6.), pt(0., 6.)) };
+            p.line_segment([a, b], s);
+            p.circle_stroke(c, 1.4 * u, s);
+        }
+        Icon::FibRetracement | Icon::FibExtension => {
+            let n = if icon == Icon::FibRetracement { 4 } else { 3 };
+            for i in 0..n {
+                let y = -5. + i as f32 * 3.;
+                p.line_segment([pt(-5., y), pt(6. - i as f32 * 1.5, y)], s);
+            }
+            if icon == Icon::FibRetracement {
+                p.circle_stroke(pt(-5., -5.), 1.4 * u, s);
+                p.circle_stroke(pt(1.5, 4.), 1.4 * u, s);
+            } else {
+                p.line_segment([pt(-6., 5.), pt(-2., -5.)], s);
+            }
+        }
+        Icon::Pitchfork => {
+            p.circle_stroke(pt(-5., 5.), 1.4 * u, s);
+            p.line_segment([pt(-4., 4.), pt(4., -4.)], s);
+            p.add(Shape::line(vec![pt(-5., -1.), pt(-1., 1.), pt(1., 5.)], s));
+            p.line_segment([pt(-5., -1.), pt(0., -6.)], s);
+            p.line_segment([pt(1., 5.), pt(6., 0.)], s);
+        }
+        Icon::Rectangle => {
+            p.rect_stroke(Rect::from_min_max(pt(-5., -5.), pt(5., 5.)), 0., s, StrokeKind::Middle);
+            for (x, y) in [(-5., -5.), (5., -5.), (-5., 5.), (5., 5.)] {
+                p.circle_stroke(pt(x, y), 1.4 * u, s);
+            }
+        }
+        Icon::Text => {
+            p.line_segment([pt(-6., -5.), pt(6., -5.)], s);
+            p.line_segment([pt(0., -5.), pt(0., 6.)], s);
+        }
+        Icon::LongPosition | Icon::ShortPosition => {
+            let d = if icon == Icon::LongPosition { 1. } else { -1. };
+            for (x, y, w, h) in [(-5., -5., 10., 6.), (-3., 1., 6., 4.)] {
+                let a = pt(x, y * d);
+                let b = pt(x + w, (y + h) * d);
+                p.rect_stroke(Rect::from_two_pos(a, b), 0., s, StrokeKind::Middle);
+            }
+            p.add(Shape::line(vec![pt(-2., -d), pt(0., -3. * d), pt(2., -d)], s));
+        }
+        Icon::Measure => {
+            p.add(Shape::line(vec![pt(-6., 3.), pt(3., -6.), pt(6., -3.), pt(-3., 6.), pt(-6., 3.)], s));
+            for i in 0..3 {
+                let x = -3. + i as f32 * 3.;
+                p.line_segment([pt(x, -x - 3.), pt(x + 1.5, -x - 1.5)], s);
+            }
+        }
+        Icon::Magnet => {
+            p.add(Shape::line(vec![pt(-5., -5.), pt(-5., 2.), pt(-3., 5.), pt(3., 5.), pt(5., 2.), pt(5., -5.)], s));
+            p.line_segment([pt(-5., -2.), pt(-2., -2.)], s);
+            p.line_segment([pt(2., -2.), pt(5., -2.)], s);
+        }
+        Icon::Eye | Icon::EyeOff => {
+            p.add(Shape::line(
+                vec![pt(-7., 0.), pt(-3., -4.), pt(3., -4.), pt(7., 0.), pt(3., 4.), pt(-3., 4.), pt(-7., 0.)],
+                s,
+            ));
+            p.circle_stroke(c, 2. * u, s);
+            if icon == Icon::EyeOff {
+                p.line_segment([pt(-6., -6.), pt(6., 6.)], s);
+            }
+        }
+        Icon::Trash => {
+            p.add(Shape::line(vec![pt(-4., -3.), pt(-3., 6.), pt(3., 6.), pt(4., -3.)], s));
+            p.line_segment([pt(-6., -4.), pt(6., -4.)], s);
+            p.line_segment([pt(-2., -6.), pt(2., -6.)], s);
+            for x in [-1.5, 1.5] {
+                p.line_segment([pt(x, -1.), pt(x, 4.)], s);
+            }
+        }
+        Icon::Grip => {
+            for x in [-2., 2.] {
+                for y in [-4., 0., 4.] {
+                    p.circle_filled(pt(x, y), u, color);
+                }
+            }
+        }
+        Icon::ChevronSmall => {
+            p.add(Shape::convex_polygon(vec![pt(-2., 2.), pt(2., -2.), pt(2., 2.)], color, Stroke::NONE));
+        }
         Icon::Sidebar | Icon::SidebarRight => {
             let b = Rect::from_center_size(c, vec2(14.0 * u, 11.0 * u));
             p.rect_stroke(b, 2.0, s, StrokeKind::Middle);

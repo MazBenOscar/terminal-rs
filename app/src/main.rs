@@ -30,6 +30,7 @@ mod price_alerts;
 mod theme;
 mod themes;
 mod widgets;
+use chart_view::drawing_toolbar;
 mod worker;
 
 use std::time::Instant;

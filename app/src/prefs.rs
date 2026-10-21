@@ -672,6 +672,14 @@ fn deserialize_drawing_favorites<'de, D: serde::Deserializer<'de>>(
     Ok(tools)
 }
 
+pub(crate) fn drawing_toolbar(ctx: &egui::Context) -> (bool, Option<[f32; 2]>) {
+    ctx.data(|data| data.get_temp(egui::Id::new("drawing-toolbar-prefs"))).unwrap_or((true, None))
+}
+
+pub(crate) fn set_drawing_toolbar(ctx: &egui::Context, value: (bool, Option<[f32; 2]>)) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("drawing-toolbar-prefs"), value));
+}
+
 pub(crate) type DrawingFavorites = (Vec<tr_chart::drawings::Tool>, bool);
 
 pub(crate) fn drawing_favorites(ctx: &egui::Context) -> DrawingFavorites {
@@ -741,6 +749,9 @@ pub struct Prefs {
     #[serde(default = "default_drawing_favorites", deserialize_with = "deserialize_drawing_favorites")]
     pub drawing_favorites: Vec<tr_chart::drawings::Tool>,
     pub show_drawing_favorites: bool,
+    pub show_drawing_rail: bool,
+    #[serde(default)]
+    pub drawing_favorites_pos: Option<[f32; 2]>,
     #[serde(default = "default_study_favorites", deserialize_with = "deserialize_study_favorites")]
     pub study_favorites: Vec<String>,
     /// Order entry through SnapTrade (off unless the user turns it on).
@@ -763,6 +774,8 @@ impl Default for Prefs {
             panels: PanelDefaults::default(),
             drawing_favorites: default_drawing_favorites(),
             show_drawing_favorites: true,
+            show_drawing_rail: true,
+            drawing_favorites_pos: None,
             study_favorites: default_study_favorites(),
             trading: TradingPrefs::default(),
             alert_sound: false,
@@ -897,6 +910,10 @@ mod tests {
         let defaults: Prefs = serde_json::from_str("{}").unwrap();
         assert_eq!(defaults.drawing_favorites, vec![Tool::Trendline, Tool::Horizontal, Tool::Fib]);
         assert!(defaults.show_drawing_favorites);
+        assert!(defaults.show_drawing_rail);
+        assert_eq!(defaults.drawing_favorites_pos, None);
+        assert!(prefs.show_drawing_rail);
+        assert_eq!(prefs.drawing_favorites_pos, None);
         let all = Tool::ALL.repeat(3);
         let json = serde_json::json!({"drawing_favorites": all});
         let prefs: Prefs = serde_json::from_value(json).unwrap();
