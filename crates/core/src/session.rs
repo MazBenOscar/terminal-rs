@@ -220,6 +220,41 @@ mod tests {
         assert_eq!(close_minute(date(2026, 11, 27)), 780);
         assert!(!Session::UsRegular.contains(ts("2026-11-27T18:00:00Z")));
     }
+
+    /// Black Friday and the calendar-day half days already close at 13:00; the
+    /// relocated half days are the ones the built-in table misses.
+    #[test]
+    fn calendar_day_half_days_stay_early_and_normal_days_stay_full() {
+        assert_eq!(close_minute(date(2026, 7, 2)), 960);
+        assert_eq!(close_minute(date(2026, 12, 24)), 780);
+        assert_eq!(close_minute(date(2026, 12, 23)), 960);
+    }
+
+    #[test]
+    #[ignore = "BUG: close_minute matches half days only by calendar day-of-month (7/3, 12/24), so the 1:00 pm early close vanishes whenever the holiday falls on a weekend. Friday 2021-07-02 (Independence Day observed Monday 2021-07-05) and Friday 2022-12-23 (Christmas Day Sunday 2022-12-25, Christmas Eve Saturday) are published 1:00 pm closes but return 960, so US-regular H2/H4 session buckets keep a phantom 13:00-16:00 afternoon and Resample_session admits post-close bars"]
+    fn early_close_follows_the_holiday_onto_the_preceding_weekday() {
+        // 2021-07-04 is a Sunday: observed holiday is Monday 7/5, early close Friday 7/2.
+        assert!(!closed(date(2021, 7, 2)));
+        assert_eq!(close_minute(date(2021, 7, 2)), 780);
+        // 2022-12-25 is a Sunday: observed holiday is Monday 12/26, Christmas Eve
+        // falls on Saturday 12/24, so the early close moves to Friday 12/23.
+        assert!(!closed(date(2022, 12, 23)));
+        assert_eq!(close_minute(date(2022, 12, 23)), 780);
+
+        // Session-aligned multi-hour buckets must stop at the relocated close.
+        let open = ts("2021-07-02T13:30:00Z"); // 09:30 EDT
+        let close = ts("2021-07-02T17:00:00Z"); // 13:00 EDT
+        assert!(!Session::UsRegular.contains(close));
+        assert!(!Session::UsRegular.contains(close + 60));
+        assert_eq!(Session::UsRegular.interval(Timeframe::H2, close - 1), (open + 7200, close));
+        assert_eq!(Session::UsRegular.interval(Timeframe::H4, close - 1), (open, close));
+
+        let open = ts("2022-12-23T14:30:00Z"); // 09:30 EST
+        let close = ts("2022-12-23T18:00:00Z"); // 13:00 EST
+        assert!(!Session::UsRegular.contains(close));
+        assert_eq!(Session::UsRegular.interval(Timeframe::H2, close - 1), (open + 7200, close));
+        assert_eq!(Session::UsRegular.interval(Timeframe::H4, close - 1), (open, close));
+    }
     #[test]
     fn aggregation_anchors_and_month_completion_are_calendar_based() {
         let t = ts("2026-03-09T14:00:00Z");

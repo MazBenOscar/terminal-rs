@@ -122,4 +122,35 @@ mod tests {
                 .contains("<key>EnvironmentVariables</key><dict></dict>")
         );
     }
+
+    /// Characters XML 1.0 forbids anywhere in a document (see production `Char`).
+    fn xml_illegal(text: &str) -> Vec<char> {
+        text.chars()
+            .filter(|c| {
+                let u = *c as u32;
+                !(u == 0x9 || u == 0xA || u == 0xD || (0x20..=0xD7FF).contains(&u) || (0xE000..=0xFFFD).contains(&u))
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "BUG: launch::xml keeps CR and every char >= 0x20 verbatim, but an XML parser silently turns CR into LF in element content and rejects the noncharacters U+FFFE/U+FFFF outright, so a binary path, log path or TR_DATA_DIR containing CR or a noncharacter is corrupted or unparseable — the generated plist is not round-trip safe and launchctl install fails or launches the wrong path"]
+    fn plist_output_is_round_trip_safe_under_xml_parsing() {
+        for poison in ['\r', '\u{fffe}', '\u{ffff}'] {
+            let binary = format!("/Applications/terminal{poison}-rs-alertd");
+            let data = format!("/Users/a{poison}b/logs");
+            let text = plist(
+                Path::new(&binary),
+                Path::new(&data),
+                &[("TR_DATA_DIR".into(), format!("/data{poison}dir")), ("TR_SECRET_STORE".into(), "file".into())],
+            );
+            let bad = xml_illegal(&text);
+            assert!(bad.is_empty(), "plist emitted XML-illegal {bad:?} for {poison:?}");
+            assert!(
+                !text.contains('\r'),
+                "raw CR survives into the plist and any XML parser normalizes it to LF, corrupting the path: {text}"
+            );
+            assert!(!text.contains('\u{fffe}') && !text.contains('\u{ffff}'));
+        }
+    }
 }

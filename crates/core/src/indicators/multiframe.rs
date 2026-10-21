@@ -210,6 +210,26 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "BUG: fetched study-history ends are computed as session.interval(tf, ts).1, which anchors every intraday study timeframe at the 09:30 NY open, but chart_history only session-aligns H2/H4 and returns UTC-bucketed bars for H1 (and other tfs). An H1 bar stamped 15:00Z really closes 16:00Z, yet ends lands on 15:30Z so its value is painted onto the 09:30-11:30 H2 bar 30 minutes before the H1 bar finishes — look-ahead bias for any H1 study on a session-aligned 2H/4H chart"]
+    fn h1_study_on_session_aligned_multi_hour_chart_waits_for_the_real_bar_close() {
+        let open = chrono::DateTime::parse_from_rfc3339("2026-03-09T13:30:00Z").unwrap().timestamp();
+        let bars: Vec<_> = (0..4).map(|i| bar(open + i * 7200, 1.)).collect();
+        // Provider H1 history is UTC-aligned: 15:00Z covers 15:00-16:00Z (10:00-11:00 EDT).
+        let h1 = vec![bar(chrono::DateTime::parse_from_rfc3339("2026-03-09T15:00:00Z").unwrap().timestamp(), 42.)];
+        let result = evaluate(
+            &specs(&[Timeframe::H1]),
+            &Input::new(&bars, Timeframe::H2),
+            Session::UsRegular,
+            &histories(Timeframe::H1, h1),
+        );
+        let values = &result[0].as_ref().unwrap()[0].values;
+        // Bar 0 is 09:30-11:30 EDT and completes at 15:30Z, before the H1 bar's 16:00Z close.
+        assert!(values[0].is_nan(), "H1 value leaked onto a chart bar that closed first: {values:?}");
+        // Bar 1 is 11:30-13:30 EDT (as_of 17:30Z) and may show the completed H1 bar.
+        assert_eq!(values[1], 42.);
+    }
+
+    #[test]
     fn fetched_higher_history_replaces_aggregation() {
         let bars: Vec<_> = (0..36).filter(|i| *i != 17).map(|i| bar(i * 300, i as f64)).collect();
         let specs = specs(&[Timeframe::H1]);

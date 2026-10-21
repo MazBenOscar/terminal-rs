@@ -628,6 +628,25 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "BUG: scan_history and alert_history hardcode Session::UsRegular for equity H2/H4 while chart_history buckets with HistoryOptions::session (default Session::Provider), so the 2H bars a scan or condition alert evaluates are not the 2H bars the chart paints: open a scanned symbol on a default chart and the study/scan grid disagrees with the candle grid (US-regular starts at 09:30, provider starts at even UTC hours)"]
+    async fn equity_multi_hour_scan_and_alert_bars_match_the_default_chart_grid() {
+        let end = chrono::DateTime::parse_from_rfc3339("2026-03-09T20:00:00Z").unwrap().timestamp();
+        let provider = sample::SampleProvider::at(end, 400);
+        for tf in [Timeframe::H2, Timeframe::H4] {
+            let chart =
+                provider.chart_history("AAPL US Equity", tf, None, 30, HistoryOptions::default()).await.unwrap();
+            let scan = provider.scan_history("AAPL US Equity", tf, 30).await.unwrap();
+            let alert = provider.alert_history("AAPL US Equity", tf, 30).await.unwrap();
+            assert!(!chart.is_empty());
+            let chart_ts: Vec<i64> = chart.iter().map(|b| b.ts).collect();
+            let scan_ts: Vec<i64> = scan.bars.iter().map(|b| b.ts).collect();
+            let alert_ts: Vec<i64> = alert.bars.iter().map(|b| b.ts).collect();
+            assert_eq!(chart_ts, scan_ts, "{tf}: chart grid != scan grid");
+            assert_eq!(chart_ts, alert_ts, "{tf}: chart grid != alert grid");
+        }
+    }
+
+    #[tokio::test]
     async fn default_yield_curve_from_history() {
         let c = sample::SampleProvider::at(1_790_000_000, 1_000).yield_curves().await.unwrap();
         assert_eq!(c.current.points.len(), 11);
