@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
-use tr_core::price_alerts::{Alert, Book, Direction, Event, Observation, Status};
+use tr_core::price_alerts::{Alert, Book, Direction, Event, Observation, Rule, Status};
 
 use crate::theme::{amber, mono, muted, text};
 use crate::worker::{Request, Worker};
@@ -16,6 +16,7 @@ const POLL: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone)]
 pub enum Action {
     Create { symbol: String, level: f64, direction: Direction },
+    Condition { symbol: String, level: f64, rule: Rule },
     Edit(u64),
     Toggle(u64),
     Delete(u64),
@@ -29,6 +30,10 @@ struct Draft {
     direction: Direction,
     simulated: bool,
     error: Option<String>,
+    rule: Option<Rule>,
+    formula: bool,
+    expression: String,
+    timeframe: tr_core::Timeframe,
 }
 
 pub struct State {
@@ -41,6 +46,8 @@ pub struct State {
     last_save: Option<Instant>,
     revision: u64,
     pending: Option<u64>,
+    pending_rules: Option<u64>,
+    last_rule_poll: Option<Instant>,
     last_poll: Option<Instant>,
     pub simulated: bool,
     pub congress_tab: bool,
@@ -73,6 +80,8 @@ impl State {
             last_save: None,
             revision: 0,
             pending: None,
+            pending_rules: None,
+            last_rule_poll: None,
             last_poll: None,
             simulated,
             congress_tab: false,
@@ -117,11 +126,29 @@ impl State {
         if config {
             self.revision = self.revision.wrapping_add(1);
             self.last_poll = None;
+            self.last_rule_poll = None;
         }
         self.save();
     }
 
     pub fn periodic(&mut self, worker: &Worker) {
+        if self.load_error.is_none()
+            && self.pending_rules.is_none()
+            && self.last_rule_poll.is_none_or(|t| t.elapsed() >= POLL)
+        {
+            let alerts: Vec<_> = self
+                .book
+                .alerts
+                .iter()
+                .filter(|a| a.rule.is_some() && a.status == Status::Armed && a.simulated == self.simulated)
+                .cloned()
+                .collect();
+            if !alerts.is_empty() {
+                self.pending_rules = Some(self.revision);
+                self.last_rule_poll = Some(Instant::now());
+                worker.send(Request::PriceAlertRules { revision: self.revision, alerts });
+            }
+        }
         if self.dirty && self.last_save.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
             self.save();
         }
@@ -132,7 +159,7 @@ impl State {
             .book
             .alerts
             .iter()
-            .filter(|a| a.status == Status::Armed && a.simulated == self.simulated)
+            .filter(|a| a.rule.is_none() && a.status == Status::Armed && a.simulated == self.simulated)
             .map(|a| a.symbol.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -182,6 +209,37 @@ impl State {
         events
     }
 
+    pub fn on_rules(&mut self, revision: u64, observations: Vec<(u64, Result<Observation, String>)>) -> Vec<Event> {
+        if self.pending_rules != Some(revision) {
+            return vec![];
+        }
+        self.pending_rules = None;
+        if revision != self.revision {
+            return vec![];
+        }
+        let now = chrono::Utc::now().timestamp();
+        let mut events = Vec::new();
+        for (id, result) in observations {
+            let key = format!("rule:{id}");
+            match result {
+                Ok(q) if q.simulated == self.simulated && q.valid_at(now) => {
+                    self.monitor.insert(key, format!("Value {:.4} · {}", q.price, timestamp(q.ts)));
+                    events.extend(self.book.observe_rule(id, q, now));
+                }
+                result => {
+                    self.monitor.insert(
+                        key,
+                        format!("Waiting · {}", result.err().unwrap_or("Invalid or mismatched data".into())),
+                    );
+                    self.book.reset_rule(id);
+                }
+            }
+        }
+        if !events.is_empty() {
+            self.changed(false);
+        }
+        events
+    }
     pub fn action(&mut self, action: Action) {
         if self.load_error.is_some() {
             return;
@@ -195,7 +253,29 @@ impl State {
                     direction,
                     simulated: self.simulated,
                     error: None,
+                    rule: None,
+                    formula: false,
+                    expression: "WRSI(14)".into(),
+                    timeframe: tr_core::Timeframe::D1,
                 })
+            }
+            Action::Condition { symbol, level, rule } => {
+                let (formula, expression, timeframe) = match &rule {
+                    Rule::Formula { expression, timeframe } => (true, expression.clone(), *timeframe),
+                    _ => (false, String::new(), tr_core::Timeframe::M1),
+                };
+                self.editor = Some(Draft {
+                    id: None,
+                    symbol,
+                    price: level.to_string(),
+                    direction: Direction::Above,
+                    simulated: self.simulated,
+                    error: None,
+                    rule: Some(rule),
+                    formula,
+                    expression,
+                    timeframe,
+                });
             }
             Action::Edit(id) => {
                 if let Some(a) = self.book.alerts.iter().find(|a| a.id == id) {
@@ -206,6 +286,16 @@ impl State {
                         direction: a.direction,
                         simulated: a.simulated,
                         error: None,
+                        rule: a.rule.clone(),
+                        formula: matches!(a.rule, Some(Rule::Formula { .. })),
+                        expression: match &a.rule {
+                            Some(Rule::Formula { expression, .. }) => expression.clone(),
+                            _ => "WRSI(14)".into(),
+                        },
+                        timeframe: match &a.rule {
+                            Some(Rule::Formula { timeframe, .. }) => *timeframe,
+                            _ => tr_core::Timeframe::D1,
+                        },
                     });
                 }
             }
@@ -241,6 +331,10 @@ impl State {
                     direction: Direction::Above,
                     simulated: self.simulated,
                     error: None,
+                    rule: None,
+                    formula: false,
+                    expression: "WRSI(14)".into(),
+                    timeframe: tr_core::Timeframe::D1,
                 });
             }
             ui.selectable_value(&mut self.history, false, "Levels");
@@ -301,6 +395,9 @@ impl State {
                 }
                 for a in &self.book.alerts {
                     ui.push_id(a.id, |ui| {
+                        if let Some(rule) = &a.rule {
+                            ui.label(RichText::new(rule.label()).color(muted()));
+                        }
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 RichText::new(format!("{} · {} {}", a.symbol, a.direction.label(), a.level))
@@ -329,7 +426,11 @@ impl State {
                                 ui.label(
                                     RichText::new(
                                         self.monitor
-                                            .get(&a.symbol)
+                                            .get(&if a.rule.is_some() {
+                                                format!("rule:{}", a.id)
+                                            } else {
+                                                a.symbol.clone()
+                                            })
                                             .map(String::as_str)
                                             .unwrap_or("Waiting for price data…"),
                                     )
@@ -361,6 +462,20 @@ impl State {
                 ui.label("Symbol");
                 ui.add_enabled(draft.id.is_none(), egui::TextEdit::singleline(&mut draft.symbol).hint_text("AAPL or BTCUSD Curncy").char_limit(100).desired_width(f32::INFINITY));
                 ui.add_space(6.);
+                if matches!(draft.rule, Some(Rule::Line { .. })) {
+                    ui.label("Saved line snapshot · zero = crossing the line");
+                    ui.label("Line uses elapsed time, including market closures; edits to the drawing do not alter this alert.");
+                } else {
+                    ui.checkbox(&mut draft.formula, "Indicator / formula condition");
+                    if draft.formula {
+                        ui.add(egui::TextEdit::singleline(&mut draft.expression).char_limit(4096).desired_width(340.));
+                        egui::ComboBox::from_id_salt("condition-timeframe").selected_text(draft.timeframe.label()).show_ui(ui, |ui| {
+                            for tf in tr_core::Timeframe::ALL { ui.selectable_value(&mut draft.timeframe, tf, tf.label()); }
+                        });
+                        ui.label("Examples: WRSI(14) crosses 70; C-XAVG(C,20) crosses 0; Boolean scan crosses 0.5.");
+                        ui.label("Uses up to 1,500 provider bars, including the forming bar.");
+                    }
+                }
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("price-alert-direction").selected_text(draft.direction.label()).show_ui(ui, |ui| {
                         ui.selectable_value(&mut draft.direction, Direction::Above, Direction::Above.label());
@@ -384,12 +499,24 @@ impl State {
         if save {
             let result = (|| {
                 let level: f64 = draft.price.trim().parse().map_err(|_| "Enter a valid price".to_string())?;
-                if let Some(id) = draft.id {
-                    self.book.edit(id, level, draft.direction)
+                let rule = if draft.formula {
+                    Some(Rule::Formula { expression: draft.expression.clone(), timeframe: draft.timeframe })
+                } else if matches!(draft.rule, Some(Rule::Line { .. })) {
+                    draft.rule.clone()
+                } else {
+                    None
+                };
+                if let Some(r) = &rule {
+                    r.validate()?;
+                }
+                let id = if let Some(id) = draft.id {
+                    self.book.edit(id, level, draft.direction)?;
+                    id
                 } else {
                     let symbol = crate::chart_compare::parse_key(&draft.symbol).ok_or("Choose a valid symbol")?;
-                    self.book.add(symbol, level, draft.direction, draft.simulated).map(|_| ())
-                }
+                    self.book.add(symbol, level, draft.direction, draft.simulated)?
+                };
+                self.book.set_rule(id, rule)
             })();
             match result {
                 Ok(()) => {
@@ -414,6 +541,17 @@ pub fn status(a: &Alert) -> &'static str {
 }
 
 pub fn event_message(e: &Event) -> String {
+    if let Some(rule) = &e.alert.rule {
+        return format!(
+            "{}{} · {} {} {} · value {:.4}",
+            if e.alert.simulated { "Sample · " } else { "" },
+            e.alert.symbol,
+            rule.label(),
+            e.alert.direction.label(),
+            e.alert.level,
+            e.price
+        );
+    }
     format!(
         "{}{} {} {} · observed {}",
         if e.alert.simulated { "Sample · " } else { "" },
@@ -459,6 +597,29 @@ mod tests {
     fn reply(state: &mut State, price: f64) -> Vec<Event> {
         state.pending = Some(state.revision);
         state.on_quotes(state.revision, vec![("AAPL US Equity".into(), Ok(q(price)))])
+    }
+
+    #[test]
+    fn rule_replies_have_separate_baselines_and_ignore_old_configuration() {
+        let mut s = state();
+        let id = s.book.add("AAPL US Equity".into(), 70., Direction::Above, false).unwrap();
+        s.book
+            .set_rule(id, Some(Rule::Formula { expression: "WRSI(14)".into(), timeframe: tr_core::Timeframe::D1 }))
+            .unwrap();
+        for value in [69., 71.] {
+            s.pending_rules = Some(s.revision);
+            let fired = s.on_rules(s.revision, vec![(id, Ok(q(value)))]);
+            assert_eq!(fired.len(), usize::from(value == 71.));
+            if let Some(e) = fired.first() {
+                assert!(event_message(e).contains("value 71.0000"));
+            }
+        }
+        s.book.toggle(id);
+        s.changed(true);
+        s.pending_rules = Some(s.revision - 1);
+        assert!(s.on_rules(s.revision - 1, vec![(id, Ok(q(90.)))]).is_empty());
+        assert!(s.pending_rules.is_none());
+        std::fs::remove_dir_all(s.path.parent().unwrap()).unwrap();
     }
 
     #[test]

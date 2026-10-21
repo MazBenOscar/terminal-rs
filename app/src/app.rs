@@ -1094,6 +1094,18 @@ impl TerminalApp {
                         ));
                     }
                 }
+                Response::PriceAlertRules { revision, observations } => {
+                    for event in self.price_alerts.on_rules(revision, observations) {
+                        self.toasts.push((
+                            format!(
+                                "{}{}",
+                                crate::price_alerts::TOAST_PREFIX,
+                                crate::price_alerts::event_message(&event)
+                            ),
+                            Instant::now(),
+                        ));
+                    }
+                }
                 Response::Quotes(q) => {
                     if q.len() > 20 {
                         self.wei_updated = Some(format!("updated {}", chrono::Local::now().format("%H:%M:%S")));

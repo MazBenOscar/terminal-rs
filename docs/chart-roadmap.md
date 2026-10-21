@@ -92,3 +92,21 @@ coordinates. Risk/reward tools use entry, stop and target; they show per-unit ri
 reward and the ratio, and label invalid sides rather than displaying a fictitious
 ratio. They are planning annotations and do not submit orders or size positions.
 All use the existing selection, three-handle/body dragging, ownership and undo path.
+
+## Condition alerts
+
+The alert editor supports PCF formula values on a selected timeframe (for example
+`WRSI(14)` crossing 70 or `C-XAVG(C,20)` crossing zero). A chart opened from a scan
+can create a Boolean condition alert for that symbol. Selected trendlines, rays and
+horizontal drawings can create an alert against a saved line snapshot. Sloping line
+alerts extrapolate by elapsed time, including closed sessions; they are labeled
+explicitly because chart drawings use bar-space geometry. Later drawing edits do not
+change an already saved alert. Zero means price crosses the saved line.
+
+Condition polling uses up to 1,500 uncached provider bars, including the forming bar,
+with a fresh minute observation required for source/mode/age checks. Each rule has
+its own baseline and one-shot history; edits, errors, source changes and long gaps
+re-seed. Indicator values are labeled as values and never drawn as dollar levels.
+The app must remain running; crossings between polls may be missed. Scan alerts
+monitor selected symbols, not an unattended universe-wide rescan. Alert storage v2
+accepts v1 files; keep a backup before opening with an older build.

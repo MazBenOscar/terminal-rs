@@ -155,6 +155,10 @@ pub enum Request {
         revision: u64,
         symbols: Vec<String>,
     },
+    PriceAlertRules {
+        revision: u64,
+        alerts: Vec<tr_core::price_alerts::Alert>,
+    },
     Latest {
         limit: usize,
     },
@@ -368,6 +372,10 @@ pub enum Response {
     PriceAlertQuotes {
         revision: u64,
         observations: Vec<(String, Result<tr_core::price_alerts::Observation, String>)>,
+    },
+    PriceAlertRules {
+        revision: u64,
+        observations: Vec<(u64, Result<tr_core::price_alerts::Observation, String>)>,
     },
     Status(String),
     CongressRefreshed(String),
@@ -884,6 +892,42 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     .collect()
                     .await;
             s.send(Response::PriceAlertQuotes { revision, observations });
+        }
+        Request::PriceAlertRules { revision, alerts } => {
+            use futures::{StreamExt, stream};
+            let observations = stream::iter(alerts)
+                .map(|alert| async move {
+                    let result = tokio::time::timeout(Duration::from_secs(20), async {
+                        let rule = alert.rule.as_ref().ok_or("Missing condition")?;
+                        let mut q = s.provider.alert_observation(&alert.symbol).await.map_err(|e| e.to_string())?;
+                        if !q.valid_at(chrono::Utc::now().timestamp()) {
+                            return Err("Stale price observation".into());
+                        }
+                        let tf = match rule {
+                            tr_core::price_alerts::Rule::Formula { timeframe, .. } => *timeframe,
+                            _ => Timeframe::M1,
+                        };
+                        let history =
+                            s.provider.scan_history(&alert.symbol, tf, 1500).await.map_err(|e| e.to_string())?;
+                        if history.simulated != q.simulated {
+                            return Err("Condition and price data modes differ".into());
+                        }
+                        let last = history.bars.last().ok_or("No condition history")?;
+                        if last.ts > q.ts + 30 || q.ts.saturating_sub(last.ts) > tf.seconds() + 120 {
+                            return Err("Condition history is stale relative to price".into());
+                        }
+                        q.price = rule.value(&history.bars)?;
+                        q.source = format!("{} · {}", q.source, rule.label().chars().take(200).collect::<String>());
+                        Ok(q)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("Condition request timed out".into()));
+                    (alert.id, result)
+                })
+                .buffer_unordered(4)
+                .collect()
+                .await;
+            s.send(Response::PriceAlertRules { revision, observations });
         }
         Request::Heikin { pane, generation, bars } => {
             let input = bars.clone();

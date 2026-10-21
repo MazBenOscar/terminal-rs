@@ -2334,7 +2334,7 @@ impl ChartState {
     fn paint_price_alerts(&self, ui: &Ui, plot: Rect, scale: &PriceScale) {
         use tr_core::price_alerts::Status;
         let painter = ui.painter_at(plot);
-        for alert in self.price_alerts.iter().filter(|a| a.status != Status::Triggered) {
+        for alert in self.price_alerts.iter().filter(|a| a.status != Status::Triggered && a.rule.is_none()) {
             if scale.log && alert.level <= 0. {
                 continue;
             }
@@ -2411,6 +2411,25 @@ impl ChartState {
             ui.close();
         }
         ui.menu_button("Price alerts", |ui| {
+            if ui.button("Indicator / formula alert…").clicked() {
+                self.price_alert_actions.push(AlertAction::Condition {
+                    symbol: self.symbol.clone(),
+                    level: 70.,
+                    rule: tr_core::price_alerts::Rule::Formula { expression: "WRSI(14)".into(), timeframe: self.tf },
+                });
+                ui.close();
+            }
+            if let Some(scan) = &self.data.workflow.scan
+                && ui.button("Alert when this symbol matches scan…").clicked()
+                && let Ok(expression) = crate::chart_workflow::expression(scan)
+            {
+                self.price_alert_actions.push(AlertAction::Condition {
+                    symbol: self.symbol.clone(),
+                    level: 0.5,
+                    rule: tr_core::price_alerts::Rule::Formula { expression, timeframe: scan.timeframe },
+                });
+                ui.close();
+            }
             if ui.button("Manage all alerts…").clicked() {
                 self.price_alert_actions.push(AlertAction::Manage);
                 ui.close();
@@ -2574,6 +2593,22 @@ impl ChartState {
                 ui.separator();
                 let mut edited = self.drawings[index].clone();
                 ui.label(format!("Selected {}", edited.tool.label()));
+                if matches!(edited.tool, Tool::Trendline | Tool::Ray | Tool::Horizontal)
+                    && ui.button("Alert on saved line…").clicked()
+                {
+                    let (a, b) = if edited.a.ts <= edited.b.ts { (edited.a, edited.b) } else { (edited.b, edited.a) };
+                    let (start, end, first, last) = if edited.tool == Tool::Horizontal {
+                        (a.ts, a.ts + 60, a.price, a.price)
+                    } else {
+                        (a.ts, b.ts, a.price, b.price)
+                    };
+                    self.price_alert_actions.push(AlertAction::Condition {
+                        symbol: self.symbol.clone(),
+                        level: 0.,
+                        rule: tr_core::price_alerts::Rule::Line { start, end, first, last, logarithmic: self.log },
+                    });
+                    ui.close();
+                }
                 if edited.tool == Tool::Text && ui.button("Edit text…").clicked() {
                     self.draw.note = Some(NoteDraft {
                         anchor: edited.a,

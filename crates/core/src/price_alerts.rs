@@ -48,6 +48,67 @@ pub struct Alert {
     pub status: Status,
     /// Sample alerts can only be evaluated against explicitly simulated data.
     pub simulated: bool,
+    #[serde(default)]
+    pub rule: Option<Rule>,
+}
+
+/// Formula values and line-distance values have their own units, not market prices.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Rule {
+    Formula { expression: String, timeframe: crate::Timeframe },
+    Line { start: i64, end: i64, first: f64, last: f64, logarithmic: bool },
+}
+impl Rule {
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Formula { expression, .. } => crate::indicators::pcf::evaluate(
+                expression,
+                &crate::indicators::registry::Input::new(&[], crate::Timeframe::D1),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+            Self::Line { start, end, first, last, logarithmic } => {
+                if *start > 0
+                    && end > start
+                    && first.is_finite()
+                    && last.is_finite()
+                    && (!logarithmic || (*first > 0. && *last > 0.))
+                {
+                    Ok(())
+                } else {
+                    Err("Line requires two increasing timestamps and valid prices".into())
+                }
+            }
+        }
+    }
+    pub fn value(&self, bars: &[crate::Bar]) -> Result<f64, String> {
+        let bar = bars.last().ok_or("No condition history")?;
+        let value = match self {
+            Self::Formula { expression, timeframe } => *crate::indicators::pcf::evaluate(
+                expression,
+                &crate::indicators::registry::Input::new(bars, *timeframe),
+            )
+            .map_err(|e| e.to_string())?
+            .last()
+            .ok_or("No formula value")?,
+            Self::Line { start, end, first, last, logarithmic } => {
+                let fraction = (bar.ts - start) as f64 / (end - start) as f64;
+                let line = if *logarithmic {
+                    (first.ln() + fraction * (last.ln() - first.ln())).exp()
+                } else {
+                    first + fraction * (last - first)
+                };
+                bar.close - line
+            }
+        };
+        if value.is_finite() { Ok(value) } else { Err("Condition needs more valid history".into()) }
+    }
+    pub fn label(&self) -> String {
+        match self {
+            Self::Formula { expression, timeframe } => format!("{expression} · {}", timeframe.label()),
+            Self::Line { .. } => "Price minus saved line (time extrapolation)".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -87,18 +148,25 @@ pub struct Book {
 
 impl Default for Book {
     fn default() -> Self {
-        Self { version: 1, alerts: vec![], events: vec![], next_id: 1, previous: HashMap::new() }
+        Self { version: 2, alerts: vec![], events: vec![], next_id: 1, previous: HashMap::new() }
     }
 }
 
 impl Book {
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 1 || self.next_id == 0 || self.alerts.len() > MAX_ALERTS || self.events.len() > MAX_EVENTS {
+        if !(1..=2).contains(&self.version)
+            || self.next_id == 0
+            || self.alerts.len() > MAX_ALERTS
+            || self.events.len() > MAX_EVENTS
+        {
             return Err("Unsupported or oversized price-alert file".into());
         }
         let mut ids = HashSet::new();
         for a in &self.alerts {
             validate_alert(&a.symbol, a.level)?;
+            if let Some(rule) = &a.rule {
+                rule.validate()?;
+            }
             if a.id == 0 || a.id >= self.next_id || !ids.insert(a.id) {
                 return Err("Invalid or duplicate price-alert ID".into());
             }
@@ -127,7 +195,7 @@ impl Book {
         }
         let id = self.next_id;
         self.next_id = id.checked_add(1).ok_or("No free alert IDs")?;
-        self.alerts.push(Alert { id, symbol, level, direction, status: Status::Armed, simulated });
+        self.alerts.push(Alert { id, symbol, level, direction, status: Status::Armed, simulated, rule: None });
         Ok(id)
     }
 
@@ -159,12 +227,42 @@ impl Book {
     }
 
     pub fn observe(&mut self, q: Observation, now: i64) -> Vec<Event> {
+        self.observe_target(q, now, None)
+    }
+    pub fn observe_rule(&mut self, id: u64, q: Observation, now: i64) -> Vec<Event> {
+        self.observe_target(q, now, Some(id))
+    }
+    pub fn set_rule(&mut self, id: u64, rule: Option<Rule>) -> Result<(), String> {
+        if let Some(r) = &rule {
+            r.validate()?;
+        }
+        let a = self.alerts.iter_mut().find(|a| a.id == id).ok_or("Alert no longer exists")?;
+        a.rule = rule;
+        self.version = 2;
+        self.previous.remove(&id);
+        Ok(())
+    }
+    pub fn reset_rule(&mut self, id: u64) {
+        self.previous.remove(&id);
+    }
+    fn observe_target(&mut self, q: Observation, now: i64, target: Option<u64>) -> Vec<Event> {
         if !q.valid_at(now) {
-            self.reset_symbol(&q.symbol);
+            if let Some(id) = target {
+                self.previous.remove(&id);
+            } else {
+                self.reset_symbol(&q.symbol);
+            }
             return vec![];
         }
         let mut fired = Vec::new();
-        for a in self.alerts.iter_mut().filter(|a| a.symbol == q.symbol && a.status == Status::Armed) {
+        for a in self.alerts.iter_mut().filter(|a| {
+            a.symbol == q.symbol
+                && a.status == Status::Armed
+                && match target {
+                    Some(id) => a.id == id && a.rule.is_some(),
+                    None => a.rule.is_none(),
+                }
+        }) {
             if a.simulated != q.simulated {
                 self.previous.remove(&a.id);
                 continue;
@@ -211,6 +309,27 @@ fn validate_alert(symbol: &str, level: f64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conditions_are_isolated_and_line_math_and_migration_are_valid() {
+        let mut b = book(Direction::Above);
+        let id = b.add("AAPL US Equity".into(), 70., Direction::Above, false).unwrap();
+        let rule = Rule::Formula { expression: "WRSI(14)".into(), timeframe: crate::Timeframe::D1 };
+        rule.validate().unwrap();
+        b.set_rule(id, Some(rule)).unwrap();
+        b.observe_rule(id, quote(69., 1000), 1000);
+        assert!(b.observe(quote(71., 1001), 1001).is_empty());
+        assert_eq!(b.observe_rule(id, quote(71., 1001), 1001).len(), 1);
+        assert_eq!(b.alerts[0].status, Status::Armed);
+        let line = Rule::Line { start: 1000, end: 1100, first: 100., last: 110., logarithmic: false };
+        line.validate().unwrap();
+        let bar = crate::Bar::new(1200, 125., 125., 125., 125., 1.);
+        assert_eq!(line.value(&[bar]).unwrap(), 5.);
+        let json = r#"{"version":1,"alerts":[{"id":1,"symbol":"AAPL US Equity","level":100.0,"direction":"Above","status":"Armed","simulated":false}],"events":[],"next_id":2}"#;
+        let legacy: Book = serde_json::from_str(json).unwrap();
+        legacy.validate().unwrap();
+        assert!(legacy.alerts[0].rule.is_none());
+        assert!(Rule::Formula { expression: "BOGUS(10)".into(), timeframe: crate::Timeframe::M1 }.validate().is_err());
+    }
     fn quote(price: f64, ts: i64) -> Observation {
         Observation { symbol: "AAPL US Equity".into(), price, ts, simulated: false, source: "test".into() }
     }
