@@ -30,6 +30,7 @@ pub struct Snapshot {
     pub levels: Vec<Level>,
     pub status: String,
     pub chart_mark: bool,
+    status_error: bool,
 }
 impl Snapshot {
     pub fn build(
@@ -42,6 +43,7 @@ impl Snapshot {
     ) -> Self {
         let Some(pf) = pf else {
             return Self {
+                status_error: !demo && error.is_some(),
                 status: if demo {
                     "DEMO · no portfolio".into()
                 } else {
@@ -59,6 +61,7 @@ impl Snapshot {
         };
         let mut out =
             Self { accounts: pf.accounts.iter().map(|a| (a.id.clone(), a.label())).collect(), ..Default::default() };
+        out.status_error = error.is_some();
         let age = pf.fetched.map(|t| (chrono::Utc::now() - t).num_seconds());
         out.status = format!(
             "{mode} overlays{}{}",
@@ -137,8 +140,10 @@ impl Snapshot {
         out
     }
     pub fn menu(&self, ui: &mut Ui, settings: &mut Settings) {
+        ui.set_max_width(theme::dp(280.));
         ui.checkbox(&mut settings.positions, "Position average cost and P/L");
         ui.checkbox(&mut settings.orders, "Working limit and stop orders");
+        ui.label(egui::RichText::new("Account").small().color(muted()));
         egui::ComboBox::from_id_salt("chart-overlay-account")
             .selected_text(
                 settings
@@ -153,8 +158,13 @@ impl Snapshot {
                     ui.selectable_value(&mut settings.account, Some(id.clone()), name);
                 }
             });
-        ui.label(&self.status);
-        ui.label("Read-only. P/L uses the chart's latest loaded price; data can be delayed.");
+        ui.separator();
+        if self.status_error {
+            ui.add(egui::Label::new(egui::RichText::new(&self.status).small().color(theme::down())).wrap());
+        } else {
+            crate::chart_view::menu_note(ui, &self.status);
+        }
+        crate::chart_view::menu_note(ui, "Read-only · P/L at the chart's latest loaded price; may be delayed.");
     }
     pub fn paint(&self, ui: &Ui, plot: Rect, scale: &PriceScale, mark: Option<f64>) {
         let p = ui.painter_at(plot);

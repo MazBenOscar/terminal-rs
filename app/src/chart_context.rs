@@ -43,11 +43,13 @@ pub fn session_levels(bars: &[Bar], tf: Timeframe, us: bool) -> Option<(Option<f
 }
 impl Settings {
     pub fn menu(&mut self, ui: &mut Ui) {
+        ui.set_max_width(theme::dp(280.));
         ui.checkbox(&mut self.countdown, "Countdown to bar close");
         ui.checkbox(&mut self.previous, "Previous loaded session close");
         ui.checkbox(&mut self.range, "Loaded session high / low");
         ui.checkbox(&mut self.extended, "Shade available US pre/post-market bars");
-        ui.label("Uses loaded provider bars. Missing extended-hours history is not synthesized.");
+        ui.separator();
+        crate::chart_view::menu_note(ui, "From loaded bars; missing extended hours are not filled in.");
     }
     pub fn shade(&self, ui: &Ui, plot: Rect, v: &Viewport, bars: &[Bar], tf: Timeframe, us: bool) {
         if !self.extended || !tf.is_intraday() || !us {

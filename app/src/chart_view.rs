@@ -25,6 +25,15 @@ use crate::theme::{self, amber, amber_dim, mono, muted, text, ui_font};
 use crate::widgets;
 use crate::worker::{BuiltIndicator, PaneId, Request, Worker, initial_limit};
 
+fn menu_section(ui: &mut Ui, title: &str) {
+    ui.add_space(theme::dp(3.));
+    ui.label(RichText::new(title).small().color(theme::muted()));
+}
+
+pub(crate) fn menu_note(ui: &mut Ui, text: &str) {
+    ui.add(egui::Label::new(RichText::new(text).small().color(theme::muted())).wrap());
+}
+
 pub(crate) fn label_plate(painter: &egui::Painter, rect: Rect) {
     painter.rect_filled(rect.expand2(vec2(2., 1.)), 2., theme::card().gamma_multiply(0.82));
 }
@@ -2747,24 +2756,68 @@ impl ChartState {
     }
 
     fn context_menu(&mut self, ui: &mut Ui, w: &Worker) {
-        ui.menu_button("Anchored VWAP and volume profile", |ui| {
+        ui.set_min_width(theme::dp(190.));
+        menu_section(ui, "View");
+        self.view_menu(ui, w);
+        ui.separator();
+        menu_section(ui, "Analysis");
+        self.analysis_menu(ui);
+        ui.separator();
+        menu_section(ui, "Alerts & account");
+        self.alerts_menu(ui);
+        ui.menu_button("Positions & orders", |ui| self.account_overlay.menu(ui, &mut self.data.account));
+        ui.separator();
+        menu_section(ui, "Tools");
+        self.replay_export_menu(ui, w);
+        self.navigation_menu(ui, w);
+        self.data_navigation_menu(ui, w);
+        ui.separator();
+        if ui.button("Add to Watchlist").clicked() {
+            self.actions.push(Action::AddToWatchlist(self.symbol.clone()));
+            ui.close();
+        }
+        if self.sec.has_congress_trades() {
+            ui.checkbox(&mut self.show_congress, "Congress Trade Markers");
+            if ui.button("Who in Congress Traded This…").clicked() {
+                self.actions.push(Action::OpenTicker(self.symbol.clone()));
+                ui.close();
+            }
+        }
+    }
+
+    fn analysis_menu(&mut self, ui: &mut Ui) {
+        ui.menu_button("Anchored VWAP & volume profile", |ui| {
             self.data.analytics.menu(ui, self.context_timestamp, self.context_price)
         });
-        ui.menu_button("Price and session context", |ui| self.data.context.menu(ui));
-        ui.menu_button("Earnings, dividends and splits", |ui| {
-            ui.checkbox(&mut self.data.show_events,"Show corporate event markers");
-            ui.label("E earnings · D dividends · S splits; hover for details and source.");
-            ui.label(&self.events_notice);
-            ui.label("Yahoo supplies available dividends/splits. Import attributed earnings in chart-events.json in the app data directory.");
-            if ui.button("Reload event data").clicked() { self.events_range = None; }
+        ui.menu_button("Session context", |ui| self.data.context.menu(ui));
+        ui.menu_button("Corporate events", |ui| {
+            ui.set_max_width(theme::dp(280.));
+            ui.checkbox(&mut self.data.show_events, "Show event markers");
+            if ui.button("Reload event data").clicked() {
+                self.events_range = None;
+            }
+            ui.separator();
+            menu_note(ui, "E earnings · D dividends · S splits; hover for details and source.");
+            if self.events_notice.starts_with("Provider events unavailable:")
+                || self.events_notice.contains("import error:")
+            {
+                ui.add(egui::Label::new(RichText::new(&self.events_notice).small().color(theme::down())).wrap());
+            } else {
+                menu_note(ui, &self.events_notice);
+            }
+            menu_note(ui, "Dividends/splits from Yahoo · earnings from chart-events.json");
+            menu_note(ui, "Import attributed earnings in the app data directory.");
         });
-        ui.menu_button("Chart navigation", |ui| {
-            ui.label("DATE YYYY-MM-DD jumps to a date; provider history limits apply.");
-            if ui.button("Previous symbol (Up)").clicked() {
+    }
+
+    fn navigation_menu(&mut self, ui: &mut Ui, w: &Worker) {
+        ui.menu_button("Navigation", |ui| {
+            ui.set_max_width(theme::dp(280.));
+            if ui.add(egui::Button::new("Previous symbol").shortcut_text("↑")).clicked() {
                 self.actions.push(Action::Command("PREV".into()));
                 ui.close();
             }
-            if ui.button("Next symbol (Down)").clicked() {
+            if ui.add(egui::Button::new("Next symbol").shortcut_text("↓")).clicked() {
                 self.actions.push(Action::Command("NEXT".into()));
                 ui.close();
             }
@@ -2773,19 +2826,40 @@ impl ChartState {
                 ui.close();
             }
             if let Some(scan) = &self.data.workflow.scan {
-                ui.label(format!("{} · {} matched symbols", scan.name, self.data.workflow.symbols.len()));
+                ui.label(
+                    RichText::new(format!("Scan · {} · {} symbols", scan.name, self.data.workflow.symbols.len()))
+                        .small()
+                        .color(muted()),
+                );
                 for condition in &scan.conditions {
-                    ui.label(condition.label());
+                    ui.label(RichText::new(condition.label()).font(mono(11.)).color(muted()));
                 }
-                if ui.button("Plot scan conditions (1 = match)").clicked() {
+                if ui.button("Plot scan conditions").clicked() {
                     self.plot_scan(w);
                     ui.close();
                 }
-                ui.label("The plot evaluates loaded chart bars, not the earlier scanner snapshot.");
+            }
+            ui.separator();
+            menu_note(ui, "Type DATE YYYY-MM-DD to jump to a date");
+            menu_note(ui, "Provider history limits apply.");
+            if self.data.workflow.scan.is_some() {
+                menu_note(ui, "Plot: 1 = match; uses loaded bars, not the earlier scan snapshot.");
             }
         });
-        ui.menu_button("Replay and exports", |ui| {
-            for (label, image) in [("Export visible OHLCV CSV", false), ("Export visible price chart SVG", true)] {
+    }
+
+    fn replay_export_menu(&mut self, ui: &mut Ui, w: &Worker) {
+        ui.menu_button("Replay & export", |ui| {
+            ui.set_max_width(theme::dp(280.));
+            if ui.add_enabled(!self.source_bars.is_empty(), egui::Button::new("Replay from here…")).clicked() {
+                self.replay_cutoff =
+                    self.context_timestamp.or_else(|| self.source_bars.get(self.source_bars.len() / 2).map(|b| b.ts));
+                self.replay_play = false;
+                ui.ctx().request_repaint();
+                ui.close();
+            }
+            ui.separator();
+            for (label, image) in [("Export visible bars as CSV", false), ("Export chart as SVG", true)] {
                 if ui.add_enabled(!self.bars.is_empty(), egui::Button::new(label)).clicked() {
                     let (a, b) = self.viewport.map_or((0, self.bars.len()), |v| v.visible_range(self.bars.len()));
                     w.send(Request::ExportChart {
@@ -2808,7 +2882,6 @@ impl ChartState {
                     self.export_notice = None;
                 }
             }
-            ui.label("SVG exports OHLC candles and axes; studies/drawings/UI panes are excluded.");
             if let Some(result) = &self.export_notice {
                 match result {
                     Ok(path) => {
@@ -2827,22 +2900,21 @@ impl ChartState {
                     }
                 }
             }
-            if ui.add_enabled(!self.source_bars.is_empty(), egui::Button::new("Replay loaded history…")).clicked() {
-                self.replay_cutoff =
-                    self.context_timestamp.or_else(|| self.source_bars.get(self.source_bars.len() / 2).map(|b| b.ts));
-                self.replay_play = false;
-                ui.ctx().request_repaint();
-                ui.close();
-            }
-            ui.label("Replay uses loaded bars; live alerts keep monitoring independently.");
-            ui.label("Drawings, account levels and disclosure markers are hidden during replay.");
+            ui.separator();
+            menu_note(ui, "Replay uses loaded bars; live alerts keep running.");
+            menu_note(ui, "Hidden during replay: drawings, account levels, Congress markers.");
+            menu_note(ui, "SVG: candles and axes only (no studies, drawings or UI panes).");
         });
         if self.chart_type == ChartType::Renko {
+            menu_section(ui, "Renko box");
             self.box_controls(ui);
-            ui.label("Close-only, one-box reversal; studies use synthetic bricks.");
-            ui.label("Comparisons and drawings are unavailable on repeated brick timestamps.");
+            ui.separator();
+            menu_note(ui, "Close-only bricks, one-box reversal; studies use synthetic bricks.");
+            menu_note(ui, "No comparisons or drawings on repeated brick timestamps.");
         }
-        ui.menu_button("Positions and orders", |ui| self.account_overlay.menu(ui, &mut self.data.account));
+    }
+
+    fn alerts_menu(&mut self, ui: &mut Ui) {
         use crate::price_alerts::Action as AlertAction;
         if ui.add_enabled(self.context_price.is_some(), egui::Button::new("Create price alert here…")).clicked() {
             if let Some(level) = self.context_price {
@@ -2912,12 +2984,11 @@ impl ChartState {
                 });
             }
         });
-        ui.separator();
-        ui.set_min_width(190.0);
+    }
+
+    fn data_navigation_menu(&mut self, ui: &mut Ui, w: &Worker) {
         ui.menu_button("Time zone, session & refresh", |ui| {
-            if let Some(notice) = &self.live_notice {
-                ui.colored_label(amber(), notice);
-            }
+            ui.set_max_width(theme::dp(280.));
             let before = self.data.clone();
             self.data.edit(ui, matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf));
             if self.data.session != before.session || self.data.history != before.history {
@@ -2931,17 +3002,26 @@ impl ChartState {
                 self.load(w);
                 ui.close();
             }
+            ui.separator();
+            menu_note(ui, "Session filters are separate from history requests; unsupported options show an error.");
+            menu_note(ui, &tr_core::exchange_calendar::description());
+            menu_note(ui, "History refresh does not establish a real-time subscription.");
+            if let Some(notice) = &self.live_notice {
+                menu_note(ui, notice);
+            }
         });
         ui.menu_button("Linked navigation", |ui| {
-            ui.label("Uses this pane's color link group");
+            ui.set_max_width(theme::dp(280.));
             ui.checkbox(&mut self.navigation.cursor, "Synchronize timestamp cursor");
             ui.checkbox(&mut self.navigation.range, "Synchronize visible date range");
+            ui.separator();
+            menu_note(ui, "Uses this pane's color link group");
         });
-        if ui.button("Reset View").clicked() {
-            self.reset_view();
-            ui.close();
-        }
-        ui.menu_button("Chart Type", |ui| {
+    }
+
+    fn view_menu(&mut self, ui: &mut Ui, w: &Worker) {
+        use crate::price_alerts::Action as AlertAction;
+        ui.menu_button("Chart type", |ui| {
             for ct in ChartType::ALL {
                 if ui.radio(self.chart_type == ct, ct.label()).clicked() {
                     self.chart_type = ct;
@@ -2951,11 +3031,11 @@ impl ChartState {
         });
         ui.menu_button("Indicators", |ui| {
             ui.set_min_width(220.0);
-            if ui.button("Manage Indicators…").clicked() {
+            if ui.button("Manage indicators…").clicked() {
                 self.indicator_editor = true;
                 ui.close();
             }
-            if ui.button("Search Indicators…").clicked() {
+            if ui.button("Search indicators…").clicked() {
                 self.actions.push(Action::Command("IND".into()));
                 ui.close();
             }
@@ -2970,7 +3050,12 @@ impl ChartState {
             }
             ui.separator();
             for cat in Category::ALL {
-                ui.menu_button(cat.label(), |ui| {
+                let label = match cat {
+                    Category::MovingAverages => "Moving averages",
+                    Category::Bands => "Bands & channels",
+                    _ => cat.label(),
+                };
+                ui.menu_button(label, |ui| {
                     ui.set_min_width(260.0);
                     egui::ScrollArea::vertical().max_height(440.0).show(ui, |ui| {
                         for def in registry::all().iter().filter(|d| d.category == cat) {
@@ -2988,7 +3073,7 @@ impl ChartState {
                 });
             }
             ui.separator();
-            if ui.button("Remove All").clicked() {
+            if ui.button("Remove all").clicked() {
                 self.clear_indicators();
                 ui.close();
             }
@@ -2997,7 +3082,7 @@ impl ChartState {
             if ui
                 .add_enabled(
                     self.draw.selected.is_some(),
-                    egui::Button::new("Delete Selected Drawing").shortcut_text("Delete"),
+                    egui::Button::new("Delete selected drawing").shortcut_text("Delete"),
                 )
                 .clicked()
             {
@@ -3085,31 +3170,23 @@ impl ChartState {
                     self.drawings[index] = edited;
                 }
             }
-            if ui.button("Remove Drawings on This Symbol").clicked() {
+            if ui.button("Remove drawings on this symbol").clicked() {
                 self.remember_drawings();
                 self.drawings.retain(|d| !d.visible_on(&self.symbol));
                 self.draw = DrawState::default();
                 ui.close();
             }
         });
-        ui.checkbox(&mut self.log, "Log Scale");
         if ui.button("Compare symbol…").clicked() {
             self.compare_picker.open();
             ui.close();
         }
-        ui.checkbox(&mut self.magnet, "Magnet");
+        ui.checkbox(&mut self.log, "Log scale");
         ui.checkbox(&mut self.show_volume, "Volume");
-        ui.separator();
-        if ui.button("Add to Watchlist").clicked() {
-            self.actions.push(Action::AddToWatchlist(self.symbol.clone()));
+        ui.checkbox(&mut self.magnet, "Magnet");
+        if ui.button("Reset view").clicked() {
+            self.reset_view();
             ui.close();
-        }
-        if self.sec.has_congress_trades() {
-            ui.checkbox(&mut self.show_congress, "Congress Trade Markers");
-            if ui.button("Who in Congress Traded This…").clicked() {
-                self.actions.push(Action::OpenTicker(self.symbol.clone()));
-                ui.close();
-            }
         }
     }
 
@@ -4613,6 +4690,18 @@ mod tests {
     }
 
     #[test]
+    fn context_menu_renders_sections_in_order() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        let worker = Worker::inert();
+        let texts = ui_frame(&ctx, vec![], |ui| chart.context_menu(ui, &worker));
+        let headers = ["View", "Analysis", "Alerts & account", "Tools"];
+        let rendered: Vec<_> = texts.iter().filter(|(text, _)| headers.contains(&text.as_str())).collect();
+        assert_eq!(rendered.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>(), headers);
+        assert!(rendered.windows(2).all(|pair| pair[0].1.top() < pair[1].1.top()));
+    }
+
+    #[test]
     fn context_menu_deletes_only_the_selected_drawing_and_undo_restores_it() {
         let ctx = egui::Context::default();
         let mut chart = sample_chart();
@@ -4629,7 +4718,7 @@ mod tests {
         let texts = ui_frame(&ctx, vec![], |ui| chart.context_menu(ui, &worker));
         let delete = texts
             .iter()
-            .find(|(text, _)| text == "Delete Selected Drawing")
+            .find(|(text, _)| text == "Delete selected drawing")
             .expect("selected deletion is exposed")
             .1
             .center();

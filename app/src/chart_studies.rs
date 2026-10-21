@@ -47,6 +47,7 @@ impl Cache {
 }
 impl Settings {
     pub fn menu(&mut self, ui: &mut Ui, timestamp: Option<i64>, price: Option<f64>) {
+        ui.set_max_width(theme::dp(280.));
         if ui.add_enabled(timestamp.is_some(), egui::Button::new("Anchor VWAP at clicked bar")).clicked() {
             self.anchor = timestamp;
             ui.close();
@@ -54,25 +55,30 @@ impl Settings {
         if ui.button("Clear anchored VWAP").clicked() {
             self.anchor = None;
         }
+        ui.label(egui::RichText::new("Volume profile").small().color(muted()));
         for mode in [ProfileMode::Off, ProfileMode::Visible, ProfileMode::Session] {
-            ui.selectable_value(
+            ui.radio_value(
                 &mut self.profile,
                 mode,
                 match mode {
-                    ProfileMode::Off => "Volume profile off",
-                    ProfileMode::Visible => "Visible-range profile",
-                    ProfileMode::Session => "Latest session profile",
+                    ProfileMode::Off => "Off",
+                    ProfileMode::Visible => "Visible range",
+                    ProfileMode::Session => "Latest session",
                 },
             );
         }
-        ui.add(egui::DragValue::new(&mut self.bins).range(8..=128).prefix("Bins "));
+        ui.horizontal(|ui| {
+            ui.label("Profile bins");
+            ui.add_enabled(self.profile != ProfileMode::Off, egui::DragValue::new(&mut self.bins).range(8..=128));
+        });
         if ui.add_enabled(price.is_some(), egui::Button::new("Set baseline to clicked price")).clicked() {
             self.baseline = price;
         }
         if ui.button("Reset baseline to visible start").clicked() {
             self.baseline = None;
         }
-        ui.label("OHLCV profile estimate; exact volume-at-price requires trade data.");
+        ui.separator();
+        crate::chart_view::menu_note(ui, "Estimated from OHLCV; exact volume-at-price requires trades.");
     }
     pub fn paint_profile(
         &self,
