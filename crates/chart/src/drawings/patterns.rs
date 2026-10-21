@@ -31,7 +31,10 @@ impl Placement {
         if self.points.len() != point_count(tool) {
             return None;
         }
-        let mut d = Drawing::new(tool, self.points[0], self.points[1]);
+        let [first, second, ..] = self.points.as_slice() else {
+            return None;
+        };
+        let mut d = Drawing::new(tool, *first, *second);
         d.pattern_points = std::mem::take(&mut self.points);
         Some(d)
     }
@@ -58,11 +61,14 @@ pub fn ratios(tool: Tool, p: &[Anchor]) -> Vec<(&'static str, Option<f64>)> {
 /// Screen y grows downward. Extrema use both neighbours; monotone/tied
 /// points use their neighbour mean (ties go above) for a stable fallback.
 pub fn label_above(points: &[Point], index: usize) -> bool {
-    let y = points[index][1];
-    let neighbours: Vec<_> = [index.checked_sub(1), (index + 1 < points.len()).then_some(index + 1)]
+    let Some(point) = points.get(index) else {
+        return true;
+    };
+    let y = point[1];
+    let neighbours: Vec<_> = [index.checked_sub(1), index.checked_add(1)]
         .into_iter()
         .flatten()
-        .map(|i| points[i][1])
+        .filter_map(|i| points.get(i).map(|point| point[1]))
         .collect();
     neighbours.is_empty() || y <= neighbours.iter().sum::<f64>() / neighbours.len() as f64
 }
@@ -115,16 +121,20 @@ pub fn geometry(d: &Drawing, points: &[Point], bounds: [f64; 4]) -> Vec<LabeledS
             }
         }
     }
-    if d.tool == Tool::HeadAndShoulders && points.len() > 4 {
-        let (a, b) = neckline(points[2], points[4], bounds[2]).unwrap_or((points[2], points[4]));
+    if d.tool == Tool::HeadAndShoulders
+        && let [_, _, a, _, b, ..] = points
+    {
+        let (a, b) = neckline(*a, *b, bounds[2]).unwrap_or((*a, *b));
         result.push((Shape::Segment(a, b), None));
     }
-    if d.tool == Tool::TrianglePattern && points.len() >= 3 {
-        result.push((Shape::Segment(points[0], points[2]), None));
-        if points.len() == 4 {
-            result.push((Shape::Segment(points[1], points[3]), None));
-            if let Some(end) = intersection(points[0], points[2], points[1], points[3]) {
-                for start in [points[0], points[1]] {
+    if d.tool == Tool::TrianglePattern
+        && let [a, _, c, ..] = points
+    {
+        result.push((Shape::Segment(*a, *c), None));
+        if let [a, b, c, d] = points {
+            result.push((Shape::Segment(*b, *d), None));
+            if let Some(end) = intersection(*a, *c, *b, *d) {
+                for start in [*a, *b] {
                     result.push((Shape::Segment(start, end), None));
                 }
             }

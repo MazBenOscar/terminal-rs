@@ -212,6 +212,22 @@ impl Drawing {
             arrow_end: false,
         }
     }
+    /// Normalise untrusted saved geometry; false means the drawing is incomplete.
+    pub fn sanitize(&mut self) -> bool {
+        self.text = text::sanitize(&self.text);
+        if self.tool != Tool::Path {
+            self.arrow_end = false;
+        }
+        if matches!(self.tool, Tool::Path | Tool::Brush) {
+            self.vertices.retain(|point| point.price.is_finite());
+            self.vertices.truncate(shapes::MAX_POINTS);
+            self.vertices.len() >= 2
+        } else {
+            self.vertices.clear();
+            true
+        }
+    }
+
     pub fn visible_on(&self, symbol: &str) -> bool {
         self.all_symbols || self.symbol.as_deref().is_none_or(|owner| owner == symbol)
     }
@@ -400,6 +416,29 @@ pub fn hit_distance(context: &Geometry<'_>, point: Point) -> f64 {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
+
+    #[test]
+    fn sanitizing_untrusted_vertices_clears_caps_and_rejects_incomplete_strokes() {
+        let a = Anchor { ts: 1, price: 100. };
+        for tool in Tool::ALL {
+            let mut drawing = Drawing::new(tool, a, a);
+            drawing.vertices = vec![a; shapes::MAX_POINTS + 500];
+            drawing.arrow_end = true;
+            assert!(drawing.sanitize());
+            assert_eq!(drawing.arrow_end, tool == Tool::Path);
+            if matches!(tool, Tool::Path | Tool::Brush) {
+                assert_eq!(drawing.vertices.len(), shapes::MAX_POINTS);
+                for vertices in [vec![], vec![a], vec![a, Anchor { price: f64::NAN, ..a }]] {
+                    drawing.vertices = vertices;
+                    assert!(!drawing.sanitize());
+                }
+            } else {
+                assert!(drawing.vertices.is_empty());
+            }
+        }
+        assert!(patterns::label_above(&[], 0));
+        assert!(patterns::label_above(&[[0., 0.]], usize::MAX));
+    }
 
     #[test]
     fn family_dispatch_covers_every_tool_geometry_hits_and_handles() {

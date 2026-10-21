@@ -76,6 +76,7 @@ pub enum PaneSettings {
         chart_type: ChartType,
         log: bool,
         indicators: Vec<IndicatorSpec>,
+        #[serde(deserialize_with = "deserialize_drawings")]
         drawings: Vec<Drawing>,
         compare: Option<String>,
         #[serde(default)]
@@ -145,6 +146,12 @@ pub enum PaneSettings {
         #[serde(default)]
         open_only: bool,
     },
+}
+
+fn deserialize_drawings<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Drawing>, D::Error> {
+    let mut drawings = Vec::<Drawing>::deserialize(deserializer)?;
+    drawings.retain_mut(Drawing::sanitize);
+    Ok(drawings)
 }
 
 fn yes() -> bool {

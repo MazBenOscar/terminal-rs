@@ -6,7 +6,11 @@ pub fn point_count(_tool: Tool) -> usize {
     2
 }
 pub fn handles(d: &super::Drawing) -> Vec<Anchor> {
-    if !d.vertices.is_empty() { d.vertices.clone() } else { super::anchor_handles(d, 2) }
+    if matches!(d.tool, Tool::Path | Tool::Brush) && !d.vertices.is_empty() {
+        d.vertices.clone()
+    } else {
+        super::anchor_handles(d, 2)
+    }
 }
 pub fn hit_distance(g: &Geometry<'_>, p: Point) -> f64 {
     super::distance_to_shapes(geometry(g), p)
@@ -29,8 +33,10 @@ pub fn geometry(g: &Geometry<'_>) -> Vec<LabeledShape> {
                 g.drawing.vertices.iter().copied().map(g.project).collect()
             };
             let mut shapes: Vec<_> = points.windows(2).map(|p| (Shape::Segment(p[0], p[1]), None)).collect();
-            if g.drawing.arrow_end && points.len() > 1 {
-                shapes.extend(super::lines::arrowhead(points[points.len() - 2], points[points.len() - 1]));
+            if g.drawing.arrow_end
+                && let [.., a, b] = points.as_slice()
+            {
+                shapes.extend(super::lines::arrowhead(*a, *b));
             }
             shapes
         }
@@ -54,24 +60,33 @@ pub fn simplify(points: &[Anchor], project: &dyn Fn(Anchor) -> Point) -> Vec<Anc
     }
     let screen: Vec<_> = points.iter().copied().map(project).collect();
     let mut keep = vec![false; points.len()];
-    keep[0] = true;
-    keep[points.len() - 1] = true;
+    if let Some(first) = keep.first_mut() {
+        *first = true;
+    }
+    if let Some(last) = keep.last_mut() {
+        *last = true;
+    }
     let mut stack = vec![(0, points.len() - 1)];
     while let Some((start, end)) = stack.pop() {
-        let segment = Shape::Segment(screen[start], screen[end]);
-        let farthest =
-            (start + 1..end).map(|i| (i, super::distance(&segment, screen[i]))).max_by(|a, b| a.1.total_cmp(&b.1));
+        let (Some(&a), Some(&b)) = (screen.get(start), screen.get(end)) else {
+            continue;
+        };
+        let segment = Shape::Segment(a, b);
+        let farthest = (start + 1..end)
+            .filter_map(|i| screen.get(i).map(|&point| (i, super::distance(&segment, point))))
+            .max_by(|a, b| a.1.total_cmp(&b.1));
         if let Some((i, d)) = farthest
             && d > 0.5
+            && let Some(point) = keep.get_mut(i)
         {
-            keep[i] = true;
+            *point = true;
             stack.push((start, i));
             stack.push((i, end));
         }
     }
     let simplified: Vec<_> = points.iter().copied().zip(keep).filter_map(|(p, keep)| keep.then_some(p)).collect();
     if simplified.len() > MAX_POINTS {
-        (0..MAX_POINTS).map(|i| simplified[i * (simplified.len() - 1) / (MAX_POINTS - 1)]).collect()
+        (0..MAX_POINTS).filter_map(|i| simplified.get(i * (simplified.len() - 1) / (MAX_POINTS - 1)).copied()).collect()
     } else {
         simplified
     }

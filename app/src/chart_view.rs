@@ -896,8 +896,11 @@ impl ChartState {
         let Some(tool) = self.draw.tool else {
             return false;
         };
+        let (Some(&first), Some(&last)) = (self.draw.vertices.first(), self.draw.vertices.last()) else {
+            return false;
+        };
         let vertices = std::mem::take(&mut self.draw.vertices);
-        let mut drawing = Drawing::new(tool, vertices[0], *vertices.last().unwrap());
+        let mut drawing = Drawing::new(tool, first, last);
         drawing.vertices = vertices;
         drawing.symbol = Some(self.symbol.clone());
         self.remember_drawings();
@@ -4224,10 +4227,12 @@ impl ChartState {
                 for (i, anchor) in drawings::handles(drawing).into_iter().enumerate() {
                     let handle = if drawings::patterns::point_count(drawing.tool) > 0 {
                         DrawHandle::Pattern(i)
-                    } else if !drawing.vertices.is_empty() {
+                    } else if matches!(drawing.tool, Tool::Path | Tool::Brush) && !drawing.vertices.is_empty() {
                         DrawHandle::Vertex(i)
+                    } else if let Some(&handle) = [DrawHandle::A, DrawHandle::B, DrawHandle::C].get(i) {
+                        handle
                     } else {
-                        [DrawHandle::A, DrawHandle::B, DrawHandle::C][i]
+                        continue;
                     };
                     let point = pos2(
                         rect.left() + v.x_of(this.index_of_ts(anchor.ts)) as f32,
@@ -4277,11 +4282,19 @@ impl ChartState {
                 DrawHandle::A => edited.a = anchor,
                 DrawHandle::B => edited.b = anchor,
                 DrawHandle::C => edited.c = Some(anchor),
-                DrawHandle::Pattern(i) => edited.pattern_points[i] = anchor,
+                DrawHandle::Pattern(i) => {
+                    if let Some(point) = edited.pattern_points.get_mut(i) {
+                        *point = anchor;
+                    }
+                }
                 DrawHandle::Vertex(index) => {
-                    edited.vertices[index] = anchor;
-                    edited.a = edited.vertices[0];
-                    edited.b = *edited.vertices.last().unwrap();
+                    if let Some(v) = edited.vertices.get_mut(index) {
+                        *v = anchor;
+                        if let (Some(&first), Some(&last)) = (edited.vertices.first(), edited.vertices.last()) {
+                            edited.a = first;
+                            edited.b = last;
+                        }
+                    }
                 }
                 DrawHandle::Body => {
                     for point in std::iter::once(&mut edited.a)
@@ -4306,11 +4319,13 @@ impl ChartState {
                     edited.b = edited.a;
                 }
             }
-            if edited.pattern_points.len() >= 2 {
-                edited.a = edited.pattern_points[0];
-                edited.b = edited.pattern_points[1];
+            if let [first, second, ..] = edited.pattern_points.as_slice() {
+                edited.a = *first;
+                edited.b = *second;
             }
-            self.drawings[drag.index] = edited;
+            if let Some(drawing) = self.drawings.get_mut(drag.index) {
+                *drawing = edited;
+            }
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         } else if self.draw.hover.is_some() {
             ui.ctx().set_cursor_icon(CursorIcon::Grab);
@@ -4439,9 +4454,9 @@ impl ChartState {
             .map(|(i, d)| (d, self.draw.selected == Some(i)))
             .collect();
         if let Some(tool @ (Tool::Path | Tool::Brush)) = self.draw.tool
-            && let Some(&first) = self.draw.vertices.first()
+            && let (Some(&first), Some(&last)) = (self.draw.vertices.first(), self.draw.vertices.last())
         {
-            let mut preview = Drawing::new(tool, first, *self.draw.vertices.last().unwrap());
+            let mut preview = Drawing::new(tool, first, last);
             preview.vertices = self.draw.vertices.clone();
             if tool == Tool::Path
                 && let Some(h) = hover.filter(|h| rect.contains(*h))
@@ -5602,6 +5617,77 @@ mod tests {
         assert_eq!(chart.drawings[0], original);
         chart.undo_drawings();
         assert!(chart.drawings.is_empty());
+    }
+
+    #[test]
+    fn hostile_layout_vertices_survive_selection_drag_and_paint() {
+        use crate::layouts::{LayoutDoc, PaneSettings};
+        let a = Anchor { ts: 25 * 86400, price: 150. };
+        let b = Anchor { ts: 75 * 86400, price: 150. };
+        let mut hostile = Vec::new();
+        for tool in Tool::ALL {
+            let mut drawing = Drawing::new(tool, a, b);
+            drawing.vertices = vec![a; 8];
+            drawing.arrow_end = true;
+            hostile.push(drawing);
+        }
+        for tool in [Tool::Path, Tool::Brush] {
+            for count in [0, 1, 2_500] {
+                let mut drawing = Drawing::new(tool, a, b);
+                drawing.vertices = vec![a; count];
+                hostile.push(drawing);
+            }
+        }
+        let mut settings = crate::layouts::chart_settings("TEST", &crate::prefs::PanelDefaults::default());
+        if let PaneSettings::Chart { drawings, .. } = &mut settings {
+            *drawings = hostile;
+        }
+        let doc = LayoutDoc::preset("hostile vertices", crate::layout::Layout::Grid2x2, vec![settings]);
+        let loaded = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        let PaneSettings::Chart { drawings, .. } = &loaded.panes[0].settings else { panic!("chart") };
+        assert_eq!(drawings.len(), Tool::ALL.len() + 2);
+        for drawing in drawings {
+            if matches!(drawing.tool, Tool::Path | Tool::Brush) {
+                assert!((2..=2_000).contains(&drawing.vertices.len()));
+            } else {
+                assert!(drawing.vertices.is_empty());
+            }
+            if drawing.tool != Tool::Path {
+                assert!(!drawing.arrow_end);
+            }
+        }
+        assert_eq!(drawings.iter().filter(|d| d.vertices.len() == 2_000).count(), 2);
+
+        let ctx = egui::Context::default();
+        let from = pos2(200., 200.);
+        let to = pos2(240., 180.);
+        // Also exercise unsanitised runtime drawings: handle dispatch must not
+        // confuse a rectangle/circle's anchors with a hostile vertex list.
+        let mut raw = Drawing::new(Tool::Circle, a, b);
+        raw.vertices = vec![a; 8];
+        for drawing in drawings.iter().chain(std::iter::once(&raw)) {
+            let mut chart = drawing_chart();
+            chart.drawings = vec![drawing.clone()];
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(from)], false);
+            if drawing.tool == Tool::Circle {
+                assert!(matches!(chart.draw.hover, Some((0, DrawHandle::A))));
+            }
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], false);
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], false);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], false);
+        }
+        for handle in [DrawHandle::Vertex(usize::MAX), DrawHandle::Pattern(usize::MAX), DrawHandle::Vertex(0)] {
+            let mut chart = drawing_chart();
+            let original = Drawing::new(Tool::Path, a, b);
+            chart.drawings = vec![original.clone()];
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], false);
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(pos2(220., 190.))], false);
+            chart.drawings[0] = original.clone();
+            chart.draw.drag = Some(DrawingDrag { index: 0, handle, start: a, original: original.clone() });
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], false);
+            assert_eq!(chart.drawings[0], original);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], false);
+        }
     }
 
     #[test]
