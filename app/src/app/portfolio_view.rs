@@ -454,7 +454,7 @@ fn setup_screen(ui: &mut Ui, b: &BrokerState, out: &mut Vec<PortAction>) {
     ui.add_space(dp(4.0));
     note(
         ui,
-        "terminal-rs reads accounts, balances, positions, orders and activity through SnapTrade. Access is read-only \
+        "Terminal reads accounts, balances, positions, orders and activity through SnapTrade. Access is read-only \
          unless you turn on trading in Settings › Trading.",
     );
     ui.add_space(dp(8.0));

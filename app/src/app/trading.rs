@@ -1607,8 +1607,8 @@ impl TerminalApp {
             ui.add_space(dp(4.0));
             for line in [
                 "Orders you confirm are sent to your real brokerage account through SnapTrade and can execute immediately with real money.",
-                "Market orders fill at the prevailing price, which can differ from the preview. Quotes in terminal-rs may be delayed.",
-                "terminal-rs is provided as is, without warranty. You are responsible for every order you place.",
+                "Market orders fill at the prevailing price, which can differ from the preview. Quotes in Terminal may be delayed.",
+                "Terminal is provided as is, without warranty. You are responsible for every order you place.",
                 "Your brokerage connection must allow trading (reconnect with trading access if it was connected read-only).",
             ] {
                 ui.label(RichText::new(format!("• {line}")).font(ui_font(12.0)).color(text()));
@@ -1692,7 +1692,7 @@ impl TerminalApp {
              requests read-only access; use Reconnect with Trading Access in Settings › Trading for brokers that trade."
                 .into()
         } else {
-            "Read-only: terminal-rs reads accounts, balances, positions, orders and activity. Live trading is off \
+            "Read-only: Terminal reads accounts, balances, positions, orders and activity. Live trading is off \
              (Settings › Trading), and the Connection Portal requests read-only access."
                 .into()
         }

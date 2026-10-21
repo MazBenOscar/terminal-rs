@@ -4087,7 +4087,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-rs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4405,7 +4405,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tr-broker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -4424,7 +4424,7 @@ dependencies = [
 
 [[package]]
 name = "tr-chart"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -4438,7 +4438,7 @@ dependencies = [
 
 [[package]]
 name = "tr-congress"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4460,7 +4460,7 @@ dependencies = [
 
 [[package]]
 name = "tr-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "criterion",
@@ -4470,7 +4470,7 @@ dependencies = [
 
 [[package]]
 name = "tr-data"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4489,7 +4489,7 @@ dependencies = [
 
 [[package]]
 name = "tr-macos"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",

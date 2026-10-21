@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Build a universal (Apple Silicon + Intel) Terminal.app, sign it with a Developer ID
 # certificate and the hardened runtime, notarize and staple it, then package it as
-# target/universal-apple-darwin/release/terminal-rs-universal.dmg, itself signed, notarized and
-# stapled. That file name is the release asset the download page links to. Next to it go
-# terminal-rs-<version>-universal.zip, the app alone, and appcast.xml, the signed update feed
+# target/universal-apple-darwin/release/Terminal.dmg, itself signed, notarized and stapled, with
+# the app icon as its volume icon. That file name is the release asset the download page links
+# to. Next to it go Terminal-<version>.zip, the app alone, and appcast.xml, the signed update feed
 # that points installed copies at that zip. Upload all three to a release tagged v<version>
 # (the script prints the command); bump the version in Cargo.toml first, since installed
 # copies only offer a version higher than their own.
@@ -53,7 +53,15 @@ if [ "$notarize" = 1 ]; then
 fi
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+# A failure while the DMG's writable image is mounted would otherwise leave it attached, and
+# rm -rf would delete into it.
+cleanup() {
+  if [ -d "$tmp/mnt" ] && [ "$(stat -f %d "$tmp/mnt")" != "$(stat -f %d "$tmp")" ]; then
+    hdiutil detach -force "$tmp/mnt" >/dev/null || { echo "left $tmp/rw.dmg mounted at $tmp/mnt" >&2; return; }
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 
 # Submits $1, waits for Apple's verdict, then staples the ticket to $2.
 notarize() {
@@ -74,7 +82,7 @@ for target in aarch64-apple-darwin x86_64-apple-darwin; do
 done
 out=target/universal-apple-darwin/release
 mkdir -p "$out"
-rm -f "$out"/terminal-rs-*-universal.zip "$out/appcast.xml"
+rm -f "$out"/Terminal-*.zip "$out/appcast.xml"
 lipo -create -output "$out/terminal-rs" \
   target/aarch64-apple-darwin/release/terminal-rs target/x86_64-apple-darwin/release/terminal-rs
 scripts/bundle-macos.sh "$out/terminal-rs"
@@ -93,12 +101,19 @@ if [ "$notarize" = 1 ]; then
   notarize "$tmp/Terminal.zip" "$app"
 fi
 
-dmg=$out/terminal-rs-universal.dmg
+dmg=$out/Terminal.dmg
 stage=$tmp/dmg
-mkdir "$stage"
+mkdir "$stage" "$tmp/mnt"
 ditto "$app" "$stage/Terminal.app"
 ln -s /Applications "$stage/Applications"
-hdiutil create -volname Terminal -srcfolder "$stage" -format UDZO -ov "$dmg"
+cp app/assets/AppIcon.icns "$stage/.VolumeIcon.icns"
+# -srcfolder drops the volume's custom-icon flag, so it is set on a writable image that is then
+# compressed.
+hdiutil create -volname Terminal -srcfolder "$stage" -format UDRW "$tmp/rw.dmg"
+hdiutil attach -nobrowse -noautoopen -mountpoint "$tmp/mnt" "$tmp/rw.dmg" >/dev/null
+SetFile -a C "$tmp/mnt"
+hdiutil detach "$tmp/mnt" >/dev/null
+hdiutil convert "$tmp/rw.dmg" -format UDZO -ov -o "$dmg"
 codesign --force --timestamp --sign "$identity" "$dmg"
 if [ "$notarize" = 1 ]; then
   notarize "$dmg" "$dmg"
@@ -108,7 +123,7 @@ fi
 echo "built $dmg"
 
 # ditto keeps the signature and the stapled ticket; plain zip does not.
-zip=$out/terminal-rs-$version-universal.zip
+zip=$out/Terminal-$version.zip
 ditto -c -k --keepParent "$app" "$zip"
 echo "built $zip"
 [ "$notarize" = 1 ] || exit 0
