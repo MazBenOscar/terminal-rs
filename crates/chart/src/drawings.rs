@@ -22,6 +22,10 @@ pub enum Tool {
     Ray,
     Channel,
     Text,
+    FibExtension,
+    Pitchfork,
+    LongPosition,
+    ShortPosition,
 }
 
 impl Tool {
@@ -29,7 +33,7 @@ impl Tool {
         match self {
             Tool::Horizontal | Tool::Vertical | Tool::Text => 1,
             Tool::Trendline | Tool::Fib | Tool::Measure | Tool::Rectangle | Tool::Ray => 2,
-            Tool::Channel => 3,
+            Tool::Channel | Tool::FibExtension | Tool::Pitchfork | Tool::LongPosition | Tool::ShortPosition => 3,
         }
     }
 
@@ -44,6 +48,10 @@ impl Tool {
             Tool::Ray => "Ray",
             Tool::Channel => "Parallel channel",
             Tool::Text => "Text note",
+            Tool::FibExtension => "Fib extension",
+            Tool::Pitchfork => "Pitchfork",
+            Tool::LongPosition => "Long risk/reward",
+            Tool::ShortPosition => "Short risk/reward",
         }
     }
 }
@@ -102,6 +110,25 @@ impl Drawing {
     /// usual retracement convention for a swing drawn from `a` to `b`.
     pub fn fib_levels(&self) -> Vec<(f64, f64)> {
         FIB_LEVELS.iter().map(|&r| (r, self.b.price + (self.a.price - self.b.price) * r)).collect()
+    }
+    pub fn extension_levels(&self) -> Vec<(f64, f64)> {
+        let c = self.c.unwrap_or(self.b);
+        [0., 0.618, 1., 1.272, 1.618, 2., 2.618]
+            .into_iter()
+            .map(|r| (r, c.price + (self.b.price - self.a.price) * r))
+            .collect()
+    }
+    pub fn risk_reward(&self) -> Option<(f64, f64, f64)> {
+        let c = self.c?;
+        if self.tool == Tool::LongPosition && !(self.b.price < self.a.price && c.price > self.a.price) {
+            return None;
+        }
+        if self.tool == Tool::ShortPosition && !(self.b.price > self.a.price && c.price < self.a.price) {
+            return None;
+        }
+        let risk = (self.a.price - self.b.price).abs();
+        let reward = (c.price - self.a.price).abs();
+        (risk.is_finite() && reward.is_finite() && risk > 0.).then_some((risk, reward, reward / risk))
     }
 }
 
@@ -268,6 +295,22 @@ mod tests {
         assert_eq!(lv[3], (0.5, 150.0));
         assert!((lv[4].1 - 138.2).abs() < 1e-9);
         assert_eq!(lv[6], (1.0, 100.0));
+    }
+    #[test]
+    fn extensions_project_the_swing_from_c_and_risk_rewards_reject_wrong_sides() {
+        let mut d = Drawing::new(Tool::FibExtension, Anchor { ts: 1, price: 100. }, Anchor { ts: 2, price: 120. });
+        d.c = Some(Anchor { ts: 3, price: 110. });
+        assert_eq!(d.extension_levels()[2], (1., 130.));
+        d.tool = Tool::LongPosition;
+        d.a.price = 110.;
+        d.b.price = 100.;
+        d.c.as_mut().unwrap().price = 130.;
+        assert_eq!(d.risk_reward(), Some((10., 20., 2.)));
+        d.b.price = 120.;
+        assert!(d.risk_reward().is_none());
+        d.tool = Tool::ShortPosition;
+        d.c.as_mut().unwrap().price = 90.;
+        assert_eq!(d.risk_reward(), Some((10., 20., 2.)));
     }
 
     #[test]

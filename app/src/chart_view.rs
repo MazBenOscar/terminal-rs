@@ -2546,7 +2546,17 @@ impl ChartState {
                     ui.close();
                 }
             }
-            for tool in [Tool::Measure, Tool::Rectangle, Tool::Ray, Tool::Channel, Tool::Text] {
+            for tool in [
+                Tool::Measure,
+                Tool::Rectangle,
+                Tool::Ray,
+                Tool::Channel,
+                Tool::Text,
+                Tool::FibExtension,
+                Tool::Pitchfork,
+                Tool::LongPosition,
+                Tool::ShortPosition,
+            ] {
                 if ui.button(tool.label()).clicked() {
                     self.start_tool(tool);
                     ui.close();
@@ -2733,7 +2743,7 @@ impl ChartState {
         }
         if let Some(tool) = self.draw.tool {
             let msg = if self.draw.second.is_some() {
-                "click channel width (Esc cancels)"
+                "click third point / target (Esc cancels)"
             } else if self.draw.pending.is_some() {
                 "click second point (Esc cancels)"
             } else {
@@ -2849,6 +2859,42 @@ impl ChartState {
                     vec![(Shape::Segment(px(&d.a), px(&d.b)), None)]
                 }
             }
+            Tool::Pitchfork => {
+                let (a, b) = (px(&d.a), px(&d.b));
+                let c = px(&d.c.unwrap_or(d.b));
+                let m = [(b[0] + c[0]) / 2., (b[1] + c[1]) / 2.];
+                let delta = [m[0] - a[0], m[1] - a[1]];
+                [a, b, c]
+                    .into_iter()
+                    .filter_map(|start| {
+                        drawings::clip_line(
+                            start,
+                            [start[0] + delta[0], start[1] + delta[1]],
+                            [rect.left() as f64, rect.top() as f64, rect.right() as f64, rect.bottom() as f64],
+                            false,
+                            true,
+                        )
+                        .map(|(a, b)| (Shape::Segment(a, b), None))
+                    })
+                    .collect()
+            }
+            Tool::LongPosition | Tool::ShortPosition => {
+                if let Some((risk, reward, ratio)) = d.risk_reward() {
+                    let a = px(&d.a);
+                    let b = px(&d.b);
+                    let c = px(&d.c.unwrap());
+                    let right = b[0].max(c[0]).max(a[0] + 35.);
+                    vec![
+                        (Shape::Rect(a, [right, b[1]]), Some(format!("Risk {risk:.2} / unit"))),
+                        (Shape::Rect(a, [right, c[1]]), Some(format!("Reward {reward:.2} / unit · R/R {ratio:.2}"))),
+                    ]
+                } else {
+                    vec![(
+                        Shape::Segment(px(&d.a), px(&d.b)),
+                        Some("Set entry, stop, then target on the opposite side".into()),
+                    )]
+                }
+            }
             Tool::Text => {
                 let a = px(&d.a);
                 let size = ui.painter().layout(d.text.clone(), ui_font(11.5), text(), 220.).size() + vec2(8., 4.);
@@ -2856,16 +2902,27 @@ impl ChartState {
             }
             Tool::Horizontal => vec![(Shape::HLine(px(&d.a)[1]), Some(format!("{:.2}", d.a.price)))],
             Tool::Vertical => vec![(Shape::VLine(px(&d.a)[0]), None)],
-            Tool::Fib => {
+            Tool::Fib | Tool::FibExtension => {
                 let (xa, xb) = (px(&d.a)[0], px(&d.b)[0]);
-                let (x0, x1) = (xa.min(xb), xa.max(xb));
-                d.fib_levels()
+                let (x0, x1) = if d.tool == Tool::FibExtension {
+                    (px(&d.c.unwrap_or(d.b))[0], rect.right() as f64)
+                } else {
+                    (xa.min(xb), xa.max(xb))
+                };
+                let mut shapes: Vec<_> = (if d.tool == Tool::Fib { d.fib_levels() } else { d.extension_levels() })
                     .into_iter()
                     .map(|(r, price)| {
                         let y = rect.top() as f64 + s.y_of(price);
                         (Shape::Segment([x0, y], [x1, y]), Some(format!("{r:.3} ({price:.2})")))
                     })
-                    .collect()
+                    .collect();
+                if d.tool == Tool::FibExtension {
+                    shapes.extend([
+                        (Shape::Segment(px(&d.a), px(&d.b)), None),
+                        (Shape::Segment(px(&d.b), px(&d.c.unwrap_or(d.b))), None),
+                    ]);
+                }
+                shapes
             }
         }
     }
@@ -2997,7 +3054,7 @@ impl ChartState {
                 drawing.symbol = Some(self.symbol.clone());
                 self.drawings.push(drawing);
                 self.draw = DrawState::default();
-            } else if tool == Tool::Channel
+            } else if tool.points() == 3
                 && self.draw.second.is_none()
                 && let Some(first) = self.draw.pending
             {
@@ -3011,7 +3068,7 @@ impl ChartState {
             } else if let Some(first) = self.draw.pending.take() {
                 self.remember_drawings();
                 let mut drawing = Drawing::new(tool, first, self.draw.second.unwrap_or(a));
-                if tool == Tool::Channel {
+                if tool.points() == 3 {
                     drawing.c = Some(a);
                 }
                 drawing.symbol = Some(self.symbol.clone());
@@ -3107,7 +3164,16 @@ impl ChartState {
                             let galley = p.layout(label.unwrap_or_default(), ui_font(11.5), color, 220.);
                             p.galley(r.min + vec2(4., 2.), galley, color);
                         } else {
-                            p.rect_filled(r, 0., color.gamma_multiply(0.08));
+                            let fill = if matches!(d.tool, Tool::LongPosition | Tool::ShortPosition) {
+                                if label.as_ref().is_some_and(|s| s.starts_with("Risk")) {
+                                    theme::down()
+                                } else {
+                                    theme::up()
+                                }
+                            } else {
+                                color
+                            };
+                            p.rect_filled(r, 0., fill.gamma_multiply(0.12));
                             p.rect_stroke(r, 0., stroke, StrokeKind::Inside);
                             if let Some(label) = label {
                                 let galley = p.layout(label, mono(11.), color, rect.width().min(330.));
@@ -3556,6 +3622,27 @@ mod tests {
         assert_eq!(chart.drawings[0], original);
         chart.undo_drawings();
         assert!(chart.drawings.is_empty());
+    }
+    #[test]
+    fn advanced_drawings_place_three_points_and_keep_undo() {
+        for tool in [Tool::FibExtension, Tool::Pitchfork, Tool::LongPosition, Tool::ShortPosition] {
+            let ctx = egui::Context::default();
+            let mut chart = drawing_chart();
+            chart.start_tool(tool);
+            click_drawing(&ctx, &mut chart, pos2(400., 200.), false);
+            click_drawing(&ctx, &mut chart, pos2(500., if tool == Tool::ShortPosition { 100. } else { 300. }), false);
+            assert!(chart.drawings.is_empty());
+            click_drawing(&ctx, &mut chart, pos2(600., if tool == Tool::ShortPosition { 300. } else { 100. }), false);
+            assert_eq!(chart.drawings.len(), 1);
+            assert!(chart.drawings[0].c.is_some());
+            if matches!(tool, Tool::LongPosition | Tool::ShortPosition) {
+                assert_eq!(chart.drawings[0].risk_reward(), Some((25., 25., 1.)));
+            }
+            chart.undo_drawings();
+            assert!(chart.drawings.is_empty());
+            chart.redo_drawings();
+            assert_eq!(chart.drawings.len(), 1);
+        }
     }
 
     #[test]

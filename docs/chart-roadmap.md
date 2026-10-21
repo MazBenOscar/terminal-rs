@@ -82,3 +82,13 @@ Ashi construction runs in the worker and keeps raw timestamps; source OHLC, stud
 alerts and account valuations still use actual source bars. Baseline lines/fills use
 positive/negative colors relative to the chosen reference or visible start. Layouts
 use v7 so older builds cannot silently discard the new style and study settings.
+
+## Advanced drawings
+
+`FIBEXT`, `PITCHFORK`, `LONGRR` and `SHORTRR` add three-point tools through the
+same Draw menu/command palette. Fib extensions project A→B from C. Pitchforks use
+the median from A through the B/C midpoint and two parallel rays, in displayed
+coordinates. Risk/reward tools use entry, stop and target; they show per-unit risk,
+reward and the ratio, and label invalid sides rather than displaying a fictitious
+ratio. They are planning annotations and do not submit orders or size positions.
+All use the existing selection, three-handle/body dragging, ownership and undo path.
