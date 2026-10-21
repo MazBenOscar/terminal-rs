@@ -210,6 +210,12 @@ pub enum Request {
         bars: Arc<Vec<Bar>>,
         image: bool,
     },
+    ExportChartImage {
+        pane: PaneId,
+        symbol: String,
+        image: Arc<egui::ColorImage>,
+        rect_px: [usize; 4],
+    },
     PriceAlertRules {
         revision: u64,
         alerts: Vec<tr_core::price_alerts::Alert>,
@@ -1098,6 +1104,15 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         Request::PriceAlertRules { revision, alerts } => {
             let observations = condition_observations(s.provider.clone(), alerts).await;
             s.send(Response::PriceAlertRules { revision, observations });
+        }
+        Request::ExportChartImage { pane, symbol, image, rect_px } => {
+            let result = tokio::task::spawn_blocking(move || {
+                let bytes = crate::chart_export::crop_png(&image, rect_px)?;
+                crate::chart_export::save_bytes(&data_dir().join("exports"), &symbol, &bytes, "png")
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            s.send(Response::ExportChart { pane, result });
         }
         Request::ExportChart { pane, symbol, title, bars, image } => {
             let title = format!("{title} · source {}", s.provider.name());
