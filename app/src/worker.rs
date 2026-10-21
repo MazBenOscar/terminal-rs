@@ -1567,7 +1567,6 @@ mod column_tests {
     }
 
     #[test]
-    #[ignore = "BUG: column_history_plan sizes Formula columns from ColumnDef::required_bars_for which hardcodes 300 and never consults pcf::lookback; AVG(C,1000) therefore plans 900 bars (300*3) and the cell evaluates as Unavailable"]
     fn column_history_plan_covers_formula_lookback() {
         let column = |expression: &str| ColumnDef {
             id: 1,

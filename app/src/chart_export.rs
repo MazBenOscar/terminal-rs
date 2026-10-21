@@ -81,15 +81,36 @@ pub fn save_bytes(
     bytes: &[u8],
     extension: &str,
 ) -> Result<std::path::PathBuf, String> {
-    use std::io::Write;
+    if !(1..=8).contains(&extension.len()) || !extension.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+        return Err("Export extension must contain 1 to 8 lowercase ASCII letters or digits".into());
+    }
     std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
     let symbol: String = symbol.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(40).collect();
     let stamp =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
-    let path = directory.join(format!("{symbol}-{stamp}.{extension}"));
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
-    file.write_all(bytes).and_then(|()| file.sync_all()).map_err(|e| e.to_string())?;
-    Ok(path)
+    save_unique(directory, &format!("{symbol}-{stamp}"), bytes, extension)
+}
+
+fn save_unique(
+    directory: &std::path::Path,
+    stem: &str,
+    bytes: &[u8],
+    extension: &str,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    for attempt in 1..=100 {
+        let suffix = if attempt == 1 { String::new() } else { format!("-{attempt}") };
+        let path = directory.join(format!("{stem}{suffix}.{extension}"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(bytes).and_then(|()| file.sync_all()).map_err(|e| e.to_string())?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("Export name collisions exhausted 100 attempts".into())
 }
 /// Encodes a screenshot crop, clamping its bounds to the source image.
 pub fn crop_png(image: &egui::ColorImage, rect_px: [usize; 4]) -> Result<Vec<u8>, String> {
@@ -166,6 +187,24 @@ mod tests {
     }
 
     #[test]
+    fn same_name_collisions_retry_suffixes_and_stop_at_100() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target")
+            .join(format!("export-collision-{stamp}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        for attempt in 1..=100 {
+            let path = save_unique(&directory, "fixed", &[attempt], "png").unwrap();
+            let name = if attempt == 1 { "fixed.png".into() } else { format!("fixed-{attempt}.png") };
+            assert_eq!(path, directory.join(name));
+            assert_eq!(std::fs::read(path).unwrap(), [attempt]);
+        }
+        assert!(save_unique(&directory, "fixed", &[0], "png").is_err());
+        assert_eq!(std::fs::read(directory.join("fixed.png")).unwrap(), [1]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn exports_preserve_values_and_escape_labels() {
         let b = [Bar::new(123, 1., 3., 0.5, 2., 123.45)];
         assert!(csv(&b).contains("123,1,3,0.5,2,123.45\n"));
@@ -204,13 +243,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: save_bytes sanitises the symbol but appends `extension` verbatim into the file name; a path-like extension (`png/../../evil`) yields a multi-component path that Path::join treats as nested segments (ENOENT here, or escape/write outside the exports dir when intermediate dirs exist)"]
     fn save_bytes_sanitises_extension_and_colliding_names() {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let directory =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target").join(format!("export-ext-{stamp}"));
-        // Extension is appended verbatim: a path-like extension must not escape the directory.
-        let path = save_bytes(&directory, "AAPL", &[1], "png/../../evil").unwrap();
+        // Reject path-like extensions rather than allowing directory traversal.
+        for extension in ["png/../../evil", "", "PNG", "abcdefghi", "p.ng", "é"] {
+            assert!(save_bytes(&directory, "AAPL", &[1], extension).is_err());
+        }
+        let path = save_bytes(&directory, "../../AAPL", &[1], "png").unwrap();
+        assert!(path.file_name().unwrap().to_str().unwrap().starts_with("AAPL-"));
         assert_eq!(path.parent(), Some(directory.as_path()), "extension must not introduce path segments");
         std::fs::remove_dir_all(directory).unwrap();
     }

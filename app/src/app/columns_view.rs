@@ -309,6 +309,14 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_titles_disable_apply_with_a_clear_validation_error() {
+        let mut set = sample();
+        set.columns[1].title = set.columns[0].title.to_ascii_lowercase();
+        assert!(!apply_enabled(&set));
+        assert!(set.validate().unwrap_err().contains("Duplicate column title"));
+    }
+
+    #[test]
     fn column_sets_library_merges_updates_and_preserves_corrupt_files() {
         // Keep all test writes within this worktree.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
