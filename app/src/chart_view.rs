@@ -539,7 +539,9 @@ impl ChartState {
 
     fn effective_session(&self) -> tr_core::session::Session {
         if matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
-            self.data.session
+            tr_data::HistoryOptions { session: self.data.session, ..self.data.history }
+                .for_chart(self.sec.class, self.tf)
+                .session
         } else {
             tr_core::session::Session::Provider
         }

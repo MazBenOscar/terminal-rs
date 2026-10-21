@@ -118,7 +118,7 @@ impl Timeframe {
         }
         let mut out: Vec<Bar> = Vec::new();
         for b in bars.iter().filter(|b| session.contains(b.ts)) {
-            let start = session.interval(self, b.ts).0;
+            let start = crate::session::bar_interval(self, session, b.ts).0;
             match out.last_mut() {
                 Some(cur) if cur.ts == start => {
                     cur.high = cur.high.max(b.high);
@@ -147,7 +147,7 @@ impl Timeframe {
     pub fn resample(self, bars: &[Bar]) -> Vec<Bar> {
         let mut out: Vec<Bar> = Vec::with_capacity(bars.len() / 2 + 1);
         for b in bars {
-            let start = self.bucket_start(b.ts);
+            let start = crate::session::bar_interval(self, crate::session::Session::Provider, b.ts).0;
             match out.last_mut() {
                 Some(cur) if cur.ts == start => {
                     cur.high = cur.high.max(b.high);

@@ -93,6 +93,12 @@ impl Session {
         }
     }
 }
+/// Boundaries of history bars: only regular H2/H4 use the exchange grid.
+/// All other histories retain their UTC-hour or plain calendar buckets.
+pub fn bar_interval(tf: Timeframe, session: Session, ts: i64) -> (i64, i64) {
+    if tf.session_aligned(session) { session.interval(tf, ts) } else { (tf.bucket_start(ts), next_bucket(tf, ts)) }
+}
+
 fn local_ts(day: NaiveDate, minute: u32) -> i64 {
     let local = day.and_time(chrono::NaiveTime::MIN) + Duration::minutes(i64::from(minute));
     chrono_tz::America::New_York
@@ -220,6 +226,40 @@ mod tests {
         assert_eq!(close_minute(date(2026, 11, 27)), 780);
         assert!(!Session::UsRegular.contains(ts("2026-11-27T18:00:00Z")));
     }
+
+    /// Black Friday and the calendar-day half days already close at 13:00; the
+    /// relocated half days are the ones the built-in table misses.
+    #[test]
+    fn calendar_day_half_days_stay_early_and_normal_days_stay_full() {
+        assert_eq!(close_minute(date(2026, 7, 2)), 960);
+        assert_eq!(close_minute(date(2026, 12, 24)), 780);
+        assert_eq!(close_minute(date(2026, 12, 23)), 960);
+    }
+
+    #[test]
+    fn history_boundaries_only_session_align_regular_multi_hour_bars() {
+        let t = ts("2026-03-09T15:00:00Z");
+        assert_eq!(bar_interval(Timeframe::H1, Session::UsRegular, t), (t, t + 3600));
+        for session in Session::ALL {
+            for tf in [
+                Timeframe::M1,
+                Timeframe::M30,
+                Timeframe::H1,
+                Timeframe::H2,
+                Timeframe::H4,
+                Timeframe::D1,
+                Timeframe::W1,
+            ] {
+                let expected = if tf.session_aligned(session) {
+                    session.interval(tf, t)
+                } else {
+                    (tf.bucket_start(t), next_bucket(tf, t))
+                };
+                assert_eq!(bar_interval(tf, session, t), expected);
+            }
+        }
+    }
+
     #[test]
     fn aggregation_anchors_and_month_completion_are_calendar_based() {
         let t = ts("2026-03-09T14:00:00Z");

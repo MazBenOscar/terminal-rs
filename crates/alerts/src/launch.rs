@@ -8,7 +8,6 @@ const LABEL: &str = "com.terminal-rs.alertd";
 fn xml(value: &str) -> String {
     value
         .chars()
-        .filter(|c| matches!(*c, '\t' | '\n' | '\r') || *c >= ' ')
         .collect::<String>()
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -16,7 +15,14 @@ fn xml(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
-pub fn plist(binary: &Path, data_dir: &Path, env: &[(String, String)]) -> String {
+pub fn plist(binary: &Path, data_dir: &Path, env: &[(String, String)]) -> Result<String, String> {
+    let invalid = |value: &str| value.chars().any(|c| c.is_control() || matches!(c, '\u{fffe}' | '\u{ffff}'));
+    if invalid(&binary.to_string_lossy())
+        || invalid(&data_dir.to_string_lossy())
+        || env.iter().any(|(key, value)| invalid(key) || invalid(value))
+    {
+        return Err("Cannot generate alert plist: paths and environment values must not contain control characters or U+FFFE/U+FFFF".into());
+    }
     let binary = xml(&binary.to_string_lossy());
     let logs = data_dir.join("logs");
     let stdout = xml(&logs.join("alertd.out.log").to_string_lossy());
@@ -26,9 +32,9 @@ pub fn plist(binary: &Path, data_dir: &Path, env: &[(String, String)]) -> String
         .filter(|(key, _)| matches!(key.as_str(), "TR_DATA_DIR" | "TR_SECRET_STORE"))
         .map(|(key, value)| format!("<key>{}</key><string>{}</string>", xml(key), xml(value)))
         .collect::<String>();
-    format!(
+    Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array><string>{binary}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>{stdout}</string><key>StandardErrorPath</key><string>{stderr}</string><key>EnvironmentVariables</key><dict>{env}</dict></dict></plist>\n"
-    )
+    ))
 }
 pub fn plist_path() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or("Home directory is unavailable")?;
@@ -88,7 +94,7 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
             })
         })
         .collect();
-    crate::storage::write_atomic(&path, plist(&binary, &dir, &env).as_bytes()).map_err(|e| e.to_string())?;
+    crate::storage::write_atomic(&path, plist(&binary, &dir, &env)?.as_bytes()).map_err(|e| e.to_string())?;
     let result = launchctl(&["bootstrap".as_ref(), domain.as_ref(), path.as_os_str()]);
     if result.is_err() {
         let _ = std::fs::remove_file(&path);
@@ -109,7 +115,8 @@ mod tests {
                 ("TR_SECRET_STORE".into(), "file".into()),
                 ("CREDENTIAL".into(), "excluded".into()),
             ],
-        );
+        )
+        .unwrap();
         assert!(text.contains("/Applications/A &amp; &lt;B&gt;/terminal-rs-alertd"));
         assert!(text.contains("/a b/&amp;logs/logs/alertd.err.log"));
         assert!(text.contains("<key>TR_SECRET_STORE</key><string>file</string>"));
@@ -119,7 +126,40 @@ mod tests {
         assert!(text.contains("<key>KeepAlive</key><true/>"));
         assert!(
             plist(Path::new("/bin/d"), Path::new("/data"), &[])
+                .unwrap()
                 .contains("<key>EnvironmentVariables</key><dict></dict>")
         );
+    }
+
+    /// Characters XML 1.0 forbids anywhere in a document (see production `Char`).
+    fn xml_illegal(text: &str) -> Vec<char> {
+        text.chars()
+            .filter(|c| {
+                let u = *c as u32;
+                !(u == 0x9 || u == 0xA || u == 0xD || (0x20..=0xD7FF).contains(&u) || (0xE000..=0xFFFD).contains(&u))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plist_output_is_round_trip_safe_under_xml_parsing() {
+        for poison in (0..=0x9f).filter_map(char::from_u32).filter(|c| c.is_control()).chain(['\u{fffe}', '\u{ffff}']) {
+            let binary = format!("/Applications/terminal{poison}-rs-alertd");
+            let data = format!("/Users/a{poison}b/logs");
+            // Refuse generation instead of silently corrupting an input on parse.
+            for (binary, data, env) in [
+                (Path::new(&binary), Path::new("/data"), vec![]),
+                (Path::new("/bin/d"), Path::new(&data), vec![]),
+                (Path::new("/bin/d"), Path::new("/data"), vec![("TR_DATA_DIR".into(), format!("/data{poison}dir"))]),
+            ] {
+                let error = plist(binary, data, &env).unwrap_err();
+                assert!(error.contains("control characters or U+FFFE/U+FFFF"));
+            }
+            let text = plist(Path::new("/bin/d"), Path::new("/data"), &[]).unwrap();
+            let bad = xml_illegal(&text);
+            assert!(bad.is_empty(), "plist emitted XML-illegal {bad:?} for {poison:?}");
+            assert!(!text.contains('\r'));
+            assert!(!text.contains('\u{fffe}') && !text.contains('\u{ffff}'));
+        }
     }
 }

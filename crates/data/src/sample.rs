@@ -52,6 +52,7 @@ impl MarketData for SampleProvider {
         limit: usize,
         options: crate::HistoryOptions,
     ) -> Result<Vec<Bar>> {
+        let options = options.for_chart(security(symbol).class, tf);
         if matches!(security(symbol).class, AssetClass::Equity | AssetClass::Etf) && tf.session_aligned(options.session)
         {
             let bars = self.bars(symbol, Timeframe::M30);

@@ -1548,7 +1548,7 @@ async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize)
     let now = chrono::Utc::now().timestamp();
     let route = s.provider.scan_cache_key(symbol);
     let source =
-        if matches!(tf, Timeframe::H2 | Timeframe::H4) { format!("session-v1:{route}") } else { route.clone() };
+        if matches!(tf, Timeframe::H2 | Timeframe::H4) { format!("session-v2:{route}") } else { route.clone() };
     let (stored, fetched) = {
         let store = s.scan_store.lock().expect("scan store");
         let store = store.as_ref().ok_or("The scan store could not be opened")?;
