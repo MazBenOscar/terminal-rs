@@ -246,6 +246,7 @@ struct DrawState {
     tool: Option<Tool>,
     pending: Option<Anchor>,
     second: Option<Anchor>,
+    pattern: drawings::patterns::Placement,
     note: Option<NoteDraft>,
     selected: Option<usize>,
     hover: Option<(usize, DrawHandle)>,
@@ -257,6 +258,7 @@ enum DrawHandle {
     A,
     B,
     C,
+    Pattern(usize),
     Body,
 }
 
@@ -955,6 +957,15 @@ impl ChartState {
         }
         if self.draw.tool.is_some() || self.draw.selected.is_some() || self.draw.note.is_some() {
             self.draw = DrawState::default();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn pattern_backspace(&mut self) -> bool {
+        if self.draw.tool.is_some_and(|tool| drawings::patterns::point_count(tool) > 0) {
+            self.draw.pattern.backspace();
             true
         } else {
             false
@@ -3669,8 +3680,14 @@ impl ChartState {
             .id_salt((self.id, "draw-menu"))
             .max_height((ui.available_height() * 0.5).clamp(theme::dp(100.), theme::dp(360.)))
             .show(ui, |ui| {
-                for index in 0..crate::drawing_toolbar::CATEGORIES.len() {
-                    self.drawing_category_menu(ui, index);
+                for index in [0, 1, 5, 2, 3, 4] {
+                    if index == 5 {
+                        ui.menu_button(crate::drawing_toolbar::PATTERNS.title, |ui| {
+                            self.drawing_category_menu(ui, index)
+                        });
+                    } else {
+                        self.drawing_category_menu(ui, index);
+                    }
                 }
             });
         let mut favorites = crate::prefs::drawing_favorites(ui.ctx());
@@ -4009,7 +4026,9 @@ impl ChartState {
             ly += 14.;
         }
         if let Some(tool) = self.draw.tool {
-            let msg = if self.draw.second.is_some() {
+            let msg = if drawings::patterns::point_count(tool) > 0 {
+                "click next point (Backspace removes last; Esc cancels)"
+            } else if self.draw.second.is_some() {
                 "click third point / target (Esc cancels)"
             } else if self.draw.pending.is_some() {
                 "click second point (Esc cancels)"
@@ -4085,12 +4104,7 @@ impl ChartState {
         v: &Viewport,
         s: &PriceScale,
     ) -> Vec<(Shape, Option<String>)> {
-        if [Some(d.a), Some(d.b), d.c]
-            .into_iter()
-            .take(d.tool.points())
-            .flatten()
-            .any(|a| !a.price.is_finite() || (s.log && a.price <= 0.))
-        {
+        if drawings::handles(d).into_iter().any(|a| !a.price.is_finite() || (s.log && a.price <= 0.)) {
             return vec![];
         }
         let px =
@@ -4112,6 +4126,7 @@ impl ChartState {
         let geometry = drawings::Geometry {
             drawing: d,
             points: [px(&d.a), px(&d.b), px(&d.c.unwrap_or(d.b))],
+            pattern_points: d.pattern_points.iter().map(px).collect(),
             bounds: [rect.left() as f64, rect.top() as f64, rect.right() as f64, rect.bottom() as f64],
             price_y: &|price| rect.top() as f64 + s.y_of(price),
             measure_label: if d.tool == Tool::InfoLine {
@@ -4163,9 +4178,12 @@ impl ChartState {
                 return None;
             }
             for (index, drawing) in this.drawings.iter().enumerate().rev().filter(|(_, d)| d.visible_on(&this.symbol)) {
-                for (anchor, handle) in
-                    drawings::handles(drawing).into_iter().zip([DrawHandle::A, DrawHandle::B, DrawHandle::C])
-                {
+                for (i, anchor) in drawings::handles(drawing).into_iter().enumerate() {
+                    let handle = if drawings::patterns::point_count(drawing.tool) > 0 {
+                        DrawHandle::Pattern(i)
+                    } else {
+                        [DrawHandle::A, DrawHandle::B, DrawHandle::C][i]
+                    };
                     let point = pos2(
                         rect.left() + v.x_of(this.index_of_ts(anchor.ts)) as f32,
                         rect.top() + s.y_of(anchor.price) as f32,
@@ -4214,9 +4232,12 @@ impl ChartState {
                 DrawHandle::A => edited.a = anchor,
                 DrawHandle::B => edited.b = anchor,
                 DrawHandle::C => edited.c = Some(anchor),
+                DrawHandle::Pattern(i) => edited.pattern_points[i] = anchor,
                 DrawHandle::Body => {
-                    for point in
-                        std::iter::once(&mut edited.a).chain(std::iter::once(&mut edited.b)).chain(edited.c.iter_mut())
+                    for point in std::iter::once(&mut edited.a)
+                        .chain(std::iter::once(&mut edited.b))
+                        .chain(edited.c.iter_mut())
+                        .chain(edited.pattern_points.iter_mut())
                     {
                         point.ts = point.ts.saturating_add(anchor.ts.saturating_sub(drag.start.ts));
                         point.price = if s.log && drag.start.price > 0. {
@@ -4234,6 +4255,10 @@ impl ChartState {
                     edited.b = edited.a;
                 }
             }
+            if edited.pattern_points.len() >= 2 {
+                edited.a = edited.pattern_points[0];
+                edited.b = edited.pattern_points[1];
+            }
             self.drawings[drag.index] = edited;
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         } else if self.draw.hover.is_some() {
@@ -4248,7 +4273,15 @@ impl ChartState {
             (self.draw.tool, resp.clicked(), resp.interact_pointer_pos().filter(|p| rect.contains(*p)))
         {
             let a = pointer_anchor(self, pos);
-            if tool == Tool::Text {
+            if drawings::patterns::point_count(tool) > 0 {
+                if let Some(mut drawing) = self.draw.pattern.click(tool, a) {
+                    self.remember_drawings();
+                    drawing.symbol = Some(self.symbol.clone());
+                    self.drawings.push(drawing);
+                    self.draw = DrawState::default();
+                    self.draw.selected = Some(self.drawings.len() - 1);
+                }
+            } else if tool == Tool::Text {
                 self.draw = DrawState {
                     note: Some(NoteDraft { anchor: a, existing: None, text: String::new() }),
                     ..Default::default()
@@ -4313,6 +4346,14 @@ impl ChartState {
             if self.draw.second.is_some() {
                 preview.c = Some(pointer_anchor(self, h));
             }
+            all.push((preview, true));
+        }
+        if let (Some(tool), Some(first), Some(h)) = (self.draw.tool, self.draw.pattern.points.first(), hover)
+            && rect.contains(h)
+        {
+            let mut preview = Drawing::new(tool, *first, pointer_anchor(self, h));
+            preview.pattern_points = self.draw.pattern.points.clone();
+            preview.pattern_points.push(pointer_anchor(self, h));
             all.push((preview, true));
         }
         for (d, selected) in all {
@@ -5263,6 +5304,72 @@ mod tests {
     }
 
     #[test]
+    fn patterns_place_backspace_cancel_edit_last_handle_and_undo_redo() {
+        for tool in Tool::ALL.into_iter().filter(|t| drawings::patterns::point_count(*t) > 0) {
+            let ctx = egui::Context::default();
+            let mut chart = drawing_chart();
+            chart.start_tool(tool);
+            click_drawing(&ctx, &mut chart, pos2(100., 200.), false);
+            assert!(chart.pattern_backspace());
+            assert!(chart.draw.pattern.points.is_empty());
+            click_drawing(&ctx, &mut chart, pos2(100., 200.), false);
+            assert!(chart.cancel());
+            assert!(chart.draw.pattern.points.is_empty() && chart.drawings.is_empty());
+            chart.start_tool(tool);
+            let points: Vec<_> =
+                (0..tool.points()).map(|i| pos2(100. + i as f32 * 80., if i % 2 == 0 { 280. } else { 120. })).collect();
+            for &point in &points {
+                click_drawing(&ctx, &mut chart, point, false);
+            }
+            let original = chart.drawings[0].clone();
+            assert_eq!(original.pattern_points.len(), tool.points());
+            assert_eq!(original.symbol.as_deref(), Some(chart.symbol.as_str()));
+            chart.undo_drawings();
+            assert!(chart.drawings.is_empty());
+            chart.redo_drawings();
+            assert_eq!(chart.drawings.as_slice(), std::slice::from_ref(&original));
+            let from = *points.last().unwrap();
+            let to = from + vec2(20., 25.);
+            chart.drawings_locked = true;
+            click_drawing(&ctx, &mut chart, from, false);
+            assert!(chart.draw.selected.is_none());
+            chart.drawings_locked = false;
+            chart.drawings_hidden = true;
+            let labels = click_drawing(&ctx, &mut chart, from, false);
+            assert!(labels.is_empty() && chart.draw.selected.is_none());
+            chart.drawings_hidden = false;
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(from)], false);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], false);
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], false);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], false);
+            let edited = chart.drawings[0].clone();
+            assert_ne!(edited.pattern_points.last(), original.pattern_points.last());
+            assert_eq!(&edited.pattern_points[..tool.points() - 1], &original.pattern_points[..tool.points() - 1]);
+            chart.undo_drawings();
+            assert_eq!(chart.drawings, [original]);
+            chart.redo_drawings();
+            assert_eq!(chart.drawings, [edited]);
+        }
+    }
+
+    #[test]
+    fn patterns_magnet_snap_and_share_replay_renko_availability() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.magnet = true;
+        chart.start_tool(Tool::Abcd);
+        for x in [100., 200., 300., 400.] {
+            click_drawing(&ctx, &mut chart, pos2(x, 190.), false);
+        }
+        assert!(chart.drawings[0].pattern_points.iter().all(|a| a.price == 150.));
+        chart.replay_cutoff = Some(1);
+        assert!(!chart.drawing_available());
+        chart.replay_cutoff = None;
+        chart.chart_type = ChartType::Renko;
+        assert!(!chart.drawing_available());
+    }
+
+    #[test]
     fn hide_menu_suppresses_painting_keeps_sources_and_pane_layout_and_shows_all() {
         let ctx = egui::Context::default();
         let mut chart = sample_chart();
@@ -5703,7 +5810,7 @@ mod tests {
         chart.cancel();
         rail_frame(&ctx, &mut chart, vec![]);
         for (index, tool) in tools.into_iter().enumerate() {
-            let at = pos2(28., 10. + theme::dp(19. + 34. * (index + 1) as f32));
+            let at = rail_point(index + 1);
             click_rail(&ctx, &mut chart, at);
             assert_eq!(chart.draw.tool, Some(tool));
             chart.cancel();

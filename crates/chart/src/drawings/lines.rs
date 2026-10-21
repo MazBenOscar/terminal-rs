@@ -182,6 +182,7 @@ mod tests {
         let mut g = Geometry {
             drawing: &drawing,
             points: [[20., 20.], [40., 40.], [40., 40.]],
+            pattern_points: Vec::new(),
             bounds: [0., 0., 100., 100.],
             price_y: &|p| p,
             measure_label: String::new(),

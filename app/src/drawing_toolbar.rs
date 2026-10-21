@@ -26,7 +26,7 @@ impl Category {
     }
 }
 
-pub const CATEGORIES: [Category; 5] = [
+pub const CATEGORIES: [Category; 6] = [
     Category {
         title: "Trend lines",
         sections: &[
@@ -76,11 +76,18 @@ pub const CATEGORIES: [Category; 5] = [
         ],
     },
     Category { title: "Text & notes", sections: &[Section { title: "Text and notes", tools: &[Tool::Text] }] },
+    PATTERNS,
 ];
 
 pub const PATTERNS: Category = Category {
     title: "Patterns",
-    sections: &[Section { title: "Chart patterns", tools: &[] }, Section { title: "Elliott waves", tools: &[] }],
+    sections: &[
+        Section {
+            title: "Chart patterns",
+            tools: &[Tool::Xabcd, Tool::Abcd, Tool::HeadAndShoulders, Tool::TrianglePattern],
+        },
+        Section { title: "Elliott waves", tools: &[Tool::ElliottImpulse, Tool::ElliottCorrection] },
+    ],
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,13 +119,17 @@ const RAIL: [RailItem; 12] = [
 
 /// Pure geometry shared by painting, interaction and tests.
 pub fn rail_layout(rail: Rect) -> Vec<(RailItem, Rect)> {
+    rail_layout_with_categories(rail, &CATEGORIES, &PATTERNS)
+}
+
+fn rail_layout_with_categories(rail: Rect, categories: &[Category], patterns: &Category) -> Vec<(RailItem, Rect)> {
     let size = theme::dp(30.);
     let mut y = rail.top() + theme::dp(4.);
     RAIL.into_iter()
         .filter_map(|item| {
             let visible = match item {
-                RailItem::Category(index) => CATEGORIES[index].tools().next().is_some(),
-                RailItem::Patterns => PATTERNS.tools().next().is_some(),
+                RailItem::Category(index) => categories[index].tools().next().is_some(),
+                RailItem::Patterns => patterns.tools().next().is_some(),
                 _ => true,
             };
             if !visible {
@@ -162,6 +173,7 @@ pub const GROUPS: [(&str, &[Tool]); 5] = [
 #[derive(Clone, Debug)]
 pub struct State {
     pub last: [Tool; 5],
+    pub pattern_last: Tool,
     pub open: Option<usize>,
     pub hide_open: bool,
     pub held: Option<(usize, f64)>,
@@ -172,6 +184,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             last: [Tool::Trendline, Tool::Fib, Tool::LongPosition, Tool::Rectangle, Tool::Text],
+            pattern_last: Tool::Xabcd,
             open: None,
             hide_open: false,
             held: None,
@@ -191,7 +204,11 @@ impl State {
 
     pub fn remember(&mut self, tool: Tool) {
         if let Some(index) = CATEGORIES.iter().position(|category| category.tools().any(|item| item == tool)) {
-            self.last[index] = tool;
+            if index == 5 {
+                self.pattern_last = tool;
+            } else {
+                self.last[index] = tool;
+            }
         }
     }
 }
@@ -207,6 +224,7 @@ fn rail_layout_orders_controls_and_omits_empty_patterns() {
             RailItem::Crosshair,
             RailItem::Category(0),
             RailItem::Category(1),
+            RailItem::Patterns,
             RailItem::Category(2),
             RailItem::Category(3),
             RailItem::Category(4),
@@ -220,7 +238,14 @@ fn rail_layout_orders_controls_and_omits_empty_patterns() {
     assert!(layout.windows(2).all(|pair| pair[0].1.bottom() < pair[1].1.top()));
     assert!(layout.iter().all(|(_, rect)| rail.contains_rect(*rect)));
     assert_eq!(PATTERNS.sections.iter().map(|s| s.title).collect::<Vec<_>>(), ["Chart patterns", "Elliott waves"]);
-    assert!(PATTERNS.visible_sections().next().is_none());
+    assert!(PATTERNS.visible_sections().next().is_some());
+    let empty = Category { title: "Empty", sections: &[Section { title: "Empty", tools: &[] }] };
+    assert!(empty.visible_sections().next().is_none());
+    let empty_layout = rail_layout_with_categories(rail, &CATEGORIES, &empty);
+    assert_eq!(
+        empty_layout.iter().map(|(item, _)| *item).collect::<Vec<_>>(),
+        layout.iter().map(|(item, _)| *item).filter(|item| *item != RailItem::Patterns).collect::<Vec<_>>()
+    );
 }
 
 #[cfg(test)]
@@ -339,6 +364,7 @@ impl super::ChartState {
             let slot = match item {
                 RailItem::Crosshair => 0,
                 RailItem::Category(index) => index + 1,
+                RailItem::Patterns => 10,
                 RailItem::Magnet => 6,
                 RailItem::Hide => 7,
                 RailItem::RemoveAll => 8,
@@ -347,13 +373,14 @@ impl super::ChartState {
             };
             let tool = match item {
                 RailItem::Category(index) => Some(self.drawing_toolbar.last[index]),
+                RailItem::Patterns => Some(self.drawing_toolbar.pattern_last),
                 _ => None,
             };
             let (icon, active, hint) = if let Some(tool) = tool {
                 (
                     widgets::tool_icon(tool),
                     self.draw.tool == Some(tool),
-                    format!("{} · {}", CATEGORIES[slot - 1].title, Self::tool_hint(tool)),
+                    format!("{} · {}", CATEGORIES[if slot == 10 { 5 } else { slot - 1 }].title, Self::tool_hint(tool)),
                 )
             } else {
                 match slot {
@@ -374,8 +401,8 @@ impl super::ChartState {
                     button(ui, rect, (self.id, "rail", slot), icon, active, &hint)
                 })
                 .inner;
-            if (1..=5).contains(&slot) {
-                let group = slot - 1;
+            if (1..=5).contains(&slot) || slot == 10 {
+                let group = if slot == 10 { 5 } else { slot - 1 };
                 anchors[group] = pos2(rail.right() + theme::dp(4.), rect.top());
                 let corner = Rect::from_min_max(rect.max - vec2(theme::dp(11.), theme::dp(11.)), rect.max);
                 widgets::draw_icon(ui.painter(), corner, Icon::ChevronSmall, theme::muted());

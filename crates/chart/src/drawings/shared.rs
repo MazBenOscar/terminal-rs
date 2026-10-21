@@ -9,6 +9,7 @@ use super::{Anchor, Drawing, Tool};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shape {
     Segment([f64; 2], [f64; 2]),
+    DashedSegment([f64; 2], [f64; 2]),
     HLine(f64),
     VLine(f64),
     Rect([f64; 2], [f64; 2]),
@@ -40,7 +41,7 @@ pub fn distance(shape: &Shape, p: [f64; 2]) -> f64 {
             }
             if area.abs() > 1e-8 && !(positive && negative) { 0. } else { nearest }
         }
-        Shape::Segment(a, b) => {
+        Shape::Segment(a, b) | Shape::DashedSegment(a, b) => {
             let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
             let len2 = dx * dx + dy * dy;
             let t = if len2 == 0.0 { 0.0 } else { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2).clamp(0.0, 1.0) };
