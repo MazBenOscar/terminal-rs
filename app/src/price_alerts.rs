@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
-use tr_core::price_alerts::{Alert, Book, Direction, Event, Observation, Rule, Status};
+use tr_core::price_alerts::{Alert, Book, Direction, Event, Observation, Repeat, Rule, Status};
 
 use crate::theme::{amber, mono, muted, text};
 use crate::worker::{Request, Worker};
@@ -28,6 +28,7 @@ struct Draft {
     symbol: String,
     price: String,
     direction: Direction,
+    repeat: Repeat,
     simulated: bool,
     error: Option<String>,
     rule: Option<Rule>,
@@ -91,6 +92,15 @@ impl State {
         }
     }
 
+    pub fn mark_seen(&mut self, id: u64, quote_ts: i64) {
+        for event in &mut self.book.events {
+            if event.alert.id == id && event.quote_ts == quote_ts {
+                event.seen = true;
+            }
+        }
+        self.changed(false);
+    }
+
     pub fn unread(&self) -> usize {
         self.book.events.iter().filter(|e| !e.seen).count()
     }
@@ -100,6 +110,7 @@ impl State {
             return;
         }
         self.last_save = Some(Instant::now());
+        self.book.version = 3;
         let result = self.book.validate().and_then(|()| {
             let bytes = serde_json::to_vec_pretty(&self.book).map_err(|e| e.to_string())?;
             if let Some(parent) = self.path.parent() {
@@ -251,6 +262,7 @@ impl State {
                     symbol,
                     price: level.to_string(),
                     direction,
+                    repeat: Repeat::Once,
                     simulated: self.simulated,
                     error: None,
                     rule: None,
@@ -269,6 +281,7 @@ impl State {
                     symbol,
                     price: level.to_string(),
                     direction: Direction::Above,
+                    repeat: Repeat::Once,
                     simulated: self.simulated,
                     error: None,
                     rule: Some(rule),
@@ -284,6 +297,7 @@ impl State {
                         symbol: a.symbol.clone(),
                         price: a.level.to_string(),
                         direction: a.direction,
+                        repeat: a.repeat,
                         simulated: a.simulated,
                         error: None,
                         rule: a.rule.clone(),
@@ -329,6 +343,7 @@ impl State {
                     symbol: String::new(),
                     price: String::new(),
                     direction: Direction::Above,
+                    repeat: Repeat::Once,
                     simulated: self.simulated,
                     error: None,
                     rule: None,
@@ -354,7 +369,7 @@ impl State {
             })
             .color(muted()),
         );
-        ui.label(RichText::new("One shot per crossing; the first valid observation sets the baseline.").color(muted()));
+        ui.label(RichText::new("The first valid observation sets the baseline.").color(muted()));
         if let Some(error) = &self.save_error {
             ui.label(
                 RichText::new(format!("Not saved: {error}. Retrying; changes may be lost on exit."))
@@ -410,6 +425,12 @@ impl State {
                                 muted()
                             }));
                         });
+                        if let Repeat::Rearm { cooldown_secs } = a.repeat {
+                            ui.label(
+                                RichText::new(format!("Every time · {} min cooldown", cooldown_secs / 60))
+                                    .color(muted()),
+                            );
+                        }
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Edit…").clicked() {
                                 action = Some(Action::Edit(a.id));
@@ -484,7 +505,24 @@ impl State {
                     ui.add(egui::TextEdit::singleline(&mut draft.price).hint_text("Price").char_limit(30).desired_width(135.));
                 });
                 ui.add_space(8.);
-                ui.label(RichText::new("Fires once, then stops. Saving rearms the alert.").color(muted()));
+                ui.label("Repeat");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut draft.repeat, Repeat::Once, "Once");
+                    let every = matches!(draft.repeat, Repeat::Rearm { .. });
+                    if ui.radio(every, "Every time").clicked() && !every {
+                        draft.repeat = Repeat::Rearm { cooldown_secs: 300 };
+                    }
+                });
+                if let Repeat::Rearm { cooldown_secs } = &mut draft.repeat {
+                    let mut minutes = *cooldown_secs / 60;
+                    ui.horizontal(|ui| {
+                        ui.label("Cooldown");
+                        if ui.add(egui::DragValue::new(&mut minutes).range(1..=1440).suffix(" min")).changed() {
+                            *cooldown_secs = minutes * 60;
+                        }
+                    });
+                }
+                ui.label(RichText::new("Saving rearms the alert with a fresh baseline.").color(muted()));
                 ui.label(RichText::new("Polls about every 15 seconds while the app runs; slow providers delay checks. Crossings between checks can be missed.").small().color(muted()));
                 if draft.simulated { ui.label(RichText::new("Sample alert · simulated data only").color(amber())); }
                 if let Some(error) = &draft.error { ui.label(RichText::new(error).color(crate::theme::down())); }
@@ -516,6 +554,7 @@ impl State {
                     let symbol = crate::chart_compare::parse_key(&draft.symbol).ok_or("Choose a valid symbol")?;
                     self.book.add(symbol, level, draft.direction, draft.simulated)?
                 };
+                self.book.set_repeat(id, draft.repeat)?;
                 self.book.set_rule(id, rule)
             })();
             match result {
@@ -767,6 +806,39 @@ mod tests {
                 }],
             );
         }
+    }
+
+    #[test]
+    fn repeat_editor_round_trip_and_actionable_event_seen() {
+        let ctx = egui::Context::default();
+        let mut s = state();
+        click(&ctx, &mut s, "New price alert…");
+        s.editor.as_mut().unwrap().symbol = "AAPL".into();
+        s.editor.as_mut().unwrap().price = "100".into();
+        click(&ctx, &mut s, "Every time");
+        click(&ctx, &mut s, "Create alert");
+        assert_eq!(s.book.alerts[0].repeat, Repeat::Rearm { cooldown_secs: 300 });
+        let restored = State::load(s.path.clone(), false);
+        assert_eq!(restored.book.alerts[0].repeat, s.book.alerts[0].repeat);
+        click(&ctx, &mut s, "Edit…");
+        assert_eq!(s.editor.as_ref().unwrap().repeat, Repeat::Rearm { cooldown_secs: 300 });
+        click(&ctx, &mut s, "Once");
+        click(&ctx, &mut s, "Save and rearm");
+        assert_eq!(s.book.alerts[0].repeat, Repeat::Once);
+        reply(&mut s, 99.);
+        let event = reply(&mut s, 101.).remove(0);
+        s.mark_seen(event.alert.id, event.quote_ts);
+        assert_eq!(State::load(s.path.clone(), false).unread(), 0);
+        std::fs::remove_dir_all(s.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn delivery_settings_default_off() {
+        let prefs: crate::prefs::Prefs = serde_json::from_str("{}").unwrap();
+        assert!(!prefs.alert_sound);
+        assert!(!prefs.desktop_notification);
+        assert!(!crate::prefs::Prefs::default().alert_sound);
+        assert!(!crate::prefs::Prefs::default().desktop_notification);
     }
 
     #[test]

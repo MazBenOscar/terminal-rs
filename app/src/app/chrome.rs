@@ -880,7 +880,25 @@ impl TerminalApp {
 
     /// Alerts stacked at the top right: each slides in from the edge with a slight
     /// overshoot, the stack glides up as older ones leave, and they fade out at the end.
-    pub(super) fn toasts(&self, ctx: &egui::Context) {
+    pub(super) fn alert_toast(&mut self, event: tr_core::price_alerts::Event) {
+        let note = if self.price_alerts.save_error.is_some() { " · not saved" } else { "" };
+        let body = format!("{}{note}", crate::price_alerts::event_message(&event));
+        if self.prefs.desktop_notification {
+            crate::alert_delivery::spawn(
+                crate::alert_delivery::notification_command(&format!("Alert: {}", event.alert.symbol), &body),
+                event.alert.id,
+            );
+        }
+        if self.prefs.alert_sound {
+            crate::alert_delivery::spawn(crate::alert_delivery::sound_command(), event.alert.id);
+        }
+        let at = Instant::now();
+        self.toasts.push((format!("{}{body}", crate::price_alerts::TOAST_PREFIX), at));
+        self.alert_toasts.push((at, event));
+    }
+
+    pub(super) fn toasts(&mut self, ctx: &egui::Context) {
+        let mut clicked = None;
         let screen = ctx.content_rect();
         let layer = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("toasts")));
         let life = super::TOAST_SECS as f32;
@@ -896,6 +914,21 @@ impl TerminalApp {
                 anim::spring(ctx, Id::new(("toast-y", *at)), screen.top() + self.toolbar_h() + 10.0 + k as f32 * 58.0);
             let x = screen.right() - 432.0 + (1.0 - enter) * 444.0;
             let r = Rect::from_min_size(pos2(x, y), vec2(420.0, 50.0));
+            if let Some((_, event)) = self.alert_toasts.iter().find(|(time, _)| time == at) {
+                egui::Area::new(Id::new(("alert-toast-click", *at)))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(r.min)
+                    .show(ctx, |ui| {
+                        if ui
+                            .allocate_exact_size(r.size(), Sense::click())
+                            .1
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            clicked = Some(event.clone());
+                        }
+                    });
+            }
             let mut p = layer.clone();
             p.multiply_opacity(1.0 - leave);
             widgets::card_on(&p, r, 0.0);
@@ -907,7 +940,7 @@ impl TerminalApp {
                     _ => ("Trading", rest, amber()),
                 },
                 None => match msg.strip_prefix(crate::price_alerts::TOAST_PREFIX) {
-                    Some(m) => ("Price Alert", m, amber()),
+                    Some(m) => ("Price alert", m, amber()),
                     None => ("Congress Alert", msg.as_str(), amber()),
                 },
             };
@@ -926,6 +959,10 @@ impl TerminalApp {
                 ui_font(11.5),
                 muted(),
             );
+        }
+        if let Some(event) = clicked {
+            self.open_security(&event.alert.symbol);
+            self.price_alerts.mark_seen(event.alert.id, event.quote_ts);
         }
     }
 }

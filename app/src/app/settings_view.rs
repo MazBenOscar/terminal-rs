@@ -584,6 +584,13 @@ impl TerminalApp {
     }
 
     fn panels_tab(&mut self, ui: &mut Ui, cmds: &mut Vec<SettingsCmd>) {
+        section(ui, "Alerts");
+        let sound = ui.checkbox(&mut self.prefs.alert_sound, "Alert sound").changed();
+        let notification = ui.checkbox(&mut self.prefs.desktop_notification, "Desktop notification").changed();
+        ui.label(RichText::new("Alerts are checked only while terminal-rs is running.").color(muted()));
+        if sound || notification {
+            cmds.push(SettingsCmd::SavePrefs);
+        }
         let before = self.prefs.panels.clone();
         let d = &mut self.prefs.panels;
         section(ui, "New charts");
