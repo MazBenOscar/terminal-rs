@@ -45,8 +45,11 @@ pub const CATEGORIES: [Category; 5] = [
     Category {
         title: "Measure & volume",
         sections: &[
-            Section { title: "Measurers", tools: &[Tool::Measure] },
-            Section { title: "Volume-based", tools: &[] },
+            Section {
+                title: "Measurers",
+                tools: &[Tool::Measure, Tool::PriceRange, Tool::DateRange, Tool::DatePriceRange],
+            },
+            Section { title: "Volume-based", tools: &[Tool::AnchoredVwap, Tool::FixedRangeVolumeProfile] },
             Section { title: "Forecasting", tools: &[Tool::LongPosition, Tool::ShortPosition] },
         ],
     },
@@ -137,7 +140,7 @@ const fn category_tools<const N: usize>(index: usize) -> [Tool; N] {
 pub const GROUPS: [(&str, &[Tool]); 5] = [
     (CATEGORIES[0].title, &category_tools::<6>(0)),
     (CATEGORIES[1].title, &category_tools::<2>(1)),
-    (CATEGORIES[2].title, &category_tools::<3>(2)),
+    (CATEGORIES[2].title, &category_tools::<8>(2)),
     (CATEGORIES[3].title, &category_tools::<1>(3)),
     (CATEGORIES[4].title, &category_tools::<1>(4)),
 ];

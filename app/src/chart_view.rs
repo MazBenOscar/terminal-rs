@@ -3665,9 +3665,14 @@ impl ChartState {
     }
 
     fn drawing_tools_menu(&mut self, ui: &mut Ui) {
-        for index in 0..crate::drawing_toolbar::CATEGORIES.len() {
-            self.drawing_category_menu(ui, index);
-        }
+        egui::ScrollArea::vertical()
+            .id_salt((self.id, "draw-menu-scroll"))
+            .max_height((ui.available_height() * 0.5).clamp(theme::dp(100.), theme::dp(360.)))
+            .show(ui, |ui| {
+                for index in 0..crate::drawing_toolbar::CATEGORIES.len() {
+                    self.drawing_category_menu(ui, index);
+                }
+            });
         let mut favorites = crate::prefs::drawing_favorites(ui.ctx());
         ui.checkbox(&mut favorites.1, "Favorites bar");
         crate::prefs::set_drawing_favorites(ui.ctx(), favorites);
@@ -3872,6 +3877,13 @@ impl ChartState {
                 });
                 ui.close();
             }
+            if edited.tool == Tool::FixedRangeVolumeProfile {
+                ui.add_enabled(
+                    !self.drawings_locked,
+                    egui::DragValue::new(&mut edited.profile_rows).range(4..=200).prefix("Rows "),
+                );
+                edited.profile_rows = drawings::measure::row_count(edited.profile_rows);
+            }
             ui.add(egui::DragValue::new(&mut edited.width).range(0.5..=6.0).speed(0.1).prefix("Width "));
             let mut custom = edited.color.is_some();
             if ui.checkbox(&mut custom, "Custom drawing color").changed() {
@@ -3887,7 +3899,7 @@ impl ChartState {
                 ui.checkbox(&mut edited.extend_left, "Extend left");
                 ui.checkbox(&mut edited.extend_right, "Extend right");
             }
-            if edited != self.drawings[index] {
+            if !self.drawings_locked && edited != self.drawings[index] {
                 self.remember_drawings();
                 self.drawings[index] = edited;
             }
@@ -4087,18 +4099,21 @@ impl ChartState {
             [0., 0.]
         };
         let bars = (self.index_of_ts(d.b.ts) - self.index_of_ts(d.a.ts)).abs().round() as usize;
-        drawings::geometry(&drawings::Geometry {
+        let geometry = drawings::Geometry {
             drawing: d,
             points: [px(&d.a), px(&d.b), px(&d.c.unwrap_or(d.b))],
             bounds: [rect.left() as f64, rect.top() as f64, rect.right() as f64, rect.bottom() as f64],
             price_y: &|price| rect.top() as f64 + s.y_of(price),
-            measure_label: if d.tool == Tool::Measure {
-                drawings::measure_label(d.a, d.b, bars, self.sec.decimals(d.a.price))
-            } else {
-                String::new()
-            },
+            measure_label: drawings::measure::range_label(d, &self.bars, bars, self.sec.decimals(d.a.price)),
             text_size,
-        })
+        };
+        if matches!(d.tool, Tool::AnchoredVwap | Tool::FixedRangeVolumeProfile) {
+            drawings::measure::series_geometry(&geometry, &self.bars, &|index| {
+                rect.left() as f64 + v.x_of(index as f64)
+            })
+        } else {
+            drawings::geometry(&geometry)
+        }
     }
 
     fn paint_drawings(
@@ -5374,6 +5389,105 @@ mod tests {
             chart.redo_drawings();
             assert!(chart.drawings.is_empty());
         }
+    }
+
+    #[test]
+    fn range_and_volume_drawings_place_edit_lock_hide_and_undo() {
+        for tool in
+            [Tool::PriceRange, Tool::DateRange, Tool::DatePriceRange, Tool::AnchoredVwap, Tool::FixedRangeVolumeProfile]
+        {
+            let ctx = egui::Context::default();
+            let mut chart = drawing_chart();
+            chart.start_tool(tool);
+            let from = pos2(320., 300.);
+            click_drawing(&ctx, &mut chart, from, false);
+            if tool.points() == 2 {
+                assert!(chart.drawings.is_empty());
+                click_drawing(&ctx, &mut chart, pos2(480., 100.), false);
+            }
+            assert_eq!(chart.drawings.len(), 1);
+            let original = chart.drawings[0].clone();
+            assert_eq!(original.symbol.as_deref(), Some(chart.symbol.as_str()));
+            click_drawing(&ctx, &mut chart, from, false);
+            assert_eq!(chart.draw.selected, Some(0));
+            let to = pos2(360., 260.);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], false);
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], false);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], false);
+            assert_ne!(chart.drawings[0].a, original.a);
+            chart.undo_drawings();
+            assert_eq!(chart.drawings[0], original);
+            chart.redo_drawings();
+            assert_ne!(chart.drawings[0].a, original.a);
+            chart.undo_drawings();
+            chart.drawings_locked = true;
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], false);
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], false);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], false);
+            assert_eq!(chart.drawings[0], original);
+            chart.drawings_hidden = true;
+            click_drawing(&ctx, &mut chart, from, false);
+            assert_eq!(chart.drawings[0], original);
+            chart.drawings_hidden = false;
+            chart.drawings_locked = false;
+            click_drawing(&ctx, &mut chart, from, false);
+            assert!(chart.delete_selected());
+            chart.undo_drawings();
+            assert_eq!(chart.drawings[0], original);
+            chart.redo_drawings();
+            assert!(chart.drawings.is_empty());
+        }
+    }
+
+    #[test]
+    fn fixed_profile_context_rows_edit_is_undoable_and_locked() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.start_tool(Tool::FixedRangeVolumeProfile);
+        click_drawing(&ctx, &mut chart, pos2(320., 300.), false);
+        click_drawing(&ctx, &mut chart, pos2(480., 100.), false);
+        let original = chart.drawings[0].clone();
+        ui_frame(&ctx, vec![], |ui| chart.draw_menu(ui));
+        let labels = ui_frame(&ctx, vec![], |ui| chart.draw_menu(ui));
+        let from = labels.iter().find(|(text, _)| text.starts_with("Rows ")).unwrap().1.center();
+        let to = from + vec2(50., 0.);
+        ui_frame(&ctx, vec![egui::Event::PointerMoved(from), pointer_button(from, true)], |ui| chart.draw_menu(ui));
+        ui_frame(&ctx, vec![egui::Event::PointerMoved(to)], |ui| chart.draw_menu(ui));
+        ui_frame(&ctx, vec![pointer_button(to, false)], |ui| chart.draw_menu(ui));
+        assert_ne!(chart.drawings[0].profile_rows, 24);
+        assert!((4..=200).contains(&chart.drawings[0].profile_rows));
+        chart.undo_drawings();
+        assert_eq!(chart.drawings[0], original);
+        chart.drawings_locked = true;
+        ui_frame(&ctx, vec![egui::Event::PointerMoved(from), pointer_button(from, true)], |ui| chart.draw_menu(ui));
+        ui_frame(&ctx, vec![egui::Event::PointerMoved(to)], |ui| chart.draw_menu(ui));
+        ui_frame(&ctx, vec![pointer_button(to, false)], |ui| chart.draw_menu(ui));
+        assert_eq!(chart.drawings[0], original);
+    }
+
+    #[test]
+    fn volume_drawings_are_independent_and_magnet_snaps_anchor_price() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.magnet = true;
+        for tool in [Tool::AnchoredVwap, Tool::AnchoredVwap, Tool::FixedRangeVolumeProfile] {
+            chart.start_tool(tool);
+            click_drawing(&ctx, &mut chart, pos2(320., 300.), false);
+            if tool.points() == 2 {
+                click_drawing(&ctx, &mut chart, pos2(480., 100.), false);
+            }
+        }
+        assert_eq!(chart.drawings.len(), 3);
+        assert!(chart.drawings.iter().all(|d| d.a.price == 140.));
+        chart.drawings[0].color = Some(theme::up().to_array()[..3].try_into().unwrap());
+        assert_eq!(chart.drawings[1].color, None);
+        assert_eq!(chart.drawings[2].profile_rows, 24);
+        assert!(chart.data.analytics.anchor.is_none());
+        chart.replay_cutoff = Some(86400);
+        assert!(!chart.drawing_available());
+        chart.replay_cutoff = None;
+        chart.chart_type = ChartType::Renko;
+        assert!(!chart.drawing_available());
     }
 
     #[test]
