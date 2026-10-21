@@ -179,7 +179,13 @@ impl TerminalApp {
         let mut out = Vec::new();
         let row_h = dp(22.0);
         let w = ui.available_width();
-        let (hdr, _) = ui.allocate_exact_size(vec2(w, row_h), Sense::hover());
+        let (hdr, header_response) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
+        header_response.context_menu(|ui| {
+            if ui.button("Edit columns…").clicked() {
+                out.push(Action::Command("COL EDIT".into()));
+                ui.close();
+            }
+        });
         let p = ui.painter();
         p.rect_filled(hdr, theme::CONTROL_RADIUS, theme::header());
         let extra = self.watch_columns.columns.len().min(((w - dp(380.0)).max(0.0) / dp(85.0)) as usize);
@@ -214,7 +220,14 @@ impl TerminalApp {
             let left = if index == 0 { hdr.left() } else { col(hdr, k - 1) };
             let right = if index == 0 { col(hdr, 1) } else { col(hdr, k) };
             let hit = Rect::from_min_max(pos2(left, hdr.top()), pos2(right, hdr.bottom()));
-            if ui.interact(hit, ui.id().with(("watch-header", index)), Sense::click()).clicked() {
+            let response = ui.interact(hit, ui.id().with(("watch-header", index)), Sense::click());
+            response.context_menu(|ui| {
+                if ui.button("Edit columns…").clicked() {
+                    out.push(Action::Command("COL EDIT".into()));
+                    ui.close();
+                }
+            });
+            if response.clicked() {
                 self.watch_sort = match self.watch_sort {
                     Some((active, false)) if active == index => Some((index, true)),
                     Some((active, true)) if active == index => None,

@@ -6,6 +6,7 @@
 
 mod broker;
 mod chrome;
+mod columns_view;
 mod demo;
 mod hotkeys_view;
 mod options_view;
@@ -525,6 +526,7 @@ pub struct TerminalApp {
 
     watchlist: Vec<String>,
     watch_columns: tr_core::columns::ColumnSet,
+    columns_editor: Option<columns_view::ColumnsEditor>,
     column_cells: HashMap<String, Vec<tr_core::columns::Cell>>,
     columns_revision: u64,
     columns_computed_at: i64,
@@ -685,6 +687,7 @@ impl TerminalApp {
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
             watch_columns: Default::default(),
+            columns_editor: None,
             column_cells: HashMap::new(),
             columns_revision: 0,
             columns_computed_at: 0,
@@ -927,6 +930,9 @@ impl TerminalApp {
                 self.watch_columns.columns.retain(|c| !c.title.eq_ignore_ascii_case(&title));
                 self.watch_sort = None;
                 self.refresh_columns();
+            }
+            Function::ColumnEdit => {
+                self.columns_editor = Some(columns_view::ColumnsEditor::new(&self.watch_columns));
             }
             Function::ColumnClear => {
                 self.watch_columns.columns.clear();
@@ -1809,6 +1815,16 @@ impl eframe::App for TerminalApp {
         actions.extend(self.render_dock(ui, area, gap));
         actions.extend(self.render_windows(&ctx));
         self.run_actions(actions);
+        if let Some(editor) = &mut self.columns_editor {
+            let (applied, open) = editor.show(&ctx);
+            if let Some(set) = applied {
+                self.watch_columns = set;
+                self.refresh_columns();
+            }
+            if !open {
+                self.columns_editor = None;
+            }
+        }
         self.trading_windows(&ctx);
         self.price_alerts.editor(&ctx);
         if let Some(notice) = self.price_alerts.notice.take() {

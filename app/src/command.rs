@@ -236,6 +236,7 @@ pub enum Function {
     ColumnAdd(tr_core::columns::ColumnDef),
     ColumnDelete(String),
     ColumnClear,
+    ColumnEdit,
     WatchAdd(Vec<String>),
     WatchRemove(Vec<String>),
     /// `LAYOUT 1|2|2H|3|4|6` preset, `LAYOUT <name>` switch, or a layout subcommand
@@ -352,6 +353,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "COL" => {
             let (action, args) = rest.split_first()?;
             match action.to_ascii_uppercase().as_str() {
+                "EDIT" if args.is_empty() => Function::ColumnEdit,
                 "CLEAR" if args.is_empty() => Function::ColumnClear,
                 "DEL" if !args.is_empty() => Function::ColumnDelete(args.join(" ")),
                 "ADD" => {
@@ -535,6 +537,7 @@ fn describe(f: &Function) -> String {
         Function::ColumnAdd(c) => format!("Add column {}", c.title),
         Function::ColumnDelete(title) => format!("Delete column {title}"),
         Function::ColumnClear => "Remove all custom columns".into(),
+        Function::ColumnEdit => "Edit watchlist columns".into(),
         Function::Watchlist => "Watchlist".into(),
         Function::Scanner => "Scan the watchlist with saved conditions".into(),
         Function::WatchAdd(s) => format!("Add {} to watchlist", s.join(", ")),
@@ -625,6 +628,13 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn column_edit_parses() {
+        assert_eq!(parse("COL EDIT"), Some(Command::Function(Function::ColumnEdit)));
+        assert_eq!(parse("col edit"), Some(Command::Function(Function::ColumnEdit)));
+        assert!(parse("COL EDIT extra").is_none());
+    }
 
     #[test]
     fn column_commands() {
