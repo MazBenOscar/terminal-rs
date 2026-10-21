@@ -129,7 +129,7 @@ pub fn rail_layout(rail: Rect) -> Vec<(RailItem, Rect)> {
 }
 
 fn rail_layout_with_categories(rail: Rect, categories: &[Category], patterns: &Category) -> Vec<(RailItem, Rect)> {
-    let size = theme::dp(30.);
+    let size = theme::dp(32.);
     let mut y = rail.top() + theme::dp(4.);
     RAIL.into_iter()
         .filter_map(|item| {
@@ -143,7 +143,7 @@ fn rail_layout_with_categories(rail: Rect, categories: &[Category], patterns: &C
             }
             let height = if item == RailItem::Separator { theme::dp(4.) } else { size };
             let rect = Rect::from_min_size(pos2(rail.center().x - size / 2., y), vec2(size, height));
-            y += height + theme::dp(4.);
+            y += height + theme::dp(2.);
             Some((item, rect))
         })
         .collect()
@@ -314,7 +314,7 @@ pub fn button(
     }
     widgets::draw_icon(
         ui.painter(),
-        rect.shrink(theme::dp(7.)),
+        Rect::from_center_size(rect.center(), vec2(theme::dp(20.), theme::dp(20.))),
         icon,
         if active { theme::accent() } else { theme::text() },
     );
@@ -337,6 +337,142 @@ pub fn favorites_rect(plot: Rect, count: usize, position: Option<[f32; 2]>, top:
 
 pub fn fraction(plot: Rect, rect: Rect) -> [f32; 2] {
     [(rect.left() - plot.left()) / plot.width(), (rect.top() - plot.top()) / plot.height()]
+}
+
+/// Shared menu row. A separate star hit target never selects the tool.
+pub fn tool_row(ui: &mut Ui, tool: Tool, shortcut: &str, active: bool, favorite: Option<bool>) -> (Response, bool) {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let label = ui.painter().layout_no_wrap(tool.label().into(), font.clone(), theme::text());
+    let keys = ui.painter().layout_no_wrap(shortcut.into(), font, theme::muted());
+    let star_width = if favorite.is_some() { theme::dp(28.) } else { 0. };
+    let min_width = theme::dp(24. + 18. + 10. + 12.) + label.size().x + keys.size().x + star_width;
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(ui.available_width().max(theme::dp(260.)).max(min_width), theme::dp(32.)),
+        Sense::hover(),
+    );
+    let content = rect.shrink2(vec2(theme::dp(12.), 0.));
+    let star_rect = Rect::from_min_max(pos2(content.right() - star_width, rect.top()), content.right_bottom());
+    let select_rect = Rect::from_min_max(
+        rect.min,
+        pos2(if favorite.is_some() { star_rect.left() } else { rect.right() }, rect.bottom()),
+    );
+    let response = ui.interact(select_rect, ui.id().with((tool, "select")), Sense::click());
+    let star = favorite.map(|_| {
+        let hit_rect = Rect::from_min_max(star_rect.min, rect.max);
+        ui.interact(hit_rect, ui.id().with((tool, "star")), Sense::click())
+    });
+    let hovered = response.hovered() || star.as_ref().is_some_and(Response::hovered);
+    if active || hovered {
+        ui.painter().rect_filled(
+            rect,
+            theme::CONTROL_RADIUS,
+            if active { theme::accent_wash() } else { theme::control_hover() },
+        );
+    }
+    widgets::draw_icon(
+        ui.painter(),
+        Rect::from_center_size(
+            pos2(content.left() + theme::dp(9.), rect.center().y),
+            vec2(theme::dp(18.), theme::dp(18.)),
+        ),
+        widgets::tool_icon(tool),
+        theme::text(),
+    );
+    ui.painter().galley(
+        pos2(content.left() + theme::dp(28.), rect.center().y - label.size().y / 2.),
+        label,
+        theme::text(),
+    );
+    if !shortcut.is_empty() {
+        ui.painter().galley(
+            pos2(content.right() - star_width - keys.size().x, rect.center().y - keys.size().y / 2.),
+            keys,
+            theme::muted(),
+        );
+    }
+    if let Some(filled) = favorite.filter(|&filled| filled || hovered) {
+        widgets::favorite_star(
+            ui.painter(),
+            Rect::from_center_size(star_rect.center(), vec2(theme::dp(18.), theme::dp(18.))),
+            filled,
+        );
+    }
+    let toggled = star.is_some_and(|response| {
+        response
+            .on_hover_text(if favorite == Some(true) { "Remove from favorites" } else { "Add to favorites" })
+            .clicked()
+    });
+    (response, toggled)
+}
+
+pub fn section_heading(ui: &mut Ui, title: &str, separator_before: bool) {
+    if separator_before {
+        ui.separator();
+    }
+    ui.add_space(theme::dp(8.));
+    let mut font = egui::TextStyle::Body.resolve(ui.style());
+    font.size *= 0.78;
+    let job = egui::text::LayoutJob::single_section(
+        title.to_uppercase(),
+        egui::TextFormat {
+            font_id: font,
+            color: theme::muted(),
+            extra_letter_spacing: theme::dp(0.6),
+            ..Default::default()
+        },
+    );
+    ui.horizontal(|ui| {
+        ui.add_space(theme::dp(12.));
+        ui.label(job);
+    });
+    ui.add_space(theme::dp(4.));
+}
+
+#[cfg(test)]
+#[test]
+fn flyout_paints_stars_only_for_hover_or_favorites_and_uppercase_headings() {
+    fn frame(favorite: bool, hovered: bool) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let mut pointer = None;
+        let mut output = None;
+        // Settle the headless UI before testing hover hit detection.
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                events: pointer.map(|p| vec![egui::Event::PointerMoved(p)]).unwrap_or_default(),
+                ..Default::default()
+            };
+            let mut next = ctx.run_ui(input, |ui| {
+                section_heading(ui, "Chart patterns", false);
+                let (response, _) = tool_row(ui, Tool::Xabcd, "", false, Some(favorite));
+                if hovered {
+                    pointer = Some(response.rect.center());
+                }
+            });
+            next.textures_delta.clear();
+            output = Some(next);
+        }
+        output.unwrap()
+    }
+    let star_count = |output: &egui::FullOutput| {
+        output
+            .shapes
+            .iter()
+            .filter(|shape| matches!(&shape.shape, egui::Shape::Path(path) if path.points.len() == 11))
+            .count()
+    };
+    let quiet = frame(false, false);
+    assert_eq!(star_count(&quiet), 0, "Non-favorite stars must not be painted at rest");
+    assert_eq!(star_count(&frame(false, true)), 1, "Hover reveals the star");
+    assert!(frame(true, false).shapes.len() > quiet.shapes.len(), "Favorites remain filled at rest");
+    let headings: Vec<_> = quiet
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text.contains("PATTERNS") => Some(text.galley.job.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(headings, ["CHART PATTERNS"]);
 }
 
 pub fn separator(ui: &Ui, rect: Rect) {
@@ -510,7 +646,8 @@ impl super::ChartState {
                 .default_size(vec2(theme::dp(320.), theme::dp(440.)))
                 .fixed_pos(anchor)
                 .show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    egui::Frame::popup(ui.style()).inner_margin(theme::dp(6.)).show(ui, |ui| {
+                        ui.set_min_width(theme::dp(260.));
                         let height =
                             theme::dp(420.).min(ui.ctx().content_rect().height() - theme::dp(24.)).max(theme::dp(24.));
                         ui.set_max_height(height);

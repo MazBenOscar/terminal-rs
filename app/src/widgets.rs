@@ -158,7 +158,7 @@ pub enum Icon {
 fn measure_volume_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
     let unit = r.width().min(r.height()) / 12.;
     let pt = |x: f32, y: f32| r.center() + vec2((x - 6.) * unit, (y - 6.) * unit);
-    let stroke = Stroke::new(1.4, color);
+    let stroke = Stroke::new(theme::dp(1.4), color);
     if icon == Icon::AnchoredVwap {
         p.circle_stroke(pt(2., 9.), unit, stroke);
         p.add(Shape::line(vec![pt(2., 8.), pt(4., 5.), pt(6., 6.), pt(8., 3.), pt(11., 2.)], stroke));
@@ -193,7 +193,7 @@ fn annotation_point(r: egui::Rect, x: f32, y: f32) -> egui::Pos2 {
 }
 fn arrow_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, color: egui::Color32) {
     let pt = |x, y| annotation_point(r, x, y);
-    let s = egui::Stroke::new(1.4, color);
+    let s = egui::Stroke::new(theme::dp(1.4), color);
     if icon == Icon::Arrow {
         p.line_segment([pt(1., 11.), pt(11., 1.)], s);
         p.add(egui::Shape::line(vec![pt(5., 1.), pt(11., 1.), pt(11., 7.)], s));
@@ -206,24 +206,24 @@ fn brush_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
     let pt = |x, y| annotation_point(r, x, y);
     p.add(egui::Shape::line(
         vec![pt(1., 10.), pt(3., 3.), pt(5., 2.), pt(6., 8.), pt(8., 10.), pt(11., 4.)],
-        egui::Stroke::new(1.4, color),
+        egui::Stroke::new(theme::dp(1.4), color),
     ));
 }
 fn shape_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, color: egui::Color32) {
     let pt = |x, y| annotation_point(r, x, y);
-    let s = egui::Stroke::new(1.4, color);
+    let s = egui::Stroke::new(theme::dp(1.4), color);
     if icon == Icon::Circle {
         p.circle_stroke(pt(6., 6.), r.width().min(r.height()) * 5. / 16., s);
     } else {
         p.add(egui::Shape::line(vec![pt(1., 10.), pt(4., 2.), pt(8., 9.), pt(11., 3.)], s));
         for (x, y) in [(1., 10.), (4., 2.), (8., 9.), (11., 3.)] {
-            p.circle_filled(pt(x, y), 1., color);
+            p.circle_stroke(pt(x, y), 1.6 * r.width().min(r.height()) / 16., s);
         }
     }
 }
 fn note_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, color: egui::Color32) {
     let pt = |x, y| annotation_point(r, x, y);
-    let s = egui::Stroke::new(1.4, color);
+    let s = egui::Stroke::new(theme::dp(1.4), color);
     match icon {
         Icon::FlagMark => {
             p.line_segment([pt(3., 12.), pt(3., 1.)], s);
@@ -317,27 +317,162 @@ fn pattern_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
         Icon::Xabcd => &[[-6., 4.], [-3., -5.], [0., 2.], [3., -2.], [6., 5.]],
         Icon::Abcd => &[[-6., 5.], [-2., -4.], [2., 2.], [6., -5.]],
         Icon::HeadAndShoulders => &[[-6., 5.], [-4., -1.], [-2., 2.], [0., -6.], [2., 2.], [4., -1.], [6., 5.]],
-        Icon::TrianglePattern => &[[-6., -5.], [-4., 5.], [2., -2.], [5., 2.]],
+        Icon::TrianglePattern => &[[-6., -5.], [-6., 5.], [6., 0.]],
         Icon::ElliottImpulse => &[[-6., 6.], [-4., 1.], [-2., 3.], [0., -3.], [3., -1.], [6., -6.]],
         Icon::ElliottCorrection => &[[-6., -5.], [-2., 3.], [2., -2.], [6., 5.]],
         _ => unreachable!("Non-pattern icon"),
     };
     let unit = r.width().min(r.height()) / 16.;
     let point = |a: [f32; 2]| r.center() + vec2(a[0] * unit, a[1] * unit);
-    let stroke = Stroke::new(1.4, color);
-    p.add(Shape::line(points.iter().copied().map(point).collect(), stroke));
+    let stroke = Stroke::new(theme::dp(1.4), color);
+    let radius = 1.6 * unit;
+    // Stop each segment at the open anchors rather than drawing through their centres.
+    for pair in points.windows(2) {
+        let a = point(pair[0]);
+        let b = point(pair[1]);
+        let offset = (b - a).normalized() * radius;
+        p.line_segment([a + offset, b - offset], stroke);
+    }
     if icon == Icon::Xabcd {
-        p.line_segment([point(points[0]), point(points[4])], stroke);
+        p.extend(Shape::dashed_line(&[point(points[0]), point(points[4])], stroke, 2. * unit, 2. * unit));
+    }
+    if icon == Icon::HeadAndShoulders {
+        p.line_segment([point([-6., 3.]), point([6., 3.])], stroke);
     }
     if icon == Icon::TrianglePattern {
         p.line_segment([point(points[0]), point([6., 0.])], stroke);
         p.line_segment([point(points[1]), point([6., 0.])], stroke);
     }
+    for &anchor in points {
+        p.circle_stroke(point(anchor), radius, stroke);
+    }
+}
+
+/// Multi-point glyphs share open anchors and scale-aware strokes.
+fn anchored_tool_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) -> bool {
+    let unit = r.width().min(r.height()) / 16.;
+    let pt = |a: [f32; 2]| r.center() + vec2(a[0], a[1]) * unit;
+    let stroke = Stroke::new(theme::dp(1.4), color);
+    let anchors: &[[f32; 2]] = match icon {
+        Icon::Trendline | Icon::Ray | Icon::Channel | Icon::RegressionTrend => &[[-5., 5.], [5., -5.]],
+        Icon::ExtendedLine => &[[-2., 2.], [2., -2.]],
+        Icon::InfoLine => &[[-5., 5.], [2., -2.]],
+        Icon::Pitchfork => &[[-5., 5.], [-4., -2.], [2., 4.]],
+        Icon::FibRetracement => &[[-5., 5.], [5., -5.]],
+        Icon::FibExtension => &[[-5., 5.], [-1., -5.], [4., 2.]],
+        Icon::FibChannel => &[[-5., 5.], [5., -2.], [-5., 0.]],
+        Icon::FibTimeZone => &[[-5., 3.], [-2., 3.]],
+        Icon::PriceRange => &[[-3., -5.], [-3., 5.]],
+        Icon::DateRange => &[[-5., 2.], [5., 2.]],
+        Icon::DatePriceRange => &[[-5., 5.], [5., -5.]],
+        Icon::Path => &[[-5., 4.], [-2., -4.], [2., 3.], [5., -3.]],
+        _ => return false,
+    };
+    let radius = 1.6 * unit;
+    for pair in anchors.windows(2) {
+        let a = pt(pair[0]);
+        let b = pt(pair[1]);
+        let offset = (b - a).normalized() * radius;
+        p.line_segment([a + offset, b - offset], stroke);
+    }
+    let segment = |a, b| {
+        p.line_segment([pt(a), pt(b)], stroke);
+    };
+    match icon {
+        Icon::Ray | Icon::ExtendedLine => {
+            segment([3., -3.], [6., -6.]);
+            if icon == Icon::ExtendedLine {
+                segment([-6., 6.], [-3., 3.]);
+            }
+        }
+        Icon::Channel | Icon::RegressionTrend => {
+            segment([-5., 0.], [0., -5.]);
+            if icon == Icon::RegressionTrend {
+                segment([0., 5.], [5., 0.]);
+            }
+        }
+        Icon::InfoLine => {
+            p.rect_stroke(Rect::from_min_max(pt([0., -6.]), pt([6., -2.])), 0., stroke, StrokeKind::Middle);
+            segment([2., -4.], [4., -4.]);
+        }
+        Icon::Pitchfork => {
+            for (a, b) in [([-4., -2.], [0., -6.]), ([2., 4.], [6., 0.]), ([-1., 1.], [5., -5.])] {
+                segment(a, b);
+            }
+        }
+        Icon::FibRetracement | Icon::FibExtension => {
+            for y in [-5., -2., 1., 5.] {
+                segment([-3., y], [6., y]);
+            }
+        }
+        Icon::FibChannel => {
+            for offset in [-4., -2., 2.] {
+                segment([-5., 3. + offset], [5., -4. + offset]);
+            }
+        }
+        Icon::FibTimeZone => {
+            for x in [-5., -2., 1., 5.] {
+                segment([x, -5.], [x, 1.]);
+            }
+        }
+        Icon::PriceRange => {
+            segment([-5., -5.], [-1., -5.]);
+            segment([-5., 5.], [-1., 5.]);
+        }
+        Icon::DateRange => {
+            segment([-5., 0.], [-5., 4.]);
+            segment([5., 0.], [5., 4.]);
+        }
+        Icon::DatePriceRange => {
+            segment([-5., 2.], [-5., -5.]);
+            segment([-5., -5.], [2., -5.]);
+            segment([-2., 5.], [5., 5.]);
+            segment([5., 5.], [5., -2.]);
+        }
+        _ => {}
+    }
+    for &anchor in anchors {
+        p.circle_stroke(pt(anchor), radius, stroke);
+    }
+    true
+}
+
+/// Favourite glyph uses the same geometry in its quiet and selected states.
+pub fn favorite_star(p: &egui::Painter, r: Rect, filled: bool) {
+    let color = if filled { theme::accent() } else { theme::muted() };
+    let unit = r.width().min(r.height()) / 16.;
+    let points: Vec<_> = (0..10)
+        .map(|i| {
+            let angle = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.;
+            let radius = if i % 2 == 0 { 6. } else { 2.6 };
+            r.center() + vec2(angle.cos(), angle.sin()) * radius * unit
+        })
+        .collect();
+    if filled {
+        // Five convex wedges fill the concave star without invalid convex tessellation.
+        for i in (0..10).step_by(2) {
+            p.add(Shape::convex_polygon(
+                vec![r.center(), points[(i + 9) % 10], points[i], points[(i + 1) % 10]],
+                color,
+                Stroke::NONE,
+            ));
+        }
+    } else {
+        let mut outline = points;
+        outline.push(outline[0]);
+        p.add(Shape::line(outline, Stroke::new(theme::dp(1.4), color)));
+    }
 }
 
 /// Draw a simple line icon centred in `r`.
 pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
-    let s = Stroke::new(1.4, color);
+    // Tool glyphs use a twelve-unit grid; leave room for the open anchor rings.
+    let is_tool = tr_chart::drawings::Tool::ALL.iter().any(|&tool| tool_icon(tool) == icon);
+    let r = if is_tool { Rect::from_center_size(r.center(), r.size() * (16. / 15.5)) } else { r };
+    if anchored_tool_icon(p, r, icon, color) {
+        return;
+    }
+    let s = Stroke::new(theme::dp(1.4), color);
     let c = r.center();
     let u = r.height().min(r.width()) / 16.0;
     let pt = |x: f32, y: f32| pos2(c.x + x * u, c.y + y * u);
@@ -427,7 +562,7 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
             }
         }
         Icon::ChevronSmall => {
-            p.add(Shape::convex_polygon(vec![pt(-2., 2.), pt(2., -2.), pt(2., 2.)], color, Stroke::NONE));
+            p.add(Shape::convex_polygon(vec![pt(-3., 3.), pt(3., -3.), pt(3., 3.)], color, Stroke::NONE));
         }
         Icon::Sidebar | Icon::SidebarRight => {
             let b = Rect::from_center_size(c, vec2(14.0 * u, 11.0 * u));
