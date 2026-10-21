@@ -26,7 +26,7 @@ impl Category {
     }
 }
 
-pub const CATEGORIES: [Category; 5] = [
+pub const CATEGORIES: [Category; 6] = [
     Category {
         title: "Trend lines",
         sections: &[
@@ -59,11 +59,18 @@ pub const CATEGORIES: [Category; 5] = [
         ],
     },
     Category { title: "Text & notes", sections: &[Section { title: "Text and notes", tools: &[Tool::Text] }] },
+    PATTERNS,
 ];
 
 pub const PATTERNS: Category = Category {
     title: "Patterns",
-    sections: &[Section { title: "Chart patterns", tools: &[] }, Section { title: "Elliott waves", tools: &[] }],
+    sections: &[
+        Section {
+            title: "Chart patterns",
+            tools: &[Tool::Xabcd, Tool::Abcd, Tool::HeadAndShoulders, Tool::TrianglePattern],
+        },
+        Section { title: "Elliott waves", tools: &[Tool::ElliottImpulse, Tool::ElliottCorrection] },
+    ],
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +152,7 @@ pub const GROUPS: [(&str, &[Tool]); 5] = [
 #[derive(Clone, Debug)]
 pub struct State {
     pub last: [Tool; 5],
+    pub pattern_last: Tool,
     pub open: Option<usize>,
     pub hide_open: bool,
     pub held: Option<(usize, f64)>,
@@ -155,6 +163,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             last: [Tool::Trendline, Tool::Fib, Tool::LongPosition, Tool::Rectangle, Tool::Text],
+            pattern_last: Tool::Xabcd,
             open: None,
             hide_open: false,
             held: None,
@@ -174,7 +183,11 @@ impl State {
 
     pub fn remember(&mut self, tool: Tool) {
         if let Some(index) = CATEGORIES.iter().position(|category| category.tools().any(|item| item == tool)) {
-            self.last[index] = tool;
+            if index == 5 {
+                self.pattern_last = tool;
+            } else {
+                self.last[index] = tool;
+            }
         }
     }
 }
@@ -322,6 +335,7 @@ impl super::ChartState {
             let slot = match item {
                 RailItem::Crosshair => 0,
                 RailItem::Category(index) => index + 1,
+                RailItem::Patterns => 10,
                 RailItem::Magnet => 6,
                 RailItem::Hide => 7,
                 RailItem::RemoveAll => 8,
@@ -330,13 +344,14 @@ impl super::ChartState {
             };
             let tool = match item {
                 RailItem::Category(index) => Some(self.drawing_toolbar.last[index]),
+                RailItem::Patterns => Some(self.drawing_toolbar.pattern_last),
                 _ => None,
             };
             let (icon, active, hint) = if let Some(tool) = tool {
                 (
                     widgets::tool_icon(tool),
                     self.draw.tool == Some(tool),
-                    format!("{} · {}", CATEGORIES[slot - 1].title, Self::tool_hint(tool)),
+                    format!("{} · {}", CATEGORIES[if slot == 10 { 5 } else { slot - 1 }].title, Self::tool_hint(tool)),
                 )
             } else {
                 match slot {
@@ -357,8 +372,8 @@ impl super::ChartState {
                     button(ui, rect, (self.id, "rail", slot), icon, active, &hint)
                 })
                 .inner;
-            if (1..=5).contains(&slot) {
-                let group = slot - 1;
+            if (1..=5).contains(&slot) || slot == 10 {
+                let group = if slot == 10 { 5 } else { slot - 1 };
                 anchors[group] = pos2(rail.right() + theme::dp(4.), rect.top());
                 let corner = Rect::from_min_max(rect.max - vec2(theme::dp(11.), theme::dp(11.)), rect.max);
                 widgets::draw_icon(ui.painter(), corner, Icon::ChevronSmall, theme::muted());

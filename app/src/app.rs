@@ -1587,9 +1587,12 @@ impl TerminalApp {
                 c.cancel();
             });
         }
-        if pressed(Modifiers::NONE, Key::Delete) || pressed(Modifiers::NONE, Key::Backspace) {
+        let backspace = pressed(Modifiers::NONE, Key::Backspace);
+        if pressed(Modifiers::NONE, Key::Delete) || backspace {
             self.with_chart(|c, _| {
-                c.delete_selected();
+                if !backspace || !c.pattern_backspace() {
+                    c.delete_selected();
+                }
             });
         }
         if pressed(Modifiers { shift: true, ..Modifiers::COMMAND }, Key::Z) {

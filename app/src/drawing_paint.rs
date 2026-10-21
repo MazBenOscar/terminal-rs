@@ -28,6 +28,31 @@ pub fn paint(drawing: &Drawing, paint: &Paint<'_>, shapes: Vec<LabeledShape>) {
         }
         Tool::Rectangle => paint_shapes(paint, shapes),
         Tool::Text => paint_text(paint, shapes),
+        Tool::Xabcd
+        | Tool::Abcd
+        | Tool::HeadAndShoulders
+        | Tool::TrianglePattern
+        | Tool::ElliottImpulse
+        | Tool::ElliottCorrection => paint_patterns(paint, shapes),
+    }
+}
+
+fn paint_patterns(p: &Paint<'_>, shapes: Vec<LabeledShape>) {
+    for (shape, label) in shapes {
+        if let Some(label) = label {
+            if let DrawingShape::Segment(a, _) = shape {
+                label_text(
+                    p.painter,
+                    pos2(a[0] as f32, a[1] as f32),
+                    Align2::CENTER_CENTER,
+                    label,
+                    mono(10.),
+                    p.stroke.color,
+                );
+            }
+        } else {
+            primitives(p, vec![(shape, None)], RectStyle::Plain);
+        }
     }
 }
 
@@ -69,6 +94,11 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
                         color,
                     );
                 }
+            }
+            DrawingShape::DashedSegment(a, b) => {
+                let a = pos2(a[0] as f32, a[1] as f32);
+                let b = pos2(b[0] as f32, b[1] as f32);
+                p.extend(Shape::dashed_line(&[a, b], stroke, 4., 4.));
             }
             DrawingShape::HLine(y) => {
                 p.hline(rect.x_range(), y as f32, stroke);

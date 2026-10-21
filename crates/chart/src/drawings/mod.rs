@@ -26,10 +26,16 @@ pub enum Tool {
     Pitchfork,
     LongPosition,
     ShortPosition,
+    Xabcd,
+    Abcd,
+    HeadAndShoulders,
+    TrianglePattern,
+    ElliottImpulse,
+    ElliottCorrection,
 }
 
 impl Tool {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 19] = [
         Self::Trendline,
         Self::Horizontal,
         Self::Vertical,
@@ -43,6 +49,12 @@ impl Tool {
         Self::Pitchfork,
         Self::LongPosition,
         Self::ShortPosition,
+        Self::Xabcd,
+        Self::Abcd,
+        Self::HeadAndShoulders,
+        Self::TrianglePattern,
+        Self::ElliottImpulse,
+        Self::ElliottCorrection,
     ];
     pub fn points(self) -> usize {
         point_count(self)
@@ -62,6 +74,12 @@ impl Tool {
             Tool::Pitchfork => "Pitchfork",
             Tool::LongPosition => "Long risk/reward",
             Tool::ShortPosition => "Short risk/reward",
+            Tool::Xabcd => "XABCD",
+            Tool::Abcd => "ABCD",
+            Tool::HeadAndShoulders => "Head and shoulders",
+            Tool::TrianglePattern => "Triangle pattern",
+            Tool::ElliottImpulse => "Elliott impulse",
+            Tool::ElliottCorrection => "Elliott correction",
         }
     }
 }
@@ -89,6 +107,9 @@ pub struct Drawing {
     pub c: Option<Anchor>,
     #[serde(default)]
     pub text: String,
+    /// Ordered anchors for the pattern family; absent in legacy saves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pattern_points: Vec<Anchor>,
 }
 
 fn line_width() -> f32 {
@@ -108,6 +129,7 @@ impl Drawing {
             extend_right: false,
             c: None,
             text: String::new(),
+            pattern_points: Vec::new(),
         }
     }
     pub fn visible_on(&self, symbol: &str) -> bool {
@@ -127,6 +149,7 @@ impl Drawing {
 pub mod fib;
 pub mod lines;
 pub mod measure;
+pub mod patterns;
 pub mod shapes;
 pub mod text;
 
@@ -136,6 +159,7 @@ pub type LabeledShape = (Shape, Option<String>);
 pub struct Geometry<'a> {
     pub drawing: &'a Drawing,
     pub points: [Point; 3],
+    pub pattern_points: Vec<Point>,
     pub bounds: [f64; 4],
     pub price_y: &'a dyn Fn(f64) -> f64,
     pub measure_label: String,
@@ -151,6 +175,12 @@ pub fn geometry(context: &Geometry<'_>) -> Vec<LabeledShape> {
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::geometry(context),
         Tool::Rectangle => shapes::geometry(context),
         Tool::Text => text::geometry(context),
+        Tool::Xabcd
+        | Tool::Abcd
+        | Tool::HeadAndShoulders
+        | Tool::TrianglePattern
+        | Tool::ElliottImpulse
+        | Tool::ElliottCorrection => patterns::geometry(context.drawing, &context.pattern_points, context.bounds),
     }
 }
 
@@ -163,6 +193,12 @@ pub fn point_count(tool: Tool) -> usize {
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::point_count(tool),
         Tool::Rectangle => shapes::point_count(),
         Tool::Text => text::point_count(),
+        Tool::Xabcd
+        | Tool::Abcd
+        | Tool::HeadAndShoulders
+        | Tool::TrianglePattern
+        | Tool::ElliottImpulse
+        | Tool::ElliottCorrection => patterns::point_count(tool),
     }
 }
 
@@ -175,6 +211,12 @@ pub fn handles(drawing: &Drawing) -> Vec<Anchor> {
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::handles(drawing),
         Tool::Rectangle => shapes::handles(drawing),
         Tool::Text => text::handles(drawing),
+        Tool::Xabcd
+        | Tool::Abcd
+        | Tool::HeadAndShoulders
+        | Tool::TrianglePattern
+        | Tool::ElliottImpulse
+        | Tool::ElliottCorrection => patterns::handles(drawing),
     }
 }
 
@@ -195,6 +237,12 @@ pub fn hit_distance(context: &Geometry<'_>, point: Point) -> f64 {
         Tool::Measure | Tool::LongPosition | Tool::ShortPosition => measure::hit_distance(context, point),
         Tool::Rectangle => shapes::hit_distance(context, point),
         Tool::Text => text::hit_distance(context, point),
+        Tool::Xabcd
+        | Tool::Abcd
+        | Tool::HeadAndShoulders
+        | Tool::TrianglePattern
+        | Tool::ElliottImpulse
+        | Tool::ElliottCorrection => patterns::hit_distance(context, point),
     }
 }
 
@@ -215,6 +263,7 @@ mod dispatch_tests {
             let g = Geometry {
                 drawing: &drawing,
                 points: [[20., 100.], [60., 90.], [80., 120.]],
+                pattern_points: drawing.pattern_points.iter().map(|a| [a.ts as f64, a.price]).collect(),
                 bounds: [0., 0., 200., 200.],
                 price_y: &|p| p,
                 measure_label: "Measurement".into(),

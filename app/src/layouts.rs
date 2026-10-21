@@ -740,6 +740,10 @@ mod tests {
                 let mut drawing = Drawing::new(tool, Anchor { ts: 1, price: 100. }, Anchor { ts: 2, price: 90. });
                 drawing.c = Some(Anchor { ts: 3, price: 120. });
                 drawing.text = "Fixture note".into();
+                if tr_chart::drawings::patterns::point_count(tool) > 0 {
+                    drawing.pattern_points =
+                        (0..tool.points()).map(|i| Anchor { ts: i as i64 + 1, price: 100. - i as f64 * 10. }).collect();
+                }
                 drawing
             })
             .collect();

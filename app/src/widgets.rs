@@ -117,6 +117,12 @@ pub enum Icon {
     Text,
     LongPosition,
     ShortPosition,
+    Xabcd,
+    Abcd,
+    HeadAndShoulders,
+    TrianglePattern,
+    ElliottImpulse,
+    ElliottCorrection,
     Measure,
     Magnet,
     Lock,
@@ -144,6 +150,12 @@ pub fn tool_icon(tool: tr_chart::drawings::Tool) -> Icon {
         Tool::LongPosition => Icon::LongPosition,
         Tool::ShortPosition => Icon::ShortPosition,
         Tool::Measure => Icon::Measure,
+        Tool::Xabcd => Icon::Xabcd,
+        Tool::Abcd => Icon::Abcd,
+        Tool::HeadAndShoulders => Icon::HeadAndShoulders,
+        Tool::TrianglePattern => Icon::TrianglePattern,
+        Tool::ElliottImpulse => Icon::ElliottImpulse,
+        Tool::ElliottCorrection => Icon::ElliottCorrection,
     }
 }
 
@@ -171,6 +183,30 @@ mod drawing_icon_tests {
     }
 }
 
+/// Original pattern glyphs on a centred twelve-unit grid.
+fn pattern_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
+    let points: &[[f32; 2]] = match icon {
+        Icon::Xabcd => &[[-6., 4.], [-3., -5.], [0., 2.], [3., -2.], [6., 5.]],
+        Icon::Abcd => &[[-6., 5.], [-2., -4.], [2., 2.], [6., -5.]],
+        Icon::HeadAndShoulders => &[[-6., 5.], [-4., -1.], [-2., 2.], [0., -6.], [2., 2.], [4., -1.], [6., 5.]],
+        Icon::TrianglePattern => &[[-6., -5.], [-4., 5.], [2., -2.], [5., 2.]],
+        Icon::ElliottImpulse => &[[-6., 6.], [-4., 1.], [-2., 3.], [0., -3.], [3., -1.], [6., -6.]],
+        Icon::ElliottCorrection => &[[-6., -5.], [-2., 3.], [2., -2.], [6., 5.]],
+        _ => unreachable!("Non-pattern icon"),
+    };
+    let unit = r.width().min(r.height()) / 16.;
+    let point = |a: [f32; 2]| r.center() + vec2(a[0] * unit, a[1] * unit);
+    let stroke = Stroke::new(1.4, color);
+    p.add(Shape::line(points.iter().copied().map(point).collect(), stroke));
+    if icon == Icon::Xabcd {
+        p.line_segment([point(points[0]), point(points[4])], stroke);
+    }
+    if icon == Icon::TrianglePattern {
+        p.line_segment([point(points[0]), point([6., 0.])], stroke);
+        p.line_segment([point(points[1]), point([6., 0.])], stroke);
+    }
+}
+
 /// Draw a simple line icon centred in `r`.
 pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
     let s = Stroke::new(1.4, color);
@@ -191,6 +227,12 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
         Icon::Rectangle => crate::drawing_paint::shapes(p, r, color),
         Icon::Text => crate::drawing_paint::text(p, r, color),
         Icon::LongPosition | Icon::ShortPosition | Icon::Measure => crate::drawing_paint::measure(p, r, icon, color),
+        Icon::Xabcd
+        | Icon::Abcd
+        | Icon::HeadAndShoulders
+        | Icon::TrianglePattern
+        | Icon::ElliottImpulse
+        | Icon::ElliottCorrection => pattern_icon(p, r, icon, color),
         Icon::Magnet => {
             p.add(Shape::line(vec![pt(-5., -5.), pt(-5., 2.), pt(-3., 5.), pt(3., 5.), pt(5., 2.), pt(5., -5.)], s));
             p.line_segment([pt(-5., -2.), pt(-2., -2.)], s);
