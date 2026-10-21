@@ -1,4 +1,4 @@
-//! Themes: named bundles of colours, fonts and density. Eight are built in; custom themes
+//! Themes: named bundles of colours, fonts and density. Nine are built in; custom themes
 //! are TOML (or JSON) files in `<data dir>/themes/`, so they can be shared, hand-edited,
 //! imported and exported. A file only needs the fields it changes: anything missing is
 //! filled from the built-in dark or light base, chosen by its `dark` flag.
@@ -529,6 +529,46 @@ fn monokai() -> Theme {
     }
 }
 
+/// Midnight violet: one deep navy surface, lilac text and violet accents, monospace.
+fn midnight_violet() -> Theme {
+    Theme {
+        name: "Midnight Violet".into(),
+        dark: true,
+        colors: ThemeColors {
+            background: Hex::rgb(0x0a, 0x0f, 0x1a),
+            sidebar: Hex::rgba(0x0c, 0x12, 0x1e, 230),
+            panel: Hex::rgb(0x0e, 0x14, 0x21),
+            panel_header: Hex::rgb(0x14, 0x1b, 0x2a),
+            border: Hex::rgba(0xc8, 0xb4, 0xff, 22),
+            grid: Hex::rgb(0x17, 0x1d, 0x2b),
+            text: Hex::rgb(0xe2, 0xda, 0xf0),
+            muted: Hex::rgb(0x7a, 0x68, 0x90),
+            highlight: Hex::rgb(0xb0, 0x7a, 0xe0),
+            highlight_dim: Hex::rgb(0x7c, 0x4f, 0xae),
+            info: Hex::rgb(0x4a, 0x82, 0xd8),
+            control: Hex::rgba(0xb0, 0x7a, 0xe0, 22),
+            control_hover: Hex::rgba(0xb0, 0x7a, 0xe0, 40),
+            accent: Some(Hex::rgb(0x8b, 0x3f, 0xc0)),
+            up: Hex::rgb(0x26, 0xc0, 0x5e),
+            down: Hex::rgb(0xe0, 0x48, 0x48),
+            candle_up: Hex::rgb(0x48, 0xa8, 0x8c),
+            candle_down: Hex::rgb(0xc8, 0x50, 0x5a),
+            series: [
+                Hex::rgb(0xd8, 0xb0, 0x38),
+                Hex::rgb(0x4a, 0x7e, 0xd6),
+                Hex::rgb(0x8a, 0x64, 0xc8),
+                Hex::rgb(0xe0, 0x5a, 0x78),
+                Hex::rgb(0x48, 0xa8, 0x8c),
+                Hex::rgb(0xe8, 0x90, 0x4a),
+            ],
+        },
+        fonts: fonts(UiFont::Monospace, MonoFont::System, 1.0),
+        density: Density::Regular,
+        builtin: true,
+        source: None,
+    }
+}
+
 /// The themes that ship with the app, in display order.
 pub fn builtins() -> Vec<Theme> {
     vec![
@@ -540,6 +580,7 @@ pub fn builtins() -> Vec<Theme> {
         solarized_light(),
         nord(),
         monokai(),
+        midnight_violet(),
     ]
 }
 
@@ -688,7 +729,7 @@ mod tests {
     #[test]
     fn builtins_are_distinct_and_readable() {
         let all = builtins();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 9);
         for (i, t) in all.iter().enumerate() {
             assert!(t.builtin);
             assert!(all[i + 1..].iter().all(|o| !o.name.eq_ignore_ascii_case(&t.name)), "duplicate {}", t.name);
@@ -741,7 +782,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tr-themes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = ThemeStore::new(dir.clone());
-        assert_eq!(store.load_all().len(), 8);
+        assert_eq!(store.load_all().len(), 9);
         let mut mine = Theme { name: "Desk".into(), builtin: false, source: None, ..nord() };
         mine.colors.up = Hex::rgb(1, 2, 3);
         store.save(&mine).unwrap();
@@ -749,7 +790,7 @@ mod tests {
         // A hand-dropped JSON file reusing a built-in name gets a suffix.
         std::fs::write(dir.join("x.json"), r##"{"name":"Nord","colors":{"down":"#ff00ff"}}"##).unwrap();
         let all = store.load_all();
-        assert_eq!(all.len(), 10);
+        assert_eq!(all.len(), 11);
         assert_eq!(find(&all, "Desk").unwrap().colors.up, Hex::rgb(1, 2, 3));
         let copy = find(&all, "Nord (Custom)").unwrap();
         assert_eq!(copy.colors.down, Hex::rgb(255, 0, 255));
@@ -771,7 +812,7 @@ mod tests {
         store.delete(find(&all, "Nord (Custom)").unwrap()).unwrap();
         assert!(store.delete(&desk).is_err());
         assert!(store.delete(&nord()).is_err());
-        assert_eq!(store.load_all().len(), 8);
+        assert_eq!(store.load_all().len(), 9);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
