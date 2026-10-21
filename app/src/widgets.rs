@@ -98,6 +98,7 @@ pub enum Icon {
     Plus,
     More,
     Gear,
+    Close,
 }
 
 /// Draw a simple line icon centred in `r`.
@@ -211,6 +212,10 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
                 );
             }
             p.circle_stroke(c, 4.6 * u, s);
+        }
+        Icon::Close => {
+            p.line_segment([pt(-4.5, -4.5), pt(4.5, 4.5)], s);
+            p.line_segment([pt(4.5, -4.5), pt(-4.5, 4.5)], s);
         }
         Icon::Star => {
             let pts: Vec<Pos2> = (0..=10)
