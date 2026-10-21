@@ -1509,7 +1509,7 @@ impl TerminalApp {
             let Some(geom) = self.panes[i].window else { continue };
             let title = self.panes[i].display_title();
             let builder = ViewportBuilder::default()
-                .with_title(format!("{title} — terminal-rs"))
+                .with_title(format!("{title} — Terminal"))
                 .with_inner_size([geom.w, geom.h])
                 .with_position([geom.x, geom.y])
                 .with_min_inner_size([320.0, 220.0]);

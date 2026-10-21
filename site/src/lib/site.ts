@@ -1,4 +1,4 @@
-export const VERSION = '0.1.0';
+export const VERSION = '0.1.1';
 
 /** `scripts/release-macos.sh` builds the release DMG as a universal binary. */
 export const ARCH = 'Apple Silicon and Intel';
@@ -8,7 +8,7 @@ export const NAME = 'Terminal';
 /** `static/robots.txt` and `static/sitemap.xml` repeat this origin. */
 export const SITE_URL = 'https://terminal.rasmic.xyz';
 export const REPO_URL = 'https://github.com/michaelshimeles/terminal-rs';
-export const DOWNLOAD_URL = `${REPO_URL}/releases/latest/download/terminal-rs-universal.dmg`;
+export const DOWNLOAD_URL = `${REPO_URL}/releases/latest/download/Terminal.dmg`;
 
 export const TITLE = `${NAME}: a fast market terminal for the Mac`;
 export const DESCRIPTION =
