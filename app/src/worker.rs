@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use tr_core::indicators::study::StudyHistories;
+use tr_core::indicators::study::{StudyHistories, warmup_bars};
 
 use tokio::sync::Mutex;
 use tr_chart::gpu::{LineKind, LineRef};
@@ -476,7 +476,6 @@ pub struct Worker {
 /// Bars per pane tagged with the load generation they belong to.
 type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>, String)>;
 
-const STUDY_WARMUP_BARS: usize = 300;
 const MAX_STUDY_BARS: usize = 10_000;
 const MAX_STUDY_HISTORIES: usize = 32;
 
@@ -505,11 +504,21 @@ fn study_timeframes(specs: &[IndicatorSpec], chart_tf: Timeframe) -> Vec<Timefra
     timeframes
 }
 
-fn study_request(bars: &[Bar], chart_tf: Timeframe, tf: Timeframe) -> Option<(i64, i64, usize)> {
+fn study_request(
+    bars: &[Bar],
+    chart_tf: Timeframe,
+    tf: Timeframe,
+    specs: &[IndicatorSpec],
+) -> Option<(i64, i64, usize)> {
     let end = tr_core::session::next_bucket(chart_tf, bars.last()?.ts);
     let start = bars.first()?.ts;
-    let limit = (((end - start).max(0) / tf.seconds().max(1)) as usize + STUDY_WARMUP_BARS)
-        .clamp(STUDY_WARMUP_BARS, MAX_STUDY_BARS);
+    let specs: Vec<_> = specs
+        .iter()
+        .filter(|s| s.chart.as_ref().and_then(|c| c.timeframe).unwrap_or(chart_tf) == tf)
+        .cloned()
+        .collect();
+    let warmup = warmup_bars(&specs);
+    let limit = (((end - start).max(0) / tf.seconds().max(1)) as usize + warmup).clamp(warmup, MAX_STUDY_BARS);
     Some((end, start, limit))
 }
 
@@ -963,7 +972,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let mut histories = StudyHistories::new();
             let source = chart_options_key(s.provider.as_ref(), &symbol, options);
             for study_tf in study_timeframes(&specs, tf) {
-                let Some((end, start, limit)) = study_request(&bars, tf, study_tf) else { continue };
+                let Some((end, start, limit)) = study_request(&bars, tf, study_tf, &specs) else { continue };
                 let key = (source.clone(), study_tf);
                 let fetch = {
                     let mut fetches = s.study_fetches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1743,16 +1752,36 @@ mod tests {
 
     #[test]
     fn study_request_uses_bucket_end_and_clamps_limits() {
-        assert_eq!(study_request(&[], Timeframe::D1, Timeframe::H1), None);
+        assert_eq!(study_request(&[], Timeframe::D1, Timeframe::H1, &[]), None);
         let bar = |ts| Bar::new(ts, 1., 1., 1., 1., 1.);
         let bars = [bar(0), bar(100 * 86400)];
-        let (end, start, limit) = study_request(&bars, Timeframe::D1, Timeframe::M1).unwrap();
+        let (end, start, limit) = study_request(&bars, Timeframe::D1, Timeframe::M1, &[]).unwrap();
         assert_eq!(end, tr_core::session::next_bucket(Timeframe::D1, bars[1].ts));
         assert_eq!(start, 0);
         assert_eq!(limit, MAX_STUDY_BARS);
-        assert_eq!(study_request(&[bar(0)], Timeframe::M1, Timeframe::D1).unwrap().2, STUDY_WARMUP_BARS);
-        let (_, _, limit) = study_request(&[bar(0), bar(86400)], Timeframe::D1, Timeframe::H1).unwrap();
+        assert_eq!(study_request(&[bar(0)], Timeframe::M1, Timeframe::D1, &[]).unwrap().2, 300);
+        let (_, _, limit) = study_request(&[bar(0), bar(86400)], Timeframe::D1, Timeframe::H1, &[]).unwrap();
         assert_eq!(limit, 348);
+    }
+
+    #[test]
+    fn study_request_uses_per_timeframe_warmup() {
+        let mut specs = vec![
+            IndicatorSpec::new("EMA", &[200.]).unwrap(),
+            IndicatorSpec::new("EMA", &[400.]).unwrap(),
+            IndicatorSpec::new("EMA", &[1_000.]).unwrap(),
+        ];
+        tr_core::indicators::study::assign_ids(&mut specs);
+        specs[0].chart.as_mut().unwrap().timeframe = Some(Timeframe::W1);
+        specs[1].chart.as_mut().unwrap().timeframe = Some(Timeframe::MN1);
+        // The unqualified EMA 1000 belongs to the chart, not either study history.
+        let bars = [Bar::new(0, 1., 1., 1., 1., 1.)];
+        let request = |tf| study_request(&bars, Timeframe::M1, tf, &specs).unwrap().2;
+        assert_eq!(request(Timeframe::W1), 800);
+        assert_eq!(request(Timeframe::MN1), 1_600);
+        assert_eq!(request(Timeframe::D1), 300);
+        specs[1].chart.as_mut().unwrap().timeframe = Some(Timeframe::W1);
+        assert_eq!(study_request(&bars, Timeframe::M1, Timeframe::W1, &specs).unwrap().2, 1_600);
     }
 
     #[test]

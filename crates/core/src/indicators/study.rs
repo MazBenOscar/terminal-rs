@@ -6,6 +6,13 @@ use serde::{Deserialize, Serialize};
 use super::registry::{Input, Output, Spec};
 use crate::Bar;
 
+/// Extra history for study initialization: four times the largest numeric
+/// parameter (conservatively treated as a length), bounded to 300..=5,000 bars.
+pub fn warmup_bars(specs: &[Spec]) -> usize {
+    let longest = specs.iter().flat_map(|spec| spec.params.iter()).copied().fold(0.0, f64::max);
+    (4.0 * longest).ceil().clamp(300.0, 5_000.0) as usize
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlotStyle {
     Line,
@@ -375,6 +382,19 @@ pub(super) fn evaluate_native(specs: &[Spec], input: &Input<'_>) -> Vec<Result<V
 mod tests {
     use super::*;
     use crate::Timeframe;
+
+    #[test]
+    fn warmup_scales_with_parameters_and_is_bounded() {
+        assert_eq!(warmup_bars(&[]), 300);
+        let defaults = [Spec::new("EMA", &[]).unwrap(), Spec::new("RSI", &[]).unwrap()];
+        assert_eq!(warmup_bars(&defaults), 300);
+        let ema = Spec::new("EMA", &[200.]).unwrap();
+        assert_eq!(warmup_bars(std::slice::from_ref(&ema)), 800);
+        let mut large = ema.clone();
+        // Exercise the helper's cap independently of registry parameter clamping.
+        large.params = vec![2_000.];
+        assert_eq!(warmup_bars(&[ema, large]), 5_000);
+    }
 
     #[test]
     fn session_vwap_does_not_reset_at_utc_midnight_inside_the_ny_evening() {

@@ -92,12 +92,15 @@ pub(super) fn evaluate(specs: &[Spec], input: &Input<'_>, session: Session, hist
                     .enumerate()
                     .map(|(i, bar)| {
                         let mut as_of = crate::session::next_bucket(input.tf, bar.ts);
-                        // On daily+ charts, a successor proves closure across weekends/holidays.
-                        // Without one, keep open periods hidden; intraday gaps prove nothing.
+                        // A successor can prove closure across weekends/holidays, but
+                        // only for this bar's own study period, never a later gap period.
+                        let aggregation = if input.tf.is_intraday() { session } else { Session::Provider };
+                        let own_end = aggregation.interval(tf, bar.ts).1;
                         if !input.tf.is_intraday()
                             && let Some(next) = input.bars.get(i + 1)
+                            && next.ts >= own_end
                         {
-                            as_of = as_of.max(next.ts);
+                            as_of = as_of.max(own_end);
                         }
                         ends.partition_point(|end| *end <= as_of).checked_sub(1).map_or(f64::NAN, |j| output.values[j])
                     })
@@ -553,7 +556,6 @@ mod tests {
     /// value onto the bar before the gap. The successor only proves the chart
     /// bar's own period closed; it is not a license to skip ahead.
     #[test]
-    #[ignore = "BUG: as_of = max(next_bucket(chart), successor.ts) lets a multi-period chart gap select a study bar from inside the gap. partition_point then returns the newest study bar with end <= successor.ts, so Fri Mar 6 shows the W1 close of the week of Mar 9 (20) instead of the week of Mar 2 (10). Clamp the successor proof to the study period containing the chart bar."]
     fn chart_gap_does_not_leak_the_next_weeks_study_value_onto_the_prior_bar() {
         // Fri 2026-03-06 then Mon 2026-03-16: the week of Mar 9 is missing entirely.
         let bars = vec![bar(ts("2026-03-06T00:00:00Z"), 0.), bar(ts("2026-03-16T00:00:00Z"), 0.)];
@@ -567,7 +569,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: same successor.ts leap as the weekly gap case. With February's sessions missing, as_of for Fri 2026-01-30 becomes Mar 2 and MN1 picks February's close (200) instead of January's (100)."]
     fn chart_gap_does_not_leak_the_next_months_study_value_onto_the_prior_bar() {
         // Fri 2026-01-30 then Mon 2026-03-02: February's sessions are missing.
         let bars = vec![bar(ts("2026-01-30T00:00:00Z"), 0.), bar(ts("2026-03-02T00:00:00Z"), 0.)];
@@ -600,18 +601,22 @@ mod tests {
     /// bars past the seed. The worker's fixed 300 warm-up bars therefore leave
     /// EMA 200 on W1 visibly under-converged at the start of a fetched history.
     #[test]
-    #[ignore = "BUG: STUDY_WARMUP_BARS=300 is not derived from the study's lookback. EMA 200 on W1 seeds with SMA(200) at study index 199 and only gets ~100 post-seed bars of convergence (~37% seed weight remains), so chart-bar values differ from a converged EMA by >1 point on volatile series. Warm-up must scale with the indicator period (several multiples of the longest lookback)."]
     fn warmup_of_300_is_insufficient_for_ema_200_on_weekly_bars() {
         // Violent swings keep the decaying seed transient large.
-        let closes: Vec<f64> = (0..2000)
+        let specs = [Spec::new("EMA", &[200.]).unwrap()];
+        // Four initialization windows are needed for this test's strict 1e-9
+        // numerical convergence tolerance; the worker requests one such window.
+        let warmup = 4 * study::warmup_bars(&specs);
+        let history_len = 2 * warmup + 50;
+        let closes: Vec<f64> = (0..history_len)
             .map(|i| {
                 let t = i as f64;
                 100. + 40. * (t * 0.037).sin() + 25. * (t * 0.11).sin() + 15. * (t * 0.41).sin()
             })
             .collect();
         let long: Vec<Bar> = closes.iter().enumerate().map(|(i, &c)| bar(i as i64 * 604_800, c)).collect();
-        // Worker fetch shape: 300 warm-up + 50 chart bars.
-        let short = &long[2000 - 350..];
+        let offset = history_len - (warmup + 50);
+        let short = &long[offset..];
         let ema = |bars: &[Bar]| {
             let mut specs = vec![Spec::new("EMA", &[200.]).unwrap()];
             study::assign_ids(&mut specs);
@@ -621,16 +626,15 @@ mod tests {
         };
         let converged = ema(&long);
         let starved = ema(short);
-        let offset = 2000 - 350;
         let mut worst = 0.0f64;
-        for i in 300..short.len() {
+        for i in warmup..short.len() {
             let a = starved[i];
             let b = converged[offset + i];
             worst = worst.max((a - b).abs());
             assert!(
                 (a - b).abs() < 1e-9,
-                "EMA 200 with 300 warm-up diverges at chart bar {}: starved {a} vs converged {b}",
-                i - 300
+                "EMA 200 with {warmup} warm-up diverges at chart bar {}: starved {a} vs converged {b}",
+                i - warmup
             );
         }
         let _ = worst;
