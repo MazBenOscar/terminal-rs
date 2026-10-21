@@ -1283,6 +1283,7 @@ impl TerminalApp {
             let worker = &self.worker;
             if let PaneKind::Chart(c) = &mut self.panes[ci].kind {
                 c.controls_in_strip = controls_fit;
+                c.export_pane_rect = Some(inner);
                 if controls_fit {
                     let r = Rect::from_min_size(
                         pos2(controls_left, strip.center().y - crate::chart_view::CONTROL_H / 2.0),

@@ -123,6 +123,39 @@ struct DrawingDrag {
     original: Drawing,
 }
 
+struct PendingExport {
+    pane: PaneId,
+    rect: Rect,
+    pixels_per_point: f32,
+    symbol: String,
+    token: u64,
+    started: std::time::Instant,
+    frame: u64,
+    requested: bool,
+}
+
+fn export_timed_out(pending: &PendingExport, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(pending.started) >= std::time::Duration::from_secs(5)
+}
+
+fn screenshot_request(pending: Option<&PendingExport>, token: u64, image: Arc<egui::ColorImage>) -> Option<Request> {
+    let pending = pending.filter(|p| p.requested && p.token == token)?;
+    let rect = pending.rect;
+    let ppp = pending.pixels_per_point;
+    let x = (rect.left() * ppp).round().max(0.) as usize;
+    let y = (rect.top() * ppp).round().max(0.) as usize;
+    let right = ((rect.right() * ppp).round().max(0.) as usize).min(image.width());
+    let bottom = ((rect.bottom() * ppp).round().max(0.) as usize).min(image.height());
+    let x = x.min(image.width());
+    let y = y.min(image.height());
+    Some(Request::ExportChartImage {
+        pane: pending.pane,
+        symbol: pending.symbol.clone(),
+        image,
+        rect_px: [x, y, right.saturating_sub(x), bottom.saturating_sub(y)],
+    })
+}
+
 pub struct ChartState {
     pub id: PaneId,
     pub symbol: String,
@@ -195,6 +228,9 @@ pub struct ChartState {
     pub price_alert_actions: Vec<crate::price_alerts::Action>,
     pub account_overlay: crate::chart_account::Snapshot,
     pub export_notice: Option<Result<std::path::PathBuf, String>>,
+    pending_export: Option<PendingExport>,
+    /// The workspace pane bounds, including the tab strip and chart controls.
+    pub export_pane_rect: Option<Rect>,
     events: Vec<tr_data::ChartEvent>,
     events_range: Option<(i64, i64)>,
     events_notice: String,
@@ -293,6 +329,8 @@ impl ChartState {
             price_alert_actions: Vec::new(),
             account_overlay: Default::default(),
             export_notice: None,
+            pending_export: None,
+            export_pane_rect: None,
             events: vec![],
             events_range: None,
             events_notice: String::new(),
@@ -1295,6 +1333,8 @@ impl ChartState {
     }
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
+        self.capture_export(ui.ctx(), w);
+        self.export_pane_rect = Some(self.export_pane_rect.unwrap_or(rect).union(rect));
         self.refresh_view(w);
         if self.data.show_events
             && self.replay_cutoff.is_none()
@@ -2947,6 +2987,35 @@ impl ChartState {
         });
     }
 
+    fn capture_export(&mut self, ctx: &egui::Context, w: &Worker) {
+        if self.pending_export.as_ref().is_some_and(|p| export_timed_out(p, std::time::Instant::now())) {
+            self.pending_export = None;
+            self.export_notice = Some(Err("Couldn't capture the chart".into()));
+            return;
+        }
+        let request = ctx.input(|input| {
+            input.events.iter().find_map(|event| {
+                if let egui::Event::Screenshot { image, user_data, .. } = event {
+                    let token = user_data.data.as_ref()?.downcast_ref::<u64>()?;
+                    screenshot_request(self.pending_export.as_ref(), *token, image.clone())
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(request) = request {
+            self.pending_export = None;
+            w.send(request);
+        }
+        if let Some(pending) = &mut self.pending_export {
+            if !pending.requested && ctx.cumulative_frame_nr() > pending.frame {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(pending.token)));
+                pending.requested = true;
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
     fn replay_export_menu(&mut self, ui: &mut Ui, w: &Worker) {
         ui.menu_button("Replay & export", |ui| {
             ui.set_max_width(theme::dp(280.));
@@ -2979,6 +3048,31 @@ impl ChartState {
                         image,
                     });
                     self.export_notice = None;
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.pending_export.is_none(),
+                    egui::Button::new("Export chart as PNG (with studies and drawings)"),
+                )
+                .clicked()
+            {
+                static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                if let Some(rect) = self.export_pane_rect {
+                    self.pending_export = Some(PendingExport {
+                        pane: self.id,
+                        rect,
+                        pixels_per_point: ui.ctx().pixels_per_point(),
+                        symbol: self.symbol.clone(),
+                        token: NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                        started: std::time::Instant::now(),
+                        frame: ui.ctx().cumulative_frame_nr(),
+                        requested: false,
+                    });
+                    self.export_notice = None;
+                    ui.close();
+                    egui::Popup::close_all(ui.ctx());
+                    ui.ctx().request_repaint();
                 }
             }
             if let Some(result) = &self.export_notice {
@@ -5156,6 +5250,45 @@ mod tests {
         chart.indicators[0].params[0] = 2.;
         chart.on_indicators(chart.generation, chart.indicator_revision, built);
         assert!(chart.built.is_empty(), "a superseded parameter response cannot replace current studies");
+    }
+
+    fn pending_screenshot() -> PendingExport {
+        PendingExport {
+            pane: 7,
+            rect: Rect::from_min_max(pos2(-1., 1.25), pos2(3.25, 9.)),
+            pixels_per_point: 2.,
+            symbol: "AAPL".into(),
+            token: 42,
+            started: std::time::Instant::now(),
+            frame: 0,
+            requested: true,
+        }
+    }
+
+    #[test]
+    fn screenshot_tokens_match_only_the_pending_export() {
+        let mut pending = pending_screenshot();
+        let image = Arc::new(egui::ColorImage::filled([10, 10], Color32::BLACK));
+        assert!(screenshot_request(None, 42, image.clone()).is_none());
+        assert!(screenshot_request(Some(&pending), 41, image.clone()).is_none());
+        let request = screenshot_request(Some(&pending), 42, image.clone()).unwrap();
+        let Request::ExportChartImage { pane, symbol, image: captured, rect_px } = request else {
+            panic!("Expected a chart image export");
+        };
+        assert_eq!(pane, 7);
+        assert_eq!(symbol, "AAPL");
+        assert!(Arc::ptr_eq(&captured, &image));
+        assert_eq!(rect_px, [0, 3, 7, 7]);
+        pending.requested = false;
+        assert!(screenshot_request(Some(&pending), 42, image).is_none());
+    }
+
+    #[test]
+    fn screenshot_timeout_is_five_seconds() {
+        let pending = pending_screenshot();
+        assert!(!export_timed_out(&pending, pending.started + std::time::Duration::from_millis(4999)));
+        assert!(export_timed_out(&pending, pending.started + std::time::Duration::from_secs(5)));
+        assert!(export_timed_out(&pending, pending.started + std::time::Duration::from_secs(6)));
     }
 
     #[test]
