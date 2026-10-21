@@ -233,6 +233,10 @@ pub enum Function {
     Refresh,
     Watchlist,
     Scanner,
+    ColumnAdd(tr_core::columns::ColumnDef),
+    ColumnDelete(String),
+    ColumnClear,
+    ColumnEdit,
     WatchAdd(Vec<String>),
     WatchRemove(Vec<String>),
     /// `LAYOUT 1|2|2H|3|4|6` preset, `LAYOUT <name>` switch, or a layout subcommand
@@ -346,6 +350,31 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "ALRT" | "ALERTS" | "ALERT" => Function::Alerts,
         "REFRESH" | "SYNC" => Function::Refresh,
         "SCAN" | "SCANNER" | "EASYSCAN" => Function::Scanner,
+        "COL" => {
+            let (action, args) = rest.split_first()?;
+            match action.to_ascii_uppercase().as_str() {
+                "EDIT" if args.is_empty() => Function::ColumnEdit,
+                "CLEAR" if args.is_empty() => Function::ColumnClear,
+                "DEL" if !args.is_empty() => Function::ColumnDelete(args.join(" ")),
+                "ADD" => {
+                    let joined = args.join(" ");
+                    let (title, expression) = joined.split_once('=')?;
+                    let (expression, timeframe) = match expression.rsplit_once('@') {
+                        Some((expression, tf)) => (expression.trim(), tf.trim().parse().ok()?),
+                        None => (expression.trim(), Timeframe::D1),
+                    };
+                    let column = tr_core::columns::ColumnDef {
+                        id: 0,
+                        title: title.trim().into(),
+                        timeframe,
+                        kind: tr_core::columns::ColumnKind::Formula { expression: expression.into() },
+                    };
+                    column.validate().ok()?;
+                    Function::ColumnAdd(column)
+                }
+                _ => return None,
+            }
+        }
         "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => match words().first().map(String::as_str) {
             Some("ADD") => Function::WatchAdd(words()[1..].to_vec()),
             Some("DEL") | Some("RM") | Some("REMOVE") => Function::WatchRemove(words()[1..].to_vec()),
@@ -420,6 +449,9 @@ pub fn parse(input: &str) -> Option<Command> {
         [us, k, ..] if us.eq_ignore_ascii_case("US") && YellowKey::parse(k).is_some() => true,
         _ => false,
     };
+    if !keyed && head.eq_ignore_ascii_case("COL") {
+        return parse_function(head, rest).map(Command::Function);
+    }
     if !keyed && let Some(f) = parse_function(head, rest) {
         return Some(Command::Function(f));
     }
@@ -502,6 +534,10 @@ fn describe(f: &Function) -> String {
         Function::Untrack(n) => format!("Stop tracking {n}"),
         Function::Alerts => "Alerts".into(),
         Function::Refresh => "Refresh congressional disclosures now".into(),
+        Function::ColumnAdd(c) => format!("Add column {}", c.title),
+        Function::ColumnDelete(title) => format!("Delete column {title}"),
+        Function::ColumnClear => "Remove all custom columns".into(),
+        Function::ColumnEdit => "Edit watchlist columns".into(),
         Function::Watchlist => "Watchlist".into(),
         Function::Scanner => "Scan the watchlist with saved conditions".into(),
         Function::WatchAdd(s) => format!("Add {} to watchlist", s.join(", ")),
@@ -592,6 +628,32 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn column_edit_parses() {
+        assert_eq!(parse("COL EDIT"), Some(Command::Function(Function::ColumnEdit)));
+        assert_eq!(parse("col edit"), Some(Command::Function(Function::ColumnEdit)));
+        assert!(parse("COL EDIT extra").is_none());
+    }
+
+    #[test]
+    fn column_commands() {
+        let Some(Command::Function(Function::ColumnAdd(c))) = parse("COL ADD Weekly close = C @ 1W") else {
+            panic!("column command");
+        };
+        assert_eq!(c.title, "Weekly close");
+        assert_eq!(c.timeframe, Timeframe::W1);
+        assert_eq!(c.kind, tr_core::columns::ColumnKind::Formula { expression: "C".into() });
+        assert!(matches!(parse("col add Close = C"), Some(Command::Function(Function::ColumnAdd(_)))));
+        assert_eq!(
+            parse("COL DEL Weekly close"),
+            Some(Command::Function(Function::ColumnDelete("Weekly close".into())))
+        );
+        assert_eq!(parse("COL CLEAR"), Some(Command::Function(Function::ColumnClear)));
+        for input in ["COL ADD = C", "COL ADD Close = INVALID(", "COL ADD Close = C @ bad", "COL CLEAR extra"] {
+            assert_eq!(parse(input), None);
+        }
+    }
 
     #[test]
     fn scanner_commands_and_panel_specs() {

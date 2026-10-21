@@ -261,6 +261,27 @@ fn remove_at(group: &mut ConditionGroup, path: &[usize]) {
     }
 }
 
+/// Shared condition editor; inherited timeframes use the caller's timeframe.
+pub(crate) fn condition_group_editor(
+    ui: &mut Ui,
+    group: &mut ConditionGroup,
+    scan_tf: Timeframe,
+    id_salt: impl egui::AsIdSalt,
+) {
+    ui.push_id(id_salt, |ui| {
+        ui.horizontal(|ui| {
+            mode_editor(ui, &mut group.mode);
+            ui.label(RichText::new(format!("Default timeframe: {}", scan_tf.label())).small().color(muted()));
+        });
+        let mut leaves = ScanDefinition { name: String::new(), timeframe: scan_tf, root: group.clone() }.leaves().len();
+        let mut remove = None;
+        group_editor(ui, group, 1, &mut leaves, &mut Vec::new(), &mut remove);
+        if let Some(path) = remove {
+            remove_at(group, &path);
+        }
+    });
+}
+
 fn group_editor(
     ui: &mut Ui,
     group: &mut ConditionGroup,

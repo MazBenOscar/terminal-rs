@@ -190,6 +190,8 @@ pub struct WindowGeometry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayoutDoc {
+    #[serde(default)]
+    pub watch_columns: tr_core::columns::ColumnSet,
     #[serde(default = "version")]
     pub version: u32,
     pub name: String,
@@ -273,6 +275,7 @@ impl LayoutDoc {
             .collect();
         let ids: Vec<PaneId> = panes.iter().map(|p| p.id).collect();
         LayoutDoc {
+            watch_columns: Default::default(),
             version: FORMAT_VERSION,
             name: name.into(),
             dock: Node::preset(layout, &ids),
@@ -470,6 +473,13 @@ mod tests {
         doc.panes[0].settings = PaneSettings::Scanner(settings.clone());
         let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
         assert_eq!(restored.panes[0].settings, PaneSettings::Scanner(settings));
+    }
+
+    #[test]
+    fn old_layout_without_watch_columns_loads() {
+        let raw = br#"{"name":"Old","dock":{"type":"tabs","panes":[1]},"panes":[{"id":1,"Watchlist":null}]}"#;
+        let doc = LayoutDoc::from_json(raw).unwrap();
+        assert!(doc.watch_columns.columns.is_empty());
     }
 
     #[test]
