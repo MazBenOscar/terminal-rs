@@ -1,12 +1,14 @@
 # Charting review checklist
 
 This increment implements the charting priorities with the boundaries below. It
-does not establish complete TC2000 compatibility. Existing layouts migrate to v4;
+does not establish complete TC2000 compatibility. Existing layouts migrate to v5;
 new templates use v2 and accept v1. Older builds reject these newer versions.
 
 For local price-level alert creation, monitoring rules and verification steps, see
 [Price alerts](price-alerts.md). Chart interaction controls are covered in
 [Chart interaction fixes](chart-interaction-fixes.md).
+For the measure tool, zones, rays, parallel channels and text notes, see
+[Chart drawing tools](chart-drawing-tools.md).
 
 ## Output styles and fills
 

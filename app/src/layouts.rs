@@ -17,7 +17,7 @@ use crate::congress_view::FeedFilter;
 use crate::dock::{Node, PaneId};
 use crate::layout::Layout;
 
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Colour link groups: panes in the same group follow one security.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -564,6 +564,29 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(doc.panes[1].settings, PaneSettings::Feed(None));
+    }
+
+    #[test]
+    fn expanded_drawings_roundtrip_and_legacy_drawings_keep_default_fields() {
+        use tr_chart::drawings::{Anchor, Drawing, Tool};
+        let old: Drawing =
+            serde_json::from_str(r#"{"tool":"Trendline","a":{"ts":1,"price":10},"b":{"ts":2,"price":20}}"#).unwrap();
+        assert_eq!(old.c, None);
+        assert!(old.text.is_empty());
+        let mut doc = LayoutDoc::default_workspace("Drawing test", &Default::default());
+        let PaneSettings::Chart { drawings, .. } = &mut doc.panes[0].settings else {
+            panic!("Expected chart");
+        };
+        for tool in [Tool::Measure, Tool::Rectangle, Tool::Ray, Tool::Channel, Tool::Text] {
+            let mut d = Drawing::new(tool, Anchor { ts: 1, price: 10. }, Anchor { ts: 2, price: 20. });
+            d.c = (tool == Tool::Channel).then_some(Anchor { ts: 3, price: 30. });
+            d.text = if tool == Tool::Text { "Support zone\nWait for confirmation".into() } else { String::new() };
+            d.symbol = Some("AAPL US Equity".into());
+            drawings.push(d);
+        }
+        let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(restored.version, 5);
+        assert_eq!(restored.panes[0].settings, doc.panes[0].settings);
     }
 
     #[test]

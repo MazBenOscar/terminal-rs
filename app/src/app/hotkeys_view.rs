@@ -306,6 +306,10 @@ impl TerminalApp {
                     (&["SMA 50", "RSI", "IND"], "Indicators (see below)"),
                     (&["CMP MSFT"], "Compare, rebased to the main symbol"),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
+                    (
+                        &["MEASURE", "RECT", "RAY", "CHANNEL", "NOTE"],
+                        "Measure, zones, rays, parallel channels and text notes",
+                    ),
                 ],
             );
             para(

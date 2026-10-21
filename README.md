@@ -97,6 +97,9 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   to OHLC; click to select, drag anchors or the body to edit, Del to remove. Drawings belong to
   their symbol, with an optional all-symbol scope; color, width and trendline extensions are
   editable. Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z undo and redo drawing edits.
+  The Draw menu and command palette also offer `MEASURE` (price, %, bars and elapsed time),
+  `RECT` / `ZONE`, directional `RAY`, three-point `CHANNEL` and multiline `NOTE`.
+  See [drawing tools and layout compatibility](docs/chart-drawing-tools.md).
 - **Options** (`AAPL OMON`, ⌘⇧O) — full chains from Yahoo for US equities, ETFs and indices
   (SPX via ^SPX): every expiration, calls and puts by strike with bid/ask/last, change, volume,
   open interest and IV, plus Black-Scholes greeks (Δ, Γ, Θ/day, vega) from each contract's IV, the

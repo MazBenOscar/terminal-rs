@@ -68,6 +68,8 @@ impl Glide {
 struct DrawState {
     tool: Option<Tool>,
     pending: Option<Anchor>,
+    second: Option<Anchor>,
+    note: Option<NoteDraft>,
     selected: Option<usize>,
     hover: Option<(usize, DrawHandle)>,
     drag: Option<DrawingDrag>,
@@ -77,7 +79,14 @@ struct DrawState {
 enum DrawHandle {
     A,
     B,
+    C,
     Body,
+}
+
+struct NoteDraft {
+    anchor: Anchor,
+    existing: Option<(usize, Drawing)>,
+    text: String,
 }
 
 struct DrawingDrag {
@@ -431,8 +440,8 @@ impl ChartState {
     }
 
     pub fn start_tool(&mut self, tool: Tool) {
-        self.draw.tool = Some(tool);
-        self.draw.pending = None;
+        self.cancel();
+        self.draw = DrawState { tool: Some(tool), ..Default::default() };
     }
 
     /// Esc: cancel an in-progress drawing, then deselect. Returns whether it consumed the key.
@@ -443,7 +452,7 @@ impl ChartState {
             }
             self.drawing_undo.pop();
         }
-        if self.draw.tool.is_some() || self.draw.selected.is_some() {
+        if self.draw.tool.is_some() || self.draw.selected.is_some() || self.draw.note.is_some() {
             self.draw = DrawState::default();
             true
         } else {
@@ -843,6 +852,7 @@ impl ChartState {
         }
         study::assign_ids(&mut self.indicators);
         self.show_indicator_editor(ui.ctx(), w);
+        self.show_note_editor(ui.ctx());
         self.compare_picker.chart = Some(rect);
         if let Some(chosen) = self.compare_picker.show(
             ui.ctx(),
@@ -2309,6 +2319,12 @@ impl ChartState {
                     ui.close();
                 }
             }
+            for tool in [Tool::Measure, Tool::Rectangle, Tool::Ray, Tool::Channel, Tool::Text] {
+                if ui.button(tool.label()).clicked() {
+                    self.start_tool(tool);
+                    ui.close();
+                }
+            }
             if ui.add_enabled(!self.drawing_undo.is_empty(), egui::Button::new("Undo drawing edit")).clicked() {
                 self.undo_drawings();
                 ui.close();
@@ -2321,6 +2337,14 @@ impl ChartState {
                 ui.separator();
                 let mut edited = self.drawings[index].clone();
                 ui.label(format!("Selected {}", edited.tool.label()));
+                if edited.tool == Tool::Text && ui.button("Edit text…").clicked() {
+                    self.draw.note = Some(NoteDraft {
+                        anchor: edited.a,
+                        text: edited.text.clone(),
+                        existing: Some((index, edited.clone())),
+                    });
+                    ui.close();
+                }
                 ui.add(egui::DragValue::new(&mut edited.width).range(0.5..=6.0).speed(0.1).prefix("Width "));
                 let mut custom = edited.color.is_some();
                 if ui.checkbox(&mut custom, "Custom drawing color").changed() {
@@ -2422,7 +2446,9 @@ impl ChartState {
             ly += 14.0;
         }
         if let Some(tool) = self.draw.tool {
-            let msg = if self.draw.pending.is_some() {
+            let msg = if self.draw.second.is_some() {
+                "click channel width (Esc cancels)"
+            } else if self.draw.pending.is_some() {
                 "click second point (Esc cancels)"
             } else {
                 "click to place (Esc cancels)"
@@ -2438,27 +2464,109 @@ impl ChartState {
         crate::chart_legend::paint(ui, rows);
     }
 
-    fn drawing_shapes(&self, d: &Drawing, rect: Rect, v: &Viewport, s: &PriceScale) -> Vec<(Shape, Option<String>)> {
+    fn show_note_editor(&mut self, ctx: &egui::Context) {
+        let Some(draft) = &mut self.draw.note else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Chart text note")
+            .id(egui::Id::new((self.id, "drawing-note")))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(300.)
+            .show(ctx, |ui| {
+                ui.label("Note");
+                ui.add(egui::TextEdit::multiline(&mut draft.text).char_limit(500).desired_rows(4).desired_width(285.));
+                ui.label(
+                    RichText::new("Up to 500 characters. Double-click the note to edit it.").small().color(muted()),
+                );
+                ui.horizontal(|ui| {
+                    save = ui.add_enabled(!draft.text.trim().is_empty(), egui::Button::new("Save note")).clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if save {
+            let draft = self.draw.note.take().unwrap();
+            let note = draft.text.trim().to_string();
+            if let Some((index, original)) = draft.existing {
+                // A nonmodal editor must not update a different drawing after undo/delete.
+                if self.drawings.get(index) == Some(&original) && original.text != note {
+                    self.remember_drawings();
+                    self.drawings[index].text = note;
+                }
+            } else {
+                self.remember_drawings();
+                let mut drawing = Drawing::new(Tool::Text, draft.anchor, draft.anchor);
+                drawing.text = note;
+                drawing.symbol = Some(self.symbol.clone());
+                self.drawings.push(drawing);
+                self.draw.selected = Some(self.drawings.len() - 1);
+            }
+        } else if cancel || !open {
+            self.draw.note = None;
+        }
+    }
+
+    fn drawing_shapes(
+        &self,
+        ui: &Ui,
+        d: &Drawing,
+        rect: Rect,
+        v: &Viewport,
+        s: &PriceScale,
+    ) -> Vec<(Shape, Option<String>)> {
+        if [Some(d.a), Some(d.b), d.c]
+            .into_iter()
+            .take(d.tool.points())
+            .flatten()
+            .any(|a| !a.price.is_finite() || (s.log && a.price <= 0.))
+        {
+            return vec![];
+        }
         let px =
             |a: &Anchor| [rect.left() as f64 + v.x_of(self.index_of_ts(a.ts)), rect.top() as f64 + s.y_of(a.price)];
         match d.tool {
-            Tool::Trendline => {
+            Tool::Trendline | Tool::Ray => {
                 let (mut a, mut b) = (px(&d.a), px(&d.b));
-                if (b[0] - a[0]).abs() > 1e-6 && (d.extend_left || d.extend_right) {
-                    if a[0] > b[0] {
-                        std::mem::swap(&mut a, &mut b);
-                    }
-                    let slope = (b[1] - a[1]) / (b[0] - a[0]);
-                    if d.extend_left {
-                        a[1] += (rect.left() as f64 - a[0]) * slope;
-                        a[0] = rect.left() as f64;
-                    }
-                    if d.extend_right {
-                        b[1] += (rect.right() as f64 - b[0]) * slope;
-                        b[0] = rect.right() as f64;
-                    }
+                if d.tool == Tool::Trendline && a[0] > b[0] {
+                    std::mem::swap(&mut a, &mut b);
                 }
-                vec![(Shape::Segment(a, b), None)]
+                drawings::clip_line(
+                    a,
+                    b,
+                    [rect.left() as f64, rect.top() as f64, rect.right() as f64, rect.bottom() as f64],
+                    d.tool == Tool::Trendline && d.extend_left,
+                    d.tool == Tool::Ray || d.extend_right,
+                )
+                .map(|(a, b)| vec![(Shape::Segment(a, b), None)])
+                .unwrap_or_default()
+            }
+            Tool::Rectangle | Tool::Measure => {
+                let label = if d.tool == Tool::Measure {
+                    let bars = (self.index_of_ts(d.b.ts) - self.index_of_ts(d.a.ts)).abs().round() as usize;
+                    Some(drawings::measure_label(d.a, d.b, bars, self.sec.decimals(d.a.price)))
+                } else {
+                    None
+                };
+                vec![(Shape::Rect(px(&d.a), px(&d.b)), label)]
+            }
+            Tool::Channel => {
+                if let Some(c) = d.c {
+                    vec![(Shape::Polygon(drawings::channel_polygon(px(&d.a), px(&d.b), px(&c))), None)]
+                } else {
+                    vec![(Shape::Segment(px(&d.a), px(&d.b)), None)]
+                }
+            }
+            Tool::Text => {
+                let a = px(&d.a);
+                let size = ui.painter().layout(d.text.clone(), ui_font(11.5), text(), 220.).size() + vec2(8., 4.);
+                vec![(Shape::Rect(a, [a[0] + size.x as f64, a[1] + size.y as f64]), Some(d.text.clone()))]
             }
             Tool::Horizontal => vec![(Shape::HLine(px(&d.a)[1]), Some(format!("{:.2}", d.a.price)))],
             Tool::Vertical => vec![(Shape::VLine(px(&d.a)[0]), None)],
@@ -2505,17 +2613,22 @@ impl ChartState {
                 return None;
             }
             for (index, drawing) in this.drawings.iter().enumerate().rev().filter(|(_, d)| d.visible_on(&this.symbol)) {
-                for (anchor, handle) in [(&drawing.a, DrawHandle::A), (&drawing.b, DrawHandle::B)] {
+                let anchors =
+                    [(Some(drawing.a), DrawHandle::A), (Some(drawing.b), DrawHandle::B), (drawing.c, DrawHandle::C)];
+                for (anchor, handle) in anchors.into_iter().take(drawing.tool.points()) {
+                    let Some(anchor) = anchor else {
+                        continue;
+                    };
                     let point = pos2(
                         rect.left() + v.x_of(this.index_of_ts(anchor.ts)) as f32,
                         rect.top() + s.y_of(anchor.price) as f32,
                     );
-                    if point.distance(pos) < 8.0 {
+                    if point.is_finite() && point.distance(pos) < 8.0 {
                         return Some((index, handle));
                     }
                 }
                 if this
-                    .drawing_shapes(drawing, rect, v, s)
+                    .drawing_shapes(ui, drawing, rect, v, s)
                     .iter()
                     .any(|(shape, _)| drawings::distance(shape, [pos.x as f64, pos.y as f64]) < 6.0)
                 {
@@ -2524,10 +2637,11 @@ impl ChartState {
             }
             None
         };
-        if self.draw.tool.is_none() && self.draw.drag.is_none() {
+        if self.draw.tool.is_none() && self.draw.drag.is_none() && self.draw.note.is_none() {
             self.draw.hover = hover.and_then(|pos| hit(self, pos));
         }
         if self.draw.tool.is_none()
+            && self.draw.note.is_none()
             && resp.drag_started()
             && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos())
             && let Some((index, handle)) = hit(self, pos)
@@ -2551,8 +2665,11 @@ impl ChartState {
             match drag.handle {
                 DrawHandle::A => edited.a = anchor,
                 DrawHandle::B => edited.b = anchor,
+                DrawHandle::C => edited.c = Some(anchor),
                 DrawHandle::Body => {
-                    for point in [&mut edited.a, &mut edited.b] {
+                    for point in
+                        std::iter::once(&mut edited.a).chain(std::iter::once(&mut edited.b)).chain(edited.c.iter_mut())
+                    {
                         point.ts = point.ts.saturating_add(anchor.ts.saturating_sub(drag.start.ts));
                         point.price = if s.log && drag.start.price > 0. {
                             point.price * anchor.price / drag.start.price
@@ -2579,26 +2696,58 @@ impl ChartState {
         }
 
         // Placement.
-        if let (Some(tool), true, Some(pos)) = (self.draw.tool, resp.clicked(), resp.interact_pointer_pos()) {
+        if let (Some(tool), true, Some(pos)) =
+            (self.draw.tool, resp.clicked(), resp.interact_pointer_pos().filter(|p| rect.contains(*p)))
+        {
             let a = pointer_anchor(self, pos);
-            if tool.points() == 1 {
+            if tool == Tool::Text {
+                self.draw = DrawState {
+                    note: Some(NoteDraft { anchor: a, existing: None, text: String::new() }),
+                    ..Default::default()
+                };
+            } else if tool.points() == 1 {
                 self.remember_drawings();
                 let mut drawing = Drawing::new(tool, a, a);
                 drawing.symbol = Some(self.symbol.clone());
                 self.drawings.push(drawing);
                 self.draw = DrawState::default();
+            } else if tool == Tool::Channel
+                && self.draw.second.is_none()
+                && let Some(first) = self.draw.pending
+            {
+                let screen = pos2(
+                    rect.left() + v.x_of(self.index_of_ts(first.ts)) as f32,
+                    rect.top() + s.y_of(first.price) as f32,
+                );
+                if screen.distance(pos) >= 3. {
+                    self.draw.second = Some(a);
+                }
             } else if let Some(first) = self.draw.pending.take() {
                 self.remember_drawings();
-                let mut drawing = Drawing::new(tool, first, a);
+                let mut drawing = Drawing::new(tool, first, self.draw.second.unwrap_or(a));
+                if tool == Tool::Channel {
+                    drawing.c = Some(a);
+                }
                 drawing.symbol = Some(self.symbol.clone());
                 self.drawings.push(drawing);
                 self.draw = DrawState::default();
+                self.draw.selected = Some(self.drawings.len() - 1);
             } else {
                 self.draw.pending = Some(a);
             }
-        } else if self.draw.tool.is_none() && resp.clicked() {
+        } else if self.draw.tool.is_none() && self.draw.note.is_none() && resp.clicked() {
             // Selection by proximity.
             self.draw.selected = resp.interact_pointer_pos().and_then(|pos| hit(self, pos).map(|(index, _)| index));
+            if resp.double_clicked()
+                && let Some(index) = self.draw.selected.filter(|&i| self.drawings[i].tool == Tool::Text)
+            {
+                let original = self.drawings[index].clone();
+                self.draw.note = Some(NoteDraft {
+                    anchor: original.a,
+                    text: original.text.clone(),
+                    existing: Some((index, original)),
+                });
+            }
         }
 
         let mut all: Vec<(Drawing, bool)> = self
@@ -2609,23 +2758,31 @@ impl ChartState {
             .filter(|(_, d)| d.visible_on(&self.symbol))
             .map(|(i, d)| (d, self.draw.selected == Some(i)))
             .collect();
-        if let (Some(tool), Some(first), Some(h)) = (self.draw.tool, self.draw.pending, hover) {
-            all.push((Drawing::new(tool, first, pointer_anchor(self, h)), true));
+        if let (Some(tool), Some(first), Some(h)) = (self.draw.tool, self.draw.pending, hover)
+            && rect.contains(h)
+        {
+            let mut preview = Drawing::new(tool, first, self.draw.second.unwrap_or_else(|| pointer_anchor(self, h)));
+            if self.draw.second.is_some() {
+                preview.c = Some(pointer_anchor(self, h));
+            }
+            all.push((preview, true));
         }
         for (d, selected) in all {
             let color =
                 if selected { amber() } else { d.color.map_or(theme::cyan(), |[r, g, b]| Color32::from_rgb(r, g, b)) };
             let stroke = Stroke::new(if selected { d.width.clamp(2.0, 6.0) } else { d.width.clamp(0.5, 6.0) }, color);
             if selected {
-                for anchor in [d.a, d.b] {
+                for anchor in [Some(d.a), Some(d.b), d.c].into_iter().take(d.tool.points()).flatten() {
                     let point = pos2(
                         rect.left() + v.x_of(self.index_of_ts(anchor.ts)) as f32,
                         rect.top() + s.y_of(anchor.price) as f32,
                     );
-                    p.circle_filled(point, 3.5, amber());
+                    if point.is_finite() {
+                        p.circle_filled(point, 3.5, amber());
+                    }
                 }
             }
-            for (shape, label) in self.drawing_shapes(&d, rect, v, s) {
+            for (shape, label) in self.drawing_shapes(ui, &d, rect, v, s) {
                 match shape {
                     Shape::Segment(a, b) => {
                         p.line_segment([pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32)], stroke);
@@ -2653,6 +2810,34 @@ impl ChartState {
                     }
                     Shape::VLine(x) => {
                         p.vline(x as f32, rect.y_range(), stroke);
+                    }
+                    Shape::Rect(a, b) => {
+                        let r = Rect::from_two_pos(pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32));
+                        if d.tool == Tool::Text {
+                            p.rect_filled(r, 2., theme::card());
+                            if selected {
+                                p.rect_stroke(r, 2., stroke, StrokeKind::Inside);
+                            }
+                            let galley = p.layout(label.unwrap_or_default(), ui_font(11.5), color, 220.);
+                            p.galley(r.min + vec2(4., 2.), galley, color);
+                        } else {
+                            p.rect_filled(r, 0., color.gamma_multiply(0.08));
+                            p.rect_stroke(r, 0., stroke, StrokeKind::Inside);
+                            if let Some(label) = label {
+                                let galley = p.layout(label, mono(11.), color, rect.width().min(330.));
+                                let size = galley.size() + vec2(8., 4.);
+                                let min = pos2(
+                                    r.left().clamp(rect.left(), (rect.right() - size.x).max(rect.left())),
+                                    (r.top() - size.y - 2.).max(rect.top()),
+                                );
+                                p.rect_filled(Rect::from_min_size(min, size), 2., theme::card());
+                                p.galley(min + vec2(4., 2.), galley, color);
+                            }
+                        }
+                    }
+                    Shape::Polygon(points) => {
+                        let points: Vec<_> = points.iter().map(|p| pos2(p[0] as f32, p[1] as f32)).collect();
+                        p.add(egui::Shape::convex_polygon(points, color.gamma_multiply(0.08), stroke));
                     }
                 }
             }
@@ -2948,6 +3133,144 @@ mod tests {
         chart_frame(ctx, chart, vec![pointer_button(pos, true)]);
         chart_frame(ctx, chart, vec![pointer_button(pos, false)]);
         chart_frame(ctx, chart, vec![])
+    }
+
+    fn drawing_frame(
+        ctx: &egui::Context,
+        chart: &mut ChartState,
+        events: Vec<egui::Event>,
+        log: bool,
+    ) -> Vec<(String, Rect)> {
+        ui_frame(ctx, events, |ui| {
+            chart.show_note_editor(ui.ctx());
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(800., 400.));
+            let v = Viewport { right: 100., bar_px: 8., width_px: 800. };
+            let scale = PriceScale::new(100., 200., log, 400.);
+            let response = ui.interact(rect, egui::Id::new("expanded-drawing-test"), Sense::click_and_drag());
+            chart.paint_drawings(ui, rect, &v, &scale, ui.input(|i| i.pointer.hover_pos()), &response);
+        })
+    }
+
+    fn drawing_chart() -> ChartState {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.bars = Arc::new((0..100).map(|i| Bar::new(i * 86400, 150., 160., 140., 150., 1.)).collect());
+        chart
+    }
+
+    fn click_drawing(ctx: &egui::Context, chart: &mut ChartState, at: Pos2, log: bool) -> Vec<(String, Rect)> {
+        drawing_frame(ctx, chart, vec![egui::Event::PointerMoved(at)], log);
+        drawing_frame(ctx, chart, vec![pointer_button(at, true)], log);
+        drawing_frame(ctx, chart, vec![pointer_button(at, false)], log);
+        drawing_frame(ctx, chart, vec![], log)
+    }
+
+    #[test]
+    fn measure_zone_and_ray_place_select_delete_and_undo_without_losing_anchors() {
+        for tool in [Tool::Measure, Tool::Rectangle, Tool::Ray] {
+            let ctx = egui::Context::default();
+            let mut chart = drawing_chart();
+            chart.start_tool(tool);
+            click_drawing(&ctx, &mut chart, pos2(320., 300.), false);
+            assert!(chart.drawings.is_empty());
+            let labels = click_drawing(&ctx, &mut chart, pos2(480., 100.), false);
+            assert_eq!(chart.drawings.len(), 1);
+            let drawing = chart.drawings[0].clone();
+            assert_eq!(drawing.symbol, Some(chart.symbol.clone()));
+            assert_eq!(drawing.a.price, 125.);
+            assert_eq!(drawing.b.price, 175.);
+            if tool == Tool::Measure {
+                assert!(
+                    labels
+                        .iter()
+                        .any(|(s, _)| s.contains("+50.00 (+40.00%)") && s.contains("20 bars") && s.contains("20d"))
+                );
+            }
+            click_drawing(&ctx, &mut chart, pos2(400., 200.), false);
+            assert_eq!(chart.draw.selected, Some(0));
+            assert!(chart.delete_selected());
+            assert!(chart.drawings.is_empty());
+            chart.undo_drawings();
+            assert_eq!(chart.drawings[0], drawing);
+            chart.redo_drawings();
+            assert!(chart.drawings.is_empty());
+        }
+    }
+
+    #[test]
+    fn channel_requires_three_points_and_width_edits_undo_on_log_scale() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.start_tool(Tool::Channel);
+        click_drawing(&ctx, &mut chart, pos2(320., 300.), true);
+        click_drawing(&ctx, &mut chart, pos2(480., 100.), true);
+        assert!(chart.drawings.is_empty());
+        assert!(chart.draw.second.is_some());
+        click_drawing(&ctx, &mut chart, pos2(480., 200.), true);
+        let original = chart.drawings[0].clone();
+        assert!(original.c.is_some());
+        let from = pos2(480., 200.);
+        let to = pos2(480., 250.);
+        drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(from)], true);
+        drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], true);
+        drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], true);
+        drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], true);
+        assert_eq!(chart.drawings[0].a, original.a);
+        assert_eq!(chart.drawings[0].b, original.b);
+        assert_ne!(chart.drawings[0].c, original.c);
+        chart.undo_drawings();
+        assert_eq!(chart.drawings[0], original);
+        // Moving the band translates its width anchor too, preserving log ratios.
+        let from = pos2(425., 220.);
+        let to = pos2(445., 240.);
+        drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(from)], true);
+        drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], true);
+        drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], true);
+        drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], true);
+        let moved = &chart.drawings[0];
+        assert_ne!(moved.a, original.a);
+        assert_ne!(moved.b, original.b);
+        assert_ne!(moved.c, original.c);
+        assert!((moved.c.unwrap().price / moved.a.price - original.c.unwrap().price / original.a.price).abs() < 1e-8);
+        chart.undo_drawings();
+        assert_eq!(chart.drawings[0], original);
+        chart.start_tool(Tool::Channel);
+        click_drawing(&ctx, &mut chart, pos2(200., 150.), true);
+        assert!(chart.cancel());
+        assert!(chart.draw.pending.is_none() && chart.draw.second.is_none());
+        assert_eq!(chart.drawings.len(), 1);
+    }
+
+    #[test]
+    fn note_creation_cancellation_editing_and_undo_are_transactional() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.start_tool(Tool::Text);
+        click_drawing(&ctx, &mut chart, pos2(500., 300.), false);
+        assert!(chart.drawings.is_empty());
+        assert!(chart.draw.note.is_some());
+        chart.cancel();
+        assert!(chart.drawings.is_empty() && chart.drawing_undo.is_empty());
+        chart.start_tool(Tool::Text);
+        click_drawing(&ctx, &mut chart, pos2(500., 300.), false);
+        chart.draw.note.as_mut().unwrap().text = "Watch support\nWait for volume".into();
+        drawing_frame(&ctx, &mut chart, vec![], false);
+        let labels = drawing_frame(&ctx, &mut chart, vec![], false);
+        let save = labels.iter().find(|(s, _)| s == "Save note").unwrap().1.center();
+        click_drawing(&ctx, &mut chart, save, false);
+        assert_eq!(chart.drawings.len(), 1);
+        let original = chart.drawings[0].clone();
+        assert_eq!(original.text, "Watch support\nWait for volume");
+        chart.draw.note =
+            Some(NoteDraft { anchor: original.a, existing: Some((0, original.clone())), text: "Updated note".into() });
+        drawing_frame(&ctx, &mut chart, vec![], false);
+        let labels = drawing_frame(&ctx, &mut chart, vec![], false);
+        let save = labels.iter().find(|(s, _)| s == "Save note").unwrap().1.center();
+        click_drawing(&ctx, &mut chart, save, false);
+        assert_eq!(chart.drawings[0].text, "Updated note");
+        chart.undo_drawings();
+        assert_eq!(chart.drawings[0], original);
+        chart.undo_drawings();
+        assert!(chart.drawings.is_empty());
     }
 
     #[test]
