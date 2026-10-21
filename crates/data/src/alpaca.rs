@@ -36,6 +36,14 @@ impl AlpacaProvider {
     }
 }
 
+fn validate_options(tf: Timeframe, options: crate::HistoryOptions) -> Result<()> {
+    if options.extended_hours && !tf.is_intraday() {
+        bail!("Alpaca history does not support extended hours for non-intraday bars");
+    }
+    // Intraday bars include pre/post-market trades; do not apply a session filter.
+    Ok(())
+}
+
 fn timeframe(tf: Timeframe) -> &'static str {
     match tf {
         Timeframe::M2 | Timeframe::M3 => unreachable!("resampled interval"),
@@ -101,6 +109,7 @@ impl MarketData for AlpacaProvider {
         limit: usize,
         options: crate::HistoryOptions,
     ) -> Result<Vec<Bar>> {
+        validate_options(tf, options)?;
         if let Some((base, factor)) = tf.source_interval() {
             let bars =
                 self.chart_history(symbol, base, end, limit.saturating_add(1).saturating_mul(factor), options).await?;
@@ -154,6 +163,19 @@ impl MarketData for AlpacaProvider {
 mod tests {
     use super::*;
 
+    #[test]
+    fn extended_hours_requires_intraday_bars() {
+        let options = crate::HistoryOptions { extended_hours: true, ..Default::default() };
+        assert!(validate_options(Timeframe::M1, options).is_ok());
+        assert!(validate_options(Timeframe::H4, options).is_ok());
+        assert!(
+            validate_options(Timeframe::D1, options)
+                .unwrap_err()
+                .to_string()
+                .contains("Alpaca history does not support")
+        );
+        assert!(validate_options(Timeframe::D1, crate::HistoryOptions::default()).is_ok());
+    }
     #[test]
     fn parses_fixture() {
         let (bars, next) = parse_bars_page(include_str!("../tests/fixtures/alpaca_bars.json")).unwrap();

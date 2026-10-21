@@ -854,6 +854,10 @@ impl TerminalApp {
             }
             Function::Timeframe(tf) => self.with_chart(|c, w| c.set_timeframe(tf, w)),
             Function::ChartType(t) => self.with_chart(|c, _| c.chart_type = t),
+            Function::RenkoBox(size) => self.with_chart(|c, _| {
+                c.data.analytics.renko_size = size.unwrap_or(0.);
+                c.chart_type = tr_chart::scene::ChartType::Renko;
+            }),
             Function::Indicator(spec) => self.with_chart(|c, w| c.toggle_indicator(spec, w)),
             Function::IndicatorPicker(q) => self.palette.open_scoped(crate::palette::Kind::Indicator, &q),
             Function::ClearIndicators => self.with_chart(|c, _| c.clear_indicators()),
@@ -1067,6 +1071,12 @@ impl TerminalApp {
                     }
                 }
                 Response::ExportChart { pane, result } => {
+                    self.status = match &result {
+                        Ok(path) => {
+                            format!("Exported {}", path.file_name().unwrap_or(path.as_os_str()).to_string_lossy())
+                        }
+                        Err(err) => format!("Export failed: {err}"),
+                    };
                     if let Some(c) = self.chart_mut(pane) {
                         c.export_notice = Some(result);
                     }
@@ -1333,6 +1343,13 @@ impl TerminalApp {
         let other_text_focused = focused.is_some() && !cmd_focused;
         if other_text_focused {
             return;
+        }
+        if !cmd_focused && self.cmd.is_empty() && self.focused_is_chart() {
+            let mut handled = false;
+            self.with_chart(|chart, worker| handled = chart.replay_keys(ctx, worker));
+            if handled {
+                return;
+            }
         }
         // Chorded bindings (⌘, Ctrl, Alt) work even while the command line has text.
         let mut swallow_text = false;

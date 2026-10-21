@@ -1,6 +1,34 @@
 //! Causal bar-derived chart analytics; profiles are OHLCV estimates, not trade prints.
 use crate::Bar;
 
+/// ATR(14), rounded down to a 1/2/2.5/5 box; short histories use 1% of close.
+pub fn auto_box_size(bars: &[Bar]) -> f64 {
+    let fallback = bars.last().map_or(1., |b| b.close.abs() * 0.01);
+    let atr = if bars.len() >= 15 {
+        bars[bars.len() - 15..]
+            .windows(2)
+            .map(|pair| {
+                let (prev, bar) = (&pair[0], &pair[1]);
+                (bar.high - bar.low).max((bar.high - prev.close).abs()).max((bar.low - prev.close).abs())
+            })
+            .sum::<f64>()
+            / 14.
+    } else {
+        fallback
+    };
+    let value = if atr.is_finite() && atr > 0. {
+        atr
+    } else if fallback.is_finite() && fallback > 0. {
+        fallback
+    } else {
+        1.
+    };
+    let power = 10f64.powf(value.log10().floor());
+    let unit = value / power;
+    let nice = [5., 2.5, 2., 1.].into_iter().find(|n| *n <= unit).unwrap_or(1.);
+    (nice * power).max(f64::MIN_POSITIVE)
+}
+
 /// Fixed-box, close-only Renko with a one-box reversal. Timestamps are source times;
 /// multiple bricks may share one time. Volume is apportioned, not tick-volume.
 pub fn renko(bars: &[Bar], size: f64) -> Result<Vec<Bar>, String> {
@@ -40,10 +68,7 @@ pub fn renko(bars: &[Bar], size: f64) -> Result<Vec<Bar>, String> {
 }
 pub fn anchored_vwap(bars: &[Bar], anchor: i64) -> Vec<f64> {
     let mut out = vec![f64::NAN; bars.len()];
-    if bars.first().is_none_or(|b| anchor < b.ts) || bars.last().is_none_or(|b| anchor > b.ts) {
-        return out;
-    }
-    let start = bars.partition_point(|b| b.ts < anchor);
+    let start = bars.partition_point(|b| b.ts <= anchor).saturating_sub(1);
     let (mut pv, mut volume) = (0., 0.);
     for (i, b) in bars.iter().enumerate().skip(start) {
         if !b.volume.is_finite() || b.volume < 0. || ![b.high, b.low, b.close].iter().all(|p| p.is_finite()) {
@@ -130,6 +155,17 @@ pub fn heikin_ashi(bars: &[Bar]) -> Vec<Bar> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn automatic_box_sizes() {
+        let btc: Vec<_> = (0..15).map(|ts| crate::Bar::new(ts, 60_000., 61_400., 58_600., 60_000., 1.)).collect();
+        assert_eq!(super::auto_box_size(&btc), 2500.);
+        let small: Vec<_> = (0..15).map(|ts| crate::Bar::new(ts, 5., 5.15, 4.85, 5., 1.)).collect();
+        assert_eq!(super::auto_box_size(&small), 0.25);
+        assert_eq!(super::auto_box_size(&btc[..1]), 500.);
+        assert_eq!(super::auto_box_size(&small[..1]), 0.05);
+        assert_eq!(super::auto_box_size(&[]), 1.);
+        assert!(super::auto_box_size(&[crate::Bar::new(0, 0., 0., 0., 0., 0.)]) > 0.);
+    }
     use super::*;
     #[test]
     fn renko_builds_multiple_bricks_without_future_values_and_bounds_work() {
@@ -152,7 +188,7 @@ mod tests {
         assert!(renko(&b, 0.00000001).is_err());
     }
     #[test]
-    fn anchored_vwap_is_causal_and_never_substitutes_missing_volume_or_anchor_history() {
+    fn anchored_vwap_snaps_to_containing_bar_and_never_substitutes_missing_volume() {
         let b = [
             Bar::new(1, 10., 10., 10., 10., 2.),
             Bar::new(2, 20., 20., 20., 20., 1.),
@@ -161,7 +197,14 @@ mod tests {
         assert_eq!(anchored_vwap(&b, 1), vec![10., 40. / 3., 40. / 3.]);
         assert!(anchored_vwap(&b, 2)[0].is_nan());
         assert_eq!(anchored_vwap(&b, 2)[1], 20.);
-        assert!(anchored_vwap(&b, 0).iter().all(|v| v.is_nan()));
+        assert_eq!(anchored_vwap(&b, 0), anchored_vwap(&b, 1));
+        let daily = [Bar::new(86_400, 10., 10., 10., 10., 1.), Bar::new(172_800, 20., 20., 20., 20., 1.)];
+        for anchor in [172_800, 180_000] {
+            let values = anchored_vwap(&daily, anchor);
+            assert!(values[0].is_nan());
+            assert_eq!(values[1], 20.);
+        }
+        assert_eq!(anchored_vwap(&daily, 0), vec![10., 15.]);
         let mut broken = b;
         broken[1].volume = f64::NAN;
         assert!(anchored_vwap(&broken, 1)[2].is_nan());

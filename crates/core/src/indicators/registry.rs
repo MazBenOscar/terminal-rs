@@ -357,7 +357,7 @@ impl<'de> Deserialize<'de> for Spec {
         #[serde(untagged)]
         enum Repr {
             Label(String),
-            Instance { indicator: String, chart: super::study::Settings },
+            Instance { indicator: String, chart: Box<super::study::Settings> },
             Legacy(Legacy),
         }
         let spec = |code: &str, params: &[f64]| Spec::new(code, params).expect("legacy indicators are in the catalog");
@@ -365,7 +365,7 @@ impl<'de> Deserialize<'de> for Spec {
             Repr::Label(s) => Spec::from_label(&s),
             Repr::Instance { indicator, chart } => {
                 let mut spec = Spec::from_label(&indicator);
-                spec.chart = Some(chart);
+                spec.chart = Some(*chart);
                 spec
             }
             Repr::Legacy(Legacy::Sma(n)) => spec("SMA", &[n as f64]),

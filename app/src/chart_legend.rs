@@ -3,7 +3,7 @@ use crate::{
     theme::{self, mono},
     worker::BuiltIndicator,
 };
-use egui::{Align2, Color32, Rect, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Color32, Rect, Sense, Stroke, Ui, pos2, vec2};
 use tr_core::indicators::{registry::Spec, study};
 
 pub struct Row {
@@ -125,11 +125,13 @@ pub fn interact(ui: &Ui, pane: u64, rows: &[Row]) -> Option<Action> {
 
 pub fn paint(ui: &Ui, rows: &[Row]) {
     for row in rows {
-        let painter = ui.painter_at(row.rect);
+        let painter = ui.painter_at(row.rect.expand2(vec2(2., 1.)));
+        let galley = painter.layout_no_wrap(row.text.clone(), mono(10.5), row.color);
+        crate::chart_view::label_plate(&painter, Rect::from_min_size(row.rect.min, galley.size()));
         if ui.rect_contains_pointer(row.rect) {
             painter.rect_filled(row.rect, 2., theme::control_hover());
             painter.hline(row.rect.x_range(), row.rect.bottom() - 1., Stroke::new(0.5, row.color));
         }
-        painter.text(row.rect.left_top(), Align2::LEFT_TOP, &row.text, mono(10.5), row.color);
+        painter.galley(row.rect.min, galley, row.color);
     }
 }

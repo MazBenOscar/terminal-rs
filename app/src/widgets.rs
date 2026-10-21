@@ -100,6 +100,10 @@ pub enum Icon {
     Gear,
     ArrowUp,
     Close,
+    Play,
+    Pause,
+    StepBack,
+    StepForward,
 }
 
 /// Draw a simple line icon centred in `r`.
@@ -217,6 +221,18 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
         Icon::ArrowUp => {
             p.line_segment([pt(0.0, -5.0), pt(0.0, 5.0)], s);
             p.add(Shape::line(vec![pt(-4.5, -0.5), pt(0.0, -5.0), pt(4.5, -0.5)], s));
+        }
+        Icon::Play => {
+            p.add(Shape::convex_polygon(vec![pt(-3., -5.), pt(5., 0.), pt(-3., 5.)], color, Stroke::NONE));
+        }
+        Icon::Pause => {
+            p.line_segment([pt(-2.5, -5.), pt(-2.5, 5.)], Stroke::new(2.8, color));
+            p.line_segment([pt(2.5, -5.), pt(2.5, 5.)], Stroke::new(2.8, color));
+        }
+        Icon::StepBack | Icon::StepForward => {
+            let d = if icon == Icon::StepBack { -1. } else { 1. };
+            p.add(Shape::convex_polygon(vec![pt(-4. * d, -5.), pt(3. * d, 0.), pt(-4. * d, 5.)], color, Stroke::NONE));
+            p.line_segment([pt(5. * d, -5.), pt(5. * d, 5.)], s);
         }
         Icon::Close => {
             p.line_segment([pt(-4.5, -4.5), pt(4.5, 4.5)], s);

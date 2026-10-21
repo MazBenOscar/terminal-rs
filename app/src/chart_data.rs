@@ -9,6 +9,8 @@ pub struct ChartData {
     pub refresh_seconds: u32,
     pub account: crate::chart_account::Settings,
     pub comparisons: Vec<String>,
+    #[serde(default)]
+    pub compare_slots: Vec<(String, u8)>,
     pub hidden_comparisons: Vec<String>,
     pub workflow: Box<crate::chart_workflow::Workflow>,
     pub context: crate::chart_context::Settings,
@@ -46,8 +48,6 @@ impl ChartData {
                     }
                 });
         });
-        ui.label("Session filters are separate from history requests. Unsupported provider options show an error.");
-        ui.label(tr_core::exchange_calendar::description());
         let mut refresh = self.refresh_seconds > 0;
         if ui.checkbox(&mut refresh, "Refresh chart history automatically").changed() {
             self.refresh_seconds = if refresh { 60 } else { 0 };
@@ -58,6 +58,5 @@ impl ChartData {
                 ui.add(egui::DragValue::new(&mut self.refresh_seconds).range(15..=600));
             });
         }
-        ui.label("History refresh does not establish a real-time subscription.");
     }
 }

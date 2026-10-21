@@ -5,8 +5,14 @@ use tr_core::scanner::{Comparison, MatchMode, ScanDefinition, ScanOperand, Sourc
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Workflow {
+    #[serde(deserialize_with = "bounded_symbols")]
     pub symbols: Vec<String>,
     pub scan: Option<ScanDefinition>,
+}
+fn bounded_symbols<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let mut symbols = Vec::<String>::deserialize(deserializer)?;
+    symbols.truncate(5_000);
+    Ok(symbols)
 }
 pub fn next(symbols: &[String], current: &str, delta: isize) -> Option<String> {
     if symbols.is_empty() {
@@ -61,6 +67,14 @@ pub fn expression(scan: &ScanDefinition) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restored_queue_is_capped() {
+        let json = serde_json::json!({"symbols": (0..5_010).map(|i| i.to_string()).collect::<Vec<_>>()});
+        let workflow: Workflow = serde_json::from_value(json).unwrap();
+        assert_eq!(workflow.symbols.len(), 5_000);
+        assert_eq!(workflow.symbols.last().unwrap(), "4999");
+        assert!(serde_json::from_str::<Workflow>("{}").unwrap().symbols.is_empty());
+    }
     #[test]
     fn traversal_wraps_and_expressions_preserve_offsets_and_scaling() {
         let symbols = vec!["A".into(), "B".into()];

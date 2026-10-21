@@ -1,6 +1,6 @@
 //! Optional attributed exchange schedule. Missing dates inside explicit coverage are
 //! closed; outside it, callers retain the documented built-in approximation.
-use chrono::NaiveDate;
+use chrono::{NaiveDate, TimeZone};
 use serde::Deserialize;
 use std::{collections::BTreeMap, sync::OnceLock};
 #[derive(Debug, Deserialize)]
@@ -43,6 +43,10 @@ impl Calendar {
                 || day.open >= day.close
                 || day.close >= 1440
                 || sessions.contains_key(&day.date)
+                || [day.open, day.close].iter().any(|minute| {
+                    let local = day.date.and_hms_opt(minute / 60, minute % 60, 0).unwrap();
+                    chrono_tz::America::New_York.from_local_datetime(&local).single().is_none()
+                })
             {
                 return Err("Invalid/duplicate exchange session".into());
             }
@@ -79,6 +83,15 @@ pub fn description() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rejects_dst_gaps_and_ambiguous_times() {
+        for (date, open, close) in
+            [("2026-03-08", 150, 240), ("2026-03-08", 60, 150), ("2026-11-01", 90, 240), ("2026-01-01", 570, 570)]
+        {
+            let json = serde_json::json!({"start":date,"end":date,"source":"test","sessions":[{"date":date,"open":open,"close":close}]});
+            assert!(Calendar::parse(&serde_json::to_vec(&json).unwrap()).is_err());
+        }
+    }
     #[test]
     fn explicit_coverage_handles_closures_late_opens_and_missing_coverage() {
         let json = br#"{"start":"2001-09-10","end":"2001-09-17","source":"test schedule","sessions":[{"date":"2001-09-10","open":570,"close":960},{"date":"2001-09-17","open":600,"close":960}]}"#;
