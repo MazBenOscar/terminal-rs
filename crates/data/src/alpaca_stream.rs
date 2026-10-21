@@ -31,7 +31,15 @@ fn server_error(row: &serde_json::Value, authenticating: bool) -> Failure {
 }
 
 #[derive(Default)]
+struct Recovery {
+    authenticated: bool,
+    failed: bool,
+    last: BTreeMap<String, i64>,
+}
+
+#[derive(Default)]
 pub struct Hub {
+    recovery: Mutex<Recovery>,
     channels: Mutex<BTreeMap<String, broadcast::Sender<LiveUpdate>>>,
     changed: Notify,
     started: AtomicBool,
@@ -90,6 +98,32 @@ impl Hub {
             }
         }
     }
+    fn authenticated(&self) {
+        let mut recovery = self.recovery.lock().expect("recovery lock");
+        if recovery.authenticated && recovery.failed {
+            self.status("Live stream restored; filling missed bars");
+            if let Ok(channels) = self.channels.lock() {
+                for (symbol, tx) in channels.iter() {
+                    let _ = tx.send(LiveUpdate::Reconnected { since: recovery.last.get(symbol).copied() });
+                }
+            }
+        } else {
+            self.status("Alpaca minute stream authenticated; waiting for minute bars");
+        }
+        recovery.authenticated = true;
+        recovery.failed = false;
+    }
+
+    fn delivered(&self, symbol: &str, bar: Bar) {
+        let mut recovery = self.recovery.lock().expect("recovery lock");
+        if let Ok(channels) = self.channels.lock()
+            && let Some(tx) = channels.get(symbol)
+            && tx.send(LiveUpdate::Snapshot(bar)).is_ok()
+        {
+            recovery.last.insert(symbol.to_string(), bar.ts);
+        }
+    }
+
     async fn run(self: Arc<Self>, key: String, secret: String, feed: String) {
         let url = format!("wss://stream.data.alpaca.markets/v2/{feed}");
         let mut delay = 1;
@@ -105,7 +139,7 @@ impl Hub {
                 }
                 Err(Failure::Retry) => {
                     // Never include server payloads or authentication material in logs/status.
-                    self.status("Alpaca minute stream unavailable; reconnecting. Refresh history after a gap.");
+                    self.status("Live stream reconnecting…");
                     tokio::time::sleep(Duration::from_secs(delay)).await;
                     delay = next_delay(delay);
                 }
@@ -114,6 +148,14 @@ impl Hub {
         }
     }
     async fn connection(&self, url: &str, key: &str, secret: &str, delay: &mut u64) -> Result<(), Failure> {
+        let result = self.connected(url, key, secret, delay).await;
+        if result.is_err() {
+            self.recovery.lock().expect("recovery lock").failed = true;
+        }
+        result
+    }
+
+    async fn connected(&self, url: &str, key: &str, secret: &str, delay: &mut u64) -> Result<(), Failure> {
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(15), tokio_tungstenite::connect_async(url))
             .await
             .map_err(|_| Failure::Retry)?
@@ -140,7 +182,7 @@ impl Hub {
         .await
         .map_err(|_| Failure::Retry)??;
         *delay = 1;
-        self.status("Alpaca minute stream authenticated; waiting for minute bars");
+        self.authenticated();
         let mut subscribed = BTreeSet::<String>::new();
         let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
         let mut received = std::time::Instant::now();
@@ -172,9 +214,9 @@ impl Hub {
                             let rows: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|_| Failure::Retry)?;
                             for row in rows {
                                 if row["T"]=="error" { return Err(server_error(&row, false)); }
-                                if let Some((symbol,bar)) = parse_bar(&row)
-                                    && let Ok(channels) = self.channels.lock()
-                                    && let Some(tx) = channels.get(&symbol) { let _ = tx.send(LiveUpdate::Snapshot(bar)); }
+                                if let Some((symbol,bar)) = parse_bar(&row) {
+                                    self.delivered(&symbol, bar);
+                                }
                             }
                         }
                         Message::Ping(bytes) => { socket.send(Message::Pong(bytes)).await.map_err(|_| Failure::Retry)?; }
@@ -278,6 +320,40 @@ mod tests {
         server.await.unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(3), connection).await.unwrap().unwrap().is_err());
     }
+    #[tokio::test]
+    async fn reconnect_requires_failure_and_reauthentication_and_tracks_each_symbol() {
+        let hub = Hub::default();
+        let (a, mut a_rx) = broadcast::channel(16);
+        let (b, mut b_rx) = broadcast::channel(16);
+        let (c, mut c_rx) = broadcast::channel(16);
+        hub.channels.lock().unwrap().extend([("AAA".into(), a), ("BBB".into(), b), ("CCC".into(), c)]);
+        // A failed initial attempt is not a reconnect.
+        hub.recovery.lock().unwrap().failed = true;
+        hub.authenticated();
+        for rx in [&mut a_rx, &mut b_rx, &mut c_rx] {
+            assert!(matches!(rx.try_recv().unwrap(), LiveUpdate::Status(_)));
+            assert!(rx.try_recv().is_err());
+        }
+        hub.delivered("AAA", Bar::new(60, 1., 1., 1., 1., 1.));
+        hub.delivered("BBB", Bar::new(120, 1., 1., 1., 1., 1.));
+        assert!(matches!(a_rx.try_recv().unwrap(), LiveUpdate::Snapshot(_)));
+        assert!(matches!(b_rx.try_recv().unwrap(), LiveUpdate::Snapshot(_)));
+        assert_eq!(classify(500), Failure::Retry);
+        hub.recovery.lock().unwrap().failed = true;
+        assert!(a_rx.try_recv().is_err(), "failure alone must not emit recovery");
+        hub.authenticated();
+        for (rx, since) in [(&mut a_rx, Some(60)), (&mut b_rx, Some(120)), (&mut c_rx, None)] {
+            assert!(
+                matches!(rx.try_recv().unwrap(), LiveUpdate::Status(s) if s == "Live stream restored; filling missed bars")
+            );
+            assert!(matches!(rx.try_recv().unwrap(), LiveUpdate::Reconnected { since: actual } if actual == since));
+            assert!(rx.try_recv().is_err());
+        }
+        hub.authenticated();
+        assert!(matches!(a_rx.try_recv().unwrap(), LiveUpdate::Status(_)));
+        assert!(a_rx.try_recv().is_err(), "no duplicate recovery without another failure");
+    }
+
     #[test]
     fn parses_only_complete_minute_snapshots_and_corrections() {
         let mut row = serde_json::json!({"T":"b","S":"AAPL","t":"2026-10-20T14:30:00Z","o":100.,"h":102.,"l":99.,"c":101.,"v":300});

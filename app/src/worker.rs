@@ -986,6 +986,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     if !store_series(s, pane, generation, bars.clone()) {
                         return; // superseded while loading
                     }
+                    let Some(bars) = current_series(s, pane, generation) else { return };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
                         pane,
@@ -1000,7 +1001,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         live: false,
                     });
                     if !refreshing && options == tr_data::HistoryOptions::default() {
-                        start_live(s.clone(), pane, generation, symbol, tf);
+                        start_live(s.clone(), pane, generation, symbol, tf, options);
                     }
                 }
                 Ok(_) => s.send(Response::HistoryError { pane, generation, error: format!("no data for {symbol}") }),
@@ -1768,6 +1769,11 @@ fn store_series(s: &Shared, pane: PaneId, generation: u64, bars: Arc<Vec<Bar>>) 
         Some((g, _, _)) if *g > generation => false,
         _ => {
             let source = map.get(&pane).map(|(_, _, source)| source.clone()).unwrap_or_default();
+            let bars = if let Some((_, current, _)) = map.get(&pane) {
+                Arc::new(merge_history(current, &bars).0)
+            } else {
+                bars
+            };
             map.insert(pane, (generation, bars, source));
             true
         }
@@ -1778,17 +1784,85 @@ fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<B
     s.series.lock().expect("series lock").get(&pane).filter(|(g, _, _)| *g == generation).map(|(_, b, _)| b.clone())
 }
 
+/// Fetched values win overlaps; retain older history and any newer live tail.
+/// The ordered map also normalizes duplicate/out-of-order provider timestamps.
+fn merge_history(current: &[Bar], fetched: &[Bar]) -> (Vec<Bar>, usize) {
+    let mut bars: std::collections::BTreeMap<_, _> = current.iter().map(|bar| (bar.ts, *bar)).collect();
+    let mut filled = 0;
+    for bar in fetched {
+        if bars.insert(bar.ts, *bar).is_none() {
+            filled += 1;
+        }
+    }
+    (bars.into_values().collect(), filled)
+}
+
+fn backfill_limit(now: i64, since: Option<i64>, tf: Timeframe) -> usize {
+    since.map_or(100, |since| (now.saturating_sub(since) / tf.seconds()).saturating_add(5).clamp(5, 2_000) as usize)
+}
+
+fn merge_backfill(s: &Shared, pane: PaneId, generation: u64, source: &str, fetched: &[Bar]) -> Option<usize> {
+    let mut map = s.series.lock().expect("series lock");
+    let (_, bars, _) = map.get_mut(&pane).filter(|(g, _, key)| *g == generation && key == source)?;
+    let (merged, filled) = merge_history(bars, fetched);
+    *bars = Arc::new(merged);
+    Some(filled)
+}
+
+fn live_is_current(s: &Shared, pane: PaneId, generation: u64, source: &str) -> bool {
+    s.series.lock().expect("series lock").get(&pane).is_some_and(|(g, _, key)| *g == generation && key == source)
+}
+
 /// Merge the provider's live feed (if any) into the pane's series, publishing at most
 /// four updates a second. Stops when the pane reloads, closes or the feed ends.
-fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe) {
+fn start_live(
+    s: Arc<Shared>,
+    pane: PaneId,
+    generation: u64,
+    symbol: String,
+    tf: Timeframe,
+    options: tr_data::HistoryOptions,
+) {
+    let source = chart_options_key(s.provider.as_ref(), &symbol, options);
     let Some(mut feed) = s.provider.live(&symbol, tf) else { return };
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut dirty = false;
+        // Poll history alongside the feed: live bars and the publish timer keep
+        // running during a fetch. Further reconnects coalesce into this request.
+        let mut backfill: Option<futures::future::BoxFuture<'static, anyhow::Result<Vec<Bar>>>> = None;
         loop {
             tokio::select! {
+                result = async { backfill.as_mut().expect("active backfill").await }, if backfill.is_some() => {
+                    backfill = None;
+                    if chart_options_key(s.provider.as_ref(), &symbol, options) != source
+                        || !live_is_current(&s, pane, generation, &source) { break; }
+                    let message = match result {
+                        Ok(fetched) => {
+                            let Some(filled) = merge_backfill(&s, pane, generation, &source, &fetched) else { break };
+                            dirty = true;
+                            format!("Filled {filled} missed bars")
+                        }
+                        // Provider errors may contain raw response bodies or secrets.
+                        Err(_) => "Missed-bar history fetch failed; retry by refreshing history".into(),
+                    };
+                    s.send(Response::LiveStatus { pane, generation, message: Some(message) });
+                }
                 bar = feed.recv() => {
                     let Some(bar) = bar else { break };
+                    if chart_options_key(s.provider.as_ref(), &symbol, options) != source
+                        || !live_is_current(&s, pane, generation, &source) { break; }
+                    if let tr_data::LiveUpdate::Reconnected { since } = bar {
+                        if backfill.is_none() {
+                            let provider = s.provider.clone();
+                            let symbol = symbol.clone();
+                            let limit = backfill_limit(chrono::Utc::now().timestamp(), since, tf);
+                            backfill = Some(Box::pin(async move {
+                                provider.chart_history(&symbol, tf, None, limit, options).await
+                            }));
+                        }
+                        continue;
+                    }
                     if let tr_data::LiveUpdate::Status(message) = &bar {
                         s.send(Response::LiveStatus { pane,generation,message:Some(message.clone()) });
                         continue;
@@ -1796,20 +1870,19 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
                     s.send(Response::LiveStatus { pane,generation,message:None });
                     let mut map = s.series.lock().expect("series lock");
                     match map.get_mut(&pane) {
-                        Some((g, bars, source)) if *g == generation && *source == chart_cache_key(s.provider.as_ref(),&symbol)
+                        Some((g, bars, source)) if *g == generation && *source == chart_options_key(s.provider.as_ref(),&symbol,options)
                             => dirty |= match bar {
                                 tr_data::LiveUpdate::Partial(bar) => Series::apply_live(Arc::make_mut(bars), bar),
                                 tr_data::LiveUpdate::Snapshot(bar) => Series::apply_snapshot(Arc::make_mut(bars), bar),
-                                tr_data::LiveUpdate::Status(_) => false,
+                                tr_data::LiveUpdate::Status(_) | tr_data::LiveUpdate::Reconnected { .. } => false,
                             },
                         _ => break,
                     }
                 }
                 _ = tick.tick() => {
+                    if chart_options_key(s.provider.as_ref(), &symbol, options) != source
+                        || !live_is_current(&s, pane, generation, &source) { break; }
                     if !dirty {
-                        if current_series(&s, pane, generation).is_none() {
-                            break;
-                        }
                         continue;
                     }
                     dirty = false;
@@ -1905,6 +1978,130 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backfill_shared(provider: Provider) -> (Arc<Shared>, mpsc::Receiver<Response>) {
+        let (out, rx) = mpsc::channel();
+        (
+            Arc::new(Shared {
+                provider,
+                study_histories: Default::default(),
+                study_fetches: Default::default(),
+                series: Default::default(),
+                cache: std::sync::Mutex::new(None),
+                scan_store: std::sync::Mutex::new(None),
+                db: Mutex::new(Db::open_in_memory().unwrap()),
+                out,
+                ctx: egui::Context::default(),
+            }),
+            rx,
+        )
+    }
+
+    #[test]
+    fn backfill_limit_defaults_and_clamps() {
+        assert_eq!(backfill_limit(600, None, Timeframe::M1), 100);
+        assert_eq!(backfill_limit(600, Some(0), Timeframe::M1), 15);
+        assert_eq!(backfill_limit(600, Some(900), Timeframe::M1), 5);
+        assert_eq!(backfill_limit(i64::MAX, Some(i64::MIN), Timeframe::M1), 2_000);
+        assert_eq!(backfill_limit(600, Some(600), Timeframe::M1), 5);
+    }
+
+    #[test]
+    fn backfill_merge_fills_gap_replaces_overlap_keeps_live_tail_and_rejects_stale() {
+        let (s, _) = backfill_shared(Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)));
+        let bar = |ts, close| Bar::new(ts, close, close, close, close, 1.);
+        assert!(claim_series(&s, 1, 2, "source"));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![bar(60, 1.), bar(180, 1.), bar(240, 7.)])));
+        let fetched = vec![bar(180, 3.), bar(120, 2.), bar(180, 4.)];
+        assert_eq!(merge_backfill(&s, 1, 1, "source", &fetched), None);
+        assert_eq!(merge_backfill(&s, 1, 2, "old-source", &fetched), None);
+        assert_eq!(merge_backfill(&s, 1, 2, "source", &fetched), Some(1));
+        let bars = current_series(&s, 1, 2).unwrap();
+        assert_eq!(bars.iter().map(|b| b.ts).collect::<Vec<_>>(), vec![60, 120, 180, 240]);
+        assert_eq!(bars.iter().map(|b| b.close).collect::<Vec<_>>(), vec![1., 2., 4., 7.]);
+        // Refresh and reconnect use exactly the same overlap semantics.
+        assert!(store_series(&s, 1, 2, Arc::new(vec![bar(180, 9.)])));
+        let bars = current_series(&s, 1, 2).unwrap();
+        assert_eq!(bars[2].close, 9.);
+        assert_eq!(bars.last().unwrap().close, 7.);
+    }
+
+    #[tokio::test]
+    async fn reconnects_coalesce_one_fetch_while_live_updates_continue() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Feed {
+            rx: std::sync::Mutex<Option<tr_data::LiveFeed>>,
+            calls: AtomicUsize,
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Feed {
+            fn name(&self) -> &str {
+                "fixture"
+            }
+            fn live(&self, _: &str, _: Timeframe) -> Option<tr_data::LiveFeed> {
+                self.rx.lock().unwrap().take()
+            }
+            async fn history(
+                &self,
+                symbol: &str,
+                tf: Timeframe,
+                end: Option<i64>,
+                limit: usize,
+            ) -> anyhow::Result<Vec<Bar>> {
+                assert_eq!(symbol, "AAA");
+                assert_eq!(tf, Timeframe::M1);
+                assert_eq!(end, None);
+                assert_eq!(limit, 100);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(vec![Bar::new(120, 2., 2., 2., 2., 1.)])
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let provider = Arc::new(Feed {
+            rx: std::sync::Mutex::new(Some(rx)),
+            calls: AtomicUsize::new(0),
+            started: Default::default(),
+            release: Default::default(),
+        });
+        let (s, responses) = backfill_shared(provider.clone());
+        let source = chart_options_key(provider.as_ref(), "AAA", Default::default());
+        assert!(claim_series(&s, 1, 2, &source));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(60, 1., 1., 1., 1., 1.)])));
+        start_live(s.clone(), 1, 2, "AAA".into(), Timeframe::M1, Default::default());
+        tx.send(tr_data::LiveUpdate::Reconnected { since: None }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), provider.started.notified()).await.unwrap();
+        tx.send(tr_data::LiveUpdate::Reconnected { since: None }).await.unwrap();
+        tx.send(tr_data::LiveUpdate::Partial(Bar::new(180, 3., 3., 3., 3., 1.))).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while current_series(&s, 1, 2).unwrap().last().unwrap().ts != 180 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        provider.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if responses
+                    .try_iter()
+                    .any(|r| matches!(r, Response::LiveStatus { message: Some(m), .. } if m == "Filled 1 missed bars"))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(current_series(&s, 1, 2).unwrap().iter().map(|b| b.ts).collect::<Vec<_>>(), vec![60, 120, 180]);
+        drop(tx);
+    }
 
     #[test]
     fn study_history_eviction_keeps_the_32_newest_fetches() {
