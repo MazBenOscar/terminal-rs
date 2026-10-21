@@ -160,7 +160,8 @@ fn due_at(
     run_duration: chrono::Duration,
 ) -> chrono::DateTime<chrono::Utc> {
     let interval = chrono::Duration::minutes(i64::from(interval));
-    completed + if run_duration > interval { interval.max(chrono::Duration::seconds(30)) } else { interval }
+    let delay = if run_duration > interval { chrono::Duration::seconds(30) } else { interval };
+    completed + delay.max(chrono::Duration::seconds(30))
 }
 
 fn interval_allowed(symbols: usize, minutes: u32) -> bool {
@@ -981,12 +982,11 @@ mod tests {
     fn refresh_due_time_waits_after_completion_with_backpressure() {
         let completed = chrono::DateTime::from_timestamp(1_000, 0).unwrap();
         assert_eq!(due_at(completed, 5, chrono::Duration::seconds(10)), completed + chrono::Duration::minutes(5));
-        assert_eq!(due_at(completed, 1, chrono::Duration::minutes(10)), completed + chrono::Duration::minutes(1));
+        assert_eq!(due_at(completed, 1, chrono::Duration::minutes(10)), completed + chrono::Duration::seconds(30));
         assert_eq!(due_at(completed, 0, chrono::Duration::seconds(10)), completed + chrono::Duration::seconds(30));
     }
 
     #[test]
-    #[ignore = "BUG: due_at's overrun arm `interval.max(chrono::Duration::seconds(30))` is a no-op for every supported refresh interval — 1|5|15|60 minutes are all >= 60s so max() equals interval and due is always `completed + interval`. run_duration is only read by that dead comparison, so a run that overruns its interval is rescheduled exactly like a short one (waiting another full interval on top of the overrun) and the 30-second floor the arm encodes (exercised only by the impossible interval=0 case) never applies."]
     fn refresh_due_time_applies_backpressure_when_a_run_overruns_its_interval() {
         let completed = chrono::DateTime::from_timestamp(1_000, 0).unwrap();
         // Overrun: a 30-minute run against a 5-minute interval has already blown the

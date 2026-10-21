@@ -235,7 +235,17 @@ impl Default for Book {
 }
 
 impl Book {
+    /// Drop corrupted duplicate-protection pins without discarding the user's alerts.
+    pub fn sanitize_fired_through(&mut self, now: i64) {
+        self.fired_through
+            .retain(|id, ts| self.alerts.iter().any(|a| a.id == *id) && *ts > 0 && *ts <= now.saturating_add(30));
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_at(chrono::Utc::now().timestamp())
+    }
+
+    pub fn validate_at(&self, now: i64) -> Result<(), String> {
         if !(1..=3).contains(&self.version)
             || self.next_id == 0
             || self.alerts.len() > MAX_ALERTS
@@ -249,10 +259,16 @@ impl Book {
             a.repeat.validate()?;
             if let Some(rule) = &a.rule {
                 rule.validate()?;
+                if matches!(rule, Rule::Condition { .. }) && !(a.level > 0.0 && a.level < 1.0) {
+                    return Err("Condition alert level must be strictly between 0 and 1".into());
+                }
             }
             if a.id == 0 || a.id >= self.next_id || !ids.insert(a.id) {
                 return Err("Invalid or duplicate price-alert ID".into());
             }
+        }
+        if self.fired_through.iter().any(|(id, ts)| !ids.contains(id) || *ts <= 0 || *ts > now.saturating_add(30)) {
+            return Err("Invalid price-alert duplicate-protection timestamp or ID".into());
         }
         if self.alerts.iter().map(|a| &a.symbol).collect::<HashSet<_>>().len() > MAX_SYMBOLS {
             return Err(format!("At most {MAX_SYMBOLS} distinct price-alert symbols"));
@@ -330,7 +346,8 @@ impl Book {
     }
 
     pub fn reset_symbol(&mut self, symbol: &str) {
-        self.previous.retain(|_, q| q.symbol != symbol);
+        self.previous
+            .retain(|id, _| !self.alerts.iter().any(|a| a.id == *id && a.symbol == symbol && a.rule.is_none()));
     }
 
     pub fn observe(&mut self, q: Observation, now: i64) -> Vec<Event> {
@@ -474,6 +491,7 @@ mod tests {
     #[test]
     fn condition_v3_book_roundtrip_and_legacy_books_load() {
         let mut b = book(Direction::Above);
+        b.edit(1, 0.5, Direction::Above).unwrap();
         b.set_rule(1, Some(condition(Some(crate::Timeframe::W1)))).unwrap();
         let json = serde_json::to_string(&b).unwrap();
         let restored: Book = serde_json::from_str(&json).unwrap();
@@ -617,7 +635,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: Book::reset_symbol (also reached from observe_target's invalid-quote path when target is None) drops `previous` for every alert on the symbol — including rule alerts — so one stale price quote wipes a Condition alert's 0/1 baseline and the next 0->1 crossing only re-seeds instead of firing."]
     fn invalid_price_quote_must_not_reset_rule_alert_baselines() {
         let mut b = book(Direction::Above);
         b.edit(1, 0.5, Direction::Above).unwrap();
@@ -632,7 +649,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: Book::validate never inspects the v3 `fired_through` map, so a crafted or corrupted book can pin an alert's fired_through to a far-future quote_ts (or foreign alert ids) and permanently suppress every crossing while the file still validates and loads."]
     fn validate_rejects_fired_through_pins_that_would_permanently_suppress_crossings() {
         let mut b = book(Direction::Above);
         b.set_repeat(1, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
@@ -644,7 +660,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: Rule::Condition evaluates to only 0.0 (NoMatch) or 1.0 (Match), but Book::validate never couples the alert level to that domain — a Condition rule with level 2.0 (or -1.0) is accepted and the editor's free-form price field will save one, producing an alert whose crosses() threshold can never be reached."]
     fn validate_rejects_condition_levels_outside_the_zero_one_domain() {
         let mut b = book(Direction::Above);
         b.edit(1, 2.0, Direction::Above).unwrap();
@@ -652,6 +667,51 @@ mod tests {
         assert!(b.validate().is_err(), "level 2.0 can never be crossed by a 0/1 condition value");
         b.edit(1, -1.0, Direction::Above).unwrap();
         assert!(b.validate().is_err(), "level -1.0 can never be crossed by a 0/1 condition value");
+    }
+
+    #[test]
+    fn fired_through_validation_and_sanitizing_preserve_valid_alerts() {
+        let mut b = book(Direction::Above);
+        let other = b.add("MSFT US Equity".into(), 100., Direction::Above, false).unwrap();
+        b.fired_through.insert(1, 1030);
+        b.validate_at(1000).unwrap();
+        b.fired_through.insert(other, 1031);
+        b.fired_through.insert(999, 1000);
+        assert!(b.validate_at(1000).is_err());
+        b.sanitize_fired_through(1000);
+        b.validate_at(1000).unwrap();
+        assert_eq!(b.alerts.len(), 2);
+        assert_eq!(b.fired_through, HashMap::from([(1, 1030)]));
+        b.fired_through.insert(999, 1000);
+        assert!(b.validate_at(1000).is_err());
+    }
+
+    #[test]
+    fn invalid_price_observation_resets_only_price_baselines() {
+        let mut b = book(Direction::Above);
+        let rule = b.add("AAPL US Equity".into(), 0.5, Direction::Above, false).unwrap();
+        b.set_rule(rule, Some(condition(None))).unwrap();
+        b.observe(quote(99., 1000), 1000);
+        b.observe_rule(rule, quote(0., 1000), 1000);
+        b.observe(quote(f64::NAN, 1001), 1001);
+        assert!(b.observe(quote(101., 1002), 1002).is_empty());
+        assert_eq!(b.observe_rule(rule, quote(1., 1002), 1002).len(), 1);
+        b.toggle(rule);
+        b.observe_rule(rule, quote(0., 1003), 1003);
+        b.observe_rule(rule, quote(f64::NAN, 1004), 1004);
+        assert!(b.observe_rule(rule, quote(1., 1005), 1005).is_empty());
+    }
+
+    #[test]
+    fn condition_level_domain_is_exclusive() {
+        let mut b = book(Direction::Above);
+        b.set_rule(1, Some(condition(None))).unwrap();
+        for level in [0.0, 1.0, -1.0, 2.0] {
+            b.alerts[0].level = level;
+            assert!(b.validate().is_err());
+        }
+        b.alerts[0].level = 0.5;
+        b.validate().unwrap();
     }
 
     #[test]

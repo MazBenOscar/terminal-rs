@@ -72,7 +72,11 @@ impl State {
         let loaded = match std::fs::read(&path) {
             Ok(bytes) if bytes.len() <= 4_194_304 => serde_json::from_slice::<Book>(&bytes)
                 .map_err(|e| format!("Reading price alerts: {e}"))
-                .and_then(|book| book.validate().map(|()| book)),
+                .and_then(|mut book| {
+                    let now = chrono::Utc::now().timestamp();
+                    book.sanitize_fired_through(now);
+                    book.validate_at(now).map(|()| book)
+                }),
             Ok(_) => Err("Price-alert file exceeds 4 MiB".into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Book::default()),
             Err(e) => Err(format!("Reading price alerts: {e}")),
@@ -511,13 +515,19 @@ impl State {
                         ui.label("Uses up to 1,500 provider bars, including the forming bar.");
                     }
                 }
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("price-alert-direction").selected_text(draft.direction.label()).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut draft.direction, Direction::Above, Direction::Above.label());
-                        ui.selectable_value(&mut draft.direction, Direction::Below, Direction::Below.label());
+                if matches!(draft.rule, Some(Rule::Condition { .. })) {
+                    draft.price = "0.5".into();
+                    draft.direction = Direction::Above;
+                    ui.label("Fires when the condition becomes true");
+                } else {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("price-alert-direction").selected_text(draft.direction.label()).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut draft.direction, Direction::Above, Direction::Above.label());
+                            ui.selectable_value(&mut draft.direction, Direction::Below, Direction::Below.label());
+                        });
+                        ui.add(egui::TextEdit::singleline(&mut draft.price).hint_text("Price").char_limit(30).desired_width(135.));
                     });
-                    ui.add(egui::TextEdit::singleline(&mut draft.price).hint_text("Price").char_limit(30).desired_width(135.));
-                });
+                }
                 ui.add_space(8.);
                 ui.label("Repeat");
                 ui.horizontal(|ui| {

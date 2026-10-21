@@ -2,26 +2,38 @@
 use std::process::{Command, Stdio};
 
 pub fn notification_command(title: &str, body: &str) -> Option<Command> {
+    let title = notification_text(title);
+    let body = notification_text(body);
     if cfg!(target_os = "macos") {
-        let mut command = Command::new("osascript");
-        command.args([
-            "-e",
-            "on run argv",
-            "-e",
-            "display notification (item 2 of argv) with title (item 1 of argv)",
-            "-e",
-            "end run",
-            title,
-            body,
-        ]);
-        Some(command)
+        Some(macos_notification_command(&title, &body))
     } else if cfg!(target_os = "linux") {
         let mut command = Command::new("notify-send");
-        command.args(["--", title, body]);
+        command.args(["--", &title, &body]);
         Some(command)
     } else {
         None
     }
+}
+
+fn notification_text(text: &str) -> String {
+    let mut chars = text.chars().filter(|c| !c.is_ascii_control());
+    let mut result: String = chars.by_ref().take(256).collect();
+    if chars.next().is_some() {
+        result.pop();
+        result.push('…');
+    }
+    result
+}
+
+// Kept platform-independent so security properties can be tested without executing osascript.
+fn macos_notification_command(title: &str, body: &str) -> Command {
+    let mut command = Command::new("osascript");
+    command.args([
+        "-e",
+        "display notification (system attribute \"TR_NOTIFY_BODY\") with title (system attribute \"TR_NOTIFY_TITLE\")",
+    ]);
+    command.env("TR_NOTIFY_TITLE", title).env("TR_NOTIFY_BODY", body);
+    command
 }
 
 pub fn sound_command() -> Option<Command> {
@@ -50,65 +62,55 @@ pub fn spawn(command: Option<Command>, alert_id: u64) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn notification_text_is_passed_as_raw_arguments() {
-        let title = "Alert: AAPL \" & do shell script \"bad";
-        let body = "Raw body\nwith 'quotes' and \\slashes";
-        let Some(command) = notification_command(title, body) else { return };
+    fn assert_macos_payload(command: &Command, title: &str, body: &str) {
         let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
-        assert_eq!(&args[args.len() - 2..], &[title, body]);
-        for script in &args[..args.len() - 2] {
-            assert!(!script.contains(title));
-            assert!(!script.contains(body));
-        }
-        if cfg!(target_os = "macos") {
-            assert_eq!(
-                &args[..6],
-                &[
-                    "-e",
-                    "on run argv",
-                    "-e",
-                    "display notification (item 2 of argv) with title (item 1 of argv)",
-                    "-e",
-                    "end run"
-                ]
-            );
-        } else {
-            assert_eq!(args[0], "--");
-        }
+        assert_eq!(
+            args,
+            [
+                "-e",
+                "display notification (system attribute \"TR_NOTIFY_BODY\") with title (system attribute \"TR_NOTIFY_TITLE\")"
+            ]
+        );
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(env[std::ffi::OsStr::new("TR_NOTIFY_TITLE")], Some(std::ffi::OsStr::new(title)));
+        assert_eq!(env[std::ffi::OsStr::new("TR_NOTIFY_BODY")], Some(std::ffi::OsStr::new(body)));
     }
 
     #[test]
-    #[ignore = "BUG: notification_command on macOS appends title/body after the -e script statements without a `--` end-of-options marker, so osascript's getopt re-parses any payload that starts with '-' as CLI options: `-h` prints usage (the notification never shows and stderr is Stdio::null so the failure is silent), `-l JavaScript` switches the language and the AppleScript fails to compile, and `-e <text>` injects another script statement (AppleScript accepts `use …`/comments as top-level). notify-send already passes `--`; macOS must do the same."]
     fn notification_payload_must_follow_end_of_options_marker() {
-        let title = "-e use scripting additions";
-        let body = "-h";
-        let Some(command) = notification_command(title, body) else { panic!("macOS must produce a command") };
-        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
-        let payload_at = args.len() - 2;
-        let separator = args[..payload_at].iter().position(|a| *a == "--");
-        assert_eq!(separator, Some(payload_at - 1), "title/body must sit after a bare `--`, got {args:?}");
-        assert_eq!(args[payload_at], title);
-        assert_eq!(args[payload_at + 1], body);
+        // Raw command construction preserves even newlines as data, never options or code.
+        for payload in
+            ["-e beep", "-h", "-l JavaScript", "line1\nline2", "\" & do shell script \"bad", "'quoted' \\slashes"]
+        {
+            assert_macos_payload(&macos_notification_command(payload, payload), payload, payload);
+            let Some(command) = notification_command(payload, payload) else { continue };
+            let cleaned = notification_text(payload);
+            if cfg!(target_os = "macos") {
+                assert_macos_payload(&command, &cleaned, &cleaned);
+            } else {
+                let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+                assert_eq!(args, ["--", &cleaned, &cleaned]);
+            }
+        }
     }
 
     #[test]
-    fn notification_and_sound_commands_keep_payload_intact_and_reapless() {
-        // Very long text is a single argv element; delivery failures must not panic.
-        let title = "T".repeat(16_384);
-        let body = "line1\nline2\ttabbed \"quoted\" 'single'".to_string();
-        let Some(command) = notification_command(&title, &body) else { return };
-        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
-        assert_eq!(args[args.len() - 2], title);
-        assert_eq!(args[args.len() - 1], body);
-        // Sound is a fixed path with no user-controlled arguments.
+    fn notification_text_is_bounded_and_strips_ascii_controls() {
+        assert_eq!(notification_text("a\0\n\r\t\u{7f}b"), "ab");
+        assert_eq!(notification_text(&"é".repeat(256)), "é".repeat(256));
+        let long = "é".repeat(257);
+        let capped = format!("{}…", "é".repeat(255));
+        assert_eq!(notification_text(&long), capped);
+        let Some(command) = notification_command(&long, &long) else { return };
+        if cfg!(target_os = "macos") {
+            assert_macos_payload(&command, &capped, &capped);
+        } else {
+            let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+            assert_eq!(args, ["--", &capped, &capped]);
+        }
         if let Some(sound) = sound_command() {
-            let sound_args: Vec<_> = sound.get_args().map(|a| a.to_str().unwrap()).collect();
-            assert!(sound_args.iter().all(|a| !a.contains(&title) && !a.contains(&body)));
-            if cfg!(target_os = "macos") {
-                assert_eq!(sound.get_program().to_str().unwrap(), "afplay");
-                assert_eq!(sound_args, vec!["/System/Library/Sounds/Glass.aiff"]);
-            }
+            assert_eq!(sound.get_program(), "afplay");
+            assert_eq!(sound.get_args().collect::<Vec<_>>(), ["/System/Library/Sounds/Glass.aiff"]);
         }
     }
 }
