@@ -6,9 +6,11 @@ into this repository. Screenshots were inspected in a scratch directory and are 
 
 ## Method
 
-All observations come from REA `capture_browser_scenario` runs against the public, logged-out
+The original observations come from REA `capture_browser_scenario` runs against the public, logged-out
 chart page `https://www.tradingview.com/chart/?symbol=NASDAQ%3AAAPL` in headless Chromium
 (1600x900, dark scheme, UTC, service workers blocked). No account, login or paid feature was used.
+The dated follow-up reports below describe their own viewport, target and runtime
+or static-analysis scope; their evidence is separate from these original runs.
 
 | Evidence ID | Scenario |
 |---|---|
@@ -26,6 +28,17 @@ Labels used in every note:
   which the scenario runner does not provide).
 
 ## Notes
+
+- [Quick tools and Auto/Log follow-up](toolbar-scale-followup.md) — 2026-10-21
+  REA website runtime tests of drawing favorites, reload, scale-state transitions
+  and indicator access; includes explicit account/interaction limits.
+
+- [TC2000 remaining gap backlog](tc2000-gap-backlog.md) — current implementation
+  priorities reconciled against `personal/main` at `cfee48c`, including decisions
+  on hold and parity/data limits.
+- [TradingView Desktop investigation](tradingview-desktop.md) — separate
+  2026-10-21 static REA inspection of the installed Windows application, its
+  chart-linking/layout/notification adapters, evidence ledger and coverage limits.
 
 - [TC2000 EasyScan](tc2000-easyscan.md) — separate static REA study of scan definitions,
   condition sets, snapshot/streaming query paths, and the scope of the independent Rust scanner.

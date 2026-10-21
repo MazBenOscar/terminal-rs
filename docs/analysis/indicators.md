@@ -1,5 +1,21 @@
 # Indicators
 
+## Quick access and automatic studies: 2026-10-21 follow-up
+
+The fresh REA capture confirms Add to favorites controls in indicator-result DOM
+and searchable built-in/community results. Favorite clicks timed out, so the
+favorites workflow, quick dropdown and persistence remain unverified. Clicking
+the built-in RSI result produced an account-access prompt in this logged-out
+session; successful attachment and output were not established.
+
+The picker lists Auto fib extension/retracement, Auto key levels (Beta), Auto
+pitchfork and Auto trendlines (Beta). These automatic-study labels are distinct
+from Auto price scaling. Their algorithms, parameters, confirmation/repainting
+rules and calculated results remain unknown. See I1–I3, failed probes and the
+independent Rust design proposals in the
+[focused toolbar/scale report](toolbar-scale-followup.md). The historical defaults
+and As built notes below are not a numerical parity certification.
+
 ## Observed (`ev_c8bc591b`)
 
 - The **Indicators** toolbar button opens a modal "Indicators, metrics, and strategies" with a search box

@@ -1,5 +1,21 @@
 # Chart interactions
 
+## Auto and Logarithmic: 2026-10-21 follow-up
+
+REA exercised the right-axis context menu: initial Auto + Regular changed to
+Auto + Logarithmic, then manual + Logarithmic, then Auto + Logarithmic again.
+Auto and the scale transform are independent. The menu describes Auto as fitting
+data to screen; Regular, Percent, Indexed to 100 and Logarithmic are scale choices.
+This is scale behavior, not an algorithmic signal-generation mode.
+
+The DOM also exposes A / Toggle auto scale and L / Toggle log scale controls in
+an area marked hidden. Hover reveal/direct button clicks, drag-to-manual behavior,
+per-pane persistence and exact numeric margins were not verified. See S1/S2 and
+the proposed independent Auto/Log controls in the
+[focused toolbar/scale report](toolbar-scale-followup.md). terminal-rs already
+has automatic/manual scaling and Log scale; the proposed gap is visible access
+and explicit state, not the absence of those calculations.
+
 ## Observed
 
 - **Chrome around the canvas** (`ev_5888cfc1`, accessibility tree): top toolbar (symbol button, interval

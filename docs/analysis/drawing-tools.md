@@ -1,5 +1,20 @@
 # Drawing tools
 
+## Quick drawing favorites: 2026-10-21 follow-up
+
+REA runtime observation now verifies adding Trendline to favorites from its tool
+menu, a separate floating favorites item, show/hide without clearing selection,
+same-profile reload persistence, and removal of the last favorite. The floating
+item is present in DOM but is not an accessible button, so the accessibility tree
+alone underreports this UI. Clicking the item completed; creating a finished
+drawing through it was not verified. Drag placement/reordering, custom presets
+and cross-device persistence remain unknown.
+
+For evidence IDs D1–D5, exact limits and terminal-rs acceptance criteria, see
+[the focused toolbar/scale report](toolbar-scale-followup.md). A configurable
+favorites strip is a proposed access improvement to the existing Rust drawing
+tools; the older MVP list below is historical, not the current tool inventory.
+
 ## Observed (`ev_16ea0e50`, `ev_5888cfc1` accessibility tree)
 
 Left toolbar groups (accessible names): Cursors (pressed by default), Trend tools, Gann and Fibonacci

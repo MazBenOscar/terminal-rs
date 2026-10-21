@@ -1,5 +1,8 @@
 # Chart audit delivery
 
+For the reconciled remaining backlog at `cfee48c`, including the macOS QA merge,
+evidence limits and decisions on hold, see [TC2000 gap backlog](analysis/tc2000-gap-backlog.md).
+
 The working baseline incorporates price alerts, comparison scale modes and expanded
 drawing tools through `03019b3`. The user requested continuing through the remaining
 priorities without pausing for review after each increment.
