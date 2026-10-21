@@ -37,7 +37,7 @@ confirmed absence of a TC2000-equivalent feature.
 
 | ID / priority | Classification | Remaining work and completion evidence |
 |---|---|---|
-| T01 / first | Implementation · **Done on `codex/chart-study-history`** | **Independent study histories.** Studies evaluate from fetched per-interval histories (`study::evaluate_with_histories` / `StudyHistories`), including lower-than-chart intervals, aligned to the last completed study value (NaN otherwise). On daily-and-above charts, visibility extends to the next loaded chart bar's start when later than the current bar's end, proving closure across weekends/holidays; without a successor, open periods stay hidden, and intraday charts are unchanged. Higher intervals without fetched history still aggregate chart bars (first partial bucket dropped); provider daily bars on intraday exchange-session charts map via noon UTC to that date's session close. The worker fetches each study interval's history with 300 warm-up bars, capped at 10,000, and caches up to 32 histories keyed by provider route + symbol + options + interval, with one in-flight fetch per key and live refresh at most once a minute. The Indicators editor lists every interval. Remaining limits: source/child chains must share one study interval; very long spans of low intervals are capped. Sparse-history, missing-bar, calendar and replay tests cover alignment. |
+| T01 / first | Implementation · **Done on `codex/chart-study-history`** | **Independent study histories.** Studies evaluate from fetched per-interval histories (`study::evaluate_with_histories` / `StudyHistories`), including lower-than-chart intervals, aligned to the last completed study value (NaN otherwise). On daily-and-above charts, a next loaded chart bar at or after the end of the current bar's own study period proves that period closed (across weekends and holidays) but never a later one, so gaps cannot leak future periods; without a successor, open periods stay hidden, and intraday charts are unchanged. Higher intervals without fetched history still aggregate chart bars (first partial bucket dropped); provider daily bars on intraday exchange-session charts map via noon UTC to that date's session close. The worker fetches each study interval's history with warm-up of 4× the longest study parameter (300–5,000 bars), capped at 10,000, and caches up to 32 histories keyed by provider route + symbol + options + interval, with one in-flight fetch per key and live refresh at most once a minute. The Indicators editor lists every interval. Remaining limits: source/child chains must share one study interval; very long spans of low intervals are capped. Sparse-history, missing-bar, calendar and replay tests cover alignment. |
 | T02 / first | Unverified parity, plus bounded implementation gaps | **Formula and indicator compatibility.** Expand the documented PCF subset deliberately; do not promise unrestricted TC2000 syntax. Use matched attributed TC2000 OHLCV/output exports for initialization, offsets, units, zero/flat data, missing bars and parameter combinations. A reference-fixture harness already exists in `indicators/parity.rs`; acquiring and validating real fixtures is pending, not creating the harness. Worden BOP/TSV and other proprietary mappings remain unverified despite matching names. Recheck historical inventory findings against today's code before changing formulas. |
 | T03 / next foundation | Implementation gap | **Reusable condition definitions.** Introduce one versioned condition model reusable by scans, chart plots, alerts and columns, with nested ALL/ANY groups, per-condition timeframes/explicit overrides and bounded PCF predicates in the scanner. Current scanner has a flat condition list, a shared timeframe and typed operands; PCF chart/alert support and scan-to-PCF translation do not make PCF a general scanner operand. Preserve history requirements, eligibility/error reasons, source/missing-data policy and one calculation meaning across consumers. |
 | T04 / next workflow | Implementation gap | **Custom watchlist columns and ranking.** Persist formula-value columns and condition checkmarks, sort/filter by evaluated results and save column sets. Current watchlist quote columns and scanner result tables are not a general reusable formula-column/ranking system. Define explicit stale/unavailable states and bounded shared computations. TC2000 watchlist/condition-column static evidence is in EasyScan ref W; exact runtime editing/ranking behavior still needs observation. |
@@ -104,12 +104,36 @@ scan-plot replacement, anchor containment, stream auth backoff, calendar boundar
 DST checks, event-fetch throttling and replay/menu/legend controls. This is the
 current baseline, not work to repeat from the older stacked feature branches.
 
+## Delivery status at `d2671cd`
+
+`personal/main` at `d2671cd` delivers T01 (with lookback-sized warm-up of 4×
+the longest study parameter, 300–5,000 bars, and no leakage across chart gaps),
+T03 (versioned condition trees, nested editor, condition alerts), T04 (formula
+and condition watchlist columns, sorting, column editor and named sets), T05
+(scheduled scan refresh, new/dropped matches, streamed partial results), T06
+(repeat with cooldown, v3 alert book, optional sound and desktop notification
+while the app runs) and the full-chart PNG part of T08. Layout files are treated
+as untrusted input. Independent reviews found and fixed five defects; live-app QA
+found and fixed five more. T02, T07, T09, cross-study fills and app-closed alert
+monitoring remain open.
+
+In progress: drawing favorites strip and explicit Auto/Log controls
+(`codex/chart-quick-tools`), backfill after live-stream reconnects
+(`codex/alpaca-backfill`), and adversarial reviews of T04–T06/T08.
+
+## User-reported QA backlog
+
+| ID | Classification | Work and acceptance |
+|---|---|---|
+| Q01 | Usability defect | **Chart template save looks broken.** In Indicators → Chart templates, "Save current" stays disabled until a name is typed, but the name field renders like a muted label, so users read the button as permanently greyed out. Give the field a visible input frame, prefill a suggested name (e.g. `<symbol> <interval> studies`), explain the disabled state on hover ("Enter a template name"), and confirm the save in the status bar. Test: with studies on a chart, the default state can save in one click. |
+| Q02 | Implementation gap, product choice | **Save scan results as a watchlist.** Finished scan results have no way to reach the watchlist; the app has a single watchlist (`WL ADD`). First increment: result-table actions "Add matches to watchlist" (deduplicated, respecting the watchlist cap) and "Replace watchlist with matches" with an undo toast, plus a per-row context-menu add. Larger option needing a product decision: named watchlists (create, switch, rename, delete; a scan result saved as a new named list). Test: matches only, unavailable rows excluded, order preserved, persistence with the layout. |
+
 ## Implementation sequence and branch policy
 
-Start with `codex/chart-study-history`, then `codex/shared-conditions`, based on
-the latest `personal/main`; these are proposed branch names, not branches created
-by this document. Follow with columns/ranking and automated scanning/alert policy.
-Keep data validation/fixtures moving alongside the code. Merge `personal/main`
-into an older feature branch before continuing it; merge rather than rebase.
-Keep upstream `master` separate. No full parity milestone is complete until its
-behavior and numeric reference evidence are supplied and pass documented checks.
+Next: Q01 and the first Q02 increment, alongside the in-progress quick tools and
+backfill work. Base new work on the latest `personal/main`; these branch names
+are proposals until created. Keep data validation/fixtures moving alongside the
+code. Merge `personal/main` into an older feature branch before continuing it;
+merge rather than rebase. Keep upstream `master` separate. No full parity
+milestone is complete until its behavior and numeric reference evidence are
+supplied and pass documented checks.
