@@ -587,7 +587,31 @@ impl TerminalApp {
         section(ui, "Alerts");
         let sound = ui.checkbox(&mut self.prefs.alert_sound, "Alert sound").changed();
         let notification = ui.checkbox(&mut self.prefs.desktop_notification, "Desktop notification").changed();
-        ui.label(RichText::new("Alerts are checked only while terminal-rs is running.").color(muted()));
+        let id = egui::Id::new("alert-daemon-install-error");
+        let mut enabled = tr_alerts::launch::installed();
+        if ui
+            .add_enabled(
+                cfg!(target_os = "macos"),
+                egui::Checkbox::new(&mut enabled, "Keep checking alerts when Terminal is closed"),
+            )
+            .changed()
+        {
+            let error = tr_alerts::launch::set_enabled(enabled).err();
+            ui.ctx().data_mut(|data| data.insert_temp(id, error));
+        }
+        if cfg!(target_os = "macos") {
+            let error = ui.ctx().data(|data| data.get_temp::<Option<String>>(id)).flatten();
+            let status = if let Some(error) = error {
+                format!("Error {error}")
+            } else if tr_alerts::launch::installed() {
+                "Installed".into()
+            } else {
+                "Not installed".into()
+            };
+            ui.label(RichText::new(status).color(muted()));
+        } else {
+            ui.label(RichText::new("Available on macOS").color(muted()));
+        }
         if sound || notification {
             cmds.push(SettingsCmd::SavePrefs);
         }

@@ -18,6 +18,7 @@ sparkle=$(scripts/fetch-sparkle.sh)
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$app/Contents/Frameworks"
 cp "$bin" "$app/Contents/MacOS/Terminal"
+cp "$(dirname "$bin")/terminal-rs-alertd" "$app/Contents/MacOS/terminal-rs-alertd"
 cp app/assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 # The app isn't sandboxed, so Sparkle's XPC services aren't needed; headers and modules are
 # build-time only.

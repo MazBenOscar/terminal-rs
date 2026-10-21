@@ -69,18 +69,7 @@ pub struct State {
 
 impl State {
     pub fn load(path: PathBuf, simulated: bool) -> Self {
-        let loaded = match std::fs::read(&path) {
-            Ok(bytes) if bytes.len() <= 4_194_304 => serde_json::from_slice::<Book>(&bytes)
-                .map_err(|e| format!("Reading price alerts: {e}"))
-                .and_then(|mut book| {
-                    let now = chrono::Utc::now().timestamp();
-                    book.sanitize_fired_through(now);
-                    book.validate_at(now).map(|()| book)
-                }),
-            Ok(_) => Err("Price-alert file exceeds 4 MiB".into()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Book::default()),
-            Err(e) => Err(format!("Reading price alerts: {e}")),
-        };
+        let loaded = tr_alerts::storage::load(&path);
         let (book, load_error) = match loaded {
             Ok(book) => (book, None),
             Err(e) => (Book::default(), Some(e)),
@@ -125,13 +114,7 @@ impl State {
         }
         self.last_save = Some(Instant::now());
         self.book.version = 3;
-        let result = self.book.validate().and_then(|()| {
-            let bytes = serde_json::to_vec_pretty(&self.book).map_err(|e| e.to_string())?;
-            if let Some(parent) = self.path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            crate::layouts::write_atomic(&self.path, &bytes).map_err(|e| e.to_string())
-        });
+        let result = tr_alerts::storage::save(&self.path, &self.book);
         match result {
             Ok(()) => {
                 self.dirty = false;
@@ -209,13 +192,13 @@ impl State {
         let now = chrono::Utc::now().timestamp();
         let mut events = Vec::new();
         for (symbol, result) in observations {
+            events.extend(tr_alerts::merge_price(&mut self.book, &symbol, result.clone(), self.simulated, now));
             match result {
                 Ok(q) if q.symbol == symbol && q.simulated == self.simulated && q.valid_at(now) => {
                     self.monitor.insert(
                         symbol.clone(),
                         format!("{} · data {}", display_price(&symbol, q.price), timestamp(q.ts)),
                     );
-                    events.extend(self.book.observe(q, now));
                 }
                 result => {
                     let error = match result {
@@ -224,7 +207,6 @@ impl State {
                         Ok(_) => "Waiting · stale or invalid price data".into(),
                     };
                     self.monitor.insert(symbol.clone(), error);
-                    self.book.reset_symbol(&symbol);
                 }
             }
         }
@@ -245,18 +227,17 @@ impl State {
         let now = chrono::Utc::now().timestamp();
         let mut events = Vec::new();
         for (id, result) in observations {
+            events.extend(tr_alerts::merge_rule(&mut self.book, id, result.clone(), self.simulated, now));
             let key = format!("rule:{id}");
             match result {
                 Ok(q) if q.simulated == self.simulated && q.valid_at(now) => {
                     self.monitor.insert(key, format!("Value {:.4} · {}", q.price, timestamp(q.ts)));
-                    events.extend(self.book.observe_rule(id, q, now));
                 }
                 result => {
                     self.monitor.insert(
                         key,
                         format!("Waiting · {}", result.err().unwrap_or("Invalid or mismatched data".into())),
                     );
-                    self.book.reset_rule(id);
                 }
             }
         }
@@ -378,7 +359,7 @@ impl State {
         });
         ui.label(
             RichText::new(if self.simulated {
-                "Sample mode · simulated alerts only · app must stay running"
+                "Sample mode · simulated alerts only"
             } else {
                 "Polls about every 15 seconds while app runs · prices may be delayed"
             })
