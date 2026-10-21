@@ -8,6 +8,7 @@ pub mod options;
 pub mod sample;
 pub mod scanner;
 pub mod security;
+pub mod session;
 pub mod timeframe;
 
 pub use bar::{Bar, Series};

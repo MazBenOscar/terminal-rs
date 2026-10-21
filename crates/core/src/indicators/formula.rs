@@ -128,7 +128,7 @@ pub fn compute(spec: &Spec, input: &Input<'_>) -> Result<Vec<Output>, String> {
     if f.rsi_method == RsiMethod::Wilder && f.rsi_smoothing != 1 {
         return Err("Use a child moving average to smooth Wilder RSI".into());
     }
-    if *f == defaults {
+    if *f == defaults && spec.code != "PCF" {
         return Ok(spec.compute(input));
     }
     let mut outputs = spec.compute(input);
@@ -136,6 +136,10 @@ pub fn compute(spec: &Spec, input: &Input<'_>) -> Result<Vec<Output>, String> {
     let values = &input.d.close;
     let n = params.first().copied().unwrap_or(1.) as usize;
     match spec.code.as_str() {
+        "PCF" => {
+            let expression = spec.chart.as_ref().and_then(|c| c.expression.as_deref()).unwrap_or("C");
+            outputs[0].values = super::pcf::evaluate(expression, input)?;
+        }
         "RSI" => {
             let result = match f.rsi_method {
                 RsiMethod::Wilder => rsi(values, n),

@@ -104,11 +104,26 @@ pub struct Input<'a> {
     pub bars: &'a [Bar],
     pub tf: Timeframe,
     pub d: Ohlcv,
+    pub session: crate::session::Session,
 }
 
 impl<'a> Input<'a> {
     pub fn new(bars: &'a [Bar], tf: Timeframe) -> Self {
-        Input { bars, tf, d: Ohlcv::new(bars) }
+        Input { bars, tf, d: Ohlcv::new(bars), session: crate::session::Session::Provider }
+    }
+
+    pub fn with_session(mut self, session: crate::session::Session) -> Self {
+        self.session = session;
+        self
+    }
+
+    fn session_key(&self, ts: i64) -> i64 {
+        let ts = if self.session != crate::session::Session::Provider && self.tf.is_intraday() {
+            crate::session::Zone::NewYork.local(ts).and_utc().timestamp()
+        } else {
+            ts
+        };
+        session_key(self.tf)(ts)
     }
 
     fn c(&self) -> &[f64] {
@@ -421,7 +436,7 @@ fn trail(t: Trail, plot: Plot) -> Vec<Output> {
 }
 
 fn pivot_levels(i: &Input<'_>, kind: PivotKind) -> Vec<Output> {
-    pivots(&i.d, session_key(i.tf), kind)
+    pivots(&i.d, |ts| i.session_key(ts), kind)
         .into_iter()
         .map(|(name, v)| {
             let tone = match name.as_bytes()[0] {
@@ -590,7 +605,7 @@ fn catalog() -> Vec<Def> {
         .int("Length", 21.0, 3.0, MAX_LENGTH)
         .n("Smoothing", 3.0)
         .real("StdErr", 2.0, 0.1, 10.0),
-        overlay("VWAPB", "VWAP Bands", bnd, |i, p| bands(vwap_bands(&i.d, session_key(i.tf), p[0]), "VWAP"))
+        overlay("VWAPB", "VWAP Bands", bnd, |i, p| bands(vwap_bands(&i.d, |ts| i.session_key(ts), p[0]), "VWAP"))
             .alias(&["VWAPBANDS"])
             .real("StdDev", 1.0, 0.1, 10.0),
         // Momentum.
@@ -1058,7 +1073,9 @@ fn catalog() -> Vec<Def> {
         .int("KC Length", 20.0, 2.0, MAX_LENGTH)
         .real("KC Multiplier", 1.5, 0.1, 10.0),
         // Volume.
-        overlay("VWAP", "Volume-Weighted Average Price", vlm, |i, _| one("VWAP", vwap_by(i.bars, session_key(i.tf)))),
+        overlay("VWAP", "Volume-Weighted Average Price", vlm, |i, _| {
+            one("VWAP", vwap_by(i.bars, |ts| i.session_key(ts)))
+        }),
         pane("OBV", "On-Balance Volume", vlm, |i, _| one("OBV", obv(&i.d))),
         pane("AD", "Accumulation/Distribution", vlm, |i, _| one("A/D", adl(&i.d))).alias(&["ADL", "ACCDIST"]),
         pane("CMF", "Chaikin Money Flow", vlm, |i, p| one("CMF", cmf(&i.d, n(p, 0)))).n("Length", 20.0).levels(&[0.0]),
@@ -1130,6 +1147,7 @@ fn catalog() -> Vec<Def> {
             .n("Length", 13.0)
             .levels(&[0.0]),
         // Statistics.
+        pane("PCF", "Custom formula (PCF subset)", sta, |i, _| one("Formula", i.c().to_vec())).multi(),
         pane("STDEV", "Standard Deviation", sta, |i, p| one("StdDev", stdev(i.c(), n(p, 0))))
             .alias(&["SD", "STD"])
             .n("Length", 20.0),

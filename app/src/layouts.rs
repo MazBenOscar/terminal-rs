@@ -17,7 +17,7 @@ use crate::congress_view::FeedFilter;
 use crate::dock::{Node, PaneId};
 use crate::layout::Layout;
 
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Colour link groups: panes in the same group follow one security.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -70,6 +70,10 @@ pub enum PaneSettings {
         show_congress: bool,
         #[serde(default)]
         magnet: bool,
+        #[serde(default)]
+        navigation: crate::chart_navigation::Navigation,
+        #[serde(default)]
+        data: crate::chart_data::ChartData,
     },
     /// Congress feed with its filter (`None` = unfiltered).
     Feed(Option<FeedSettings>),
@@ -290,6 +294,8 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         show_volume: d.show_volume,
         show_congress: d.congress_markers,
         magnet: false,
+        navigation: Default::default(),
+        data: Default::default(),
     }
 }
 

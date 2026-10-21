@@ -119,6 +119,7 @@ pub enum Request {
         limit: usize,
     },
     Indicators {
+        revision: u64,
         pane: PaneId,
         generation: u64,
         bars: Arc<Vec<Bar>>,
@@ -126,6 +127,7 @@ pub enum Request {
         specs: Vec<IndicatorSpec>,
         /// Colours are baked into overlays, so the UI passes its current palette.
         palette: theme::Palette,
+        session: tr_core::session::Session,
     },
     Compare {
         pane: PaneId,
@@ -229,6 +231,10 @@ pub struct BuiltIndicator {
     pub spec: IndicatorSpec,
     pub overlays: Vec<(String, Overlay)>,
     pub error: Option<String>,
+    pub fill: Option<crate::chart_fill::Fill>,
+    pub ports: Vec<String>,
+    /// Transparent geometry keeps hidden band boundaries in autoscale without a legend entry.
+    pub bounds: Vec<Overlay>,
 }
 
 pub struct Profile {
@@ -295,6 +301,7 @@ pub enum Response {
         error: String,
     },
     Indicators {
+        revision: u64,
         pane: PaneId,
         generation: u64,
         built: Vec<BuiltIndicator>,
@@ -470,20 +477,31 @@ async fn congress_refresh(s: &Shared) {
 
 fn overlay(values: &[f64], color: egui::Color32, kind: LineKind) -> Overlay {
     let line = if kind == LineKind::Dots { marker_ref(values) } else { line_ref(values) };
-    Overlay { line, color: theme::rgba(color), kind, scale: 1.0 }
+    Overlay { line, color: theme::rgba(color), kind, scale: 1.0, width: 1.3, histogram_color: None }
 }
 
 /// Compute every indicator on `bars`. The `i`-th indicator takes the `i`-th series colour;
 /// its signal lines, outer bands and up/down lines take theme roles.
+#[cfg(test)]
 pub fn build_indicators(
     bars: &[Bar],
     tf: Timeframe,
     specs: &[IndicatorSpec],
     palette: &theme::Palette,
 ) -> Vec<BuiltIndicator> {
+    build_indicators_session(bars, tf, specs, palette, tr_core::session::Session::Provider)
+}
+
+fn build_indicators_session(
+    bars: &[Bar],
+    tf: Timeframe,
+    specs: &[IndicatorSpec],
+    palette: &theme::Palette,
+    session: tr_core::session::Session,
+) -> Vec<BuiltIndicator> {
     let input = Input::new(bars, tf);
     let colors = palette.series.len();
-    let calculated = tr_core::indicators::study::evaluate(specs, &input);
+    let calculated = tr_core::indicators::study::evaluate_with_session(specs, &input, session);
     specs
         .iter()
         .zip(calculated)
@@ -497,11 +515,42 @@ pub fn build_indicators(
                 .map_or(palette.series[i % colors], |[r, g, b]| egui::Color32::from_rgb(r, g, b));
             let error = result.as_ref().err().cloned();
             let mut outputs = result.unwrap_or_default();
+            let ports = outputs.iter().map(|o| o.name.to_string()).collect();
+            let fill = spec.chart.as_ref().and_then(|c| crate::chart_fill::Fill::build(c, &outputs));
+            let bounds = outputs
+                .iter()
+                .filter(|o| {
+                    spec.chart.as_ref().is_some_and(|c| {
+                        c.fill.as_ref().is_some_and(|fill| o.name == fill.upper || o.name == fill.lower)
+                            && c.outputs.get(o.name).is_some_and(|style| !style.visible)
+                    })
+                })
+                .map(|o| {
+                    overlay(
+                        &tr_core::indicators::formula::display_values(
+                            &o.values,
+                            spec.chart.as_ref().map_or(0, |c| c.displacement),
+                        ),
+                        egui::Color32::TRANSPARENT,
+                        LineKind::Line,
+                    )
+                })
+                .collect();
             // Columns first, so lines and markers draw over them.
-            outputs.sort_by_key(|o| o.plot != Plot::Hist);
+            outputs.sort_by_key(|o| {
+                let custom = spec.chart.as_ref().and_then(|c| c.outputs.get(o.name));
+                !custom
+                    .and_then(|c| c.plot)
+                    .map_or(o.plot == Plot::Hist, |p| p == tr_core::indicators::study::PlotStyle::Histogram)
+            });
             let overlays = outputs
                 .into_iter()
-                .map(|o| {
+                .filter_map(|o| {
+                    use tr_core::indicators::study::PlotStyle;
+                    let custom = spec.chart.as_ref().and_then(|c| c.outputs.get(o.name));
+                    if custom.is_some_and(|c| !c.visible) {
+                        return None;
+                    }
                     let color = match o.tone {
                         Tone::Main => main,
                         Tone::Signal if main == palette.amber => palette.cyan,
@@ -511,20 +560,31 @@ pub fn build_indicators(
                         Tone::Down => palette.down,
                         Tone::Series(k) => palette.series[(i + 1 + k as usize) % colors],
                     };
-                    let kind = match o.plot {
-                        Plot::Line => LineKind::Line,
-                        Plot::Hist => LineKind::Hist,
-                        Plot::Dots => LineKind::Dots,
-                        Plot::Steps => LineKind::Steps,
+                    let color =
+                        custom.and_then(|c| c.color).map_or(color, |[r, g, b]| egui::Color32::from_rgb(r, g, b));
+                    let kind = match custom.and_then(|c| c.plot) {
+                        Some(PlotStyle::Line) => LineKind::Line,
+                        Some(PlotStyle::Dots) => LineKind::Dots,
+                        Some(PlotStyle::Steps) => LineKind::Steps,
+                        Some(PlotStyle::Histogram) => LineKind::Hist,
+                        None => match o.plot {
+                            Plot::Line => LineKind::Line,
+                            Plot::Hist => LineKind::Hist,
+                            Plot::Dots => LineKind::Dots,
+                            Plot::Steps => LineKind::Steps,
+                        },
                     };
                     let values = tr_core::indicators::formula::display_values(
                         &o.values,
                         spec.chart.as_ref().map_or(0, |c| c.displacement),
                     );
-                    (o.name.to_string(), overlay(&values, color, kind))
+                    let mut overlay = overlay(&values, color, kind);
+                    overlay.width = custom.map_or(1.3, |c| c.width);
+                    overlay.histogram_color = custom.and_then(|c| c.color).map(|_| theme::rgba(color));
+                    Some((o.name.to_string(), overlay))
                 })
                 .collect();
-            BuiltIndicator { spec: spec.clone(), overlays, error }
+            BuiltIndicator { spec: spec.clone(), overlays, error, fill, ports, bounds }
         })
         .collect()
 }
@@ -590,12 +650,24 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::Scan { pane, generation, rows });
         }
         Request::History { pane, generation, symbol, tf, limit } => {
+            let refreshing = current_series(s, pane, generation).is_some_and(|bars| !bars.is_empty());
             let source = chart_cache_key(s.provider.as_ref(), &symbol);
             if !claim_series(s, pane, generation, &source) {
+                if current_series(s, pane, generation).is_some() {
+                    s.send(Response::HistoryError {
+                        pane,
+                        generation,
+                        error: "Data route changed; reload the chart".into(),
+                    });
+                }
                 return; // a newer load for this pane is already running
             }
             // Paint from the disk cache immediately, then refresh from the network.
-            let cached = s.cache.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.load(&source, tf, limit).ok()));
+            let cached = if refreshing {
+                None
+            } else {
+                s.cache.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.load(&source, tf, limit).ok()))
+            };
             if let Some(bars) = cached.filter(|b| !b.is_empty()) {
                 let bars = Arc::new(bars);
                 let gpu = build_gpu(bars.clone()).await;
@@ -645,7 +717,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         exhausted,
                         live: false,
                     });
-                    start_live(s.clone(), pane, generation, symbol, tf);
+                    if !refreshing {
+                        start_live(s.clone(), pane, generation, symbol, tf);
+                    }
                 }
                 Ok(_) => s.send(Response::HistoryError { pane, generation, error: format!("no data for {symbol}") }),
                 Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
@@ -709,11 +783,12 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
             }
         }
-        Request::Indicators { pane, generation, bars, tf, specs, palette } => {
-            let built = tokio::task::spawn_blocking(move || build_indicators(&bars, tf, &specs, &palette))
-                .await
-                .unwrap_or_default();
-            s.send(Response::Indicators { pane, generation, built });
+        Request::Indicators { pane, generation, bars, tf, specs, palette, session, revision } => {
+            let built =
+                tokio::task::spawn_blocking(move || build_indicators_session(&bars, tf, &specs, &palette, session))
+                    .await
+                    .unwrap_or_default();
+            s.send(Response::Indicators { pane, generation, built, revision });
         }
         Request::Compare { pane, generation, symbol, tf, base } => {
             let limit = base.len().max(100);
@@ -1180,6 +1255,95 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_band_outlines_still_contribute_to_fill_autoscale() {
+        use tr_core::indicators::study::{self, BandFill, OutputStyle};
+        let bars: Vec<_> = (0..30)
+            .map(|i| {
+                let c = if i % 2 == 0 { 1. } else { 10. };
+                Bar::new(i * 86400, c, c, c, c, 1.)
+            })
+            .collect();
+        let mut specs = vec![IndicatorSpec::new("BB", &[3., 2.]).unwrap()];
+        study::assign_ids(&mut specs);
+        let settings = specs[0].chart.as_mut().unwrap();
+        settings.fill = Some(BandFill { upper: "Upper".into(), lower: "Lower".into(), color: [1, 2, 3], opacity: 30 });
+        for port in ["Upper", "Basis", "Lower"] {
+            settings.outputs.insert(port.into(), OutputStyle { visible: false, ..Default::default() });
+        }
+        let built = build_indicators(&bars, Timeframe::D1, &specs, &theme::palette());
+        assert!(built[0].overlays.is_empty());
+        assert_eq!(built[0].bounds.len(), 2);
+        let pane = tr_chart::scene::sub_pane(
+            &built[0].bounds,
+            &tr_chart::viewport::Viewport::fit_last(30, 20, 600.),
+            200.,
+            None,
+            tr_chart::gpu::Style::default(),
+        );
+        assert!(pane.scale.lo < -4. && pane.scale.hi > 12.);
+    }
+
+    #[test]
+    fn automatic_refresh_reports_a_changed_route_instead_of_staying_loading() {
+        let (out, rx) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)),
+            series: Default::default(),
+            cache: std::sync::Mutex::new(None),
+            scan_store: std::sync::Mutex::new(None),
+            db: Mutex::new(Db::open_in_memory().unwrap()),
+            out,
+            ctx: egui::Context::default(),
+        });
+        assert!(claim_series(&shared, 1, 2, "previous-provider"));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(handle(
+            &shared,
+            Request::History { pane: 1, generation: 2, symbol: "AAPL US Equity".into(), tf: Timeframe::D1, limit: 100 },
+        ));
+        assert!(
+            matches!(rx.try_recv().unwrap(),Response::HistoryError {generation:2,error,..} if error.contains("route changed"))
+        );
+    }
+
+    #[test]
+    fn output_styles_preserve_hidden_sources_and_reach_gpu_uniforms() {
+        use tr_core::indicators::study::{self, OutputStyle, Source};
+        let bars = tr_core::sample::generate("AAPL", Timeframe::D1, 300, 1_790_000_000);
+        let mut specs = vec![IndicatorSpec::new("MACD", &[]).unwrap(), IndicatorSpec::new("EMA", &[3.]).unwrap()];
+        study::assign_ids(&mut specs);
+        specs[0]
+            .chart
+            .as_mut()
+            .unwrap()
+            .outputs
+            .insert("Signal".into(), OutputStyle { visible: false, ..Default::default() });
+        specs[0]
+            .chart
+            .as_mut()
+            .unwrap()
+            .outputs
+            .insert("Histogram".into(), OutputStyle { color: Some([255, 0, 0]), width: 3., ..Default::default() });
+        specs[1].chart.as_mut().unwrap().source = Source::Output { study: 1, output: "Signal".into() };
+        let built = build_indicators(&bars, Timeframe::D1, &specs, &theme::palette());
+        assert!(built[0].ports.contains(&"Signal".into()));
+        assert!(!built[0].overlays.iter().any(|(name, _)| name == "Signal"));
+        assert!(built[1].error.is_none());
+        let hist = &built[0].overlays.iter().find(|(name, _)| name == "Histogram").unwrap().1;
+        assert_eq!(hist.width, 3.);
+        let out = tr_chart::scene::sub_pane(
+            std::slice::from_ref(hist),
+            &tr_chart::viewport::Viewport::fit_last(300, 100, 800.),
+            200.,
+            None,
+            tr_chart::gpu::Style::default(),
+        );
+        let tr_chart::gpu::DrawCmd::Line { uniforms, .. } = &out.cmds[0] else { panic!("Expected histogram") };
+        assert_eq!(uniforms.up, [1., 0., 0., 1.]);
+        assert_eq!(uniforms.down, [1., 0., 0., 1.]);
+    }
 
     #[test]
     fn chart_cache_does_not_reuse_legacy_or_other_provider_history() {

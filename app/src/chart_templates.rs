@@ -20,6 +20,8 @@ pub struct Template {
     pub chart_type: ChartType,
     pub log: bool,
     pub show_volume: bool,
+    #[serde(default)]
+    pub data: crate::chart_data::ChartData,
 }
 
 fn path(dir: &Path, name: &str) -> Result<PathBuf, String> {
@@ -59,7 +61,7 @@ pub fn names(dir: &Path) -> Result<Vec<String>, String> {
 
 impl Template {
     pub fn validate(&mut self) -> Result<(), String> {
-        if self.version != 1 {
+        if !matches!(self.version, 1 | 2) {
             return Err("This chart-template version is not supported".into());
         }
         if self.indicators.len() > 128 {
@@ -67,7 +69,11 @@ impl Template {
         }
         study::assign_ids(&mut self.indicators);
         let input = Input::new(&[], Timeframe::D1);
-        for result in study::evaluate(&self.indicators, &input) {
+        let mut validation = self.indicators.clone();
+        for settings in validation.iter_mut().filter_map(|s| s.chart.as_mut()) {
+            settings.timeframe = None;
+        }
+        for result in study::evaluate(&validation, &input) {
             result.map_err(|e| format!("Invalid template: {e}"))?;
         }
         Ok(())
@@ -87,6 +93,7 @@ impl Template {
     pub fn save(&mut self, dir: &Path) -> Result<(), String> {
         let destination = path(dir, &self.name)?;
         self.validate()?;
+        self.version = 2;
         // Preserve corrupt or unsupported files instead of silently replacing them.
         if destination.exists() {
             Self::load(dir, &self.name)?;
@@ -145,6 +152,7 @@ mod tests {
             chart_type: ChartType::Candles,
             log: false,
             show_volume: true,
+            data: Default::default(),
         }
     }
     #[test]

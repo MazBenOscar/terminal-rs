@@ -31,6 +31,8 @@ fn renders_candles_volume_lines_and_hist() {
         color: [0.0, 0.6, 1.0, 1.0],
         kind: LineKind::Line,
         scale: 1.0,
+        width: 1.3,
+        histogram_color: None,
     }];
     let v = Viewport::fit_last(bars.len(), 150, 800.0);
     for ct in ChartType::ALL {
@@ -66,7 +68,14 @@ fn renders_candles_volume_lines_and_hist() {
 
     // MACD histogram in a sub-pane.
     let m = indicators::macd(&closes, 12, 26, 9);
-    let hist = [Overlay { line: line_ref(&m.histogram), color: [1.0; 4], kind: LineKind::Hist, scale: 1.0 }];
+    let hist = [Overlay {
+        line: line_ref(&m.histogram),
+        color: [1.0; 4],
+        kind: LineKind::Hist,
+        scale: 1.0,
+        width: 1.3,
+        histogram_color: None,
+    }];
     let out = sub_pane(&hist, &v, 400.0, None, Style::default());
     h.render(&mut [Frame { pane: 2, frame_no: 0, cmds: out.cmds }]);
     let px = h.read_pixels();
@@ -89,12 +98,16 @@ fn reveal_sweeps_in_from_the_left_and_fades() {
             color: [0.0, 0.6, 1.0, 1.0],
             kind: LineKind::Line,
             scale: 1.0,
+            width: 1.3,
+            histogram_color: None,
         },
         Overlay {
             line: line_ref(&indicators::ema(&closes, 50)),
             color: [1.0, 0.3, 0.3, 1.0],
             kind: LineKind::Dots,
             scale: 1.0,
+            width: 1.3,
+            histogram_color: None,
         },
     ];
     let v = Viewport::fit_last(bars.len(), 150, 800.0);
@@ -151,7 +164,8 @@ fn steps_draw_short_sessions_without_joining_them() {
     levels.push(50.0);
     let v = Viewport::fit_last(levels.len(), levels.len(), 800.0);
     let mut draw = |kind: LineKind, pane: u64| {
-        let o = [Overlay { line: line_ref(&levels), color: [1.0; 4], kind, scale: 1.0 }];
+        let o =
+            [Overlay { line: line_ref(&levels), color: [1.0; 4], kind, scale: 1.0, width: 1.3, histogram_color: None }];
         let out = sub_pane(&o, &v, 400.0, Some((0.0, 100.0)), Style::default());
         h.render(&mut [Frame { pane, frame_no: pane, cmds: out.cmds }]);
         h.read_pixels()
@@ -184,7 +198,14 @@ fn zoomed_out_steps_stay_inside_their_group() {
     let mut levels = vec![25.0; 400];
     levels.push(75.0);
     let v = Viewport { right: 410.0, bar_px: 1.0, width_px: 800.0 };
-    let o = [Overlay { line: line_ref(&levels), color: [1.0; 4], kind: LineKind::Steps, scale: 1.0 }];
+    let o = [Overlay {
+        line: line_ref(&levels),
+        color: [1.0; 4],
+        kind: LineKind::Steps,
+        scale: 1.0,
+        width: 1.3,
+        histogram_color: None,
+    }];
     let out = sub_pane(&o, &v, 400.0, Some((0.0, 100.0)), Style::default());
     h.render(&mut [Frame { pane: 1, frame_no: 0, cmds: out.cmds }]);
     let px = h.read_pixels();

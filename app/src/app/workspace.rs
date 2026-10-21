@@ -454,6 +454,45 @@ impl TerminalApp {
 
     // ---- symbols and link groups ---------------------------------------------------------
 
+    pub(super) fn sync_chart_navigation(&mut self) {
+        let visible = self.visible_panes();
+        let mut cursors = Vec::new();
+        let mut ranges = Vec::new();
+        for &i in &visible {
+            let pane = &mut self.panes[i];
+            if let PaneKind::Chart(c) = &mut pane.kind {
+                if let Some(link) = pane.link {
+                    if c.navigation.cursor
+                        && let Some(ts) = c.local_cursor
+                    {
+                        cursors.push((pane.id, link, ts));
+                    }
+                    if c.navigation.range
+                        && let Some(range) = c.range_event.take()
+                    {
+                        ranges.push((pane.id, link, range));
+                    }
+                } else {
+                    c.range_event = None;
+                }
+            }
+        }
+        for pane in &mut self.panes {
+            if let PaneKind::Chart(c) = &mut pane.kind {
+                c.shared_cursor = cursors
+                    .iter()
+                    .find(|(id, link, _)| *id != pane.id && Some(*link) == pane.link)
+                    .map(|(_, _, ts)| *ts);
+                if c.navigation.range
+                    && let Some((_, _, range)) =
+                        ranges.iter().find(|(id, link, _)| *id != pane.id && Some(*link) == pane.link)
+                {
+                    c.apply_linked_range(*range);
+                }
+            }
+        }
+    }
+
     /// Point a symbol-driven pane at `symbol`. Returns whether it follows symbols.
     pub(super) fn set_pane_symbol(&mut self, i: usize, symbol: &str) -> bool {
         let id = self.panes[i].id;

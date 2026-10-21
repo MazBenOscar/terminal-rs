@@ -33,12 +33,16 @@ fn main() {
             color: [0.0, 0.6, 1.0, 1.0],
             kind: LineKind::Line,
             scale: 1.0,
+            width: 1.3,
+            histogram_color: None,
         },
         Overlay {
             line: line_ref(&indicators::bollinger(&closes, 20, 2.0).upper),
             color: [0.8, 0.8, 0.8, 1.0],
             kind: LineKind::Line,
             scale: 1.0,
+            width: 1.3,
+            histogram_color: None,
         },
     ];
     let prep_ms = t.elapsed().as_secs_f64() * 1e3;

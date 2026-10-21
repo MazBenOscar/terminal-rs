@@ -98,11 +98,19 @@ pub struct ChartState {
     pub indicators: Vec<IndicatorSpec>,
     pub drawings: Vec<Drawing>,
     pub compare: Option<String>,
+    pub navigation: crate::chart_navigation::Navigation,
+    pub data: crate::chart_data::ChartData,
+    refresh_at: std::time::Instant,
+    pub local_cursor: Option<i64>,
+    pub shared_cursor: Option<i64>,
+    pub range_event: Option<crate::chart_navigation::DateRange>,
+    pending_dates: Option<crate::chart_navigation::DateRange>,
 
     bars: Arc<Vec<Bar>>,
     gpu: Option<SeriesGpu>,
     generation: u64,
     viewport: Option<Viewport>,
+    plot_width: f64,
     manual_scale: Option<PriceScale>,
     glide: Option<Glide>,
     /// Shown autoscale bounds (transformed) and whether they are log, easing to the target.
@@ -127,6 +135,7 @@ pub struct ChartState {
     sec: Security,
     last_live: Option<std::time::Instant>,
     last_indicator_req: Option<std::time::Instant>,
+    indicator_revision: u64,
     /// App-level actions requested from this chart (context menu), drained by the app.
     pub actions: Vec<Action>,
     /// False while a pane is being dragged over the workspace: no crosshair or hover cards.
@@ -164,10 +173,18 @@ impl ChartState {
             indicators,
             drawings: Vec::new(),
             compare: None,
+            navigation: Default::default(),
+            data: Default::default(),
+            refresh_at: std::time::Instant::now(),
+            local_cursor: None,
+            shared_cursor: None,
+            range_event: None,
+            pending_dates: None,
             bars: Arc::new(Vec::new()),
             gpu: None,
             generation: 0,
             viewport: None,
+            plot_width: 800.,
             manual_scale: None,
             glide: None,
             shown_scale: None,
@@ -188,6 +205,7 @@ impl ChartState {
             sec: tr_data::security(symbol),
             last_live: None,
             last_indicator_req: None,
+            indicator_revision: 0,
             actions: Vec::new(),
             hover_enabled: true,
             controls_in_strip: false,
@@ -208,6 +226,16 @@ impl ChartState {
 
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
+        if let Some(view) = self.viewport {
+            self.plot_width = view.width_px;
+        }
+        if !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
+            self.data.session = tr_core::session::Session::Provider;
+        }
+        self.refresh_at = std::time::Instant::now();
+        self.local_cursor = None;
+        self.shared_cursor = None;
+        self.range_event = None;
         if self.draw.drag.is_some() {
             self.cancel();
         }
@@ -243,6 +271,7 @@ impl ChartState {
     }
 
     pub fn set_symbol(&mut self, symbol: &str, w: &Worker) {
+        self.pending_dates = None;
         self.adopt_legacy_drawings();
         let sec = tr_data::security(symbol);
         if sec.class == AssetClass::Govt {
@@ -252,18 +281,24 @@ impl ChartState {
         }
         self.symbol = sec.key();
         self.sec = sec;
+        if !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
+            self.data.session = tr_core::session::Session::Provider;
+        }
         self.draw = DrawState::default();
         self.load(w);
     }
 
     pub fn set_timeframe(&mut self, tf: Timeframe, w: &Worker) {
         if tf != self.tf {
+            self.pending_dates =
+                self.viewport.as_ref().and_then(|v| crate::chart_navigation::date_range(&self.bars, self.tf, v));
             self.tf = tf;
             self.load(w);
         }
     }
 
     pub fn set_range(&mut self, r: Range, w: &Worker) {
+        self.pending_dates = None;
         self.pending_range = Some(r);
         if r.timeframe() != self.tf {
             self.tf = r.timeframe();
@@ -280,6 +315,10 @@ impl ChartState {
             self.viewport = Some(g.to);
         }
         change(self);
+        if self.navigation.range {
+            self.range_event =
+                self.viewport.as_ref().and_then(|v| crate::chart_navigation::date_range(&self.bars, self.tf, v));
+        }
         if let (Some(from), Some(to)) = (shown, self.viewport)
             && from != to
             && !crate::anim::reduced()
@@ -297,6 +336,9 @@ impl ChartState {
             None => self.bars.len(),
         };
         *v = Viewport::fit_last(self.bars.len(), count.max(2), v.width_px);
+        if self.navigation.range {
+            self.range_event = crate::chart_navigation::date_range(&self.bars, self.tf, v);
+        }
         self.manual_scale = None;
     }
 
@@ -479,15 +521,18 @@ impl ChartState {
         PriceScale { lo: inv(lo), hi: inv(hi), ..target }
     }
 
-    fn request_indicators(&self, w: &Worker) {
+    fn request_indicators(&mut self, w: &Worker) {
         if !self.bars.is_empty() {
+            self.indicator_revision += 1;
             w.send(Request::Indicators {
+                revision: self.indicator_revision,
                 pane: self.id,
                 generation: self.generation,
                 bars: self.bars.clone(),
                 tf: self.tf,
                 specs: self.indicators.clone(),
                 palette: theme::palette(),
+                session: self.data.session,
             });
         }
     }
@@ -521,6 +566,19 @@ impl ChartState {
         if generation != self.generation {
             return;
         }
+        let filtered = self.data.session != tr_core::session::Session::Provider && self.tf.is_intraday();
+        let (bars, gpu, prepended) = if filtered {
+            let filtered = Arc::new(self.data.session.filter(&bars, self.tf));
+            let prepended = if prepended > 0 {
+                self.bars.first().map_or(0, |first| filtered.partition_point(|b| b.ts < first.ts))
+            } else {
+                0
+            };
+            let gpu = SeriesGpu::build(&filtered);
+            (filtered, gpu, prepended)
+        } else {
+            (bars, gpu, prepended)
+        };
         if live {
             self.last_live = Some(std::time::Instant::now());
         }
@@ -547,7 +605,7 @@ impl ChartState {
         self.error = None;
         match self.viewport.as_mut() {
             None => {
-                self.viewport = Some(Viewport::fit_last(new_len, DEFAULT_VISIBLE, 800.0));
+                self.viewport = Some(Viewport::fit_last(new_len, DEFAULT_VISIBLE, self.plot_width));
             }
             Some(v) if prepended > 0 => v.right += prepended as f64,
             Some(v) => {
@@ -557,6 +615,14 @@ impl ChartState {
             }
         }
         self.apply_range();
+        if let Some(range) = self.pending_dates {
+            if let Some(v) = &mut self.viewport {
+                crate::chart_navigation::apply(&self.bars, self.tf, range, v);
+            }
+            if !from_cache && (self.exhausted || self.bars.first().is_some_and(|bar| bar.ts <= range.start)) {
+                self.pending_dates = None;
+            }
+        }
         // Live ticks only move the last bar: refresh indicators at most every 1.5 s and
         // leave the compare series alone.
         let due = self.last_indicator_req.is_none_or(|t| t.elapsed().as_millis() >= 1500);
@@ -579,8 +645,11 @@ impl ChartState {
         }
     }
 
-    pub fn on_indicators(&mut self, generation: u64, built: Vec<BuiltIndicator>) {
-        if generation == self.generation && built.iter().map(|b| &b.spec).eq(self.indicators.iter()) {
+    pub fn on_indicators(&mut self, generation: u64, revision: u64, built: Vec<BuiltIndicator>) {
+        if generation == self.generation
+            && revision == self.indicator_revision
+            && built.iter().map(|b| &b.spec).eq(self.indicators.iter())
+        {
             self.built = built;
         }
     }
@@ -588,6 +657,18 @@ impl ChartState {
     pub fn on_compare(&mut self, generation: u64, symbol: &str, line: LineRef) {
         if generation == self.generation && self.compare.as_deref() == Some(symbol) {
             self.compare_line = Some(line);
+        }
+    }
+
+    pub fn apply_linked_range(&mut self, range: crate::chart_navigation::DateRange) {
+        if self.bars.first().is_none_or(|b| range.start < b.ts) {
+            self.pending_dates = Some(range);
+        }
+        if let Some(v) = &mut self.viewport {
+            crate::chart_navigation::apply(&self.bars, self.tf, range, v);
+            self.glide = None;
+        } else {
+            self.pending_dates = Some(range);
         }
     }
 
@@ -664,6 +745,24 @@ impl ChartState {
     }
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
+        self.local_cursor = None;
+        if self.data.refresh_seconds > 0
+            && !self.loading
+            && self.refresh_at.elapsed().as_secs() >= u64::from(self.data.refresh_seconds.max(15))
+        {
+            self.refresh_at = std::time::Instant::now();
+            self.loading = true;
+            w.send(Request::History {
+                pane: self.id,
+                generation: self.generation,
+                symbol: self.symbol.clone(),
+                tf: self.tf,
+                limit: initial_limit(self.tf).max(self.bars.len()),
+            });
+        }
+        if self.data.refresh_seconds > 0 {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
         study::assign_ids(&mut self.indicators);
         self.show_indicator_editor(ui.ctx(), w);
         let painter = ui.painter_at(rect);
@@ -745,11 +844,19 @@ impl ChartState {
             (_, true, _) => "loading…".into(),
             (_, _, true) => "loading history…".into(),
             _ => format!(
-                "{} bars{}{}{}",
+                "{} bars{}{}{} · {}{}",
                 self.bars.len(),
                 if self.cached_history { " · cached" } else { "" },
                 if self.log { "  LOG" } else { "" },
-                if self.magnet { "  MAGNET" } else { "" }
+                if self.magnet { "  MAGNET" } else { "" },
+                self.data.zone.label(),
+                if self.data.session == tr_core::session::Session::Provider {
+                    ""
+                } else if self.data.session == tr_core::session::Session::UsRegular {
+                    " · US RTH"
+                } else {
+                    " · US EXT"
+                }
             ),
         };
         painter.text(
@@ -762,6 +869,7 @@ impl ChartState {
 
         let body = Rect::from_min_max(pos2(rect.left(), header.bottom()), pos2(rect.right(), range_row.top()));
         let plot_all = Rect::from_min_max(body.min, pos2(body.right() - AXIS_W, body.bottom() - TIME_H));
+        self.plot_width = plot_all.width().max(1.) as f64;
         if plot_all.width() < 40.0 || plot_all.height() < 40.0 {
             return clicked;
         }
@@ -890,6 +998,14 @@ impl ChartState {
         v.clamp(len);
         self.viewport = Some(v);
 
+        let changed_by_user = plot_resp.dragged()
+            || time_resp.dragged()
+            || ui.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO || i.zoom_delta() != 1.) && plot_resp.hovered()
+            || self.glide.is_some();
+        if self.navigation.range && changed_by_user {
+            self.range_event = crate::chart_navigation::date_range(&self.bars, self.tf, &v);
+        }
+
         // Page older history when the left edge approaches loaded data.
         if !self.paging && !self.loading && !self.exhausted && v.left() < v.visible_bars() * 0.3 {
             self.paging = true;
@@ -909,7 +1025,7 @@ impl ChartState {
             .filter(|(key, _)| key.is_none())
             .flat_map(|(_, members)| members.iter().map(|&i| &self.built[i]))
             .filter(|b| b.spec.chart.as_ref().is_none_or(|c| c.scale == StudyScale::Shared))
-            .flat_map(|b| b.overlays.iter().map(|o| o.1.clone()))
+            .flat_map(|b| b.overlays.iter().map(|o| o.1.clone()).chain(b.bounds.iter().cloned()))
             .collect();
         if let Some(c) = &self.compare_line {
             let (lo, hi) = self.viewport.as_ref().map(|v| v.visible_range(len)).unwrap_or((0, len));
@@ -920,6 +1036,8 @@ impl ChartState {
                 color: theme::rgba(theme::series(5)),
                 kind: LineKind::Line,
                 scale,
+                width: 1.3,
+                histogram_color: None,
             });
         }
         let reveal_t =
@@ -986,7 +1104,7 @@ impl ChartState {
                 let b = &self.built[index];
                 if b.spec.chart.as_ref().is_some_and(|c| c.scale != StudyScale::Shared) {
                     let fixed = study_fixed_range(&b.spec);
-                    let ovs: Vec<_> = b.overlays.iter().map(|o| o.1.clone()).collect();
+                    let ovs: Vec<_> = b.overlays.iter().map(|o| o.1.clone()).chain(b.bounds.iter().cloned()).collect();
                     let separate = scene::sub_pane(&ovs, &v, price_rect.height() as f64, fixed, style);
                     out.cmds.extend(separate.cmds);
                     price_study_scales.push((price_rect, index, separate.scale));
@@ -994,6 +1112,14 @@ impl ChartState {
             }
         }
         let frame = Frame { pane: self.id * 8, frame_no, cmds: out.cmds };
+        if let Some((_, members)) = groups.iter().find(|(key, _)| key.is_none()) {
+            for &index in members {
+                let study_scale = price_study_scales.iter().find(|(_, i, _)| *i == index).map_or(scale, |(_, _, s)| *s);
+                if let Some(fill) = &self.built[index].fill {
+                    fill.paint(ui, price_rect, &v, &study_scale);
+                }
+            }
+        }
         ui.painter().add(tr_chart::egui_wgpu::Callback::new_paint_callback(price_rect, ChartCallback(Arc::new(frame))));
 
         // Sub panes.
@@ -1011,7 +1137,9 @@ impl ChartState {
             let ovs: Vec<Overlay> = members
                 .iter()
                 .filter(|&&i| self.built[i].spec.chart.as_ref().is_none_or(|c| c.scale == StudyScale::Shared))
-                .flat_map(|&i| self.built[i].overlays.iter().map(|o| o.1.clone()))
+                .flat_map(|&i| {
+                    self.built[i].overlays.iter().map(|o| o.1.clone()).chain(self.built[i].bounds.iter().cloned())
+                })
                 .collect();
             let mut s = style;
             s.thickness_px = 1.3;
@@ -1019,7 +1147,7 @@ impl ChartState {
             for &bi in members {
                 let b = &self.built[bi];
                 let scale = if b.spec.chart.as_ref().is_some_and(|c| c.scale != StudyScale::Shared) {
-                    let ovs: Vec<_> = b.overlays.iter().map(|o| o.1.clone()).collect();
+                    let ovs: Vec<_> = b.overlays.iter().map(|o| o.1.clone()).chain(b.bounds.iter().cloned()).collect();
                     let separate = scene::sub_pane(&ovs, &v, r.height() as f64, study_fixed_range(&b.spec), s);
                     so.cmds.extend(separate.cmds);
                     separate.scale
@@ -1037,6 +1165,11 @@ impl ChartState {
                 }
             }
             let frame = Frame { pane: self.id * 8 + 1 + k as u64, frame_no, cmds: so.cmds };
+            for (rect, index, scale) in sub_rects.iter().filter(|(rect, _, _)| *rect == r) {
+                if let Some(fill) = &self.built[*index].fill {
+                    fill.paint(ui, *rect, &v, scale);
+                }
+            }
             ui.painter().add(tr_chart::egui_wgpu::Callback::new_paint_callback(r, ChartCallback(Arc::new(frame))));
         }
         sub_rects.extend(price_study_scales);
@@ -1097,7 +1230,8 @@ impl ChartState {
         if hi > lo {
             let stride = ((hi - lo) / 600).max(1);
             let idxs: Vec<usize> = (lo..hi).step_by(stride).collect();
-            let times: Vec<i64> = idxs.iter().map(|&i| self.bars[i].ts).collect();
+            let times: Vec<i64> =
+                idxs.iter().map(|&i| self.data.zone.label_timestamp(self.bars[i].ts, self.tf)).collect();
             let gap = 90.0 / (v.bar_px * stride as f64);
             for (j, label) in scale::time_ticks(&times, 0, times.len(), gap, self.tf) {
                 let x = price_rect.left() + v.x_center(idxs[j]) as f32;
@@ -1145,7 +1279,29 @@ impl ChartState {
         }
 
         // ---- crosshair + legend ----
-        let hovered_bar = hover.and_then(|p| v.bar_at((p.x - price_rect.left()) as f64, len));
+        let local_bar = hover.and_then(|p| {
+            let index = v.index_at((p.x - price_rect.left()) as f64);
+            (index >= 0. && index < len as f64).then_some(index.floor() as usize)
+        });
+        self.local_cursor = local_bar.map(|i| self.bars[i].ts);
+        if self.navigation.cursor && self.local_cursor.is_some() {
+            ui.ctx().request_repaint();
+        }
+        let linked_bar = self
+            .navigation
+            .cursor
+            .then_some(self.shared_cursor)
+            .flatten()
+            .and_then(|ts| crate::chart_navigation::index_at(&self.bars, self.tf, ts));
+        let hovered_bar = local_bar.or(linked_bar);
+        if hover.is_none()
+            && let Some(i) = linked_bar
+        {
+            let x = price_rect.left() + v.x_center(i) as f32;
+            if plot_all.x_range().contains(x) {
+                dashed_v(&ui.painter_at(plot_all), x, plot_all.y_range(), Stroke::new(1., Color32::from_gray(110)));
+            }
+        }
         if let Some(p) = hover {
             let ch = Stroke::new(1.0, Color32::from_gray(110));
             let plot_painter = ui.painter_at(plot_all);
@@ -1165,7 +1321,7 @@ impl ChartState {
                 );
             }
             if let Some(i) = hovered_bar {
-                let label = scale::crosshair_label(self.bars[i].ts, self.tf);
+                let label = scale::crosshair_label(self.data.zone.label_timestamp(self.bars[i].ts, self.tf), self.tf);
                 let gw = label.len() as f32 * 7.0 + 10.0;
                 let tag = Rect::from_center_size(pos2(xi, time_rect.center().y), vec2(gw, TIME_H));
                 time_painter.rect_filled(tag, 0.0, Color32::from_gray(70));
@@ -1350,7 +1506,7 @@ impl ChartState {
                                             if !study::can_use_source(&before, c.id, parent.id) {
                                                 continue;
                                             }
-                                            for (name, _) in &b.overlays {
+                                            for name in &b.ports {
                                                 ui.selectable_value(
                                                     &mut c.source,
                                                     StudySource::Output { study: parent.id, output: name.clone() },
@@ -1363,6 +1519,16 @@ impl ChartState {
                                     .on_hover_text("Calculation input; independent of display placement");
                             }
                             ui.collapsing("Calculation & offsets", |ui| {
+                                if spec.code=="PCF" {
+                                    ui.label("Formula (documented PCF subset)");
+                                    ui.add(egui::TextEdit::multiline(c.expression.get_or_insert_with(|| "C".into())).desired_rows(3).desired_width(ui.available_width()));
+                                    ui.label("Example: C > AVGC20 AND V > 2 * AVG(V,50)");
+                                }
+                                egui::ComboBox::from_id_salt("study-timeframe").selected_text(c.timeframe.map_or("Chart timeframe",Timeframe::label)).show_ui(ui,|ui| {
+                                    ui.selectable_value(&mut c.timeframe,None,"Chart timeframe");
+                                    for tf in Timeframe::ALL.into_iter().filter(|tf| *tf>=self.tf) { ui.selectable_value(&mut c.timeframe,Some(tf),tf.label()); }
+                                });
+                                if c.timeframe.is_some_and(|tf| tf!=self.tf) { ui.label("Uses completed periods derived from loaded bars; first period omitted."); }
                                 if matches!(spec.code.as_str(), "BB" | "BBW" | "PCTB" | "ATR" | "MACD" | "ENV") {
                                     let original = match spec.code.as_str() {
                                         "ATR" => "Original: Wilder", "MACD" => "Original: Exponential", _ => "Original: Simple",
@@ -1468,6 +1634,8 @@ impl ChartState {
                                     ui.color_edit_button_srgb(color);
                                 }
                             });
+                            let names = registry::Spec::new(&spec.code, &spec.params).map(|s| s.compute(&registry::Input::new(&[],self.tf)).into_iter().map(|o| o.name.to_string()).collect::<Vec<_>>()).unwrap_or_default();
+                            crate::chart_controls::output_styles(ui,c,&names);
                             if let Some(error) = self
                                 .built
                                 .iter()
@@ -1490,12 +1658,13 @@ impl ChartState {
         if save_template {
             let name = self.template_name.trim().to_string();
             let mut template = crate::chart_templates::Template {
-                version: 1,
+                version: 2,
                 name: name.clone(),
                 indicators: self.indicators.clone(),
                 chart_type: self.chart_type,
                 log: self.log,
                 show_volume: self.show_volume,
+                data: self.data,
             };
             self.template_status = Some(template.save(&crate::chart_templates::directory()).map(|()| {
                 self.template_names = None;
@@ -1514,6 +1683,14 @@ impl ChartState {
                             self.chart_type = template.chart_type;
                             self.log = template.log;
                             self.show_volume = template.show_volume;
+                            let old_session = self.data.session;
+                            self.data = template.data;
+                            if !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
+                                self.data.session = tr_core::session::Session::Provider;
+                            }
+                            if old_session != self.data.session {
+                                self.load(w);
+                            }
                         }
                         Ok(format!("Applied {}", self.template_selected))
                     }),
@@ -1532,6 +1709,26 @@ impl ChartState {
 
     fn context_menu(&mut self, ui: &mut Ui, w: &Worker) {
         ui.set_min_width(190.0);
+        ui.menu_button("Time zone, session & refresh", |ui| {
+            let before = self.data;
+            self.data.edit(ui, matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf));
+            if self.data.session != before.session {
+                self.pending_dates =
+                    self.viewport.as_ref().and_then(|v| crate::chart_navigation::date_range(&self.bars, self.tf, v));
+                self.load(w);
+            }
+            if ui.button("Refresh history now").clicked() {
+                self.pending_dates =
+                    self.viewport.as_ref().and_then(|v| crate::chart_navigation::date_range(&self.bars, self.tf, v));
+                self.load(w);
+                ui.close();
+            }
+        });
+        ui.menu_button("Linked navigation", |ui| {
+            ui.label("Uses this pane's color link group");
+            ui.checkbox(&mut self.navigation.cursor, "Synchronize timestamp cursor");
+            ui.checkbox(&mut self.navigation.range, "Synchronize visible date range");
+        });
         if ui.button("Reset View").clicked() {
             self.reset_view();
             ui.close();
@@ -2161,6 +2358,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn advanced_studies_build_headless_frames_at_split_pane_width() {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.indicators = vec![
+            IndicatorSpec::new("BB", &[]).unwrap(),
+            IndicatorSpec::new("EMA", &[3.]).unwrap(),
+            IndicatorSpec::new("PCF", &[]).unwrap(),
+        ];
+        study::assign_ids(&mut chart.indicators);
+        chart.indicators[0].chart.as_mut().unwrap().fill =
+            Some(study::BandFill { upper: "Upper".into(), lower: "Lower".into(), color: [80, 160, 180], opacity: 35 });
+        chart.indicators[1].chart.as_mut().unwrap().timeframe = Some(Timeframe::W1);
+        chart.indicators[2].chart.as_mut().unwrap().expression = Some("C > AVGC20".into());
+        chart.bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 500, 1_790_000_000));
+        chart.gpu = Some(SeriesGpu::build(&chart.bars));
+        chart.built = crate::worker::build_indicators(&chart.bars, chart.tf, &chart.indicators, &theme::palette());
+        assert!(chart.built.iter().all(|b| b.error.is_none()));
+        let ctx = egui::Context::default();
+        let worker = Worker::inert();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(430., 600.))),
+                ..Default::default()
+            },
+            |ui| {
+                chart.show(ui, ui.max_rect(), true, &worker);
+            },
+        );
+        assert!(
+            out.shapes.iter().any(|s| matches!(&s.shape,egui::Shape::Mesh(mesh) if !mesh.vertices.is_empty())),
+            "Band fill mesh is present"
+        );
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn timeframe_changes_preserve_the_historical_date_range() {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 500, 1_790_000_000));
+        chart.viewport = Some(Viewport { right: 250., bar_px: 4., width_px: 400. });
+        let before = crate::chart_navigation::date_range(&chart.bars, chart.tf, &chart.viewport.unwrap()).unwrap();
+        let worker = Worker::inert();
+        chart.set_timeframe(Timeframe::W1, &worker);
+        let bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::W1, 500, 1_790_000_000));
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &worker);
+        let after = crate::chart_navigation::date_range(&chart.bars, chart.tf, &chart.viewport.unwrap()).unwrap();
+        assert!((after.start - before.start).abs() <= Timeframe::W1.seconds());
+        assert!((after.end - before.end).abs() <= Timeframe::W1.seconds());
+        assert!(chart.pending_dates.is_none());
+    }
+
+    #[test]
+    fn a_newer_calculation_request_rejects_an_old_result_on_the_same_bars() {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 300, 1_790_000_000));
+        let old = crate::worker::build_indicators(&chart.bars, chart.tf, &chart.indicators, &theme::palette());
+        let worker = Worker::inert();
+        chart.request_indicators(&worker);
+        let revision = chart.indicator_revision;
+        chart.request_indicators(&worker);
+        chart.on_indicators(chart.generation, revision, old);
+        assert!(chart.built.is_empty());
+    }
+
+    #[test]
     fn drawing_body_drag_preserves_log_ratios_and_supports_undo() {
         let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
         chart.bars = Arc::new((0..100).map(|i| Bar::new(i * 86400, 10., 10., 10., 10., 1.)).collect());
@@ -2311,7 +2572,7 @@ mod tests {
         let built = crate::worker::build_indicators(&bars, Timeframe::D1, &chart.indicators, &theme::palette());
         assert_eq!(study_groups(&built), vec![(Some(1), vec![0, 1]), (None, vec![3])]);
         chart.indicators[0].params[0] = 2.;
-        chart.on_indicators(chart.generation, built);
+        chart.on_indicators(chart.generation, chart.indicator_revision, built);
         assert!(chart.built.is_empty(), "a superseded parameter response cannot replace current studies");
     }
 

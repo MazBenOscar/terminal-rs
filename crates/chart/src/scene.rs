@@ -94,6 +94,8 @@ pub struct Overlay {
     pub kind: LineKind,
     /// Values are drawn multiplied by this factor (compare series rebased per frame).
     pub scale: f64,
+    pub width: f32,
+    pub histogram_color: Option<[f32; 4]>,
 }
 
 /// Everything needed to draw the main price pane.
@@ -242,6 +244,11 @@ fn overlay_cmds(overlays: &[Overlay], v: &Viewport, t: &PaneTransform, base: &St
             let k = level_for(v.bar_px, lp.levels());
             let mut s = *base;
             s.color = o.color;
+            s.thickness_px = o.width.clamp(0.5, 8.0);
+            if let Some(color) = o.histogram_color {
+                s.up = color;
+                s.down = color;
+            }
             // Drawing v*scale against [lo, hi] equals drawing v against [lo/scale, hi/scale].
             let mut t = *t;
             if o.scale != 1.0 && o.scale > 0.0 {
@@ -439,7 +446,14 @@ mod tests {
     #[test]
     fn sub_pane_fixed_and_auto() {
         let vals: Vec<f64> = (0..100).map(|i| (i as f64 * 0.2).sin()).collect();
-        let o = Overlay { line: line_ref(&vals), color: [1.0; 4], kind: LineKind::Hist, scale: 1.0 };
+        let o = Overlay {
+            line: line_ref(&vals),
+            color: [1.0; 4],
+            kind: LineKind::Hist,
+            scale: 1.0,
+            width: 1.3,
+            histogram_color: None,
+        };
         let v = Viewport::fit_last(100, 100, 500.0);
         let out = sub_pane(std::slice::from_ref(&o), &v, 100.0, None, Style::default());
         assert!(out.scale.lo < -0.9 && out.scale.hi > 0.9);
@@ -455,7 +469,14 @@ mod tests {
         let top = bars.iter().map(|b| b.high).fold(f64::MIN, f64::max) * 2.0;
         let mut marks = vec![f64::NAN; 200];
         marks[150] = top;
-        let o = Overlay { line: line_ref(&marks), color: [1.0; 4], kind: LineKind::Dots, scale: 1.0 };
+        let o = Overlay {
+            line: line_ref(&marks),
+            color: [1.0; 4],
+            kind: LineKind::Dots,
+            scale: 1.0,
+            width: 1.3,
+            histogram_color: None,
+        };
         let out = price_pane(&PricePane {
             series: &s,
             chart_type: ChartType::Candles,
@@ -482,7 +503,8 @@ mod tests {
         let mut marks = vec![f64::NAN; 4096];
         marks[2002] = top;
         let pane = |line: LineRef| {
-            let o = Overlay { line, color: [1.0; 4], kind: LineKind::Dots, scale: 1.0 };
+            let o =
+                Overlay { line, color: [1.0; 4], kind: LineKind::Dots, scale: 1.0, width: 1.3, histogram_color: None };
             let out = price_pane(&PricePane {
                 series: &s,
                 chart_type: ChartType::Candles,
@@ -507,7 +529,14 @@ mod tests {
     fn steps_draw_one_full_bar_dash_per_point() {
         let s = SeriesGpu::build(&sample::generate("X", Timeframe::H4, 200, 1_790_000_000));
         let levels: Vec<f64> = (0..200).map(|i| if i / 2 % 2 == 0 { 1.0 } else { 1e6 }).collect();
-        let o = Overlay { line: line_ref(&levels), color: [1.0; 4], kind: LineKind::Steps, scale: 1.0 };
+        let o = Overlay {
+            line: line_ref(&levels),
+            color: [1.0; 4],
+            kind: LineKind::Steps,
+            scale: 1.0,
+            width: 1.3,
+            histogram_color: None,
+        };
         for (bar_px, group) in [(4.0, 1.0), (0.5, 4.0)] {
             let v = Viewport { right: 200.0, bar_px, width_px: 800.0 };
             let out = price_pane(&PricePane {

@@ -1,5 +1,9 @@
 # Chart compatibility checkpoint
 
+This describes the preceding formula/template/drawing increment. The subsequent
+[charting review checklist](../chart-review.md) records output styles/fills, linked
+navigation, sessions, larger study timeframes, custom formulas and reference tooling.
+
 This increment extends the existing REA-based inventory with documented calculation
 choices, reusable local study setups and drawing editing. It does not establish
 full numeric or interaction parity with TC2000. The earlier

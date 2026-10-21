@@ -8,9 +8,9 @@ Commands still toggle the first matching code/parameter combination.
 
 Each study has a stable number, numeric parameters, visibility and optional custom
 color. **Move up** changes pane/legend order without changing calculation inputs.
-Settings are saved automatically with the workspace layout. Layout format v3
+Settings are saved automatically with the workspace layout. Layout format v4
 retains the original calculations when migrating older labels and settings;
-older application versions cannot read v3 layouts. Back up layouts before switching
+older application versions cannot read v4 layouts. Back up layouts before switching
 back to an older application build.
 
 ## Inputs, panes and scales
@@ -20,7 +20,9 @@ These are separate choices:
 - **Input** selects the values used for calculation. SMA, EMA, WMA, HMA, RMA,
   Bollinger Bands, bandwidth, %B, envelopes, RSI and MACD accept open/high/low/close, volume, typical price
   (HLC3), or another study's named output. **Original bars** preserves the study's
-  original OHLCV definition. Other studies currently keep that original input.
+  original OHLCV definition. Additional close-based moving averages and statistics
+  expose the same Input selector. OHLCV-only studies retain their original input;
+  volume-weighted averages keep the chart's original volume weights.
 - **Pane** chooses Price, Own, or another study's pane. Several studies can occupy
   the same pane. Drag its top divider to resize an oscillator pane; price keeps
   at least 40% of the chart's plotting space.
@@ -97,15 +99,18 @@ provider route. Older unqualified cache entries are ignored and fetched again.
 A route can still choose among real upstream providers: the cache does not establish
 exchange session, adjustment or actual vendor equivalence.
 
-Per-output styles, band fills, linked chart cursors and independent study timeframes
-remain future work. Exchange calendars, session-aware studies and comparable
-adjusted source data also need further work before claiming full TC2000 parity.
+Per-output styles, band fills, linked navigation, timezone/session controls,
+completed higher-timeframe studies and a bounded custom formula editor are now
+available. See the [functional review checklist](chart-review.md) for controls,
+examples and exact limitations. Complete formula compatibility, native independent
+history, full exchange calendars and adjusted source consistency remain pending.
 
 There are at most six additional panes. Hidden panes beyond the limit are noted
 on the chart; their studies still calculate. Source chaining currently supports
 the scalar consumers above. Intrinsically displaced output arrays (such as Ichimoku) are rejected as sources
 until timestamp/offset alignment is implemented; ordinary named outputs retain
-the chart's bar alignment. All studies use the chart's symbol/timeframe/history.
+the chart's bar alignment. Studies share the chart's symbol and loaded history;
+larger study timeframes derive completed periods from those bars.
 
 Missing inputs remain undefined rather than becoming false signals: RSI blanks
 the missing difference and the next adjacent difference, while MACD skips missing

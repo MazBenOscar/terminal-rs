@@ -86,6 +86,12 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   complete setup and migrate older indicator labels. Calculation options include plain/Wilder RSI,
   selectable ATR/MACD/Bollinger averages, bandwidth units and historical/visual offsets. Named
   local templates restore or merge study setups. See the [chart study guide](docs/chart-studies.md).
+  Each output supports its own visibility, color, stroke and plot type; multi-output studies
+  can fill between bands. Charts optionally synchronize cursors/date ranges within color
+  link groups, preserve historical dates on interval changes, and offer display zones,
+  US session filters and periodic history refresh. Larger study timeframes use completed
+  periods derived from loaded bars. The `PCF` study plots a documented expression subset.
+  See the [review checklist and remaining limits](docs/chart-review.md).
 - **Drawings** — trendline (Alt+T), horizontal (Alt+H), vertical (Alt+V) and fib retracement
   (Alt+F), stored in (time, price) so they survive zoom and timeframe changes; magnet (Alt+M) snaps
   to OHLC; click to select, drag anchors or the body to edit, Del to remove. Drawings belong to

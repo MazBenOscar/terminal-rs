@@ -252,6 +252,8 @@ impl PaneKind {
                 show_volume: c.show_volume,
                 show_congress: c.show_congress,
                 magnet: c.magnet,
+                navigation: c.navigation,
+                data: c.data,
             },
             PaneKind::Feed { filter } => {
                 PaneSettings::Feed((*filter != FeedFilter::default()).then(|| (*filter).into()))
@@ -300,6 +302,8 @@ impl PaneKind {
                 show_volume,
                 show_congress,
                 magnet,
+                navigation,
+                data,
             } => {
                 let mut c = ChartState::new(0, &symbol, tf);
                 c.chart_type = chart_type;
@@ -310,6 +314,8 @@ impl PaneKind {
                 c.show_volume = show_volume;
                 c.show_congress = show_congress;
                 c.magnet = magnet;
+                c.navigation = navigation;
+                c.data = data;
                 PaneKind::Chart(Box::new(c))
             }
             PaneSettings::Feed(f) => PaneKind::Feed { filter: f.map(Into::into).unwrap_or_default() },
@@ -1003,9 +1009,9 @@ impl TerminalApp {
                         self.status = format!("data error: {error}");
                     }
                 }
-                Response::Indicators { pane, generation, built } => {
+                Response::Indicators { pane, generation, built, revision } => {
                     if let Some(c) = self.chart_mut(pane) {
-                        c.on_indicators(generation, built);
+                        c.on_indicators(generation, revision, built);
                     }
                 }
                 Response::Compare { pane, generation, symbol, line } => {
@@ -1530,6 +1536,7 @@ impl eframe::App for TerminalApp {
         theme::refresh(&ctx, &self.themes[ti], self.system_accent);
         self.drain();
         self.periodic();
+        self.sync_chart_navigation();
 
         let screen = ui.max_rect();
         let open = anim::spring_with(
@@ -1666,5 +1673,29 @@ mod tests {
         ] {
             assert_eq!(PaneKind::from_settings(s.clone()).settings(), s);
         }
+    }
+
+    #[test]
+    fn advanced_chart_settings_survive_layout_serialization() {
+        use tr_core::Timeframe;
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::H1);
+        chart.navigation = crate::chart_navigation::Navigation { cursor: true, range: true };
+        chart.data = crate::chart_data::ChartData {
+            zone: tr_core::session::Zone::NewYork,
+            session: tr_core::session::Session::UsRegular,
+            refresh_seconds: 60,
+        };
+        chart.indicators = vec![crate::command::IndicatorSpec::new("PCF", &[]).unwrap()];
+        tr_core::indicators::study::assign_ids(&mut chart.indicators);
+        let settings = chart.indicators[0].chart.as_mut().unwrap();
+        settings.expression = Some("CROSS(C, AVGC20)".into());
+        settings.timeframe = Some(Timeframe::D1);
+        settings.outputs.insert(
+            "Formula".into(),
+            tr_core::indicators::study::OutputStyle { color: Some([12, 34, 56]), width: 2.5, ..Default::default() },
+        );
+        let before = PaneKind::Chart(Box::new(chart)).settings();
+        let restored = serde_json::from_str(&serde_json::to_string(&before).unwrap()).unwrap();
+        assert_eq!(PaneKind::from_settings(restored).settings(), before);
     }
 }

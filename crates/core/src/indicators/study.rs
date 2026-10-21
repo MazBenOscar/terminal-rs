@@ -6,6 +6,36 @@ use serde::{Deserialize, Serialize};
 use super::registry::{Input, Output, Spec};
 use crate::Bar;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlotStyle {
+    Line,
+    Dots,
+    Steps,
+    Histogram,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutputStyle {
+    pub visible: bool,
+    pub color: Option<[u8; 3]>,
+    pub width: f32,
+    pub plot: Option<PlotStyle>,
+}
+impl Default for OutputStyle {
+    fn default() -> Self {
+        Self { visible: true, color: None, width: 1.3, plot: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BandFill {
+    pub upper: String,
+    pub lower: String,
+    pub color: [u8; 3],
+    pub opacity: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Source {
     #[default]
@@ -59,6 +89,14 @@ pub struct Settings {
     /// Display-only shift. Calculation consumers always see undisplaced values.
     #[serde(default)]
     pub displacement: i16,
+    #[serde(default)]
+    pub outputs: std::collections::BTreeMap<String, OutputStyle>,
+    #[serde(default)]
+    pub fill: Option<BandFill>,
+    #[serde(default)]
+    pub timeframe: Option<crate::Timeframe>,
+    #[serde(default)]
+    pub expression: Option<String>,
 }
 
 fn yes() -> bool {
@@ -80,6 +118,10 @@ impl Settings {
             height: height(),
             formula: Default::default(),
             displacement: 0,
+            outputs: Default::default(),
+            fill: None,
+            timeframe: None,
+            expression: (spec.code == "PCF").then(|| "C".into()),
         }
     }
 }
@@ -135,7 +177,46 @@ pub fn pane_key(specs: &[Spec], index: usize) -> Result<Option<u32>, String> {
 /// Only these scalar-input studies currently accept a selectable input. Other
 /// registry studies retain their original OHLCV semantics, never fabricated bars.
 pub fn accepts_source(code: &str) -> bool {
-    matches!(code, "SMA" | "EMA" | "WMA" | "HMA" | "RMA" | "BB" | "BBW" | "PCTB" | "ENV" | "RSI" | "MACD")
+    matches!(
+        code,
+        "SMA"
+            | "EMA"
+            | "WMA"
+            | "HMA"
+            | "RMA"
+            | "BB"
+            | "BBW"
+            | "PCTB"
+            | "ENV"
+            | "RSI"
+            | "MACD"
+            | "DEMA"
+            | "TEMA"
+            | "TRIMA"
+            | "KAMA"
+            | "ZLEMA"
+            | "ALMA"
+            | "VWMA"
+            | "EVWMA"
+            | "T3"
+            | "MCGINLEY"
+            | "VIDYA"
+            | "SUPERSMOOTHER"
+            | "DECYCLER"
+            | "MAMA"
+            | "ITREND"
+            | "LSMA"
+            | "GMMA"
+            | "STDEV"
+            | "VAR"
+            | "ZSCORE"
+            | "SLOPE"
+            | "R2"
+            | "STDERR"
+            | "TSF"
+            | "MEDIAN"
+            | "PRANK"
+    )
 }
 
 /// Whether adding this source edge would be acyclic. Evaluation also validates
@@ -159,6 +240,22 @@ pub fn can_use_source(specs: &[Spec], consumer: u32, mut parent: u32) -> bool {
 /// Evaluate in dependency order, retaining independent successes when a node fails.
 /// Missing output ports, cycles and displaced inputs are explicit errors.
 pub fn evaluate(specs: &[Spec], input: &Input<'_>) -> Vec<Result<Vec<Output>, String>> {
+    evaluate_with_session(specs, input, crate::session::Session::Provider)
+}
+
+pub fn evaluate_with_session(
+    specs: &[Spec],
+    input: &Input<'_>,
+    session: crate::session::Session,
+) -> Vec<Result<Vec<Output>, String>> {
+    if input.session != session {
+        super::multiframe::evaluate(specs, &Input::new(input.bars, input.tf).with_session(session), session)
+    } else {
+        super::multiframe::evaluate(specs, input, session)
+    }
+}
+
+pub(super) fn evaluate_native(specs: &[Spec], input: &Input<'_>) -> Vec<Result<Vec<Output>, String>> {
     fn node(
         index: usize,
         specs: &[Spec],
@@ -233,8 +330,22 @@ pub fn evaluate(specs: &[Spec], input: &Input<'_>) -> Vec<Result<Vec<Output>, St
                     b
                 })
                 .collect();
-            super::formula::compute(spec, &Input::new(&bars, input.tf))
-        })();
+            super::formula::compute(spec, &Input::new(&bars, input.tf).with_session(input.session))
+        })()
+        .and_then(|outputs| {
+            if let Some(settings) = &spec.chart {
+                if settings.outputs.values().any(|style| !style.width.is_finite() || !(0.5..=8.).contains(&style.width))
+                {
+                    return Err("Output stroke width must be between 0.5 and 8".into());
+                }
+                if let Some(fill) = &settings.fill
+                    && (!outputs.iter().any(|o| o.name == fill.upper) || !outputs.iter().any(|o| o.name == fill.lower))
+                {
+                    return Err("Band fill refers to an unavailable output".into());
+                }
+            }
+            Ok(outputs)
+        });
         visiting[index] = false;
         done[index] = Some(result.clone());
         result
@@ -248,6 +359,23 @@ pub fn evaluate(specs: &[Spec], input: &Input<'_>) -> Vec<Result<Vec<Output>, St
 mod tests {
     use super::*;
     use crate::Timeframe;
+
+    #[test]
+    fn session_vwap_does_not_reset_at_utc_midnight_inside_the_ny_evening() {
+        let ts = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        let bars = [
+            Bar::new(ts("2026-01-05T23:30:00Z"), 10., 10., 10., 10., 1.),
+            Bar::new(ts("2026-01-06T00:30:00Z"), 20., 20., 20., 20., 1.),
+        ];
+        let specs = [Spec::new("VWAP", &[]).unwrap()];
+        let output =
+            evaluate_with_session(&specs, &Input::new(&bars, Timeframe::H1), crate::session::Session::UsExtended)[0]
+                .clone()
+                .unwrap();
+        assert_eq!(output[0].values[1], 15.);
+        let utc = evaluate(&specs, &Input::new(&bars, Timeframe::H1))[0].clone().unwrap();
+        assert_eq!(utc[0].values[1], 20.);
+    }
 
     fn specs() -> Vec<Spec> {
         let mut specs = vec![Spec::new("RSI", &[3.0]).unwrap(), Spec::new("EMA", &[2.0]).unwrap()];

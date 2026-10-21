@@ -24,12 +24,16 @@ fn bench(c: &mut Criterion) {
             color: [0.0, 0.6, 1.0, 1.0],
             kind: LineKind::Line,
             scale: 1.0,
+            width: 1.3,
+            histogram_color: None,
         },
         Overlay {
             line: line_ref(&indicators::sma(&closes, 50)),
             color: [1.0, 0.0, 1.0, 1.0],
             kind: LineKind::Line,
             scale: 1.0,
+            width: 1.3,
+            histogram_color: None,
         },
     ];
     let mut g = c.benchmark_group("frame_1M_bars_1600x900");
