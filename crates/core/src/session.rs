@@ -69,7 +69,7 @@ impl Session {
     }
     /// Half-open aggregation interval, anchored to the NY session open when selected.
     pub fn interval(self, tf: Timeframe, ts: i64) -> (i64, i64) {
-        if self == Self::Provider {
+        if self == Self::Provider || self == Self::UsExtended && matches!(tf, Timeframe::H2 | Timeframe::H4) {
             return (tf.bucket_start(ts), next_bucket(tf, ts));
         }
         let date = Zone::NewYork.local(ts).date();

@@ -69,10 +69,26 @@ impl MarketData for Markets {
         limit: usize,
         options: crate::HistoryOptions,
     ) -> Result<Vec<Bar>> {
+        let sec = security(symbol);
+        if matches!(sec.class, AssetClass::Equity | AssetClass::Etf) && tf.session_aligned(options.session) {
+            let source_options = crate::HistoryOptions { session: Default::default(), ..options };
+            let factor = (tf.seconds() / Timeframe::M30.seconds()) as usize;
+            let bars = self
+                .chart_history(
+                    symbol,
+                    Timeframe::M30,
+                    end,
+                    limit.saturating_add(1).saturating_mul(factor).saturating_mul(4),
+                    source_options,
+                )
+                .await?;
+            return Ok(crate::clip(tf.resample_session(&bars, options.session), end, limit));
+        }
+        // Session selection is a chart aggregation concern, not a provider option.
+        let options = crate::HistoryOptions { session: Default::default(), ..options };
         if options == crate::HistoryOptions::default() {
             return self.history(symbol, tf, end, limit).await;
         }
-        let sec = security(symbol);
         match sec.class {
             AssetClass::Equity | AssetClass::Etf if self.questrade().is_some() => {
                 self.questrade().unwrap().chart_history(&sec.ticker, tf, end, limit, options).await
@@ -97,6 +113,15 @@ impl MarketData for Markets {
     }
     async fn alert_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
         let sec = security(symbol);
+        let session = tr_core::session::Session::UsRegular;
+        if matches!(sec.class, AssetClass::Equity | AssetClass::Etf) && tf.session_aligned(session) {
+            let factor = (tf.seconds() / Timeframe::M30.seconds()) as usize;
+            let mut history = self
+                .alert_history(symbol, Timeframe::M30, limit.saturating_add(1).saturating_mul(factor).saturating_mul(4))
+                .await?;
+            history.bars = crate::clip(tf.resample_session(&history.bars, session), None, limit);
+            return Ok(history);
+        }
         match (sec.class, self.questrade(), self.alpaca.as_ref()) {
             (AssetClass::Equity | AssetClass::Etf, Some(q), _) => q.scan_history(&sec.ticker, tf, limit).await,
             (AssetClass::Equity | AssetClass::Etf, None, Some(a)) => a.scan_history(&sec.ticker, tf, limit).await,
@@ -169,6 +194,15 @@ impl MarketData for Markets {
 
     async fn scan_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
         let sec = security(symbol);
+        let session = tr_core::session::Session::UsRegular;
+        if matches!(sec.class, AssetClass::Equity | AssetClass::Etf) && tf.session_aligned(session) {
+            let factor = (tf.seconds() / Timeframe::M30.seconds()) as usize;
+            let mut history = self
+                .scan_history(symbol, Timeframe::M30, limit.saturating_add(1).saturating_mul(factor).saturating_mul(4))
+                .await?;
+            history.bars = crate::clip(tf.resample_session(&history.bars, session), None, limit);
+            return Ok(history);
+        }
         match sec.class {
             AssetClass::Crypto => {
                 Ok(ScanHistory { bars: self.crypto.history(&sec, tf, None, limit).await?, simulated: false })

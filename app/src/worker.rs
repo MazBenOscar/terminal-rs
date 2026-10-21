@@ -1615,7 +1615,9 @@ fn column_history_plan(columns: &[tr_core::columns::ColumnDef]) -> Vec<(Timefram
 
 async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize) -> Result<(Vec<Bar>, bool), String> {
     let now = chrono::Utc::now().timestamp();
-    let source = s.provider.scan_cache_key(symbol);
+    let route = s.provider.scan_cache_key(symbol);
+    let source =
+        if matches!(tf, Timeframe::H2 | Timeframe::H4) { format!("session-v1:{route}") } else { route.clone() };
     let (stored, fetched) = {
         let store = s.scan_store.lock().expect("scan store");
         let store = store.as_ref().ok_or("The scan store could not be opened")?;
@@ -1636,7 +1638,7 @@ async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize)
     if history.bars.is_empty() {
         return Err(format!("No history for {symbol}"));
     }
-    if s.provider.scan_cache_key(symbol) != source {
+    if s.provider.scan_cache_key(symbol) != route {
         return Err("The scan data source changed during the request; run the scan again".into());
     }
     let fetch = Fetch { at: now, source, simulated: history.simulated };
@@ -1773,7 +1775,7 @@ fn chart_options_key(provider: &dyn tr_data::MarketData, symbol: &str, options: 
 fn chart_cache_key(provider: &dyn tr_data::MarketData, symbol: &str) -> String {
     // Versioned namespace excludes old, ambiguous caches (including legacy samples).
     let route = provider.scan_cache_key(symbol);
-    format!("chart-v2:{}:{route}:{symbol}", route.len())
+    format!("chart-v3:{}:{route}:{symbol}", route.len())
 }
 
 fn claim_series(s: &Shared, pane: PaneId, generation: u64, source: &str) -> bool {
@@ -1850,6 +1852,10 @@ fn start_live(
     options: tr_data::HistoryOptions,
 ) {
     let source = chart_options_key(s.provider.as_ref(), &symbol, options);
+    // UTC-aligned provider snapshots cannot be merged into session buckets.
+    if tf.session_aligned(options.session) {
+        return;
+    }
     let Some(mut feed) = s.provider.live(&symbol, tf) else { return };
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -2468,6 +2474,32 @@ mod tests {
         let tr_chart::gpu::DrawCmd::Line { uniforms, .. } = &out.cmds[0] else { panic!("Expected histogram") };
         assert_eq!(uniforms.up, [1., 0., 0., 1.]);
         assert_eq!(uniforms.down, [1., 0., 0., 1.]);
+    }
+
+    #[test]
+    fn session_chart_cache_is_separate_from_provider_extended_and_v2() {
+        use tr_core::session::Session;
+        let provider = tr_data::sample::SampleProvider::default();
+        let symbol = "AAPL US Equity";
+        let regular = chart_options_key(
+            &provider,
+            symbol,
+            tr_data::HistoryOptions { session: Session::UsRegular, ..Default::default() },
+        );
+        let utc = chart_options_key(&provider, symbol, Default::default());
+        let extended = chart_options_key(
+            &provider,
+            symbol,
+            tr_data::HistoryOptions { session: Session::UsExtended, ..Default::default() },
+        );
+        assert_ne!(regular, utc);
+        assert_ne!(regular, extended);
+        let mut cache = BarCache::open_in_memory().unwrap();
+        for tf in [Timeframe::H2, Timeframe::H4] {
+            let old = utc.replacen("chart-v3:", "chart-v2:", 1);
+            cache.store(&old, tf, &[Bar::new(0, 1., 1., 1., 1., 1.)]).unwrap();
+            assert!(cache.load(&regular, tf, 100).unwrap().is_empty());
+        }
     }
 
     #[test]

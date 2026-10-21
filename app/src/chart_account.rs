@@ -6,17 +6,12 @@ use serde::{Deserialize, Serialize};
 use tr_broker::{InstrumentKind, Portfolio};
 use tr_chart::viewport::PriceScale;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub positions: bool,
     pub orders: bool,
     pub account: Option<String>,
-}
-impl Default for Settings {
-    fn default() -> Self {
-        Self { positions: true, orders: true, account: None }
-    }
 }
 #[derive(Debug, Clone)]
 pub struct Level {
@@ -216,6 +211,22 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlays_default_off_and_saved_layout_opt_in_survives() {
+        let defaults = Settings::default();
+        assert!(!defaults.positions && !defaults.orders);
+        let legacy: crate::chart_data::ChartData = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.account, defaults);
+        let saved: crate::chart_data::ChartData =
+            serde_json::from_str(r#"{"account":{"positions":true,"orders":true}}"#).unwrap();
+        let restored: crate::chart_data::ChartData =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(restored.account.positions && restored.account.orders);
+        let partial: Settings = serde_json::from_str(r#"{"positions":true}"#).unwrap();
+        assert!(partial.positions && !partial.orders);
+    }
+
     #[test]
     fn separates_accounts_skips_derivatives_and_closed_orders_and_preserves_short_sign() {
         let mut pf = tr_broker::sample::portfolio();
@@ -234,11 +245,17 @@ mod tests {
         let mut foreign = p.clone();
         foreign.currency = "CAD".into();
         pf.positions.push(foreign);
-        let snap =
-            Snapshot::build(Some(&pf), &symbol, &Settings { orders: false, ..Default::default() }, false, None, false);
+        let snap = Snapshot::build(
+            Some(&pf),
+            &symbol,
+            &Settings { positions: true, orders: false, account: None },
+            false,
+            None,
+            false,
+        );
         assert_eq!(snap.levels.len(), 1);
         assert_eq!(snap.levels[0].position.as_ref().unwrap().0, -10.);
-        let settings = Settings { account: Some("absent".into()), ..Default::default() };
+        let settings = Settings { positions: true, orders: true, account: Some("absent".into()) };
         assert!(Snapshot::build(Some(&pf), &symbol, &settings, false, None, false).levels.is_empty());
     }
     #[test]
@@ -256,7 +273,7 @@ mod tests {
         pf.orders = vec![order];
         pf.simulated = false;
         pf.demo = false;
-        let settings = Settings { positions: false, ..Default::default() };
+        let settings = Settings { positions: false, orders: true, account: None };
         let snap = Snapshot::build(Some(&pf), "AAPL US Equity", &settings, false, None, true);
         assert_eq!(snap.levels.len(), 2);
         assert!(!snap.chart_mark);

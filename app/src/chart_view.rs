@@ -542,7 +542,7 @@ impl ChartState {
 
     fn effective_history(&self) -> tr_data::HistoryOptions {
         if matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf) {
-            self.data.history
+            tr_data::HistoryOptions { session: self.effective_session(), ..self.data.history }
         } else {
             Default::default()
         }
@@ -3335,7 +3335,7 @@ impl ChartState {
         ui.separator();
         menu_section(ui, "Alerts & account");
         self.alerts_menu(ui);
-        ui.menu_button("Positions & orders", |ui| self.account_overlay.menu(ui, &mut self.data.account));
+        ui.menu_button("Show positions and orders", |ui| self.account_overlay.menu(ui, &mut self.data.account));
         ui.separator();
         menu_section(ui, "Tools");
         self.replay_export_menu(ui, w);
