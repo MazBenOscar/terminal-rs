@@ -170,6 +170,13 @@ impl MarketData for Markets {
         }
         .into()
     }
+    async fn crypto_stats(&self, symbol: &str) -> Result<crate::crypto_catalog::Rolling24h> {
+        checked_security(symbol)?;
+        self.crypto.crypto_stats(symbol).await
+    }
+    async fn crypto_catalog(&self, venue: tr_core::crypto::CryptoVenue) -> Result<crate::crypto_catalog::Catalog> {
+        self.crypto.crypto_catalog(venue).await
+    }
     fn crypto_instrument(&self, symbol: &str) -> Option<tr_core::crypto::CryptoInstrument> {
         crate::crypto::resolved_instrument(&checked_security(symbol).ok()?).ok()
     }

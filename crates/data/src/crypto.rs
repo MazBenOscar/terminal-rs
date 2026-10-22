@@ -218,6 +218,8 @@ pub fn parse_coinbase_book(json: &str, symbol: &str, depth: usize) -> Result<cra
 
 pub struct CryptoProvider {
     client: reqwest::Client,
+    catalogs: crate::crypto_catalog::CatalogCache,
+    metric_slots: tokio::sync::Semaphore,
     #[cfg(test)]
     test_rest: Option<String>,
 }
@@ -230,9 +232,50 @@ impl CryptoProvider {
             .build()?;
         Ok(Self {
             client,
+            catalogs: Default::default(),
+            metric_slots: tokio::sync::Semaphore::new(4),
             #[cfg(test)]
             test_rest: None,
         })
+    }
+
+    pub async fn crypto_catalog(&self, venue: CryptoVenue) -> Result<crate::crypto_catalog::Catalog> {
+        self.catalogs.load(&self.client, venue).await
+    }
+
+    /// Market-data statistics only; the semaphore and deadline also bound time
+    /// spent waiting behind another scan's requests.
+    pub async fn crypto_stats(&self, symbol: &str) -> Result<crate::crypto_catalog::Rolling24h> {
+        let route = resolved_instrument(&crate::security(symbol))?;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let _permit = self.metric_slots.acquire().await.context("crypto metric limiter closed")?;
+            if route.venue == CryptoVenue::Coinbase {
+                let body = self
+                    .get(&format!("{}/products/{}/stats", self.quote_host(COINBASE_REST), route.native_symbol), &[])
+                    .await?;
+                return crate::crypto_catalog::parse_rolling(&route, &body, chrono::Utc::now().timestamp());
+            }
+            let mut last_error = anyhow!("no Binance statistics response");
+            for host in BINANCE_REST {
+                match async {
+                    let body = self
+                        .get(
+                            &format!("{}/api/v3/ticker/24hr", self.quote_host(host)),
+                            &[("symbol", route.native_symbol.clone())],
+                        )
+                        .await?;
+                    crate::crypto_catalog::parse_rolling(&route, &body, chrono::Utc::now().timestamp())
+                }
+                .await
+                {
+                    Ok(statistics) => return Ok(statistics),
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(last_error)
+        })
+        .await
+        .context("crypto rolling statistics timed out")?
     }
 
     async fn get(&self, url: &str, query: &[(&str, String)]) -> Result<String> {
@@ -691,6 +734,50 @@ mod tests {
         assert!(quotes.iter().all(|q| q.last == 100.0 && q.crypto_source.as_ref().unwrap().native_symbol == "BTC-USD"));
         assert_eq!(quotes[0].ts, quotes[1].ts);
         server.join().unwrap();
+    }
+
+    /// Explicit network contract check. Restricted venues fail visibly and never
+    /// borrow a different exchange's product. Run manually with --ignored.
+    #[tokio::test]
+    #[ignore = "public exchange network availability and regional restrictions"]
+    async fn live_catalog_quote_history_keep_exact_venue() {
+        let provider = CryptoProvider::new().unwrap();
+        for venue in [CryptoVenue::Binance, CryptoVenue::Coinbase] {
+            let catalog = provider
+                .crypto_catalog(venue)
+                .await
+                .unwrap_or_else(|error| panic!("{} catalog: {error:#}", venue.label()));
+            let product = catalog
+                .products
+                .iter()
+                .find(|p| p.base == "BTC" && p.quote == if venue == CryptoVenue::Binance { "USDT" } else { "USD" })
+                .expect("BTC spot product");
+            let key = product.security().key();
+            let quotes = provider.quotes(&[(key, product.security())]).await.unwrap();
+            let source = quotes[0].crypto_source.as_ref().unwrap();
+            assert_eq!(source.canonical_ticker(), product.canonical_ticker());
+            assert_eq!(source.venue, venue);
+            let statistics = provider.crypto_stats(&product.security().key()).await.unwrap();
+            statistics.validate().unwrap();
+            assert_eq!(statistics.instrument.canonical_ticker(), product.canonical_ticker());
+            eprintln!(
+                "{} rolling24h: base volume {}, quote volume {:?}, change {:?}",
+                venue.label(),
+                statistics.base_volume,
+                statistics.quote_volume,
+                statistics.change_percent
+            );
+            let bars = provider.history(&product.security(), Timeframe::H1, None, 10).await.unwrap();
+            assert!(!bars.is_empty());
+            assert!(bars.iter().all(valid_bar));
+            eprintln!(
+                "{}: {} products, {} history bars, quote source {}",
+                venue.label(),
+                catalog.products.len(),
+                bars.len(),
+                source.canonical_ticker()
+            );
+        }
     }
 
     #[test]

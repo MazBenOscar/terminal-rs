@@ -5,7 +5,7 @@
 //! - `TR_PROVIDER=sample` forces deterministic sample data (fully offline, with simulated
 //!   live ticks).
 //! - Otherwise [`markets::Markets`] routes each asset class to a free source: Binance public
-//!   REST/websocket (Coinbase as fallback) for crypto, Treasury.gov (FRED fallback) for US
+//!   REST/websocket for explicit Binance or Coinbase crypto products, Treasury.gov (FRED fallback) for US
 //!   Treasury yields, Yahoo Finance for FX, indices, futures, ETFs and stocks, or Alpaca for
 //!   US stocks/ETFs when `APCA_API_KEY_ID` + `APCA_API_SECRET_KEY` are set.
 //!
@@ -15,6 +15,7 @@
 pub mod alpaca;
 pub mod cache;
 pub mod crypto;
+pub mod crypto_catalog;
 pub mod markets;
 pub mod questrade;
 pub mod rss;
@@ -290,6 +291,14 @@ pub trait MarketData: Send + Sync {
         None
     }
 
+    /// Active exchange spot products. Unsupported/sample providers fail explicitly.
+    async fn crypto_catalog(&self, _venue: tr_core::crypto::CryptoVenue) -> Result<crypto_catalog::Catalog> {
+        anyhow::bail!("Crypto discovery requires a live exchange data provider")
+    }
+    async fn crypto_stats(&self, _symbol: &str) -> Result<crypto_catalog::Rolling24h> {
+        anyhow::bail!("Rolling 24-hour crypto statistics are unavailable from this provider")
+    }
+
     /// Up to `limit` bars at `tf` ending at or before `end` (Unix seconds; `None` = now),
     /// ascending by time. Paging older history means calling again with `end` set to the
     /// oldest bar already held.
@@ -450,6 +459,12 @@ impl<P: MarketData> MarketData for Fallback<P> {
 
     fn crypto_instrument(&self, symbol: &str) -> Option<tr_core::crypto::CryptoInstrument> {
         self.primary.crypto_instrument(symbol)
+    }
+    async fn crypto_catalog(&self, venue: tr_core::crypto::CryptoVenue) -> Result<crypto_catalog::Catalog> {
+        self.primary.crypto_catalog(venue).await
+    }
+    async fn crypto_stats(&self, symbol: &str) -> Result<crypto_catalog::Rolling24h> {
+        self.primary.crypto_stats(symbol).await
     }
     fn name(&self) -> &str {
         &self.name

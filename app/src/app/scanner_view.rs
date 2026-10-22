@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use egui::{Align2, Color32, RichText, Sense, Ui, pos2};
 use tr_core::Timeframe;
+use tr_core::crypto::CryptoUniverseFilter;
 use tr_core::scanner::{
     Comparison, ConditionGroup, ConditionItem, FormulaCondition, MAX_BARS_AGO, MAX_CONDITIONS, MAX_GROUP_DEPTH,
     MatchMode, ScanCondition, ScanDefinition, ScanOperand, ScanOutcome, Source,
@@ -31,6 +32,7 @@ pub struct ScannerPane {
     notice: Option<String>,
     pub(super) matches_only: bool,
     pub universe: Universe,
+    pub crypto_filter: CryptoUniverseFilter,
     /// Universe scan progress: symbols evaluated and total.
     pub progress: Option<(usize, usize)>,
     /// Stops the running universe scan.
@@ -45,6 +47,8 @@ pub struct ScannerPane {
     started: Option<chrono::DateTime<chrono::Utc>>,
     run_duration: chrono::Duration,
     universe_size: Option<usize>,
+    catalog_status: Option<String>,
+    crypto_stats: std::collections::BTreeMap<String, Result<tr_data::crypto_catalog::Rolling24h, String>>,
 }
 
 impl Default for ScannerPane {
@@ -58,7 +62,8 @@ impl ScannerPane {
         Self::from_settings(definition.into())
     }
 
-    pub fn from_settings(settings: ScanSettings) -> Self {
+    pub fn from_settings(mut settings: ScanSettings) -> Self {
+        settings.crypto_filter.sanitize();
         let (saved, notice) = match load_saved() {
             Ok(saved) => (saved, None),
             Err(e) => (Vec::new(), Some(e)),
@@ -74,6 +79,7 @@ impl ScannerPane {
             notice,
             matches_only: true,
             universe: settings.universe,
+            crypto_filter: settings.crypto_filter,
             progress: None,
             cancel: None,
             show_unavailable: false,
@@ -86,6 +92,8 @@ impl ScannerPane {
             started: None,
             run_duration: chrono::Duration::zero(),
             universe_size: None,
+            catalog_status: None,
+            crypto_stats: Default::default(),
         }
     }
 
@@ -112,6 +120,8 @@ impl ScannerPane {
         self.entered.clear();
         self.exited.clear();
         self.universe_size = None;
+        self.catalog_status = None;
+        self.crypto_stats.clear();
     }
 
     fn stop(&mut self) {
@@ -134,6 +144,11 @@ impl ScannerPane {
         let completed = chrono::Utc::now();
         self.run_duration = self.started.map_or(chrono::Duration::zero(), |start| completed - start);
         let stopped = self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+        if self.universe.crypto_venue().is_some() && rows.len() == 1 && rows[0].symbol == self.universe.label() {
+            // Directory failures have no product row. Keep the recovery message
+            // visible even when "Show unavailable" is off.
+            self.notice = rows[0].error.clone();
+        }
         self.entered.clear();
         self.exited.clear();
         if !stopped {
@@ -159,9 +174,60 @@ impl ScannerPane {
         self.restrict_refresh();
     }
 
+    pub fn catalog_info(&mut self, generation: u64, available: usize, selected: usize, fetched_at: i64) {
+        if !self.running || generation != self.generation {
+            return;
+        }
+        let timestamp = chrono::DateTime::from_timestamp(fetched_at, 0)
+            .map_or_else(|| "unknown time".into(), |at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string());
+        self.catalog_status = Some(format!(
+            "{available} supported active spot products match filters · {selected} selected (cap {}, page {}) · directory fetched {timestamp}",
+            self.crypto_filter.limit,
+            self.crypto_filter.page.saturating_add(1)
+        ));
+        self.universe_size = Some(selected);
+    }
+
+    pub fn crypto_stats(
+        &mut self,
+        generation: u64,
+        symbol: String,
+        result: Result<tr_data::crypto_catalog::Rolling24h, String>,
+    ) {
+        if !self.running
+            || generation != self.generation
+            || self.crypto_stats.len() >= 200 && !self.crypto_stats.contains_key(&symbol)
+        {
+            return;
+        }
+        let Some(venue) = self.universe.crypto_venue() else { return };
+        let Ok(instrument) = tr_core::crypto::CryptoInstrument::parse(&symbol) else { return };
+        if instrument.venue != venue || !self.crypto_filter.matches(&instrument) {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp();
+        let result = result.and_then(|stats| {
+            stats.validate().map_err(|e| e.to_string())?;
+            if stats.instrument.canonical_ticker() != instrument.canonical_ticker()
+                || stats.observed_at > now.saturating_add(30)
+                || stats.observed_at < now.saturating_sub(60)
+            {
+                return Err("24h metrics are stale or belong to another exchange product; refresh the scan".into());
+            }
+            Ok(stats)
+        });
+        self.crypto_stats.insert(instrument.canonical_ticker(), result);
+    }
+
     fn restrict_refresh(&mut self) {
         // Until the directory arrives, conservatively treat a market universe as large.
-        let size = if self.universe == Universe::Watchlist { 0 } else { self.universe_size.unwrap_or(1001) };
+        let size = if self.universe == Universe::Watchlist {
+            0
+        } else if self.universe.crypto_venue().is_some() {
+            self.crypto_filter.limit
+        } else {
+            self.universe_size.unwrap_or(1001)
+        };
         if self.refresh.is_some_and(|minutes| !interval_allowed(size, minutes)) {
             self.refresh = Some(15);
         }
@@ -226,8 +292,26 @@ fn load_saved() -> Result<Vec<ScanSettings>, String> {
 }
 
 fn load_saved_at(dir: &std::path::Path) -> Result<Vec<ScanSettings>, String> {
-    match std::fs::read(dir.join("scans.json")) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("Could not read saved scans: {e}")),
+    use std::io::Read;
+    match std::fs::File::open(dir.join("scans.json")) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(8 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("Could not read saved scans: {e}"))?;
+            if bytes.len() > 8 * 1024 * 1024 {
+                return Err("Saved scan library exceeds 8 MiB".into());
+            }
+            let mut saved: Vec<ScanSettings> =
+                serde_json::from_slice(&bytes).map_err(|e| format!("Could not read saved scans: {e}"))?;
+            if saved.len() > 500 {
+                return Err("Saved scan library exceeds 500 scans".into());
+            }
+            for settings in &mut saved {
+                settings.crypto_filter.sanitize();
+            }
+            Ok(saved)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!("Could not open saved scans: {e}")),
     }
@@ -240,11 +324,17 @@ fn save_definition(definition: &ScanSettings) -> Result<Vec<ScanSettings>, Strin
 
 fn save_definition_at(definition: &ScanSettings, dir: &std::path::Path) -> Result<Vec<ScanSettings>, String> {
     definition.definition.validate()?;
+    if definition.universe.crypto_venue().is_some() {
+        definition.crypto_filter.validate()?;
+    }
     let mut saved = load_saved_at(dir)?;
     saved.retain(|s| !s.definition.name.eq_ignore_ascii_case(definition.definition.name.trim()));
     let mut definition = definition.clone();
     definition.definition.name = definition.definition.name.trim().into();
     saved.push(definition);
+    if saved.len() > 500 {
+        return Err("Saved scan library is full (500 scans); replace an existing scan".into());
+    }
     saved.sort_by(|a, b| a.definition.name.cmp(&b.definition.name));
     std::fs::create_dir_all(dir).map_err(|e| format!("Could not create scan folder: {e}"))?;
     let bytes = serde_json::to_vec_pretty(&saved).map_err(|e| format!("Could not encode scans: {e}"))?;
@@ -428,6 +518,10 @@ fn condition_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) -> (egui::Rect, egui::R
 
 fn run_enabled(definition: &ScanDefinition, running: bool, data_ready: bool) -> bool {
     !running && data_ready && definition.validate().is_ok()
+}
+
+fn universe_enabled(universe: Universe, bulk_ready: bool) -> bool {
+    !universe.requires_bulk() || bulk_ready
 }
 
 fn can_add_leaf(leaves: usize) -> bool {
@@ -636,7 +730,7 @@ pub fn show_named(
                         .selected_text(if pane.universe == Universe::Watchlist { format!("Watchlist: {watchlist_name}") } else { pane.universe.label().into() })
                         .show_ui(ui, |ui| {
                             for universe in Universe::ALL {
-                                let enabled = universe == Universe::Watchlist || bulk_ready;
+                                let enabled = universe_enabled(universe, bulk_ready);
                                 ui.add_enabled_ui(enabled, |ui| {
                                     ui.selectable_value(&mut pane.universe, universe, if universe == Universe::Watchlist { format!("Watchlist: {watchlist_name}") } else { universe.label().into() })
                                         .on_disabled_hover_text(
@@ -650,6 +744,35 @@ pub fn show_named(
                     }
                 });
             });
+            if pane.universe.crypto_venue().is_some() {
+                let filter_before = pane.crypto_filter.clone();
+                ui.label(RichText::new("Active spot products only · exact base/quote filters · alphabetical selection within the cap").small().color(muted()));
+                ui.horizontal_wrapped(|ui| {
+                    field(ui, "Base", |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut pane.crypto_filter.base).desired_width(dp(72.0)).hint_text("Any").char_limit(24));
+                    });
+                    field(ui, "Quote", |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut pane.crypto_filter.quote).desired_width(dp(72.0)).hint_text("Any").char_limit(24));
+                    });
+                    field(ui, "Max products", |ui| {
+                        ui.add(egui::DragValue::new(&mut pane.crypto_filter.limit).range(1..=200));
+                    });
+                    if pane.crypto_filter.base != filter_before.base || pane.crypto_filter.quote != filter_before.quote || pane.crypto_filter.limit != filter_before.limit {
+                        pane.crypto_filter.page = 0;
+                    }
+                    let mut page = pane.crypto_filter.page.saturating_add(1);
+                    let pages = 30_000usize.div_ceil(pane.crypto_filter.limit.clamp(1, 200));
+                    field(ui, "Page", |ui| {
+                        if ui.add(egui::DragValue::new(&mut page).range(1..=pages)).changed() {
+                            pane.crypto_filter.page = page.saturating_sub(1);
+                        }
+                    });
+                });
+                if pane.crypto_filter != filter_before {
+                    pane.crypto_filter.sanitize();
+                    pane.invalidate();
+                }
+            }
             ui.add_space(dp(6.0));
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Conditions").color(muted()));
@@ -671,7 +794,9 @@ pub fn show_named(
         if pane.definition != before {
             pane.invalidate();
         }
-        let validation = pane.definition.validate().err();
+        let validation = pane.definition.validate().err().or_else(|| {
+            pane.universe.crypto_venue().and_then(|_| pane.crypto_filter.validate().err())
+        });
         if let Some(error) = &validation {
             ui.label(RichText::new(error).small().color(muted()));
         }
@@ -681,8 +806,8 @@ pub fn show_named(
         let can_run = run_enabled(
             &pane.definition,
             pane.running,
-            if market { bulk_ready } else { !symbols.is_empty() && symbols.len() <= 200 },
-        );
+            if market { universe_enabled(pane.universe, bulk_ready) } else { !symbols.is_empty() && symbols.len() <= 200 },
+        ) && validation.is_none();
         ui.horizontal_wrapped(|ui| {
             let run = egui::Button::new(RichText::new("Run scan").color(Color32::WHITE))
                 .fill(theme::accent())
@@ -695,7 +820,7 @@ pub fn show_named(
                 let label = pane.refresh.map_or_else(|| "Off".into(), |m| format!("{m} min"));
                 egui::ComboBox::from_id_salt("scan-refresh").selected_text(label).show_ui(ui, |ui| {
                     ui.selectable_value(&mut pane.refresh, None, "Off");
-                    let size = if market { pane.universe_size.unwrap_or(1001) } else { symbols.len() };
+                    let size = if pane.universe.crypto_venue().is_some() { pane.crypto_filter.limit } else if market { pane.universe_size.unwrap_or(1001) } else { symbols.len() };
                     for minutes in [1, 5, 15, 60] {
                         ui.add_enabled_ui(interval_allowed(size, minutes), |ui| {
                             ui.selectable_value(&mut pane.refresh, Some(minutes), format!("{minutes} min"))
@@ -725,6 +850,8 @@ pub fn show_named(
                 pane.started = Some(now);
                 pane.running = true;
                 pane.notice = None;
+                pane.catalog_status = None;
+                pane.crypto_stats.clear();
                 let cancel = Arc::new(AtomicBool::new(false));
                 pane.cancel = Some(cancel.clone());
                 if market {
@@ -735,6 +862,7 @@ pub fn show_named(
                         generation: pane.generation,
                         definition: pane.definition.clone(),
                         universe: pane.universe,
+                        crypto_filter: pane.crypto_filter.clone(),
                         cancel,
                     });
                 } else {
@@ -749,7 +877,7 @@ pub fn show_named(
                 }
             }
             if ui.add_enabled(!pane.running && validation.is_none(), egui::Button::new("Save scan")).clicked() {
-                match save_definition(&ScanSettings { definition: pane.definition.clone(), universe: pane.universe, refresh: pane.refresh }) {
+                match save_definition(&ScanSettings { definition: pane.definition.clone(), universe: pane.universe, refresh: pane.refresh, crypto_filter: pane.crypto_filter.clone() }) {
                     Ok(saved) => {
                         pane.saved = saved;
                         pane.notice = Some(SAVED_NOTICE.into());
@@ -763,7 +891,7 @@ pub fn show_named(
                     ui.label(RichText::new("Presets").small().color(muted()));
                     for preset in ScanDefinition::presets() {
                         if ui.selectable_label(false, &preset.name).clicked() {
-                            selected = Some(ScanSettings { definition: preset, universe: pane.universe, refresh: pane.refresh });
+                            selected = Some(ScanSettings { definition: preset, universe: pane.universe, refresh: pane.refresh, crypto_filter: pane.crypto_filter.clone() });
                         }
                     }
                     ui.separator();
@@ -782,6 +910,8 @@ pub fn show_named(
                 pane.definition = settings.definition;
                 pane.universe = settings.universe;
                 pane.refresh = settings.refresh;
+                pane.crypto_filter = settings.crypto_filter;
+                pane.crypto_filter.sanitize();
                 pane.invalidate();
             }
             if pane.running && !market {
@@ -799,7 +929,7 @@ pub fn show_named(
             let (done, total) = pane.progress.unwrap_or((0, 0));
             ui.horizontal(|ui| {
                 let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
-                let text = if total == 0 { "Loading the US symbol directory…".to_string() } else { format!("{done} / {total}") };
+                let text = if total == 0 { if pane.universe.crypto_venue().is_some() { "Loading the exchange product directory…" } else { "Loading the US symbol directory…" }.to_string() } else { format!("{done} / {total}") };
                 ui.add(egui::ProgressBar::new(fraction).text(text).desired_width(dp(260.0)));
                 let stopping = pane.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
                 if ui.add_enabled(!stopping, egui::Button::new(if stopping { "Stopping…" } else { "Stop" })).clicked() {
@@ -825,7 +955,7 @@ pub fn show_named(
         let warn = |ui: &mut Ui, message: &str| {
             ui.label(RichText::new(message).color(amber()));
         };
-        if market && !bulk_ready {
+        if pane.universe.requires_bulk() && !bulk_ready {
             warn(ui, "Market-wide scans need a bulk data source: set up Questrade in Settings › Brokerage.");
         }
         if !market && symbols.is_empty() {
@@ -837,6 +967,9 @@ pub fn show_named(
         if let Some(notice) = &pane.notice {
             let color = if notice == SAVED_NOTICE { theme::up() } else { theme::down() };
             ui.label(RichText::new(notice).color(color));
+        }
+        if let Some(catalog_status) = &pane.catalog_status {
+            ui.label(RichText::new(catalog_status).small().color(muted()));
         }
         if let Some(completed) = pane.completed.filter(|_| !pane.running) {
             let count = |outcome| {
@@ -925,6 +1058,57 @@ fn compact(v: f64) -> String {
 
 const SAVED_NOTICE: &str = "Scan saved to scans.json";
 
+fn ready_stats<'a>(pane: &'a ScannerPane, symbol: &str, now: i64) -> Option<&'a tr_data::crypto_catalog::Rolling24h> {
+    let ticker = tr_core::Security::parse(symbol)?.ticker;
+    pane.crypto_stats
+        .get(&ticker)?
+        .as_ref()
+        .ok()
+        .filter(|stats| stats.observed_at <= now.saturating_add(30) && stats.observed_at >= now.saturating_sub(60))
+}
+
+fn rolling_order(a: Option<f64>, b: Option<f64>, descending: bool) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            if descending {
+                b.total_cmp(&a)
+            } else {
+                a.total_cmp(&b)
+            }
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn stats_hint(pane: &ScannerPane, symbol: &str, now: i64) -> String {
+    let ticker = tr_data::security(symbol).ticker;
+    match pane.crypto_stats.get(&ticker) {
+        Some(Ok(stats)) => {
+            let timestamp = |ts: Option<i64>| {
+                ts.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                    .map_or_else(|| "unavailable".into(), |ts| ts.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            };
+            let observed = timestamp(Some(stats.observed_at));
+            let state = if ready_stats(pane, symbol, now).is_some() {
+                "Rolling 24h"
+            } else {
+                "Stale 24h metrics; refresh the scan"
+            };
+            format!(
+                "{state} · observed {observed}\nBase volume: {} · quote volume: {}\nExchange window: {} to {}. Change uses the exchange's rolling 24h window. Missing metrics are unavailable.",
+                stats.instrument.base,
+                stats.instrument.quote,
+                timestamp(stats.window_start),
+                timestamp(stats.window_end)
+            )
+        }
+        Some(Err(error)) => format!("24h metrics unavailable: {error}"),
+        None => "24h metrics unavailable; awaiting the exchange observation".into(),
+    }
+}
+
 /// Results drawn like the watchlist: a header band, hover-washed rows, click to chart.
 fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec<Action>) {
     let matches = matching_symbols(&pane.rows);
@@ -961,14 +1145,56 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
             });
         });
     }
+    if pane.universe.crypto_venue().is_some() {
+        egui::ScrollArea::horizontal().id_salt("crypto-results-scroll").show(ui, |ui| {
+            ui.set_min_width(dp(1180.0));
+            results_rows(ui, pane, market, actions);
+        });
+    } else {
+        results_rows(ui, pane, market, actions);
+    }
+}
+
+fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec<Action>) {
     let row_h = dp(22.0);
     let w = ui.available_width();
     // Left edges: security, result, last bar, bar age, details.
     let names =
         ui.data(|d| d.get_temp::<crate::security_names::Names>(egui::Id::new("security-names"))).unwrap_or_default();
-    let show_name = w >= dp(750.0);
+    let crypto = pane.universe.crypto_venue().is_some();
+    let security_width = if pane.rows.iter().any(|row| row.symbol.contains(':')) { dp(220.0) } else { dp(100.0) };
+    let show_name = !crypto && w >= dp(750.0) + security_width - dp(100.0);
     let shift = if show_name { dp(150.0) } else { 0.0 };
-    let x = [8.0, dp(100.0) + shift, dp(196.0) + shift, dp(320.0) + shift, dp(392.0) + shift];
+    let x = [
+        8.0,
+        security_width + shift,
+        dp(96.0) + security_width + shift,
+        dp(220.0) + security_width + shift,
+        dp(292.0) + security_width + shift,
+    ];
+    let now = chrono::Utc::now().timestamp();
+    let sort_id = ui.id().with("crypto-24h-sort");
+    let mut sort = ui.data(|data| data.get_temp::<bool>(sort_id));
+    if crypto {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Rolling 24h exchange metrics · volumes use each product's base and quote assets")
+                    .small()
+                    .color(muted()),
+            );
+            if ui
+                .button(match sort {
+                    None => "Sort 24h %",
+                    Some(true) => "24h %: highest first",
+                    Some(false) => "24h %: lowest first",
+                })
+                .clicked()
+            {
+                sort = Some(!sort.unwrap_or(false));
+                ui.data_mut(|data| data.insert_temp(sort_id, sort.unwrap()));
+            }
+        });
+    }
     let (hdr, _) = ui.allocate_exact_size(egui::vec2(w, row_h), Sense::hover());
     let p = ui.painter_at(hdr);
     p.rect_filled(hdr, theme::CONTROL_RADIUS, theme::header());
@@ -976,10 +1202,26 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
         p.text(pos2(hdr.left() + x[k], hdr.center().y), Align2::LEFT_CENTER, title, ui_font(11.5), muted());
     }
     if show_name {
-        p.text(pos2(hdr.left() + dp(100.0), hdr.center().y), Align2::LEFT_CENTER, "Name", ui_font(11.5), muted());
+        p.text(pos2(hdr.left() + security_width, hdr.center().y), Align2::LEFT_CENTER, "Name", ui_font(11.5), muted());
+    }
+    if crypto {
+        for (offset, label) in [(700.0, "24h %"), (800.0, "Volume (base)"), (950.0, "Volume (quote)")] {
+            p.text(pos2(hdr.left() + dp(offset), hdr.center().y), Align2::LEFT_CENTER, label, ui_font(11.5), muted());
+        }
     }
     let mut shown = 0;
-    for row in &pane.rows {
+    let mut rows: Vec<_> = pane.rows.iter().collect();
+    if crypto && let Some(descending) = sort {
+        rows.sort_by(|a, b| {
+            rolling_order(
+                ready_stats(pane, &a.symbol, now).and_then(|s| s.change_percent),
+                ready_stats(pane, &b.symbol, now).and_then(|s| s.change_percent),
+                descending,
+            )
+            .then_with(|| a.symbol.cmp(&b.symbol))
+        });
+    }
+    for row in rows {
         let outcome = row.evaluation.as_ref().map(|e| e.outcome).unwrap_or(ScanOutcome::Unavailable);
         if pane.matches_only && outcome == ScanOutcome::NoMatch {
             continue;
@@ -993,10 +1235,16 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
         let p = ui.painter_at(r);
         let y = r.center().y;
         let ticker = tr_data::security(&row.symbol).ticker;
-        p.text(pos2(r.left() + x[0], y), Align2::LEFT_CENTER, &ticker, mono(12.5), amber());
+        let mut job = egui::text::LayoutJob::simple_singleline(ticker.clone(), mono(12.5), amber());
+        job.wrap.max_width = security_width - dp(14.0);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        let galley = p.layout_job(job);
+        p.galley(pos2(r.left() + x[0], y - galley.size().y / 2.0), galley, amber());
         if show_name {
             let hit = egui::Rect::from_min_max(
-                pos2(r.left() + dp(100.0), r.top()),
+                pos2(r.left() + security_width, r.top()),
                 pos2(r.left() + x[1] - dp(6.0), r.bottom()),
             );
             crate::security_names::paint(ui, hit, names.name(&row.symbol).unwrap_or(""), ("scan-name", &row.symbol));
@@ -1039,7 +1287,30 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
                     .unwrap_or_default()
             });
         let detail_color = if row.error.is_some() { theme::down() } else { muted() };
-        p.text(pos2(r.left() + x[4], y), Align2::LEFT_CENTER, &detail, mono(12.0), detail_color);
+        let detail_painter = if crypto {
+            p.with_clip_rect(egui::Rect::from_min_max(r.min, pos2(r.left() + dp(690.0), r.bottom())))
+        } else {
+            p.clone()
+        };
+        detail_painter.text(pos2(r.left() + x[4], y), Align2::LEFT_CENTER, &detail, mono(12.0), detail_color);
+        if crypto {
+            let stats = ready_stats(pane, &row.symbol, now);
+            let change = stats.and_then(|s| s.change_percent).map_or_else(
+                || {
+                    if stats.is_none() && pane.crypto_stats.get(&ticker).is_some_and(Result::is_ok) {
+                        "Stale".into()
+                    } else {
+                        "—".into()
+                    }
+                },
+                |v| format!("{v:+.2}%"),
+            );
+            let base = stats.map_or_else(|| "—".into(), |s| compact(s.base_volume));
+            let quote = stats.and_then(|s| s.quote_volume).map_or_else(|| "—".into(), compact);
+            for (offset, value) in [(700.0, change), (800.0, base), (950.0, quote)] {
+                p.text(pos2(r.left() + dp(offset), y), Align2::LEFT_CENTER, value, mono(12.0), text());
+            }
+        }
         let source = if row.simulated {
             "Simulated data"
         } else if row.error.is_some() {
@@ -1049,8 +1320,9 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
         } else {
             "Provider snapshot"
         };
+        let metrics = if crypto { format!("\n{}", stats_hint(pane, &row.symbol, now)) } else { String::new() };
         let resp = resp.on_hover_text(format!(
-            "{} · {source}\n{detail}\nClick to chart. Bar age is the age of the bar's opening timestamp, not a freshness guarantee.",
+            "{} · {source}\n{detail}{metrics}\nClick to chart. Bar age is the age of the bar's opening timestamp, not a freshness guarantee.",
             row.symbol
         ));
         resp.context_menu(|ui| {
@@ -1086,6 +1358,194 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn crypto_metrics(symbol: &str, observed_at: i64) -> tr_data::crypto_catalog::Rolling24h {
+        tr_data::crypto_catalog::Rolling24h {
+            instrument: tr_core::crypto::CryptoInstrument::parse(symbol).unwrap(),
+            observed_at,
+            window_start: None,
+            window_end: None,
+            last: 60_000.0,
+            change_percent: Some(2.5),
+            base_volume: 100.0,
+            quote_volume: None,
+        }
+    }
+
+    #[test]
+    fn crypto_metrics_keep_missing_units_and_reject_stale_wrong_generation_or_source() {
+        let now = chrono::Utc::now().timestamp();
+        let mut pane = ScannerPane::default();
+        pane.universe = Universe::CoinbaseSpot;
+        pane.running = true;
+        pane.generation = 3;
+        pane.crypto_stats(2, "COINBASE:BTC-USD".into(), Ok(crypto_metrics("COINBASE:BTC-USD", now)));
+        pane.crypto_stats(3, "BINANCE:BTCUSDT".into(), Ok(crypto_metrics("BINANCE:BTCUSDT", now)));
+        assert!(pane.crypto_stats.is_empty());
+        pane.crypto_stats(3, "COINBASE:BTC-USD".into(), Ok(crypto_metrics("COINBASE:BTC-USD", now)));
+        assert!(ready_stats(&pane, "COINBASE:BTC-USD Curncy", now).unwrap().quote_volume.is_none());
+        assert!(ready_stats(&pane, "COINBASE:BTC-USD", now + 61).is_none());
+        assert!(stats_hint(&pane, "COINBASE:BTC-USD", now + 61).contains("Stale"));
+        pane.crypto_stats(3, "COINBASE:ETH-USD".into(), Ok(crypto_metrics("COINBASE:BTC-USD", now)));
+        assert!(pane.crypto_stats["COINBASE:ETH-USD"].is_err());
+        pane.crypto_stats(3, "COINBASE:SOL-USD".into(), Ok(crypto_metrics("COINBASE:SOL-USD", now - 61)));
+        assert!(pane.crypto_stats["COINBASE:SOL-USD"].is_err());
+        for index in 0..205 {
+            pane.crypto_stats(3, format!("COINBASE:C{index}-USD"), Err("Unavailable".into()));
+        }
+        assert_eq!(pane.crypto_stats.len(), 200);
+        pane.finish(3, Vec::new());
+        assert!(!pane.crypto_stats.is_empty());
+        pane.invalidate();
+        assert!(pane.crypto_stats.is_empty());
+    }
+
+    #[test]
+    fn rolling_change_sort_keeps_missing_metrics_last_in_either_direction() {
+        for descending in [true, false] {
+            let mut values = [None, Some(-3.0), Some(8.0), None];
+            values.sort_by(|a, b| rolling_order(*a, *b, descending));
+            assert_eq!(&values[2..], &[None, None]);
+            assert_eq!(values[0], if descending { Some(8.0) } else { Some(-3.0) });
+        }
+    }
+
+    #[test]
+    fn crypto_universes_run_without_equity_bulk_provider() {
+        for universe in [Universe::BinanceSpot, Universe::CoinbaseSpot, Universe::Watchlist] {
+            assert!(universe_enabled(universe, false));
+        }
+        assert!(!universe_enabled(Universe::Nasdaq, false));
+        assert!(universe_enabled(Universe::Nasdaq, true));
+        let mut settings = ScanSettings::from(ScanDefinition::default());
+        settings.universe = Universe::CoinbaseSpot;
+        settings.crypto_filter =
+            CryptoUniverseFilter { base: " btc ".into(), quote: " usd ".into(), limit: 12, page: 0 };
+        settings.refresh = Some(1);
+        let mut pane = ScannerPane::from_settings(settings);
+        assert_eq!(pane.crypto_filter.base, "BTC");
+        assert_eq!(pane.crypto_filter.quote, "USD");
+        pane.restrict_refresh();
+        assert_eq!(pane.refresh, Some(1));
+    }
+
+    #[test]
+    fn crypto_catalog_info_is_scoped_to_running_generation_and_survives_finish() {
+        let mut pane = ScannerPane::default();
+        pane.universe = Universe::CoinbaseSpot;
+        pane.running = true;
+        pane.generation = 5;
+        pane.crypto_filter.limit = 20;
+        pane.catalog_info(4, 700, 200, 1_790_000_000);
+        assert!(pane.catalog_status.is_none());
+        pane.catalog_info(5, 80, 20, 1_790_000_000);
+        assert!(pane.catalog_status.as_ref().unwrap().contains("80 supported active spot products"));
+        assert!(pane.catalog_status.as_ref().unwrap().contains("20 selected (cap 20, page 1)"));
+        assert!(pane.catalog_status.as_ref().unwrap().contains("UTC"));
+        pane.finish(5, Vec::new());
+        assert!(pane.catalog_status.is_some());
+        pane.catalog_info(5, 1, 1, 1_790_000_000);
+        assert!(pane.catalog_status.as_ref().unwrap().contains("80 supported active"));
+        pane.baseline_ready = true;
+        pane.invalidate();
+        assert!(!pane.baseline_ready);
+        assert!(pane.catalog_status.is_none());
+    }
+
+    #[test]
+    fn crypto_discovery_failure_is_visible_without_unavailable_row_filter() {
+        let mut pane = ScannerPane::default();
+        pane.universe = Universe::BinanceSpot;
+        pane.running = true;
+        pane.generation = 1;
+        pane.finish(
+            1,
+            vec![ScanRow {
+                symbol: Universe::BinanceSpot.label().into(),
+                evaluation: None,
+                ts: None,
+                simulated: false,
+                error: Some("Exchange unavailable; retry discovery".into()),
+            }],
+        );
+        assert!(!pane.show_unavailable);
+        assert!(pane.notice.as_ref().unwrap().contains("retry discovery"));
+    }
+
+    #[test]
+    fn invalid_crypto_filter_is_preserved_for_validation_and_cannot_save() {
+        let dir = std::env::temp_dir().join(format!("tr-invalid-crypto-filter-{}", std::process::id()));
+        let mut settings = ScanSettings::from(ScanDefinition::default());
+        settings.universe = Universe::BinanceSpot;
+        settings.crypto_filter.quote = "USD/T".into();
+        let pane = ScannerPane::from_settings(settings.clone());
+        assert_eq!(pane.crypto_filter.quote, "USD/T");
+        assert!(pane.crypto_filter.validate().is_err());
+        assert!(save_definition_at(&settings, &dir).is_err());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn crypto_scheduled_ui_forwards_filter_without_bulk_and_blocks_invalid_filters() {
+        for width in [280.0, 900.0] {
+            let ctx = egui::Context::default();
+            let mut settings = ScanSettings::from(ScanDefinition::default());
+            settings.universe = Universe::CoinbaseSpot;
+            settings.refresh = Some(1);
+            settings.crypto_filter =
+                CryptoUniverseFilter { base: "BTC".into(), quote: "USD".into(), limit: 5, page: 0 };
+            let mut pane = ScannerPane::from_settings(settings);
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 900.0))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        show_named(ui, &mut pane, 1, &[], false, |request| requests.push(request), "Main");
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            assert_eq!(requests.len(), 1, "Scheduled scans must not overlap");
+            let Request::ScanUniverse { universe, crypto_filter, .. } = requests.pop().unwrap() else {
+                panic!("crypto request expected")
+            };
+            assert_eq!(universe, Universe::CoinbaseSpot);
+            assert_eq!(crypto_filter, pane.crypto_filter);
+            pane.crypto_stats(
+                pane.generation,
+                "COINBASE:BTC-USD".into(),
+                Ok(crypto_metrics("COINBASE:BTC-USD", chrono::Utc::now().timestamp())),
+            );
+            pane.finish(
+                pane.generation,
+                vec![ScanRow {
+                    symbol: "COINBASE:BTC-USD".into(),
+                    evaluation: Some(tr_core::scanner::ScanEvaluation {
+                        outcome: ScanOutcome::Match,
+                        conditions: Vec::new(),
+                        reason: None,
+                    }),
+                    ts: Some(chrono::Utc::now().timestamp()),
+                    simulated: false,
+                    error: None,
+                }],
+            );
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                show_named(ui, &mut pane, 1, &[], false, |request| requests.push(request), "Main");
+            });
+            assert!(!output.shapes.is_empty());
+            output.textures_delta.clear();
+            pane.crypto_filter.quote = "USD/T".into();
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                show_named(ui, &mut pane, 1, &[], false, |request| requests.push(request), "Main");
+            });
+            output.textures_delta.clear();
+            assert!(requests.is_empty(), "An invalid filter must not schedule an unfiltered scan");
+        }
+    }
 
     #[test]
     fn refresh_due_time_waits_after_completion_with_backpressure() {
@@ -1680,7 +2140,12 @@ mod tests {
             },
         };
         assert!(definition.validate().is_ok());
-        let settings = ScanSettings { definition: definition.clone(), universe: Universe::Nasdaq, refresh: None };
+        let settings = ScanSettings {
+            definition: definition.clone(),
+            universe: Universe::Nasdaq,
+            refresh: None,
+            crypto_filter: Default::default(),
+        };
         let saved = save_definition_at(&settings, &dir).unwrap();
         assert_eq!(saved.len(), 1);
         let loaded = load_saved_at(&dir).unwrap();
@@ -1865,6 +2330,7 @@ mod tests {
             notice: None,
             matches_only: true,
             universe: Universe::Watchlist,
+            crypto_filter: Default::default(),
             progress: None,
             cancel: None,
             show_unavailable: false,
@@ -1877,6 +2343,8 @@ mod tests {
             started: None,
             run_duration: chrono::Duration::zero(),
             universe_size: None,
+            catalog_status: None,
+            crypto_stats: Default::default(),
         };
         // Full pane layout, including narrow docks, without a network worker or GPU.
         for width in [280.0, 900.0] {
@@ -1923,6 +2391,7 @@ mod tests {
             definition: ScanDefinition { name: "First".into(), ..Default::default() },
             universe: Universe::Nasdaq,
             refresh: None,
+            crypto_filter: Default::default(),
         };
         assert_eq!(save_definition_at(&definition, &dir).unwrap().len(), 1);
         definition.definition.name = "Second".into();

@@ -220,9 +220,115 @@ pub fn split_pair(product: &str) -> Option<(&str, &str)> {
     })
 }
 
+/// Exact asset filters for a venue-owned crypto universe. Invalid filters fail
+/// closed: sanitizing never removes invalid characters or truncates an asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CryptoUniverseFilter {
+    #[serde(default)]
+    pub base: String,
+    #[serde(default)]
+    pub quote: String,
+    #[serde(default = "default_universe_limit")]
+    pub limit: usize,
+    /// Zero-based offset in the deterministically ordered matching catalog.
+    #[serde(default)]
+    pub page: usize,
+}
+
+fn default_universe_limit() -> usize {
+    200
+}
+
+impl Default for CryptoUniverseFilter {
+    fn default() -> Self {
+        Self { base: String::new(), quote: String::new(), limit: default_universe_limit(), page: 0 }
+    }
+}
+
+impl CryptoUniverseFilter {
+    pub const MAX_LIMIT: usize = 200;
+
+    /// Normalize ordinary surrounding spaces and ASCII case. Preserve invalid
+    /// values so validation can report them instead of widening the universe.
+    pub fn sanitize(&mut self) {
+        for asset in [&mut self.base, &mut self.quote] {
+            if asset.len() <= 80 && !asset.chars().any(char::is_control) {
+                *asset = asset.trim_matches(' ').to_ascii_uppercase();
+            }
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.base.is_empty() && !asset_valid(&self.base) {
+            return Err("Crypto base filter must be an ASCII asset code of at most 24 characters".into());
+        }
+        if !self.quote.is_empty() && !asset_valid(&self.quote) {
+            return Err("Crypto quote filter must be an ASCII asset code of at most 24 characters".into());
+        }
+        if self.limit == 0 || self.limit > Self::MAX_LIMIT {
+            return Err(format!("Crypto universe limit must be between 1 and {}", Self::MAX_LIMIT));
+        }
+        if self.page.checked_mul(self.limit).is_none_or(|offset| offset >= 30_000) {
+            return Err("Crypto universe page is outside the supported catalog range".into());
+        }
+        Ok(())
+    }
+
+    pub fn matches(&self, instrument: &CryptoInstrument) -> bool {
+        self.validate().is_ok()
+            && instrument.require_spot().is_ok()
+            && (self.base.is_empty() || self.base == instrument.base)
+            && (self.quote.is_empty() || self.quote == instrument.quote)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn universe_filters_default_and_normalize_without_changing_assets() {
+        let filter: CryptoUniverseFilter = serde_json::from_str("{}").unwrap();
+        assert_eq!(filter, CryptoUniverseFilter::default());
+        assert_eq!(filter.limit, 200);
+        let mut filter = CryptoUniverseFilter { base: " btc ".into(), quote: " usd ".into(), limit: 10, page: 0 };
+        filter.sanitize();
+        assert_eq!(filter.base, "BTC");
+        assert_eq!(filter.quote, "USD");
+        assert!(filter.validate().is_ok());
+        assert!(filter.matches(&CryptoInstrument::parse("COINBASE:BTC-USD").unwrap()));
+        assert!(!filter.matches(&CryptoInstrument::parse("BINANCE:BTCUSDT").unwrap()));
+        assert!(!filter.matches(&CryptoInstrument::parse("COINBASE:ETH-USD").unwrap()));
+        let filter = CryptoUniverseFilter::default();
+        assert!(!filter.matches(&CryptoInstrument::parse("BINANCE:BTCUSDT.P").unwrap()));
+    }
+
+    #[test]
+    fn invalid_universe_filters_fail_closed_after_sanitizing() {
+        let instrument = CryptoInstrument::parse("COINBASE:BTC-USD").unwrap();
+        for value in ["A".repeat(25), " ".repeat(100_000), "BTC/USD".into(), "\n".into(), "B TC".into(), "é".into()] {
+            let mut filter = CryptoUniverseFilter { base: value.clone(), ..Default::default() };
+            filter.sanitize();
+            assert!(filter.validate().is_err(), "{value:?}");
+            assert!(!filter.matches(&instrument));
+            let mut filter = CryptoUniverseFilter { quote: value, ..Default::default() };
+            filter.sanitize();
+            assert!(filter.validate().is_err());
+            assert!(!filter.matches(&instrument));
+        }
+        for limit in [0, 201, usize::MAX] {
+            let mut filter = CryptoUniverseFilter { limit, ..Default::default() };
+            filter.sanitize();
+            assert!(filter.validate().is_err());
+            assert!(!filter.matches(&instrument));
+        }
+        for (page, limit, valid) in
+            [(149, 200, true), (150, 200, false), (29_999, 1, true), (30_000, 1, false), (usize::MAX, 200, false)]
+        {
+            let filter = CryptoUniverseFilter { page, limit, ..Default::default() };
+            assert_eq!(filter.validate().is_ok(), valid);
+        }
+    }
 
     #[test]
     fn legacy_pairs_resolve_exact_quote_assets() {
