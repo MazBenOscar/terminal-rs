@@ -30,6 +30,7 @@ mod prefs;
 mod price_alerts;
 mod theme;
 mod themes;
+mod watch_sections;
 mod widgets;
 use chart_view::drawing_toolbar;
 mod security_names;

@@ -1710,14 +1710,11 @@ mod tests {
             ],
         );
         doc.watchlists = Some(vec![
-            crate::app::NamedWatchlist {
-                name: "Technology".into(),
-                symbols: vec!["AAPL US Equity".into(), "MSFT US Equity".into()],
-            },
-            crate::app::NamedWatchlist {
-                name: "Crypto".into(),
-                symbols: vec!["BTCUSD Curncy".into(), "ETHUSD Curncy".into()],
-            },
+            crate::app::NamedWatchlist::new(
+                "Technology".into(),
+                vec!["AAPL US Equity".into(), "MSFT US Equity".into()],
+            ),
+            crate::app::NamedWatchlist::new("Crypto".into(), vec!["BTCUSD Curncy".into(), "ETHUSD Curncy".into()]),
         ]);
         doc.active_watchlist = 1;
         doc.watch_columns.columns = vec![ColumnDef {

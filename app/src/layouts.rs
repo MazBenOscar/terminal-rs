@@ -305,7 +305,7 @@ impl LayoutDoc {
         }
         if self.watchlists.is_none() {
             self.watchlists =
-                self.watchlist.take().map(|symbols| vec![crate::app::NamedWatchlist { name: "Main".into(), symbols }]);
+                self.watchlist.take().map(|symbols| vec![crate::app::NamedWatchlist::new("Main".into(), symbols)]);
         }
         if let Some(lists) = self.watchlists.take() {
             let lists = crate::app::sanitize_watchlists(lists);

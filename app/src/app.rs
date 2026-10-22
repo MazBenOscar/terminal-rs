@@ -384,19 +384,37 @@ impl Pane {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NamedWatchlist {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub symbols: Vec<String>,
+    /// Section headers over `symbols`; older files have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<crate::watch_sections::WatchSection>,
+}
+
+impl NamedWatchlist {
+    pub fn new(name: String, symbols: Vec<String>) -> Self {
+        Self { name, symbols, sections: Vec::new() }
+    }
+
+    /// Rows in display order (section headers and symbols).
+    pub fn items(&self) -> Vec<crate::watch_sections::Item> {
+        crate::watch_sections::items(&self.symbols, &self.sections)
+    }
+
+    pub fn set_items(&mut self, items: &[crate::watch_sections::Item]) {
+        (self.symbols, self.sections) = crate::watch_sections::split(items);
+    }
 }
 
 fn watchlist_name_key(name: &str) -> String {
     name.to_uppercase().to_lowercase()
 }
 
-fn valid_watchlist_name(name: &str) -> bool {
+pub(crate) fn valid_watchlist_name(name: &str) -> bool {
     (1..=40).contains(&name.trim().chars().count())
         && !name.chars().any(|c| {
             c.is_control()
@@ -424,6 +442,8 @@ pub(crate) fn sanitize_watchlists(lists: Vec<NamedWatchlist>) -> Vec<NamedWatchl
             continue;
         }
         let name = unique_watchlist_name(name, &out);
+        // Rows from the raw list keep each header beside the symbols that survive cleaning.
+        let raw = crate::watch_sections::items(&list.symbols, &list.sections);
         let symbols = watchlist_append(
             &[],
             list.symbols
@@ -439,13 +459,28 @@ pub(crate) fn sanitize_watchlists(lists: Vec<NamedWatchlist>) -> Vec<NamedWatchl
                 .collect(),
         )
         .0;
-        out.push(NamedWatchlist { name, symbols });
+        let clean = raw
+            .into_iter()
+            .filter_map(|item| match item {
+                crate::watch_sections::Item::Symbol(s) => {
+                    let tokens: Vec<_> = s.split_whitespace().collect();
+                    tr_core::Security::resolve_tokens(&tokens)
+                        .and_then(|(security, used)| (used == tokens.len()).then(|| security.key()))
+                        .map(crate::watch_sections::Item::Symbol)
+                }
+                section => Some(section),
+            })
+            .collect::<Vec<_>>();
+        let clean = crate::watch_sections::resync(&clean, &symbols);
+        let (symbols, sections) = crate::watch_sections::split(&clean);
+        let sections = crate::watch_sections::sanitize(&symbols, sections);
+        out.push(NamedWatchlist { name, symbols, sections });
         if out.len() == 50 {
             break;
         }
     }
     if out.is_empty() {
-        out.push(NamedWatchlist { name: "Main".into(), symbols: Vec::new() });
+        out.push(NamedWatchlist::new("Main".into(), Vec::new()));
     }
     out
 }
@@ -474,7 +509,7 @@ struct Settings {
 impl Settings {
     fn sanitized_watchlists(&self) -> (Vec<NamedWatchlist>, usize) {
         let lists = if self.watchlists.is_empty() {
-            vec![NamedWatchlist { name: "Main".into(), symbols: self.watchlist.clone() }]
+            vec![NamedWatchlist::new("Main".into(), self.watchlist.clone())]
         } else {
             self.watchlists.clone()
         };
@@ -848,10 +883,7 @@ impl TerminalApp {
             congress_status: String::new(),
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
-            watchlists: vec![NamedWatchlist {
-                name: "Main".into(),
-                symbols: DEFAULT_WATCHLIST.map(String::from).to_vec(),
-            }],
+            watchlists: vec![NamedWatchlist::new("Main".into(), DEFAULT_WATCHLIST.map(String::from).to_vec())],
             active_watchlist: 0,
             watchlist_entry: None,
             watchlist_delete: false,
@@ -994,7 +1026,7 @@ impl TerminalApp {
         if self.watchlists.len() >= 50 {
             return Err("At most 50 watchlists are allowed".into());
         }
-        self.watchlists.push(NamedWatchlist { name, symbols: watchlist_append(&[], symbols).0 });
+        self.watchlists.push(NamedWatchlist::new(name, watchlist_append(&[], symbols).0));
         self.switch_watchlist(self.watchlists.len() - 1);
         Ok(())
     }
@@ -1057,12 +1089,22 @@ impl TerminalApp {
         Ok(())
     }
 
+    /// Replace the active list's symbols. Sections keep the symbols that remain; new
+    /// symbols join the end (the last section).
     fn set_watchlist(&mut self, symbols: Vec<String>) {
+        let items = crate::watch_sections::resync(&self.watchlists[self.active_watchlist].items(), &symbols);
+        self.set_watchlist_items(&items);
+    }
+
+    /// Store the active list's rows (sections and order). Membership or order changes
+    /// refresh quotes and columns like any watchlist edit; section-only edits do not.
+    pub(crate) fn set_watchlist_items(&mut self, items: &[crate::watch_sections::Item]) {
+        self.watchlists[self.active_watchlist].set_items(items);
+        let symbols = self.watchlists[self.active_watchlist].symbols.clone();
         if self.watchlist != symbols {
             if let Some((at, _, _)) = self.watchlist_undo.take() {
                 self.toasts.retain(|(_, time)| *time != at);
             }
-            self.watchlists[self.active_watchlist].symbols = symbols.clone();
             self.watchlist = symbols;
             self.last_quotes = None;
             self.refresh_columns();
@@ -2336,7 +2378,7 @@ impl TerminalApp {
             congress_status: String::new(),
             congress_checked: None,
             watchlist: Vec::new(),
-            watchlists: vec![NamedWatchlist { name: "Main".into(), symbols: Vec::new() }],
+            watchlists: vec![NamedWatchlist::new("Main".into(), Vec::new())],
             active_watchlist: 0,
             watchlist_entry: None,
             watchlist_delete: false,
@@ -2386,7 +2428,7 @@ mod tests {
         assert_eq!(lists[0].symbols, vec![tr_data::security("AAPL").key(), tr_data::security("NVDA").key()]);
         let mut settings = old;
         settings.watchlists = lists.clone();
-        settings.watchlists.push(NamedWatchlist { name: "Second".into(), symbols: Vec::new() });
+        settings.watchlists.push(NamedWatchlist::new("Second".into(), Vec::new()));
         settings.active_watchlist = 1;
         let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
         assert_eq!(restored.sanitized_watchlists(), (settings.watchlists, 1));
@@ -2402,8 +2444,8 @@ mod tests {
         assert_eq!(lists[0].name, "Main");
         assert_eq!(lists[0].symbols.len(), 2);
         doc.watchlists = Some(vec![
-            NamedWatchlist { name: "Main".into(), symbols: vec!["AAPL".into()] },
-            NamedWatchlist { name: "MAIN".into(), symbols: vec!["NVDA".into()] },
+            NamedWatchlist::new("Main".into(), vec!["AAPL".into()]),
+            NamedWatchlist::new("MAIN".into(), vec!["NVDA".into()]),
         ]);
         doc.active_watchlist = 999;
         let loaded = LayoutDoc::from_json(&doc.to_json()).unwrap();
@@ -2444,13 +2486,15 @@ mod tests {
 
     #[test]
     fn named_watchlists_sanitize_names_symbols_and_limits() {
-        let list = |name: &str| NamedWatchlist {
-            name: name.into(),
-            symbols: vec!["aapl".into(), "NVDA".into(), "AAPL".into(), "".into(), "bad!".into(), "AAPL garbage".into()],
+        let list = |name: &str| {
+            NamedWatchlist::new(
+                name.into(),
+                vec!["aapl".into(), "NVDA".into(), "AAPL".into(), "".into(), "bad!".into(), "AAPL garbage".into()],
+            )
         };
         let mut input =
             vec![list(""), list("\nMain"), list(&"x".repeat(41)), list(" Main "), list("main"), list("MAIN")];
-        input.push(NamedWatchlist { name: "Full".into(), symbols: (0..205).map(|n| format!("QA{n}")).collect() });
+        input.push(NamedWatchlist::new("Full".into(), (0..205).map(|n| format!("QA{n}")).collect()));
         let out = sanitize_watchlists(input);
         assert_eq!(out.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["Main", "main (2)", "MAIN (3)", "Full"]);
         assert_eq!(out[0].symbols.len(), 2);
@@ -2521,6 +2565,42 @@ mod tests {
             app.create_watchlist(format!("List {i}"), Vec::new()).unwrap();
         }
         assert!(app.create_watchlist("Overflow".into(), Vec::new()).is_err());
+    }
+
+    #[test]
+    fn watchlist_sections_survive_edits_sanitizing_and_old_files() {
+        use crate::watch_sections::{Item, items};
+        let root = std::env::temp_dir().join(format!("watch-sections-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        let key = |s: &str| tr_data::security(s).key();
+        let rows = vec![
+            Item::Section { name: "Macro".into(), collapsed: true },
+            Item::Symbol(key("SPX Index")),
+            Item::Symbol(key("AAPL")),
+            Item::Section { name: "Empty".into(), collapsed: false },
+            Item::Section { name: "Crypto".into(), collapsed: false },
+            Item::Symbol(key("BTCUSD Curncy")),
+        ];
+        app.set_watchlist_items(&rows);
+        assert_eq!(app.watchlist, [key("SPX Index"), key("AAPL"), key("BTCUSD Curncy")]);
+        app.set_watchlist(vec![key("BTCUSD Curncy"), key("SPX Index"), key("NVDA")]);
+        let list = &app.watchlists[app.active_watchlist];
+        assert_eq!(
+            list.items(),
+            [&rows[..2], &rows[3..], &[Item::Symbol(key("NVDA"))]].concat(),
+            "removed symbols leave their section, new ones join the end"
+        );
+        let mut dirty = list.clone();
+        dirty.symbols.insert(1, "not a ticker!".into());
+        dirty.sections[2].at += 1;
+        let clean = sanitize_watchlists(vec![dirty]);
+        assert_eq!(clean[0].items(), list.items(), "cleaning a symbol keeps headers in place");
+        let json = serde_json::to_string(&clean[0]).unwrap();
+        assert_eq!(&serde_json::from_str::<NamedWatchlist>(&json).unwrap(), &clean[0]);
+        let old: NamedWatchlist = serde_json::from_str(r#"{"name":"Main","symbols":["AAPL US Equity"]}"#).unwrap();
+        assert!(old.sections.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("sections"), "unsectioned lists save as before");
+        assert_eq!(items(&old.symbols, &old.sections), [Item::Symbol(key("AAPL"))]);
     }
 
     #[test]
@@ -2673,7 +2753,7 @@ mod tests {
 
     #[test]
     fn watchlist_names_must_treat_case_fold_equivalent_names_as_duplicates() {
-        let list = |name: &str| NamedWatchlist { name: name.into(), symbols: Vec::new() };
+        let list = |name: &str| NamedWatchlist::new(name.into(), Vec::new());
         // Case folding maps ß to "ss", the long s to "s" and the final sigma to "σ".
         let out = sanitize_watchlists(vec![list("SS"), list("ß")]);
         assert_eq!(out.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["SS", "ß (2)"]);
@@ -2711,7 +2791,7 @@ mod tests {
         assert!(app.create_watchlist("   ".into(), Vec::new()).is_err());
         app.create_watchlist("  Trimmed  ".into(), Vec::new()).unwrap();
         assert_eq!(app.watchlists[1].name, "Trimmed");
-        let list = |name: &str| NamedWatchlist { name: name.into(), symbols: Vec::new() };
+        let list = |name: &str| NamedWatchlist::new(name.into(), Vec::new());
         let invisible = |c: char| matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}');
         let out = sanitize_watchlists(vec![list("\u{200B}"), list("Main\u{200B}"), list("Main"), list("\u{202E}niam")]);
         assert!(
