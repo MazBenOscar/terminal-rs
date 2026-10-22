@@ -153,8 +153,9 @@ bucket delivered before the failure, or None for a heartbeat-only feed. The
 worker fetches REST chart history using the existing bounded backfill limit,
 merges exact buckets, preserves the live tail and reports `Filled N missed bars`.
 Coinbase seeds its current aggregate as described in C03b below; partial-bar merges
-retain the original open and larger volume, while REST backfill replaces exact
-buckets. No `Bar::absorb` or chart live-merge semantics change.
+retain the original open and larger volume. REST backfill replaces completed exact
+buckets; the current last bucket is combined as described in C03b. No `Bar::absorb`
+or chart live-merge semantics change.
 
 Retry delays start at one second, double through 2, 4, 8 and 16 seconds, and cap
 at 30 seconds. A healthy product message resets the delay to one second. Dropping
@@ -181,10 +182,17 @@ On the first healthy product message of each connection, a concurrent REST histo
 request seeds the exact product/timeframe's current bar, using a one-bar history
 limit and an 800 ms deadline. Websocket reads and Ping/Pong continue during the
 fetch; only provisional bar publication waits for that bounded seed attempt.
-Failure silently publishes the unseeded aggregate instead of a chart error. A REST
-bar outside the current bucket is not used, including a fetch crossing rollover.
+Trades are buffered as per-bucket aggregates while the seed is pending. When it
+resolves (success, failure or timeout), completed buffered buckets are published in
+time order before the current one. A REST bar is used only for the request-start
+bucket, even if the fetch crosses rollover; other REST buckets are rejected.
 Seeded bars preserve REST open/high/low and volume, extending them with new trades.
-A later bucket starts with only its own first trade; it is not seeded.
+A later bucket starts with only its own trades; it is not seeded. Open follows the
+earliest trade time (except REST's open is retained for seeded bars), close follows
+the latest trade time, and high/low and volume are independent of arrival order.
+Failure silently publishes unseeded aggregates instead of a chart error. Without an
+applied seed, all trades received on this connection count, including pre-cutoff
+trades: this is a lower bound combined with worker history by maximum volume.
 
 The cutoff is the REST request's start time, at nanosecond precision. Only trades
 with exchange time **at or after** that cutoff extend a seeded bar. Earlier trades
@@ -192,7 +200,10 @@ are assumed included in REST, not added again. REST's own lag can omit trades ju
 before that cutoff, so this boundary can still under-count: exact per-trade live
 volume is not a guarantee of gap-free REST reconciliation. There is no addition of
 the REST volume to an already accumulated full bar. Worker partial merges keep the
-larger complete volume, and reconnect backfill replaces, rather than adds, buckets.
+larger complete volume. History loads and reconnect backfill use `Bar::absorb` for
+the current (last) bucket: REST supplies the earlier open, live supplies the latest
+close, high/low cover both, and volume is the larger value, never the sum.
+Completed buckets retain exact REST replacement and C03's missed-bar counting.
 
 Loopback HTTP/websocket tests cover the exact subscription, REST volume 10 plus
 sizes 1 and 2 yielding 13 with extended OHLC, pre-cutoff exclusion, replayed trade
