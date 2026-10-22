@@ -86,21 +86,25 @@ impl TerminalApp {
         self.themes_changed_at = Some(Instant::now());
     }
 
+    pub(super) fn theme_writes(&self) -> Vec<super::SaveWrite> {
+        self.themes
+            .iter()
+            .filter(|theme| !theme.builtin && self.dirty_themes.contains(&theme.name))
+            .map(|theme| (self.theme_store.save_path(theme), theme.to_toml().into_bytes()))
+            .collect()
+    }
+
     /// Write edited custom themes once editing pauses (colour drags change every frame).
     pub(super) fn save_dirty_themes(&mut self, force: bool) {
         let idle = self.themes_changed_at.is_some_and(|t| t.elapsed() > Duration::from_millis(500));
         if self.dirty_themes.is_empty() || !(idle || force) {
             return;
         }
-        for name in std::mem::take(&mut self.dirty_themes) {
-            if let Some(t) = self.themes.iter_mut().find(|t| t.name == name && !t.builtin) {
-                match self.theme_store.save(t) {
-                    Ok(path) => t.source = Some(path),
-                    Err(e) => self.status = format!("Could not save theme {name:?}: {e:#}"),
-                }
-            }
+        if self.saves.job.as_ref().is_some_and(|job| !job.is_finished()) {
+            return;
         }
-        self.themes_changed_at = None;
+        self.finish_save();
+        self.saves.start(self.theme_writes());
     }
 
     /// Apply a change to the active theme (copying a built-in first), e.g. from THEME COMPACT.

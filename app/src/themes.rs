@@ -1044,16 +1044,20 @@ impl ThemeStore {
         out
     }
 
+    pub(crate) fn save_path(&self, theme: &Theme) -> PathBuf {
+        theme
+            .source
+            .clone()
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .unwrap_or_else(|| self.path(&theme.name))
+    }
+
     /// Write a custom theme (to the file it came from, else `<name>.toml`).
     pub fn save(&self, theme: &Theme) -> Result<PathBuf> {
         if theme.builtin {
             bail!("built-in themes are read-only; duplicate it to edit");
         }
-        let path = theme
-            .source
-            .clone()
-            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-            .unwrap_or_else(|| self.path(&theme.name));
+        let path = self.save_path(theme);
         crate::layouts::write_atomic(&path, theme.to_toml().as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(path)

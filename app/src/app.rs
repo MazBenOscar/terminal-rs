@@ -47,6 +47,46 @@ use crate::worker::{Profile, Request, Response, Worker, data_dir};
 use chrome::{SIDEBAR_W, STATUS_H, SidebarCmd};
 use settings_view::SettingsTab;
 
+type SaveWrite = (std::path::PathBuf, Vec<u8>);
+type SaveResult = (SaveWrite, std::io::Result<()>);
+type SaveWriter = std::sync::Arc<dyn Fn(&std::path::Path, &[u8]) -> std::io::Result<()> + Send + Sync>;
+
+struct SaveState {
+    written: HashMap<std::path::PathBuf, Vec<u8>>,
+    job: Option<std::thread::JoinHandle<Vec<SaveResult>>>,
+    writer: SaveWriter,
+}
+
+impl Default for SaveState {
+    fn default() -> Self {
+        Self { written: HashMap::new(), job: None, writer: std::sync::Arc::new(crate::layouts::write_atomic) }
+    }
+}
+
+impl SaveState {
+    fn changed(&self, writes: Vec<SaveWrite>) -> Vec<SaveWrite> {
+        writes.into_iter().filter(|(path, bytes)| self.written.get(path) != Some(bytes)).collect()
+    }
+
+    fn write(writes: Vec<SaveWrite>, writer: &SaveWriter) -> Vec<SaveResult> {
+        writes
+            .into_iter()
+            .map(|write| {
+                let result = writer(&write.0, &write.1);
+                (write, result)
+            })
+            .collect()
+    }
+
+    fn start(&mut self, writes: Vec<SaveWrite>) {
+        let writes = self.changed(writes);
+        if !writes.is_empty() {
+            let writer = self.writer.clone();
+            self.job = Some(std::thread::spawn(move || Self::write(writes, &writer)));
+        }
+    }
+}
+
 pub enum PaneKind {
     Chart(Box<ChartState>),
     Feed {
@@ -680,7 +720,8 @@ pub struct TerminalApp {
     store: Store,
     layout_name: String,
     layout_names: Vec<String>,
-    last_saved: Vec<u8>,
+    saves: SaveState,
+    settings_file: std::path::PathBuf,
     /// Layout being renamed in the sidebar: old name and edit buffer.
     renaming_layout: Option<(String, String)>,
 
@@ -908,7 +949,8 @@ impl TerminalApp {
             store: Store::new(data_dir().join("layouts")),
             layout_name: "Default".into(),
             layout_names: Vec::new(),
-            last_saved: Vec::new(),
+            saves: SaveState::default(),
+            settings_file: settings_path(),
             renaming_layout: None,
             editing_theme: prefs.appearance.theme.clone(),
             themes,
@@ -1020,6 +1062,9 @@ impl TerminalApp {
                 }
             })
             .unwrap_or_else(|| LayoutDoc::default_workspace("Default", &app.prefs.panels));
+        if let Ok(bytes) = std::fs::read(&app.settings_file) {
+            app.saves.written.insert(app.settings_file.clone(), bytes);
+        }
         app.apply_doc(doc);
         if !app.store.exists(&app.layout_name) {
             app.save_layout();
@@ -1043,7 +1088,7 @@ impl TerminalApp {
         app
     }
 
-    fn save_settings(&self) {
+    fn settings_json(&self) -> Vec<u8> {
         let s = Settings {
             watchlist: Vec::new(),
             watchlists: self.watchlists.clone(),
@@ -1054,11 +1099,13 @@ impl TerminalApp {
             layout: None,
             panes: None,
         };
-        if let Ok(json) = serde_json::to_vec_pretty(&s)
-            && let Err(e) = crate::layouts::write_atomic(&settings_path(), &json)
-        {
-            tracing::warn!("saving settings: {e}");
-        }
+        serde_json::to_vec_pretty(&s).expect("settings serialize")
+    }
+
+    fn save_settings(&mut self) {
+        self.finish_save();
+        let write = (self.settings_file.clone(), self.settings_json());
+        self.save_sync(vec![write]);
     }
 
     fn save_prefs(&mut self) {
@@ -2247,14 +2294,68 @@ impl TerminalApp {
         }
     }
 
-    /// Save the active layout (only when it changed) and app settings.
+    /// Compare snapshots every tick, including edits with no explicit dirty marking.
     fn autosave(&mut self) {
-        self.save_dirty_themes(true);
-        let json = self.current_doc().to_json();
-        if json != self.last_saved {
-            self.save_layout();
+        if self.saves.job.as_ref().is_some_and(|job| !job.is_finished()) {
+            return;
         }
-        self.save_settings();
+        self.finish_save();
+        let mut writes = self.theme_writes();
+        writes.push((self.store.path(&self.layout_name), self.current_doc().to_json()));
+        writes.push((self.settings_file.clone(), self.settings_json()));
+        self.saves.start(writes);
+    }
+
+    fn complete_save(&mut self, results: Vec<SaveResult>) {
+        for ((path, bytes), result) in results {
+            match result {
+                Ok(()) => {
+                    let mut is_theme = false;
+                    for theme in &mut self.themes {
+                        if !theme.builtin && self.theme_store.save_path(theme) == path {
+                            is_theme = true;
+                            theme.source = Some(path.clone());
+                            if theme.to_toml().as_bytes() == bytes {
+                                self.dirty_themes.retain(|name| name != &theme.name);
+                            }
+                        }
+                    }
+                    if !is_theme {
+                        self.saves.written.insert(path, bytes);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("saving {}: {e}", path.display());
+                    self.status = format!("Could not save {}: {e}; will retry", path.display());
+                }
+            }
+        }
+        if self.dirty_themes.is_empty() {
+            self.themes_changed_at = None;
+        }
+    }
+
+    fn finish_save(&mut self) {
+        if let Some(job) = self.saves.job.take() {
+            match job.join() {
+                Ok(results) => self.complete_save(results),
+                Err(_) => self.status = "Could not autosave; will retry".into(),
+            }
+        }
+    }
+
+    fn save_sync(&mut self, writes: Vec<SaveWrite>) {
+        let writes = self.saves.changed(writes);
+        let results = SaveState::write(writes, &self.saves.writer);
+        self.complete_save(results);
+    }
+
+    fn exit_save(&mut self) {
+        self.finish_save();
+        let mut writes = self.theme_writes();
+        writes.push((self.store.path(&self.layout_name), self.current_doc().to_json()));
+        writes.push((self.settings_file.clone(), self.settings_json()));
+        self.save_sync(writes);
     }
 }
 
@@ -2466,7 +2567,7 @@ impl eframe::App for TerminalApp {
     }
 
     fn on_exit(&mut self) {
-        self.autosave();
+        self.exit_save();
         self.price_alerts.save();
         if self.demo.save_error.is_some() {
             self.demo.save();
@@ -2499,7 +2600,8 @@ impl TerminalApp {
             store: Store::new(root.join("layouts")),
             layout_name: "Default".into(),
             layout_names: Vec::new(),
-            last_saved: Vec::new(),
+            saves: SaveState::default(),
+            settings_file: root.join("settings.json"),
             renaming_layout: None,
             editing_theme: String::new(),
             themes: Vec::new(),
@@ -2584,6 +2686,135 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type SaveLog = std::sync::Arc<std::sync::Mutex<Vec<(SaveWrite, std::thread::ThreadId)>>>;
+
+    fn autosave_fixture(tag: &str) -> (TerminalApp, SaveLog) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(tag);
+        let mut app = TerminalApp::test_workspace(&root);
+        let log = SaveLog::default();
+        let writes = log.clone();
+        app.saves.writer = std::sync::Arc::new(move |path, bytes| {
+            writes.lock().unwrap().push(((path.to_owned(), bytes.to_vec()), std::thread::current().id()));
+            Ok(())
+        });
+        app.autosave();
+        app.finish_save();
+        log.lock().unwrap().clear();
+        (app, log)
+    }
+
+    #[test]
+    fn autosave_unchanged_state_performs_no_write() {
+        let (mut app, log) = autosave_fixture("autosave-unchanged");
+        app.autosave();
+        assert!(app.saves.job.is_none());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn autosave_settings_change_writes_only_settings_once() {
+        let (mut app, log) = autosave_fixture("autosave-settings");
+        app.watch_details = !app.watch_details;
+        app.autosave();
+        app.finish_save();
+        app.autosave();
+        assert!(app.saves.job.is_none());
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].0.0, app.settings_file);
+        assert_eq!(log[0].0.1, app.settings_json());
+    }
+
+    #[test]
+    fn autosave_unmarked_layout_change_writes_only_layout_once() {
+        let (mut app, log) = autosave_fixture("autosave-layout");
+        app.layout_theme = true;
+        app.autosave();
+        app.finish_save();
+        app.autosave();
+        assert!(app.saves.job.is_none());
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].0.0, app.store.path(&app.layout_name));
+        assert_eq!(log[0].0.1, app.current_doc().to_json());
+    }
+
+    #[test]
+    fn autosave_writer_runs_off_the_ui_thread() {
+        let (mut app, log) = autosave_fixture("autosave-thread");
+        app.watch_details = !app.watch_details;
+        app.autosave();
+        app.finish_save();
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_ne!(log.lock().unwrap()[0].1, std::thread::current().id());
+    }
+
+    #[test]
+    fn autosave_failed_file_retries_without_rewriting_successful_file() {
+        let (mut app, log) = autosave_fixture("autosave-retry");
+        let previous = app.saves.written[&app.settings_file].clone();
+        let settings = app.settings_file.clone();
+        let writes = log.clone();
+        let mut_fail = std::sync::atomic::AtomicBool::new(true);
+        app.saves.writer = std::sync::Arc::new(move |path, bytes| {
+            writes.lock().unwrap().push(((path.to_owned(), bytes.to_vec()), std::thread::current().id()));
+            if path == settings && mut_fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Err(std::io::Error::other("injected failure"))
+            } else {
+                Ok(())
+            }
+        });
+        app.watch_details = !app.watch_details;
+        app.layout_theme = true;
+        app.autosave();
+        app.finish_save();
+        assert_eq!(app.saves.written[&app.settings_file], previous);
+        assert!(app.status.contains("injected failure"));
+        app.autosave();
+        app.finish_save();
+        app.autosave();
+        assert!(app.saves.job.is_none());
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log.iter().filter(|w| w.0.0 == app.settings_file).count(), 2);
+        assert_eq!(app.saves.written[&app.settings_file], app.settings_json());
+    }
+
+    #[test]
+    fn autosave_exit_waits_for_in_flight_job_and_saves_latest_synchronously() {
+        let (mut app, log) = autosave_fixture("autosave-exit");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let writes = log.clone();
+        app.saves.writer = std::sync::Arc::new(move |path, bytes| {
+            if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            writes.lock().unwrap().push(((path.to_owned(), bytes.to_vec()), std::thread::current().id()));
+            Ok(())
+        });
+        app.watch_details = !app.watch_details;
+        app.autosave();
+        started_rx.recv().unwrap();
+        app.watch_details = !app.watch_details;
+        app.layout_theme = true;
+        app.autosave();
+        assert!(log.lock().unwrap().is_empty());
+        let release = std::thread::spawn(move || release_tx.send(()).unwrap());
+        app.exit_save();
+        release.join().unwrap();
+        assert!(app.saves.job.is_none());
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 3);
+        assert_ne!(log[0].1, std::thread::current().id());
+        assert!(log[1..].iter().all(|w| w.1 == std::thread::current().id()));
+        assert_eq!(app.saves.written[&app.settings_file], app.settings_json());
+        assert_eq!(app.saves.written[&app.store.path(&app.layout_name)], app.current_doc().to_json());
+    }
 
     #[test]
     fn named_watchlists_legacy_migration_and_settings_round_trip() {

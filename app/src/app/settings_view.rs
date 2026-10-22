@@ -457,6 +457,7 @@ impl TerminalApp {
     }
 
     fn rename_theme(&mut self, old: &str, new: &str) {
+        self.finish_save();
         if new.is_empty() || new.eq_ignore_ascii_case(SYSTEM) {
             self.status = "Theme names cannot be empty or \"System\"".into();
             return;
@@ -524,6 +525,7 @@ impl TerminalApp {
                 };
             }
             "delete" => {
+                self.finish_save();
                 let t = self.themes[idx].clone();
                 match self.theme_store.delete(&t) {
                     Ok(()) | Err(_) if t.source.is_none() => {}
