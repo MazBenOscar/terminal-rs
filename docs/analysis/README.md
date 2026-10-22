@@ -33,6 +33,13 @@ Labels used in every note:
   identity migration, exchange discovery/scanning, rolling metrics, validation
   results and remaining boundaries. This is a delivery record, not REA evidence.
 
+- [Watchlist sections and symbol search](watchlist-and-search.md) — sections,
+  drag-and-drop, details card and the categorized symbol search dialog
+  (delivery record at `dc27b49`).
+
+- [Performance audit](performance-audit.md) — 2026-10-22 measured and
+  code-review findings with the P1–P6 optimisation programme (pending).
+
 - [Quick tools and Auto/Log follow-up](toolbar-scale-followup.md) — 2026-10-21
   REA website runtime tests of drawing favorites, reload, scale-state transitions
   and indicator access; includes explicit account/interaction limits.

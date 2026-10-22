@@ -167,6 +167,14 @@ fetch and merge; no crypto-specific duplicate is needed.
 
 Remaining limits: recovery depends on REST history availability and its bounded
 history window; it cannot guarantee every missed bar during a long outage.
+
+Pending as C03b (not started): Coinbase builds the current bar from ticks only, on
+every connection, and merges keep the larger volume. After connect or reconnect the
+current bar's volume therefore stays at the REST snapshot until the new ticks alone
+exceed it, then shows only their volume: it is under-counted, never double-counted.
+C03b seeds the live aggregate from the REST current bar and adds only trades newer
+than the seed, de-duplicated by trade id. Binance kline streams carry the running
+bar volume and are unaffected.
 Order-book streams are out of scope. Alerts use polled quotes and already reject
 stale or out-of-order prices. These tests use no public network and do not replace
 running-app visual QA.

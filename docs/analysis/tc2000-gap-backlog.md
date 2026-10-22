@@ -65,7 +65,8 @@ confirmed absence of a TC2000-equivalent feature.
 
 ## Decisions explicitly on hold
 
-Do not change these without checking with the user:
+Both decisions below were resolved by the user and shipped in `85faba8`
+(overlays default off; 2H/4H aligned to the 09:30 open). Kept for history:
 
 1. **Account-overlay default:** `chart_account::Settings::default` currently
    enables overlays, so visible charts can trigger broker polling. Whether this
@@ -117,17 +118,48 @@ as untrusted input. Independent reviews found and fixed five defects; live-app Q
 found and fixed five more. T02, T07, T09, cross-study fills and app-closed alert
 monitoring remain open.
 
-In progress: drawing favorites strip and explicit Auto/Log controls
-(`codex/chart-quick-tools`), backfill after live-stream reconnects
-(`codex/alpaca-backfill`), and adversarial reviews of T04–T06/T08.
+Superseded by the status at `dc27b49` below.
+
+## Delivery status at `dc27b49` (2026-10-22)
+
+`personal/main` at `dc27b49` (pushed) adds, since `d2671cd`: Alpaca backfill after
+reconnects; drawing favorites and explicit Auto/Log controls; cross-study fills
+(rest of T08); app-closed alert checks on macOS through the alert daemon; named
+watchlists with instrument names; 2H/4H bars aligned to the 09:30 open and account
+overlays off by default (both former decisions on hold); the drawing rail and
+programme D0–D4 (lines, Fib, patterns, measurers, volume and annotation tools,
+Lock and Hide); new built-in themes; crypto C01–C03 (exact instrument identity and
+provenance, exchange discovery and rolling-metric scans, live-stream reconnect
+recovery: see [crypto delivery](crypto-delivery.md)); and a chart and watchlist
+usability round (candle details on press and hold, smooth higher-timeframe study
+lines, named-watchlist targets, watchlist sections, drag-and-drop, details card
+and a categorized symbol search dialog: see
+[watchlist and search delivery](watchlist-and-search.md)). Final checks at
+`dc27b49`: formatting and strict Clippy clean, 954 tests passing, 7 network
+tests ignored.
+
+### Pending work
+
+| ID | Classification | Work | Owner / note |
+|---|---|---|---|
+| T02 | Unverified parity | Formula and indicator parity against attributed TC2000 exports | Remote agent (holds the TC2000 export files) |
+| C03b | Implementation gap | Crypto current-bar seeding and Coinbase volume accounting after connect/reconnect (see crypto delivery, C03 remaining limits) | Not started |
+| P1–P6 | Performance | Incremental live updates, idle throttling, virtualized tables, batched alerts, overlay caching, distribution build profile (see [performance audit](performance-audit.md)) | Not started; measure before and after |
+| T07 | External data/validation | Live Alpaca entitlements, broader stock streaming, earnings and full exchange calendars | Needs accounts and data |
+| T09 | External data | Actual volume at price from trade data | Needs a data source |
+| F01 | Follow-up | Details card and chart tab show raw crypto keys (`COINBASE:BTC-USD`) instead of `BTC/USD` | Small |
+| F02 | Follow-up | Scanner, portfolio and Congress menus add only to the active watchlist; chart and watchlist menus already offer every list | Small |
+| F03 | Follow-up | Watchlist Last/Change/% columns overlap in very narrow panes | Small |
+| F04 | Validation | Real LaunchAgent install for app-closed alerts was not exercised; needs the user's approval | Needs approval |
+| F05 | Cleanup | `#[path = "drawing_toolbar.rs"]` module path, merged local branches and worktrees | Housekeeping |
 
 ## User-reported QA backlog
 
 | ID | Classification | Work and acceptance |
 |---|---|---|
-| Q01 | Usability defect | **Chart template save looks broken.** In Indicators → Chart templates, "Save current" stays disabled until a name is typed, but the name field renders like a muted label, so users read the button as permanently greyed out. Give the field a visible input frame, prefill a suggested name (e.g. `<symbol> <interval> studies`), explain the disabled state on hover ("Enter a template name"), and confirm the save in the status bar. Test: with studies on a chart, the default state can save in one click. |
-| Q02 | Implementation gap, product choice | **Save scan results as a watchlist.** Finished scan results have no way to reach the watchlist; the app has a single watchlist (`WL ADD`). First increment: result-table actions "Add matches to watchlist" (deduplicated, respecting the watchlist cap) and "Replace watchlist with matches" with an undo toast, plus a per-row context-menu add. Larger option needing a product decision: named watchlists (create, switch, rename, delete; a scan result saved as a new named list). Test: matches only, unavailable rows excluded, order preserved, persistence with the layout. |
-| Q03 | Defect | **Removed scan plot keeps coming back.** Opening a ticker from scan results (`Action::ScanChart`) always calls `plot_scan`, adding a "PCF Custom formula" study in its own pane on every ticker, even after the user removes it. Make the automatic plot opt-in: a per-chart "Show scan conditions on chart" toggle (default off, persisted with the chart's workflow), removing the scan-plot study turns the toggle off, and "Plot scan conditions" still adds it once on demand. Test: navigating results never re-adds a removed plot; with the toggle on, exactly one scan plot is kept and replaced per ticker. |
+| Q01 · done `6b84960` | Usability defect | **Chart template save looks broken.** In Indicators → Chart templates, "Save current" stays disabled until a name is typed, but the name field renders like a muted label, so users read the button as permanently greyed out. Give the field a visible input frame, prefill a suggested name (e.g. `<symbol> <interval> studies`), explain the disabled state on hover ("Enter a template name"), and confirm the save in the status bar. Test: with studies on a chart, the default state can save in one click. |
+| Q02 · done `6b84960`, `fe78361` | Implementation gap, product choice | **Save scan results as a watchlist.** Finished scan results have no way to reach the watchlist; the app has a single watchlist (`WL ADD`). First increment: result-table actions "Add matches to watchlist" (deduplicated, respecting the watchlist cap) and "Replace watchlist with matches" with an undo toast, plus a per-row context-menu add. Larger option needing a product decision: named watchlists (create, switch, rename, delete; a scan result saved as a new named list). Test: matches only, unavailable rows excluded, order preserved, persistence with the layout. |
+| Q03 · done `5499c9f` | Defect | **Removed scan plot keeps coming back.** Opening a ticker from scan results (`Action::ScanChart`) always calls `plot_scan`, adding a "PCF Custom formula" study in its own pane on every ticker, even after the user removes it. Make the automatic plot opt-in: a per-chart "Show scan conditions on chart" toggle (default off, persisted with the chart's workflow), removing the scan-plot study turns the toggle off, and "Plot scan conditions" still adds it once on demand. Test: navigating results never re-adds a removed plot; with the toggle on, exactly one scan plot is kept and replaced per ticker. |
 
 ## Drawing tools programme
 
@@ -142,6 +174,9 @@ Post and Idea entries (social-platform features) are out of scope.
 Scope is limited to the tools professional traders use routinely (2026-10-21
 decision): marking levels, measuring moves, planning trades and annotating
 setups. Categories with no tools are not shown.
+
+Status: D0–D4 delivered on `personal/main` (`b20175b`, `82f17da`, `bebae66` and
+their adversarial-test commits).
 
 | Phase | Scope | Notes |
 |---|---|---|
@@ -162,8 +197,7 @@ hit-testing and replay/Renko visibility rules matching existing drawings.
 
 ## Implementation sequence and branch policy
 
-Next: Q01 and the first Q02 increment, alongside the in-progress quick tools and
-backfill work. Base new work on the latest `personal/main`; these branch names
+Next: choose from the pending work table above. Base new work on the latest `personal/main`; these branch names
 are proposals until created. Keep data validation/fixtures moving alongside the
 code. Merge `personal/main` into an older feature branch before continuing it;
 merge rather than rebase. Keep upstream `master` separate. No full parity
