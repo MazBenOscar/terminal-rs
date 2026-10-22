@@ -441,6 +441,55 @@ mod dispatch_tests {
     }
 
     #[test]
+    fn sanitizing_keeps_complete_pattern_and_three_point_drawings() {
+        let a = Anchor { ts: 1, price: 100. };
+        let b = Anchor { ts: 2, price: 90. };
+        for tool in [
+            Tool::Xabcd,
+            Tool::Abcd,
+            Tool::HeadAndShoulders,
+            Tool::TrianglePattern,
+            Tool::ElliottImpulse,
+            Tool::ElliottCorrection,
+        ] {
+            let mut drawing = Drawing::new(tool, a, b);
+            drawing.pattern_points = (0..tool.points()).map(|i| Anchor { ts: i as i64, price: 100. }).collect();
+            assert!(drawing.sanitize(), "{tool:?}");
+            assert_eq!(drawing.pattern_points.len(), tool.points());
+        }
+        for tool in [Tool::Channel, Tool::FibChannel, Tool::FibExtension, Tool::Pitchfork] {
+            let mut drawing = Drawing::new(tool, a, b);
+            drawing.c = Some(Anchor { ts: 3, price: 110. });
+            assert!(drawing.sanitize(), "{tool:?}");
+            assert_eq!(handles(&drawing).len(), tool.points());
+        }
+    }
+
+    #[test]
+    #[ignore = "BUG: Drawing::sanitize never rejects incomplete non-path drawings. An Xabcd/Abcd/etc. with empty pattern_points (or a Channel/FibChannel/Pitchfork/FibExtension with c=None) loads as a ghost: handles() is short/empty so the object cannot be selected or deleted individually, and pattern geometry is empty. sanitize() should return false when pattern_points.len() != tool.points() for the pattern family and when c.is_none() for 3-point tools."]
+    fn sanitize_rejects_incomplete_pattern_and_three_point_drawings() {
+        let a = Anchor { ts: 1, price: 100. };
+        let b = Anchor { ts: 2, price: 90. };
+        for tool in [
+            Tool::Xabcd,
+            Tool::Abcd,
+            Tool::HeadAndShoulders,
+            Tool::TrianglePattern,
+            Tool::ElliottImpulse,
+            Tool::ElliottCorrection,
+        ] {
+            let mut drawing = Drawing::new(tool, a, b);
+            assert!(!drawing.sanitize(), "empty pattern_points must be rejected for {tool:?}");
+            drawing.pattern_points = vec![a; tool.points().saturating_sub(1)];
+            assert!(!drawing.sanitize(), "short pattern_points must be rejected for {tool:?}");
+        }
+        for tool in [Tool::Channel, Tool::FibChannel, Tool::FibExtension, Tool::Pitchfork] {
+            let mut drawing = Drawing::new(tool, a, b);
+            assert!(!drawing.sanitize(), "missing c must be rejected for {tool:?}");
+        }
+    }
+
+    #[test]
     fn family_dispatch_covers_every_tool_geometry_hits_and_handles() {
         for tool in Tool::ALL {
             let mut drawing = Drawing::new(tool, Anchor { ts: 1, price: 100. }, Anchor { ts: 2, price: 90. });
