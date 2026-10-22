@@ -966,4 +966,105 @@ mod tests {
         let json = serde_json::to_value(&set).unwrap();
         assert_eq!(json["version"], 1);
     }
+
+    #[test]
+    fn hostile_drawing_payloads_are_sanitized_without_killing_the_layout() {
+        let raw = r#"{
+            "name": "Hostile",
+            "dock": {"type": "tabs", "panes": [1]},
+            "panes": [{
+                "id": 1,
+                "Chart": {
+                    "symbol": "AAPL", "tf": "D1", "chart_type": "Line", "log": false,
+                    "indicators": [], "compare": null,
+                    "drawings": [
+                        {"tool": "Callout", "a": {"ts": 1, "price": 10}, "b": {"ts": 2, "price": 20},
+                         "text": "Hi\u0000\n\té", "width": 1.0},
+                        {"tool": "FixedRangeVolumeProfile", "a": {"ts": 1, "price": 10}, "b": {"ts": 2, "price": 20},
+                         "profile_rows": 0, "width": 1.0},
+                        {"tool": "FixedRangeVolumeProfile", "a": {"ts": 1, "price": 10}, "b": {"ts": 2, "price": 20},
+                         "profile_rows": 9999, "width": 1.0},
+                        {"tool": "Brush", "a": {"ts": 1, "price": 10}, "b": {"ts": 2, "price": 20},
+                         "vertices": [{"ts": 1, "price": 10}, {"ts": 2, "price": 10}, {"ts": 3, "price": 20}],
+                         "width": 1.0},
+                        {"tool": "Path", "a": {"ts": 1, "price": 10}, "b": {"ts": 2, "price": 20},
+                         "vertices": [{"ts": 1, "price": 1}], "arrow_end": true, "width": 1.0}
+                    ]
+                }
+            }]
+        }"#;
+        let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
+        let PaneSettings::Chart { drawings, .. } = &doc.panes[0].settings else { panic!("chart") };
+        // Incomplete Path is dropped; the other four survive sanitised.
+        assert_eq!(drawings.len(), 4);
+        assert_eq!(drawings[0].text, "Hi\né");
+        assert_eq!(drawings[1].profile_rows, 4);
+        assert_eq!(drawings[2].profile_rows, 200);
+        assert_eq!(drawings[3].vertices.len(), 3);
+        let again = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(again.panes[0].settings, doc.panes[0].settings);
+    }
+
+    #[test]
+    #[ignore = "BUG: deserialize_drawings loads Vec<Drawing> as a unit, so one drawing whose JSON fails type/range checks (price: 1e999 -> serde_json 'number out of range', text: 123, profile_rows: -1) aborts the entire LayoutDoc parse instead of dropping that drawing; repair/sanitize never get a chance to salvage the workspace"]
+    fn one_unparseable_drawing_does_not_abort_the_whole_layout() {
+        let raw = r#"{
+            "name": "Mixed",
+            "dock": {"type": "tabs", "panes": [1]},
+            "panes": [{
+                "id": 1,
+                "Chart": {
+                    "symbol": "AAPL", "tf": "D1", "chart_type": "Line", "log": false,
+                    "indicators": [], "compare": null,
+                    "drawings": [
+                        {"tool": "Text", "a": {"ts": 1, "price": 10}, "b": {"ts": 1, "price": 10},
+                         "text": "keep me", "width": 1.0},
+                        {"tool": "PriceNote", "a": {"ts": 1, "price": 1e999}, "b": {"ts": 1, "price": 10},
+                         "text": "drop me", "width": 1.0},
+                        {"tool": "ArrowMarkUp", "a": {"ts": 2, "price": 11}, "b": {"ts": 2, "price": 11},
+                         "width": 1.0}
+                    ]
+                }
+            }]
+        }"#;
+        let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
+        let PaneSettings::Chart { drawings, .. } = &doc.panes[0].settings else { panic!("chart") };
+        assert_eq!(drawings.len(), 2);
+        assert_eq!(drawings[0].text, "keep me");
+        assert_eq!(drawings[1].tool, tr_chart::drawings::Tool::ArrowMarkUp);
+    }
+
+    #[test]
+    fn drawing_new_tools_round_trip_through_layout_documents() {
+        use tr_chart::drawings::{Anchor, Drawing, Tool};
+        let mut doc = LayoutDoc::default_workspace("New tools", &PanelDefaults::default());
+        let PaneSettings::Chart { drawings, .. } = &mut doc.panes[0].settings else { panic!("chart") };
+        for tool in [
+            Tool::PriceRange,
+            Tool::DateRange,
+            Tool::DatePriceRange,
+            Tool::AnchoredVwap,
+            Tool::FixedRangeVolumeProfile,
+            Tool::Arrow,
+            Tool::ArrowMarkUp,
+            Tool::ArrowMarkDown,
+            Tool::Brush,
+            Tool::Circle,
+            Tool::Path,
+            Tool::PriceNote,
+            Tool::Callout,
+            Tool::FlagMark,
+        ] {
+            let mut d = Drawing::new(tool, Anchor { ts: 1, price: 10. }, Anchor { ts: 2, price: 20. });
+            d.text = "Note\nline".into();
+            d.profile_rows = 16;
+            if matches!(tool, Tool::Path | Tool::Brush) {
+                d.vertices = vec![d.a, d.b, Anchor { ts: 3, price: 30. }];
+                d.arrow_end = tool == Tool::Path;
+            }
+            drawings.push(d);
+        }
+        let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(restored.panes[0].settings, doc.panes[0].settings);
+    }
 }

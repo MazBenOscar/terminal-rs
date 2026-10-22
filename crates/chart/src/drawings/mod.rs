@@ -471,4 +471,57 @@ mod dispatch_tests {
             assert!((1..=7).contains(&tool.points()));
         }
     }
+
+    #[test]
+    fn new_tool_drawings_serde_round_trip_and_sanitize_hostile_payloads() {
+        let a = Anchor { ts: 1, price: 100. };
+        let b = Anchor { ts: 2, price: 90. };
+        for tool in [
+            Tool::PriceRange,
+            Tool::DateRange,
+            Tool::DatePriceRange,
+            Tool::AnchoredVwap,
+            Tool::FixedRangeVolumeProfile,
+            Tool::Arrow,
+            Tool::ArrowMarkUp,
+            Tool::ArrowMarkDown,
+            Tool::Brush,
+            Tool::Circle,
+            Tool::Path,
+            Tool::PriceNote,
+            Tool::Callout,
+            Tool::FlagMark,
+        ] {
+            let mut d = Drawing::new(tool, a, b);
+            d.text = "Note\nline".into();
+            d.profile_rows = 12;
+            d.width = 2.5;
+            if matches!(tool, Tool::Path | Tool::Brush) {
+                d.vertices = vec![a, b, Anchor { ts: 3, price: 80. }];
+                d.arrow_end = tool == Tool::Path;
+            }
+            let json = serde_json::to_string(&d).unwrap();
+            let loaded: Drawing = serde_json::from_str(&json).unwrap();
+            assert_eq!(loaded, d, "{tool:?}");
+            // Hostile vertex / text / rows payloads never panic and stay bounded.
+            let mut hostile = d.clone();
+            hostile.text = "x\u{0}\r\n".repeat(400);
+            hostile.profile_rows = usize::MAX;
+            hostile.vertices = (0..2_500)
+                .map(|i| Anchor { ts: i as i64, price: if i % 3 == 0 { f64::NAN } else { i as f64 } })
+                .collect();
+            hostile.arrow_end = true;
+            assert!(hostile.sanitize(), "{tool:?}");
+            assert!(hostile.text.chars().count() <= 500);
+            // Use-site row_count is the bound; serde load also clamps via deserialize_rows.
+            assert_eq!(measure::row_count(hostile.profile_rows), 200);
+            assert_eq!(hostile.arrow_end, tool == Tool::Path);
+            if matches!(tool, Tool::Path | Tool::Brush) {
+                assert!((2..=shapes::MAX_POINTS).contains(&hostile.vertices.len()));
+                assert!(hostile.vertices.iter().all(|p| p.price.is_finite()));
+            } else {
+                assert!(hostile.vertices.is_empty());
+            }
+        }
+    }
 }

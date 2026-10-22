@@ -140,4 +140,59 @@ mod tests {
         assert_eq!(result.first(), noisy.first());
         assert_eq!(result.last(), noisy.last());
     }
+
+    #[test]
+    fn simplify_collapses_duplicate_runs_and_never_drops_endpoints_at_the_cap() {
+        let project = |a: Anchor| [a.ts as f64, a.price];
+        let flat: Vec<_> = (0..50).map(|_| Anchor { ts: 0, price: 0. }).collect();
+        assert_eq!(simplify(&flat, &project), vec![flat[0], flat[49]]);
+        let twins = [Anchor { ts: 0, price: 1. }, Anchor { ts: 0, price: 1. }, Anchor { ts: 0, price: 1. }];
+        assert_eq!(simplify(&twins, &project).len(), 2);
+        // Exactly at the cap: returned unchanged and still size-safe.
+        let exact: Vec<_> = (0..MAX_POINTS).map(|ts| Anchor { ts: ts as i64, price: ts as f64 }).collect();
+        assert_eq!(simplify(&exact, &project), vec![exact[0], exact[MAX_POINTS - 1]]);
+        // One past the cap with a real zigzag so RDP cannot collapse it.
+        let zig: Vec<_> =
+            (0..MAX_POINTS + 1).map(|ts| Anchor { ts: ts as i64, price: (ts % 2) as f64 * 20. }).collect();
+        let capped = simplify(&zig, &project);
+        assert!(capped.len() <= MAX_POINTS);
+        assert_eq!(capped.first(), zig.first());
+        assert_eq!(capped.last(), zig.last());
+    }
+
+    #[test]
+    fn circle_zero_radius_and_path_strokes_with_few_vertices_stay_selectable() {
+        fn ctx<'a>(drawing: &'a super::super::Drawing) -> Geometry<'a> {
+            Geometry {
+                drawing,
+                points: [[20., 30.], [20., 30.], [0., 0.]],
+                bounds: [0., 0., 100., 100.],
+                price_y: &|p| p,
+                measure_label: String::new(),
+                text_size: [0., 0.],
+                project: &|a| [a.ts as f64, a.price],
+                pattern_points: Vec::new(),
+                closes: &[],
+            }
+        }
+        let a = Anchor { ts: 0, price: 100. };
+        let circle = super::super::Drawing::new(Tool::Circle, a, a);
+        let g = ctx(&circle);
+        assert_eq!(geometry(&g).len(), 96);
+        assert!(hit_distance(&g, [20., 30.]).abs() < 1e-9, "zero-radius circle hits at its centre");
+        assert!(hit_distance(&g, [50., 50.]).is_finite());
+
+        let mut path = super::super::Drawing::new(Tool::Path, a, a);
+        path.vertices.clear();
+        assert_eq!(geometry(&ctx(&path)).len(), 1, "empty vertices fall back to the anchors");
+        path.vertices = vec![a];
+        // One vertex cannot form a stroke (windows(2) is empty); the state is rejected on save.
+        assert_eq!(geometry(&ctx(&path)).len(), 0);
+        path.vertices = vec![a, Anchor { ts: 1, price: 110. }];
+        path.arrow_end = true;
+        let g = ctx(&path);
+        let shapes = geometry(&g);
+        assert!(shapes.len() >= 3, "two-vertex stroke plus arrowhead");
+        assert!(hit_distance(&g, [0.5, 105.]).is_finite());
+    }
 }

@@ -5809,6 +5809,92 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "BUG: paint_drawings looks up the marker bar with index_of_ts(...).round(); index_of_ts already returns the bar centre (k+0.5) so round() yields k+1 — ArrowMarkUp/Down and FlagMark snap to the following bar's low/high (and the last bar falls through to None, keeping the raw anchor price)"]
+    fn markers_snap_to_the_anchor_bar_not_the_next_one() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        let mut bars = chart.bars.as_ref().clone();
+        // Distinct extremes so a wrong bar is obvious on a 100..200 scale (400px).
+        bars[50] = Bar::new(50 * 86400, 150., 151., 149., 150., 10.);
+        bars[51] = Bar::new(51 * 86400, 150., 200., 100., 150., 10.);
+        chart.bars = Arc::new(bars);
+        ui_frame(&ctx, vec![], |ui| {
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(800., 400.));
+            let v = Viewport { right: 100., bar_px: 8., width_px: 800. };
+            let scale = PriceScale::new(100., 200., false, 400.);
+            let a = Anchor { ts: 50 * 86400, price: 150. };
+            let up = Drawing::new(Tool::ArrowMarkUp, a, a);
+            let shapes = chart.drawing_shapes(ui, &up, rect, &v, &scale);
+            let Shape::Polygon(points) = &shapes.last().unwrap().0 else { panic!("marker") };
+            assert!(
+                points.iter().all(|p| p[1] < scale.y_of(120.)),
+                "ArrowMarkUp must sit at bar 50 low=149, not bar 51 low=100: {points:?}"
+            );
+            let down = Drawing::new(Tool::ArrowMarkDown, a, a);
+            let shapes = chart.drawing_shapes(ui, &down, rect, &v, &scale);
+            let Shape::Polygon(points) = &shapes.last().unwrap().0 else { panic!("marker") };
+            assert!(
+                points.iter().all(|p| p[1] > scale.y_of(180.)),
+                "ArrowMarkDown must sit at bar 50 high=151, not bar 51 high=200: {points:?}"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "BUG: drawing_shapes assigns anchor.price = bar.low/high for ArrowMarkUp/Down and FlagMark without an is_finite guard, so NaN/±inf bar extremes produce non-finite polygon coordinates that paint as nothing and cannot be hit-tested (handles still use the raw anchor, so the drawing looks present but is a ghost)"]
+    fn markers_on_bars_with_nonfinite_extremes_keep_finite_hit_testable_geometry() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        let mut bars = chart.bars.as_ref().clone();
+        bars[50] = Bar::new(50 * 86400, 150., f64::NAN, f64::NAN, 150., 10.);
+        bars[51] = Bar::new(51 * 86400, 150., f64::INFINITY, f64::NEG_INFINITY, 150., 10.);
+        chart.bars = Arc::new(bars);
+        ui_frame(&ctx, vec![], |ui| {
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(800., 400.));
+            let v = Viewport { right: 100., bar_px: 8., width_px: 800. };
+            let scale = PriceScale::new(100., 200., false, 400.);
+            for (ts, tool) in [
+                (50 * 86400, Tool::ArrowMarkUp),
+                (50 * 86400, Tool::ArrowMarkDown),
+                (50 * 86400, Tool::FlagMark),
+                (51 * 86400, Tool::ArrowMarkUp),
+                (51 * 86400, Tool::FlagMark),
+            ] {
+                let a = Anchor { ts, price: 150. };
+                let d = Drawing::new(tool, a, a);
+                let shapes = chart.drawing_shapes(ui, &d, rect, &v, &scale);
+                assert!(!shapes.is_empty(), "{tool:?} on broken bar must still draw");
+                for (shape, _) in &shapes {
+                    let points: Vec<[f64; 2]> = match shape {
+                        Shape::Polygon(points) => points.to_vec(),
+                        Shape::Segment(a, b) => vec![*a, *b],
+                        Shape::Rect(a, b) => vec![*a, *b],
+                        Shape::HLine(_) | Shape::VLine(_) | Shape::DashedSegment(..) => continue,
+                    };
+                    assert!(
+                        points.iter().flatten().all(|v| v.is_finite()),
+                        "{tool:?} produced non-finite geometry: {shape:?}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn date_range_paints_its_elapsed_and_volume_label_like_the_other_measurers() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.start_tool(Tool::DateRange);
+        click_drawing(&ctx, &mut chart, pos2(320., 300.), false);
+        let labels = click_drawing(&ctx, &mut chart, pos2(480., 100.), false);
+        assert_eq!(chart.drawings.len(), 1);
+        assert!(
+            labels.iter().any(|(s, _)| s.contains("bars") && s.contains("Volume")),
+            "DateRange must paint its range label, got {labels:?}"
+        );
+    }
+
+    #[test]
     fn hide_menu_suppresses_painting_keeps_sources_and_pane_layout_and_shows_all() {
         let ctx = egui::Context::default();
         let mut chart = sample_chart();
