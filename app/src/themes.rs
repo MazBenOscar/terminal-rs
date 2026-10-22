@@ -1,4 +1,4 @@
-//! Themes: named bundles of colours, fonts and density. Thirteen are built in; custom themes
+//! Themes: named bundles of colours, fonts and density. Nineteen are built in; custom themes
 //! are TOML (or JSON) files in `<data dir>/themes/`, so they can be shared, hand-edited,
 //! imported and exported. A file only needs the fields it changes: anything missing is
 //! filled from the built-in dark or light base, chosen by its `dark` flag.
@@ -728,6 +728,244 @@ fn rose_pine_dawn() -> Theme {
     }
 }
 
+/// Tokyo Night (folke/tokyonight.nvim, Apache-2.0): the night variant.
+fn tokyo_night() -> Theme {
+    Theme {
+        name: "Tokyo Night".into(),
+        dark: true,
+        colors: ThemeColors {
+            background: Hex::rgb(0x16, 0x16, 0x1e),
+            sidebar: Hex::rgba(0x16, 0x16, 0x1e, 220),
+            panel: Hex::rgb(0x1a, 0x1b, 0x26),
+            panel_header: Hex::rgb(0x29, 0x2e, 0x42),
+            border: Hex::rgba(0xc0, 0xca, 0xf5, 26),
+            grid: Hex::rgb(0x1f, 0x23, 0x35),
+            text: Hex::rgb(0xc0, 0xca, 0xf5),
+            muted: Hex::rgb(0x73, 0x7a, 0xa2),
+            highlight: Hex::rgb(0xe0, 0xaf, 0x68),
+            highlight_dim: Hex::rgb(0xa0, 0x7d, 0x4c),
+            info: Hex::rgb(0x7d, 0xcf, 0xff),
+            control: Hex::rgba(0xc0, 0xca, 0xf5, 20),
+            control_hover: Hex::rgba(0xc0, 0xca, 0xf5, 36),
+            accent: Some(Hex::rgb(0x7a, 0xa2, 0xf7)),
+            up: Hex::rgb(0x9e, 0xce, 0x6a),
+            down: Hex::rgb(0xf7, 0x76, 0x8e),
+            candle_up: Hex::rgb(0x9e, 0xce, 0x6a),
+            candle_down: Hex::rgb(0xf7, 0x76, 0x8e),
+            series: [
+                Hex::rgb(0x7a, 0xa2, 0xf7),
+                Hex::rgb(0xbb, 0x9a, 0xf7),
+                Hex::rgb(0xff, 0x9e, 0x64),
+                Hex::rgb(0x73, 0xda, 0xca),
+                Hex::rgb(0x2a, 0xc3, 0xde),
+                Hex::rgb(0x9d, 0x7c, 0xd8),
+            ],
+        },
+        fonts: fonts(UiFont::System, MonoFont::System, 1.0),
+        density: Density::Regular,
+        builtin: true,
+        source: None,
+    }
+}
+
+/// Dracula (draculatheme.com, MIT).
+fn dracula() -> Theme {
+    Theme {
+        name: "Dracula".into(),
+        dark: true,
+        colors: ThemeColors {
+            background: Hex::rgb(0x21, 0x22, 0x2c),
+            sidebar: Hex::rgba(0x21, 0x22, 0x2c, 220),
+            panel: Hex::rgb(0x28, 0x2a, 0x36),
+            panel_header: Hex::rgb(0x34, 0x37, 0x46),
+            border: Hex::rgba(0xf8, 0xf8, 0xf2, 26),
+            grid: Hex::rgb(0x2e, 0x30, 0x3e),
+            text: Hex::rgb(0xf8, 0xf8, 0xf2),
+            muted: Hex::rgb(0x62, 0x72, 0xa4),
+            highlight: Hex::rgb(0xf1, 0xfa, 0x8c),
+            highlight_dim: Hex::rgb(0xa8, 0xae, 0x62),
+            info: Hex::rgb(0x8b, 0xe9, 0xfd),
+            control: Hex::rgba(0xf8, 0xf8, 0xf2, 20),
+            control_hover: Hex::rgba(0xf8, 0xf8, 0xf2, 36),
+            accent: Some(Hex::rgb(0xbd, 0x93, 0xf9)),
+            up: Hex::rgb(0x50, 0xfa, 0x7b),
+            down: Hex::rgb(0xff, 0x55, 0x55),
+            candle_up: Hex::rgb(0x50, 0xfa, 0x7b),
+            candle_down: Hex::rgb(0xff, 0x55, 0x55),
+            series: [
+                Hex::rgb(0xbd, 0x93, 0xf9),
+                Hex::rgb(0xff, 0x79, 0xc6),
+                Hex::rgb(0xff, 0xb8, 0x6c),
+                Hex::rgb(0x8b, 0xe9, 0xfd),
+                Hex::rgb(0xf1, 0xfa, 0x8c),
+                Hex::rgb(0xf8, 0xf8, 0xf2),
+            ],
+        },
+        fonts: fonts(UiFont::System, MonoFont::System, 1.0),
+        density: Density::Regular,
+        builtin: true,
+        source: None,
+    }
+}
+
+// Everforest (sainnhe/everforest, MIT): the medium-contrast dark and light palettes.
+fn everforest_dark() -> Theme {
+    Theme {
+        name: "Everforest Dark".into(),
+        dark: true,
+        colors: ThemeColors {
+            background: Hex::rgb(0x23, 0x2a, 0x2e),
+            sidebar: Hex::rgba(0x23, 0x2a, 0x2e, 210),
+            panel: Hex::rgb(0x2d, 0x35, 0x3b),
+            panel_header: Hex::rgb(0x34, 0x3f, 0x44),
+            border: Hex::rgba(0xd3, 0xc6, 0xaa, 28),
+            grid: Hex::rgb(0x31, 0x3a, 0x3f),
+            text: Hex::rgb(0xd3, 0xc6, 0xaa),
+            muted: Hex::rgb(0x85, 0x92, 0x89),
+            highlight: Hex::rgb(0xdb, 0xbc, 0x7f),
+            highlight_dim: Hex::rgb(0xa0, 0x8a, 0x5c),
+            info: Hex::rgb(0x7f, 0xbb, 0xb3),
+            control: Hex::rgba(0xd3, 0xc6, 0xaa, 20),
+            control_hover: Hex::rgba(0xd3, 0xc6, 0xaa, 36),
+            accent: Some(Hex::rgb(0xa7, 0xc0, 0x80)),
+            up: Hex::rgb(0xa7, 0xc0, 0x80),
+            down: Hex::rgb(0xe6, 0x7e, 0x80),
+            candle_up: Hex::rgb(0xa7, 0xc0, 0x80),
+            candle_down: Hex::rgb(0xe6, 0x7e, 0x80),
+            series: [
+                Hex::rgb(0x7f, 0xbb, 0xb3),
+                Hex::rgb(0xd6, 0x99, 0xb6),
+                Hex::rgb(0xe6, 0x98, 0x75),
+                Hex::rgb(0x83, 0xc0, 0x92),
+                Hex::rgb(0xdb, 0xbc, 0x7f),
+                Hex::rgb(0x85, 0x92, 0x89),
+            ],
+        },
+        fonts: fonts(UiFont::System, MonoFont::System, 1.0),
+        density: Density::Regular,
+        builtin: true,
+        source: None,
+    }
+}
+
+fn everforest_light() -> Theme {
+    Theme {
+        name: "Everforest Light".into(),
+        dark: false,
+        colors: ThemeColors {
+            background: Hex::rgb(0xef, 0xeb, 0xd4),
+            sidebar: Hex::rgba(0xef, 0xeb, 0xd4, 200),
+            panel: Hex::rgb(0xfd, 0xf6, 0xe3),
+            panel_header: Hex::rgb(0xf4, 0xf0, 0xd9),
+            border: Hex::rgba(0x5c, 0x6a, 0x72, 40),
+            grid: Hex::rgb(0xf4, 0xf0, 0xd9),
+            text: Hex::rgb(0x5c, 0x6a, 0x72),
+            muted: Hex::rgb(0x93, 0x9f, 0x91),
+            highlight: Hex::rgb(0xf5, 0x7d, 0x26),
+            highlight_dim: Hex::rgb(0xdf, 0xa0, 0x00),
+            info: Hex::rgb(0x3a, 0x94, 0xc5),
+            control: Hex::rgba(0x5c, 0x6a, 0x72, 18),
+            control_hover: Hex::rgba(0x5c, 0x6a, 0x72, 32),
+            accent: Some(Hex::rgb(0x35, 0xa7, 0x7c)),
+            up: Hex::rgb(0x8d, 0xa1, 0x01),
+            down: Hex::rgb(0xf8, 0x55, 0x52),
+            candle_up: Hex::rgb(0x8d, 0xa1, 0x01),
+            candle_down: Hex::rgb(0xf8, 0x55, 0x52),
+            series: [
+                Hex::rgb(0x3a, 0x94, 0xc5),
+                Hex::rgb(0xdf, 0x69, 0xba),
+                Hex::rgb(0xf5, 0x7d, 0x26),
+                Hex::rgb(0x35, 0xa7, 0x7c),
+                Hex::rgb(0xdf, 0xa0, 0x00),
+                Hex::rgb(0x93, 0x9f, 0x91),
+            ],
+        },
+        fonts: fonts(UiFont::System, MonoFont::System, 1.0),
+        density: Density::Regular,
+        builtin: true,
+        source: None,
+    }
+}
+
+// Gruvbox (morhetz/gruvbox, MIT/X11): bright accents on dark, faded accents on light.
+fn gruvbox_dark() -> Theme {
+    Theme {
+        name: "Gruvbox Dark".into(),
+        dark: true,
+        colors: ThemeColors {
+            background: Hex::rgb(0x1d, 0x20, 0x21),
+            sidebar: Hex::rgba(0x1d, 0x20, 0x21, 220),
+            panel: Hex::rgb(0x28, 0x28, 0x28),
+            panel_header: Hex::rgb(0x3c, 0x38, 0x36),
+            border: Hex::rgba(0xeb, 0xdb, 0xb2, 28),
+            grid: Hex::rgb(0x32, 0x30, 0x2f),
+            text: Hex::rgb(0xeb, 0xdb, 0xb2),
+            muted: Hex::rgb(0x92, 0x83, 0x74),
+            highlight: Hex::rgb(0xfa, 0xbd, 0x2f),
+            highlight_dim: Hex::rgb(0xd7, 0x99, 0x21),
+            info: Hex::rgb(0x83, 0xa5, 0x98),
+            control: Hex::rgba(0xeb, 0xdb, 0xb2, 20),
+            control_hover: Hex::rgba(0xeb, 0xdb, 0xb2, 36),
+            accent: Some(Hex::rgb(0xfe, 0x80, 0x19)),
+            up: Hex::rgb(0xb8, 0xbb, 0x26),
+            down: Hex::rgb(0xfb, 0x49, 0x34),
+            candle_up: Hex::rgb(0xb8, 0xbb, 0x26),
+            candle_down: Hex::rgb(0xfb, 0x49, 0x34),
+            series: [
+                Hex::rgb(0x83, 0xa5, 0x98),
+                Hex::rgb(0xd3, 0x86, 0x9b),
+                Hex::rgb(0xfe, 0x80, 0x19),
+                Hex::rgb(0x8e, 0xc0, 0x7c),
+                Hex::rgb(0xfa, 0xbd, 0x2f),
+                Hex::rgb(0xa8, 0x99, 0x84),
+            ],
+        },
+        fonts: fonts(UiFont::System, MonoFont::System, 1.0),
+        density: Density::Regular,
+        builtin: true,
+        source: None,
+    }
+}
+
+fn gruvbox_light() -> Theme {
+    Theme {
+        name: "Gruvbox Light".into(),
+        dark: false,
+        colors: ThemeColors {
+            background: Hex::rgb(0xf2, 0xe5, 0xbc),
+            sidebar: Hex::rgba(0xf2, 0xe5, 0xbc, 200),
+            panel: Hex::rgb(0xfb, 0xf1, 0xc7),
+            panel_header: Hex::rgb(0xeb, 0xdb, 0xb2),
+            border: Hex::rgba(0x3c, 0x38, 0x36, 40),
+            grid: Hex::rgb(0xf4, 0xe8, 0xc1),
+            text: Hex::rgb(0x3c, 0x38, 0x36),
+            muted: Hex::rgb(0x7c, 0x6f, 0x64),
+            highlight: Hex::rgb(0xb5, 0x76, 0x14),
+            highlight_dim: Hex::rgb(0xd7, 0x99, 0x21),
+            info: Hex::rgb(0x07, 0x66, 0x78),
+            control: Hex::rgba(0x3c, 0x38, 0x36, 18),
+            control_hover: Hex::rgba(0x3c, 0x38, 0x36, 32),
+            accent: Some(Hex::rgb(0xaf, 0x3a, 0x03)),
+            up: Hex::rgb(0x79, 0x74, 0x0e),
+            down: Hex::rgb(0x9d, 0x00, 0x06),
+            candle_up: Hex::rgb(0x79, 0x74, 0x0e),
+            candle_down: Hex::rgb(0x9d, 0x00, 0x06),
+            series: [
+                Hex::rgb(0x07, 0x66, 0x78),
+                Hex::rgb(0x8f, 0x3f, 0x71),
+                Hex::rgb(0xaf, 0x3a, 0x03),
+                Hex::rgb(0x42, 0x7b, 0x58),
+                Hex::rgb(0xb5, 0x76, 0x14),
+                Hex::rgb(0x7c, 0x6f, 0x64),
+            ],
+        },
+        fonts: fonts(UiFont::System, MonoFont::System, 1.0),
+        density: Density::Regular,
+        builtin: true,
+        source: None,
+    }
+}
+
 /// The themes that ship with the app, in display order.
 pub fn builtins() -> Vec<Theme> {
     vec![
@@ -744,6 +982,12 @@ pub fn builtins() -> Vec<Theme> {
         catppuccin_latte(),
         rose_pine(),
         rose_pine_dawn(),
+        tokyo_night(),
+        dracula(),
+        everforest_dark(),
+        everforest_light(),
+        gruvbox_dark(),
+        gruvbox_light(),
     ]
 }
 
@@ -892,7 +1136,7 @@ mod tests {
     #[test]
     fn builtins_are_distinct_and_readable() {
         let all = builtins();
-        assert_eq!(all.len(), 13);
+        assert_eq!(all.len(), 19);
         for (i, t) in all.iter().enumerate() {
             assert!(t.builtin);
             assert!(all[i + 1..].iter().all(|o| !o.name.eq_ignore_ascii_case(&t.name)), "duplicate {}", t.name);
@@ -945,7 +1189,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tr-themes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = ThemeStore::new(dir.clone());
-        assert_eq!(store.load_all().len(), 13);
+        assert_eq!(store.load_all().len(), 19);
         let mut mine = Theme { name: "Desk".into(), builtin: false, source: None, ..nord() };
         mine.colors.up = Hex::rgb(1, 2, 3);
         store.save(&mine).unwrap();
@@ -953,7 +1197,7 @@ mod tests {
         // A hand-dropped JSON file reusing a built-in name gets a suffix.
         std::fs::write(dir.join("x.json"), r##"{"name":"Nord","colors":{"down":"#ff00ff"}}"##).unwrap();
         let all = store.load_all();
-        assert_eq!(all.len(), 15);
+        assert_eq!(all.len(), 21);
         assert_eq!(find(&all, "Desk").unwrap().colors.up, Hex::rgb(1, 2, 3));
         let copy = find(&all, "Nord (Custom)").unwrap();
         assert_eq!(copy.colors.down, Hex::rgb(255, 0, 255));
@@ -975,7 +1219,7 @@ mod tests {
         store.delete(find(&all, "Nord (Custom)").unwrap()).unwrap();
         assert!(store.delete(&desk).is_err());
         assert!(store.delete(&nord()).is_err());
-        assert_eq!(store.load_all().len(), 13);
+        assert_eq!(store.load_all().len(), 19);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
