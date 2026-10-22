@@ -4047,10 +4047,11 @@ impl ChartState {
         };
         ui.ctx().set_cursor_icon(CursorIcon::Default);
         let dec = self.sec.decimals(info.close);
-        let price = |v: f64| format!("{v:.dec$}");
+        let dollar = if self.sec.dollar_priced() { "$" } else { "" };
+        let price = |v: f64| format!("{dollar}{v:.dec$}");
         let (change, percent, color) = match info.change {
             Some((abs, pct)) => (
-                format!("{abs:+.dec$}"),
+                format!("{}{dollar}{:.dec$}", if abs < 0.0 { "-" } else { "+" }, abs.abs()),
                 pct.map_or("—".into(), |p| format!("{p:+.2}%")),
                 if abs >= 0.0 { theme::up() } else { theme::down() },
             ),

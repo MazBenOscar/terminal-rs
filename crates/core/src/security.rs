@@ -270,6 +270,20 @@ impl Security {
         }
     }
 
+    /// Whether prices are quoted in US dollars, so they can carry a `$`. Indices (points),
+    /// yields and non-USD quotes are not; Canadian listings trade in CAD.
+    pub fn dollar_priced(&self) -> bool {
+        match self.class {
+            AssetClass::Equity | AssetClass::Etf => {
+                ![".TO", ".V", ".CN", ".NE"].iter().any(|suffix| self.ticker.ends_with(suffix))
+            }
+            AssetClass::Fx => self.ticker.ends_with("USD"),
+            AssetClass::Crypto => self.crypto_instrument().is_ok_and(|c| c.quote == "USD"),
+            AssetClass::Cmdty => true,
+            AssetClass::Index | AssetClass::Govt => false,
+        }
+    }
+
     /// Whether congressional (STOCK Act) disclosures can reference this security.
     pub fn has_congress_trades(&self) -> bool {
         matches!(self.class, AssetClass::Equity | AssetClass::Etf)
@@ -378,5 +392,15 @@ mod tests {
         assert_eq!(value.key(), "BTCUSD Curncy");
         assert_eq!(value.crypto_instrument().unwrap().canonical_ticker(), "COINBASE:BTC-USD");
         assert_eq!(r("BTCUSDT").crypto_instrument().unwrap().canonical_ticker(), "BINANCE:BTCUSDT");
+    }
+
+    #[test]
+    fn dollar_priced_follows_the_quote_currency() {
+        for usd in ["AAPL", "BRK.B US Equity", "EURUSD Curncy", "BTCUSD Curncy", "COINBASE:ETH-USD", "CL1 Comdty"] {
+            assert!(r(usd).dollar_priced(), "{usd}");
+        }
+        for other in ["BMO.TO US Equity", "USDJPY Curncy", "BTCUSDT", "SPX Index", "US10Y Govt"] {
+            assert!(!r(other).dollar_priced(), "{other}");
+        }
     }
 }
