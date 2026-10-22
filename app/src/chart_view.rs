@@ -2661,24 +2661,25 @@ impl ChartState {
                 let price = scale.price_at((p.y - price_rect.top()) as f64);
                 let y = spread_tags(&[(p.y, 16.)], None, axis_labels_rect.top(), axis_labels_rect.bottom())[0];
                 let tag = Rect::from_min_size(pos2(plot_all.right() + 1.0, y - 8.0), vec2(AXIS_W - 2.0, 16.0));
-                axis_painter.rect_filled(tag, 0.0, Color32::from_gray(70));
+                let (tag_fill, tag_text) = crosshair_tag();
+                axis_painter.rect_filled(tag, 0.0, tag_fill);
                 let label = match percent_base {
                     Some(base) => axis_value(percent(price, base), 2, self.compare_axis),
                     None => scale::format_price(price, self.sec.decimals(price)),
                 };
-                axis_painter.text(tag.left_center() + vec2(5.0, 0.0), Align2::LEFT_CENTER, label, mono(11.0), text());
+                axis_painter.text(tag.left_center() + vec2(5.0, 0.0), Align2::LEFT_CENTER, label, mono(11.0), tag_text);
                 if let Some(s) = own_scale {
                     let own = s.price_at((p.y - price_rect.top()) as f64);
                     let tag =
                         Rect::from_min_size(pos2(body.left() + rail_width + 1.0, p.y - 8.0), vec2(AXIS_W - 2.0, 16.0));
-                    left_painter.rect_filled(tag, 0.0, Color32::from_gray(70));
+                    left_painter.rect_filled(tag, 0.0, tag_fill);
                     let decimals = scale::decimals_for(own.abs() / 1000.0).clamp(2, 4);
                     left_painter.text(
                         tag.right_center() - vec2(5.0, 0.0),
                         Align2::RIGHT_CENTER,
                         scale::format_price(own, decimals),
                         mono(11.0),
-                        text(),
+                        tag_text,
                     );
                 }
             }
@@ -2686,8 +2687,9 @@ impl ChartState {
                 let label = scale::crosshair_label(self.data.zone.label_timestamp(self.bars[i].ts, self.tf), self.tf);
                 let gw = label.len() as f32 * 7.0 + 10.0;
                 let tag = Rect::from_center_size(pos2(xi, time_rect.center().y), vec2(gw, TIME_H));
-                time_painter.rect_filled(tag, 0.0, Color32::from_gray(70));
-                time_painter.text(tag.center(), Align2::CENTER_CENTER, label, mono(10.5), text());
+                let (tag_fill, tag_text) = crosshair_tag();
+                time_painter.rect_filled(tag, 0.0, tag_fill);
+                time_painter.text(tag.center(), Align2::CENTER_CENTER, label, mono(10.5), tag_text);
             }
             if self.draw.tool.is_some() {
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
@@ -4722,6 +4724,12 @@ fn dashed_h(p: &egui::Painter, x: egui::Rangef, y: f32, s: Stroke) {
         p.hline(a..=(a + 4.0).min(x.max), y, s);
         a += 7.0;
     }
+}
+
+/// Crosshair axis tag fill and label colours: a dark tag in every theme, so the
+/// label stays readable when light themes use dark body text.
+fn crosshair_tag() -> (Color32, Color32) {
+    if theme::palette().dark { (Color32::from_gray(70), text()) } else { (text(), theme::card()) }
 }
 
 fn dashed_v(p: &egui::Painter, x: f32, y: egui::Rangef, s: Stroke) {
