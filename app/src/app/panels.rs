@@ -428,24 +428,31 @@ impl TerminalApp {
                 let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
                 widgets::hover_wash(ui, r, &resp, false);
                 let p = ui.painter();
-                let ticker = sec.crypto_instrument().ok().map_or_else(
+                let crypto = sec.crypto_instrument().ok();
+                // Crypto pairs use the type column too: BASE/QUOTE must keep its quote
+                // asset visible (USD and USDT are different markets), and "Curncy" adds nothing.
+                let crypto_pair = crypto.is_some();
+                let ticker_width = if crypto_pair { 114.0 } else { 70.0 };
+                let ticker = crypto.map_or_else(
                     || sec.ticker.clone(),
                     |instrument| format!("{}/{}", instrument.base, instrument.quote),
                 );
-                p.with_clip_rect(Rect::from_min_max(r.min, pos2(col(r, 0) + 70., r.bottom()))).text(
-                    pos2(col(r, 0), r.center().y),
-                    Align2::LEFT_CENTER,
-                    ticker,
-                    mono(12.5),
-                    amber(),
-                );
-                p.text(
-                    pos2(col(r, 0) + 74.0, r.center().y),
-                    Align2::LEFT_CENTER,
-                    sec.class.yellow_key().label(),
-                    ui_font(11.0),
-                    muted(),
-                );
+                let mut job = egui::text::LayoutJob::simple_singleline(ticker, mono(12.5), amber());
+                job.wrap.max_width = ticker_width;
+                job.wrap.max_rows = 1;
+                job.wrap.break_anywhere = true;
+                job.wrap.overflow_character = Some('…');
+                let galley = p.layout_job(job);
+                p.galley(pos2(col(r, 0), r.center().y - galley.size().y / 2.0), galley, amber());
+                if !crypto_pair {
+                    p.text(
+                        pos2(col(r, 0) + 74.0, r.center().y),
+                        Align2::LEFT_CENTER,
+                        sec.class.yellow_key().label(),
+                        ui_font(11.0),
+                        muted(),
+                    );
+                }
                 let name = self.security_names.name(s);
                 let ticker_hit = Rect::from_min_max(r.min, pos2(name_left, r.bottom()));
                 let mut description = crate::security_names::hover(&sec.ticker, name);

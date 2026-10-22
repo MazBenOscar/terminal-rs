@@ -427,11 +427,28 @@ fn operand_editor(ui: &mut Ui, operand: &mut ScanOperand, bars_ago: &mut usize, 
 
 /// A muted label and its control, kept together when the row wraps.
 fn field(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
-    ui.horizontal(|ui| {
+    wrap_group(ui, label, |ui| {
         ui.label(RichText::new(label).color(muted()));
         add(ui);
     });
-    ui.add_space(dp(8.0));
+}
+
+/// A nested group cannot wrap on its own, so a wrapped row starts a new line when
+/// the group's width from the last frame no longer fits. Without this, narrow panes
+/// overflow and widen the whole scroll area past the pane edge.
+fn wrap_group(ui: &mut Ui, key: &str, add: impl FnOnce(&mut Ui)) {
+    let width_id = ui.id().with(("field-width", key));
+    let last_width = ui.data(|data| data.get_temp::<f32>(width_id));
+    if ui.cursor().min.x > ui.max_rect().left() + 1.0 {
+        let gap = dp(8.0);
+        if ui.layout().main_wrap && last_width.is_some_and(|width| width + gap > ui.available_size_before_wrap().x) {
+            ui.end_row();
+        } else {
+            ui.add_space(gap);
+        }
+    }
+    let width = ui.horizontal(add).response.rect.width();
+    ui.data_mut(|data| data.insert_temp(width_id, width));
 }
 
 fn timeframe_editor(ui: &mut Ui, timeframe: &mut Option<Timeframe>) {
@@ -886,24 +903,26 @@ pub fn show_named(
                 }
             }
             let mut selected = None;
-            ui.add_enabled_ui(!pane.running, |ui| {
-                egui::ComboBox::from_id_salt("saved-scans").selected_text("Load scan").show_ui(ui, |ui| {
-                    ui.label(RichText::new("Presets").small().color(muted()));
-                    for preset in ScanDefinition::presets() {
-                        if ui.selectable_label(false, &preset.name).clicked() {
-                            selected = Some(ScanSettings { definition: preset, universe: pane.universe, refresh: pane.refresh, crypto_filter: pane.crypto_filter.clone() });
+            wrap_group(ui, "load-scan", |ui| {
+                ui.add_enabled_ui(!pane.running, |ui| {
+                    egui::ComboBox::from_id_salt("saved-scans").selected_text("Load scan").show_ui(ui, |ui| {
+                        ui.label(RichText::new("Presets").small().color(muted()));
+                        for preset in ScanDefinition::presets() {
+                            if ui.selectable_label(false, &preset.name).clicked() {
+                                selected = Some(ScanSettings { definition: preset, universe: pane.universe, refresh: pane.refresh, crypto_filter: pane.crypto_filter.clone() });
+                            }
                         }
-                    }
-                    ui.separator();
-                    ui.label(RichText::new("Saved").small().color(muted()));
-                    if pane.saved.is_empty() {
-                        ui.label(RichText::new("No saved scans yet").color(muted()));
-                    }
-                    for saved in &pane.saved {
-                        if ui.selectable_label(false, &saved.definition.name).clicked() {
-                            selected = Some(saved.clone());
+                        ui.separator();
+                        ui.label(RichText::new("Saved").small().color(muted()));
+                        if pane.saved.is_empty() {
+                            ui.label(RichText::new("No saved scans yet").color(muted()));
                         }
-                    }
+                        for saved in &pane.saved {
+                            if ui.selectable_label(false, &saved.definition.name).clicked() {
+                                selected = Some(saved.clone());
+                            }
+                        }
+                    });
                 });
             });
             if let Some(settings) = selected {
@@ -1147,7 +1166,7 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
     }
     if pane.universe.crypto_venue().is_some() {
         egui::ScrollArea::horizontal().id_salt("crypto-results-scroll").show(ui, |ui| {
-            ui.set_min_width(dp(1180.0));
+            ui.set_min_width(dp(1000.0));
             results_rows(ui, pane, market, actions);
         });
     } else {
@@ -1162,26 +1181,40 @@ fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec
     let names =
         ui.data(|d| d.get_temp::<crate::security_names::Names>(egui::Id::new("security-names"))).unwrap_or_default();
     let crypto = pane.universe.crypto_venue().is_some();
-    let security_width = if pane.rows.iter().any(|row| row.symbol.contains(':')) { dp(220.0) } else { dp(100.0) };
+    // Crypto rows share one venue, so they show BASE/QUOTE and keep the 24h metrics
+    // beside the result where a narrow pane can still see them.
+    let security_width = if crypto {
+        dp(150.0)
+    } else if pane.rows.iter().any(|row| row.symbol.contains(':')) {
+        dp(220.0)
+    } else {
+        dp(100.0)
+    };
     let show_name = !crypto && w >= dp(750.0) + security_width - dp(100.0);
     let shift = if show_name { dp(150.0) } else { 0.0 };
+    let metrics_left = security_width + dp(96.0);
+    let metrics: &[(f32, &str)] = if crypto {
+        &[
+            (metrics_left, "24h %"),
+            (metrics_left + dp(76.0), "Volume (base)"),
+            (metrics_left + dp(176.0), "Volume (quote)"),
+        ]
+    } else {
+        &[]
+    };
+    let metrics_width = if crypto { dp(280.0) } else { 0.0 };
     let x = [
         8.0,
         security_width + shift,
-        dp(96.0) + security_width + shift,
-        dp(220.0) + security_width + shift,
-        dp(292.0) + security_width + shift,
+        dp(96.0) + security_width + shift + metrics_width,
+        dp(220.0) + security_width + shift + metrics_width,
+        dp(292.0) + security_width + shift + metrics_width,
     ];
     let now = chrono::Utc::now().timestamp();
     let sort_id = ui.id().with("crypto-24h-sort");
     let mut sort = ui.data(|data| data.get_temp::<bool>(sort_id));
     if crypto {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Rolling 24h exchange metrics · volumes use each product's base and quote assets")
-                    .small()
-                    .color(muted()),
-            );
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .button(match sort {
                     None => "Sort 24h %",
@@ -1193,6 +1226,11 @@ fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec
                 sort = Some(!sort.unwrap_or(false));
                 ui.data_mut(|data| data.insert_temp(sort_id, sort.unwrap()));
             }
+            ui.label(
+                RichText::new("Rolling 24h exchange metrics · volumes use each product's base and quote assets")
+                    .small()
+                    .color(muted()),
+            );
         });
     }
     let (hdr, _) = ui.allocate_exact_size(egui::vec2(w, row_h), Sense::hover());
@@ -1204,10 +1242,8 @@ fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec
     if show_name {
         p.text(pos2(hdr.left() + security_width, hdr.center().y), Align2::LEFT_CENTER, "Name", ui_font(11.5), muted());
     }
-    if crypto {
-        for (offset, label) in [(700.0, "24h %"), (800.0, "Volume (base)"), (950.0, "Volume (quote)")] {
-            p.text(pos2(hdr.left() + dp(offset), hdr.center().y), Align2::LEFT_CENTER, label, ui_font(11.5), muted());
-        }
+    for &(left, label) in metrics {
+        p.text(pos2(hdr.left() + left, hdr.center().y), Align2::LEFT_CENTER, label, ui_font(11.5), muted());
     }
     let mut shown = 0;
     let mut rows: Vec<_> = pane.rows.iter().collect();
@@ -1234,8 +1270,13 @@ fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec
         widgets::hover_wash(ui, r, &resp, false);
         let p = ui.painter_at(r);
         let y = r.center().y;
-        let ticker = tr_data::security(&row.symbol).ticker;
-        let mut job = egui::text::LayoutJob::simple_singleline(ticker.clone(), mono(12.5), amber());
+        let security = tr_data::security(&row.symbol);
+        let ticker = security.ticker.clone();
+        let shown_ticker = security
+            .crypto_instrument()
+            .ok()
+            .map_or_else(|| ticker.clone(), |instrument| format!("{}/{}", instrument.base, instrument.quote));
+        let mut job = egui::text::LayoutJob::simple_singleline(shown_ticker, mono(12.5), amber());
         job.wrap.max_width = security_width - dp(14.0);
         job.wrap.max_rows = 1;
         job.wrap.break_anywhere = true;
@@ -1287,12 +1328,7 @@ fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec
                     .unwrap_or_default()
             });
         let detail_color = if row.error.is_some() { theme::down() } else { muted() };
-        let detail_painter = if crypto {
-            p.with_clip_rect(egui::Rect::from_min_max(r.min, pos2(r.left() + dp(690.0), r.bottom())))
-        } else {
-            p.clone()
-        };
-        detail_painter.text(pos2(r.left() + x[4], y), Align2::LEFT_CENTER, &detail, mono(12.0), detail_color);
+        p.text(pos2(r.left() + x[4], y), Align2::LEFT_CENTER, &detail, mono(12.0), detail_color);
         if crypto {
             let stats = ready_stats(pane, &row.symbol, now);
             let change = stats.and_then(|s| s.change_percent).map_or_else(
@@ -1307,8 +1343,8 @@ fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec
             );
             let base = stats.map_or_else(|| "—".into(), |s| compact(s.base_volume));
             let quote = stats.and_then(|s| s.quote_volume).map_or_else(|| "—".into(), compact);
-            for (offset, value) in [(700.0, change), (800.0, base), (950.0, quote)] {
-                p.text(pos2(r.left() + dp(offset), y), Align2::LEFT_CENTER, value, mono(12.0), text());
+            for ((left, _), value) in metrics.iter().zip([change, base, quote]) {
+                p.text(pos2(r.left() + left, y), Align2::LEFT_CENTER, value, mono(12.0), text());
             }
         }
         let source = if row.simulated {
@@ -2376,6 +2412,55 @@ mod tests {
                 assert!(!output.shapes.is_empty());
                 // This headless pass intentionally has no renderer to upload textures.
                 output.textures_delta.clear();
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_pane_wraps_header_fields_instead_of_widening_the_pane() {
+        for universe in [Universe::Nasdaq, Universe::BinanceSpot] {
+            let mut pane = ScannerPane::from_settings(ScanSettings {
+                definition: ScanDefinition { name: "Volume Thrust".into(), ..Default::default() },
+                universe,
+                refresh: None,
+                crypto_filter: Default::default(),
+            });
+            pane.definition.root.items = vec![
+                ConditionItem::Compare(ScanCondition::default()),
+                ConditionItem::Compare(ScanCondition {
+                    right: ScanOperand::Sma { period: 20, source: Source::Close },
+                    right_multiplier: 2.5,
+                    ..Default::default()
+                }),
+            ];
+            let ctx = egui::Context::default();
+            theme::configure(&ctx, &crate::themes::builtins()[0], Color32::LIGHT_BLUE);
+            let width = 360.0;
+            // Field widths are learned on the first frame; the second frame must fit.
+            for frame in 0..6 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 900.0))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            show(ui, &mut pane, 1, &["AAPL US Equity".into()], true, |_| {
+                                panic!("No scan requested during render")
+                            });
+                        });
+                    },
+                );
+                output.textures_delta.clear();
+                if frame == 5 {
+                    let right = output
+                        .shapes
+                        .iter()
+                        .map(|clipped| clipped.shape.visual_bounding_rect())
+                        .filter(|rect| rect.is_positive())
+                        .fold(0.0_f32, |right, rect| right.max(rect.max.x));
+                    assert!(right <= width + 1.0, "{universe:?}: content reaches {right} in a {width} pane");
+                }
             }
         }
     }
