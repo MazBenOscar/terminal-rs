@@ -141,7 +141,10 @@ fn kind(class: AssetClass) -> &'static str {
     }
 }
 
-fn rank(hit: &SearchHit, query: &str) -> Option<(u8, u8, usize)> {
+/// Quote currencies people usually mean, most likely first; other quotes follow.
+const MAJOR_QUOTES: [&str; 5] = ["USD", "USDT", "USDC", "EUR", "BTC"];
+
+fn rank(hit: &SearchHit, query: &str) -> Option<(u8, u8, u8, usize)> {
     let sec = tr_data::security(&hit.key);
     let ticker = sec.ticker.to_uppercase();
     let crypto = sec.crypto_instrument().ok();
@@ -160,7 +163,11 @@ fn rank(hit: &SearchHit, query: &str) -> Option<(u8, u8, usize)> {
     } else {
         return None;
     };
-    Some((rank, u8::from(!matches!(hit.class, AssetClass::Equity | AssetClass::Crypto)), native.len()))
+    // Within a rank, XRP/USD and XRP/USDT come before XRP/BRL or XRP/TRY.
+    let quote = crypto
+        .as_ref()
+        .map_or(0, |c| MAJOR_QUOTES.iter().position(|q| *q == c.quote).unwrap_or(MAJOR_QUOTES.len()) as u8);
+    Some((rank, u8::from(!matches!(hit.class, AssetClass::Equity | AssetClass::Crypto)), quote, native.len()))
 }
 
 impl Dialog {
@@ -478,6 +485,27 @@ mod tests {
         dialog.network("XRP", &[hit("XRP", "Exact ticker")]);
         assert_eq!(dialog.results()[0].key, "XRP US Equity");
         assert!(rank(&hit("XRPABC", "Prefix"), "XRP") < rank(&hit("AXRP", "Substring"), "XRP"));
+    }
+
+    #[test]
+    fn major_quote_pairs_rank_before_other_quotes_for_the_same_base() {
+        let pair = |ticker: &str| SearchHit {
+            key: tr_data::security(ticker).key(),
+            name: ticker.into(),
+            class: AssetClass::Crypto,
+            exchange: None,
+        };
+        let mut hits: Vec<_> =
+            ["BINANCE:XRPBRL", "BINANCE:XRPTRY", "COINBASE:XRP-USD", "BINANCE:XRPUSDC", "BINANCE:XRPUSDT"]
+                .into_iter()
+                .map(pair)
+                .collect();
+        hits.sort_by_cached_key(|h| (rank(h, "XRP"), h.key.clone()));
+        let order: Vec<String> = hits.iter().map(|h| tr_data::security(&h.key).ticker).collect();
+        assert_eq!(
+            order,
+            ["COINBASE:XRP-USD", "BINANCE:XRPUSDT", "BINANCE:XRPUSDC", "BINANCE:XRPBRL", "BINANCE:XRPTRY"]
+        );
     }
 
     #[test]
