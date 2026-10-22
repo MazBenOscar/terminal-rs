@@ -155,6 +155,9 @@ fn rank(hit: &SearchHit, query: &str) -> Option<(u8, u8, u8, usize)> {
     }
     let pair = tokens[usize::from(venue.is_some())..].concat();
     let query = query.as_str();
+    if hit.key.to_uppercase() == query {
+        return Some((0, 0, 0, 0));
+    }
     let sec = tr_data::security(&hit.key);
     let ticker = sec.ticker.to_uppercase();
     let crypto = sec.crypto_instrument().ok();
@@ -366,6 +369,20 @@ impl Dialog {
             }));
         }
         hits.extend(builtin);
+        // A pasted market key ("AAPL US Equity", "SPX Index") names one instrument exactly,
+        // which free-text matching cannot find.
+        let tokens: Vec<&str> = self.query.split_whitespace().collect();
+        if tokens.len() > 1
+            && let Some((security, used)) = tr_core::Security::resolve_tokens(&tokens)
+            && used == tokens.len()
+        {
+            hits.push(SearchHit {
+                key: security.key(),
+                name: security.ticker.clone(),
+                class: security.class,
+                exchange: None,
+            });
+        }
         for hit in &mut hits {
             let security = tr_data::security(&hit.key);
             hit.key = security.crypto_instrument().map_or_else(|_| security.key(), |c| c.security().key());
@@ -1355,5 +1372,35 @@ mod tests {
         dialog.query = "NOSUCHPAIR".into();
         let view = snapshot(&mut dialog, &ctx, vec![], &[]);
         text_rect(&view, "No symbols match “NOSUCHPAIR”");
+    }
+
+    #[test]
+    fn space_pair_query_surfaces_crypto_pairs() {
+        for (query, expect) in [("xrp usd", "COINBASE:XRP-USD"), ("XRP USDT", "BINANCE:XRPUSDT")] {
+            let mut dialog = Dialog::new(query.into(), Some(Target::Append));
+            for (venue, key) in [(CryptoVenue::Binance, "BINANCE:XRPUSDT"), (CryptoVenue::Coinbase, "COINBASE:XRP-USD")]
+            {
+                dialog.catalog(venue, Ok(vec![CryptoInstrument::parse(key).unwrap()]));
+            }
+            let hits = dialog.results();
+            assert!(
+                has_key(&hits, expect),
+                "{query:?} must surface {expect}: {:?}",
+                hits.iter().map(|h| &h.key).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn full_market_key_query_finds_the_instrument() {
+        for query in ["AAPL US Equity", "msft us equity", "SPX Index"] {
+            let dialog = Dialog::new(query.into(), Some(Target::Append));
+            let hits = dialog.results();
+            assert!(
+                !hits.is_empty(),
+                "{query:?} must resolve to its instrument, got {:?}",
+                hits.iter().map(|h| &h.key).collect::<Vec<_>>()
+            );
+        }
     }
 }
