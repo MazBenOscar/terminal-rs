@@ -433,10 +433,20 @@ impl TerminalApp {
         }
         let stale = chrono::Utc::now().timestamp() - self.columns_computed_at > 180;
         let mut remove = None;
+        let mut items = self.watchlists[self.active_watchlist].items();
+        let mut drop = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let mut drag =
+                super::watchlist_drag::DragFrame::new(ui, &mut self.watch_drag, &items, self.watch_sort.is_some());
             for s in &symbols {
                 let sec = tr_data::security(s);
-                let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
+                let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click_and_drag());
+                let item_index = items
+                    .iter()
+                    .position(|item| matches!(item, crate::watch_sections::Item::Symbol(key) if key == s))
+                    .unwrap();
+                let offset = drag.row(ui, item_index, r, &resp);
+                let r = r.translate(vec2(0.0, offset));
                 widgets::hover_wash(ui, r, &resp, false);
                 let p = ui.painter();
                 let crypto = sec.crypto_instrument().ok();
@@ -577,11 +587,17 @@ impl TerminalApp {
                     }
                 });
             }
+            drop = drag.finish(ui);
             ui.add_space(4.0);
             ui.label(
                 RichText::new("WL ADD <KEY> to add · right-click a row for options").font(ui_font(11.0)).color(muted()),
             );
         });
+        if let Some((from, gap)) = drop
+            && crate::watch_sections::move_item(&mut items, from, gap)
+        {
+            self.set_watchlist_items(&items);
+        }
         if let Some(s) = remove {
             self.set_watchlist(self.watchlist.iter().filter(|x| **x != s).cloned().collect());
         }
@@ -882,6 +898,80 @@ mod tests {
         assert_eq!(format_column_value(&btc, 249_999.0, Some(last)), "249999.00");
         // Values at/above 1e6 use compact formatting regardless of price-likeness.
         assert_eq!(format_column_value(&btc, 1e6, Some(last)), "1.00M");
+    }
+
+    fn watch_frame(
+        ctx: &egui::Context,
+        app: &mut TerminalApp,
+        events: Vec<egui::Event>,
+    ) -> (Vec<Action>, Vec<egui::Pos2>) {
+        let mut actions = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| actions = app.watchlist(ui),
+        );
+        let rows = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if ["AAPL", "MSFT", "NVDA"].contains(&text.galley.job.text.as_str()) => {
+                    Some(pos2(250.0, text.pos.y + text.galley.size().y / 2.0))
+                }
+                _ => None,
+            })
+            .collect();
+        output.textures_delta.clear();
+        (actions, rows)
+    }
+
+    fn watch_pointer(at: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn watch_drag_reorders_active_symbols_and_click_still_opens_chart() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/watch-drag-panel");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.set_watchlist(vec!["AAPL".into(), "MSFT".into(), "NVDA".into()]);
+        let ctx = egui::Context::default();
+        let (_, rows) = watch_frame(&ctx, &mut app, vec![]);
+        let from = rows[0];
+        watch_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(from), watch_pointer(from, true)]);
+        let (actions, _) = watch_frame(&ctx, &mut app, vec![watch_pointer(from, false)]);
+        assert!(actions.iter().any(|a| matches!(a, Action::OpenChart(key) if key == "AAPL")));
+        assert_eq!(app.watchlist, ["AAPL", "MSFT", "NVDA"]);
+        let to = rows[2] + vec2(0.0, 8.0);
+        watch_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(from), watch_pointer(from, true)]);
+        watch_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(to)]);
+        watch_frame(&ctx, &mut app, vec![watch_pointer(to, false)]);
+        assert_eq!(app.watchlist, ["MSFT", "NVDA", "AAPL"]);
+        assert_eq!(app.watchlists[app.active_watchlist].symbols, app.watchlist);
+    }
+
+    #[test]
+    fn watch_sorted_drag_does_not_reorder() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/watch-drag-sorted");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.set_watchlist(vec!["AAPL".into(), "MSFT".into(), "NVDA".into()]);
+        app.watch_sort = Some((0, false));
+        let ctx = egui::Context::default();
+        let (_, rows) = watch_frame(&ctx, &mut app, vec![]);
+        let from = rows[0];
+        let to = rows[2] + vec2(0.0, 8.0);
+        watch_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(from), watch_pointer(from, true)]);
+        watch_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(to)]);
+        watch_frame(&ctx, &mut app, vec![watch_pointer(to, false)]);
+        assert_eq!(app.watchlist, ["AAPL", "MSFT", "NVDA"]);
+        assert!(app.watch_drag.is_none());
     }
 
     #[test]
