@@ -7975,8 +7975,10 @@ mod tests {
     fn add_comparison_stops_at_the_extra_comparison_limit() {
         let mut chart = sample_chart();
         let worker = Worker::inert();
-        let keys: Vec<String> =
-            ["SPY", "MSFT", "NVDA", "QQQ", "DIA", "IWM", "TLT", "GLD", "USO"].iter().map(|s| tr_data::security(s).key()).collect();
+        let keys: Vec<String> = ["SPY", "MSFT", "NVDA", "QQQ", "DIA", "IWM", "TLT", "GLD", "USO"]
+            .iter()
+            .map(|s| tr_data::security(s).key())
+            .collect();
         chart.add_comparison(keys[0].clone(), &worker);
         for k in &keys[1..8] {
             chart.add_comparison(k.clone(), &worker);

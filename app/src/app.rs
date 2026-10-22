@@ -17,6 +17,7 @@ mod scanner_view;
 mod settings_view;
 mod theming;
 mod trading;
+mod watchlist_drag;
 mod workspace;
 
 pub use broker::{PosSort, questrade_handle};
@@ -710,6 +711,7 @@ pub struct TerminalApp {
     columns_in_flight: Option<u64>,
     columns_snapshot: (Vec<String>, tr_core::columns::ColumnSet),
     watch_sort: Option<(usize, bool)>,
+    watch_drag: Option<watchlist_drag::WatchDrag>,
     quotes: HashMap<String, Quote>,
     last_quotes: Option<Instant>,
     last_feed: Option<Instant>,
@@ -919,6 +921,7 @@ impl TerminalApp {
             columns_in_flight: None,
             columns_snapshot: Default::default(),
             watch_sort: None,
+            watch_drag: None,
             quotes: HashMap::new(),
             last_quotes: None,
             last_feed: None,
@@ -2468,6 +2471,7 @@ impl TerminalApp {
             columns_requested: None,
             columns_snapshot: Default::default(),
             watch_sort: None,
+            watch_drag: None,
             quotes: HashMap::new(),
             last_quotes: None,
             last_feed: None,

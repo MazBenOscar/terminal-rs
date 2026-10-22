@@ -448,16 +448,31 @@ impl TerminalApp {
             stale: chrono::Utc::now().timestamp() - self.columns_computed_at > 180,
         };
         let height = (ui.available_height() - if details { dp(134.0) } else { 0.0 }).max(row_h);
+        // The drag state leaves `self` for the loop, which draws rows through `&mut self`.
+        let mut drag_state = self.watch_drag.take();
+        let mut drop = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(height).show(ui, |ui| {
+            let mut drag =
+                super::watchlist_drag::DragFrame::new(ui, &mut drag_state, &items, self.watch_sort.is_some());
             for index in order {
-                let (rect, response) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
+                let (rect, response) = ui.allocate_exact_size(vec2(w, row_h), Sense::click_and_drag());
+                let offset = drag.row(ui, index, rect, &response);
+                let rect = rect.translate(vec2(0.0, offset));
                 self.draw_watch_item(ui, index, &items[index], (rect, response), &layout, &mut out);
             }
+            drop = drag.finish(ui);
             ui.add_space(4.0);
             ui.label(
                 RichText::new("WL ADD <KEY> to add · right-click a row for options").font(ui_font(11.0)).color(muted()),
             );
         });
+        self.watch_drag = drag_state;
+        if let Some((from, gap)) = drop {
+            let mut items = items;
+            if watch_sections::move_item(&mut items, from, gap) {
+                self.set_watchlist_items(&items);
+            }
+        }
         if details {
             self.watch_details_card(ui);
         }
@@ -1512,10 +1527,7 @@ mod tests {
                 let names = row_names(&items);
                 let tech = names.iter().position(|n| n == "#Tech").unwrap();
                 let mac = names.iter().position(|n| n == "#Macro").unwrap();
-                assert!(
-                    tech < pos && pos < mac,
-                    "MSFT was opened for Tech but landed at {pos} in {names:?}"
-                );
+                assert!(tech < pos && pos < mac, "MSFT was opened for Tech but landed at {pos} in {names:?}");
             }
         }
     }
@@ -1690,7 +1702,11 @@ mod tests {
         let texts = labels(&ui_frame(&ctx, Vec::new(), &mut |ui| {
             app.watchlist(ui);
         }));
-        assert_eq!(texts.iter().filter(|s| *s == "SPY").count(), 2, "card shows the first symbol once selection is gone");
+        assert_eq!(
+            texts.iter().filter(|s| *s == "SPY").count(),
+            2,
+            "card shows the first symbol once selection is gone"
+        );
         assert!(!texts.iter().any(|s| s == "123.45"), "stale AAPL quote must not appear");
         // Switch to a list without AAPL while it is still selected in the previous list.
         app.switch_watchlist(0);
@@ -1700,7 +1716,11 @@ mod tests {
             app.watchlist(ui);
         }));
         assert!(texts.iter().any(|s| s == "MSFT"));
-        assert_eq!(texts.iter().filter(|s| *s == "MSFT").count(), 2, "card falls back to the active list's first symbol");
+        assert_eq!(
+            texts.iter().filter(|s| *s == "MSFT").count(),
+            2,
+            "card falls back to the active list's first symbol"
+        );
     }
 
     #[test]
@@ -1708,7 +1728,7 @@ mod tests {
         let mut app = sections_app();
         app.set_watchlist_items(&(0..200).map(|i| Item::Symbol(format!("TEST{i} US Equity"))).collect::<Vec<_>>());
         // Below an interior row, not just at the end.
-        click_ui("Add symbol", |ui| app.watch_symbol_menu(ui, 5, &format!("TEST5 US Equity"), &mut Vec::new()));
+        click_ui("Add symbol", |ui| app.watch_symbol_menu(ui, 5, "TEST5 US Equity", &mut Vec::new()));
         save_entry(&mut app, "MSFT");
         assert_eq!(app.watchlist.len(), 200);
         assert!(app.status.contains("200 symbols"));
@@ -1750,5 +1770,79 @@ mod tests {
         });
         assert!(app.watchlists[0].sections[0].collapsed);
         assert!(!app.watchlists[0].sections[1].collapsed);
+    }
+
+    fn watch_frame(
+        ctx: &egui::Context,
+        app: &mut TerminalApp,
+        events: Vec<egui::Event>,
+    ) -> (Vec<Action>, Vec<egui::Pos2>) {
+        let mut actions = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| actions = app.watchlist(ui),
+        );
+        let rows = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if ["AAPL", "MSFT", "NVDA"].contains(&text.galley.job.text.as_str()) => {
+                    Some(pos2(250.0, text.pos.y + text.galley.size().y / 2.0))
+                }
+                _ => None,
+            })
+            .collect();
+        output.textures_delta.clear();
+        (actions, rows)
+    }
+
+    fn watch_pointer(at: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn watch_drag_reorders_active_symbols_and_click_still_opens_chart() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/watch-drag-panel");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.set_watchlist(vec!["AAPL".into(), "MSFT".into(), "NVDA".into()]);
+        let ctx = egui::Context::default();
+        let (_, rows) = watch_frame(&ctx, &mut app, vec![]);
+        let from = rows[0];
+        watch_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(from), watch_pointer(from, true)]);
+        let (actions, _) = watch_frame(&ctx, &mut app, vec![watch_pointer(from, false)]);
+        assert!(actions.iter().any(|a| matches!(a, Action::OpenChart(key) if key == "AAPL")));
+        assert_eq!(app.watchlist, ["AAPL", "MSFT", "NVDA"]);
+        let to = rows[2] + vec2(0.0, 8.0);
+        watch_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(from), watch_pointer(from, true)]);
+        watch_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(to)]);
+        watch_frame(&ctx, &mut app, vec![watch_pointer(to, false)]);
+        assert_eq!(app.watchlist, ["MSFT", "NVDA", "AAPL"]);
+        assert_eq!(app.watchlists[app.active_watchlist].symbols, app.watchlist);
+    }
+
+    #[test]
+    fn watch_sorted_drag_does_not_reorder() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/watch-drag-sorted");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.set_watchlist(vec!["AAPL".into(), "MSFT".into(), "NVDA".into()]);
+        app.watch_sort = Some((0, false));
+        let ctx = egui::Context::default();
+        let (_, rows) = watch_frame(&ctx, &mut app, vec![]);
+        let from = rows[0];
+        let to = rows[2] + vec2(0.0, 8.0);
+        watch_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(from), watch_pointer(from, true)]);
+        watch_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(to)]);
+        watch_frame(&ctx, &mut app, vec![watch_pointer(to, false)]);
+        assert_eq!(app.watchlist, ["AAPL", "MSFT", "NVDA"]);
+        assert!(app.watch_drag.is_none());
     }
 }
