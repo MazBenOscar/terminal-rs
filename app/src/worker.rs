@@ -1936,13 +1936,21 @@ fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<B
     s.series.lock().expect("series lock").get(&pane).filter(|(g, _, _)| *g == generation).map(|(_, b, _)| b.clone())
 }
 
-/// Fetched values win overlaps; retain older history and any newer live tail.
+/// Fetched values win completed overlaps; absorb the last bucket's live partial.
+/// Retain older history and any newer live tail.
 /// The ordered map also normalizes duplicate/out-of-order provider timestamps.
 fn merge_history(current: &[Bar], fetched: &[Bar]) -> (Vec<Bar>, usize) {
     let mut bars: std::collections::BTreeMap<_, _> = current.iter().map(|bar| (bar.ts, *bar)).collect();
+    let last = current.iter().chain(fetched).map(|bar| bar.ts).max();
     let mut filled = 0;
     for bar in fetched {
-        if bars.insert(bar.ts, *bar).is_none() {
+        let mut bar = *bar;
+        if Some(bar.ts) == last
+            && let Some(live) = bars.get(&bar.ts)
+        {
+            bar.absorb(live);
+        }
+        if bars.insert(bar.ts, bar).is_none() {
             filled += 1;
         }
     }
@@ -2162,6 +2170,22 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    #[test]
+    fn history_absorbs_only_last_bucket_and_replaces_completed_volume() {
+        let current = [Bar::new(60, 100., 130., 70., 120., 20.), Bar::new(120, 105., 125., 75., 115., 13.)];
+        let fetched = [Bar::new(60, 90., 110., 80., 100., 10.), Bar::new(120, 95., 110., 90., 100., 10.)];
+        let (merged, filled) = merge_history(&current, &fetched);
+        assert_eq!(filled, 0);
+        assert_eq!(merged[0], fetched[0]);
+        assert_eq!(merged[1], Bar::new(120, 95., 125., 75., 115., 13.));
+
+        let next = Bar::new(180, 100., 110., 90., 105., 2.);
+        let (merged, filled) = merge_history(&current, &[fetched[1], next]);
+        assert_eq!(filled, 1);
+        assert_eq!(merged[1], fetched[1]);
+        assert_eq!(merged[2], next);
     }
 
     #[test]
@@ -3528,5 +3552,184 @@ mod tests {
             }
             assert!(received_stats, "The scanner must publish the selected product's rolling metrics");
         }
+    }
+
+    #[tokio::test]
+    async fn seeded_crypto_partial_and_reconnect_backfill_never_double_volume() {
+        struct Feed(std::sync::Mutex<Option<tr_data::LiveFeed>>);
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Feed {
+            fn name(&self) -> &str {
+                "Coinbase fixture"
+            }
+            fn live(&self, _: &str, _: Timeframe) -> Option<tr_data::LiveFeed> {
+                self.0.lock().unwrap().take()
+            }
+            async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+                Ok(vec![Bar::new(60, 100., 120., 80., 105., 13.)])
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let provider = Arc::new(Feed(std::sync::Mutex::new(Some(rx))));
+        let (s, responses) = backfill_shared(provider.clone());
+        let symbol = "COINBASE:BTC-USD Curncy";
+        let source = chart_options_key(provider.as_ref(), symbol, Default::default());
+        assert!(claim_series(&s, 1, 2, &source));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(60, 100., 110., 90., 105., 10.)])));
+        start_live(s.clone(), 1, 2, symbol.into(), Timeframe::M1, Default::default());
+        let seeded = Bar::new(60, 100., 120., 80., 105., 13.);
+        tx.send(tr_data::LiveUpdate::Partial(seeded)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while current_series(&s, 1, 2).unwrap().last().unwrap().volume != 13. {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*current_series(&s, 1, 2).unwrap().last().unwrap(), seeded);
+        responses.try_iter().for_each(drop);
+        tx.send(tr_data::LiveUpdate::Reconnected { since: Some(60) }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !responses.try_iter().any(|r| matches!(r, Response::LiveStatus { message: None, .. })) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(current_series(&s, 1, 2).unwrap().last().unwrap().volume, 13.);
+        tx.send(tr_data::LiveUpdate::Partial(seeded)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if responses.try_iter().any(
+                    |r| matches!(r, Response::History { bars, live: true, .. } if bars.last().unwrap().volume == 13.),
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(current_series(&s, 1, 2).unwrap().last().unwrap().volume, 13.);
+    }
+
+    // ---- adversarial seeded-partial vs backfill merge tests (task C03b) ----
+
+    struct LowerVolumeFeed(std::sync::Mutex<Option<tr_data::LiveFeed>>, f64);
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for LowerVolumeFeed {
+        fn name(&self) -> &str {
+            "Coinbase fixture"
+        }
+        fn live(&self, _: &str, _: Timeframe) -> Option<tr_data::LiveFeed> {
+            self.0.lock().unwrap().take()
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            // The REST candle undercounts the live aggregate (lagging candle).
+            Ok(vec![Bar::new(60, 100., 110., 90., 105., self.1)])
+        }
+    }
+
+    async fn wait_until(s: &Shared, pane: PaneId, generation: u64, f: impl Fn(&Bar) -> bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if current_series(s, pane, generation).and_then(|bars| bars.last().copied()).is_some_and(|b| f(&b)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn wait_backfill_done(responses: &mut mpsc::Receiver<Response>) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if responses.try_iter().any(|r| matches!(r, Response::LiveStatus { message: None, .. })) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Probe: a seeded live partial (seed + post-cutoff tail) must survive a
+    /// reconnect backfill whose REST candle has not caught up yet — no lost volume.
+    #[tokio::test]
+    async fn reconnect_backfill_must_not_lose_seeded_live_volume() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let provider = Arc::new(LowerVolumeFeed(std::sync::Mutex::new(Some(rx)), 10.0));
+        let (s, mut responses) = backfill_shared(provider.clone());
+        let symbol = "COINBASE:BTC-USD Curncy";
+        let source = chart_options_key(provider.as_ref(), symbol, Default::default());
+        assert!(claim_series(&s, 1, 2, &source));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(60, 100., 110., 90., 105., 5.)])));
+        start_live(s.clone(), 1, 2, symbol.into(), Timeframe::M1, Default::default());
+        let seeded = Bar::new(60, 100., 120., 80., 105., 13.);
+        tx.send(tr_data::LiveUpdate::Partial(seeded)).await.unwrap();
+        wait_until(&s, 1, 2, |b| b.volume == 13.).await;
+        responses.try_iter().for_each(drop);
+        tx.send(tr_data::LiveUpdate::Reconnected { since: Some(60) }).await.unwrap();
+        wait_backfill_done(&mut responses).await;
+        assert_eq!(
+            current_series(&s, 1, 2).unwrap().last().unwrap().volume,
+            13.,
+            "backfill of a lagging 10-volume REST candle must not drop the seeded 13-volume live partial"
+        );
+    }
+
+    /// Probe: the seeded partial arriving after the backfill absorbs with the larger
+    /// volume — never added on top (no double count) and never ignored (no lost volume).
+    #[tokio::test]
+    async fn seeded_partial_after_backfill_absorbs_without_double_count_or_loss() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let provider = Arc::new(LowerVolumeFeed(std::sync::Mutex::new(Some(rx)), 10.0));
+        let (s, mut responses) = backfill_shared(provider.clone());
+        let symbol = "COINBASE:BTC-USD Curncy";
+        let source = chart_options_key(provider.as_ref(), symbol, Default::default());
+        assert!(claim_series(&s, 1, 2, &source));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(60, 100., 110., 90., 105., 5.)])));
+        start_live(s.clone(), 1, 2, symbol.into(), Timeframe::M1, Default::default());
+        tx.send(tr_data::LiveUpdate::Reconnected { since: Some(60) }).await.unwrap();
+        wait_backfill_done(&mut responses).await;
+        assert_eq!(current_series(&s, 1, 2).unwrap().last().unwrap().volume, 10.);
+        responses.try_iter().for_each(drop);
+        let seeded = Bar::new(60, 100., 120., 80., 105., 13.);
+        tx.send(tr_data::LiveUpdate::Partial(seeded)).await.unwrap();
+        wait_until(&s, 1, 2, |b| b.volume == 13.).await;
+        assert_eq!(*current_series(&s, 1, 2).unwrap().last().unwrap(), seeded);
+        assert_eq!(current_series(&s, 1, 2).unwrap().last().unwrap().volume, 13., "13, not 23 and not 10");
+    }
+
+    /// Probe: a more complete backfill candle wins the overlap without double counting,
+    /// and a later live partial cannot inflate it past the larger volume.
+    #[tokio::test]
+    async fn richer_backfill_wins_overlap_and_live_partial_cannot_inflate() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let provider = Arc::new(LowerVolumeFeed(std::sync::Mutex::new(Some(rx)), 15.0));
+        let (s, mut responses) = backfill_shared(provider.clone());
+        let symbol = "COINBASE:BTC-USD Curncy";
+        let source = chart_options_key(provider.as_ref(), symbol, Default::default());
+        assert!(claim_series(&s, 1, 2, &source));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(60, 100., 110., 90., 105., 5.)])));
+        start_live(s.clone(), 1, 2, symbol.into(), Timeframe::M1, Default::default());
+        let seeded = Bar::new(60, 100., 120., 80., 105., 13.);
+        tx.send(tr_data::LiveUpdate::Partial(seeded)).await.unwrap();
+        wait_until(&s, 1, 2, |b| b.volume == 13.).await;
+        responses.try_iter().for_each(drop);
+        tx.send(tr_data::LiveUpdate::Reconnected { since: Some(60) }).await.unwrap();
+        wait_backfill_done(&mut responses).await;
+        assert_eq!(current_series(&s, 1, 2).unwrap().last().unwrap().volume, 15.);
+        responses.try_iter().for_each(drop);
+        tx.send(tr_data::LiveUpdate::Partial(seeded)).await.unwrap();
+        wait_until(&s, 1, 2, |b| b.volume == 15.).await;
+        assert_eq!(
+            current_series(&s, 1, 2).unwrap().last().unwrap().volume,
+            15.,
+            "the larger volume wins; nothing is added on top"
+        );
     }
 }
