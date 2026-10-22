@@ -353,6 +353,14 @@ pub enum Response {
         cells: std::collections::HashMap<String, Vec<tr_core::columns::Cell>>,
         computed_at: i64,
     },
+    LiveBars {
+        pane: PaneId,
+        generation: u64,
+        revision: u64,
+        from: usize,
+        bars: Vec<Bar>,
+        len: usize,
+    },
     LiveStatus {
         pane: PaneId,
         generation: u64,
@@ -430,6 +438,7 @@ pub enum Response {
         symbol: String,
         tf: Timeframe,
         bars: Arc<Vec<Bar>>,
+        revision: u64,
         gpu: SeriesGpu,
         /// Resolved contract belonging to these bars (also applies to cached/live bars).
         crypto_source: Option<tr_core::crypto::CryptoInstrument>,
@@ -519,7 +528,7 @@ pub struct Worker {
 }
 
 /// Bars per pane tagged with the load generation they belong to.
-type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>, String)>;
+type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>, String, u64)>;
 
 const MAX_STUDY_BARS: usize = 10_000;
 const MAX_STUDY_HISTORIES: usize = 32;
@@ -1080,6 +1089,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     symbol: symbol.clone(),
                     tf,
                     bars,
+                    revision: 0,
                     gpu,
                     prepended: 0,
                     from_cache: true,
@@ -1107,7 +1117,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     if !store_series(s, pane, generation, bars.clone()) {
                         return; // superseded while loading
                     }
-                    let Some(bars) = current_series(s, pane, generation) else { return };
+                    let Some((bars, revision)) = series_snapshot(s, pane, generation) else { return };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
                         crypto_source: s.provider.crypto_instrument(&symbol),
@@ -1116,6 +1126,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         symbol: symbol.clone(),
                         tf,
                         bars,
+                        revision,
                         gpu,
                         prepended: 0,
                         from_cache: false,
@@ -1137,8 +1148,8 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 .lock()
                 .expect("series lock")
                 .get(&pane)
-                .filter(|(g, _, _)| *g == generation)
-                .map(|(_, _, source)| source.clone());
+                .filter(|(g, _, _, _)| *g == generation)
+                .map(|(_, _, source, _)| source.clone());
             if previous.as_ref().is_some_and(|previous| previous != &source) {
                 s.send(Response::HistoryError {
                     pane,
@@ -1161,15 +1172,21 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         return;
                     }
                     let older: Vec<Bar> = older.into_iter().filter(|b| b.ts < first.ts).collect();
-                    let prepended = older.len();
-                    let bars = {
+                    let (bars, revision, prepended) = {
                         let mut map = s.series.lock().expect("series lock");
-                        let Some((g, cur, _)) = map.get_mut(&pane).filter(|(g, _, _)| *g == generation) else { return };
-                        let _ = g;
+                        let Some((_, cur, _, revision)) = map.get_mut(&pane).filter(|(g, _, _, _)| *g == generation)
+                        else {
+                            return;
+                        };
                         let mut merged = older;
+                        merged.retain(|bar| cur.first().is_none_or(|first| bar.ts < first.ts));
+                        merged.sort_by_key(|bar| bar.ts);
+                        merged.dedup_by_key(|bar| bar.ts);
+                        let prepended = merged.len();
                         merged.extend_from_slice(cur);
                         *cur = Arc::new(merged);
-                        cur.clone()
+                        *revision += 1;
+                        (Arc::new(cur.as_ref().clone()), *revision, prepended)
                     };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
@@ -1179,6 +1196,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         symbol,
                         tf,
                         bars,
+                        revision,
                         gpu,
                         prepended,
                         from_cache: false,
@@ -1905,10 +1923,10 @@ fn chart_cache_key(provider: &dyn tr_data::MarketData, symbol: &str) -> String {
 fn claim_series(s: &Shared, pane: PaneId, generation: u64, source: &str) -> bool {
     let mut map = s.series.lock().expect("series lock");
     match map.get(&pane) {
-        Some((g, _, _)) if *g > generation => false,
-        Some((g, _, route)) if *g == generation => route == source,
+        Some((g, _, _, _)) if *g > generation => false,
+        Some((g, _, route, _)) if *g == generation => route == source,
         _ => {
-            map.insert(pane, (generation, Arc::new(Vec::new()), source.to_string()));
+            map.insert(pane, (generation, Arc::new(Vec::new()), source.to_string(), 0));
             true
         }
     }
@@ -1918,22 +1936,37 @@ fn claim_series(s: &Shared, pane: PaneId, generation: u64, source: &str) -> bool
 fn store_series(s: &Shared, pane: PaneId, generation: u64, bars: Arc<Vec<Bar>>) -> bool {
     let mut map = s.series.lock().expect("series lock");
     match map.get(&pane) {
-        Some((g, _, _)) if *g > generation => false,
+        Some((g, _, _, _)) if *g > generation => false,
         _ => {
-            let source = map.get(&pane).map(|(_, _, source)| source.clone()).unwrap_or_default();
-            let bars = if let Some((_, current, _)) = map.get(&pane) {
+            let source = map.get(&pane).map(|(_, _, source, _)| source.clone()).unwrap_or_default();
+            let bars = if let Some((_, current, _, _)) = map.get(&pane) {
                 Arc::new(merge_history(current, &bars).0)
             } else {
                 bars
             };
-            map.insert(pane, (generation, bars, source));
+            let revision = map.get(&pane).map_or(1, |(_, _, _, revision)| revision + 1);
+            map.insert(pane, (generation, Arc::new(bars.as_ref().clone()), source, revision));
             true
         }
     }
 }
 
 fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<Bar>>> {
-    s.series.lock().expect("series lock").get(&pane).filter(|(g, _, _)| *g == generation).map(|(_, b, _)| b.clone())
+    s.series
+        .lock()
+        .expect("series lock")
+        .get(&pane)
+        .filter(|(g, _, _, _)| *g == generation)
+        .map(|(_, b, _, _)| Arc::new(b.as_ref().clone()))
+}
+
+fn series_snapshot(s: &Shared, pane: PaneId, generation: u64) -> Option<(Arc<Vec<Bar>>, u64)> {
+    s.series
+        .lock()
+        .expect("series lock")
+        .get(&pane)
+        .filter(|(g, _, _, _)| *g == generation)
+        .map(|(_, bars, _, revision)| (Arc::new(bars.as_ref().clone()), *revision))
 }
 
 /// Fetched values win completed overlaps; absorb the last bucket's live partial.
@@ -1963,14 +1996,15 @@ fn backfill_limit(now: i64, since: Option<i64>, tf: Timeframe) -> usize {
 
 fn merge_backfill(s: &Shared, pane: PaneId, generation: u64, source: &str, fetched: &[Bar]) -> Option<usize> {
     let mut map = s.series.lock().expect("series lock");
-    let (_, bars, _) = map.get_mut(&pane).filter(|(g, _, key)| *g == generation && key == source)?;
+    let (_, bars, _, revision) = map.get_mut(&pane).filter(|(g, _, key, _)| *g == generation && key == source)?;
     let (merged, filled) = merge_history(bars, fetched);
     *bars = Arc::new(merged);
+    *revision += 1;
     Some(filled)
 }
 
 fn live_is_current(s: &Shared, pane: PaneId, generation: u64, source: &str) -> bool {
-    s.series.lock().expect("series lock").get(&pane).is_some_and(|(g, _, key)| *g == generation && key == source)
+    s.series.lock().expect("series lock").get(&pane).is_some_and(|(g, _, key, _)| *g == generation && key == source)
 }
 
 /// Merge the provider's live feed (if any) into the pane's series, publishing at most
@@ -1992,6 +2026,9 @@ fn start_live(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut dirty = false;
+        let mut dirty_from = usize::MAX;
+        let mut full_history = false;
+        let mut last_status: Option<String> = None;
         // Poll history alongside the feed: live bars and the publish timer keep
         // running during a fetch. Further reconnects coalesce into one follow-up.
         let mut backfill: Option<futures::future::BoxFuture<'static, anyhow::Result<Vec<Bar>>>> = None;
@@ -2016,13 +2053,17 @@ fn start_live(
                         Ok(fetched) => {
                             let Some(filled) = merge_backfill(&s, pane, generation, &source, &fetched) else { break };
                             dirty = true;
+                            full_history = true;
                             tracing::debug!(pane, filled, "filled missed bars");
                             None
                         }
                         // Provider errors may contain raw response bodies or secrets.
                         Err(_) => Some("Missed-bar history fetch failed; retry by refreshing history".into()),
                     };
-                    s.send(Response::LiveStatus { pane, generation, message });
+                    if message.is_some() || message != last_status {
+                        last_status = message.clone();
+                        s.send(Response::LiveStatus { pane, generation, message });
+                    }
                 }
                 bar = feed.recv() => {
                     let Some(bar) = bar else { break };
@@ -2036,17 +2077,38 @@ fn start_live(
                         continue;
                     }
                     if let tr_data::LiveUpdate::Status(message) = &bar {
-                        s.send(Response::LiveStatus { pane,generation,message:Some(message.clone()) });
+                        if last_status.as_ref() != Some(message) {
+                            last_status = Some(message.clone());
+                            s.send(Response::LiveStatus { pane,generation,message:Some(message.clone()) });
+                        }
                         continue;
                     }
-                    s.send(Response::LiveStatus { pane,generation,message:None });
+                    if last_status.take().is_some() {
+                        s.send(Response::LiveStatus { pane,generation,message:None });
+                    }
                     let mut map = s.series.lock().expect("series lock");
                     match map.get_mut(&pane) {
-                        Some((g, bars, source)) if *g == generation && *source == chart_options_key(s.provider.as_ref(),&symbol,options)
-                            => dirty |= match bar {
-                                tr_data::LiveUpdate::Partial(bar) => Series::apply_live(Arc::make_mut(bars), bar),
-                                tr_data::LiveUpdate::Snapshot(bar) => Series::apply_snapshot(Arc::make_mut(bars), bar),
-                                tr_data::LiveUpdate::Status(_) | tr_data::LiveUpdate::Reconnected { .. } => false,
+                        Some((g, bars, source, revision)) if *g == generation && *source == chart_options_key(s.provider.as_ref(),&symbol,options)
+                            => {
+                                let (value, snapshot) = match bar {
+                                    tr_data::LiveUpdate::Partial(bar) => (bar, false),
+                                    tr_data::LiveUpdate::Snapshot(bar) => (bar, true),
+                                    _ => continue,
+                                };
+                                debug_assert_eq!(Arc::strong_count(bars), 1, "worker series must not escape live merges");
+                                let from = bars.partition_point(|b| b.ts < value.ts);
+                                let bars = Arc::get_mut(bars).expect("worker owns live series");
+                                let changed = if snapshot {
+                                    Series::apply_snapshot(bars, value)
+                                } else {
+                                    Series::apply_live(bars, value)
+                                };
+                                if changed {
+                                    *revision += 1;
+                                    dirty = true;
+                                    dirty_from = dirty_from.min(from);
+                                    full_history |= snapshot && from < bars.len().saturating_sub(1);
+                                }
                             },
                         _ => break,
                     }
@@ -2058,7 +2120,19 @@ fn start_live(
                         continue;
                     }
                     dirty = false;
-                    let Some(bars) = current_series(&s, pane, generation) else { break };
+                    if !full_history {
+                        let map = s.series.lock().expect("series lock");
+                        let Some((_, bars, _, revision)) = map.get(&pane) else { break };
+                        if dirty_from <= bars.len() {
+                            s.send(Response::LiveBars { pane, generation, revision: *revision, from: dirty_from,
+                                bars: bars[dirty_from..].to_vec(), len: bars.len() });
+                        }
+                        dirty_from = usize::MAX;
+                        continue;
+                    }
+                    full_history = false;
+                    dirty_from = usize::MAX;
+                    let Some((bars, revision)) = series_snapshot(&s, pane, generation) else { break };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
                     crypto_source: s.provider.crypto_instrument(&symbol),
@@ -2067,6 +2141,7 @@ fn start_live(
                         symbol: symbol.clone(),
                         tf,
                         bars,
+                        revision,
                         gpu,
                         prepended: 0,
                         from_cache: false,
@@ -2170,6 +2245,32 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    #[test]
+    fn review_live_gap_requests_authoritative_history() {
+        let mut worker = Worker::inert();
+        let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        worker.tx = tx;
+        let mut chart = crate::chart_view::ChartState::new(1, "AAA", Timeframe::M1);
+        let bars = Arc::new(vec![Bar::new(60, 1., 2., 0., 1., 1.)]);
+        chart.on_history(0, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &worker);
+        while requests.try_recv().is_ok() {}
+        chart.on_live_bars(0, 2, vec![Bar::new(180, 1., 2., 0., 1., 1.)], 3, &worker);
+        for _ in 0..10 {
+            chart.on_live_bars(0, 2, vec![Bar::new(180, 1., 2., 0., 1., 1.)], 3, &worker);
+        }
+        assert_eq!(
+            std::iter::from_fn(|| requests.try_recv().ok())
+                .filter(|r| matches!(r, Request::History { generation: 0, .. }))
+                .count(),
+            1,
+            "request one authoritative snapshot, not one per tick"
+        );
+        chart.on_history(0, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &worker);
+        while requests.try_recv().is_ok() {}
+        chart.on_live_bars(0, 2, vec![Bar::new(180, 1., 2., 0., 1., 1.)], 3, &worker);
+        assert!(std::iter::from_fn(|| requests.try_recv().ok()).any(|r| matches!(r, Request::History { .. })));
     }
 
     #[test]
@@ -2284,7 +2385,7 @@ mod tests {
         provider.release.notify_one();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if responses.try_iter().any(|r| matches!(r, Response::LiveStatus { message: None, .. })) {
+                if responses.try_iter().any(|r| matches!(r, Response::History { live: true, .. })) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -2445,7 +2546,7 @@ mod tests {
         provider.release.notify_one();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if responses.try_iter().any(|r| matches!(r, Response::LiveStatus { message: None, .. })) {
+                if responses.try_iter().any(|r| matches!(r, Response::History { live: true, .. })) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -2659,7 +2760,9 @@ mod tests {
         };
         let built = build_indicators(&bars, Timeframe::H2, &[spec(None)], &theme::palette());
         let real = built[0].readouts[0].as_ref().expect("a daily study on 2H keeps its real values");
-        let drawn: Vec<f64> = (0..bars.len()).map(|i| built[0].overlays[0].1.line.pyramid.data[i][1] as f64).collect();
+        let drawn: Vec<f64> = (0..bars.len())
+            .map(|i| built[0].overlays[0].1.line.pyramid.read().expect("pyramid lock").data[i][1] as f64)
+            .collect();
         let steps = real.windows(2).filter(|w| w[0] == w[1]).count();
         assert!(steps > bars.len() / 2, "daily values hold across 2H bars");
         let changes: Vec<usize> =
@@ -3159,7 +3262,7 @@ mod tests {
         assert!(built[3].overlays.iter().all(|(_, o)| o.kind == LineKind::Dots));
         assert_eq!(built[3].overlays[0].1.color, theme::rgba(palette.up));
         // Every pair of bars holding a marker keeps one when zoomed out.
-        let up = &built[3].overlays[0].1.line.pyramid;
+        let up = &built[3].overlays[0].1.line.pyramid.read().expect("pyramid lock");
         let pairs = up.data[..up.offsets[1]].chunks(2).filter(|c| c.iter().any(|p| p[1].is_finite())).count();
         assert_eq!(up.data[up.offsets[1]..up.offsets[2]].iter().filter(|p| p[1].is_finite()).count(), pairs);
         assert!(built[4].overlays.iter().all(|(_, o)| o.kind == LineKind::Steps));
@@ -3590,7 +3693,7 @@ mod tests {
         responses.try_iter().for_each(drop);
         tx.send(tr_data::LiveUpdate::Reconnected { since: Some(60) }).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !responses.try_iter().any(|r| matches!(r, Response::LiveStatus { message: None, .. })) {
+            while !responses.try_iter().any(|r| matches!(r, Response::History { live: true, .. })) {
                 tokio::task::yield_now().await;
             }
         })
@@ -3598,11 +3701,13 @@ mod tests {
         .unwrap();
         assert_eq!(current_series(&s, 1, 2).unwrap().last().unwrap().volume, 13.);
         tx.send(tr_data::LiveUpdate::Partial(seeded)).await.unwrap();
+        tx.send(tr_data::LiveUpdate::Status("barrier".into())).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if responses.try_iter().any(
-                    |r| matches!(r, Response::History { bars, live: true, .. } if bars.last().unwrap().volume == 13.),
-                ) {
+                if responses
+                    .try_iter()
+                    .any(|r| matches!(r, Response::LiveStatus { message: Some(m), .. } if m == "barrier"))
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -3646,7 +3751,7 @@ mod tests {
     async fn wait_backfill_done(responses: &mut mpsc::Receiver<Response>) {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if responses.try_iter().any(|r| matches!(r, Response::LiveStatus { message: None, .. })) {
+                if responses.try_iter().any(|r| matches!(r, Response::History { live: true, .. })) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -3731,5 +3836,113 @@ mod tests {
             15.,
             "the larger volume wins; nothing is added on top"
         );
+    }
+
+    #[tokio::test]
+    async fn review_random_live_batches_reconstruct_authoritative_worker_series() {
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let provider = Arc::new(LowerVolumeFeed(std::sync::Mutex::new(Some(rx)), 0.));
+        let (s, responses) = backfill_shared(provider.clone());
+        let source = chart_options_key(provider.as_ref(), "AAA", Default::default());
+        claim_series(&s, 1, 2, &source);
+        let mut reconstructed: Vec<_> = (0..129).map(|i| Bar::new(i * 60, 1., 2., 0., 1., 1.)).collect();
+        store_series(&s, 1, 2, Arc::new(reconstructed.clone()));
+        start_live(s.clone(), 1, 2, "AAA".into(), Timeframe::M1, Default::default());
+        let mut seed = 19u64;
+        let mut expected = reconstructed.clone();
+        for _ in 0..16 {
+            for _ in 0..80 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let mut bar = *expected.last().unwrap();
+                if seed.is_multiple_of(3) {
+                    bar.ts += 60;
+                }
+                bar.close += (seed >> 40) as f64 / 1_000_000.;
+                bar.high = bar.high.max(bar.close);
+                bar.volume += 1.;
+                let update = if seed.is_multiple_of(7) {
+                    Series::apply_snapshot(&mut expected, bar);
+                    tr_data::LiveUpdate::Snapshot(bar)
+                } else {
+                    Series::apply_live(&mut expected, bar);
+                    tr_data::LiveUpdate::Partial(bar)
+                };
+                tx.send(update).await.unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    for response in responses.try_iter() {
+                        match response {
+                            Response::LiveBars { from, bars, len, .. } => {
+                                assert!(from <= reconstructed.len());
+                                reconstructed.truncate(from);
+                                reconstructed.extend(bars);
+                                assert_eq!(reconstructed.len(), len);
+                            }
+                            Response::History { bars, .. } => reconstructed = bars.as_ref().clone(),
+                            _ => {}
+                        }
+                    }
+                    if reconstructed == expected {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let map = s.series.lock().unwrap();
+            assert_eq!(map[&1].1.as_ref(), &reconstructed);
+            assert_eq!(Arc::strong_count(&map[&1].1), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_deltas_keep_worker_ownership_and_clear_status_only_on_change() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let provider = Arc::new(LowerVolumeFeed(std::sync::Mutex::new(Some(rx)), 0.));
+        let (s, responses) = backfill_shared(provider.clone());
+        let source = chart_options_key(provider.as_ref(), "AAA", Default::default());
+        claim_series(&s, 1, 2, &source);
+        let bars = (0..1000).map(|i| Bar::new(i * 60, 1., 2., 0., 1., 1.)).collect();
+        store_series(&s, 1, 2, Arc::new(bars));
+        let identity = {
+            let map = s.series.lock().unwrap();
+            assert_eq!(Arc::strong_count(&map[&1].1), 1);
+            Arc::as_ptr(&map[&1].1) as usize
+        };
+        start_live(s.clone(), 1, 2, "AAA".into(), Timeframe::M1, Default::default());
+        tx.send(tr_data::LiveUpdate::Status("waiting".into())).await.unwrap();
+        let mut clears = 0;
+        for step in 0..3 {
+            let bar = Bar::new((999 + step) * 60, 1., 5., 0., 3. + step as f64, 10.);
+            tx.send(tr_data::LiveUpdate::Partial(bar)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    for response in responses.try_iter() {
+                        match response {
+                            Response::LiveStatus { message: None, .. } => clears += 1,
+                            Response::LiveBars { pane, generation, revision, from, bars, len } => {
+                                assert_eq!(revision, 2 + step as u64);
+                                assert_eq!((pane, generation), (1, 2));
+                                assert_eq!(from, (999 + step) as usize);
+                                assert_eq!(bars, vec![bar]);
+                                assert_eq!(len, (1000 + step) as usize);
+                                return;
+                            }
+                            Response::History { .. } => panic!("live tick published full history"),
+                            _ => {}
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let map = s.series.lock().unwrap();
+            assert_eq!(Arc::strong_count(&map[&1].1), 1);
+            assert_eq!(Arc::as_ptr(&map[&1].1) as usize, identity);
+        }
+        assert_eq!(clears, 1);
     }
 }

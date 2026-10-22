@@ -1691,6 +1691,7 @@ impl TerminalApp {
                 Response::History {
                     pane,
                     generation,
+                    revision,
                     symbol,
                     tf,
                     bars,
@@ -1707,7 +1708,16 @@ impl TerminalApp {
                         && c.tf == tf
                     {
                         c.on_crypto_source(generation, crypto_source);
-                        c.on_history(generation, bars, gpu, prepended, from_cache, exhausted, live, worker);
+                        c.on_history_revision(
+                            generation, revision, bars, gpu, prepended, from_cache, exhausted, live, worker,
+                        );
+                    }
+                }
+                Response::LiveBars { pane, generation, revision, from, bars, len } => {
+                    let worker = &self.worker;
+                    if let Some(PaneKind::Chart(c)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        c.on_live_bars_revision(generation, revision, from, bars, len, worker);
                     }
                 }
                 Response::HistoryError { pane, generation, error } => {

@@ -1,7 +1,7 @@
 use crate::theme::{self, mono, muted};
 use egui::{Align2, Rect, Stroke, Ui, pos2, vec2};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tr_chart::{
     gpu::LineRef,
     scene::line_ref,
@@ -31,16 +31,17 @@ impl Default for Settings {
 }
 #[derive(Default)]
 pub struct Cache {
-    bars: Option<Arc<Vec<Bar>>>,
+    bars: Option<Weak<Vec<Bar>>>,
     anchor: Option<i64>,
     pub vwap: Option<LineRef>,
 }
 impl Cache {
     pub fn update(&mut self, bars: &Arc<Vec<Bar>>, anchor: Option<i64>) {
-        if self.bars.as_ref().is_some_and(|old| Arc::ptr_eq(old, bars)) && self.anchor == anchor {
+        if self.bars.as_ref().is_some_and(|old| old.as_ptr() == Arc::as_ptr(bars)) && self.anchor == anchor {
             return;
         }
-        self.bars = Some(bars.clone());
+        // A weak identity lets make_mut move the Vec without copying its contents.
+        self.bars = Some(Arc::downgrade(bars));
         self.anchor = anchor;
         self.vwap = anchor.map(|anchor| line_ref(&tr_core::chart_analytics::anchored_vwap(bars, anchor)));
     }
@@ -148,5 +149,27 @@ impl Settings {
                 muted(),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analytics_cache_does_not_retain_bars_and_refreshes_after_tail_edit() {
+        let mut bars = Arc::new(vec![Bar::new(60, 1., 2., 0., 1., 1.), Bar::new(120, 1., 2., 0., 1., 1.)]);
+        let mut cache = Cache::default();
+        cache.update(&bars, Some(60));
+        assert_eq!(Arc::strong_count(&bars), 1);
+        let storage = bars.as_ptr();
+        let key = cache.vwap.as_ref().unwrap().key;
+        Arc::make_mut(&mut bars)[1].close = 2.;
+        assert_eq!(bars.as_ptr(), storage);
+        cache.update(&bars, Some(60));
+        assert_ne!(cache.vwap.as_ref().unwrap().key, key);
+        let expected = tr_core::chart_analytics::anchored_vwap(&bars, 60);
+        let line = cache.vwap.as_ref().unwrap().pyramid.read().unwrap();
+        assert_eq!(line.data[1][1], expected[1] as f32);
     }
 }

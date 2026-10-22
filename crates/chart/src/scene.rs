@@ -1,8 +1,8 @@
 //! Turns chart state (data, viewport, chart type, overlays) into GPU draw commands.
 //! Shared by the egui widget and the headless frame-time benchmark.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use tr_core::Bar;
 
@@ -15,8 +15,13 @@ static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 /// Factor that makes `line` equal `base` at the first index in `[lo, hi)` where both
 /// are defined, so a compare series reads as performance relative to the left edge.
 pub fn rebase_factor(base: &LineRef, line: &LineRef, lo: usize, hi: usize) -> f64 {
-    let (b, l) = (&base.pyramid.data, &line.pyramid.data);
-    let n = base.pyramid.level_len(0).min(line.pyramid.level_len(0));
+    let (b, l) = (&base.pyramid.read().expect("pyramid lock").data, &line.pyramid.read().expect("pyramid lock").data);
+    let n = base
+        .pyramid
+        .read()
+        .expect("pyramid lock")
+        .level_len(0)
+        .min(line.pyramid.read().expect("pyramid lock").level_len(0));
     (lo..hi.min(n))
         .find_map(|i| {
             let (x, y) = (b[i][1] as f64, l[i][1] as f64);
@@ -80,13 +85,27 @@ impl SeriesGpu {
     pub fn build(bars: &[Bar]) -> Self {
         let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
         Self {
-            bars: SeriesRef { key: next_key(), version: 1, pyramid: Arc::new(BarPyramid::build(bars)) },
+            bars: SeriesRef { key: next_key(), version: 1, pyramid: Arc::new(RwLock::new(BarPyramid::build(bars))) },
             closes: line_ref(&closes),
         }
     }
 
+    /// Patch the changed tail without changing either GPU cache key.
+    pub fn update_tail(&mut self, bars: &[Bar], from: usize) -> Option<()> {
+        let mut bar_pyramid = self.bars.pyramid.write().expect("pyramid lock");
+        let mut line_pyramid = self.closes.pyramid.write().expect("pyramid lock");
+        if !bar_pyramid.can_update_tail(bars.len(), from) || !line_pyramid.can_update_tail(bars.len(), from) {
+            return None;
+        }
+        bar_pyramid.update_tail(bars, from)?;
+        line_pyramid.update_closes(bars, from)?;
+        self.bars.version = bar_pyramid.version;
+        self.closes.version = line_pyramid.version;
+        Some(())
+    }
+
     pub fn len(&self) -> usize {
-        self.bars.pyramid.len0
+        self.bars.pyramid.read().expect("pyramid lock").len0
     }
 
     pub fn is_empty(&self) -> bool {
@@ -94,13 +113,22 @@ impl SeriesGpu {
     }
 }
 
+impl LineRef {
+    pub fn update_tail(&mut self, values: &[f64], from: usize) -> Option<crate::lod::DirtyRanges> {
+        let mut pyramid = self.pyramid.write().expect("pyramid lock");
+        let dirty = pyramid.update_tail(values, from)?;
+        self.version = pyramid.version;
+        Some(dirty)
+    }
+}
+
 pub fn line_ref(values: &[f64]) -> LineRef {
-    LineRef { key: next_key(), version: 1, pyramid: Arc::new(LinePyramid::build(values)) }
+    LineRef { key: next_key(), version: 1, pyramid: Arc::new(RwLock::new(LinePyramid::build(values))) }
 }
 
 /// A [`LineKind::Dots`] series, reduced so sparse markers stay visible when zoomed out.
 pub fn marker_ref(values: &[f64]) -> LineRef {
-    LineRef { key: next_key(), version: 1, pyramid: Arc::new(LinePyramid::build_markers(values)) }
+    LineRef { key: next_key(), version: 1, pyramid: Arc::new(RwLock::new(LinePyramid::build_markers(values))) }
 }
 
 /// A line overlay with its colour.
@@ -157,19 +185,19 @@ pub fn visible_extent(
     v: &Viewport,
     chart_type: ChartType,
 ) -> Option<(f64, f64, f64)> {
-    let p = &series.bars.pyramid;
+    let p = &series.bars.pyramid.read().expect("pyramid lock");
     let (lo, hi) = v.visible_range(p.len0);
     let k = level_for(v.bar_px, p.levels());
     let (mut l, mut h, vmax) = match chart_type {
         ChartType::Line | ChartType::Area | ChartType::Baseline => {
-            let (l, h) = series.closes.pyramid.extent(k, lo, hi)?;
+            let (l, h) = series.closes.pyramid.read().expect("pyramid lock").extent(k, lo, hi)?;
             (l, h, p.extent(k, lo, hi).map(|e| e.2).unwrap_or(0.0))
         }
         _ => p.extent(k, lo, hi)?,
     };
     for o in overlays.iter().filter(|o| matches!(o.kind, LineKind::Line | LineKind::Dots | LineKind::Steps)) {
-        let kk = level_for(v.bar_px, o.line.pyramid.levels());
-        if let Some((a, b)) = o.line.pyramid.extent(kk, lo, hi) {
+        let kk = level_for(v.bar_px, o.line.pyramid.read().expect("pyramid lock").levels());
+        if let Some((a, b)) = o.line.pyramid.read().expect("pyramid lock").extent(kk, lo, hi) {
             l = l.min(a * o.scale);
             h = h.max(b * o.scale);
         }
@@ -197,10 +225,10 @@ fn autoscale_from(p: &PricePane<'_>, ext: Option<(f64, f64, f64)>) -> PriceScale
 
 pub fn price_pane(p: &PricePane<'_>) -> PaneOutput {
     let v = p.viewport;
-    let pyr = &p.series.bars.pyramid;
+    let ext = visible_extent(p.series, p.overlays, v, p.chart_type);
+    let pyr = &p.series.bars.pyramid.read().expect("pyramid lock");
     let (lo, hi) = v.visible_range(pyr.len0);
     let k = level_for(v.bar_px, pyr.levels());
-    let ext = visible_extent(p.series, p.overlays, v, p.chart_type);
     let vol_max = ext.map(|e| e.2).unwrap_or(1.0);
     let scale = p.manual_scale.unwrap_or_else(|| autoscale_from(p, ext));
     let t = transform(v, p.height_px, &scale, p.style.pixels_per_point);
@@ -228,7 +256,7 @@ pub fn price_pane(p: &PricePane<'_>) -> PaneOutput {
                 uniforms: Uniforms::new(&t, &style),
             }),
         ChartType::Line | ChartType::Area | ChartType::Baseline => {
-            let lp = &p.series.closes.pyramid;
+            let lp = &p.series.closes.pyramid.read().expect("pyramid lock");
             let kk = level_for(v.bar_px, lp.levels());
             let range = lp.segment_range(kk, lo, hi);
             if matches!(p.chart_type, ChartType::Area | ChartType::Baseline) {
@@ -256,12 +284,12 @@ pub fn price_pane(p: &PricePane<'_>) -> PaneOutput {
 }
 
 fn overlay_cmds(overlays: &[Overlay], v: &Viewport, t: &PaneTransform, base: &Style) -> Vec<DrawCmd> {
-    let len = overlays.first().map(|o| o.line.pyramid.level_len(0)).unwrap_or(0);
+    let len = overlays.first().map(|o| o.line.pyramid.read().expect("pyramid lock").level_len(0)).unwrap_or(0);
     let (lo, hi) = v.visible_range(len.max(v.right.ceil().max(0.0) as usize));
     overlays
         .iter()
         .map(|o| {
-            let lp = &o.line.pyramid;
+            let lp = &o.line.pyramid.read().expect("pyramid lock");
             let k = level_for(v.bar_px, lp.levels());
             let mut s = *base;
             s.baseline_mode = false;
@@ -308,13 +336,13 @@ pub fn sub_pane(
     fixed: Option<(f64, f64)>,
     style: Style,
 ) -> PaneOutput {
-    let len = overlays.first().map(|o| o.line.pyramid.level_len(0)).unwrap_or(0);
+    let len = overlays.first().map(|o| o.line.pyramid.read().expect("pyramid lock").level_len(0)).unwrap_or(0);
     let (lo, hi) = v.visible_range(len);
     let (l, h) = fixed.unwrap_or_else(|| {
         let mut ext: Option<(f64, f64)> = None;
         for o in overlays {
-            let k = level_for(v.bar_px, o.line.pyramid.levels());
-            if let Some((a, b)) = o.line.pyramid.extent(k, lo, hi) {
+            let k = level_for(v.bar_px, o.line.pyramid.read().expect("pyramid lock").levels());
+            if let Some((a, b)) = o.line.pyramid.read().expect("pyramid lock").extent(k, lo, hi) {
                 ext = Some(ext.map_or((a, b), |(x, y)| (x.min(a), y.max(b))));
             }
         }
@@ -539,7 +567,8 @@ mod tests {
                 style: Style::default(),
             });
             let Some(DrawCmd::Line { data, range, .. }) = out.cmds.last() else { panic!("no dots drawn") };
-            let drawn = data.pyramid.data[range.0 as usize..range.1 as usize].contains(&[2002.5, top as f32]);
+            let drawn = data.pyramid.read().expect("pyramid lock").data[range.0 as usize..range.1 as usize]
+                .contains(&[2002.5, top as f32]);
             (out.level, drawn, out.scale.hi >= top)
         };
         let (level, drawn, scaled) = pane(marker_ref(&marks));

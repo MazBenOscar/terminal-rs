@@ -21,6 +21,38 @@ pub struct GpuBar {
     pub _pad: f32,
 }
 
+/// Byte ranges changed by the most recent tail patch.
+pub type DirtyRanges = Vec<std::ops::Range<usize>>;
+
+fn padded<T: Copy + Zeroable>(data: Vec<T>, offsets: &mut [usize], len: usize) -> Vec<T> {
+    let mut out = Vec::new();
+    let mut n = len;
+    for offset in offsets {
+        let start = *offset;
+        *offset = out.len();
+        out.extend_from_slice(&data[start..start + n]);
+        out.resize(out.len() + n.max(16).div_ceil(4), T::zeroed());
+        n = n.div_ceil(2);
+    }
+    out
+}
+
+fn can_patch(offsets: &[usize], data_len: usize, old_len: usize, len: usize, from: usize) -> bool {
+    let tail = 1024.min(old_len.div_ceil(4).max(1));
+    if len < old_len || from > old_len || from < old_len.saturating_sub(tail) {
+        return false;
+    }
+    let mut n = len;
+    for (k, start) in offsets.iter().enumerate() {
+        let end = offsets.get(k + 1).copied().unwrap_or(data_len);
+        if n > end - start || k + 1 == offsets.len() && n > 1 {
+            return false;
+        }
+        n = n.div_ceil(2);
+    }
+    true
+}
+
 /// Target minimum on-screen width of one drawn instance.
 pub const MIN_INSTANCE_PX: f64 = 2.0;
 
@@ -35,11 +67,13 @@ pub fn level_for(bar_px: f64, levels: usize) -> usize {
 
 #[derive(Debug, Clone, Default)]
 pub struct BarPyramid {
-    /// All levels concatenated, level 0 first.
+    /// All levels concatenated, level 0 first, with spare capacity after each level.
     pub data: Vec<GpuBar>,
     /// Start offset of each level within `data`.
     pub offsets: Vec<usize>,
     pub len0: usize,
+    pub dirty: DirtyRanges,
+    pub version: u64,
 }
 
 impl BarPyramid {
@@ -85,7 +119,8 @@ impl BarPyramid {
             start = next_start;
             n = n.div_ceil(2);
         }
-        Self { data, offsets, len0: bars.len() }
+        let data = padded(data, &mut offsets, bars.len());
+        Self { data, offsets, len0: bars.len(), dirty: Vec::new(), version: 1 }
     }
 
     pub fn levels(&self) -> usize {
@@ -94,8 +129,65 @@ impl BarPyramid {
 
     pub fn level(&self, k: usize) -> &[GpuBar] {
         let start = self.offsets[k];
-        let end = self.offsets.get(k + 1).copied().unwrap_or(self.data.len());
+        let end = start + self.len0.div_ceil(1 << k);
         &self.data[start..end]
+    }
+
+    pub(crate) fn can_update_tail(&self, len: usize, from: usize) -> bool {
+        can_patch(&self.offsets, self.data.len(), self.len0, len, from)
+    }
+
+    /// Patch a tail and its ancestors, or leave everything untouched if a rebuild is needed.
+    pub fn update_tail(&mut self, bars: &[Bar], from: usize) -> Option<DirtyRanges> {
+        if !self.can_update_tail(bars.len(), from) {
+            return None;
+        }
+        self.len0 = bars.len();
+        let mut dirty = Vec::new();
+        for k in 0..self.levels() {
+            let off = self.offsets[k];
+            let n = bars.len().div_ceil(1 << k);
+            let first = from >> k;
+            for j in first..n {
+                self.data[off + j] = if k == 0 {
+                    let b = &bars[j];
+                    GpuBar {
+                        x: j as f32,
+                        w: 1.0,
+                        open: b.open as f32,
+                        high: b.high as f32,
+                        low: b.low as f32,
+                        close: b.close as f32,
+                        volume: b.volume as f32,
+                        _pad: 0.0,
+                    }
+                } else {
+                    let prev = self.offsets[k - 1];
+                    let a = self.data[prev + j * 2];
+                    if j * 2 + 1 < bars.len().div_ceil(1 << (k - 1)) {
+                        let b = self.data[prev + j * 2 + 1];
+                        GpuBar {
+                            x: a.x,
+                            w: a.w + b.w,
+                            open: a.open,
+                            high: a.high.max(b.high),
+                            low: a.low.min(b.low),
+                            close: b.close,
+                            volume: a.volume + b.volume,
+                            _pad: 0.0,
+                        }
+                    } else {
+                        a
+                    }
+                };
+            }
+            if first < n {
+                dirty.push((off + first) * 32..(off + n) * 32);
+            }
+        }
+        self.version += 1;
+        self.dirty = dirty.clone();
+        Some(dirty)
     }
 
     /// Absolute instance range in `data` covering level-0 indices `[lo, hi)` at level `k`.
@@ -128,23 +220,27 @@ impl BarPyramid {
 /// `(level-0 index of the point's bar centre, value)`. NaN values break the line.
 #[derive(Debug, Clone, Default)]
 pub struct LinePyramid {
+    markers: bool,
     pub data: Vec<[f32; 2]>,
     pub offsets: Vec<usize>,
+    pub len0: usize,
+    pub dirty: DirtyRanges,
+    pub version: u64,
 }
 
 impl LinePyramid {
     /// Keeps the later point of each pair (its value is the group's close).
     pub fn build(values: &[f64]) -> Self {
-        Self::reduce(values, |_, later| later)
+        Self::reduce(values, false, |_, later| later)
     }
 
     /// For sparse markers: a pair whose later point is blank keeps the earlier one, so
     /// markers survive zooming out.
     pub fn build_markers(values: &[f64]) -> Self {
-        Self::reduce(values, |earlier, later| if later[1].is_nan() { earlier } else { later })
+        Self::reduce(values, true, |earlier, later| if later[1].is_nan() { earlier } else { later })
     }
 
-    fn reduce(values: &[f64], merge: impl Fn([f32; 2], [f32; 2]) -> [f32; 2]) -> Self {
+    fn reduce(values: &[f64], markers: bool, merge: impl Fn([f32; 2], [f32; 2]) -> [f32; 2]) -> Self {
         let mut data: Vec<[f32; 2]> = values.iter().enumerate().map(|(i, v)| [i as f32 + 0.5, *v as f32]).collect();
         let mut offsets = vec![0];
         let (mut start, mut n) = (0, values.len());
@@ -158,7 +254,49 @@ impl LinePyramid {
             start = next_start;
             n = n.div_ceil(2);
         }
-        Self { data, offsets }
+        let data = padded(data, &mut offsets, values.len());
+        Self { markers, data, offsets, len0: values.len(), dirty: Vec::new(), version: 1 }
+    }
+
+    pub(crate) fn can_update_tail(&self, len: usize, from: usize) -> bool {
+        can_patch(&self.offsets, self.data.len(), self.len0, len, from)
+    }
+
+    pub fn update_tail(&mut self, values: &[f64], from: usize) -> Option<DirtyRanges> {
+        self.update_values(values.len(), from, |i| values[i])
+    }
+
+    pub fn update_closes(&mut self, bars: &[Bar], from: usize) -> Option<DirtyRanges> {
+        self.update_values(bars.len(), from, |i| bars[i].close)
+    }
+
+    fn update_values(&mut self, len: usize, from: usize, value: impl Fn(usize) -> f64) -> Option<DirtyRanges> {
+        if !can_patch(&self.offsets, self.data.len(), self.len0, len, from) {
+            return None;
+        }
+        self.len0 = len;
+        let mut dirty = Vec::new();
+        for k in 0..self.levels() {
+            let off = self.offsets[k];
+            let n = len.div_ceil(1 << k);
+            let first = from >> k;
+            for j in first..n {
+                self.data[off + j] = if k == 0 {
+                    [j as f32 + 0.5, value(j) as f32]
+                } else {
+                    let prev = self.offsets[k - 1];
+                    let last = (j * 2 + 1).min(len.div_ceil(1 << (k - 1)) - 1);
+                    let later = self.data[prev + last];
+                    if self.markers && later[1].is_nan() { self.data[prev + j * 2] } else { later }
+                };
+            }
+            if first < n {
+                dirty.push((off + first) * 8..(off + n) * 8);
+            }
+        }
+        self.version += 1;
+        self.dirty = dirty.clone();
+        Some(dirty)
     }
 
     pub fn levels(&self) -> usize {
@@ -166,7 +304,7 @@ impl LinePyramid {
     }
 
     pub fn level_len(&self, k: usize) -> usize {
-        self.offsets.get(k + 1).copied().unwrap_or(self.data.len()) - self.offsets[k]
+        self.len0.div_ceil(1 << k)
     }
 
     /// Absolute segment-instance range: segment `i` joins points `i` and `i+1`.
@@ -205,6 +343,56 @@ mod tests {
 
     fn bars(n: usize) -> Vec<Bar> {
         (0..n).map(|i| Bar::new(i as i64, i as f64, i as f64 + 2.0, i as f64 - 1.0, i as f64 + 1.0, 1.0)).collect()
+    }
+
+    #[test]
+    fn review_capacity_boundaries_long_growth_and_far_edit_match_rebuilds() {
+        for start in [0, 1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 1000] {
+            let mut input = bars(start);
+            let mut p = BarPyramid::build(&input);
+            let mut line = LinePyramid::build(&input.iter().map(|b| b.close).collect::<Vec<_>>());
+            let mut markers = LinePyramid::build_markers(&input.iter().map(|b| b.close).collect::<Vec<_>>());
+            for step in 0..300 {
+                // Force an old-prefix rebuild, then resume tail-only edits.
+                let from = if step == 150 { 0 } else { input.len().saturating_sub(1) };
+                if let Some(b) = input.get_mut(from) {
+                    b.close += 0.5;
+                    b.high = b.high.max(b.close);
+                }
+                input.push(Bar::new(input.len() as i64, 2., 4., 0., 3., 1.));
+                let values: Vec<_> =
+                    input.iter().enumerate().map(|(i, b)| if i % 3 == 0 { f64::NAN } else { b.close }).collect();
+                if p.update_tail(&input, from).is_none() {
+                    p = BarPyramid::build(&input);
+                }
+                if line.update_closes(&input, from).is_none() {
+                    line = LinePyramid::build(&input.iter().map(|b| b.close).collect::<Vec<_>>());
+                }
+                // The first patch must initialize all marker values from this oracle.
+                if step == 0 || markers.update_tail(&values, from).is_none() {
+                    markers = LinePyramid::build_markers(&values);
+                }
+                let fresh = BarPyramid::build(&input);
+                let fresh_line = LinePyramid::build(&input.iter().map(|b| b.close).collect::<Vec<_>>());
+                let fresh_markers = LinePyramid::build_markers(&values);
+                assert_eq!(p.levels(), fresh.levels());
+                for k in 0..fresh.levels() {
+                    assert_eq!(p.level(k), fresh.level(k), "start={start}, step={step}, level={k}");
+                    let n = line.level_len(k);
+                    assert_eq!(
+                        &line.data[line.offsets[k]..line.offsets[k] + n],
+                        &fresh_line.data[fresh_line.offsets[k]..fresh_line.offsets[k] + n]
+                    );
+                    for (a, b) in markers.data[markers.offsets[k]..markers.offsets[k] + n]
+                        .iter()
+                        .zip(&fresh_markers.data[fresh_markers.offsets[k]..fresh_markers.offsets[k] + n])
+                    {
+                        assert_eq!(a[0], b[0]);
+                        assert!(a[1] == b[1] || a[1].is_nan() && b[1].is_nan());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -260,6 +448,60 @@ mod tests {
         let (a, b) = p.segment_range(0, 3, 6);
         assert_eq!((a, b), (2, 7));
         assert_eq!(p.segment_range(0, 0, 0), (0, 1));
+    }
+
+    #[test]
+    fn seeded_tail_patches_match_fresh_pyramids_and_bytes() {
+        let mut seed = 17u64;
+        let mut rebuilds = 0;
+        for n in [1, 2, 3, 1000, 100000] {
+            let mut bars = bars(n);
+            let mut p = BarPyramid::build(&bars);
+            let mut line = LinePyramid::build(&bars.iter().map(|b| b.close).collect::<Vec<_>>());
+            for _ in 0..80 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let from = bars.len() - 1;
+                let b = bars.last_mut().unwrap();
+                b.close = (seed >> 32) as f64 / 12345.;
+                b.high = b.high.max(b.close);
+                b.low = b.low.min(b.close);
+                b.volume += 0.25;
+                if seed & (1 << 40) != 0 {
+                    bars.push(Bar::new(bars.len() as i64, 1., 3., 0., 2., 1.));
+                }
+                let mut old = bytemuck::cast_slice::<GpuBar, u8>(&p.data).to_vec();
+                let mut old_line = bytemuck::cast_slice::<[f32; 2], u8>(&line.data).to_vec();
+                if let Some(ranges) = p.update_tail(&bars, from) {
+                    let bytes = bytemuck::cast_slice::<GpuBar, u8>(&p.data);
+                    for r in ranges {
+                        old[r.clone()].copy_from_slice(&bytes[r]);
+                    }
+                    assert_eq!(old, bytes);
+                    let ranges = line.update_closes(&bars, from).unwrap();
+                    let bytes = bytemuck::cast_slice::<[f32; 2], u8>(&line.data);
+                    for r in ranges {
+                        old_line[r.clone()].copy_from_slice(&bytes[r]);
+                    }
+                    assert_eq!(old_line, bytes);
+                } else {
+                    rebuilds += 1;
+                    p = BarPyramid::build(&bars);
+                    line = LinePyramid::build(&bars.iter().map(|b| b.close).collect::<Vec<_>>());
+                }
+                let fresh = BarPyramid::build(&bars);
+                let fresh_line = LinePyramid::build(&bars.iter().map(|b| b.close).collect::<Vec<_>>());
+                for k in 0..fresh.levels() {
+                    assert_eq!(p.level(k), fresh.level(k));
+                    let (a, b) = (line.offsets[k], fresh_line.offsets[k]);
+                    assert_eq!(&line.data[a..a + line.level_len(k)], &fresh_line.data[b..b + fresh_line.level_len(k)]);
+                }
+            }
+            if n > 1024 {
+                assert!(p.update_tail(&bars, 0).is_none());
+                assert!(line.update_closes(&bars, 0).is_none());
+            }
+        }
+        assert!(rebuilds > 0);
     }
 
     #[test]

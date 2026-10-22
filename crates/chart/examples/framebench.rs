@@ -2,6 +2,7 @@
 //! a 1M-bar series, rendered offscreen at 1600x900. Prints percentiles per phase.
 //!
 //! `cargo run --release -p tr-chart --example framebench [bars]`
+//! `cargo run --release -p tr-chart --example framebench -- --live` compares live updates.
 
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,90 @@ fn pct(v: &mut [Duration], p: f64) -> f64 {
     v[((v.len() - 1) as f64 * p).round() as usize].as_secs_f64() * 1e3
 }
 
+fn live_frame(h: &mut Headless, series: &SeriesGpu) {
+    let v = Viewport::fit_last(series.len(), 200, 1600.);
+    let mut cmds = Vec::new();
+    for chart_type in [ChartType::Candles, ChartType::Line] {
+        cmds.extend(
+            price_pane(&PricePane {
+                series,
+                chart_type,
+                show_volume: true,
+                overlays: &[],
+                viewport: &v,
+                height_px: 900.,
+                log: false,
+                manual_scale: None,
+                style: Style::default(),
+            })
+            .cmds,
+        );
+    }
+    h.render(&mut [Frame { pane: 1, frame_no: 0, cmds }]);
+}
+
+fn live_bench() {
+    let mut h = Headless::new(1600, 900).expect("no wgpu adapter");
+    println!("LIVE adapter: {} ({:?})", h.adapter_info.name, h.adapter_info.backend);
+    let mut bars = sample::generate("LIVE", Timeframe::M1, 100_000, 1_790_000_000);
+    let mut new = SeriesGpu::build(&bars);
+    live_frame(&mut h, &new);
+    let (mut old_times, mut new_times) = (Vec::new(), Vec::new());
+    for tick in 1..=600 {
+        let from = bars.len() - 1;
+        let b = bars.last_mut().unwrap();
+        b.close += if tick % 2 == 0 { 0.03 } else { -0.02 };
+        b.high = b.high.max(b.close) + 0.01;
+        b.low = b.low.min(b.close) - 0.01;
+        b.volume += 1.;
+        if tick % 60 == 0 {
+            let mut b = *bars.last().unwrap();
+            b.ts += 60;
+            bars.push(b);
+        }
+        let t = Instant::now();
+        let old = SeriesGpu::build(&bars);
+        live_frame(&mut h, &old);
+        old_times.push(t.elapsed());
+        let t = Instant::now();
+        if new.update_tail(&bars, from).is_none() {
+            new = SeriesGpu::build(&bars);
+        }
+        live_frame(&mut h, &new);
+        new_times.push(t.elapsed());
+    }
+    let fresh = SeriesGpu::build(&bars);
+    for k in 0..fresh.bars.pyramid.read().expect("pyramid lock").levels() {
+        assert_eq!(
+            new.bars.pyramid.read().expect("pyramid lock").level(k),
+            fresh.bars.pyramid.read().expect("pyramid lock").level(k)
+        );
+        let (a, b) = (
+            new.closes.pyramid.read().expect("pyramid lock").offsets[k],
+            fresh.closes.pyramid.read().expect("pyramid lock").offsets[k],
+        );
+        let n = fresh.closes.pyramid.read().expect("pyramid lock").level_len(k);
+        assert_eq!(
+            &new.closes.pyramid.read().expect("pyramid lock").data[a..a + n],
+            &fresh.closes.pyramid.read().expect("pyramid lock").data[b..b + n]
+        );
+    }
+    for (name, times) in [("OLD", &mut old_times), ("NEW", &mut new_times)] {
+        println!(
+            "LIVE {name}: p50 {:.3} ms, p95 {:.3} ms, p99 {:.3} ms",
+            pct(times, 0.5),
+            pct(times, 0.95),
+            pct(times, 0.99)
+        );
+    }
+    println!("LIVE equivalence: passed (100000 bars, 600 ticks, 10 appends)");
+}
+
 fn main() {
+    if std::env::args().any(|arg| arg == "--live") {
+        live_bench();
+        return;
+    }
     let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
     let mut h = Headless::new(1600, 900).expect("no wgpu adapter");
     println!("adapter: {} ({:?}, {:?})", h.adapter_info.name, h.adapter_info.device_type, h.adapter_info.backend);

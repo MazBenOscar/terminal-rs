@@ -84,13 +84,11 @@ pub fn common_anchor(
         return None;
     }
     let valid = |line: &tr_chart::gpu::LineRef, i: usize| {
-        line.pyramid
-            .data
-            .get(i)
-            .filter(|_| i < line.pyramid.level_len(0))
-            .is_some_and(|p| p[1].is_finite() && p[1] > 0.)
+        let pyramid = line.pyramid.read().expect("pyramid lock");
+        i < pyramid.level_len(0) && pyramid.data.get(i).is_some_and(|p| p[1].is_finite() && p[1] > 0.)
     };
-    (lo..hi.min(main.pyramid.level_len(0))).find(|&i| valid(main, i) && others.iter().all(|line| valid(line, i)))
+    let len = main.pyramid.read().expect("pyramid lock").level_len(0);
+    (lo..hi.min(len)).find(|&i| valid(main, i) && others.iter().all(|line| valid(line, i)))
 }
 
 #[derive(Default)]

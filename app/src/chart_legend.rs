@@ -45,7 +45,10 @@ pub fn rows(
                     .filter_map(|(k, (name, o))| {
                         let readout = b.readouts.get(k).and_then(Option::as_ref);
                         readout
-                            .map_or_else(|| o.line.pyramid.data.get(bar).map(|p| p[1] as f64), |r| r.get(bar).copied())
+                            .map_or_else(
+                                || o.line.pyramid.read().expect("pyramid lock").data.get(bar).map(|p| p[1] as f64),
+                                |r| r.get(bar).copied(),
+                            )
                             .filter(|v| v.is_finite())
                             .map(|v| {
                                 let value = tr_chart::scale::format_value(v);
