@@ -3529,4 +3529,63 @@ mod tests {
             assert!(received_stats, "The scanner must publish the selected product's rolling metrics");
         }
     }
+
+    #[tokio::test]
+    async fn seeded_crypto_partial_and_reconnect_backfill_never_double_volume() {
+        struct Feed(std::sync::Mutex<Option<tr_data::LiveFeed>>);
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Feed {
+            fn name(&self) -> &str {
+                "Coinbase fixture"
+            }
+            fn live(&self, _: &str, _: Timeframe) -> Option<tr_data::LiveFeed> {
+                self.0.lock().unwrap().take()
+            }
+            async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+                Ok(vec![Bar::new(60, 100., 120., 80., 105., 13.)])
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let provider = Arc::new(Feed(std::sync::Mutex::new(Some(rx))));
+        let (s, responses) = backfill_shared(provider.clone());
+        let symbol = "COINBASE:BTC-USD Curncy";
+        let source = chart_options_key(provider.as_ref(), symbol, Default::default());
+        assert!(claim_series(&s, 1, 2, &source));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(60, 100., 110., 90., 105., 10.)])));
+        start_live(s.clone(), 1, 2, symbol.into(), Timeframe::M1, Default::default());
+        let seeded = Bar::new(60, 100., 120., 80., 105., 13.);
+        tx.send(tr_data::LiveUpdate::Partial(seeded)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while current_series(&s, 1, 2).unwrap().last().unwrap().volume != 13. {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*current_series(&s, 1, 2).unwrap().last().unwrap(), seeded);
+        responses.try_iter().for_each(drop);
+        tx.send(tr_data::LiveUpdate::Reconnected { since: Some(60) }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !responses.try_iter().any(|r| matches!(r, Response::LiveStatus { message: None, .. })) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(current_series(&s, 1, 2).unwrap().last().unwrap().volume, 13.);
+        tx.send(tr_data::LiveUpdate::Partial(seeded)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if responses.try_iter().any(
+                    |r| matches!(r, Response::History { bars, live: true, .. } if bars.last().unwrap().volume == 13.),
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(current_series(&s, 1, 2).unwrap().last().unwrap().volume, 13.);
+    }
 }

@@ -135,7 +135,7 @@ Crypto chart feeds keep the resolved venue and native product for their lifetime
 Binance endpoints still rotate within Binance; there is no exchange or quote
 substitution. A closed connection (including Binance's normal 24-hour close),
 connection error or 30 seconds without any websocket message triggers a retry.
-Coinbase subscribes to both `ticker` and `heartbeats` for the exact product so an
+Coinbase subscribes to both `matches` and `heartbeats` for the exact product so an
 illiquid product can stay healthy without trades. Heartbeats never generate bars;
 other products are ignored. Websocket Ping receives the automatically queued Pong.
 
@@ -152,7 +152,7 @@ event, before delivering the new bar (if any). The event carries the last bar
 bucket delivered before the failure, or None for a heartbeat-only feed. The
 worker fetches REST chart history using the existing bounded backfill limit,
 merges exact buckets, preserves the live tail and reports `Filled N missed bars`.
-Coinbase starts a fresh tick aggregate on each connection; partial-bar merges
+Coinbase seeds its current aggregate as described in C03b below; partial-bar merges
 retain the original open and larger volume, while REST backfill replaces exact
 buckets. No `Bar::absorb` or chart live-merge semantics change.
 
@@ -168,13 +168,39 @@ fetch and merge; no crypto-specific duplicate is needed.
 Remaining limits: recovery depends on REST history availability and its bounded
 history window; it cannot guarantee every missed bar during a long outage.
 
-Pending as C03b (not started): Coinbase builds the current bar from ticks only, on
-every connection, and merges keep the larger volume. After connect or reconnect the
-current bar's volume therefore stays at the REST snapshot until the new ticks alone
-exceed it, then shows only their volume: it is under-counted, never double-counted.
-C03b seeds the live aggregate from the REST current bar and adds only trades newer
-than the seed, de-duplicated by trade id. Binance kline streams carry the running
-bar volume and are unaffected.
+## C03b — current-bar seeding and exact volume
+
+Coinbase uses `matches` (one message per trade), not the batched `ticker` channel,
+plus exact-product `heartbeats`. Malformed matches, non-finite or non-positive
+prices/sizes, and `last_match` snapshots are ignored. Trade ids are remembered for
+the current and previous bucket across connections; replay cannot add them twice.
+Older buckets cannot rewind the aggregate. Binance's running-volume klines and C03
+health, status, recovery ordering and retry rules are unchanged.
+
+On the first healthy product message of each connection, a concurrent REST history
+request seeds the exact product/timeframe's current bar, using a one-bar history
+limit and an 800 ms deadline. Websocket reads and Ping/Pong continue during the
+fetch; only provisional bar publication waits for that bounded seed attempt.
+Failure silently publishes the unseeded aggregate instead of a chart error. A REST
+bar outside the current bucket is not used, including a fetch crossing rollover.
+Seeded bars preserve REST open/high/low and volume, extending them with new trades.
+A later bucket starts with only its own first trade; it is not seeded.
+
+The cutoff is the REST request's start time, at nanosecond precision. Only trades
+with exchange time **at or after** that cutoff extend a seeded bar. Earlier trades
+are assumed included in REST, not added again. REST's own lag can omit trades just
+before that cutoff, so this boundary can still under-count: exact per-trade live
+volume is not a guarantee of gap-free REST reconciliation. There is no addition of
+the REST volume to an already accumulated full bar. Worker partial merges keep the
+larger complete volume, and reconnect backfill replaces, rather than adds, buckets.
+
+Loopback HTTP/websocket tests cover the exact subscription, REST volume 10 plus
+sizes 1 and 2 yielding 13 with extended OHLC, pre-cutoff exclusion, replayed trade
+ids across reconnect, silent seed failure/timeout, continued Ping/Pong while REST
+stalls, stale-bucket rejection, malformed match rejection, and fresh volume on rollover. A worker
+test exercises history volume 10, seeded partial 13, reconnect/backfill 13 and a
+repeated seeded partial without doubling. Existing Binance recovery tests remain
+in place.
 Order-book streams are out of scope. Alerts use polled quotes and already reject
 stale or out-of-order prices. These tests use no public network and do not replace
 running-app visual QA.
