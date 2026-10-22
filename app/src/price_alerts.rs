@@ -703,7 +703,8 @@ mod tests {
         s.pending_rules = Some(s.revision - 1);
         assert!(s.on_rules(s.revision - 1, vec![(id, Ok(q(90.)))]).is_empty());
         assert!(s.pending_rules.is_none());
-        std::fs::remove_dir_all(s.path.parent().unwrap()).unwrap();
+        // Cleanup only: the directory exists only if a save already ran.
+        std::fs::remove_dir_all(s.path.parent().unwrap()).ok();
     }
 
     #[test]
