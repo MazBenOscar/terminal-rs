@@ -788,6 +788,10 @@ impl TerminalApp {
         let mut dock = self.dock.clone();
         dock.remap(&|id| ids.get(&id).copied());
         LayoutDoc {
+            skipped_drawings: 0,
+            watchlists: Some(self.watchlists.clone()),
+            active_watchlist: self.active_watchlist,
+            watchlist: None,
             watch_columns: self.watch_columns.clone(),
             version: crate::layouts::FORMAT_VERSION,
             name: self.layout_name.clone(),
@@ -813,6 +817,12 @@ impl TerminalApp {
     /// panes can never reach the new ones.
     pub(super) fn apply_doc(&mut self, mut doc: LayoutDoc) {
         doc.repair();
+        if doc.skipped_drawings > 0 {
+            self.toasts.push((
+                format!("{} drawings in this layout were invalid and were skipped", doc.skipped_drawings),
+                std::time::Instant::now(),
+            ));
+        }
         if doc.watch_columns.validate().is_err() {
             let (columns, dropped) = doc.watch_columns.sanitized();
             doc.watch_columns = columns;
@@ -824,7 +834,12 @@ impl TerminalApp {
             }
         }
         self.watch_columns = doc.watch_columns;
-        self.refresh_columns();
+        if let Some(lists) = doc.watchlists {
+            self.watchlists = lists;
+            self.switch_watchlist(doc.active_watchlist);
+        } else {
+            self.refresh_columns();
+        }
         for p in std::mem::take(&mut self.panes) {
             self.worker.send(Request::Forget(p.id));
         }
@@ -1693,6 +1708,17 @@ mod tests {
                 PaneSettings::Alerts,
             ],
         );
+        doc.watchlists = Some(vec![
+            crate::app::NamedWatchlist {
+                name: "Technology".into(),
+                symbols: vec!["AAPL US Equity".into(), "MSFT US Equity".into()],
+            },
+            crate::app::NamedWatchlist {
+                name: "Crypto".into(),
+                symbols: vec!["BTCUSD Curncy".into(), "ETHUSD Curncy".into()],
+            },
+        ]);
+        doc.active_watchlist = 1;
         doc.watch_columns.columns = vec![ColumnDef {
             id: 7,
             title: "Close".into(),
@@ -1733,6 +1759,31 @@ mod tests {
             alerts_before,
             "alert book is global, the layout references its Alerts pane"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_drawings_load_other_fields_and_emit_one_notice() {
+        let (mut app, root) = fixture("invalid-drawings");
+        let doc = LayoutDoc::default_workspace("Mixed drawings", &Default::default());
+        let mut value = serde_json::to_value(&doc).unwrap();
+        value["panes"][0]["Chart"]["drawings"] = serde_json::json!([
+            {"tool": "Text", "a": {"ts": 1, "price": 10}, "b": {"ts": 1, "price": 10}, "text": "keep"},
+            {"tool": "Text", "a": {"ts": 1, "price": 10}, "b": {"ts": 1, "price": 10}, "text": 123},
+            {"tool": "Path", "a": {"ts": 1, "price": 10}, "b": {"ts": 1, "price": 10}, "vertices": []}
+        ]);
+        let loaded = LayoutDoc::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(loaded.skipped_drawings, 2);
+        app.apply_doc(loaded);
+        assert_eq!(app.layout_name, "Mixed drawings");
+        assert_eq!(app.panes.len(), doc.panes.len());
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts[0].0, "2 drawings in this layout were invalid and were skipped");
+        let current = app.current_doc();
+        let crate::layouts::PaneSettings::Chart { drawings, .. } = &current.panes[0].settings else { panic!("chart") };
+        assert_eq!(drawings.len(), 1);
+        assert_eq!(drawings[0].text, "keep");
+        assert_eq!(LayoutDoc::from_json(&current.to_json()).unwrap().skipped_drawings, 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 

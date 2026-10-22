@@ -106,6 +106,32 @@ impl Timeframe {
         }
     }
 
+    /// Only regular exchange multi-hour bars use the session grid. Provider and
+    /// extended-hours histories retain their UTC alignment.
+    pub fn session_aligned(self, session: crate::session::Session) -> bool {
+        session == crate::session::Session::UsRegular && matches!(self, Self::H2 | Self::H4)
+    }
+
+    pub fn resample_session(self, bars: &[Bar], session: crate::session::Session) -> Vec<Bar> {
+        if !self.session_aligned(session) {
+            return self.resample(bars);
+        }
+        let mut out: Vec<Bar> = Vec::new();
+        for b in bars.iter().filter(|b| session.contains(b.ts)) {
+            let start = crate::session::bar_interval(self, session, b.ts).0;
+            match out.last_mut() {
+                Some(cur) if cur.ts == start => {
+                    cur.high = cur.high.max(b.high);
+                    cur.low = cur.low.min(b.low);
+                    cur.close = b.close;
+                    cur.volume += b.volume;
+                }
+                _ => out.push(Bar { ts: start, ..*b }),
+            }
+        }
+        out
+    }
+
     /// New intervals use existing provider intervals, then calendar-aligned aggregation.
     pub fn source_interval(self) -> Option<(Self, usize)> {
         match self {
@@ -121,7 +147,7 @@ impl Timeframe {
     pub fn resample(self, bars: &[Bar]) -> Vec<Bar> {
         let mut out: Vec<Bar> = Vec::with_capacity(bars.len() / 2 + 1);
         for b in bars {
-            let start = self.bucket_start(b.ts);
+            let start = crate::session::bar_interval(self, crate::session::Session::Provider, b.ts).0;
             match out.last_mut() {
                 Some(cur) if cur.ts == start => {
                     cur.high = cur.high.max(b.high);
@@ -184,6 +210,67 @@ impl FromStr for Timeframe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ts(s: &str) -> i64 {
+        DateTime::parse_from_rfc3339(s).unwrap().timestamp()
+    }
+
+    #[test]
+    fn regular_multi_hour_boundaries_normal_dst_and_half_day() {
+        use crate::session::Session;
+        // Trading days immediately before and after each DST transition.
+        for (day, hour) in [("2026-03-06", 14), ("2026-03-09", 13), ("2026-10-30", 13), ("2026-11-02", 14)] {
+            let open = ts(&format!("{day}T{hour}:30:00Z"));
+            for tf in [Timeframe::H2, Timeframe::H4] {
+                for minute in [0, 29, 119, 120, 239, 240, 359, 360, 389] {
+                    let t = open + minute * 60;
+                    let start = open + (t - open) / tf.seconds() * tf.seconds();
+                    assert_eq!(
+                        Session::UsRegular.interval(tf, t),
+                        (start, (start + tf.seconds()).min(open + 390 * 60))
+                    );
+                }
+            }
+        }
+        let open = ts("2026-11-27T14:30:00Z");
+        let close = ts("2026-11-27T18:00:00Z");
+        assert_eq!(Session::UsRegular.interval(Timeframe::H2, close - 1), (open + 7200, close));
+        assert_eq!(Session::UsRegular.interval(Timeframe::H4, close - 1), (open, close));
+        assert!(!Session::UsRegular.contains(close));
+    }
+
+    #[test]
+    fn regular_two_hour_from_half_hours_equals_manual_aggregation() {
+        use crate::session::Session;
+        let open = ts("2026-03-09T13:30:00Z");
+        let bars: Vec<_> = (-1..14)
+            .map(|i| Bar::new(open + i * 1800, i as f64, i as f64 + 2., i as f64 - 1., i as f64 + 1., 10.))
+            .collect();
+        let actual = Timeframe::H2.resample_session(&bars, Session::UsRegular);
+        let expected = vec![
+            Bar::new(open, 0., 5., -1., 4., 40.),
+            Bar::new(open + 7200, 4., 9., 3., 8., 40.),
+            Bar::new(open + 14400, 8., 13., 7., 12., 40.),
+            Bar::new(open + 21600, 12., 14., 11., 13., 10.),
+        ];
+        assert_eq!(actual, expected);
+        assert_eq!(actual[0].ts, open);
+        let half_open = ts("2026-11-27T14:30:00Z");
+        let half_bars: Vec<_> = (0..10).map(|i| Bar::new(half_open + i * 1800, 1., 1., 1., 1., 1.)).collect();
+        assert_eq!(Timeframe::H4.resample_session(&half_bars, Session::UsRegular)[0].volume, 7.);
+    }
+
+    #[test]
+    fn crypto_provider_and_extended_multi_hour_buckets_remain_utc() {
+        use crate::session::Session;
+        let bars = vec![Bar::new(ts("2026-03-09T13:30:00Z"), 1., 2., 0., 1., 10.)];
+        for tf in [Timeframe::H2, Timeframe::H4] {
+            for session in [Session::Provider, Session::UsExtended] {
+                assert_eq!(tf.resample_session(&bars, session), tf.resample(&bars));
+                assert_eq!(session.interval(tf, bars[0].ts).0, tf.bucket_start(bars[0].ts));
+            }
+        }
+    }
 
     #[test]
     fn parse_spellings() {

@@ -132,10 +132,32 @@ impl TerminalApp {
                 }
             }
             PaneKind::Scanner(s) => {
+                ui.data_mut(|d| d.insert_temp(egui::Id::new("security-names"), self.security_names.clone()));
+                let market = s.universe != tr_data::universe::Universe::Watchlist;
+                let shown = s
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        let outcome = row
+                            .evaluation
+                            .as_ref()
+                            .map(|e| e.outcome)
+                            .unwrap_or(tr_core::scanner::ScanOutcome::Unavailable);
+                        !(s.matches_only && outcome == tr_core::scanner::ScanOutcome::NoMatch
+                            || market && !s.show_unavailable && outcome == tr_core::scanner::ScanOutcome::Unavailable)
+                    })
+                    .map(|r| r.symbol.clone());
+                crate::security_names::request(ui, &self.security_names, &self.worker, &self.provider, shown);
                 let bulk_ready = self.broker.questrade.as_ref().is_some_and(|q| q.is_configured());
-                actions.extend(super::scanner_view::show(ui, s, id, &self.watchlist, bulk_ready, |request| {
-                    self.worker.send(request)
-                }));
+                actions.extend(super::scanner_view::show_named(
+                    ui,
+                    s,
+                    id,
+                    &self.watchlist,
+                    bulk_ready,
+                    |request| self.worker.send(request),
+                    &self.watchlists[self.active_watchlist].name,
+                ));
             }
             PaneKind::Portfolio(pp) => {
                 let demo =
@@ -188,6 +210,84 @@ impl TerminalApp {
 
     fn watchlist(&mut self, ui: &mut Ui) -> Vec<Action> {
         let mut out = Vec::new();
+        ui.horizontal(|ui| {
+            let mut active = self.active_watchlist;
+            egui::ComboBox::from_id_salt("watchlist-picker").selected_text(&self.watchlists[active].name).show_ui(
+                ui,
+                |ui| {
+                    for (i, list) in self.watchlists.iter().enumerate() {
+                        ui.selectable_value(&mut active, i, &list.name);
+                    }
+                },
+            );
+            if active != self.active_watchlist {
+                self.switch_watchlist(active);
+            }
+            let response = widgets::icon_button(ui, widgets::Icon::More, "Watchlist options", false);
+            egui::Popup::menu(&response).show(|ui| {
+                if ui.button("New list…").clicked() {
+                    self.watchlist_entry = Some((None, String::new()));
+                    ui.close();
+                }
+                if ui.button("Rename…").clicked() {
+                    self.watchlist_entry = Some((
+                        Some(super::watchlist_name_key(&self.watchlists[active].name)),
+                        self.watchlists[active].name.clone(),
+                    ));
+                    ui.close();
+                }
+                if ui.add_enabled(self.watchlists.len() < 50, egui::Button::new("Duplicate")).clicked() {
+                    let name = super::unique_watchlist_name(&self.watchlists[active].name, &self.watchlists);
+                    if let Err(e) = self.create_watchlist(name, self.watchlist.clone()) {
+                        self.status = e;
+                    }
+                    ui.close();
+                }
+                let label = if self.watchlist_delete {
+                    format!("Delete {}?", self.watchlists[active].name)
+                } else {
+                    "Delete".into()
+                };
+                if ui.add_enabled(self.watchlists.len() > 1, egui::Button::new(label)).clicked() {
+                    if self.watchlist_delete {
+                        if let Err(e) = self.delete_watchlist(active) {
+                            self.status = e;
+                        }
+                        ui.close();
+                    } else {
+                        self.watchlist_delete = true;
+                    }
+                }
+            });
+        });
+        let mut accept = false;
+        let mut cancel = false;
+        if let Some((_, name)) = &mut self.watchlist_entry {
+            ui.horizontal(|ui| {
+                egui::Frame::new()
+                    .fill(theme::header())
+                    .stroke(egui::Stroke::new(1.0, muted()))
+                    .inner_margin(dp(4.0))
+                    .show(ui, |ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(name)
+                                .frame(egui::Frame::NONE)
+                                .hint_text("List name")
+                                .char_limit(40),
+                        );
+                        accept = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    });
+                accept |= ui.button("Save").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        }
+        if accept {
+            if let Err(e) = self.apply_watchlist_entry() {
+                self.status = e;
+            }
+        } else if cancel {
+            self.watchlist_entry = None;
+        }
         let row_h = dp(22.0);
         let w = ui.available_width();
         let (hdr, header_response) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
@@ -200,12 +300,48 @@ impl TerminalApp {
         let p = ui.painter();
         p.rect_filled(hdr, theme::CONTROL_RADIUS, theme::header());
         let extra = self.watch_columns.columns.len().min(((w - dp(380.0)).max(0.0) / dp(85.0)) as usize);
-        let base = if extra == 0 { 1.0 } else { (dp(380.0) / w).max(0.45) };
+        let show_name =
+            crate::security_names::show_column(w, self.watch_columns.columns.len(), self.watch_columns.show_name);
+        let name_width = if show_name { dp(150.0) } else { 0.0 };
+        let base = if extra == 0 { 1.0 } else { (dp(380.0) / (w - name_width)).max(0.45) };
         let mut cols = vec![0.0, 0.34 * base, 0.58 * base, 0.79 * base, base];
         for i in 0..extra {
             cols.push(base + (1.0 - base) * (i + 1) as f32 / extra as f32);
         }
-        let col = |r: Rect, k: usize| r.left() + 8.0 + (r.width() - 16.0) * cols[k];
+        let col = |r: Rect, k: usize| {
+            r.left() + 8.0 + (r.width() - 16.0 - name_width) * cols[k] + if k > 0 { name_width } else { 0.0 }
+        };
+        let name_left = col(hdr, 1) - name_width;
+        if show_name {
+            let title = match self.watch_sort {
+                Some((usize::MAX, false)) => "Name ▲",
+                Some((usize::MAX, true)) => "Name ▼",
+                _ => "Name",
+            };
+            p.text(pos2(name_left, hdr.center().y), Align2::LEFT_CENTER, title, ui_font(11.5), muted());
+            let hit = Rect::from_min_max(pos2(name_left, hdr.top()), pos2(name_left + name_width, hdr.bottom()));
+            let response = ui.interact(hit, ui.id().with("watch-name-sort"), Sense::click());
+            response.context_menu(|ui| {
+                if ui.button("Edit columns…").clicked() {
+                    out.push(Action::Command("COL EDIT".into()));
+                    ui.close();
+                }
+            });
+            if response.clicked() {
+                self.watch_sort = match self.watch_sort {
+                    Some((usize::MAX, false)) => Some((usize::MAX, true)),
+                    Some((usize::MAX, true)) => None,
+                    _ => Some((usize::MAX, false)),
+                };
+            }
+        }
+        crate::security_names::request(
+            ui,
+            &self.security_names,
+            &self.worker,
+            &self.provider,
+            self.watchlist.iter().cloned(),
+        );
         let mut headers = vec!["Security".to_string(), "Last".into(), "Change".into(), "%".into()];
         headers.extend(self.watch_columns.columns.iter().take(extra).map(|c| c.title.clone()));
         for (index, title) in headers.iter().enumerate() {
@@ -229,7 +365,7 @@ impl TerminalApp {
                 muted(),
             );
             let left = if index == 0 { hdr.left() } else { col(hdr, k - 1) };
-            let right = if index == 0 { col(hdr, 1) } else { col(hdr, k) };
+            let right = if index == 0 { name_left } else { col(hdr, k) };
             let hit = Rect::from_min_max(pos2(left, hdr.top()), pos2(right, hdr.bottom()));
             let response = ui.interact(hit, ui.id().with(("watch-header", index)), Sense::click());
             response.context_menu(|ui| {
@@ -259,6 +395,13 @@ impl TerminalApp {
         let mut symbols = self.watchlist.clone();
         if let Some((index, descending)) = self.watch_sort {
             symbols.sort_by(|a, b| {
+                if index == usize::MAX {
+                    return crate::security_names::order(
+                        self.security_names.name(a),
+                        self.security_names.name(b),
+                        descending,
+                    );
+                }
                 if index == 0 {
                     let order = tr_data::security(a).ticker.cmp(&tr_data::security(b).ticker);
                     return if descending { order.reverse() } else { order };
@@ -293,6 +436,17 @@ impl TerminalApp {
                     ui_font(11.0),
                     muted(),
                 );
+                let name = self.security_names.name(s);
+                let ticker_hit = Rect::from_min_max(r.min, pos2(name_left, r.bottom()));
+                ui.interact(ticker_hit, ui.id().with(("ticker-name", s)), Sense::hover())
+                    .on_hover_text(crate::security_names::hover(&sec.ticker, name));
+                if show_name {
+                    let hit = Rect::from_min_max(
+                        pos2(name_left, r.top()),
+                        pos2(name_left + name_width - dp(6.0), r.bottom()),
+                    );
+                    crate::security_names::paint(ui, hit, name.unwrap_or(""), ("watch-name", s));
+                }
                 match self.quotes.get(s) {
                     Some(q) => {
                         let c = if q.change() >= 0.0 { theme::up() } else { theme::down() };
@@ -610,6 +764,39 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switching_watchlists_updates_panel_rows_and_column_snapshot() {
+        let root = std::env::temp_dir().join(format!("named-watchlists-panel-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        app.add_watchlist_symbols(vec!["AAPL".into()]);
+        app.create_watchlist("Technology".into(), vec!["NVDA".into()]).unwrap();
+        let ctx = egui::Context::default();
+        let draw = |app: &mut TerminalApp| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.watchlist(ui);
+            });
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let labels = draw(&mut app);
+        assert!(labels.iter().any(|text| text == "Technology"));
+        assert!(labels.iter().any(|text| text == "NVDA"));
+        assert!(!labels.iter().any(|text| text == "AAPL"));
+        app.switch_watchlist(0);
+        let labels = draw(&mut app);
+        assert!(labels.iter().any(|text| text == "Main"));
+        assert!(labels.iter().any(|text| text == "AAPL"));
+        assert!(!labels.iter().any(|text| text == "NVDA"));
+        assert_eq!(app.columns_snapshot.0, vec![tr_data::security("AAPL").key()]);
+    }
 
     #[test]
     fn column_values_use_security_precision_only_for_price_like_values() {

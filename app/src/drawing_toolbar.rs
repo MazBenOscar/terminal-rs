@@ -6,17 +6,182 @@ use crate::{
 use egui::{Rect, Response, Sense, Stroke, Ui, pos2, vec2};
 use tr_chart::drawings::Tool;
 
-pub const GROUPS: [(&str, &[Tool]); 4] = [
-    ("LINES", &[Tool::Trendline, Tool::Ray, Tool::Horizontal, Tool::Vertical]),
-    ("FIB & CHANNELS", &[Tool::Fib, Tool::FibExtension, Tool::Channel, Tool::Pitchfork]),
-    ("SHAPES & NOTES", &[Tool::Rectangle, Tool::Text]),
-    ("POSITIONS", &[Tool::LongPosition, Tool::ShortPosition]),
+pub struct Section {
+    pub title: &'static str,
+    pub tools: &'static [Tool],
+}
+
+pub struct Category {
+    pub title: &'static str,
+    pub sections: &'static [Section],
+}
+
+impl Category {
+    pub fn visible_sections(&self) -> impl Iterator<Item = &Section> {
+        self.sections.iter().filter(|section| !section.tools.is_empty())
+    }
+
+    pub fn tools(&self) -> impl Iterator<Item = Tool> + '_ {
+        self.visible_sections().flat_map(|section| section.tools.iter().copied())
+    }
+}
+
+pub const CATEGORIES: [Category; 6] = [
+    Category {
+        title: "Trend lines",
+        sections: &[
+            Section {
+                title: "Lines",
+                tools: &[
+                    Tool::Trendline,
+                    Tool::Ray,
+                    Tool::Horizontal,
+                    Tool::Vertical,
+                    Tool::HorizontalRay,
+                    Tool::ExtendedLine,
+                    Tool::InfoLine,
+                ],
+            },
+            Section { title: "Channels", tools: &[Tool::Channel, Tool::RegressionTrend] },
+            Section { title: "Pitchforks", tools: &[Tool::Pitchfork] },
+        ],
+    },
+    Category {
+        title: "Fibonacci",
+        sections: &[
+            Section {
+                title: "Fibonacci",
+                tools: &[Tool::Fib, Tool::FibExtension, Tool::FibChannel, Tool::FibTimeZone],
+            },
+            Section { title: "Volume-based", tools: &[] },
+        ],
+    },
+    Category {
+        title: "Measure & volume",
+        sections: &[
+            Section {
+                title: "Measurers",
+                tools: &[Tool::Measure, Tool::PriceRange, Tool::DateRange, Tool::DatePriceRange],
+            },
+            Section { title: "Volume-based", tools: &[Tool::AnchoredVwap, Tool::FixedRangeVolumeProfile] },
+            Section { title: "Forecasting", tools: &[Tool::LongPosition, Tool::ShortPosition] },
+        ],
+    },
+    Category {
+        title: "Annotation",
+        sections: &[
+            Section { title: "Arrows", tools: &[Tool::Arrow, Tool::ArrowMarkUp, Tool::ArrowMarkDown] },
+            Section { title: "Brushes", tools: &[Tool::Brush] },
+            Section { title: "Shapes", tools: &[Tool::Rectangle, Tool::Circle, Tool::Path] },
+        ],
+    },
+    Category {
+        title: "Text & notes",
+        sections: &[Section {
+            title: "Text and notes",
+            tools: &[Tool::Text, Tool::PriceNote, Tool::Callout, Tool::FlagMark],
+        }],
+    },
+    PATTERNS,
+];
+
+pub const PATTERNS: Category = Category {
+    title: "Patterns",
+    sections: &[
+        Section {
+            title: "Chart patterns",
+            tools: &[Tool::Xabcd, Tool::Abcd, Tool::HeadAndShoulders, Tool::TrianglePattern],
+        },
+        Section { title: "Elliott waves", tools: &[Tool::ElliottImpulse, Tool::ElliottCorrection] },
+    ],
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RailItem {
+    Crosshair,
+    Category(usize),
+    Patterns,
+    Separator,
+    Magnet,
+    Lock,
+    Hide,
+    RemoveAll,
+}
+
+const RAIL: [RailItem; 12] = [
+    RailItem::Crosshair,
+    RailItem::Category(0),
+    RailItem::Category(1),
+    RailItem::Patterns,
+    RailItem::Category(2),
+    RailItem::Category(3),
+    RailItem::Category(4),
+    RailItem::Separator,
+    RailItem::Magnet,
+    RailItem::Lock,
+    RailItem::Hide,
+    RailItem::RemoveAll,
+];
+
+/// Pure geometry shared by painting, interaction and tests.
+pub fn rail_layout(rail: Rect) -> Vec<(RailItem, Rect)> {
+    rail_layout_with_categories(rail, &CATEGORIES, &PATTERNS)
+}
+
+fn rail_layout_with_categories(rail: Rect, categories: &[Category], patterns: &Category) -> Vec<(RailItem, Rect)> {
+    let size = theme::dp(32.);
+    let mut y = rail.top() + theme::dp(4.);
+    RAIL.into_iter()
+        .filter_map(|item| {
+            let visible = match item {
+                RailItem::Category(index) => categories[index].tools().next().is_some(),
+                RailItem::Patterns => patterns.tools().next().is_some(),
+                _ => true,
+            };
+            if !visible {
+                return None;
+            }
+            let height = if item == RailItem::Separator { theme::dp(4.) } else { size };
+            let rect = Rect::from_min_size(pos2(rail.center().x - size / 2., y), vec2(size, height));
+            y += height + theme::dp(2.);
+            Some((item, rect))
+        })
+        .collect()
+}
+
+// Compatibility view for the pre-category interaction tests; derived from the table.
+#[cfg(test)]
+const fn category_tools<const N: usize>(index: usize) -> [Tool; N] {
+    let mut tools = [Tool::Trendline; N];
+    let mut section = 0;
+    let mut out = 0;
+    while section < CATEGORIES[index].sections.len() {
+        let mut row = 0;
+        while row < CATEGORIES[index].sections[section].tools.len() {
+            tools[out] = CATEGORIES[index].sections[section].tools[row];
+            out += 1;
+            row += 1;
+        }
+        section += 1;
+    }
+    tools
+}
+
+#[cfg(test)]
+pub const GROUPS: [(&str, &[Tool]); 5] = [
+    (CATEGORIES[0].title, &category_tools::<10>(0)),
+    (CATEGORIES[1].title, &category_tools::<4>(1)),
+    (CATEGORIES[2].title, &category_tools::<8>(2)),
+    (CATEGORIES[3].title, &category_tools::<7>(3)),
+    (CATEGORIES[4].title, &category_tools::<4>(4)),
 ];
 
 #[derive(Clone, Debug)]
 pub struct State {
-    pub last: [Tool; 4],
+    pub last: [Tool; 5],
+    pub pattern_last: Tool,
     pub open: Option<usize>,
+    pub hide_open: bool,
     pub held: Option<(usize, f64)>,
     pub flyout: Rect,
     pub favorites_dragging: bool,
@@ -24,12 +189,106 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            last: [Tool::Trendline, Tool::Fib, Tool::Rectangle, Tool::LongPosition],
+            last: [Tool::Trendline, Tool::Fib, Tool::LongPosition, Tool::Rectangle, Tool::Text],
+            pattern_last: Tool::Xabcd,
             open: None,
+            hide_open: false,
             held: None,
             flyout: Rect::NOTHING,
             favorites_dragging: false,
         }
+    }
+}
+
+impl State {
+    /// Accept legacy four-slot layouts and reject tools belonging to other categories.
+    pub fn restore_last(&mut self, saved: &[Tool]) {
+        for &tool in saved {
+            self.remember(tool);
+        }
+    }
+
+    pub fn remember(&mut self, tool: Tool) {
+        if let Some(index) = CATEGORIES.iter().position(|category| category.tools().any(|item| item == tool)) {
+            if index == 5 {
+                self.pattern_last = tool;
+            } else {
+                self.last[index] = tool;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn rail_layout_orders_controls_and_omits_empty_patterns() {
+    let rail = Rect::from_min_size(pos2(10., 10.), vec2(theme::dp(36.), theme::dp(600.)));
+    let layout = rail_layout(rail);
+    assert_eq!(
+        layout.iter().map(|(item, _)| *item).collect::<Vec<_>>(),
+        [
+            RailItem::Crosshair,
+            RailItem::Category(0),
+            RailItem::Category(1),
+            RailItem::Patterns,
+            RailItem::Category(2),
+            RailItem::Category(3),
+            RailItem::Category(4),
+            RailItem::Separator,
+            RailItem::Magnet,
+            RailItem::Lock,
+            RailItem::Hide,
+            RailItem::RemoveAll,
+        ]
+    );
+    assert!(layout.windows(2).all(|pair| pair[0].1.bottom() < pair[1].1.top()));
+    assert!(layout.iter().all(|(_, rect)| rail.contains_rect(*rect)));
+    assert_eq!(PATTERNS.sections.iter().map(|s| s.title).collect::<Vec<_>>(), ["Chart patterns", "Elliott waves"]);
+    assert!(PATTERNS.visible_sections().next().is_some());
+    let empty = Category { title: "Empty", sections: &[Section { title: "Empty", tools: &[] }] };
+    assert!(empty.visible_sections().next().is_none());
+    let empty_layout = rail_layout_with_categories(rail, &CATEGORIES, &empty);
+    assert_eq!(
+        empty_layout.iter().map(|(item, _)| *item).collect::<Vec<_>>(),
+        layout.iter().map(|(item, _)| *item).filter(|item| *item != RailItem::Patterns).collect::<Vec<_>>()
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn category_table_covers_every_tool_exactly_once() {
+    let tools: Vec<_> = CATEGORIES.iter().flat_map(Category::tools).collect();
+    assert_eq!(tools.len(), Tool::ALL.len());
+    for tool in Tool::ALL {
+        assert_eq!(tools.iter().filter(|&&item| item == tool).count(), 1, "{tool:?}");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn empty_sections_are_omitted_in_table_order() {
+    let category = &CATEGORIES[1];
+    assert_eq!(category.sections.len(), 2);
+    assert_eq!(category.visible_sections().map(|section| section.title).collect::<Vec<_>>(), ["Fibonacci"]);
+    assert_eq!(
+        CATEGORIES[0].visible_sections().map(|section| section.title).collect::<Vec<_>>(),
+        ["Lines", "Channels", "Pitchforks"]
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn last_used_is_independent_per_category_and_legacy_lists_are_sanitized() {
+    let mut state = State::default();
+    state.restore_last(&[Tool::Ray, Tool::FibExtension, Tool::Text, Tool::ShortPosition]);
+    assert_eq!(state.last, [Tool::Ray, Tool::FibExtension, Tool::ShortPosition, Tool::Rectangle, Tool::Text]);
+    state.remember(Tool::Measure);
+    assert_eq!(state.last, [Tool::Ray, Tool::FibExtension, Tool::Measure, Tool::Rectangle, Tool::Text]);
+    state.restore_last(&[]);
+    state.restore_last(&[Tool::Text; 8]);
+    assert_eq!(state.last[0], Tool::Ray);
+    for (category, tool) in CATEGORIES.iter().zip(state.last) {
+        assert!(category.tools().any(|item| item == tool));
     }
 }
 
@@ -55,7 +314,7 @@ pub fn button(
     }
     widgets::draw_icon(
         ui.painter(),
-        rect.shrink(theme::dp(7.)),
+        Rect::from_center_size(rect.center(), vec2(theme::dp(20.), theme::dp(20.))),
         icon,
         if active { theme::accent() } else { theme::text() },
     );
@@ -80,11 +339,151 @@ pub fn fraction(plot: Rect, rect: Rect) -> [f32; 2] {
     [(rect.left() - plot.left()) / plot.width(), (rect.top() - plot.top()) / plot.height()]
 }
 
+/// Shared menu row. A separate star hit target never selects the tool.
+pub fn tool_row(ui: &mut Ui, tool: Tool, shortcut: &str, active: bool, favorite: Option<bool>) -> (Response, bool) {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let label = ui.painter().layout_no_wrap(tool.label().into(), font.clone(), theme::text());
+    let keys = ui.painter().layout_no_wrap(shortcut.into(), font, theme::muted());
+    let star_width = if favorite.is_some() { theme::dp(28.) } else { 0. };
+    let min_width = theme::dp(24. + 18. + 10. + 12.) + label.size().x + keys.size().x + star_width;
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(ui.available_width().max(theme::dp(260.)).max(min_width), theme::dp(32.)),
+        Sense::hover(),
+    );
+    let content = rect.shrink2(vec2(theme::dp(12.), 0.));
+    let star_rect = Rect::from_min_max(pos2(content.right() - star_width, rect.top()), content.right_bottom());
+    let select_rect = Rect::from_min_max(
+        rect.min,
+        pos2(if favorite.is_some() { star_rect.left() } else { rect.right() }, rect.bottom()),
+    );
+    let response = ui.interact(select_rect, ui.id().with((tool, "select")), Sense::click());
+    let star = favorite.map(|_| {
+        let hit_rect = Rect::from_min_max(star_rect.min, rect.max);
+        ui.interact(hit_rect, ui.id().with((tool, "star")), Sense::click())
+    });
+    let hovered = response.hovered() || star.as_ref().is_some_and(Response::hovered);
+    if active || hovered {
+        ui.painter().rect_filled(
+            rect,
+            theme::CONTROL_RADIUS,
+            if active { theme::accent_wash() } else { theme::control_hover() },
+        );
+    }
+    widgets::draw_icon(
+        ui.painter(),
+        Rect::from_center_size(
+            pos2(content.left() + theme::dp(9.), rect.center().y),
+            vec2(theme::dp(18.), theme::dp(18.)),
+        ),
+        widgets::tool_icon(tool),
+        theme::text(),
+    );
+    ui.painter().galley(
+        pos2(content.left() + theme::dp(28.), rect.center().y - label.size().y / 2.),
+        label,
+        theme::text(),
+    );
+    if !shortcut.is_empty() {
+        ui.painter().galley(
+            pos2(content.right() - star_width - keys.size().x, rect.center().y - keys.size().y / 2.),
+            keys,
+            theme::muted(),
+        );
+    }
+    if let Some(filled) = favorite.filter(|&filled| filled || hovered) {
+        widgets::favorite_star(
+            ui.painter(),
+            Rect::from_center_size(star_rect.center(), vec2(theme::dp(18.), theme::dp(18.))),
+            filled,
+        );
+    }
+    let toggled = star.is_some_and(|response| {
+        response
+            .on_hover_text(if favorite == Some(true) { "Remove from favorites" } else { "Add to favorites" })
+            .clicked()
+    });
+    (response, toggled)
+}
+
+pub fn section_heading(ui: &mut Ui, title: &str, separator_before: bool) {
+    if separator_before {
+        ui.separator();
+    }
+    ui.add_space(theme::dp(8.));
+    let mut font = egui::TextStyle::Body.resolve(ui.style());
+    font.size *= 0.78;
+    let job = egui::text::LayoutJob::single_section(
+        title.to_uppercase(),
+        egui::TextFormat {
+            font_id: font,
+            color: theme::muted(),
+            extra_letter_spacing: theme::dp(0.6),
+            ..Default::default()
+        },
+    );
+    ui.horizontal(|ui| {
+        ui.add_space(theme::dp(12.));
+        ui.label(job);
+    });
+    ui.add_space(theme::dp(4.));
+}
+
+#[cfg(test)]
+#[test]
+fn flyout_paints_stars_only_for_hover_or_favorites_and_uppercase_headings() {
+    fn frame(favorite: bool, hovered: bool) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let mut pointer = None;
+        let mut output = None;
+        // Settle the headless UI before testing hover hit detection.
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                events: pointer.map(|p| vec![egui::Event::PointerMoved(p)]).unwrap_or_default(),
+                ..Default::default()
+            };
+            let mut next = ctx.run_ui(input, |ui| {
+                section_heading(ui, "Chart patterns", false);
+                let (response, _) = tool_row(ui, Tool::Xabcd, "", false, Some(favorite));
+                if hovered {
+                    pointer = Some(response.rect.center());
+                }
+            });
+            next.textures_delta.clear();
+            output = Some(next);
+        }
+        output.unwrap()
+    }
+    let star_count = |output: &egui::FullOutput| {
+        output
+            .shapes
+            .iter()
+            .filter(|shape| matches!(&shape.shape, egui::Shape::Path(path) if path.points.len() == 11))
+            .count()
+    };
+    let quiet = frame(false, false);
+    assert_eq!(star_count(&quiet), 0, "Non-favorite stars must not be painted at rest");
+    assert_eq!(star_count(&frame(false, true)), 1, "Hover reveals the star");
+    assert!(frame(true, false).shapes.len() > quiet.shapes.len(), "Favorites remain filled at rest");
+    let headings: Vec<_> = quiet
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text.contains("PATTERNS") => Some(text.galley.job.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(headings, ["CHART PATTERNS"]);
+}
+
 pub fn separator(ui: &Ui, rect: Rect) {
     ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1., theme::border()));
 }
 
 impl super::ChartState {
+    fn any_hidden(&self) -> bool {
+        self.drawings_hidden || self.indicators_hidden || self.positions_orders_hidden
+    }
+
     pub(super) fn drawing_available(&self) -> bool {
         self.replay_cutoff.is_none() && self.chart_type != tr_chart::scene::ChartType::Renko
     }
@@ -97,36 +496,45 @@ impl super::ChartState {
     pub(super) fn drawing_rail(&mut self, ui: &mut Ui, rail: Rect) {
         ui.painter().rect_filled(rail, 0., theme::header());
         ui.painter().vline(rail.right(), rail.y_range(), Stroke::new(1., theme::border()));
-        let size = theme::dp(30.);
-        let mut y = rail.top() + theme::dp(4.);
-        let mut anchors = [rail.min; 4];
-        for slot in 0..9 {
-            if (1..=6).contains(&slot) {
-                separator(
-                    ui,
-                    Rect::from_min_size(pos2(rail.left() + theme::dp(6.), y), vec2(theme::dp(24.), theme::dp(6.))),
-                );
-                y += theme::dp(8.);
+        let mut anchors = [rail.min; CATEGORIES.len()];
+        let mut hide_anchor = rail.min;
+        for (item, rect) in rail_layout(rail) {
+            if item == RailItem::Separator {
+                separator(ui, rect.shrink2(vec2(theme::dp(3.), 0.)));
+                continue;
             }
-            let rect = Rect::from_min_size(pos2(rail.center().x - size / 2., y), vec2(size, size));
-            y += size + theme::dp(4.);
-            let tool = match slot {
-                1..=4 => Some(self.drawing_toolbar.last[slot - 1]),
-                5 => Some(Tool::Measure),
+            let slot = match item {
+                RailItem::Crosshair => 0,
+                RailItem::Category(index) => index + 1,
+                RailItem::Patterns => 10,
+                RailItem::Magnet => 6,
+                RailItem::Hide => 7,
+                RailItem::RemoveAll => 8,
+                RailItem::Lock => 9,
+                _ => continue,
+            };
+            let tool = match item {
+                RailItem::Category(index) => Some(self.drawing_toolbar.last[index]),
+                RailItem::Patterns => Some(self.drawing_toolbar.pattern_last),
                 _ => None,
             };
             let (icon, active, hint) = if let Some(tool) = tool {
-                (widgets::tool_icon(tool), self.draw.tool == Some(tool), Self::tool_hint(tool))
+                (
+                    widgets::tool_icon(tool),
+                    self.draw.tool == Some(tool),
+                    format!("{} · {}", CATEGORIES[if slot == 10 { 5 } else { slot - 1 }].title, Self::tool_hint(tool)),
+                )
             } else {
                 match slot {
                     0 => (Icon::Crosshair, self.draw.tool.is_none(), "Crosshair".into()),
                     6 => (Icon::Magnet, self.magnet, "Magnet".into()),
-                    7 => (
-                        if self.drawings_hidden { Icon::EyeOff } else { Icon::Eye },
-                        self.drawings_hidden,
-                        "Hide drawings".into(),
+                    7 => (if self.any_hidden() { Icon::EyeOff } else { Icon::Eye }, self.any_hidden(), "Hide".into()),
+                    8 => (Icon::Trash, false, "Remove all drawings (undo with Cmd+Z)".into()),
+                    9 => (
+                        if self.drawings_locked { Icon::Lock } else { Icon::Unlock },
+                        self.drawings_locked,
+                        if self.drawings_locked { "Unlock drawings" } else { "Lock drawings" }.into(),
                     ),
-                    8 => (Icon::Trash, false, "Remove all drawings (undo with ⌘Z)".into()),
                     _ => break,
                 }
             };
@@ -135,8 +543,8 @@ impl super::ChartState {
                     button(ui, rect, (self.id, "rail", slot), icon, active, &hint)
                 })
                 .inner;
-            if (1..=4).contains(&slot) {
-                let group = slot - 1;
+            if (1..=5).contains(&slot) || slot == 10 {
+                let group = if slot == 10 { 5 } else { slot - 1 };
                 anchors[group] = pos2(rail.right() + theme::dp(4.), rect.top());
                 let corner = Rect::from_min_max(rect.max - vec2(theme::dp(11.), theme::dp(11.)), rect.max);
                 widgets::draw_icon(ui.painter(), corner, Icon::ChevronSmall, theme::muted());
@@ -160,23 +568,37 @@ impl super::ChartState {
                     self.toggle_quick_tool(tool.unwrap());
                     self.drawing_toolbar.open = None;
                 }
-            } else if response.clicked() {
-                match slot {
-                    0 => {
-                        self.cancel();
+            } else {
+                if item == RailItem::Hide {
+                    hide_anchor = pos2(rail.right() + theme::dp(4.), rect.top());
+                    widgets::draw_icon(
+                        ui.painter(),
+                        Rect::from_min_max(rect.max - vec2(11., 11.), rect.max),
+                        Icon::ChevronSmall,
+                        theme::muted(),
+                    );
+                }
+                if response.clicked() {
+                    match slot {
+                        0 => {
+                            self.cancel();
+                        }
+                        6 => self.magnet = !self.magnet,
+                        7 => {
+                            self.drawing_toolbar.hide_open = !self.drawing_toolbar.hide_open;
+                            self.drawing_toolbar.open = None;
+                        }
+                        9 => {
+                            self.drawings_locked = !self.drawings_locked;
+                            self.cancel();
+                        }
+                        8 => {
+                            self.remember_drawings();
+                            self.drawings.clear();
+                            self.cancel();
+                        }
+                        _ => {}
                     }
-                    5 => self.toggle_quick_tool(Tool::Measure),
-                    6 => self.magnet = !self.magnet,
-                    7 => {
-                        self.drawings_hidden = !self.drawings_hidden;
-                        self.cancel();
-                    }
-                    8 => {
-                        self.remember_drawings();
-                        self.drawings.clear();
-                        self.cancel();
-                    }
-                    _ => {}
                 }
             }
         }
@@ -184,51 +606,58 @@ impl super::ChartState {
             self.drawing_toolbar.held = None;
         }
         self.drawing_toolbar.flyout = Rect::NOTHING;
-        if let Some(group) = self.drawing_toolbar.open {
-            let anchor = anchors[group];
-            let mut favorites = crate::prefs::drawing_favorites(ui.ctx());
-            let output = egui::Area::new(egui::Id::new((self.id, "drawing-flyout")))
+        if self.drawing_toolbar.hide_open {
+            let output = egui::Area::new(egui::Id::new((self.id, "drawing-hide-menu")))
                 .order(egui::Order::Foreground)
-                .fixed_pos(anchor)
+                .fixed_pos(hide_anchor)
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.label(egui::RichText::new(GROUPS[group].0).small().color(theme::muted()));
-                        for &tool in GROUPS[group].1 {
-                            ui.push_id(tool, |ui| {
-                                ui.horizontal(|ui| {
-                                    if widgets::icon_button(
-                                        ui,
-                                        widgets::tool_icon(tool),
-                                        tool.label(),
-                                        self.draw.tool == Some(tool),
-                                    )
-                                    .clicked()
-                                    {
-                                        self.start_tool(tool);
-                                        self.drawing_toolbar.open = None;
-                                    }
-                                    if ui
-                                        .add_sized(
-                                            vec2(theme::dp(190.), theme::dp(24.)),
-                                            egui::Button::new(tool.label()).shortcut_text(Self::tool_shortcut(tool)),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.start_tool(tool);
-                                        self.drawing_toolbar.open = None;
-                                    }
-                                    if widgets::icon_button(ui, Icon::Star, "Favorite", favorites.0.contains(&tool))
-                                        .clicked()
-                                    {
-                                        crate::prefs::toggle_drawing_favorite(&mut favorites.0, tool);
-                                    }
-                                })
-                            });
+                        let changed = ui.checkbox(&mut self.drawings_hidden, "Hide drawings").changed();
+                        ui.checkbox(&mut self.indicators_hidden, "Hide indicators");
+                        ui.checkbox(&mut self.positions_orders_hidden, "Hide positions and orders");
+                        if changed {
+                            self.cancel();
+                        }
+                        if ui.button(if self.any_hidden() { "Show all" } else { "Hide all" }).clicked() {
+                            let hidden = !self.any_hidden();
+                            self.drawings_hidden = hidden;
+                            self.indicators_hidden = hidden;
+                            self.positions_orders_hidden = hidden;
+                            self.cancel();
                         }
                     });
                 });
             self.drawing_toolbar.flyout = output.response.rect;
-            crate::prefs::set_drawing_favorites(ui.ctx(), favorites);
+            if ui.input(|i| {
+                i.key_pressed(egui::Key::Escape)
+                    || (i.pointer.any_pressed()
+                        && i.pointer
+                            .interact_pos()
+                            .is_some_and(|p| !rail.contains(p) && !output.response.rect.contains(p)))
+            }) {
+                self.drawing_toolbar.hide_open = false;
+            }
+        }
+        if let Some(group) = self.drawing_toolbar.open {
+            self.drawing_toolbar.hide_open = false;
+            let anchor = anchors[group];
+            let output = egui::Area::new(egui::Id::new((self.id, "drawing-flyout")))
+                .order(egui::Order::Foreground)
+                .default_size(vec2(theme::dp(320.), theme::dp(440.)))
+                .fixed_pos(anchor)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).inner_margin(theme::dp(6.)).show(ui, |ui| {
+                        ui.set_min_width(theme::dp(260.));
+                        let height =
+                            theme::dp(420.).min(ui.ctx().content_rect().height() - theme::dp(24.)).max(theme::dp(24.));
+                        ui.set_max_height(height);
+                        egui::ScrollArea::vertical()
+                            .id_salt((self.id, "drawing-sections", group))
+                            .max_height(height)
+                            .show(ui, |ui| self.drawing_category_menu(ui, group));
+                    });
+                });
+            self.drawing_toolbar.flyout = output.response.rect;
             if ui.input(|i| {
                 i.key_pressed(egui::Key::Escape)
                     || (i.pointer.any_pressed()

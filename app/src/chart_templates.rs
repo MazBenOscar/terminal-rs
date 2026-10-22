@@ -103,7 +103,7 @@ impl Template {
             .map_err(|e| format!("Saving chart template: {e}"))
     }
 
-    /// Merge by remapping every imported ID and both calculation and pane edges.
+    /// Merge by remapping every imported ID and calculation, pane and fill edges.
     /// All validation happens before the caller's current setup changes.
     pub fn merge_into(&self, current: &mut Vec<Spec>) -> Result<(), String> {
         if current.len() + self.indicators.len() > 128 {
@@ -114,6 +114,11 @@ impl Template {
         let mut merged = current.clone();
         study::assign_ids(&mut merged);
         let mut used: HashSet<_> = merged.iter().filter_map(|s| s.chart.as_ref().map(|c| c.id)).collect();
+        for c in merged.iter().chain(&template.indicators).filter_map(|s| s.chart.as_ref()) {
+            if let Some(fill) = &c.fill {
+                used.extend([fill.upper.study, fill.lower.study].into_iter().flatten());
+            }
+        }
         let mut ids = HashMap::new();
         for spec in &template.indicators {
             let old = spec.chart.as_ref().unwrap().id;
@@ -129,6 +134,20 @@ impl Template {
             }
             if let study::Pane::With(id) = &mut c.pane {
                 *id = ids[id];
+            }
+            // A missing imported target must not accidentally bind to an
+            // unrelated existing study whose ID happens to match.
+            if c.fill.as_ref().is_some_and(|fill| {
+                [&fill.upper, &fill.lower].iter().any(|edge| edge.study.is_some_and(|id| !ids.contains_key(&id)))
+            }) {
+                c.fill = None;
+            }
+            if let Some(fill) = &mut c.fill {
+                for edge in [&mut fill.upper, &mut fill.lower] {
+                    if let Some(id) = &mut edge.study {
+                        *id = ids[id];
+                    }
+                }
             }
         }
         merged.extend(template.indicators);
@@ -170,6 +189,53 @@ mod tests {
         assert!(bad.merge_into(&mut current).is_err());
         assert_eq!(before, current);
     }
+    #[test]
+    fn cross_study_fill_template_round_trip_and_merge_remap_targets() {
+        let mut t = template();
+        t.indicators[0].chart.as_mut().unwrap().fill = Some(study::BandFill {
+            upper: "RSI".into(),
+            lower: study::FillEdge { study: Some(2), output: "EMA".into() },
+            color: [1, 2, 3],
+            opacity: 35,
+        });
+        let mut restored: Template = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, t);
+        let mut current = t.indicators.clone();
+        restored.merge_into(&mut current).unwrap();
+        let settings = current[2].chart.as_ref().unwrap();
+        assert_eq!(settings.id, 3);
+        let fill = settings.fill.as_ref().unwrap();
+        assert_eq!(fill.upper.study, None);
+        assert_eq!(fill.lower.study, Some(4));
+        assert!(study::validate_fill_edge(&current, 2, &fill.lower).is_ok());
+        t.indicators[0].chart.as_mut().unwrap().fill.as_mut().unwrap().lower.study = Some(999);
+        t.merge_into(&mut current).unwrap();
+        assert!(current[4].chart.as_ref().unwrap().fill.is_none());
+    }
+
+    #[test]
+    fn merge_must_not_rebind_dangling_fill_targets_with_fresh_ids() {
+        let mut current = vec![Spec::new("EMA", &[]).unwrap()];
+        study::assign_ids(&mut current);
+        let edge = study::FillEdge { study: Some(2), output: "Lower".into() };
+        current[0].chart.as_mut().unwrap().fill =
+            Some(study::BandFill { upper: "EMA".into(), lower: edge.clone(), color: [1, 2, 3], opacity: 35 });
+        let t = template();
+        t.merge_into(&mut current).unwrap();
+        // The dangling edge must stay dangling (or be dropped), never attach to an imported study.
+        match current[0].chart.as_ref().unwrap().fill.as_ref() {
+            None => {}
+            Some(fill) => assert!(
+                fill.lower
+                    .study
+                    .is_none_or(|id| !current.iter().skip(1).any(|s| s.chart.as_ref().is_some_and(|c| c.id == id))),
+                "the imported studies took free id {:?} and the dangling fill edge silently rebinds to one of them",
+                fill.lower.study
+            ),
+        }
+    }
+
     #[test]
     fn persistence_and_corrupt_file_protection() {
         let dir = std::env::temp_dir().join(format!(

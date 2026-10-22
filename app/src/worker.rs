@@ -43,14 +43,8 @@ mod freshness_tests {
     }
 }
 
-fn history_is_stale(tf: Timeframe, last: i64, quote: i64) -> bool {
-    let boundary = if matches!(tf, Timeframe::MN1 | Timeframe::MN3) {
-        tr_core::session::next_bucket(tf, last)
-    } else {
-        last.saturating_add(tf.seconds())
-    };
-    last > quote.saturating_add(30) || quote > boundary.saturating_add(120)
-}
+#[cfg(test)]
+use tr_alerts::history_is_stale;
 
 pub type PaneId = u64;
 
@@ -81,6 +75,7 @@ pub enum QuestradeAction {
 }
 
 pub enum Request {
+    SecurityNames(Vec<String>),
     WatchlistColumns {
         revision: u64,
         symbols: Vec<String>,
@@ -334,6 +329,7 @@ pub struct Profile {
 }
 
 pub enum Response {
+    SecurityNames(crate::security_names::Names),
     WatchlistColumns {
         revision: u64,
         cells: std::collections::HashMap<String, Vec<tr_core::columns::Cell>>,
@@ -558,6 +554,7 @@ type StudyFetches = HashMap<(String, Timeframe), Arc<Mutex<()>>>;
 
 struct Shared {
     provider: Provider,
+    names: Mutex<Option<crate::security_names::Names>>,
     study_histories: std::sync::Mutex<HashMap<(String, Timeframe), StudyHistory>>,
     study_fetches: std::sync::Mutex<StudyFetches>,
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
@@ -577,20 +574,7 @@ impl Shared {
     }
 }
 
-pub fn data_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("TR_DATA_DIR") {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/terminal-rs")
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"))
-            .join("terminal-rs")
-    }
-}
+pub use tr_alerts::data_dir;
 
 impl Worker {
     #[cfg(test)]
@@ -624,12 +608,27 @@ impl Worker {
             provider,
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(cache),
             scan_store: std::sync::Mutex::new(scan_store),
             db: Mutex::new(db),
             out,
             ctx,
+        });
+
+        // Load cached names on the worker even in sample mode; only lookups require a network.
+        let s = shared.clone();
+        rt.spawn(async move {
+            let names = crate::security_names::Names::load(
+                &data_dir().join("security-names.json"),
+                chrono::Utc::now().timestamp(),
+            );
+            let mut guard = s.names.lock().await;
+            if guard.is_none() {
+                s.send(Response::SecurityNames(names.clone()));
+                *guard = Some(names);
+            }
         });
 
         // Request dispatcher: every request runs as its own task.
@@ -712,11 +711,20 @@ pub(crate) fn build_indicators_session(
     let input = Input::new(bars, tf);
     let colors = palette.series.len();
     let calculated = tr_core::indicators::study::evaluate_with_histories(specs, &input, session, histories);
+    let lookup = specs
+        .iter()
+        .zip(&calculated)
+        .filter_map(|(spec, result)| {
+            let settings = spec.chart.as_ref()?;
+            Some((settings.id, (result.as_ref().ok()?.as_slice(), settings.displacement)))
+        })
+        .collect();
     specs
         .iter()
-        .zip(calculated)
+        .zip(&calculated)
         .enumerate()
-        .map(|(i, (spec, result))| {
+        .map(|(index, (spec, result))| {
+            let i = index;
             let i = spec.chart.as_ref().map_or(i, |c| c.id.saturating_sub(1) as usize);
             let main = spec
                 .chart
@@ -724,15 +732,35 @@ pub(crate) fn build_indicators_session(
                 .and_then(|c| c.color)
                 .map_or(palette.series[i % colors], |[r, g, b]| egui::Color32::from_rgb(r, g, b));
             let error = result.as_ref().err().cloned();
-            let mut outputs = result.unwrap_or_default();
+            let mut outputs = result.clone().unwrap_or_default();
             let ports = outputs.iter().map(|o| o.name.to_string()).collect();
-            let fill = spec.chart.as_ref().and_then(|c| crate::chart_fill::Fill::build(c, &outputs));
+            let fill = spec.chart.as_ref().and_then(|c| {
+                let band = c.fill.as_ref()?;
+                for edge in [&band.upper, &band.lower] {
+                    tr_core::indicators::study::validate_fill_edge(specs, index, edge).ok()?;
+                }
+                crate::chart_fill::Fill::build(c, &outputs, &lookup)
+            });
             let bounds = outputs
                 .iter()
                 .filter(|o| {
                     spec.chart.as_ref().is_some_and(|c| {
-                        c.fill.as_ref().is_some_and(|fill| o.name == fill.upper || o.name == fill.lower)
-                            && c.outputs.get(o.name).is_some_and(|style| !style.visible)
+                        c.outputs.get(o.name).is_some_and(|style| !style.visible)
+                            && specs.iter().enumerate().any(|(owner_index, owner)| {
+                                owner
+                                    .chart
+                                    .as_ref()
+                                    .filter(|owner| owner.visible)
+                                    .and_then(|owner| owner.fill.as_ref().map(|fill| (owner, fill)))
+                                    .is_some_and(|(owner, fill)| {
+                                        [&fill.upper, &fill.lower].iter().all(|edge| {
+                                            tr_core::indicators::study::validate_fill_edge(specs, owner_index, edge)
+                                                .is_ok()
+                                        }) && [&fill.upper, &fill.lower]
+                                            .iter()
+                                            .any(|edge| edge.study.unwrap_or(owner.id) == c.id && edge.output == o.name)
+                                    })
+                            })
                     })
                 })
                 .map(|o| {
@@ -832,6 +860,35 @@ pub fn initial_limit(tf: Timeframe) -> usize {
 
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
+        Request::SecurityNames(symbols) => {
+            use futures::StreamExt;
+            if s.provider.name().eq_ignore_ascii_case("sample") || s.provider.name().eq_ignore_ascii_case("offline") {
+                return;
+            }
+            // Serialize batches so the global concurrency bound is four, not four per pane.
+            let mut guard = s.names.lock().await;
+            let now = chrono::Utc::now().timestamp();
+            let path = data_dir().join("security-names.json");
+            let names = guard.get_or_insert_with(|| crate::security_names::Names::load(&path, now));
+            let symbols: std::collections::BTreeSet<_> =
+                symbols.into_iter().take(5_000).filter(|key| names.needs(key, now)).collect();
+            let results: Vec<_> = futures::stream::iter(symbols.into_iter().map(|key| async move {
+                let ticker = tr_data::security(&key).ticker;
+                let hits = tokio::time::timeout(Duration::from_secs(10), s.provider.search(&ticker)).await;
+                let name =
+                    hits.ok().and_then(Result::ok).and_then(|hits| crate::security_names::exact_name(&key, &hits));
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                (key, name)
+            }))
+            .buffer_unordered(4)
+            .collect()
+            .await;
+            for (key, name) in results {
+                names.insert(key, name, now);
+            }
+            names.save(&path);
+            s.send(Response::SecurityNames(names.clone()));
+        }
         Request::Questrade { handle, action } => {
             let test = async |h: &tr_data::questrade::Questrade| {
                 let bar = h.test("AAPL").await?;
@@ -1184,22 +1241,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::Markers { pane, symbol, trades });
         }
         Request::PriceAlertQuotes { revision, symbols } => {
-            use futures::{StreamExt, stream};
-            let observations =
-                stream::iter(symbols)
-                    .map(|symbol| async move {
-                        let result =
-                            match tokio::time::timeout(Duration::from_secs(20), s.provider.alert_observation(&symbol))
-                                .await
-                            {
-                                Ok(result) => result.map_err(|e| format!("{e:#}")),
-                                Err(_) => Err("Price request timed out; will retry".into()),
-                            };
-                        (symbol, result)
-                    })
-                    .buffer_unordered(4)
-                    .collect()
-                    .await;
+            let observations = tr_alerts::price_observations(s.provider.clone(), symbols).await;
             s.send(Response::PriceAlertQuotes { revision, observations });
         }
         Request::PriceAlertRules { revision, alerts } => {
@@ -1359,118 +1401,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
     }
 }
 
-/// Share provider requests across rules on the same symbol/interval. CPU evaluation
-/// stays off the async network executor, with at most four groups in flight.
-async fn condition_observations(
-    provider: Provider,
-    alerts: Vec<tr_core::price_alerts::Alert>,
-) -> Vec<(u64, Result<tr_core::price_alerts::Observation, String>)> {
-    use futures::{StreamExt, stream};
-    let mut groups = std::collections::BTreeMap::<(String, Timeframe), Vec<tr_core::price_alerts::Alert>>::new();
-    for alert in alerts {
-        let tf = match &alert.rule {
-            Some(
-                tr_core::price_alerts::Rule::Formula { timeframe, .. }
-                | tr_core::price_alerts::Rule::Condition { timeframe, .. },
-            ) => *timeframe,
-            _ => Timeframe::M1,
-        };
-        groups.entry((alert.symbol.clone(), tf)).or_default().push(alert);
-    }
-    let batches: Vec<_> = stream::iter(groups)
-        .map(|((symbol, tf), alerts)| {
-            let provider = provider.clone();
-            async move {
-                let input: Result<(tr_core::price_alerts::Observation, Vec<Bar>), String> =
-                    tokio::time::timeout(Duration::from_secs(20), async {
-                        let q = provider.alert_observation(&symbol).await.map_err(|e| e.to_string())?;
-                        if !q.valid_at(chrono::Utc::now().timestamp()) {
-                            return Err("Stale price observation".into());
-                        }
-                        let history = provider.alert_history(&symbol, tf, 1500).await.map_err(|e| e.to_string())?;
-                        if history.simulated != q.simulated {
-                            return Err("Condition and price data modes differ".into());
-                        }
-                        let last = history.bars.last().ok_or("No condition history")?;
-                        if history_is_stale(tf, last.ts, q.ts) {
-                            return Err("Condition history is stale relative to price".into());
-                        }
-                        Ok((q, history.bars))
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err("Condition request timed out".into()));
-                match input {
-                    Err(e) => alerts.into_iter().map(|a| (a.id, Err(e.clone()))).collect(),
-                    Ok((q, bars)) => {
-                        let mut set = tr_core::scanner::SeriesSet::from([(tf, Series::new(symbol.clone(), tf, bars))]);
-                        let extras: std::collections::BTreeSet<_> = alerts
-                            .iter()
-                            .filter_map(|a| a.rule.as_ref())
-                            .flat_map(|rule| rule.timeframes())
-                            .filter(|extra| *extra != tf)
-                            .collect();
-                        let mut errors = std::collections::HashMap::new();
-                        for extra in extras {
-                            let result = tokio::time::timeout(
-                                Duration::from_secs(20),
-                                provider.alert_history(&symbol, extra, 1500),
-                            )
-                            .await;
-                            match result {
-                                Ok(Ok(history)) if history.simulated == q.simulated => {
-                                    set.insert(extra, Series::new(symbol.clone(), extra, history.bars));
-                                }
-                                result => {
-                                    let error = match result {
-                                        Ok(Err(e)) => e.to_string(),
-                                        Err(_) => "Condition request timed out".into(),
-                                        _ => "Condition and price data modes differ".into(),
-                                    };
-                                    errors.insert(extra, error);
-                                }
-                            }
-                        }
-                        let ids: Vec<_> = alerts.iter().map(|a| a.id).collect();
-                        tokio::task::spawn_blocking(move || {
-                            alerts
-                                .into_iter()
-                                .map(|a| {
-                                    let result = (|| {
-                                        let rule = a.rule.as_ref().ok_or("Missing condition")?;
-                                        let mut observation = q.clone();
-                                        for required in rule.timeframes() {
-                                            if let Some(error) = errors.get(&required) {
-                                                return Err(error.clone());
-                                            }
-                                        }
-                                        observation.price = match rule {
-                                            tr_core::price_alerts::Rule::Condition { .. } => rule.value_set(&set)?,
-                                            _ => rule.value(&set[&tf].bars)?,
-                                        };
-                                        observation.source = format!(
-                                            "{} · {}",
-                                            q.source,
-                                            rule.label().chars().take(200).collect::<String>()
-                                        );
-                                        Ok(observation)
-                                    })();
-                                    (a.id, result)
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .await
-                        .unwrap_or_else(|_| {
-                            ids.into_iter().map(|id| (id, Err("Condition evaluation failed".into()))).collect()
-                        })
-                    }
-                }
-            }
-        })
-        .buffer_unordered(4)
-        .collect()
-        .await;
-    batches.into_iter().flatten().collect()
-}
+use tr_alerts::condition_observations;
 
 /// Fetch a snapshot directly from the provider, independently of chart caches/live feeds.
 /// Input order is retained even when fetches complete out of order.
@@ -1615,7 +1546,9 @@ fn column_history_plan(columns: &[tr_core::columns::ColumnDef]) -> Vec<(Timefram
 
 async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize) -> Result<(Vec<Bar>, bool), String> {
     let now = chrono::Utc::now().timestamp();
-    let source = s.provider.scan_cache_key(symbol);
+    let route = s.provider.scan_cache_key(symbol);
+    let source =
+        if matches!(tf, Timeframe::H2 | Timeframe::H4) { format!("session-v2:{route}") } else { route.clone() };
     let (stored, fetched) = {
         let store = s.scan_store.lock().expect("scan store");
         let store = store.as_ref().ok_or("The scan store could not be opened")?;
@@ -1636,7 +1569,7 @@ async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize)
     if history.bars.is_empty() {
         return Err(format!("No history for {symbol}"));
     }
-    if s.provider.scan_cache_key(symbol) != source {
+    if s.provider.scan_cache_key(symbol) != route {
         return Err("The scan data source changed during the request; run the scan again".into());
     }
     let fetch = Fetch { at: now, source, simulated: history.simulated };
@@ -1773,7 +1706,7 @@ fn chart_options_key(provider: &dyn tr_data::MarketData, symbol: &str, options: 
 fn chart_cache_key(provider: &dyn tr_data::MarketData, symbol: &str) -> String {
     // Versioned namespace excludes old, ambiguous caches (including legacy samples).
     let route = provider.scan_cache_key(symbol);
-    format!("chart-v2:{}:{route}:{symbol}", route.len())
+    format!("chart-v3:{}:{route}:{symbol}", route.len())
 }
 
 fn claim_series(s: &Shared, pane: PaneId, generation: u64, source: &str) -> bool {
@@ -1850,6 +1783,10 @@ fn start_live(
     options: tr_data::HistoryOptions,
 ) {
     let source = chart_options_key(s.provider.as_ref(), &symbol, options);
+    // UTC-aligned provider snapshots cannot be merged into session buckets.
+    if tf.session_aligned(options.session) {
+        return;
+    }
     let Some(mut feed) = s.provider.live(&symbol, tf) else { return };
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -2012,6 +1949,7 @@ mod tests {
                 provider,
                 study_histories: Default::default(),
                 study_fetches: Default::default(),
+                names: Mutex::new(None),
                 series: Default::default(),
                 cache: std::sync::Mutex::new(None),
                 scan_store: std::sync::Mutex::new(None),
@@ -2373,6 +2311,39 @@ mod tests {
     }
 
     #[test]
+    fn cross_study_fills_reject_unavailable_targets_without_suppressing_lines() {
+        use tr_core::indicators::study::{self, BandFill, FillEdge, Pane, Scale};
+        let bars: Vec<_> = (0..30).map(|i| Bar::new(i, i as f64, i as f64, i as f64, i as f64, 1.)).collect();
+        let mut specs = vec![IndicatorSpec::new("EMA", &[2.]).unwrap(), IndicatorSpec::new("BB", &[3., 2.]).unwrap()];
+        study::assign_ids(&mut specs);
+        specs[0].chart.as_mut().unwrap().fill = Some(BandFill {
+            upper: "EMA".into(),
+            lower: FillEdge { study: Some(2), output: "Lower".into() },
+            color: [1, 2, 3],
+            opacity: 35,
+        });
+        let build = |specs: &[IndicatorSpec]| build_indicators(&bars, Timeframe::D1, specs, &theme::palette());
+        let built = build(&specs);
+        assert!(built[0].fill.is_some());
+        assert!(built[1].fill.is_none(), "Only the declaring study owns the fill");
+        specs[1].chart.as_mut().unwrap().outputs.entry("Lower".into()).or_default().visible = false;
+        assert_eq!(build(&specs)[1].bounds.len(), 1, "The referenced edge still contributes to pane autoscale");
+        specs[1].chart.as_mut().unwrap().pane = Pane::Own;
+        assert!(build(&specs)[0].fill.is_none());
+        specs[1].chart.as_mut().unwrap().pane = Pane::Price;
+        specs[1].chart.as_mut().unwrap().scale = Scale::Independent;
+        assert!(build(&specs)[0].fill.is_none());
+        specs[1].chart.as_mut().unwrap().scale = Scale::Shared;
+        specs[1].chart.as_mut().unwrap().visible = false;
+        assert!(build(&specs)[0].fill.is_none());
+        specs.pop();
+        let built = build(&specs);
+        assert!(built[0].fill.is_none());
+        assert!(built[0].error.is_none());
+        assert_eq!(built[0].overlays.len(), 1);
+    }
+
+    #[test]
     fn hidden_band_outlines_still_contribute_to_fill_autoscale() {
         use tr_core::indicators::study::{self, BandFill, OutputStyle};
         let bars: Vec<_> = (0..30)
@@ -2408,6 +2379,7 @@ mod tests {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)),
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),
@@ -2471,6 +2443,32 @@ mod tests {
     }
 
     #[test]
+    fn session_chart_cache_is_separate_from_provider_extended_and_v2() {
+        use tr_core::session::Session;
+        let provider = tr_data::sample::SampleProvider::default();
+        let symbol = "AAPL US Equity";
+        let regular = chart_options_key(
+            &provider,
+            symbol,
+            tr_data::HistoryOptions { session: Session::UsRegular, ..Default::default() },
+        );
+        let utc = chart_options_key(&provider, symbol, Default::default());
+        let extended = chart_options_key(
+            &provider,
+            symbol,
+            tr_data::HistoryOptions { session: Session::UsExtended, ..Default::default() },
+        );
+        assert_ne!(regular, utc);
+        assert_ne!(regular, extended);
+        let mut cache = BarCache::open_in_memory().unwrap();
+        for tf in [Timeframe::H2, Timeframe::H4] {
+            let old = utc.replacen("chart-v3:", "chart-v2:", 1);
+            cache.store(&old, tf, &[Bar::new(0, 1., 1., 1., 1., 1.)]).unwrap();
+            assert!(cache.load(&regular, tf, 100).unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn chart_cache_does_not_reuse_legacy_or_other_provider_history() {
         let provider = tr_data::sample::SampleProvider::default();
         let default = chart_options_key(&provider, "AAPL US Equity", Default::default());
@@ -2521,6 +2519,7 @@ mod tests {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 20)),
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),
@@ -2597,6 +2596,7 @@ mod tests {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 400)),
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
@@ -2668,6 +2668,7 @@ mod tests {
             provider: fixture.clone(),
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
@@ -2738,6 +2739,7 @@ mod tests {
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             study_histories: Default::default(),
             study_fetches: Default::default(),
+            names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),

@@ -4129,6 +4129,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "tr-alerts",
  "tr-broker",
  "tr-chart",
  "tr-congress",
@@ -4137,6 +4138,16 @@ dependencies = [
  "tr-macos",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "terminal-rs-alertd"
+version = "0.1.1"
+dependencies = [
+ "serde_json",
+ "tokio",
+ "tr-alerts",
+ "tr-data",
 ]
 
 [[package]]
@@ -4434,6 +4445,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
+name = "tr-alerts"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "libc",
+ "serde_json",
+ "tokio",
+ "tr-broker",
+ "tr-core",
+ "tr-data",
+ "tracing",
+]
+
+[[package]]
 name = "tr-broker"
 version = "0.1.1"
 dependencies = [
@@ -4463,6 +4491,7 @@ dependencies = [
  "egui-wgpu",
  "pollster 0.4.0",
  "serde",
+ "serde_json",
  "tr-core",
 ]
 

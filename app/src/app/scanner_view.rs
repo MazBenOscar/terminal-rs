@@ -29,13 +29,13 @@ pub struct ScannerPane {
     snapshot_symbols: Vec<String>,
     saved: Vec<ScanSettings>,
     notice: Option<String>,
-    matches_only: bool,
+    pub(super) matches_only: bool,
     pub universe: Universe,
     /// Universe scan progress: symbols evaluated and total.
     pub progress: Option<(usize, usize)>,
     /// Stops the running universe scan.
     pub cancel: Option<Arc<AtomicBool>>,
-    show_unavailable: bool,
+    pub(super) show_unavailable: bool,
     pub refresh: Option<u32>,
     previous_matches: HashSet<String>,
     previous_evaluated: HashSet<String>,
@@ -87,6 +87,20 @@ impl ScannerPane {
             run_duration: chrono::Duration::zero(),
             universe_size: None,
         }
+    }
+
+    pub fn watchlist_changed(&mut self) {
+        if self.universe != Universe::Watchlist {
+            return;
+        }
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.running = false;
+        self.progress = None;
+        self.snapshot_symbols.clear();
+        self.invalidate();
     }
 
     fn invalidate(&mut self) {
@@ -255,8 +269,10 @@ fn operand_kind(operand: &ScanOperand) -> usize {
     }
 }
 
-/// ComboBox uses a nested horizontal UI, so reserve its minimum width before
-/// entering it: egui cannot move an already-rendered child onto the next line.
+/// ComboBox uses a nested horizontal UI, so reserve its width before entering it:
+/// egui cannot move an already-rendered child onto the next line. Row combos must
+/// also truncate selected text to this width; otherwise a wider theme font can
+/// expand the combo past this reservation and into the remove column.
 fn wrap_control(ui: &mut Ui, width: f32) {
     if ui.layout().main_wrap() && ui.available_size_before_wrap().x < width {
         ui.end_row();
@@ -267,11 +283,15 @@ fn operand_editor(ui: &mut Ui, operand: &mut ScanOperand, bars_ago: &mut usize, 
     let mut kind = operand_kind(operand);
     let before = kind;
     wrap_control(ui, 95.0);
-    egui::ComboBox::from_id_salt(id).width(95.0).selected_text(OPERAND_KINDS[kind]).show_ui(ui, |ui| {
-        for (i, name) in OPERAND_KINDS.iter().enumerate() {
-            ui.selectable_value(&mut kind, i, *name);
-        }
-    });
+    egui::ComboBox::from_id_salt(id)
+        .width(95.0)
+        .wrap_mode(egui::TextWrapMode::Truncate)
+        .selected_text(OPERAND_KINDS[kind])
+        .show_ui(ui, |ui| {
+            for (i, name) in OPERAND_KINDS.iter().enumerate() {
+                ui.selectable_value(&mut kind, i, *name);
+            }
+        });
     if kind != before {
         *operand = match kind {
             0 => ScanOperand::Price,
@@ -287,11 +307,15 @@ fn operand_editor(ui: &mut Ui, operand: &mut ScanOperand, bars_ago: &mut usize, 
     match operand {
         ScanOperand::Sma { period, source } | ScanOperand::Ema { period, source } => {
             wrap_control(ui, 70.0);
-            egui::ComboBox::from_id_salt((id, "source")).width(70.0).selected_text(source.label()).show_ui(ui, |ui| {
-                for s in Source::ALL {
-                    ui.selectable_value(source, s, s.label());
-                }
-            });
+            egui::ComboBox::from_id_salt((id, "source"))
+                .width(70.0)
+                .wrap_mode(egui::TextWrapMode::Truncate)
+                .selected_text(source.label())
+                .show_ui(ui, |ui| {
+                    for s in Source::ALL {
+                        ui.selectable_value(source, s, s.label());
+                    }
+                });
             ui.add(egui::DragValue::new(period).range(1..=500).prefix("Period "));
         }
         ScanOperand::Rsi { period } | ScanOperand::Atr { period } => {
@@ -326,18 +350,23 @@ fn timeframe_editor(ui: &mut Ui, timeframe: &mut Option<Timeframe>) {
         None => RichText::new("Scan timeframe").color(muted()),
     };
     wrap_control(ui, dp(110.0));
-    egui::ComboBox::from_id_salt("condition-timeframe").width(dp(110.0)).selected_text(selected).show_ui(ui, |ui| {
-        ui.selectable_value(timeframe, None, RichText::new("Scan timeframe").color(muted()));
-        for tf in Timeframe::ALL {
-            ui.selectable_value(timeframe, Some(tf), tf.label());
-        }
-    });
+    egui::ComboBox::from_id_salt("condition-timeframe")
+        .width(dp(110.0))
+        .wrap_mode(egui::TextWrapMode::Truncate)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(timeframe, None, RichText::new("Scan timeframe").color(muted()));
+            for tf in Timeframe::ALL {
+                ui.selectable_value(timeframe, Some(tf), tf.label());
+            }
+        });
 }
 
 fn mode_editor(ui: &mut Ui, mode: &mut MatchMode) {
     wrap_control(ui, dp(90.0));
     egui::ComboBox::from_id_salt("scan-mode")
         .width(dp(90.0))
+        .wrap_mode(egui::TextWrapMode::Truncate)
         .selected_text(if *mode == MatchMode::All { "Match all" } else { "Match any" })
         .show_ui(ui, |ui| {
             ui.selectable_value(mode, MatchMode::All, "Match all");
@@ -349,14 +378,15 @@ fn compare_editor(ui: &mut Ui, condition: &mut ScanCondition, index: usize) {
     ui.label(RichText::new(format!("{}", index + 1)).font(mono(12.0)).color(muted()));
     operand_editor(ui, &mut condition.left, &mut condition.left_bars_ago, "left");
     wrap_control(ui, dp(110.0));
-    egui::ComboBox::from_id_salt("comparison").width(dp(110.0)).selected_text(condition.comparison.label()).show_ui(
-        ui,
-        |ui| {
+    egui::ComboBox::from_id_salt("comparison")
+        .width(dp(110.0))
+        .wrap_mode(egui::TextWrapMode::Truncate)
+        .selected_text(condition.comparison.label())
+        .show_ui(ui, |ui| {
             for comparison in Comparison::ALL {
                 ui.selectable_value(&mut condition.comparison, comparison, comparison.label());
             }
-        },
-    );
+        });
     operand_editor(ui, &mut condition.right, &mut condition.right_bars_ago, "right");
     // Scaling a constant is just a different constant.
     if matches!(condition.right, ScanOperand::Constant(_)) {
@@ -381,6 +411,11 @@ fn condition_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) -> (egui::Rect, egui::R
         let content =
             ui.allocate_ui_with_layout(egui::vec2(remaining, 0.0), egui::Layout::top_down(egui::Align::LEFT), |ui| {
                 ui.set_max_width(remaining);
+                // Child max widths are layout hints, not paint boundaries. Keep
+                // oversized/edited content from painting over the remove column.
+                let mut clip = ui.clip_rect();
+                clip.max.x = clip.max.x.min(ui.max_rect().right());
+                ui.set_clip_rect(clip);
                 ui.horizontal_wrapped(|ui| {
                     ui.set_max_width(remaining);
                     add(ui);
@@ -537,13 +572,26 @@ fn outcome_label(outcome: ScanOutcome) -> (&'static str, Color32) {
     }
 }
 
+#[cfg(test)]
 pub fn show(
     ui: &mut Ui,
     pane: &mut ScannerPane,
     id: PaneId,
     symbols: &[String],
     bulk_ready: bool,
+    send: impl FnMut(Request),
+) -> Vec<Action> {
+    show_named(ui, pane, id, symbols, bulk_ready, send, "Main")
+}
+
+pub fn show_named(
+    ui: &mut Ui,
+    pane: &mut ScannerPane,
+    id: PaneId,
+    symbols: &[String],
+    bulk_ready: bool,
     mut send: impl FnMut(Request),
+    watchlist_name: &str,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     let market = pane.universe != Universe::Watchlist;
@@ -585,12 +633,12 @@ pub fn show(
                     let before = pane.universe;
                     egui::ComboBox::from_id_salt("scan-universe")
                         .width(dp(120.0))
-                        .selected_text(pane.universe.label())
+                        .selected_text(if pane.universe == Universe::Watchlist { format!("Watchlist: {watchlist_name}") } else { pane.universe.label().into() })
                         .show_ui(ui, |ui| {
                             for universe in Universe::ALL {
                                 let enabled = universe == Universe::Watchlist || bulk_ready;
                                 ui.add_enabled_ui(enabled, |ui| {
-                                    ui.selectable_value(&mut pane.universe, universe, universe.label())
+                                    ui.selectable_value(&mut pane.universe, universe, if universe == Universe::Watchlist { format!("Watchlist: {watchlist_name}") } else { universe.label().into() })
                                         .on_disabled_hover_text(
                                             "Market-wide scans need a bulk data source: set up Questrade in Settings › Brokerage",
                                         );
@@ -888,17 +936,47 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
             if ui.button("Replace watchlist with matches").clicked() {
                 actions.push(Action::ReplaceWatchlistWithMatches(matches.clone()));
             }
+            ui.menu_button("Save matches as new list…", |ui| {
+                let id = ui.id().with("save-matches-name");
+                let mut name = ui.data_mut(|data| data.get_temp::<String>(id)).unwrap_or_else(|| {
+                    format!(
+                        "{} {}",
+                        pane.definition.name.chars().take(29).collect::<String>(),
+                        chrono::Local::now().format("%Y-%m-%d")
+                    )
+                });
+                egui::Frame::new()
+                    .fill(theme::header())
+                    .stroke(egui::Stroke::new(1.0, muted()))
+                    .inner_margin(dp(4.0))
+                    .show(ui, |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut name).frame(egui::Frame::NONE).char_limit(40));
+                    });
+                ui.data_mut(|data| data.insert_temp(id, name.clone()));
+                if ui.button("Save").clicked() {
+                    actions.push(Action::SaveMatchesAsWatchlist(name, matches.clone()));
+                    ui.data_mut(|data| data.remove::<String>(id));
+                    ui.close();
+                }
+            });
         });
     }
     let row_h = dp(22.0);
     let w = ui.available_width();
     // Left edges: security, result, last bar, bar age, details.
-    let x = [8.0, dp(100.0), dp(196.0), dp(320.0), dp(392.0)];
+    let names =
+        ui.data(|d| d.get_temp::<crate::security_names::Names>(egui::Id::new("security-names"))).unwrap_or_default();
+    let show_name = w >= dp(750.0);
+    let shift = if show_name { dp(150.0) } else { 0.0 };
+    let x = [8.0, dp(100.0) + shift, dp(196.0) + shift, dp(320.0) + shift, dp(392.0) + shift];
     let (hdr, _) = ui.allocate_exact_size(egui::vec2(w, row_h), Sense::hover());
     let p = ui.painter_at(hdr);
     p.rect_filled(hdr, theme::CONTROL_RADIUS, theme::header());
     for (k, title) in ["Security", "Result", "Last bar (UTC)", "Bar age", "Details"].into_iter().enumerate() {
         p.text(pos2(hdr.left() + x[k], hdr.center().y), Align2::LEFT_CENTER, title, ui_font(11.5), muted());
+    }
+    if show_name {
+        p.text(pos2(hdr.left() + dp(100.0), hdr.center().y), Align2::LEFT_CENTER, "Name", ui_font(11.5), muted());
     }
     let mut shown = 0;
     for row in &pane.rows {
@@ -916,6 +994,13 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
         let y = r.center().y;
         let ticker = tr_data::security(&row.symbol).ticker;
         p.text(pos2(r.left() + x[0], y), Align2::LEFT_CENTER, &ticker, mono(12.5), amber());
+        if show_name {
+            let hit = egui::Rect::from_min_max(
+                pos2(r.left() + dp(100.0), r.top()),
+                pos2(r.left() + x[1] - dp(6.0), r.bottom()),
+            );
+            crate::security_names::paint(ui, hit, names.name(&row.symbol).unwrap_or(""), ("scan-name", &row.symbol));
+        }
         let (label, color) = outcome_label(outcome);
         p.text(pos2(r.left() + x[1], y), Align2::LEFT_CENTER, label, ui_font(12.0), color);
         if pane.entered.contains(&row.symbol) {
@@ -1078,6 +1163,28 @@ mod tests {
         assert!(pane.running);
     }
 
+    #[test]
+    fn switching_watchlists_clears_watchlist_scan_results_but_not_market_scans() {
+        let mut pane = ScannerPane::default();
+        assert_eq!(pane.universe, Universe::Watchlist);
+        pane.rows.push(unavailable_row("AAPL"));
+        pane.completed = Some(chrono::Utc::now());
+        pane.snapshot_symbols = vec!["AAPL".into()];
+        pane.baseline_ready = true;
+        pane.watchlist_changed();
+        assert!(pane.rows.is_empty(), "results from the previous list must not outlive the switch");
+        assert!(pane.completed.is_none());
+        assert!(pane.snapshot_symbols.is_empty());
+        assert!(!pane.baseline_ready);
+        // A market universe is independent of the named watchlists and keeps its results.
+        pane.rows.push(unavailable_row("AAPL"));
+        pane.completed = Some(chrono::Utc::now());
+        pane.universe = Universe::Nasdaq;
+        pane.watchlist_changed();
+        assert_eq!(pane.rows.len(), 1);
+        assert!(pane.completed.is_some());
+    }
+
     fn unavailable_row(symbol: &str) -> ScanRow {
         ScanRow {
             symbol: symbol.into(),
@@ -1182,6 +1289,105 @@ mod tests {
                 Action::ReplaceWatchlistWithMatches(vec![tr_data::security("NVDA").key()]),
                 Action::AddToWatchlist("NVDA".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn named_watchlist_picker_label_and_switch_cancel_stale_results() {
+        let ctx = egui::Context::default();
+        let mut pane = ScannerPane::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            show_named(ui, &mut pane, 1, &["NVDA US Equity".into()], false, |_| {}, "Technology");
+        });
+        output.textures_delta.clear();
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "Watchlist: Technology")
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
+        pane.cancel = Some(cancel.clone());
+        pane.running = true;
+        pane.rows.push(unavailable_row("OLD"));
+        let old = pane.generation;
+        pane.watchlist_changed();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!pane.running);
+        assert!(pane.rows.is_empty());
+        pane.finish(old, vec![unavailable_row("STALE")]);
+        assert!(pane.rows.is_empty());
+        pane.universe = Universe::Nasdaq;
+        pane.rows.push(unavailable_row("MARKET"));
+        pane.watchlist_changed();
+        assert_eq!(pane.rows.len(), 1);
+    }
+
+    #[test]
+    fn save_matches_menu_prefills_name_and_emits_matches_only() {
+        let ctx = egui::Context::default();
+        let mut pane = ScannerPane::default();
+        pane.definition.name = "Momentum".into();
+        let row = |symbol: &str, outcome| ScanRow {
+            symbol: symbol.into(),
+            evaluation: Some(tr_core::scanner::ScanEvaluation { outcome, conditions: Vec::new(), reason: None }),
+            ts: None,
+            simulated: false,
+            error: None,
+        };
+        pane.rows = vec![
+            row("NVDA", ScanOutcome::Match),
+            row("NO", ScanOutcome::NoMatch),
+            unavailable_row("ERROR"),
+            row("AAPL", ScanOutcome::Match),
+        ];
+        let mut actions = Vec::new();
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 600.0))),
+                    time: Some(ctx.input(|i| i.time) + 0.2),
+                    events,
+                    ..Default::default()
+                },
+                |ui| results_table(ui, &pane, false, &mut actions),
+            );
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        Some((text.galley.job.text.clone(), text.galley.rect.translate(text.pos.to_vec2())))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let point = |labels: &[(String, egui::Rect)], name: &str| {
+            labels.iter().find(|(text, _)| text == name).unwrap().1.center()
+        };
+        let pointer = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let at = point(&frame(vec![]), "Save matches as new list…");
+        frame(vec![egui::Event::PointerMoved(at)]);
+        frame(vec![pointer(at, true)]);
+        frame(vec![pointer(at, false)]);
+        let labels = frame(vec![]);
+        let name = format!("Momentum {}", chrono::Local::now().format("%Y-%m-%d"));
+        assert!(labels.iter().any(|(text, _)| text == &name));
+        let at = point(&labels, "Save");
+        frame(vec![egui::Event::PointerMoved(at)]);
+        frame(vec![pointer(at, true)]);
+        frame(vec![pointer(at, false)]);
+        assert_eq!(
+            actions,
+            vec![Action::SaveMatchesAsWatchlist(
+                name,
+                vec![tr_data::security("NVDA").key(), tr_data::security("AAPL").key()]
+            )]
         );
     }
 
@@ -1546,28 +1752,41 @@ mod tests {
 
     #[test]
     fn narrow_condition_rows_reserve_the_remove_column_on_every_line() {
-        for width in [280.0, 360.0, 530.0, 900.0] {
-            let mut items = [
-                ConditionItem::Compare(ScanCondition { right: ScanOperand::Constant(50.0), ..Default::default() }),
-                ConditionItem::Compare(ScanCondition {
-                    right: ScanOperand::Sma { period: 20, source: Source::Close },
-                    right_multiplier: 2.5,
-                    timeframe: Some(Timeframe::W1),
-                    ..Default::default()
-                }),
-                ConditionItem::Formula(FormulaCondition {
-                    expression: "C > AVGC20".into(),
-                    timeframe: Some(Timeframe::H1),
-                }),
-            ];
-            let ctx = egui::Context::default();
-            let mut output = ctx.run_ui(
+        for theme in crate::themes::builtins() {
+            for enabled in [true, false] {
+                for width in [280.0, 360.0, 530.0, 900.0] {
+                    let mut items = [
+                        ConditionItem::Compare(ScanCondition {
+                            right: ScanOperand::Constant(50.0),
+                            ..Default::default()
+                        }),
+                        ConditionItem::Compare(ScanCondition {
+                            right: ScanOperand::Sma { period: 20, source: Source::Close },
+                            right_multiplier: 2.5,
+                            timeframe: Some(Timeframe::W1),
+                            ..Default::default()
+                        }),
+                        ConditionItem::Formula(FormulaCondition {
+                            expression: "C > AVGC20".into(),
+                            timeframe: Some(Timeframe::H1),
+                        }),
+                        ConditionItem::Group(ConditionGroup::comparisons(MatchMode::All, vec![])),
+                        ConditionItem::Compare(ScanCondition {
+                            left: ScanOperand::ChangePercent,
+                            right: ScanOperand::Ema { period: 500, source: Source::Volume },
+                            ..Default::default()
+                        }),
+                    ];
+                    let ctx = egui::Context::default();
+                    theme::configure(&ctx, &theme, Color32::LIGHT_BLUE);
+                    let mut output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1200.0))),
                     ..Default::default()
                 },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
                         for (index, item) in items.iter_mut().enumerate() {
                             ui.push_id(index, |ui| {
                                 let available = ui.available_rect_before_wrap();
@@ -1583,7 +1802,10 @@ mod tests {
                                                 );
                                                 timeframe_editor(ui, &mut formula.timeframe);
                                             }
-                                            ConditionItem::Group(_) => unreachable!(),
+                                            ConditionItem::Group(child) => {
+                                                ui.label(RichText::new("Group").color(muted()));
+                                                mode_editor(ui, &mut child.mode);
+                                            },
                                         })
                                     });
                                 let (content, close) = row.inner;
@@ -1604,16 +1826,28 @@ mod tests {
                                     "width {width}, row {index}: content {content:?}, close {:?}",
                                     close.rect
                                 );
+                                let close_column = dp(22.0) + ui.spacing().item_spacing.x;
+                                // TextEdit rounds its width to pixels; density-scaled
+                                // column widths can fall between pixels.
+                                assert!(
+                                    content.right() <= frame.right() - 6.0 - close_column + 0.5,
+                                    "theme {}, enabled {enabled}, width {width}, row {index}: content {content:?}, frame {frame:?}, close {:?}, column {close_column}",
+                                    theme.name, close.rect
+                                );
+                                assert!(frame.right() <= available.right() + 0.01, "Frame must stay inside the pane");
                                 assert!(content.right() < close.rect.left());
                                 if width <= 530.0 && matches!(item, ConditionItem::Compare(_)) {
                                     assert!(content.height() > close.rect.height(), "The Compare controls must wrap");
                                 }
                             });
                         }
+                        });
                     });
                 },
             );
-            output.textures_delta.clear();
+                    output.textures_delta.clear();
+                }
+            }
         }
     }
 

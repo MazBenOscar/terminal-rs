@@ -44,8 +44,22 @@ pub enum PriceBasis {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HistoryOptions {
+    pub session: tr_core::session::Session,
     pub extended_hours: bool,
     pub price_basis: PriceBasis,
+}
+impl HistoryOptions {
+    /// Equities default to the regular-session multi-hour grid. Only an explicit
+    /// extended session opts out; scans and alerts always select regular hours.
+    pub fn for_chart(mut self, class: AssetClass, tf: Timeframe) -> Self {
+        if matches!(class, AssetClass::Equity | AssetClass::Etf)
+            && matches!(tf, Timeframe::H2 | Timeframe::H4)
+            && self.session == tr_core::session::Session::Provider
+        {
+            self.session = tr_core::session::Session::UsRegular;
+        }
+        self
+    }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
@@ -624,6 +638,42 @@ mod tests {
         assert!(q.simulated);
         assert_eq!(q.source, "sample");
         assert_eq!(q.symbol, "AAPL US Equity");
+    }
+
+    #[tokio::test]
+    async fn equity_multi_hour_scan_and_alert_bars_match_the_default_chart_grid() {
+        let end = chrono::DateTime::parse_from_rfc3339("2026-03-09T20:00:00Z").unwrap().timestamp();
+        let provider = sample::SampleProvider::at(end, 400);
+        for tf in [Timeframe::H2, Timeframe::H4] {
+            let chart =
+                provider.chart_history("AAPL US Equity", tf, None, 30, HistoryOptions::default()).await.unwrap();
+            let scan = provider.scan_history("AAPL US Equity", tf, 30).await.unwrap();
+            let alert = provider.alert_history("AAPL US Equity", tf, 30).await.unwrap();
+            assert!(!chart.is_empty());
+            let chart_ts: Vec<i64> = chart.iter().map(|b| b.ts).collect();
+            let scan_ts: Vec<i64> = scan.bars.iter().map(|b| b.ts).collect();
+            let alert_ts: Vec<i64> = alert.bars.iter().map(|b| b.ts).collect();
+            assert_eq!(chart_ts, scan_ts, "{tf}: chart grid != scan grid");
+            assert_eq!(chart_ts, alert_ts, "{tf}: chart grid != alert grid");
+            assert_eq!(chart, scan.bars);
+            assert_eq!(chart, alert.bars);
+            for bar in &chart {
+                assert_eq!(tr_core::session::bar_interval(tf, tr_core::session::Session::UsRegular, bar.ts).0, bar.ts);
+            }
+            let extended = provider
+                .chart_history(
+                    "AAPL US Equity",
+                    tf,
+                    None,
+                    30,
+                    HistoryOptions { session: tr_core::session::Session::UsExtended, ..Default::default() },
+                )
+                .await
+                .unwrap();
+            assert!(!extended.is_empty());
+            assert!(extended.iter().all(|bar| tf.bucket_start(bar.ts) == bar.ts));
+            assert_ne!(chart_ts, extended.iter().map(|bar| bar.ts).collect::<Vec<_>>());
+        }
     }
 
     #[tokio::test]

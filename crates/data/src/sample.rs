@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use tr_core::{Bar, Timeframe, sample};
+use tr_core::{AssetClass, Bar, Timeframe, sample};
 
 use crate::{LiveFeed, MarketData, OptionChain, OrderBook, ScanHistory, security};
 
@@ -50,8 +50,14 @@ impl MarketData for SampleProvider {
         tf: Timeframe,
         end: Option<i64>,
         limit: usize,
-        _options: crate::HistoryOptions,
+        options: crate::HistoryOptions,
     ) -> Result<Vec<Bar>> {
+        let options = options.for_chart(security(symbol).class, tf);
+        if matches!(security(symbol).class, AssetClass::Equity | AssetClass::Etf) && tf.session_aligned(options.session)
+        {
+            let bars = self.bars(symbol, Timeframe::M30);
+            return Ok(crate::clip(tf.resample_session(&bars, options.session), end, limit));
+        }
         self.history(symbol, tf, end, limit).await
     }
     fn name(&self) -> &str {
@@ -63,7 +69,8 @@ impl MarketData for SampleProvider {
     }
 
     async fn scan_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
-        Ok(ScanHistory { bars: self.history(symbol, tf, None, limit).await?, simulated: true })
+        let options = crate::HistoryOptions { session: tr_core::session::Session::UsRegular, ..Default::default() };
+        Ok(ScanHistory { bars: self.chart_history(symbol, tf, None, limit, options).await?, simulated: true })
     }
 
     /// A synthetic chain priced with Black-Scholes around the last price.
@@ -212,6 +219,56 @@ pub fn simulated_book(symbol: &str, mid: f64, depth: usize, step: u64) -> OrderB
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn regular_two_hour_chart_fetch_matches_manual_half_hour_aggregation() {
+        use crate::{HistoryOptions, MarketData};
+        use tr_core::{Bar, Timeframe, session::Session};
+        let end = chrono::DateTime::parse_from_rfc3339("2026-03-09T20:00:00Z").unwrap().timestamp();
+        let open = end - 390 * 60;
+        let provider = super::SampleProvider::at(end, 14);
+        let source = provider.history("AAPL US Equity", Timeframe::M30, None, 14).await.unwrap();
+        let mut expected: Vec<Bar> = Vec::new();
+        for bar in source.iter().filter(|b| Session::UsRegular.contains(b.ts)) {
+            let start = open + (bar.ts - open) / 7200 * 7200;
+            if let Some(last) = expected.last_mut()
+                && last.ts == start
+            {
+                last.high = last.high.max(bar.high);
+                last.low = last.low.min(bar.low);
+                last.close = bar.close;
+                last.volume += bar.volume;
+            } else {
+                expected.push(Bar { ts: start, ..*bar });
+            }
+        }
+        let actual = provider
+            .chart_history(
+                "AAPL US Equity",
+                Timeframe::H2,
+                None,
+                10,
+                HistoryOptions { session: Session::UsRegular, ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual[0].ts, open);
+        let scan = provider.scan_history("AAPL US Equity", Timeframe::H2, 10).await.unwrap();
+        assert_eq!(scan.bars, actual);
+        assert!(scan.simulated);
+        let crypto = provider
+            .chart_history(
+                "BTCUSD Crypto",
+                Timeframe::H2,
+                None,
+                10,
+                HistoryOptions { session: Session::UsRegular, ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(crypto, provider.history("BTCUSD Crypto", Timeframe::H2, None, 10).await.unwrap());
+    }
+
     use super::*;
 
     #[tokio::test]

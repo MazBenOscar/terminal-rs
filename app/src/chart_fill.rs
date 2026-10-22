@@ -5,21 +5,25 @@ use tr_chart::viewport::{PriceScale, Viewport};
 use tr_core::indicators::registry::Output;
 use tr_core::indicators::{formula::display_values, study::Settings};
 
+pub type OutputLookup<'a> = std::collections::HashMap<u32, (&'a [Output], i16)>;
+
 pub struct Fill {
     points: Arc<Vec<[f64; 2]>>,
     invalid: Vec<usize>,
     color: Color32,
 }
 impl Fill {
-    pub fn build(settings: &Settings, outputs: &[Output]) -> Option<Self> {
+    pub fn build(settings: &Settings, outputs: &[Output], lookup: &OutputLookup<'_>) -> Option<Self> {
         let fill = settings.fill.as_ref()?;
-        let upper = outputs.iter().find(|o| o.name == fill.upper)?;
-        let lower = outputs.iter().find(|o| o.name == fill.lower)?;
-        let points: Vec<_> = display_values(&upper.values, settings.displacement)
-            .into_iter()
-            .zip(display_values(&lower.values, settings.displacement))
-            .map(|(a, b)| [a, b])
-            .collect();
+        let values = |edge: &tr_core::indicators::study::FillEdge| {
+            let (source, displacement) = match edge.study {
+                Some(id) => *lookup.get(&id)?,
+                None => (outputs, settings.displacement),
+            };
+            let output = source.iter().find(|o| o.name == edge.output)?;
+            Some(display_values(&output.values, displacement))
+        };
+        let points: Vec<_> = values(&fill.upper)?.into_iter().zip(values(&fill.lower)?).map(|(a, b)| [a, b]).collect();
         let mut invalid = vec![0];
         for [a, b] in &points {
             invalid.push(invalid.last().copied().unwrap() + usize::from(!a.is_finite() || !b.is_finite()));
@@ -63,6 +67,45 @@ impl Fill {
 mod tests {
     use super::*;
     #[test]
+    fn ema_bollinger_fill_matches_per_bar_values_and_splits_nan_gaps() {
+        use tr_core::{
+            Bar, Timeframe,
+            indicators::{
+                registry::{Input, Spec},
+                study::{self, BandFill, FillEdge},
+            },
+        };
+        let bars: Vec<_> = (0..40).map(|i| Bar::new(i, i as f64, i as f64 + 2., i as f64 - 1., i as f64, 1.)).collect();
+        let mut specs = vec![Spec::new("EMA", &[2.]).unwrap(), Spec::new("BB", &[3., 2.]).unwrap()];
+        study::assign_ids(&mut specs);
+        let settings = specs[0].chart.as_mut().unwrap();
+        settings.fill = Some(BandFill {
+            upper: "EMA".into(),
+            lower: FillEdge { study: Some(2), output: "Lower".into() },
+            color: [1, 2, 3],
+            opacity: 35,
+        });
+        let mut outputs = study::evaluate(&specs, &Input::new(&bars, Timeframe::D1));
+        let lower = outputs[1].as_mut().unwrap().iter_mut().find(|o| o.name == "Lower").unwrap();
+        lower.values[20] = f64::NAN;
+        let upper = outputs[0].as_ref().unwrap();
+        let lower = outputs[1].as_ref().unwrap();
+        let lookup = OutputLookup::from([(2, (lower.as_slice(), 0))]);
+        let fill = Fill::build(specs[0].chart.as_ref().unwrap(), upper, &lookup).unwrap();
+        let lower = &lower.iter().find(|o| o.name == "Lower").unwrap().values;
+        for (i, point) in fill.points.iter().enumerate() {
+            for (a, b) in point.iter().zip([upper[0].values[i], lower[i]]) {
+                assert!(*a == b || a.is_nan() && b.is_nan());
+            }
+        }
+        assert!(!fill.valid(19, 20));
+        assert!(!fill.valid(20, 21));
+        assert!(!fill.valid(19, 21));
+        assert!(fill.valid(21, 22));
+        assert!(Fill::build(specs[0].chart.as_ref().unwrap(), upper, &OutputLookup::new()).is_none());
+    }
+
+    #[test]
     fn gaps_are_not_bridged_when_zoomed_out() {
         let f = Fill {
             points: Arc::new(vec![[1., 0.], [f64::NAN, 0.], [2., 1.], [3., 1.]]),
@@ -71,5 +114,42 @@ mod tests {
         };
         assert!(!f.valid(0, 2));
         assert!(f.valid(2, 3));
+    }
+
+    #[test]
+    fn cross_study_edges_use_their_own_studies_display_displacement() {
+        use tr_core::{
+            Bar, Timeframe,
+            indicators::{
+                formula::display_values,
+                registry::{Input, Spec},
+                study::{self, BandFill, FillEdge},
+            },
+        };
+        let bars: Vec<_> = (0..20).map(|i| Bar::new(i, i as f64, i as f64 + 2., i as f64 - 1., i as f64, 1.)).collect();
+        let mut specs = vec![Spec::new("EMA", &[2.]).unwrap(), Spec::new("BB", &[3., 2.]).unwrap()];
+        study::assign_ids(&mut specs);
+        let owner = specs[0].chart.as_mut().unwrap();
+        owner.displacement = 4;
+        owner.fill = Some(BandFill {
+            upper: "EMA".into(),
+            lower: FillEdge { study: Some(2), output: "Lower".into() },
+            color: [1, 2, 3],
+            opacity: 35,
+        });
+        specs[1].chart.as_mut().unwrap().displacement = -3;
+        let outputs = study::evaluate(&specs, &Input::new(&bars, Timeframe::D1));
+        let upper = outputs[0].as_ref().unwrap();
+        let lower = outputs[1].as_ref().unwrap();
+        // The lookup carries each target study's own displacement, as the worker builds it.
+        let lookup = OutputLookup::from([(2, (lower.as_slice(), -3i16))]);
+        let fill = Fill::build(specs[0].chart.as_ref().unwrap(), upper, &lookup).unwrap();
+        let upper_line = &display_values(&upper[0].values, 4);
+        let lower_line = display_values(&lower.iter().find(|o| o.name == "Lower").unwrap().values, -3);
+        assert_eq!(fill.points.len(), upper_line.len().min(lower_line.len()));
+        for (i, [a, b]) in fill.points.iter().enumerate() {
+            assert!(a == &upper_line[i] || a.is_nan() && upper_line[i].is_nan(), "upper edge {i}");
+            assert!(b == &lower_line[i] || b.is_nan() && lower_line[i].is_nan(), "lower edge {i}");
+        }
     }
 }
