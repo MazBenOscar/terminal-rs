@@ -1710,6 +1710,13 @@ impl TerminalApp {
                         c.on_history(generation, bars, gpu, prepended, from_cache, exhausted, live, worker);
                     }
                 }
+                Response::LiveBars { pane, generation, from, bars, len } => {
+                    let worker = &self.worker;
+                    if let Some(PaneKind::Chart(c)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        c.on_live_bars(generation, from, bars, len, worker);
+                    }
+                }
                 Response::HistoryError { pane, generation, error } => {
                     // Errors while paging just mean "no older history"; only report failed loads.
                     let empty = self.chart_mut(pane).map(|c| {

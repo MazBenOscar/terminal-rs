@@ -5,7 +5,7 @@
 //! cost a uniform write plus O(plot width) instances.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
@@ -145,19 +145,20 @@ impl Uniforms {
     }
 }
 
-/// Shared handle to an uploaded-on-demand bar pyramid.
+/// Shared handle to an uploaded-on-demand bar pyramid. Retained draw commands share
+/// tail patches; the pyramid's version is authoritative when uploading.
 #[derive(Clone)]
 pub struct SeriesRef {
     pub key: u64,
     pub version: u64,
-    pub pyramid: Arc<BarPyramid>,
+    pub pyramid: Arc<RwLock<BarPyramid>>,
 }
 
 #[derive(Clone)]
 pub struct LineRef {
     pub key: u64,
     pub version: u64,
-    pub pyramid: Arc<LinePyramid>,
+    pub pyramid: Arc<RwLock<LinePyramid>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,7 +191,7 @@ struct GpuBuffer {
     version: u64,
     bind_group: wgpu::BindGroup,
     last_used: u64,
-    _buffer: wgpu::Buffer,
+    buffer: wgpu::Buffer,
 }
 
 #[derive(Clone, Copy)]
@@ -345,19 +346,31 @@ impl ChartRenderer {
     fn ensure(
         &mut self,
         device: &wgpu::Device,
-        is_line: bool,
-        key: u64,
-        version: u64,
-        bytes: impl FnOnce() -> Vec<u8>,
+        queue: &wgpu::Queue,
+        identity: (bool, u64, u64),
+        bytes: &[u8],
+        dirty: &crate::lod::DirtyRanges,
     ) {
+        let (is_line, key, version) = identity;
+        let bytes = &bytes[..bytes.len().min(self.max_binding as usize)];
         let frame = self.frame_no;
         if let Some(b) = self.buffers.get_mut(&(is_line, key)) {
             b.last_used = frame;
             if b.version == version {
                 return;
             }
+            if b.version.checked_add(1) == Some(version) && !dirty.is_empty() && b.buffer.size() >= bytes.len() as u64 {
+                for range in dirty {
+                    let end = range.end.min(bytes.len());
+                    if range.start < end {
+                        queue.write_buffer(&b.buffer, range.start as u64, &bytes[range.start..end]);
+                    }
+                }
+                b.version = version;
+                return;
+            }
         }
-        let mut contents = bytes();
+        let mut contents = bytes.to_vec();
         if contents.is_empty() {
             contents = vec![0; 32];
         }
@@ -365,14 +378,14 @@ impl ChartRenderer {
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(if is_line { "chart-line" } else { "chart-bars" }),
             contents: &contents,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.storage_bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
         });
-        self.buffers.insert((is_line, key), GpuBuffer { version, bind_group, last_used: frame, _buffer: buffer });
+        self.buffers.insert((is_line, key), GpuBuffer { version, bind_group, last_used: frame, buffer });
     }
 
     /// Upload any changed data and this frame's uniforms for one pane.
@@ -392,16 +405,26 @@ impl ChartRenderer {
             self.next_slot += 1;
             let (pipe, key, range, uniforms) = match cmd {
                 DrawCmd::Candles { data, range, uniforms } | DrawCmd::Volume { data, range, uniforms } => {
-                    self.ensure(device, false, data.key, data.version, || {
-                        bytemuck::cast_slice::<GpuBar, u8>(&data.pyramid.data).to_vec()
-                    });
+                    let pyramid = data.pyramid.read().expect("pyramid lock");
+                    self.ensure(
+                        device,
+                        queue,
+                        (false, data.key, pyramid.version),
+                        bytemuck::cast_slice::<GpuBar, u8>(&pyramid.data),
+                        &pyramid.dirty,
+                    );
                     let pipe = if matches!(cmd, DrawCmd::Candles { .. }) { Pipe::Candle } else { Pipe::Volume };
                     (pipe, (false, data.key), *range, uniforms)
                 }
                 DrawCmd::Line { kind, data, range, uniforms } => {
-                    self.ensure(device, true, data.key, data.version, || {
-                        bytemuck::cast_slice::<[f32; 2], u8>(&data.pyramid.data).to_vec()
-                    });
+                    let pyramid = data.pyramid.read().expect("pyramid lock");
+                    self.ensure(
+                        device,
+                        queue,
+                        (true, data.key, pyramid.version),
+                        bytemuck::cast_slice::<[f32; 2], u8>(&pyramid.data),
+                        &pyramid.dirty,
+                    );
                     let pipe = match kind {
                         LineKind::Line => Pipe::Line,
                         LineKind::Area => Pipe::Area,
@@ -413,6 +436,10 @@ impl ChartRenderer {
                 }
             };
             queue.write_buffer(&self.uniform_buf, slot as u64 * SLOT, bytemuck::bytes_of(uniforms));
+            let stride = if key.0 { 8 } else { 32 };
+            let points = self.buffers[&key].buffer.size() / stride;
+            let limit = if matches!(pipe, Pipe::Line | Pipe::Area) { points.saturating_sub(1) } else { points } as u32;
+            let range = (range.0.min(limit), range.1.min(limit));
             resolved.push(Resolved { pipe, key, slot, range });
         }
         self.panes.insert(frame.pane, resolved);
@@ -474,5 +501,71 @@ impl egui_wgpu::CallbackTrait for ChartCallback {
         if let Some(r) = resources.get::<ChartRenderer>() {
             r.paint(self.0.pane, pass);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::headless::Headless;
+    use crate::scene::{ChartType, PricePane, SeriesGpu, price_pane};
+    use crate::viewport::Viewport;
+
+    fn render(h: &mut Headless, series: &SeriesGpu) {
+        let v = Viewport::fit_last(series.len(), 100, h.width as f64);
+        let mut cmds = Vec::new();
+        for chart_type in [ChartType::Candles, ChartType::Line] {
+            cmds.extend(
+                price_pane(&PricePane {
+                    series,
+                    chart_type,
+                    show_volume: true,
+                    overlays: &[],
+                    viewport: &v,
+                    height_px: h.height as f64,
+                    log: false,
+                    manual_scale: None,
+                    style: Style::default(),
+                })
+                .cmds,
+            );
+        }
+        h.render(&mut [Frame { pane: 1, frame_no: 0, cmds }]);
+    }
+
+    #[test]
+    fn patched_uploads_and_missed_versions_match_full_render() {
+        let Some(mut h) = Headless::new(400, 240) else { return };
+        let mut bars = tr_core::sample::generate("GPU", tr_core::Timeframe::M1, 1000, 1_790_000_000);
+        let mut series = SeriesGpu::build(&bars);
+        let retained = series.clone();
+        render(&mut h, &series);
+        for patches in [1, 3] {
+            for _ in 0..patches {
+                let from = bars.len() - 1;
+                bars[from].close += 1.;
+                bars[from].high = bars[from].high.max(bars[from].close);
+                bars[from].volume += 1.;
+                let mut next = bars[from];
+                next.ts += 60;
+                bars.push(next);
+                series.update_tail(&bars, from).unwrap();
+            }
+            // Retained draw handles share the mutable pyramid, not an O(n) snapshot.
+            assert!(Arc::ptr_eq(&retained.bars.pyramid, &series.bars.pyramid));
+            render(&mut h, &series);
+            let patched = h.read_pixels();
+            assert_eq!(h.renderer.buffers[&(false, series.bars.key)].version, series.bars.version);
+            render(&mut h, &SeriesGpu::build(&bars));
+            assert_eq!(patched, h.read_pixels());
+        }
+        h.renderer.max_binding = 128;
+        let truncated = SeriesGpu::build(&bars);
+        render(&mut h, &truncated);
+        bars.last_mut().unwrap().close += 1.;
+        series = truncated;
+        series.update_tail(&bars, bars.len() - 1).unwrap();
+        render(&mut h, &series);
+        assert_eq!(h.renderer.buffers[&(false, series.bars.key)].buffer.size(), 128);
     }
 }
