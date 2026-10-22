@@ -247,7 +247,8 @@ impl TerminalApp {
                 self.switch_watchlist(active);
             }
             if ui.small_button("+").on_hover_text("Add symbol").clicked() {
-                self.start_watch_entry(WatchEntryKind::Symbol, self.watchlists[active].items().len(), String::new());
+                self.symbol_search =
+                    Some(crate::symbol_search::Dialog::new(String::new(), Some(crate::symbol_search::Target::Append)));
             }
             let response = widgets::icon_button(ui, widgets::Icon::More, "Watchlist options", false);
             egui::Popup::menu(&response).show(|ui| {
@@ -687,7 +688,10 @@ impl TerminalApp {
             ui.close();
         }
         if ui.button("Add symbol").clicked() {
-            self.start_watch_entry(WatchEntryKind::Symbol, index + 1, String::new());
+            self.symbol_search = Some(crate::symbol_search::Dialog::new(
+                String::new(),
+                Some(crate::symbol_search::Target::After(s.into())),
+            ));
             ui.close();
         }
         if sec.has_congress_trades() && ui.button("Who in Congress Traded This").clicked() {
@@ -710,10 +714,7 @@ impl TerminalApp {
         let mut cancel = false;
         if let Some(entry) = &mut self.watch_item_entry {
             ui.horizontal(|ui| {
-                let hint = match entry.kind {
-                    WatchEntryKind::Symbol => "Ticker",
-                    _ => "Section name",
-                };
+                let hint = "Section name";
                 let response =
                     ui.add(egui::TextEdit::singleline(&mut entry.text).hint_text(hint).desired_width(dp(160.0)));
                 if !response.has_focus() && ui.memory(|m| m.focused().is_none()) {
@@ -744,12 +745,18 @@ impl TerminalApp {
         for (label, kind, target, text) in [
             ("Rename section…", WatchEntryKind::Rename, index, name.to_owned()),
             ("Add section below…", WatchEntryKind::Section, watch_sections::block(&items, index).end, String::new()),
-            ("Add symbol to section…", WatchEntryKind::Symbol, watch_sections::block(&items, index).end, String::new()),
         ] {
             if ui.button(label).clicked() {
                 self.start_watch_entry(kind, target, text);
                 ui.close();
             }
+        }
+        if ui.button("Add symbol to section…").clicked() {
+            self.symbol_search = Some(crate::symbol_search::Dialog::new(
+                String::new(),
+                Some(crate::symbol_search::Target::Section { position: index, name: name.into() }),
+            ));
+            ui.close();
         }
         if ui.button("Remove section").clicked() {
             let mut items = items;
@@ -1176,6 +1183,7 @@ mod tests {
 
     fn click_ui(label: &str, mut draw: impl FnMut(&mut Ui)) {
         let ctx = egui::Context::default();
+        ui_frame(&ctx, Vec::new(), &mut draw);
         let output = ui_frame(&ctx, Vec::new(), &mut draw);
         let pos = output
             .shapes
@@ -1203,8 +1211,25 @@ mod tests {
     }
 
     fn save_entry(app: &mut TerminalApp, value: &str) {
-        app.watch_item_entry.as_mut().unwrap().text = value.into();
-        click_ui("Save", |ui| app.watch_item_entry_ui(ui));
+        if let Some(dialog) = &mut app.symbol_search {
+            dialog.query = value.into();
+            let ctx = egui::Context::default();
+            ui_frame(&ctx, Vec::new(), &mut |ui| app.symbol_search_ui(ui.ctx()));
+            ui_frame(
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                &mut |ui| app.symbol_search_ui(ui.ctx()),
+            );
+        } else {
+            app.watch_item_entry.as_mut().unwrap().text = value.into();
+            click_ui("Save", |ui| app.watch_item_entry_ui(ui));
+        }
     }
 
     #[test]
@@ -1266,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn symbol_menu_inserts_section_above_and_symbol_below_rejects_duplicates() {
+    fn symbol_menu_inserts_section_above_and_symbol_below_and_removes_existing() {
         let mut app = sections_app();
         let nvda = tr_data::security("NVDA").key();
         click_ui("Add section", |ui| app.watch_symbol_menu(ui, 2, &nvda, &mut Vec::new()));
@@ -1275,13 +1300,12 @@ mod tests {
         assert!(matches!(&items[2], Item::Section { name, .. } if name == "Chips"));
         assert_eq!(items[3], Item::Symbol(nvda.clone()));
         click_ui("Add symbol", |ui| app.watch_symbol_menu(ui, 3, &nvda, &mut Vec::new()));
-        save_entry(&mut app, "NVDA");
-        assert_eq!(app.status, "NVDA is already in Main");
-        assert_eq!(app.watchlists[0].items(), items);
         save_entry(&mut app, "AAPL unexpected trailing input");
-        assert_eq!(app.status, "Unknown symbol");
+        assert_eq!(app.watchlists[0].items(), items);
         save_entry(&mut app, "MSFT");
         assert_eq!(app.watchlists[0].items()[4], Item::Symbol(tr_data::security("MSFT").key()));
+        save_entry(&mut app, "NVDA");
+        assert!(!app.watchlist.contains(&nvda));
     }
 
     #[test]
@@ -1376,8 +1400,9 @@ mod tests {
         assert!(app.watch_item_entry.is_none());
         assert_eq!(app.watchlists[0].items(), items);
         app.set_watchlist_items(&(0..200).map(|i| Item::Symbol(format!("TEST{i} US Equity"))).collect::<Vec<_>>());
-        app.start_watch_entry(WatchEntryKind::Symbol, 200, "MSFT".into());
-        click_ui("Save", |ui| app.watch_item_entry_ui(ui));
+        app.symbol_search =
+            Some(crate::symbol_search::Dialog::new(String::new(), Some(crate::symbol_search::Target::Append)));
+        save_entry(&mut app, "MSFT");
         assert_eq!(app.watchlist.len(), 200);
         assert!(app.status.contains("200 symbols"));
     }
@@ -1468,7 +1493,8 @@ mod tests {
     #[test]
     fn inline_entries_are_dropped_when_another_list_becomes_active() {
         let mut app = sections_app();
-        app.start_watch_entry(WatchEntryKind::Symbol, 3, String::new());
+        app.symbol_search =
+            Some(crate::symbol_search::Dialog::new(String::new(), Some(crate::symbol_search::Target::Append)));
         app.create_watchlist("Other".into(), vec![key("MSFT")]).unwrap();
         assert!(app.watch_item_entry.is_none(), "switching lists must discard the inline entry");
         // A later save must not resurrect it or touch the new list.
@@ -1512,10 +1538,7 @@ mod tests {
                 let names = row_names(&items);
                 let tech = names.iter().position(|n| n == "#Tech").unwrap();
                 let mac = names.iter().position(|n| n == "#Macro").unwrap();
-                assert!(
-                    tech < pos && pos < mac,
-                    "MSFT was opened for Tech but landed at {pos} in {names:?}"
-                );
+                assert!(tech < pos && pos < mac, "MSFT was opened for Tech but landed at {pos} in {names:?}");
             }
         }
     }
@@ -1690,7 +1713,11 @@ mod tests {
         let texts = labels(&ui_frame(&ctx, Vec::new(), &mut |ui| {
             app.watchlist(ui);
         }));
-        assert_eq!(texts.iter().filter(|s| *s == "SPY").count(), 2, "card shows the first symbol once selection is gone");
+        assert_eq!(
+            texts.iter().filter(|s| *s == "SPY").count(),
+            2,
+            "card shows the first symbol once selection is gone"
+        );
         assert!(!texts.iter().any(|s| s == "123.45"), "stale AAPL quote must not appear");
         // Switch to a list without AAPL while it is still selected in the previous list.
         app.switch_watchlist(0);
@@ -1700,7 +1727,11 @@ mod tests {
             app.watchlist(ui);
         }));
         assert!(texts.iter().any(|s| s == "MSFT"));
-        assert_eq!(texts.iter().filter(|s| *s == "MSFT").count(), 2, "card falls back to the active list's first symbol");
+        assert_eq!(
+            texts.iter().filter(|s| *s == "MSFT").count(),
+            2,
+            "card falls back to the active list's first symbol"
+        );
     }
 
     #[test]
@@ -1708,7 +1739,7 @@ mod tests {
         let mut app = sections_app();
         app.set_watchlist_items(&(0..200).map(|i| Item::Symbol(format!("TEST{i} US Equity"))).collect::<Vec<_>>());
         // Below an interior row, not just at the end.
-        click_ui("Add symbol", |ui| app.watch_symbol_menu(ui, 5, &format!("TEST5 US Equity"), &mut Vec::new()));
+        click_ui("Add symbol", |ui| app.watch_symbol_menu(ui, 5, "TEST5 US Equity", &mut Vec::new()));
         save_entry(&mut app, "MSFT");
         assert_eq!(app.watchlist.len(), 200);
         assert!(app.status.contains("200 symbols"));
@@ -1750,5 +1781,111 @@ mod tests {
         });
         assert!(app.watchlists[0].sections[0].collapsed);
         assert!(!app.watchlists[0].sections[1].collapsed);
+    }
+
+    #[test]
+    fn plus_opens_dialog_and_appends_multiple_symbols_in_order() {
+        let mut app = sections_app();
+        click_ui("+", |ui| {
+            app.watchlist(ui);
+        });
+        assert!(app.symbol_search.is_some());
+        assert!(app.watch_item_entry.is_none());
+        save_entry(&mut app, "MSFT");
+        save_entry(&mut app, "TSLA");
+        assert_eq!(&app.watchlist[app.watchlist.len() - 2..], &[key("MSFT"), key("TSLA")]);
+        assert!(app.symbol_search.is_some());
+    }
+
+    #[test]
+    fn dialog_removed_row_anchor_falls_back_to_append() {
+        let mut app = sections_app();
+        click_ui("Add symbol", |ui| app.watch_symbol_menu(ui, 2, &key("NVDA"), &mut Vec::new()));
+        app.set_watchlist(app.watchlist.iter().filter(|s| *s != &key("NVDA")).cloned().collect());
+        save_entry(&mut app, "MSFT");
+        assert_eq!(app.watchlist.last(), Some(&key("MSFT")));
+    }
+
+    #[test]
+    fn search_function_opens_selected_symbol_on_chart_and_shift_closes() {
+        let mut app = sections_app();
+        app.apply(crate::command::Function::Search("MSFT".into()));
+        assert!(app.symbol_search.as_ref().unwrap().target.is_none());
+        save_entry(&mut app, "MSFT");
+        assert!(
+            app.panes.iter().any(|p| matches!(&p.kind, super::super::PaneKind::Chart(c) if c.symbol == key("MSFT")))
+        );
+        let ctx = egui::Context::default();
+        ui_frame(&ctx, Vec::new(), &mut |ui| app.symbol_search_ui(ui.ctx()));
+        ui_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            }],
+            &mut |ui| app.symbol_search_ui(ui.ctx()),
+        );
+        assert!(app.symbol_search.is_none());
+    }
+
+    #[test]
+    fn command_footer_opens_prefilled_symbol_search() {
+        let mut app = sections_app();
+        app.cmd = "XRP".into();
+        click_ui("Search all symbols…", |ui| {
+            app.dropdown(ui.ctx(), Rect::from_min_size(pos2(10.0, 10.0), vec2(440.0, 24.0)), &[]);
+        });
+        let dialog = app.symbol_search.as_ref().unwrap();
+        assert_eq!(dialog.query, "XRP");
+        assert!(dialog.target.is_none());
+    }
+
+    #[test]
+    fn shift_enter_adds_and_closes_and_escape_does_not_add() {
+        let mut app = sections_app();
+        app.symbol_search =
+            Some(crate::symbol_search::Dialog::new("TSLA".into(), Some(crate::symbol_search::Target::Append)));
+        let ctx = egui::Context::default();
+        ui_frame(&ctx, Vec::new(), &mut |ui| app.symbol_search_ui(ui.ctx()));
+        ui_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            }],
+            &mut |ui| app.symbol_search_ui(ui.ctx()),
+        );
+        assert!(app.symbol_search.is_none());
+        assert_eq!(app.watchlist.last(), Some(&key("TSLA")));
+        app.symbol_search =
+            Some(crate::symbol_search::Dialog::new("MSFT".into(), Some(crate::symbol_search::Target::Append)));
+        ui_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut |ui| app.symbol_search_ui(ui.ctx()),
+        );
+        assert!(app.symbol_search.is_none());
+        assert!(!app.watchlist.contains(&key("MSFT")));
+    }
+
+    #[test]
+    fn removed_section_anchor_appends_instead_of_using_next_section() {
+        let mut app = sections_app();
+        click_ui("Add symbol to section…", |ui| app.watch_section_menu(ui, 1, "Tech"));
+        click_ui("Remove section", |ui| app.watch_section_menu(ui, 1, "Tech"));
+        save_entry(&mut app, "MSFT");
+        assert_eq!(app.watchlist.last(), Some(&key("MSFT")));
     }
 }

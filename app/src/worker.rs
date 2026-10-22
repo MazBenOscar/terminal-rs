@@ -248,6 +248,7 @@ pub enum Request {
     Forget(PaneId),
     YieldCurves,
     Search(String),
+    SymbolCatalog(tr_core::crypto::CryptoVenue),
     /// Order entry (see `app::trading`); only sent once trading is enabled.
     Trade(TradeRequest),
 }
@@ -500,6 +501,10 @@ pub enum Response {
     Status(String),
     CongressRefreshed(String),
     Curves(Box<YieldCurves>),
+    SymbolCatalog {
+        venue: tr_core::crypto::CryptoVenue,
+        result: Result<Vec<tr_core::crypto::CryptoInstrument>, String>,
+    },
     SearchHits {
         query: String,
         hits: Vec<SearchHit>,
@@ -1453,6 +1458,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         Request::OrderBook { pane, symbol, depth } => {
             let book = s.provider.order_book(&symbol, depth).await.map_err(|e| format!("{e:#}"));
             s.send(Response::OrderBook { pane, symbol, book });
+        }
+        Request::SymbolCatalog(venue) => {
+            let result = s.provider.crypto_catalog(venue).await.map(|c| c.products).map_err(|e| format!("{e:#}"));
+            s.send(Response::SymbolCatalog { venue, result });
         }
         Request::Search(query) => {
             let hits = s.provider.search(&query).await.unwrap_or_default();

@@ -596,7 +596,6 @@ fn migrate_legacy(s: &Settings, defaults: &prefs::PanelDefaults) -> Option<Layou
 enum WatchEntryKind {
     Section,
     Rename,
-    Symbol,
 }
 
 #[derive(Clone)]
@@ -666,6 +665,7 @@ pub struct TerminalApp {
     last_curve: Option<Instant>,
     wei_updated: Option<String>,
     /// Latest network search results and the query they answer.
+    symbol_search: Option<crate::symbol_search::Dialog>,
     net_hits: (String, Vec<SearchHit>),
     /// Query typed in the command line awaiting a debounced network search.
     search_pending: Option<(String, Instant)>,
@@ -883,6 +883,7 @@ impl TerminalApp {
             last_wei: None,
             last_curve: None,
             wei_updated: None,
+            symbol_search: None,
             net_hits: (String::new(), Vec::new()),
             search_pending: None,
             suggestion: None,
@@ -1027,6 +1028,9 @@ impl TerminalApp {
             self.toasts.retain(|(_, time)| *time != at);
         }
         self.watch_item_entry = None;
+        if self.symbol_search.as_ref().is_some_and(|d| d.target.is_some()) {
+            self.symbol_search = None;
+        }
         self.active_watchlist = index;
         self.watchlist = self.watchlists[index].symbols.clone();
         self.watchlist_delete = false;
@@ -1089,24 +1093,6 @@ impl TerminalApp {
         match entry.kind {
             WatchEntryKind::Section => crate::watch_sections::insert_section(&mut items, entry.index, &entry.text)?,
             WatchEntryKind::Rename => crate::watch_sections::rename_section(&mut items, entry.index, &entry.text)?,
-            WatchEntryKind::Symbol => {
-                let tokens: Vec<_> = entry.text.split_whitespace().collect();
-                let symbol = tr_core::Security::resolve_tokens(&tokens)
-                    .filter(|(_, used)| *used == tokens.len())
-                    .map(|(sec, _)| sec.key())
-                    .ok_or_else(|| "Unknown symbol".to_owned())?;
-                if self.watchlist.contains(&symbol) {
-                    return Err(format!(
-                        "{} is already in {}",
-                        tr_data::security(&symbol).ticker,
-                        self.watchlists[self.active_watchlist].name
-                    ));
-                }
-                if self.watchlist.len() >= 200 {
-                    return Err("At most 200 symbols are allowed".into());
-                }
-                items.insert(entry.index.min(items.len()), crate::watch_sections::Item::Symbol(symbol));
-            }
         }
         self.set_watchlist_items(&items);
         self.watch_item_entry = None;
@@ -1166,6 +1152,11 @@ impl TerminalApp {
     /// Store the active list's rows (sections and order). Membership or order changes
     /// refresh quotes and columns like any watchlist edit; section-only edits do not.
     pub(crate) fn set_watchlist_items(&mut self, items: &[crate::watch_sections::Item]) {
+        if let Some(dialog) = &mut self.symbol_search
+            && let Some(target) = &mut dialog.target
+        {
+            target.rebase(&self.watchlists[self.active_watchlist].items(), items);
+        }
         self.watchlists[self.active_watchlist].set_items(items);
         let symbols = self.watchlists[self.active_watchlist].symbols.clone();
         if self.watchlist != symbols {
@@ -1517,10 +1508,7 @@ impl TerminalApp {
                 self.open_panel(PaneKind::Curve);
             }
             Function::Search(q) => {
-                if !q.trim().is_empty() {
-                    self.worker.send(Request::Search(q.clone()));
-                }
-                self.open_panel(PaneKind::Search { query: q });
+                self.symbol_search = Some(crate::symbol_search::Dialog::new(q, None));
             }
             Function::Portfolio(view, arg) => self.portfolio_command(view, &arg, None),
             Function::Trade(t) => self.open_ticket(t, None),
@@ -1795,7 +1783,17 @@ impl TerminalApp {
                 Response::Status(s) => self.status = s,
                 Response::Curves(c) => self.curves = Some(c),
                 Response::SecurityNames(names) => self.security_names = names,
-                Response::SearchHits { query, hits } => self.net_hits = (query, hits),
+                Response::SymbolCatalog { venue, result } => {
+                    if let Some(dialog) = &mut self.symbol_search {
+                        dialog.catalog(venue, result);
+                    }
+                }
+                Response::SearchHits { query, hits } => {
+                    if let Some(dialog) = &mut self.symbol_search {
+                        dialog.network(&query, &hits);
+                    }
+                    self.net_hits = (query, hits);
+                }
                 Response::Trade(r) => self.on_trade(*r),
                 Response::CongressRefreshed(summary) => {
                     self.congress_status = summary.to_string();
@@ -2162,6 +2160,34 @@ impl TerminalApp {
         self.alert_toasts.retain(|(t, _)| t.elapsed() < Duration::from_secs(TOAST_SECS));
     }
 
+    fn symbol_search_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.symbol_search.take() else {
+            return;
+        };
+        for request in dialog.requests() {
+            self.worker.send(request);
+        }
+        let outcome = dialog.show(ctx, &self.watchlist);
+        if let Some(key) = outcome.key {
+            if let Some(target) = &mut dialog.target {
+                let mut items = self.watchlists[self.active_watchlist].items();
+                if self.watchlist.iter().any(|s| crate::symbol_search::same_key(s, &key)) {
+                    items.retain(|i| !matches!(i, crate::watch_sections::Item::Symbol(s) if crate::symbol_search::same_key(s, &key)));
+                    self.set_watchlist_items(&items);
+                } else if target.insert(&mut items, &key) {
+                    self.set_watchlist_items(&items);
+                } else {
+                    self.status = "Watchlist is limited to 200 symbols".into();
+                }
+            } else {
+                self.run_actions(vec![Action::OpenChart(key)]);
+            }
+        }
+        if !outcome.close {
+            self.symbol_search = Some(dialog);
+        }
+    }
+
     /// Save the active layout (only when it changed) and app settings.
     fn autosave(&mut self) {
         self.save_dirty_themes(true);
@@ -2277,7 +2303,9 @@ impl eframe::App for TerminalApp {
             pos2(main.right() - gap, status.top() - gap * 0.5),
         );
 
-        self.hotkeys(&ctx);
+        if self.symbol_search.is_none() {
+            self.hotkeys(&ctx);
+        }
         self.command_palette(&ctx);
         let mut sidebar_cmds = Vec::new();
         if sb_w >= 1.0 {
@@ -2330,6 +2358,7 @@ impl eframe::App for TerminalApp {
             self.save_prefs();
         }
         self.run_actions(actions);
+        self.symbol_search_ui(&ctx);
         if let Some(editor) = &mut self.columns_editor {
             let (applied, open) = editor.show(&ctx);
             if let Some(set) = applied {
@@ -2432,6 +2461,7 @@ impl TerminalApp {
             last_wei: None,
             last_curve: None,
             wei_updated: None,
+            symbol_search: None,
             net_hits: (String::new(), Vec::new()),
             search_pending: None,
             suggestion: None,
