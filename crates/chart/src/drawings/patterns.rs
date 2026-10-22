@@ -248,4 +248,76 @@ mod tests {
         assert_eq!(neckline([10., 20.], [30., 30.], 100.), Some(([10., 20.], [100., 65.])));
         assert!(neckline([10., 20.], [10., 30.], 100.).is_none());
     }
+
+    #[test]
+    fn ratio_division_by_zero_and_non_finite_prices_yield_none() {
+        let zero_leg = anchors(&[100., 100., 120., 130., 140.]);
+        let r = ratios(Tool::Xabcd, &zero_leg);
+        assert_eq!(r[0].1, None, "AB/XA with zero-length XA");
+        assert_eq!(r[3].1, None, "AD/XA with zero-length XA");
+        let nan = anchors(&[100., f64::NAN, 120., 130.]);
+        assert!(ratios(Tool::Abcd, &nan).iter().all(|(_, r)| r.is_none()));
+        // Short point lists drop incomplete legs instead of panicking.
+        assert!(ratios(Tool::Xabcd, &anchors(&[1., 2.])).len() < 4);
+    }
+
+    #[test]
+    fn label_above_ties_and_extrema_use_neighbour_mean() {
+        // Screen y grows downward: lower y is a visual high.
+        let tied = [[0., 5.], [1., 5.], [2., 5.]];
+        assert!(label_above(&tied, 0), "endpoint tie goes above");
+        assert!(label_above(&tied, 1), "interior tie goes above");
+        assert!(label_above(&tied, 2));
+        let equal_peak = [[0., 8.], [1., 2.], [2., 2.]];
+        assert!(label_above(&equal_peak, 1), "shared high labels above");
+        assert!(!label_above(&equal_peak, 0), "higher neighbour sits below");
+        // Single-point and out-of-range indices default to above.
+        assert!(label_above(&[[0., 1.]], 0));
+        assert!(label_above(&[[0., 1.]], 99));
+    }
+
+    #[test]
+    fn triangle_parallel_and_far_apex_geometry_stays_finite() {
+        let mut d = Drawing::new(Tool::TrianglePattern, Anchor { ts: 0, price: 1. }, Anchor { ts: 1, price: 2. });
+        // Nearly-parallel sides meet far to the right of the viewport.
+        let p = [[0., 0.], [50., 0.1], [0., 10.], [50., 9.9]];
+        d.pattern_points = anchors(&[0., 0.1, 10., 9.9]);
+        let shapes = geometry(&d, &p, [0., 0., 100., 100.]);
+        for (shape, label) in &shapes {
+            match shape {
+                Shape::Segment(a, b) | Shape::DashedSegment(a, b) => {
+                    assert!(a.iter().chain(b.iter()).all(|v| v.is_finite()), "{label:?}");
+                }
+                _ => {}
+            }
+        }
+        // Parallel sides never invent an apex (intersection is None).
+        assert!(intersection([0., 0.], [10., 0.], [0., 10.], [10., 10.]).is_none());
+        let parallel = [[0., 0.], [10., 0.], [0., 10.], [10., 10.]];
+        let shapes = geometry(&d, &parallel, [0., 0., 100., 100.]);
+        // 4 sides/labels + a–c and b–d only; no third pair of apex spokes.
+        let stroke_count =
+            shapes.iter().filter(|(s, label)| label.is_none() && matches!(s, Shape::Segment(a, b) if a != b)).count();
+        assert_eq!(stroke_count, 5, "windows(3) + a–c + b–d");
+    }
+
+    #[test]
+    fn placement_backspace_escape_mid_pattern_are_transactional() {
+        let mut placement = Placement::default();
+        for _ in 0..3 {
+            assert!(placement.click(Tool::Xabcd, Anchor { ts: 1, price: 1. }).is_none());
+        }
+        assert_eq!(placement.points.len(), 3);
+        placement.backspace();
+        assert_eq!(placement.points.len(), 2);
+        placement.cancel();
+        assert!(placement.points.is_empty());
+        // Completing still yields a full handle set after a mid-placement undo.
+        for i in 0..3 {
+            assert!(placement.click(Tool::Abcd, Anchor { ts: i, price: 1. }).is_none());
+        }
+        let d = placement.click(Tool::Abcd, Anchor { ts: 3, price: 1. }).unwrap();
+        assert_eq!(handles(&d).len(), 4);
+        assert!(placement.points.is_empty());
+    }
 }
