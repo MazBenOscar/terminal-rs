@@ -2225,6 +2225,7 @@ impl TerminalApp {
         for request in dialog.requests() {
             self.worker.send(request);
         }
+        dialog.list_name.clone_from(&self.watchlists[self.active_watchlist].name);
         let outcome = dialog.show(ctx, &self.watchlist);
         if let Some(key) = outcome.key {
             if let Some(target) = &mut dialog.target {
