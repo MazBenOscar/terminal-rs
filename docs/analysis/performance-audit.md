@@ -89,3 +89,19 @@ P2 was built (branch `codex/perf-idle`, `debcf6a`) and measured against
 Decision: ship only P2's autosave part (change-only writes off the UI thread,
 branch `codex/autosave`); shelve the repaint/polling policy; prioritise P1. Use a
 busy live chart at foreground idle as the P1 benchmark, measured A/B back to back.
+
+## P1a results (2026-10-22)
+
+P1a (incremental live bars: `Response::LiveBars`, in-place pyramid patching,
+dirty-range GPU uploads, status coalescing) was merged from `codex/perf-live`.
+
+| Measure | Before | P1a |
+|---|---|---|
+| `framebench --live`, 100k bars, per tick p50 / p99 | 5.9 / 15.0 ms | 0.60 / 1.25 ms |
+| App, `TR_PROVIDER=sample`, AAVE 1D (6,000 bars, 5 studies), foreground idle, CPU per 60 s | 4.61 / 4.83 s | 4.28 / 4.34 s |
+| Resident memory in the same run | 150–167 MB | 133–143 MB |
+
+The in-app gain (about 8% CPU, about 20 MB) is smaller than the per-tick gain
+because a 6,000-bar chart is cheap to rebuild and the remaining cost is indicator
+recomputation and painting; it grows with history length. Indicator work (finding
+2) and session filtering (finding 3) are P1b.
