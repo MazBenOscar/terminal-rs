@@ -363,6 +363,9 @@ pub struct ChartState {
     analytics: crate::chart_studies::Cache,
     context_timestamp: Option<i64>,
     generation: u64,
+    series_revision: u64,
+    history_resync: bool,
+    resync_revision: u64,
     viewport: Option<Viewport>,
     plot_width: f64,
     manual_scale: Option<PriceScale>,
@@ -483,6 +486,9 @@ impl ChartState {
             analytics: Default::default(),
             context_timestamp: None,
             generation: 0,
+            series_revision: 0,
+            history_resync: false,
+            resync_revision: 0,
             viewport: None,
             plot_width: 800.,
             manual_scale: None,
@@ -612,6 +618,9 @@ impl ChartState {
         self.adopt_legacy_drawings();
         study::assign_ids(&mut self.indicators);
         self.generation += 1;
+        self.series_revision = 0;
+        self.history_resync = false;
+        self.resync_revision = 0;
         self.loading = true;
         self.cached_history = false;
         self.crypto_source = None;
@@ -1207,14 +1216,54 @@ impl ChartState {
 
     // ---- worker responses -------------------------------------------------------------
 
+    fn request_history_resync(&mut self, w: &Worker) {
+        if !self.history_resync {
+            self.history_resync = true;
+            self.resync_revision = self.resync_revision.max(self.series_revision);
+            self.error = Some("Live update gap; waiting for history refresh".into());
+            w.send(Request::History {
+                pane: self.id,
+                generation: self.generation,
+                symbol: self.symbol.clone(),
+                tf: self.tf,
+                options: self.effective_history(),
+                limit: initial_limit(self.tf),
+            });
+        }
+    }
+
+    #[cfg(test)]
     pub fn on_live_bars(&mut self, generation: u64, from: usize, tail: Vec<Bar>, len: usize, w: &Worker) {
-        if generation != self.generation {
+        self.on_live_bars_revision(generation, self.series_revision + 1, from, tail, len, w);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_live_bars_revision(
+        &mut self,
+        generation: u64,
+        revision: u64,
+        from: usize,
+        tail: Vec<Bar>,
+        len: usize,
+        w: &Worker,
+    ) {
+        if generation != self.generation || self.history_resync || revision <= self.series_revision {
             return;
         }
+        let aligned = |bars: &[Bar], from: usize, tail: &[Bar], len: usize| {
+            from <= bars.len()
+                && from.checked_add(tail.len()) == Some(len)
+                && len >= bars.len()
+                && tail.windows(2).all(|pair| pair[0].ts < pair[1].ts)
+                && tail.first().is_none_or(|first| {
+                    bars.get(from).is_none_or(|old| old.ts == first.ts) && (from == 0 || bars[from - 1].ts < first.ts)
+                })
+        };
         let session = self.effective_session();
         let (from, tail, len) = if let Some(raw) = &mut self.live_source {
-            if from > raw.len() || from.checked_add(tail.len()) != Some(len) || len < raw.len() {
-                self.error = Some("Live update gap; waiting for history refresh".into());
+            if !aligned(raw, from, &tail, len) {
+                self.resync_revision = revision;
+                self.request_history_resync(w);
                 return;
             }
             let filtered_from =
@@ -1228,10 +1277,12 @@ impl ChartState {
         } else {
             (from, tail, len)
         };
-        if from > self.source_bars.len() || from.checked_add(tail.len()) != Some(len) || len < self.source_bars.len() {
-            self.error = Some("Live update gap; waiting for history refresh".into());
+        if !aligned(&self.source_bars, from, &tail, len) {
+            self.resync_revision = revision;
+            self.request_history_resync(w);
             return;
         }
+        self.series_revision = revision;
         let plain = self.replay_cutoff.is_none() && self.chart_type != ChartType::Renko;
         let replay_unchanged = self.chart_type != ChartType::Renko
             && self.view_config == (self.replay_cutoff, None)
@@ -1273,6 +1324,7 @@ impl ChartState {
         self.apply_view_with_len(bars, gpu, 0, true, w, old_len);
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn on_history(
         &mut self,
@@ -1285,12 +1337,68 @@ impl ChartState {
         live: bool,
         w: &Worker,
     ) {
+        self.on_history_revision(
+            generation,
+            self.series_revision + 1,
+            bars,
+            gpu,
+            prepended,
+            from_cache,
+            exhausted,
+            live,
+            w,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_history_revision(
+        &mut self,
+        generation: u64,
+        revision: u64,
+        mut bars: Arc<Vec<Bar>>,
+        mut gpu: SeriesGpu,
+        mut prepended: usize,
+        from_cache: bool,
+        exhausted: bool,
+        live: bool,
+        w: &Worker,
+    ) {
         if generation != self.generation {
             return;
         }
+        // A paging/cache snapshot captured before the gap is not its resync.
+        if self.history_resync && revision < self.resync_revision {
+            return;
+        }
+        let reconciled = revision < self.series_revision;
+        if reconciled {
+            let current = self.live_source.as_ref().unwrap_or(&self.source_bars);
+            let ordered = |bars: &[Bar]| bars.windows(2).all(|pair| pair[0].ts < pair[1].ts);
+            if !ordered(&bars)
+                || !ordered(current)
+                || !current.iter().any(|current| bars.binary_search_by_key(&current.ts, |bar| bar.ts).is_ok())
+            {
+                self.history_resync = false;
+                self.request_history_resync(w);
+                return;
+            }
+            // Preserve the newer overlap as well as the tail: the last bucket may
+            // have changed without advancing its timestamp.
+            let mut merged: std::collections::BTreeMap<_, _> = bars.iter().map(|bar| (bar.ts, *bar)).collect();
+            merged.extend(current.iter().map(|bar| (bar.ts, *bar)));
+            let merged: Vec<_> = merged.into_values().collect();
+            prepended = self.source_bars.first().map_or(0, |first| merged.partition_point(|bar| bar.ts < first.ts));
+            bars = Arc::new(merged);
+        }
+        self.series_revision = self.series_revision.max(revision);
+        self.history_resync = false;
+        self.error = None;
         let session = self.effective_session();
         let filtered = session != tr_core::session::Session::Provider && self.tf.is_intraday();
         self.live_source = filtered.then(|| bars.clone());
+        if reconciled && !filtered {
+            gpu = SeriesGpu::build(&bars);
+        }
         let (bars, gpu, prepended) = if filtered {
             let filtered = Arc::new(session.filter(&bars, self.tf));
             let prepended = if prepended > 0 {
@@ -8136,12 +8244,12 @@ mod tests {
             let mut full = false;
             for _ in 0..3 {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let snapshot = seed % 7 == 0;
+                let snapshot = seed.is_multiple_of(7);
                 let mut bar = authoritative[authoritative.len() - 1];
-                if seed % 3 == 0 {
+                if seed.is_multiple_of(3) {
                     bar.ts += 60;
                 }
-                if snapshot && seed % 5 == 0 {
+                if snapshot && seed.is_multiple_of(5) {
                     bar = authoritative[authoritative.len() / 2];
                 }
                 bar.close += (seed >> 40) as f64 / 1_000_000.;
@@ -8244,7 +8352,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: paging History built asynchronously can roll back newer LiveBars in the same generation"]
     fn review_delayed_prepend_history_preserves_newer_live_tail() {
         let worker = Worker::inert();
         let mut chart = ChartState::new(1, "AAPL", Timeframe::M1);
@@ -8259,9 +8366,16 @@ mod tests {
         paged.extend_from_slice(&initial);
         let snapshot = Arc::new(paged.clone());
         paged[100].close += 5.;
-        chart.on_live_bars(chart.generation, 100, paged[100..].to_vec(), paged.len(), &worker);
-        chart.on_history(
+        let mut next = paged[100];
+        next.ts += 60;
+        paged.push(next);
+        let right = chart.viewport.unwrap().right;
+        // A post-prepend index cannot line up with the unpaged chart. Use a
+        // timestamp-aligned patch to isolate delayed History reconciliation.
+        chart.on_live_bars_revision(chart.generation, 3, 99, paged[100..].to_vec(), initial.len() + 1, &worker);
+        chart.on_history_revision(
             chart.generation,
+            2,
             snapshot.clone(),
             SeriesGpu::build(&snapshot),
             1,
@@ -8274,6 +8388,64 @@ mod tests {
             *chart.source_bars, paged,
             "a delayed paging snapshot must not roll back a live update published after it was captured"
         );
+        assert_eq!(chart.viewport.unwrap().right, right + 2.);
+        assert_eq!(chart.series_revision, 3);
+        assert!(!chart.history_resync);
+        let fresh = SeriesGpu::build(&paged);
+        assert_eq!(chart.gpu.as_ref().unwrap().len(), fresh.len());
+    }
+
+    #[test]
+    fn stale_disjoint_history_requests_resync_without_replacing_view() {
+        let worker = Worker::inert();
+        let mut chart = ChartState::new(1, "AAA", Timeframe::M1);
+        let current = Arc::new(vec![Bar::new(120, 1., 2., 0., 1., 1.)]);
+        chart.on_history_revision(0, 5, current.clone(), SeriesGpu::build(&current), 0, false, false, false, &worker);
+        let old = Arc::new(vec![Bar::new(60, 1., 2., 0., 1., 1.)]);
+        chart.on_history_revision(0, 2, old.clone(), SeriesGpu::build(&old), 1, false, false, false, &worker);
+        assert!(chart.history_resync);
+        assert_eq!(*chart.bars, *current);
+        assert_eq!(chart.series_revision, 5);
+        chart.on_history_revision(0, 5, current.clone(), SeriesGpu::build(&current), 0, false, false, false, &worker);
+        assert!(!chart.history_resync);
+        assert!(chart.error.is_none());
+    }
+
+    #[test]
+    fn live_revisions_ignore_old_patches_and_recover_gaps() {
+        let worker = Worker::inert();
+        let mut chart = ChartState::new(1, "AAA", Timeframe::M1);
+        let initial = Arc::new(vec![Bar::new(60, 1., 2., 0., 1., 1.)]);
+        chart.on_history_revision(0, 1, initial.clone(), SeriesGpu::build(&initial), 0, false, false, false, &worker);
+        let updated = Bar::new(60, 1., 3., 0., 2., 2.);
+        chart.on_live_bars_revision(0, 3, 0, vec![updated], 1, &worker);
+        chart.on_live_bars_revision(0, 2, 0, initial.as_ref().clone(), 1, &worker);
+        assert_eq!(chart.bars[0], updated);
+        let key = chart.gpu.as_ref().unwrap().bars.key;
+        chart.on_live_bars_revision(0, 4, 2, vec![], 2, &worker);
+        chart.on_live_bars_revision(0, 5, 0, initial.as_ref().clone(), 1, &worker);
+        assert!(chart.history_resync);
+        chart.on_history_revision(0, 2, initial.clone(), SeriesGpu::build(&initial), 0, false, false, false, &worker);
+        assert!(chart.history_resync, "pre-gap History must not release the resync gate");
+        assert_eq!(chart.bars[0], updated);
+        assert_eq!(chart.gpu.as_ref().unwrap().bars.key, key);
+        let recovered = Arc::new(vec![updated, Bar::new(120, 2., 3., 1., 2., 1.)]);
+        chart.on_history_revision(
+            0,
+            6,
+            recovered.clone(),
+            SeriesGpu::build(&recovered),
+            0,
+            false,
+            false,
+            false,
+            &worker,
+        );
+        assert!(!chart.history_resync);
+        assert!(chart.error.is_none());
+        let next = Bar::new(180, 2., 4., 1., 3., 1.);
+        chart.on_live_bars_revision(0, 7, 2, vec![next], 3, &worker);
+        assert_eq!(chart.bars.last(), Some(&next));
     }
 
     #[test]
@@ -8321,6 +8493,18 @@ mod tests {
         assert_eq!(*chart.bars, *before);
         expected[0].close += 1.;
         chart.on_live_bars(chart.generation, 0, expected.clone(), expected.len(), &worker);
+        assert_eq!(*chart.bars, *before, "patches wait for resync History");
+        let history = Arc::new(expected.clone());
+        chart.on_history(
+            chart.generation,
+            history.clone(),
+            SeriesGpu::build(&history),
+            0,
+            false,
+            false,
+            false,
+            &worker,
+        );
         assert_ne!(chart.gpu.as_ref().unwrap().bars.key, key, "old backfills rebuild");
         assert_eq!(*chart.bars, expected);
     }

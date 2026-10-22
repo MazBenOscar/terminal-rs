@@ -561,7 +561,7 @@ mod tests {
                 let actual = h.read_pixels();
                 let cached = &h.renderer.buffers[&(false, series.bars.key)];
                 assert_eq!(cached.version, series.bars.version);
-                assert!(cached.buffer.size() <= h.renderer.max_binding as u64);
+                assert!(cached.buffer.size() <= h.renderer.max_binding);
                 render(&mut h, &SeriesGpu::build(&bars));
                 assert_eq!(actual, h.read_pixels(), "evict={evict}, max_binding={max_binding}");
             }

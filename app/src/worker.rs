@@ -356,6 +356,7 @@ pub enum Response {
     LiveBars {
         pane: PaneId,
         generation: u64,
+        revision: u64,
         from: usize,
         bars: Vec<Bar>,
         len: usize,
@@ -437,6 +438,7 @@ pub enum Response {
         symbol: String,
         tf: Timeframe,
         bars: Arc<Vec<Bar>>,
+        revision: u64,
         gpu: SeriesGpu,
         /// Resolved contract belonging to these bars (also applies to cached/live bars).
         crypto_source: Option<tr_core::crypto::CryptoInstrument>,
@@ -526,7 +528,7 @@ pub struct Worker {
 }
 
 /// Bars per pane tagged with the load generation they belong to.
-type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>, String)>;
+type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>, String, u64)>;
 
 const MAX_STUDY_BARS: usize = 10_000;
 const MAX_STUDY_HISTORIES: usize = 32;
@@ -1087,6 +1089,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     symbol: symbol.clone(),
                     tf,
                     bars,
+                    revision: 0,
                     gpu,
                     prepended: 0,
                     from_cache: true,
@@ -1114,7 +1117,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     if !store_series(s, pane, generation, bars.clone()) {
                         return; // superseded while loading
                     }
-                    let Some(bars) = current_series(s, pane, generation) else { return };
+                    let Some((bars, revision)) = series_snapshot(s, pane, generation) else { return };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
                         crypto_source: s.provider.crypto_instrument(&symbol),
@@ -1123,6 +1126,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         symbol: symbol.clone(),
                         tf,
                         bars,
+                        revision,
                         gpu,
                         prepended: 0,
                         from_cache: false,
@@ -1144,8 +1148,8 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 .lock()
                 .expect("series lock")
                 .get(&pane)
-                .filter(|(g, _, _)| *g == generation)
-                .map(|(_, _, source)| source.clone());
+                .filter(|(g, _, _, _)| *g == generation)
+                .map(|(_, _, source, _)| source.clone());
             if previous.as_ref().is_some_and(|previous| previous != &source) {
                 s.send(Response::HistoryError {
                     pane,
@@ -1168,15 +1172,21 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         return;
                     }
                     let older: Vec<Bar> = older.into_iter().filter(|b| b.ts < first.ts).collect();
-                    let prepended = older.len();
-                    let bars = {
+                    let (bars, revision, prepended) = {
                         let mut map = s.series.lock().expect("series lock");
-                        let Some((g, cur, _)) = map.get_mut(&pane).filter(|(g, _, _)| *g == generation) else { return };
-                        let _ = g;
+                        let Some((_, cur, _, revision)) = map.get_mut(&pane).filter(|(g, _, _, _)| *g == generation)
+                        else {
+                            return;
+                        };
                         let mut merged = older;
+                        merged.retain(|bar| cur.first().is_none_or(|first| bar.ts < first.ts));
+                        merged.sort_by_key(|bar| bar.ts);
+                        merged.dedup_by_key(|bar| bar.ts);
+                        let prepended = merged.len();
                         merged.extend_from_slice(cur);
                         *cur = Arc::new(merged);
-                        Arc::new(cur.as_ref().clone())
+                        *revision += 1;
+                        (Arc::new(cur.as_ref().clone()), *revision, prepended)
                     };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
@@ -1186,6 +1196,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         symbol,
                         tf,
                         bars,
+                        revision,
                         gpu,
                         prepended,
                         from_cache: false,
@@ -1912,10 +1923,10 @@ fn chart_cache_key(provider: &dyn tr_data::MarketData, symbol: &str) -> String {
 fn claim_series(s: &Shared, pane: PaneId, generation: u64, source: &str) -> bool {
     let mut map = s.series.lock().expect("series lock");
     match map.get(&pane) {
-        Some((g, _, _)) if *g > generation => false,
-        Some((g, _, route)) if *g == generation => route == source,
+        Some((g, _, _, _)) if *g > generation => false,
+        Some((g, _, route, _)) if *g == generation => route == source,
         _ => {
-            map.insert(pane, (generation, Arc::new(Vec::new()), source.to_string()));
+            map.insert(pane, (generation, Arc::new(Vec::new()), source.to_string(), 0));
             true
         }
     }
@@ -1925,15 +1936,16 @@ fn claim_series(s: &Shared, pane: PaneId, generation: u64, source: &str) -> bool
 fn store_series(s: &Shared, pane: PaneId, generation: u64, bars: Arc<Vec<Bar>>) -> bool {
     let mut map = s.series.lock().expect("series lock");
     match map.get(&pane) {
-        Some((g, _, _)) if *g > generation => false,
+        Some((g, _, _, _)) if *g > generation => false,
         _ => {
-            let source = map.get(&pane).map(|(_, _, source)| source.clone()).unwrap_or_default();
-            let bars = if let Some((_, current, _)) = map.get(&pane) {
+            let source = map.get(&pane).map(|(_, _, source, _)| source.clone()).unwrap_or_default();
+            let bars = if let Some((_, current, _, _)) = map.get(&pane) {
                 Arc::new(merge_history(current, &bars).0)
             } else {
                 bars
             };
-            map.insert(pane, (generation, Arc::new(bars.as_ref().clone()), source));
+            let revision = map.get(&pane).map_or(1, |(_, _, _, revision)| revision + 1);
+            map.insert(pane, (generation, Arc::new(bars.as_ref().clone()), source, revision));
             true
         }
     }
@@ -1944,8 +1956,17 @@ fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<B
         .lock()
         .expect("series lock")
         .get(&pane)
-        .filter(|(g, _, _)| *g == generation)
-        .map(|(_, b, _)| Arc::new(b.as_ref().clone()))
+        .filter(|(g, _, _, _)| *g == generation)
+        .map(|(_, b, _, _)| Arc::new(b.as_ref().clone()))
+}
+
+fn series_snapshot(s: &Shared, pane: PaneId, generation: u64) -> Option<(Arc<Vec<Bar>>, u64)> {
+    s.series
+        .lock()
+        .expect("series lock")
+        .get(&pane)
+        .filter(|(g, _, _, _)| *g == generation)
+        .map(|(_, bars, _, revision)| (Arc::new(bars.as_ref().clone()), *revision))
 }
 
 /// Fetched values win completed overlaps; absorb the last bucket's live partial.
@@ -1975,14 +1996,15 @@ fn backfill_limit(now: i64, since: Option<i64>, tf: Timeframe) -> usize {
 
 fn merge_backfill(s: &Shared, pane: PaneId, generation: u64, source: &str, fetched: &[Bar]) -> Option<usize> {
     let mut map = s.series.lock().expect("series lock");
-    let (_, bars, _) = map.get_mut(&pane).filter(|(g, _, key)| *g == generation && key == source)?;
+    let (_, bars, _, revision) = map.get_mut(&pane).filter(|(g, _, key, _)| *g == generation && key == source)?;
     let (merged, filled) = merge_history(bars, fetched);
     *bars = Arc::new(merged);
+    *revision += 1;
     Some(filled)
 }
 
 fn live_is_current(s: &Shared, pane: PaneId, generation: u64, source: &str) -> bool {
-    s.series.lock().expect("series lock").get(&pane).is_some_and(|(g, _, key)| *g == generation && key == source)
+    s.series.lock().expect("series lock").get(&pane).is_some_and(|(g, _, key, _)| *g == generation && key == source)
 }
 
 /// Merge the provider's live feed (if any) into the pane's series, publishing at most
@@ -2066,7 +2088,7 @@ fn start_live(
                     }
                     let mut map = s.series.lock().expect("series lock");
                     match map.get_mut(&pane) {
-                        Some((g, bars, source)) if *g == generation && *source == chart_options_key(s.provider.as_ref(),&symbol,options)
+                        Some((g, bars, source, revision)) if *g == generation && *source == chart_options_key(s.provider.as_ref(),&symbol,options)
                             => {
                                 let (value, snapshot) = match bar {
                                     tr_data::LiveUpdate::Partial(bar) => (bar, false),
@@ -2082,6 +2104,7 @@ fn start_live(
                                     Series::apply_live(bars, value)
                                 };
                                 if changed {
+                                    *revision += 1;
                                     dirty = true;
                                     dirty_from = dirty_from.min(from);
                                     full_history |= snapshot && from < bars.len().saturating_sub(1);
@@ -2099,9 +2122,9 @@ fn start_live(
                     dirty = false;
                     if !full_history {
                         let map = s.series.lock().expect("series lock");
-                        let Some((_, bars, _)) = map.get(&pane) else { break };
+                        let Some((_, bars, _, revision)) = map.get(&pane) else { break };
                         if dirty_from <= bars.len() {
-                            s.send(Response::LiveBars { pane, generation, from: dirty_from,
+                            s.send(Response::LiveBars { pane, generation, revision: *revision, from: dirty_from,
                                 bars: bars[dirty_from..].to_vec(), len: bars.len() });
                         }
                         dirty_from = usize::MAX;
@@ -2109,7 +2132,7 @@ fn start_live(
                     }
                     full_history = false;
                     dirty_from = usize::MAX;
-                    let Some(bars) = current_series(&s, pane, generation) else { break };
+                    let Some((bars, revision)) = series_snapshot(&s, pane, generation) else { break };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
                     crypto_source: s.provider.crypto_instrument(&symbol),
@@ -2118,6 +2141,7 @@ fn start_live(
                         symbol: symbol.clone(),
                         tf,
                         bars,
+                        revision,
                         gpu,
                         prepended: 0,
                         from_cache: false,
@@ -2224,7 +2248,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: LiveBars gaps set an error without requesting history, so suffix-only updates cannot recover"]
     fn review_live_gap_requests_authoritative_history() {
         let mut worker = Worker::inert();
         let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
@@ -2234,10 +2257,20 @@ mod tests {
         chart.on_history(0, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &worker);
         while requests.try_recv().is_ok() {}
         chart.on_live_bars(0, 2, vec![Bar::new(180, 1., 2., 0., 1., 1.)], 3, &worker);
-        assert!(
-            std::iter::from_fn(|| requests.try_recv().ok()).any(|r| matches!(r, Request::History { .. })),
-            "a missing prefix cannot be recovered from future suffix-only patches; request a full snapshot"
+        for _ in 0..10 {
+            chart.on_live_bars(0, 2, vec![Bar::new(180, 1., 2., 0., 1., 1.)], 3, &worker);
+        }
+        assert_eq!(
+            std::iter::from_fn(|| requests.try_recv().ok())
+                .filter(|r| matches!(r, Request::History { generation: 0, .. }))
+                .count(),
+            1,
+            "request one authoritative snapshot, not one per tick"
         );
+        chart.on_history(0, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &worker);
+        while requests.try_recv().is_ok() {}
+        chart.on_live_bars(0, 2, vec![Bar::new(180, 1., 2., 0., 1., 1.)], 3, &worker);
+        assert!(std::iter::from_fn(|| requests.try_recv().ok()).any(|r| matches!(r, Request::History { .. })));
     }
 
     #[test]
@@ -3821,13 +3854,13 @@ mod tests {
             for _ in 0..80 {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let mut bar = *expected.last().unwrap();
-                if seed % 3 == 0 {
+                if seed.is_multiple_of(3) {
                     bar.ts += 60;
                 }
                 bar.close += (seed >> 40) as f64 / 1_000_000.;
                 bar.high = bar.high.max(bar.close);
                 bar.volume += 1.;
-                let update = if seed % 7 == 0 {
+                let update = if seed.is_multiple_of(7) {
                     Series::apply_snapshot(&mut expected, bar);
                     tr_data::LiveUpdate::Snapshot(bar)
                 } else {
@@ -3889,7 +3922,8 @@ mod tests {
                     for response in responses.try_iter() {
                         match response {
                             Response::LiveStatus { message: None, .. } => clears += 1,
-                            Response::LiveBars { pane, generation, from, bars, len } => {
+                            Response::LiveBars { pane, generation, revision, from, bars, len } => {
+                                assert_eq!(revision, 2 + step as u64);
                                 assert_eq!((pane, generation), (1, 2));
                                 assert_eq!(from, (999 + step) as usize);
                                 assert_eq!(bars, vec![bar]);
