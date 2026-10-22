@@ -2214,6 +2214,299 @@ mod tests {
         drop(tx);
     }
 
+    // ---- adversarial reconnect-recovery tests (task C03) ----
+
+    /// Probe 5 (report-only): after "restored; filling missed bars" and a
+    /// successful Reconnected backfill, the worker sends
+    /// LiveStatus Some("Filled N missed bars"). chart_view's paint_live_badge
+    /// shows the amber "STREAM WAITING" badge whenever live_notice is Some,
+    /// and live_notice is only cleared when the *next* Partial/Snapshot arrives
+    /// (worker sends LiveStatus None). The success message therefore sits under
+    /// the amber STREAM WAITING badge until the next bar — a success state is
+    /// presented as a waiting/error state. No fix per task instructions.
+    #[tokio::test]
+    #[ignore = "BUG: success message 'Filled N missed bars' is shown under amber STREAM WAITING badge until the next bar clears live_notice"]
+    async fn filled_missed_bars_message_lingers_under_stream_waiting_badge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Feed {
+            rx: std::sync::Mutex<Option<tr_data::LiveFeed>>,
+            calls: AtomicUsize,
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Feed {
+            fn name(&self) -> &str {
+                "fixture"
+            }
+            fn live(&self, _: &str, _: Timeframe) -> Option<tr_data::LiveFeed> {
+                self.rx.lock().unwrap().take()
+            }
+            async fn history(
+                &self,
+                _: &str,
+                _: Timeframe,
+                _: Option<i64>,
+                _: usize,
+            ) -> anyhow::Result<Vec<Bar>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(vec![Bar::new(120, 2., 2., 2., 2., 1.)])
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let provider = Arc::new(Feed {
+            rx: std::sync::Mutex::new(Some(rx)),
+            calls: AtomicUsize::new(0),
+            started: Default::default(),
+            release: Default::default(),
+        });
+        let (s, responses) = backfill_shared(provider.clone());
+        let source = chart_options_key(provider.as_ref(), "AAA", Default::default());
+        assert!(claim_series(&s, 1, 2, &source));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(60, 1., 1., 1., 1., 1.)])));
+        start_live(s.clone(), 1, 2, "AAA".into(), Timeframe::M1, Default::default());
+
+        // Reconnect recovery sequence from the live feed.
+        tx.send(tr_data::LiveUpdate::Status("Binance live stream restored; filling missed bars".into())).await.unwrap();
+        tx.send(tr_data::LiveUpdate::Reconnected { since: Some(60) }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), provider.started.notified()).await.unwrap();
+        provider.release.notify_one();
+
+        // Wait for the "Filled 1 missed bars" LiveStatus.
+        let mut seen_filled = false;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                for r in responses.try_iter() {
+                    if matches!(&r, Response::LiveStatus { message: Some(m), .. } if m == "Filled 1 missed bars") {
+                        seen_filled = true;
+                    }
+                }
+                if seen_filled {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // BUG DEMONSTRATION: at this point chart_view.live_notice is
+        // Some("Filled 1 missed bars") and paint_live_badge renders the amber
+        // "STREAM WAITING" badge. The notice is only cleared by the next
+        // Partial (worker sends LiveStatus None).
+        //
+        // Correct behaviour: a successful fill is a success state and must
+        // clear the notice immediately (LiveStatus None right after the fill)
+        // so the amber STREAM WAITING badge does not linger over a success
+        // message. The assertion below encodes that contract and fails today.
+
+        // We deliberately do NOT send a Partial. The worker should still clear
+        // the live notice after a successful fill.
+        let mut saw_none_after_fill = false;
+        tokio::time::timeout(Duration::from_millis(400), async {
+            loop {
+                for r in responses.try_iter() {
+                    if matches!(r, Response::LiveStatus { message: None, .. }) {
+                        saw_none_after_fill = true;
+                    }
+                }
+                if saw_none_after_fill {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .ok();
+        assert!(saw_none_after_fill,
+            "successful fill must clear live_notice (send LiveStatus None) without waiting for the next bar; \
+             otherwise 'Filled N missed bars' sits under the amber STREAM WAITING badge");
+        drop(tx);
+    }
+
+    /// Probe 4: a second Reconnected while the first backfill is in flight is
+    /// coalesced (no second history call). The first call's `since`/limit wins.
+    /// This is acceptable when since is monotonically non-decreasing (the
+    /// first window covers the second), but the second `since` is silently
+    /// dropped — if the first backfill then fails, no retry covers the newer gap.
+    #[tokio::test]
+    async fn second_reconnected_during_backfill_is_coalesced_with_first_since() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Feed {
+            rx: std::sync::Mutex<Option<tr_data::LiveFeed>>,
+            calls: AtomicUsize,
+            limits: std::sync::Mutex<Vec<usize>>,
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Feed {
+            fn name(&self) -> &str {
+                "fixture"
+            }
+            fn live(&self, _: &str, _: Timeframe) -> Option<tr_data::LiveFeed> {
+                self.rx.lock().unwrap().take()
+            }
+            async fn history(
+                &self,
+                _: &str,
+                _: Timeframe,
+                _: Option<i64>,
+                limit: usize,
+            ) -> anyhow::Result<Vec<Bar>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.limits.lock().unwrap().push(limit);
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(vec![Bar::new(120, 2., 2., 2., 2., 1.)])
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let provider = Arc::new(Feed {
+            rx: std::sync::Mutex::new(Some(rx)),
+            calls: AtomicUsize::new(0),
+            limits: Default::default(),
+            started: Default::default(),
+            release: Default::default(),
+        });
+        let (s, responses) = backfill_shared(provider.clone());
+        let source = chart_options_key(provider.as_ref(), "AAA", Default::default());
+        assert!(claim_series(&s, 1, 2, &source));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(60, 1., 1., 1., 1., 1.)])));
+        start_live(s.clone(), 1, 2, "AAA".into(), Timeframe::M1, Default::default());
+
+        // First recovery: since=60 → limit based on now-60.
+        tx.send(tr_data::LiveUpdate::Reconnected { since: Some(60) }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), provider.started.notified()).await.unwrap();
+        // Second recovery while first backfill runs: coalesced, no new call.
+        tx.send(tr_data::LiveUpdate::Reconnected { since: Some(120) }).await.unwrap();
+        // A live bar keeps flowing during backfill.
+        tx.send(tr_data::LiveUpdate::Partial(Bar::new(180, 3., 3., 3., 3., 1.))).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while current_series(&s, 1, 2).unwrap().last().unwrap().ts != 180 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1, "second Reconnected must coalesce into the in-flight fetch");
+        provider.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if responses.try_iter().any(|r| matches!(r, Response::LiveStatus { message: Some(_), .. })) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        // The coalesced call used the first since's limit; the second since was dropped.
+        let limits = provider.limits.lock().unwrap().clone();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(current_series(&s, 1, 2).unwrap().iter().map(|b| b.ts).collect::<Vec<_>>(), vec![60, 120, 180]);
+        drop(tx);
+    }
+
+    /// Probe 4b: if the first backfill fails while a second Reconnected was
+    /// coalesced and lost, the missed bars from the second gap are not
+    /// automatically retried. Only a manual history refresh recovers them.
+    #[tokio::test]
+    #[ignore = "BUG: coalesced Reconnected is lost when the in-flight backfill fails — no automatic retry covers the second gap"]
+    async fn coalesced_reconnected_lost_when_backfill_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Feed {
+            rx: std::sync::Mutex<Option<tr_data::LiveFeed>>,
+            calls: AtomicUsize,
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Feed {
+            fn name(&self) -> &str {
+                "fixture"
+            }
+            fn live(&self, _: &str, _: Timeframe) -> Option<tr_data::LiveFeed> {
+                self.rx.lock().unwrap().take()
+            }
+            async fn history(
+                &self,
+                _: &str,
+                _: Timeframe,
+                _: Option<i64>,
+                _: usize,
+            ) -> anyhow::Result<Vec<Bar>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_one();
+                self.release.notified().await;
+                anyhow::bail!("simulated history failure")
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let provider = Arc::new(Feed {
+            rx: std::sync::Mutex::new(Some(rx)),
+            calls: AtomicUsize::new(0),
+            started: Default::default(),
+            release: Default::default(),
+        });
+        let (s, responses) = backfill_shared(provider.clone());
+        let source = chart_options_key(provider.as_ref(), "AAA", Default::default());
+        assert!(claim_series(&s, 1, 2, &source));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(60, 1., 1., 1., 1., 1.)])));
+        start_live(s.clone(), 1, 2, "AAA".into(), Timeframe::M1, Default::default());
+
+        // First Reconnected starts a backfill that will fail.
+        tx.send(tr_data::LiveUpdate::Reconnected { since: Some(60) }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), provider.started.notified()).await.unwrap();
+        // Second Reconnected while backfill is in-flight. We then send a Partial
+        // and wait for it to land in the series — mpsc ordering guarantees the
+        // second Reconnected was consumed (and coalesced) before the Partial.
+        tx.send(tr_data::LiveUpdate::Reconnected { since: Some(120) }).await.unwrap();
+        tx.send(tr_data::LiveUpdate::Partial(Bar::new(180, 3., 3., 3., 3., 1.))).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while current_series(&s, 1, 2).unwrap().last().unwrap().ts != 180 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The second Reconnected has been coalesced into the still-running first
+        // fetch. Now let that fetch fail.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        provider.release.notify_one();
+
+        // Wait for the failure status.
+        let mut saw_fail = false;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                for r in responses.try_iter() {
+                    if matches!(&r, Response::LiveStatus { message: Some(m), .. } if m.contains("failed")) {
+                        saw_fail = true;
+                    }
+                }
+                if saw_fail {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Correct behaviour: when the in-flight backfill fails, the coalesced
+        // second Reconnected (since=120) must still schedule a retry so the
+        // second gap is not silently abandoned. Today the second Reconnected
+        // is dropped at coalescing time and never recovered.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(provider.calls.load(Ordering::SeqCst) >= 2,
+            "coalesced Reconnected must be retried after the in-flight backfill fails \
+             (expected >=2 history calls, got {})",
+            provider.calls.load(Ordering::SeqCst));
+        drop(tx);
+    }
+
     #[test]
     fn study_history_eviction_keeps_the_32_newest_fetches() {
         let now = Instant::now();

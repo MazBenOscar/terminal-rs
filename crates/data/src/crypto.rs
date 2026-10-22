@@ -1014,4 +1014,372 @@ mod tests {
         recovery.healthy("Coinbase", &tx).await.unwrap();
         assert!(rx.try_recv().is_err());
     }
+
+    // ---- adversarial reconnect-recovery tests (task C03) ----
+
+    fn kline_for(symbol: &str, ts: i64) -> Message {
+        Message::Text(
+            serde_json::json!({
+                "k": {"s": symbol, "t": ts * 1000, "o": "2", "h": "3",
+                      "l": "1", "c": "2", "v": "1"}
+            })
+            .to_string()
+            .into(),
+        )
+    }
+
+    /// Probe 1: a non-JSON text frame must not tear down an otherwise healthy
+    /// Binance connection. One garbage frame forces a full reconnect cycle
+    /// (status churn, backoff, Reconnected backfill) for no reason.
+    #[tokio::test]
+    #[ignore = "BUG: non-JSON text frame tears down an otherwise healthy connection via serde_json::from_str(text)?"]
+    async fn non_json_text_frame_should_not_kill_connection() {
+        let (listener, url) = loopback().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(kline(60)).await.unwrap();
+            // Garbage that is valid WebSocket text but not JSON.
+            ws.send(Message::Text("this is not json".into())).await.unwrap();
+            // Connection should survive and keep delivering bars.
+            ws.send(kline(120)).await.unwrap();
+            ws.send(kline(180)).await.unwrap();
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+        });
+        let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_secs(2));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60));
+        // BUG: the next event is a disconnect status instead of the next Partial.
+        // Correct behaviour: Partial(120) arrives and the connection stays up.
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 120),
+            "connection must survive a non-JSON text frame");
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 180));
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    /// Probe 1b: a JSON frame that is not an object must also be skipped.
+    #[tokio::test]
+    async fn non_object_json_text_frame_is_skipped_without_disconnect() {
+        let (listener, url) = loopback().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(kline(60)).await.unwrap();
+            ws.send(Message::Text("123".into())).await.unwrap();
+            ws.send(Message::Text("null".into())).await.unwrap();
+            ws.send(Message::Text("[1,2,3]".into())).await.unwrap();
+            ws.send(kline(120)).await.unwrap();
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+        });
+        let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_secs(2));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 120));
+        // No status messages: the connection never dropped.
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    /// Probe 1: a Binance kline for another symbol is ignored without
+    /// disconnecting or emitting status.
+    #[tokio::test]
+    async fn binance_wrong_symbol_message_is_skipped_quietly() {
+        let (listener, url) = loopback().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(kline_for("ETHUSDT", 60)).await.unwrap();
+            ws.send(kline_for("ETHUSDT", 120)).await.unwrap();
+            ws.send(kline(180)).await.unwrap();
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+        });
+        let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_secs(2));
+        // Only the BTCUSDT bar is delivered; the wrong-symbol frames are silent.
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 180));
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    /// Probe 2: Coinbase 'subscriptions', 'error', and ticker messages with bad
+    /// price/size must be skipped without killing the connection. Heartbeats
+    /// for the right product keep the stream healthy.
+    #[tokio::test]
+    async fn coinbase_control_and_bad_ticker_messages_do_not_disconnect() {
+        let (listener, url) = loopback().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            // read subscribe
+            let _ = ws.next().await;
+            // Subscriptions ack: no product_id, must be ignored.
+            ws.send(Message::Text(
+                r#"{"type":"subscriptions","channels":[{"name":"ticker","product_ids":["BTC-USD"]}]}"#.into(),
+            ))
+            .await
+            .unwrap();
+            // Error message: must be ignored (no product_id).
+            ws.send(Message::Text(r#"{"type":"error","message":"auth required"}"#.into())).await.unwrap();
+            // Ticker with product_id but bad price: must be ignored.
+            ws.send(Message::Text(
+                r#"{"type":"ticker","product_id":"BTC-USD","price":"not-a-number","last_size":"1","time":"2024-01-01T00:00:01.000000Z"}"#.into(),
+            ))
+            .await
+            .unwrap();
+            // Ticker with zero price: must be ignored.
+            ws.send(Message::Text(
+                r#"{"type":"ticker","product_id":"BTC-USD","price":"0","last_size":"1","time":"2024-01-01T00:00:02.000000Z"}"#.into(),
+            ))
+            .await
+            .unwrap();
+            // Ticker with negative size: must be ignored.
+            ws.send(Message::Text(
+                r#"{"type":"ticker","product_id":"BTC-USD","price":"100","last_size":"-5","time":"2024-01-01T00:00:03.000000Z"}"#.into(),
+            ))
+            .await
+            .unwrap();
+            // Ticker for a different product: must be ignored.
+            ws.send(Message::Text(
+                r#"{"type":"ticker","product_id":"ETH-USD","price":"100","last_size":"1","time":"2024-01-01T00:00:04.000000Z"}"#.into(),
+            ))
+            .await
+            .unwrap();
+            // Heartbeat for the right product keeps us healthy.
+            ws.send(Message::Text(r#"{"type":"heartbeat","product_id":"BTC-USD"}"#.into())).await.unwrap();
+            // A valid ticker should still flow.
+            ws.send(Message::Text(
+                r#"{"type":"ticker","product_id":"BTC-USD","price":"100.5","last_size":"1","time":"2024-01-01T00:00:05.000000Z"}"#.into(),
+            ))
+            .await
+            .unwrap();
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+        });
+        let mut rx = test_feed("COINBASE:BTC-USD", url, Duration::from_secs(2));
+        // Only the valid ticker produces a Partial; nothing disconnects.
+        match update(&mut rx).await {
+            crate::LiveUpdate::Partial(b) => assert!(b.close > 100.0),
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    /// Probe 3: when the first message after reconnect is for a different
+    /// product, Reconnected{since} must still be the bucket of the last
+    /// delivered bar (before the gap), not the wrong-product message.
+    #[tokio::test]
+    async fn recovery_since_uses_last_delivered_bar_not_wrong_product_first_message() {
+        let (listener, url) = loopback().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(kline(60)).await.unwrap();
+            ws.send(kline(120)).await.unwrap();
+            ws.close(None).await.unwrap();
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            // First message on the new connection is for another product.
+            ws.send(kline_for("ETHUSDT", 150)).await.unwrap();
+            ws.send(kline_for("ETHUSDT", 160)).await.unwrap();
+            // Then a valid BTCUSDT bar triggers recovery.
+            ws.send(kline(180)).await.unwrap();
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+        });
+        let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_secs(2));
+        for ts in [60, 120] {
+            assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == ts));
+        }
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s)
+            if s == "Binance live stream disconnected; reconnecting…"));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s)
+            if s == "Binance live stream restored; filling missed bars"));
+        // since must be 120 (last delivered bar), not None or a wrong-product ts.
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Reconnected { since: Some(120) }),
+            "since must be the bucket of the last delivered bar");
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 180));
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    /// Probe 3b: if the first message after reconnect is a Coinbase heartbeat
+    /// for the right product, Reconnected fires with the pre-gap since (the
+    /// heartbeat is a valid liveness signal but does not advance `last`).
+    #[tokio::test]
+    async fn coinbase_heartbeat_first_after_reconnect_reports_pre_gap_since() {
+        let (listener, url) = loopback().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = ws.next().await; // subscribe
+            ws.send(Message::Text(
+                r#"{"type":"ticker","product_id":"BTC-USD","price":"100","last_size":"1","time":"2024-01-01T00:10:00.000000Z"}"#.into(),
+            ))
+            .await
+            .unwrap();
+            ws.close(None).await.unwrap();
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = ws.next().await; // subscribe
+            // Heartbeat first: triggers Reconnected with the pre-gap since.
+            ws.send(Message::Text(r#"{"type":"heartbeat","product_id":"BTC-USD"}"#.into())).await.unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"ticker","product_id":"BTC-USD","price":"101","last_size":"1","time":"2024-01-01T00:11:00.000000Z"}"#.into(),
+            ))
+            .await
+            .unwrap();
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+        });
+        let mut rx = test_feed("COINBASE:BTC-USD", url, Duration::from_secs(2));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(_)));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s) if s.contains("disconnected")));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s) if s.contains("restored")));
+        // Heartbeat-triggered Reconnected carries the pre-gap bar bucket.
+        match update(&mut rx).await {
+            crate::LiveUpdate::Reconnected { since } => assert!(since.is_some(), "heartbeat recovery must report since"),
+            other => panic!("expected Reconnected, got {other:?}"),
+        }
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(_)));
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    /// Probe 6: sparse messages that arrive within the idle timeout keep the
+    /// connection alive; the timeout is per-read, not a global deadline.
+    #[tokio::test]
+    async fn sparse_messages_within_idle_timeout_keep_connection_alive() {
+        let (listener, url) = loopback().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for i in 0..5 {
+                ws.send(kline(60 * (i + 1))).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+        });
+        // Idle 250ms; messages arrive every ~80ms so each read resets the timer.
+        let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_millis(250));
+        for i in 0..5 {
+            assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60 * (i + 1)));
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    /// Probe 6b: if messages stop for longer than idle, the connection is
+    /// treated as dead and the loop retries (with a status message).
+    #[tokio::test]
+    async fn silence_beyond_idle_timeout_triggers_reconnect_status() {
+        let (listener, url) = loopback().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(kline(60)).await.unwrap();
+            // Go silent; client should time out and retry.
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(kline(120)).await.unwrap();
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+        });
+        let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_millis(150));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s)
+            if s == "Binance live stream disconnected; reconnecting…"));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s) if s.contains("restored")));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Reconnected { .. }));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 120));
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    /// Probe 7: every Status string emitted across a full failure/recovery
+    /// cycle is a fixed venue template — never a URL, raw payload, or secret.
+    #[tokio::test]
+    async fn status_messages_never_contain_urls_or_server_payloads() {
+        let (listener, url) = loopback().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(kline(60)).await.unwrap();
+            ws.close(None).await.unwrap();
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(kline(120)).await.unwrap();
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+        });
+        let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_secs(2));
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            if let crate::LiveUpdate::Status(s) = update(&mut rx).await {
+                statuses.push(s);
+            }
+        }
+        // rest of the cycle
+        for _ in 0..3 {
+            match update(&mut rx).await {
+                crate::LiveUpdate::Status(s) => statuses.push(s),
+                _ => {}
+            }
+        }
+        assert!(!statuses.is_empty());
+        for s in &statuses {
+            assert!(!s.contains("://"), "status leaked a URL: {s}");
+            assert!(!s.contains("ws://") && !s.contains("wss://") && !s.contains("http"), "status leaked a URL: {s}");
+            assert!(!s.contains('{') && !s.contains('}'), "status leaked a JSON payload: {s}");
+            assert!(!s.contains("127.0.0.1") && !s.contains("localhost"), "status leaked a host: {s}");
+            // Only the three fixed templates (plus worker templates elsewhere).
+            assert!(
+                s.starts_with("Binance live stream "),
+                "unexpected status template: {s}"
+            );
+        }
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    /// Validated behaviour: a Binance bar with invalid OHLCV is skipped without
+    /// disconnecting (parse_binance_ws returns None → continue).
+    #[tokio::test]
+    async fn binance_invalid_bar_values_are_skipped_without_disconnect() {
+        let (listener, url) = loopback().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(kline(60)).await.unwrap();
+            // high < low: invalid bar, must be skipped.
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "k": {"s": "BTCUSDT", "t": 120_000, "o": "5", "h": "1",
+                          "l": "4", "c": "5", "v": "1"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            // NaN price: invalid, must be skipped.
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "k": {"s": "BTCUSDT", "t": 180_000, "o": "NaN", "h": "3",
+                          "l": "1", "c": "2", "v": "1"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(kline(240)).await.unwrap();
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+        });
+        let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_secs(2));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60));
+        // Invalid bars are silently skipped; the connection survives.
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 240));
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
 }
