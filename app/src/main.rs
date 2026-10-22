@@ -28,6 +28,7 @@ mod markets_view;
 mod palette;
 mod prefs;
 mod price_alerts;
+mod symbol_search;
 mod theme;
 mod themes;
 mod watch_sections;

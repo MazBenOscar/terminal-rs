@@ -415,7 +415,9 @@ impl TerminalApp {
             self.cmd_hist_pos = None;
             // The command line stays live, Bloomberg-style, unless the command opened the
             // order ticket (which takes the keyboard for its quantity) or the palette.
-            self.focus_cmd = !self.palette.open && !self.trading.ticket.as_ref().is_some_and(|t| t.focus_qty > 0);
+            self.focus_cmd = self.symbol_search.is_none()
+                && !self.palette.open
+                && !self.trading.ticket.as_ref().is_some_and(|t| t.focus_qty > 0);
             if !self.focus_cmd {
                 resp.surrender_focus();
             }
@@ -463,7 +465,8 @@ impl TerminalApp {
     /// Security suggestions for what is typed, unless it is a function command.
     pub(super) fn suggestions(&self) -> Vec<SearchHit> {
         let q = self.cmd.trim();
-        if q.is_empty()
+        if self.symbol_search.is_some()
+            || q.is_empty()
             || matches!(command::parse(q), Some(command::Command::Function(_) | command::Command::SymbolFunction(..)))
         {
             return Vec::new();
@@ -476,10 +479,11 @@ impl TerminalApp {
 
     /// Autocomplete popover under the command field.
     /// Returns the popover's screen rect when it is shown.
-    fn dropdown(&mut self, ctx: &egui::Context, below: Rect, hits: &[SearchHit]) -> Option<Rect> {
-        if hits.is_empty() {
+    pub(super) fn dropdown(&mut self, ctx: &egui::Context, below: Rect, hits: &[SearchHit]) -> Option<Rect> {
+        if hits.is_empty() && self.cmd.trim().is_empty() {
             return None;
         }
+        let mut search_all = false;
         let mut clicked = None;
         let width = below.width().clamp(420.0, 680.0);
         let shown = anim::ease_out(anim::appear(ctx, Id::new("cmd-suggestions-in"), 0.18));
@@ -529,6 +533,8 @@ impl TerminalApp {
                                 clicked = Some(h.key.clone());
                             }
                         }
+                        ui.separator();
+                        search_all = ui.button("Search all symbols…").clicked();
                         ui.add_space(2.0);
                         ui.label(
                             RichText::new(if MAC {
@@ -541,6 +547,11 @@ impl TerminalApp {
                         );
                     });
             });
+        if search_all {
+            self.apply(Function::Search(self.cmd.trim().into()));
+            self.cmd.clear();
+            self.suggestion = None;
+        }
         if let Some(key) = clicked {
             self.cmd.clear();
             self.suggestion = None;
