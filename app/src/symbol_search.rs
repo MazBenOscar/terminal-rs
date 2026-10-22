@@ -683,4 +683,47 @@ mod tests {
         assert!(outcome.key.unwrap().starts_with("COINBASE:XRP-USD"));
         assert!(outcome.close);
     }
+
+    fn has_key(hits: &[SearchHit], prefix: &str) -> bool {
+        hits.iter().any(|h| h.key.starts_with(prefix))
+    }
+
+    #[test]
+    #[ignore = "BUG: pair query 'xrp/usd' matches neither Coinbase XRP-USD nor Binance XRPUSDT"]
+    fn slash_pair_query_surfaces_crypto_pairs() {
+        let cases: [(&str, &str); 4] = [
+            ("xrp/usd", "COINBASE:XRP-USD"),
+            ("XRP/USD", "COINBASE:XRP-USD"),
+            ("XRP/USDT", "BINANCE:XRPUSDT"),
+            ("btc/usd", "COINBASE:BTC-USD"),
+        ];
+        for (query, expect) in cases {
+            let mut dialog = Dialog::new(query.into(), Some(Target::Append));
+            for (venue, key) in [
+                (CryptoVenue::Binance, "BINANCE:XRPUSDT"),
+                (CryptoVenue::Coinbase, "COINBASE:XRP-USD"),
+                (CryptoVenue::Binance, "BINANCE:BTCUSDT"),
+                (CryptoVenue::Coinbase, "COINBASE:BTC-USD"),
+            ] {
+                dialog.catalog(venue, Ok(vec![CryptoInstrument::parse(key).unwrap()]));
+            }
+            let hits = dialog.results();
+            assert!(
+                has_key(&hits, expect),
+                "{query:?} must surface {expect}: {:?}",
+                hits.iter().map(|h| &h.key).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "BUG: same_key does not canonicalize non-crypto keys, so bare/lowercase forms duplicate"]
+    fn same_key_canonicalizes_bare_lowercase_and_full_market_keys() {
+        assert!(same_key("MSFT", "MSFT US Equity"));
+        assert!(same_key("msft us equity", "MSFT US Equity"));
+        assert!(same_key("aapl", "AAPL US Equity"));
+        assert!(same_key("SPX", "SPX Index"));
+        assert!(same_key("BINANCE:XRPUSDT", "XRPUSDT Curncy"));
+        assert!(!same_key("MSFT", "AAPL US Equity"));
+    }
 }
