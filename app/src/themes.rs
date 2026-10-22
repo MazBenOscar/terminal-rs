@@ -1,4 +1,4 @@
-//! Themes: named bundles of colours, fonts and density. Nine are built in; custom themes
+//! Themes: named bundles of colours, fonts and density. Thirteen are built in; custom themes
 //! are TOML (or JSON) files in `<data dir>/themes/`, so they can be shared, hand-edited,
 //! imported and exported. A file only needs the fields it changes: anything missing is
 //! filled from the built-in dark or light base, chosen by its `dark` flag.
@@ -569,6 +569,165 @@ fn midnight_violet() -> Theme {
     }
 }
 
+// Catppuccin (catppuccin.com, MIT): Mocha and Latte flavours.
+fn catppuccin_mocha() -> Theme {
+    Theme {
+        name: "Catppuccin Mocha".into(),
+        dark: true,
+        colors: ThemeColors {
+            background: Hex::rgb(0x18, 0x18, 0x25),
+            sidebar: Hex::rgba(0x18, 0x18, 0x25, 210),
+            panel: Hex::rgb(0x1e, 0x1e, 0x2e),
+            panel_header: Hex::rgb(0x31, 0x32, 0x44),
+            border: Hex::rgba(0xcd, 0xd6, 0xf4, 28),
+            grid: Hex::rgb(0x25, 0x25, 0x36),
+            text: Hex::rgb(0xcd, 0xd6, 0xf4),
+            muted: Hex::rgb(0x7f, 0x84, 0x9c),
+            highlight: Hex::rgb(0xf9, 0xe2, 0xaf),
+            highlight_dim: Hex::rgb(0xa9, 0x9a, 0x78),
+            info: Hex::rgb(0x74, 0xc7, 0xec),
+            control: Hex::rgba(0xcd, 0xd6, 0xf4, 20),
+            control_hover: Hex::rgba(0xcd, 0xd6, 0xf4, 36),
+            accent: Some(Hex::rgb(0xcb, 0xa6, 0xf7)),
+            up: Hex::rgb(0xa6, 0xe3, 0xa1),
+            down: Hex::rgb(0xf3, 0x8b, 0xa8),
+            candle_up: Hex::rgb(0xa6, 0xe3, 0xa1),
+            candle_down: Hex::rgb(0xf3, 0x8b, 0xa8),
+            series: [
+                Hex::rgb(0x89, 0xb4, 0xfa),
+                Hex::rgb(0xcb, 0xa6, 0xf7),
+                Hex::rgb(0xfa, 0xb3, 0x87),
+                Hex::rgb(0x94, 0xe2, 0xd5),
+                Hex::rgb(0xb4, 0xbe, 0xfe),
+                Hex::rgb(0xf5, 0xc2, 0xe7),
+            ],
+        },
+        fonts: fonts(UiFont::System, MonoFont::System, 1.0),
+        density: Density::Regular,
+        builtin: true,
+        source: None,
+    }
+}
+
+fn catppuccin_latte() -> Theme {
+    Theme {
+        name: "Catppuccin Latte".into(),
+        dark: false,
+        colors: ThemeColors {
+            background: Hex::rgb(0xe6, 0xe9, 0xef),
+            sidebar: Hex::rgba(0xe6, 0xe9, 0xef, 200),
+            panel: Hex::rgb(0xef, 0xf1, 0xf5),
+            panel_header: Hex::rgb(0xe6, 0xe9, 0xef),
+            border: Hex::rgba(0x4c, 0x4f, 0x69, 40),
+            grid: Hex::rgb(0xe3, 0xe6, 0xec),
+            text: Hex::rgb(0x4c, 0x4f, 0x69),
+            muted: Hex::rgb(0x6c, 0x6f, 0x85),
+            highlight: Hex::rgb(0xfe, 0x64, 0x0b),
+            highlight_dim: Hex::rgb(0xdf, 0x8e, 0x1d),
+            info: Hex::rgb(0x20, 0x9f, 0xb5),
+            control: Hex::rgba(0x4c, 0x4f, 0x69, 18),
+            control_hover: Hex::rgba(0x4c, 0x4f, 0x69, 32),
+            accent: Some(Hex::rgb(0x88, 0x39, 0xef)),
+            up: Hex::rgb(0x40, 0xa0, 0x2b),
+            down: Hex::rgb(0xd2, 0x0f, 0x39),
+            candle_up: Hex::rgb(0x40, 0xa0, 0x2b),
+            candle_down: Hex::rgb(0xd2, 0x0f, 0x39),
+            series: [
+                Hex::rgb(0x1e, 0x66, 0xf5),
+                Hex::rgb(0x88, 0x39, 0xef),
+                Hex::rgb(0xdf, 0x8e, 0x1d),
+                Hex::rgb(0x17, 0x92, 0x99),
+                Hex::rgb(0x72, 0x87, 0xfd),
+                Hex::rgb(0xea, 0x76, 0xcb),
+            ],
+        },
+        fonts: fonts(UiFont::System, MonoFont::System, 1.0),
+        density: Density::Regular,
+        builtin: true,
+        source: None,
+    }
+}
+
+// Rosé Pine (rosepinetheme.com, MIT): main and Dawn. The palette has no true green, so
+// gains use foam (pine on Dawn) against love for losses.
+fn rose_pine() -> Theme {
+    Theme {
+        name: "Rosé Pine".into(),
+        dark: true,
+        colors: ThemeColors {
+            background: Hex::rgb(0x16, 0x14, 0x1f),
+            sidebar: Hex::rgba(0x1f, 0x1d, 0x2e, 210),
+            panel: Hex::rgb(0x19, 0x17, 0x24),
+            panel_header: Hex::rgb(0x1f, 0x1d, 0x2e),
+            border: Hex::rgba(0xe0, 0xde, 0xf4, 26),
+            grid: Hex::rgb(0x21, 0x20, 0x2e),
+            text: Hex::rgb(0xe0, 0xde, 0xf4),
+            muted: Hex::rgb(0x90, 0x8c, 0xaa),
+            highlight: Hex::rgb(0xf6, 0xc1, 0x77),
+            highlight_dim: Hex::rgb(0xa5, 0x82, 0x5a),
+            info: Hex::rgb(0xc4, 0xa7, 0xe7),
+            control: Hex::rgba(0xe0, 0xde, 0xf4, 20),
+            control_hover: Hex::rgba(0xe0, 0xde, 0xf4, 36),
+            accent: Some(Hex::rgb(0xc4, 0xa7, 0xe7)),
+            up: Hex::rgb(0x9c, 0xcf, 0xd8),
+            down: Hex::rgb(0xeb, 0x6f, 0x92),
+            candle_up: Hex::rgb(0x9c, 0xcf, 0xd8),
+            candle_down: Hex::rgb(0xeb, 0x6f, 0x92),
+            series: [
+                Hex::rgb(0xc4, 0xa7, 0xe7),
+                Hex::rgb(0xeb, 0xbc, 0xba),
+                Hex::rgb(0xf6, 0xc1, 0x77),
+                Hex::rgb(0x9c, 0xcf, 0xd8),
+                Hex::rgb(0xeb, 0x6f, 0x92),
+                Hex::rgb(0x31, 0x74, 0x8f),
+            ],
+        },
+        fonts: fonts(UiFont::System, MonoFont::System, 1.0),
+        density: Density::Regular,
+        builtin: true,
+        source: None,
+    }
+}
+
+fn rose_pine_dawn() -> Theme {
+    Theme {
+        name: "Rosé Pine Dawn".into(),
+        dark: false,
+        colors: ThemeColors {
+            background: Hex::rgb(0xf2, 0xe9, 0xe1),
+            sidebar: Hex::rgba(0xf2, 0xe9, 0xe1, 200),
+            panel: Hex::rgb(0xfa, 0xf4, 0xed),
+            panel_header: Hex::rgb(0xf2, 0xe9, 0xe1),
+            border: Hex::rgba(0x46, 0x42, 0x61, 36),
+            grid: Hex::rgb(0xf4, 0xed, 0xe8),
+            text: Hex::rgb(0x46, 0x42, 0x61),
+            muted: Hex::rgb(0x79, 0x75, 0x93),
+            highlight: Hex::rgb(0xea, 0x9d, 0x34),
+            highlight_dim: Hex::rgb(0xd7, 0x82, 0x7e),
+            info: Hex::rgb(0x90, 0x7a, 0xa9),
+            control: Hex::rgba(0x46, 0x42, 0x61, 18),
+            control_hover: Hex::rgba(0x46, 0x42, 0x61, 32),
+            accent: Some(Hex::rgb(0x90, 0x7a, 0xa9)),
+            up: Hex::rgb(0x28, 0x69, 0x83),
+            down: Hex::rgb(0xb4, 0x63, 0x7a),
+            candle_up: Hex::rgb(0x28, 0x69, 0x83),
+            candle_down: Hex::rgb(0xb4, 0x63, 0x7a),
+            series: [
+                Hex::rgb(0x90, 0x7a, 0xa9),
+                Hex::rgb(0xd7, 0x82, 0x7e),
+                Hex::rgb(0xea, 0x9d, 0x34),
+                Hex::rgb(0x56, 0x94, 0x9f),
+                Hex::rgb(0xb4, 0x63, 0x7a),
+                Hex::rgb(0x28, 0x69, 0x83),
+            ],
+        },
+        fonts: fonts(UiFont::System, MonoFont::System, 1.0),
+        density: Density::Regular,
+        builtin: true,
+        source: None,
+    }
+}
+
 /// The themes that ship with the app, in display order.
 pub fn builtins() -> Vec<Theme> {
     vec![
@@ -581,6 +740,10 @@ pub fn builtins() -> Vec<Theme> {
         nord(),
         monokai(),
         midnight_violet(),
+        catppuccin_mocha(),
+        catppuccin_latte(),
+        rose_pine(),
+        rose_pine_dawn(),
     ]
 }
 
@@ -729,7 +892,7 @@ mod tests {
     #[test]
     fn builtins_are_distinct_and_readable() {
         let all = builtins();
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), 13);
         for (i, t) in all.iter().enumerate() {
             assert!(t.builtin);
             assert!(all[i + 1..].iter().all(|o| !o.name.eq_ignore_ascii_case(&t.name)), "duplicate {}", t.name);
@@ -782,7 +945,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tr-themes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = ThemeStore::new(dir.clone());
-        assert_eq!(store.load_all().len(), 9);
+        assert_eq!(store.load_all().len(), 13);
         let mut mine = Theme { name: "Desk".into(), builtin: false, source: None, ..nord() };
         mine.colors.up = Hex::rgb(1, 2, 3);
         store.save(&mine).unwrap();
@@ -790,7 +953,7 @@ mod tests {
         // A hand-dropped JSON file reusing a built-in name gets a suffix.
         std::fs::write(dir.join("x.json"), r##"{"name":"Nord","colors":{"down":"#ff00ff"}}"##).unwrap();
         let all = store.load_all();
-        assert_eq!(all.len(), 11);
+        assert_eq!(all.len(), 15);
         assert_eq!(find(&all, "Desk").unwrap().colors.up, Hex::rgb(1, 2, 3));
         let copy = find(&all, "Nord (Custom)").unwrap();
         assert_eq!(copy.colors.down, Hex::rgb(255, 0, 255));
@@ -812,7 +975,7 @@ mod tests {
         store.delete(find(&all, "Nord (Custom)").unwrap()).unwrap();
         assert!(store.delete(&desk).is_err());
         assert!(store.delete(&nord()).is_err());
-        assert_eq!(store.load_all().len(), 9);
+        assert_eq!(store.load_all().len(), 13);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
