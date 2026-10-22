@@ -41,11 +41,16 @@ pub fn rows(
                 let single = b.overlays.len() == 1;
                 b.overlays
                     .iter()
-                    .filter_map(|(name, o)| {
-                        o.line.pyramid.data.get(bar).map(|p| p[1] as f64).filter(|v| v.is_finite()).map(|v| {
-                            let value = tr_chart::scale::format_value(v);
-                            if single { value } else { format!("{name} {value}") }
-                        })
+                    .enumerate()
+                    .filter_map(|(k, (name, o))| {
+                        let readout = b.readouts.get(k).and_then(Option::as_ref);
+                        readout
+                            .map_or_else(|| o.line.pyramid.data.get(bar).map(|p| p[1] as f64), |r| r.get(bar).copied())
+                            .filter(|v| v.is_finite())
+                            .map(|v| {
+                                let value = tr_chart::scale::format_value(v);
+                                if single { value } else { format!("{name} {value}") }
+                            })
                     })
                     .collect::<Vec<_>>()
                     .join("  ")

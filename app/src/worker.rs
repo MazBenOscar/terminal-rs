@@ -319,6 +319,9 @@ pub struct BuiltIndicator {
     pub ports: Vec<String>,
     /// Transparent geometry keeps hidden band boundaries in autoscale without a legend entry.
     pub bounds: Vec<Overlay>,
+    /// Per overlay, the study's real values when the drawn line differs from them (a
+    /// higher-timeframe study drawn smoothed). The legend reads these.
+    pub readouts: Vec<Option<Vec<f64>>>,
 }
 
 pub struct Profile {
@@ -702,6 +705,33 @@ async fn congress_refresh(s: &Shared) {
     }
 }
 
+/// Display line for a stepped series: straight segments between the bars where each new
+/// value first appears. Values hold flat after the last change and gaps (NaN) stay gaps,
+/// so every drawn point at a change bar is the real value.
+pub(crate) fn smooth_steps(values: &[f64]) -> Vec<f64> {
+    let mut out = values.to_vec();
+    let mut anchor: Option<usize> = None;
+    for i in 0..values.len() {
+        let v = values[i];
+        if !v.is_finite() {
+            anchor = None;
+            continue;
+        }
+        match anchor {
+            Some(a) if values[a] != v => {
+                let (from, span) = (values[a], (i - a) as f64);
+                for (k, slot) in out.iter_mut().enumerate().take(i).skip(a + 1) {
+                    *slot = from + (v - from) * (k - a) as f64 / span;
+                }
+                anchor = Some(i);
+            }
+            Some(_) => {}
+            None => anchor = Some(i),
+        }
+    }
+    out
+}
+
 fn overlay(values: &[f64], color: egui::Color32, kind: LineKind) -> Overlay {
     let line = if kind == LineKind::Dots { marker_ref(values) } else { line_ref(values) };
     Overlay { line, color: theme::rgba(color), kind, scale: 1.0, width: 1.3, histogram_color: None }
@@ -835,13 +865,22 @@ pub(crate) fn build_indicators_session(
                         &o.values,
                         spec.chart.as_ref().map_or(0, |c| c.displacement),
                     );
-                    let mut overlay = overlay(&values, color, kind);
+                    // A higher-timeframe value holds across each of its chart bars; drawn as a
+                    // line it would look like stairs, so join the points where values change.
+                    let higher = spec.chart.as_ref().and_then(|c| c.timeframe).is_some_and(|t| t > tf);
+                    let (drawn, readout) = if higher && kind == LineKind::Line {
+                        (smooth_steps(&values), Some(values))
+                    } else {
+                        (values, None)
+                    };
+                    let mut overlay = overlay(&drawn, color, kind);
                     overlay.width = custom.map_or(1.3, |c| c.width);
                     overlay.histogram_color = custom.and_then(|c| c.color).map(|_| theme::rgba(color));
-                    Some((o.name.to_string(), overlay))
+                    Some(((o.name.to_string(), overlay), readout))
                 })
-                .collect();
-            BuiltIndicator { spec: spec.clone(), overlays, error, fill, ports, bounds }
+                .collect::<Vec<_>>();
+            let (overlays, readouts) = overlays.into_iter().unzip();
+            BuiltIndicator { spec: spec.clone(), overlays, error, fill, ports, bounds, readouts }
         })
         .collect()
 }
@@ -2554,6 +2593,59 @@ mod tests {
         evict_study_histories(&mut map);
         assert_eq!(map.len(), 1);
         assert_eq!(map[&key].fetched_at, fetched_at);
+    }
+
+    #[test]
+    fn smooth_steps_joins_change_points_and_keeps_gaps_and_the_open_tail() {
+        let n = f64::NAN;
+        let same = |a: &[f64], b: &[f64]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y || x.is_nan() && y.is_nan())
+        };
+        let out = smooth_steps(&[n, n, 10., 10., 10., 16., 16., 16., 13., 13.]);
+        assert!(same(&out, &[n, n, 10., 12., 14., 16., 15., 14., 13., 13.]), "{out:?}");
+        let out = smooth_steps(&[1., 1., n, 3., 3., 5.]);
+        assert!(same(&out, &[1., 1., n, 3., 4., 5.]), "never interpolate across a gap: {out:?}");
+        assert!(smooth_steps(&[]).is_empty());
+    }
+
+    #[test]
+    fn higher_timeframe_lines_draw_smoothed_but_the_legend_keeps_real_values() {
+        let bars: Vec<_> = (0..12 * 30)
+            .map(|i| {
+                let close = 100. + i as f64 * 0.1;
+                Bar::new(1_700_006_400 + i * 7_200, close, close + 1., close - 1., close, 10.)
+            })
+            .collect();
+        let spec = |plot| {
+            let mut spec = IndicatorSpec::new("EMA", &[3.]).unwrap();
+            tr_core::indicators::study::assign_ids(std::slice::from_mut(&mut spec));
+            let chart = spec.chart.as_mut().unwrap();
+            chart.timeframe = Some(Timeframe::D1);
+            chart.outputs.insert("EMA".into(), tr_core::indicators::study::OutputStyle { plot, ..Default::default() });
+            spec
+        };
+        let built = build_indicators(&bars, Timeframe::H2, &[spec(None)], &theme::palette());
+        let real = built[0].readouts[0].as_ref().expect("a daily study on 2H keeps its real values");
+        let drawn: Vec<f64> = (0..bars.len()).map(|i| built[0].overlays[0].1.line.pyramid.data[i][1] as f64).collect();
+        let steps = real.windows(2).filter(|w| w[0] == w[1]).count();
+        assert!(steps > bars.len() / 2, "daily values hold across 2H bars");
+        let changes: Vec<usize> =
+            (1..real.len()).filter(|&i| real[i - 1].is_finite() && real[i] != real[i - 1]).collect();
+        assert!(changes.len() > 5);
+        for &i in &changes {
+            assert!((drawn[i] - real[i]).abs() < 1e-3, "drawn line passes through each new daily value");
+        }
+        let (a, b) = (changes[1], changes[2]);
+        assert!((a + 1..b).all(|i| drawn[i] > real[a] && drawn[i] < real[b]), "and rises between them");
+        let stepped = build_indicators(
+            &bars,
+            Timeframe::H2,
+            &[spec(Some(tr_core::indicators::study::PlotStyle::Steps))],
+            &theme::palette(),
+        );
+        assert!(stepped[0].readouts[0].is_none(), "the Steps plot style keeps the stepped drawing");
+        let native = build_indicators(&bars, Timeframe::D1, &[spec(None)], &theme::palette());
+        assert!(native[0].readouts[0].is_none(), "a study on its own timeframe is drawn as is");
     }
 
     #[test]
