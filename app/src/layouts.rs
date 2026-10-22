@@ -149,9 +149,48 @@ pub enum PaneSettings {
 }
 
 fn deserialize_drawings<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Drawing>, D::Error> {
-    let mut drawings = Vec::<Drawing>::deserialize(deserializer)?;
-    drawings.retain_mut(Drawing::sanitize);
-    Ok(drawings)
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(values.into_iter().filter_map(parse_drawing).collect())
+}
+
+fn parse_drawing(value: serde_json::Value) -> Option<Drawing> {
+    let mut drawing: Drawing = serde_json::from_value(value).ok()?;
+    drawing.sanitize().then_some(drawing)
+}
+
+/// Raw JSON keeps overflowing numbers inside individual drawings until we can
+/// reject just that element. Other fields remain untouched and strictly parsed.
+fn filter_layout_drawings(json: &[u8]) -> Result<(Vec<u8>, usize)> {
+    use serde_json::value::{RawValue, to_raw_value};
+    type Object = std::collections::BTreeMap<String, Box<RawValue>>;
+
+    let mut layout: Object = serde_json::from_slice(json)?;
+    let mut skipped = 0;
+    if let Some(raw_panes) = layout.get_mut("panes") {
+        let mut panes: Vec<Object> = serde_json::from_str(raw_panes.get())?;
+        for pane in &mut panes {
+            let Some(raw_chart) = pane.get_mut("Chart") else { continue };
+            let mut chart: Object = serde_json::from_str(raw_chart.get())?;
+            if let Some(raw_drawings) = chart.get_mut("drawings") {
+                let values: Vec<Box<RawValue>> = serde_json::from_str(raw_drawings.get())?;
+                let mut drawings = Vec::new();
+                for value in values {
+                    let drawing = serde_json::from_str::<Drawing>(value.get())
+                        .ok()
+                        .and_then(|mut drawing| drawing.sanitize().then_some(drawing));
+                    if let Some(drawing) = drawing {
+                        drawings.push(drawing);
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                *raw_drawings = to_raw_value(&drawings)?;
+            }
+            *raw_chart = to_raw_value(&chart)?;
+        }
+        *raw_panes = to_raw_value(&panes)?;
+    }
+    Ok((serde_json::to_vec(&layout)?, skipped))
 }
 
 fn yes() -> bool {
@@ -223,6 +262,9 @@ pub struct WindowGeometry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayoutDoc {
+    /// Load-only diagnostics; never persisted into the layout file.
+    #[serde(skip)]
+    pub skipped_drawings: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchlists: Option<Vec<crate::app::NamedWatchlist>>,
     #[serde(default)]
@@ -292,7 +334,9 @@ impl LayoutDoc {
     }
 
     pub fn from_json(json: &[u8]) -> Result<LayoutDoc> {
-        let mut doc: LayoutDoc = serde_json::from_slice(json).context("parsing layout JSON")?;
+        let (json, skipped) = filter_layout_drawings(json).context("parsing layout JSON")?;
+        let mut doc: LayoutDoc = serde_json::from_slice(&json).context("parsing layout JSON")?;
+        doc.skipped_drawings = skipped;
         if doc.version > FORMAT_VERSION {
             bail!("layout format v{} is newer than this build supports (v{FORMAT_VERSION})", doc.version);
         }
@@ -323,6 +367,7 @@ impl LayoutDoc {
             .collect();
         let ids: Vec<PaneId> = panes.iter().map(|p| p.id).collect();
         LayoutDoc {
+            skipped_drawings: 0,
             watchlists: None,
             active_watchlist: 0,
             watchlist: None,
@@ -1006,7 +1051,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: deserialize_drawings loads Vec<Drawing> as a unit, so one drawing whose JSON fails type/range checks (price: 1e999 -> serde_json 'number out of range', text: 123, profile_rows: -1) aborts the entire LayoutDoc parse instead of dropping that drawing; repair/sanitize never get a chance to salvage the workspace"]
     fn one_unparseable_drawing_does_not_abort_the_whole_layout() {
         let raw = r#"{
             "name": "Mixed",
@@ -1032,6 +1076,27 @@ mod tests {
         assert_eq!(drawings.len(), 2);
         assert_eq!(drawings[0].text, "keep me");
         assert_eq!(drawings[1].tool, tr_chart::drawings::Tool::ArrowMarkUp);
+        assert_eq!(doc.skipped_drawings, 1);
+        assert_eq!(doc.name, "Mixed");
+        assert!(
+            matches!(&doc.panes[0].settings, PaneSettings::Chart { symbol, tf: Timeframe::D1, .. } if symbol == "AAPL")
+        );
+        assert_eq!(LayoutDoc::from_json(&doc.to_json()).unwrap().skipped_drawings, 0);
+
+        // Type/range errors and sanitisation failures have the same isolation.
+        for invalid in [
+            r#"{"tool":"Text","a":{"ts":1,"price":10},"b":{"ts":1,"price":10},"text":123}"#,
+            r#"{"tool":"FixedRangeVolumeProfile","a":{"ts":1,"price":10},"b":{"ts":1,"price":10},"profile_rows":-1}"#,
+            r#"{"tool":"Path","a":{"ts":1,"price":10},"b":{"ts":1,"price":10},"vertices":[]}"#,
+        ] {
+            let start = raw.find(r#"{"tool": "PriceNote""#).unwrap();
+            let end = start + raw[start..].find(r#""width": 1.0}"#).unwrap() + r#""width": 1.0}"#.len();
+            let mut mixed = raw.to_string();
+            mixed.replace_range(start..end, invalid);
+            let loaded = LayoutDoc::from_json(mixed.as_bytes()).unwrap();
+            assert_eq!(loaded.skipped_drawings, 1, "{invalid}");
+            assert_eq!(loaded.panes, doc.panes);
+        }
     }
 
     #[test]

@@ -4198,9 +4198,12 @@ impl ChartState {
                 {
                     let mut anchor = d.a;
                     if matches!(d.tool, Tool::ArrowMarkUp | Tool::ArrowMarkDown | Tool::FlagMark)
-                        && let Some(bar) = self.bars.get(self.index_of_ts(anchor.ts).round().max(0.) as usize)
+                        && let Some(bar) = self.bars.get(self.index_of_ts(anchor.ts).floor().max(0.) as usize)
                     {
-                        anchor.price = if d.tool == Tool::ArrowMarkUp { bar.low } else { bar.high };
+                        let extreme = if d.tool == Tool::ArrowMarkUp { bar.low } else { bar.high };
+                        if extreme.is_finite() {
+                            anchor.price = extreme;
+                        }
                     }
                     px(&anchor)
                 },
@@ -5809,7 +5812,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: paint_drawings looks up the marker bar with index_of_ts(...).round(); index_of_ts already returns the bar centre (k+0.5) so round() yields k+1 — ArrowMarkUp/Down and FlagMark snap to the following bar's low/high (and the last bar falls through to None, keeping the raw anchor price)"]
     fn markers_snap_to_the_anchor_bar_not_the_next_one() {
         let ctx = egui::Context::default();
         let mut chart = drawing_chart();
@@ -5837,11 +5839,23 @@ mod tests {
                 points.iter().all(|p| p[1] > scale.y_of(180.)),
                 "ArrowMarkDown must sit at bar 50 high=151, not bar 51 high=200: {points:?}"
             );
+            let last = chart.bars.last().unwrap();
+            for (tool, extreme) in
+                [(Tool::ArrowMarkUp, last.low), (Tool::ArrowMarkDown, last.high), (Tool::FlagMark, last.high)]
+            {
+                let a = Anchor { ts: last.ts, price: 190. };
+                let d = Drawing::new(tool, a, a);
+                let shapes = chart.drawing_shapes(ui, &d, rect, &v, &scale);
+                let Shape::Polygon(points) = &shapes.last().unwrap().0 else { panic!("marker") };
+                assert!(
+                    points.iter().all(|p| (p[1] - scale.y_of(extreme)).abs() < 40.),
+                    "{tool:?} must use the last bar's extreme, not the placed price: {points:?}"
+                );
+            }
         });
     }
 
     #[test]
-    #[ignore = "BUG: drawing_shapes assigns anchor.price = bar.low/high for ArrowMarkUp/Down and FlagMark without an is_finite guard, so NaN/±inf bar extremes produce non-finite polygon coordinates that paint as nothing and cannot be hit-tested (handles still use the raw anchor, so the drawing looks present but is a ghost)"]
     fn markers_on_bars_with_nonfinite_extremes_keep_finite_hit_testable_geometry() {
         let ctx = egui::Context::default();
         let mut chart = drawing_chart();
