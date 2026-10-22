@@ -4183,10 +4183,12 @@ impl ChartState {
         } else {
             [0., 0.]
         };
-        let bars = (self.index_of_ts(d.b.ts) - self.index_of_ts(d.a.ts)).abs().round() as usize;
+        // Timestamp projection uses bar centers; data lookups need the containing bar.
+        let bar_index = |ts| (self.index_of_ts(ts).floor().max(0.) as usize).min(self.bars.len().saturating_sub(1));
+        let ia = bar_index(d.a.ts);
+        let ib = bar_index(d.b.ts);
+        let bars = ia.abs_diff(ib);
         let closes: Vec<_> = if d.tool == Tool::RegressionTrend {
-            let ia = self.index_of_ts(d.a.ts).round().max(0.) as usize;
-            let ib = self.index_of_ts(d.b.ts).round().max(0.) as usize;
             self.bars.iter().skip(ia.min(ib)).take(ia.max(ib) - ia.min(ib) + 1).map(|bar| bar.close).collect()
         } else {
             Vec::new()
@@ -4198,7 +4200,7 @@ impl ChartState {
                 {
                     let mut anchor = d.a;
                     if matches!(d.tool, Tool::ArrowMarkUp | Tool::ArrowMarkDown | Tool::FlagMark)
-                        && let Some(bar) = self.bars.get(self.index_of_ts(anchor.ts).floor().max(0.) as usize)
+                        && let Some(bar) = self.bars.get(bar_index(anchor.ts))
                     {
                         let extreme = if d.tool == Tool::ArrowMarkUp { bar.low } else { bar.high };
                         if extreme.is_finite() {
@@ -5690,6 +5692,10 @@ mod tests {
         let mut hostile = Vec::new();
         for tool in Tool::ALL {
             let mut drawing = Drawing::new(tool, a, b);
+            drawing.c = Some(a);
+            if drawings::patterns::point_count(tool) > 0 {
+                drawing.pattern_points = vec![a; tool.points()];
+            }
             drawing.vertices = vec![a; 8];
             drawing.arrow_end = true;
             hostile.push(drawing);
@@ -6266,7 +6272,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: drawing_shapes maps anchor timestamps with index_of_ts(ts).round(); index_of_ts returns i+0.5 on a bar so round() is i+1. RegressionTrend therefore fits the wrong bar range (shifted one bar later) and ArrowMark/FlagMark read the next bar's extreme; an anchor on the last bar looks up bars[len] and skips the extreme snap entirely. Use floor() (or cast) instead of round()."]
     fn regression_and_marker_extremes_use_containing_bar_not_the_next_one() {
         let ctx = egui::Context::default();
         let chart = ramp_chart();

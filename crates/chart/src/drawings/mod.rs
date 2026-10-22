@@ -224,7 +224,11 @@ impl Drawing {
             self.vertices.len() >= 2
         } else {
             self.vertices.clear();
-            true
+            if patterns::point_count(self.tool) > 0 {
+                self.pattern_points.len() == self.tool.points()
+            } else {
+                self.tool.points() != 3 || self.c.is_some()
+            }
         }
     }
 
@@ -422,6 +426,10 @@ mod dispatch_tests {
         let a = Anchor { ts: 1, price: 100. };
         for tool in Tool::ALL {
             let mut drawing = Drawing::new(tool, a, a);
+            drawing.c = Some(a);
+            if patterns::point_count(tool) > 0 {
+                drawing.pattern_points = vec![a; tool.points()];
+            }
             drawing.vertices = vec![a; shapes::MAX_POINTS + 500];
             drawing.arrow_end = true;
             assert!(drawing.sanitize());
@@ -466,7 +474,6 @@ mod dispatch_tests {
     }
 
     #[test]
-    #[ignore = "BUG: Drawing::sanitize never rejects incomplete non-path drawings. An Xabcd/Abcd/etc. with empty pattern_points (or a Channel/FibChannel/Pitchfork/FibExtension with c=None) loads as a ghost: handles() is short/empty so the object cannot be selected or deleted individually, and pattern geometry is empty. sanitize() should return false when pattern_points.len() != tool.points() for the pattern family and when c.is_none() for 3-point tools."]
     fn sanitize_rejects_incomplete_pattern_and_three_point_drawings() {
         let a = Anchor { ts: 1, price: 100. };
         let b = Anchor { ts: 2, price: 90. };
@@ -482,6 +489,8 @@ mod dispatch_tests {
             assert!(!drawing.sanitize(), "empty pattern_points must be rejected for {tool:?}");
             drawing.pattern_points = vec![a; tool.points().saturating_sub(1)];
             assert!(!drawing.sanitize(), "short pattern_points must be rejected for {tool:?}");
+            drawing.pattern_points = vec![a; tool.points() + 1];
+            assert!(!drawing.sanitize(), "excess pattern_points must be rejected for {tool:?}");
         }
         for tool in [Tool::Channel, Tool::FibChannel, Tool::FibExtension, Tool::Pitchfork] {
             let mut drawing = Drawing::new(tool, a, b);
