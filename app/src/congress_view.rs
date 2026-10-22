@@ -14,6 +14,7 @@ use crate::worker::Profile;
 pub enum Action {
     Notice(String),
     OpenChart(String),
+    AddToCompare(String),
     ScanChart {
         symbol: String,
         symbols: Vec<String>,

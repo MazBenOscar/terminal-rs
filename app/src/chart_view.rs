@@ -820,6 +820,22 @@ impl ChartState {
         self.compare_color(self.compare.as_deref().unwrap_or_default())
     }
 
+    pub fn add_comparison(&mut self, symbol: String, w: &Worker) {
+        let Some(symbol) = crate::chart_compare::parse_key(&symbol).filter(|s| *s != self.symbol) else {
+            return;
+        };
+        self.data.hidden_comparisons.retain(|s| s != &symbol);
+        if self.compare.is_none() {
+            self.set_compare(Some(symbol), w);
+        } else if self.compare.as_ref() != Some(&symbol)
+            && !self.data.comparisons.contains(&symbol)
+            && self.data.comparisons.len() < 7
+        {
+            self.data.comparisons.push(symbol);
+            self.request_compare(w);
+        }
+    }
+
     pub fn set_compare(&mut self, symbol: Option<String>, w: &Worker) {
         self.data.comparisons.clear();
         self.data.hidden_comparisons.clear();
@@ -1773,17 +1789,7 @@ impl ChartState {
             w,
         ) {
             if let Some(symbol) = chosen {
-                self.data.hidden_comparisons.retain(|s| s != &symbol);
-                if self.compare.is_none() {
-                    self.set_compare(Some(symbol), w);
-                } else if self.compare.as_ref() != Some(&symbol)
-                    && !self.data.comparisons.contains(&symbol)
-                    && self.data.comparisons.len() < 7
-                {
-                    self.data.hidden_comparisons.retain(|s| s != &symbol);
-                    self.data.comparisons.push(symbol);
-                    self.request_compare(w);
-                }
+                self.add_comparison(symbol, w);
             } else if self.data.comparisons.is_empty() {
                 self.set_compare(None, w);
             } else {
@@ -7930,5 +7936,72 @@ mod tests {
         let (abs, pct) = candle_info(&bars, 3).unwrap().change.unwrap();
         assert!((abs + 1.2).abs() < 1e-9 && (pct.unwrap() + 10.0).abs() < 1e-9);
         assert_eq!(candle_info(&bars, 4), None);
+    }
+
+    #[test]
+    fn add_comparison_ignores_the_chart_symbol_and_already_compared_keys() {
+        let mut chart = sample_chart();
+        let worker = Worker::inert();
+        let aapl = tr_data::security("AAPL").key();
+        let spy = tr_data::security("SPY").key();
+        let msft = tr_data::security("MSFT").key();
+        assert_eq!(chart.symbol, aapl);
+        chart.add_comparison(aapl.clone(), &worker);
+        assert!(chart.compare.is_none() && chart.data.comparisons.is_empty(), "chart symbol is not a comparison");
+        chart.add_comparison(spy.clone(), &worker);
+        assert_eq!(chart.compare.as_deref(), Some(spy.as_str()));
+        chart.add_comparison(spy.clone(), &worker);
+        assert_eq!(chart.data.comparisons, Vec::<String>::new(), "re-adding the primary must not duplicate it");
+        chart.add_comparison(msft.clone(), &worker);
+        chart.add_comparison(msft.clone(), &worker);
+        assert_eq!(chart.data.comparisons, vec![msft], "re-adding an extra must not duplicate it");
+    }
+
+    #[test]
+    fn add_comparison_appends_without_clearing_existing_ones() {
+        let mut chart = sample_chart();
+        let worker = Worker::inert();
+        let spy = tr_data::security("SPY").key();
+        let msft = tr_data::security("MSFT").key();
+        let nvda = tr_data::security("NVDA").key();
+        chart.add_comparison(spy.clone(), &worker);
+        chart.add_comparison(msft.clone(), &worker);
+        chart.add_comparison(nvda.clone(), &worker);
+        assert_eq!(chart.compare.as_deref(), Some(spy.as_str()));
+        assert_eq!(chart.data.comparisons, vec![msft, nvda], "extras accumulate; the primary is never replaced");
+    }
+
+    #[test]
+    fn add_comparison_stops_at_the_extra_comparison_limit() {
+        let mut chart = sample_chart();
+        let worker = Worker::inert();
+        let keys: Vec<String> =
+            ["SPY", "MSFT", "NVDA", "QQQ", "DIA", "IWM", "TLT", "GLD", "USO"].iter().map(|s| tr_data::security(s).key()).collect();
+        chart.add_comparison(keys[0].clone(), &worker);
+        for k in &keys[1..8] {
+            chart.add_comparison(k.clone(), &worker);
+        }
+        assert_eq!(chart.data.comparisons.len(), 7, "seven extras plus the primary");
+        assert_eq!(chart.compare.as_deref(), Some(keys[0].as_str()));
+        chart.add_comparison(keys[8].clone(), &worker);
+        assert_eq!(chart.data.comparisons.len(), 7, "the limit is a hard stop");
+        assert!(!chart.data.comparisons.contains(&keys[8]));
+    }
+
+    #[test]
+    fn add_comparison_unhides_a_hidden_series_instead_of_dropping_it() {
+        let mut chart = sample_chart();
+        let worker = Worker::inert();
+        let spy = tr_data::security("SPY").key();
+        let msft = tr_data::security("MSFT").key();
+        chart.add_comparison(spy.clone(), &worker);
+        chart.add_comparison(msft.clone(), &worker);
+        chart.data.hidden_comparisons.push(spy.clone());
+        chart.data.hidden_comparisons.push(msft.clone());
+        chart.add_comparison(spy.clone(), &worker);
+        chart.add_comparison(msft.clone(), &worker);
+        assert!(chart.data.hidden_comparisons.is_empty(), "re-adding shows a hidden series again");
+        assert_eq!(chart.compare.as_deref(), Some(spy.as_str()));
+        assert_eq!(chart.data.comparisons, vec![msft]);
     }
 }

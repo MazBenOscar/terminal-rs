@@ -293,4 +293,53 @@ mod tests {
         ];
         assert_eq!(sanitize(&["A".into()], stored), [WatchSection { name: "Kept".into(), collapsed: true, at: 1 }]);
     }
+
+    #[test]
+    fn remove_section_keeps_ungrouped_symbols_and_reveals_collapsed_ones() {
+        let mut rows = vec![sym("U"), sec("A"), sym("X"), sec("B"), sym("Y")];
+        set_collapsed(&mut rows, 1, true);
+        assert_eq!(visible(&rows), [0, 1, 3, 4], "X is hidden under collapsed A");
+        assert!(remove_section(&mut rows, 1));
+        assert_eq!(names(&rows), ["U", "X", "#B", "Y"]);
+        assert_eq!(visible(&rows), [0, 1, 2, 3], "X joins the ungrouped run and is shown again");
+        // First header with ungrouped symbols above: they simply stay ungrouped.
+        let mut rows = vec![sym("U"), sec("A"), sym("X")];
+        assert!(remove_section(&mut rows, 1));
+        assert_eq!(names(&rows), ["U", "X"]);
+        assert!(section_of(&rows, 0).is_none() && section_of(&rows, 1).is_none());
+    }
+
+    #[test]
+    fn block_end_of_a_section_is_unaffected_by_collapse() {
+        let mut rows = vec![sec("A"), sym("X"), sym("Y"), sec("B"), sym("Z")];
+        set_collapsed(&mut rows, 0, true);
+        assert_eq!(block(&rows, 0), 0..3, "the hidden symbols stay inside the block");
+        let mut rows2 = rows.clone();
+        insert_section(&mut rows2, block(&rows, 0).end, "Below A").unwrap();
+        assert_eq!(names(&rows2), ["#A", "X", "Y", "#Below A", "#B", "Z"]);
+    }
+
+    #[test]
+    fn insert_section_above_the_first_row_and_an_ungrouped_row() {
+        let mut rows = vec![sym("U"), sym("V"), sec("A"), sym("X")];
+        insert_section(&mut rows, 0, "Top").unwrap();
+        assert_eq!(names(&rows), ["#Top", "U", "V", "#A", "X"]);
+        insert_section(&mut rows, 2, "Between").unwrap();
+        assert_eq!(names(&rows), ["#Top", "U", "#Between", "V", "#A", "X"]);
+    }
+
+    #[test]
+    fn section_name_trims_and_rejects_blank_long_and_invisible_input() {
+        assert_eq!(section_name("  Macro  ").unwrap(), "Macro");
+        assert!(section_name("   ").is_err());
+        assert!(section_name("").is_err());
+        assert!(section_name(&"x".repeat(41)).is_err());
+        assert_eq!(section_name(&"y".repeat(40)).unwrap(), "y".repeat(40));
+        assert!(section_name("A\u{200b}B").is_err());
+        assert!(section_name("\u{202e}niam").is_err());
+        // Duplicates are permitted: nothing in the model keys sections by name.
+        let mut rows = vec![sec("Same"), sec("Same")];
+        rename_section(&mut rows, 1, "Same").unwrap();
+        assert_eq!(names(&rows), ["#Same", "#Same"]);
+    }
 }

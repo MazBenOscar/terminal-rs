@@ -495,6 +495,8 @@ struct Settings {
     #[serde(default)]
     active_watchlist: usize,
     #[serde(default = "default_true")]
+    watch_details: bool,
+    #[serde(default = "default_true")]
     sidebar: bool,
     /// Name of the layout to restore on launch.
     #[serde(default)]
@@ -590,6 +592,20 @@ fn migrate_legacy(s: &Settings, defaults: &prefs::PanelDefaults) -> Option<Layou
     Some(LayoutDoc::preset("Default", s.layout.unwrap_or(Layout::Grid2x2), panes))
 }
 
+#[derive(Clone, Copy)]
+enum WatchEntryKind {
+    Section,
+    Rename,
+    Symbol,
+}
+
+#[derive(Clone)]
+struct WatchItemEntry {
+    kind: WatchEntryKind,
+    index: usize,
+    text: String,
+}
+
 /// How long an alert toast stays up.
 const TOAST_SECS: u64 = 10;
 
@@ -680,6 +696,9 @@ pub struct TerminalApp {
     watchlists: Vec<NamedWatchlist>,
     active_watchlist: usize,
     watchlist_entry: Option<(Option<String>, String)>,
+    watch_item_entry: Option<WatchItemEntry>,
+    watch_selected: Option<String>,
+    watch_details: bool,
     watchlist_delete: bool,
     security_names: crate::security_names::Names,
     watch_columns: tr_core::columns::ColumnSet,
@@ -886,6 +905,9 @@ impl TerminalApp {
             watchlists: vec![NamedWatchlist::new("Main".into(), DEFAULT_WATCHLIST.map(String::from).to_vec())],
             active_watchlist: 0,
             watchlist_entry: None,
+            watch_item_entry: None,
+            watch_selected: None,
+            watch_details: true,
             watchlist_delete: false,
             security_names: Default::default(),
             watch_columns: Default::default(),
@@ -922,6 +944,7 @@ impl TerminalApp {
             (app.watchlists, app.active_watchlist) = s.sanitized_watchlists();
             app.watchlist = app.watchlists[app.active_watchlist].symbols.clone();
             app.sidebar_open = s.sidebar;
+            app.watch_details = s.watch_details;
             if let Some(name) = &s.active_layout {
                 match app.store.load(name) {
                     Ok(d) => doc = Some(d),
@@ -977,6 +1000,7 @@ impl TerminalApp {
             watchlist: Vec::new(),
             watchlists: self.watchlists.clone(),
             active_watchlist: self.active_watchlist,
+            watch_details: self.watch_details,
             sidebar: self.sidebar_open,
             active_layout: Some(self.layout_name.clone()),
             layout: None,
@@ -1002,6 +1026,7 @@ impl TerminalApp {
         if let Some((at, _, _)) = self.watchlist_undo.take() {
             self.toasts.retain(|(_, time)| *time != at);
         }
+        self.watch_item_entry = None;
         self.active_watchlist = index;
         self.watchlist = self.watchlists[index].symbols.clone();
         self.watchlist_delete = false;
@@ -1043,6 +1068,48 @@ impl TerminalApp {
         {
             return Err("A watchlist with that name already exists".into());
         }
+        Ok(())
+    }
+
+    fn duplicate_watchlist(&mut self) -> Result<(), String> {
+        let mut copy = self.watchlists[self.active_watchlist].clone();
+        copy.name = unique_watchlist_name(&copy.name, &self.watchlists);
+        self.check_watchlist_name(&copy.name, None)?;
+        if self.watchlists.len() >= 50 {
+            return Err("At most 50 watchlists are allowed".into());
+        }
+        self.watchlists.push(copy);
+        self.switch_watchlist(self.watchlists.len() - 1);
+        Ok(())
+    }
+
+    fn apply_watch_item_entry(&mut self) -> Result<(), String> {
+        let Some(entry) = self.watch_item_entry.clone() else { return Ok(()) };
+        let mut items = self.watchlists[self.active_watchlist].items();
+        match entry.kind {
+            WatchEntryKind::Section => crate::watch_sections::insert_section(&mut items, entry.index, &entry.text)?,
+            WatchEntryKind::Rename => crate::watch_sections::rename_section(&mut items, entry.index, &entry.text)?,
+            WatchEntryKind::Symbol => {
+                let tokens: Vec<_> = entry.text.split_whitespace().collect();
+                let symbol = tr_core::Security::resolve_tokens(&tokens)
+                    .filter(|(_, used)| *used == tokens.len())
+                    .map(|(sec, _)| sec.key())
+                    .ok_or_else(|| "Unknown symbol".to_owned())?;
+                if self.watchlist.contains(&symbol) {
+                    return Err(format!(
+                        "{} is already in {}",
+                        tr_data::security(&symbol).ticker,
+                        self.watchlists[self.active_watchlist].name
+                    ));
+                }
+                if self.watchlist.len() >= 200 {
+                    return Err("At most 200 symbols are allowed".into());
+                }
+                items.insert(entry.index.min(items.len()), crate::watch_sections::Item::Symbol(symbol));
+            }
+        }
+        self.set_watchlist_items(&items);
+        self.watch_item_entry = None;
         Ok(())
     }
 
@@ -1168,6 +1235,13 @@ impl TerminalApp {
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
                 Action::AddToWatchlist(s) => self.add_watchlist_symbols(vec![s]),
                 Action::AddToNamedWatchlist { list, symbol } => self.add_to_named_watchlist(&list, symbol),
+                Action::AddToCompare(symbol) => {
+                    if self.panes.iter().any(|p| matches!(p.kind, PaneKind::Chart(_))) {
+                        self.with_chart(|c, w| c.add_comparison(symbol, w));
+                    } else {
+                        self.status = "Open a chart to compare".into();
+                    }
+                }
                 Action::SaveMatchesAsWatchlist(name, symbols) => {
                     let name = unique_watchlist_name(name.trim(), &self.watchlists);
                     let result = self.create_watchlist(name, symbols);
@@ -2381,6 +2455,9 @@ impl TerminalApp {
             watchlists: vec![NamedWatchlist::new("Main".into(), Vec::new())],
             active_watchlist: 0,
             watchlist_entry: None,
+            watch_item_entry: None,
+            watch_selected: None,
+            watch_details: true,
             watchlist_delete: false,
             security_names: Default::default(),
             watch_columns: Default::default(),
@@ -2889,5 +2966,56 @@ mod tests {
         assert!(app.apply_watchlist_entry().is_err());
         assert!(app.rename_watchlist(app.watchlists.len(), "Zombie".into()).is_err());
         assert!(app.watchlists.iter().all(|l| l.name != "Zombie"), "the wrong list was renamed");
+    }
+
+    #[test]
+    fn duplicate_watchlist_copy_is_independent_of_the_original() {
+        let key = |s: &str| tr_data::security(s).key();
+        let root = std::env::temp_dir().join(format!("watch-sections-duplicate-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        use crate::watch_sections::Item;
+        app.set_watchlist_items(&[
+            Item::Symbol(key("SPY")),
+            Item::Section { name: "Tech".into(), collapsed: true },
+            Item::Symbol(key("NVDA")),
+            Item::Section { name: "Macro".into(), collapsed: false },
+        ]);
+        let original = app.watchlists[0].clone();
+        app.duplicate_watchlist().unwrap();
+        assert_eq!(app.active_watchlist, 1);
+        assert_eq!(app.watchlists[1].items(), original.items());
+        // Edit the copy: add a symbol, rename a section, expand Tech.
+        app.set_watchlist_items(&[
+            Item::Symbol(key("SPY")),
+            Item::Section { name: "Growth".into(), collapsed: false },
+            Item::Symbol(key("NVDA")),
+            Item::Symbol(key("AAPL")),
+            Item::Section { name: "Macro".into(), collapsed: false },
+        ]);
+        assert_eq!(app.watchlists[0], original, "editing the duplicate must not touch the original");
+        assert_ne!(app.watchlists[1].sections[0].name, "Tech");
+    }
+
+    #[test]
+    fn add_to_named_watchlist_preserves_the_target_lists_sections() {
+        let key = |s: &str| tr_data::security(s).key();
+        let root = std::env::temp_dir().join(format!("watch-sections-named-add-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        use crate::watch_sections::Item;
+        app.create_watchlist("Tech".into(), Vec::new()).unwrap();
+        app.set_watchlist_items(&[
+            Item::Section { name: "Chips".into(), collapsed: false },
+            Item::Symbol(key("NVDA")),
+            Item::Section { name: "Software".into(), collapsed: true },
+        ]);
+        let tech = app.active_watchlist;
+        app.create_watchlist("Main2".into(), Vec::new()).unwrap();
+        app.run_actions(vec![Action::AddToNamedWatchlist { list: "Tech".into(), symbol: key("AAPL") }]);
+        let rows = app.watchlists[tech].items();
+        assert!(rows.iter().any(|i| matches!(i, Item::Section { name, collapsed: true } if name == "Software")));
+        assert_eq!(rows.iter().filter(|i| matches!(i, Item::Symbol(_))).count(), 2);
+        // The new symbol joins the end of the last section rather than stripping headers.
+        assert!(matches!(rows.last().unwrap(), Item::Symbol(s) if s == &key("AAPL")));
+        assert_eq!(app.watchlists[tech].sections.len(), 2);
     }
 }
