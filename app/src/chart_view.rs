@@ -2255,8 +2255,10 @@ impl ChartState {
         let mut scale = out.scale;
         scale.height_px = price_rect.height() as f64;
         self.current_scale = Some(scale);
-        if self.draw.tool.is_none() && !over_legend {
-            if plot_resp.secondary_clicked() {
+        // The legend blocks opening the menu, but an open menu must be shown every frame or
+        // egui closes it, including while the pointer crosses the legend to reach an item.
+        if self.draw.tool.is_none() && (!over_legend || plot_resp.context_menu_opened()) {
+            if plot_resp.secondary_clicked() && !over_legend {
                 self.context_timestamp = plot_resp
                     .interact_pointer_pos()
                     .filter(|p| price_rect.contains(*p))
@@ -7050,6 +7052,35 @@ mod tests {
         click_chart(&ctx, &mut chart, show);
         assert!(chart.indicators[0].chart.as_ref().unwrap().visible);
         assert!(chart.drawings.is_empty());
+    }
+
+    #[test]
+    fn chart_menu_stays_open_while_the_pointer_crosses_the_legend() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart.indicators.push(IndicatorSpec::new("EMA", &[20.]).unwrap());
+        study::assign_ids(&mut chart.indicators);
+        chart.built = crate::worker::build_indicators(&chart.bars, chart.tf, &chart.indicators, &theme::palette());
+        let texts = chart_frame(&ctx, &mut chart, vec![]);
+        let legend = texts.iter().find(|(text, _)| text.starts_with("EMA 20")).expect("EMA legend row").1.center();
+        let at = pos2(700., 300.);
+        chart_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(at)]);
+        for pressed in [true, false] {
+            chart_frame(
+                &ctx,
+                &mut chart,
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        assert!(chart_frame(&ctx, &mut chart, vec![]).iter().any(|(text, _)| text == "Reset view"));
+        chart_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(legend)]);
+        let texts = chart_frame(&ctx, &mut chart, vec![]);
+        assert!(texts.iter().any(|(text, _)| text == "Reset view"), "the menu closed over the legend");
     }
 
     #[test]
