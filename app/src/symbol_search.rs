@@ -264,7 +264,9 @@ fn search_field(ui: &mut egui::Ui, text: &mut String, autofocus: &mut bool) -> b
     let mut changed = false;
     egui::Frame::new().fill(theme::header()).corner_radius(5).inner_margin(5.0).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label("⌕").on_hover_text("Search symbols or names");
+            // Drawn icons: the UI font has no magnifier or circled-x glyphs.
+            let (icon, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            crate::widgets::draw_icon(ui.painter(), icon, crate::widgets::Icon::Search, theme::muted());
             let width = (ui.available_width() - 30.0).max(20.0);
             let field = ui.add_sized(
                 [width, 24.0],
@@ -278,9 +280,13 @@ fn search_field(ui: &mut egui::Ui, text: &mut String, autofocus: &mut bool) -> b
                 field.request_focus();
             }
             changed = field.changed();
-            if !text.is_empty()
-                && ui.small_button("⊗").on_hover_text("Clear search").clicked_by(egui::PointerButton::Primary)
-            {
+            let clear = (!text.is_empty())
+                .then(|| crate::widgets::icon_button(ui, crate::widgets::Icon::Close, "Clear search", false));
+            #[cfg(test)]
+            if let Some(clear) = &clear {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("symbol-search-clear"), clear.rect));
+            }
+            if clear.is_some_and(|clear| clear.clicked_by(egui::PointerButton::Primary)) {
                 text.clear();
                 field.request_focus();
                 changed = true;
@@ -1252,14 +1258,19 @@ mod tests {
         let ctx = egui::Context::default();
         let mut dialog = btc();
         snapshot(&mut dialog, &ctx, vec![], &[]);
-        let view = snapshot(&mut dialog, &ctx, vec![], &[]);
+        snapshot(&mut dialog, &ctx, vec![], &[]);
         dialog.selected = 1;
-        click(&mut dialog, &ctx, text_rect(&view, "⊗").center());
+        let clear = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("symbol-search-clear"))).expect("clear button");
+        click(&mut dialog, &ctx, clear.center());
         assert!(dialog.query.is_empty());
         assert_eq!(dialog.selected, 0);
         assert!(ctx.memory(|m| m.focused().is_some()));
-        let view = snapshot(&mut dialog, &ctx, vec![], &[]);
-        assert!(!view.texts.iter().any(|(s, _)| s == "⊗"));
+        ctx.data_mut(|d| d.remove::<egui::Rect>(egui::Id::new("symbol-search-clear")));
+        snapshot(&mut dialog, &ctx, vec![], &[]);
+        assert!(
+            ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("symbol-search-clear"))).is_none(),
+            "no clear button without text"
+        );
     }
 
     #[test]
