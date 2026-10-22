@@ -468,7 +468,7 @@ pub fn parse_spark(json: &str) -> Result<Vec<Quote>> {
         let prev =
             if closes.len() >= 2 { closes[closes.len() - 2] } else { d["chartPreviousClose"].as_f64().unwrap_or(last) };
         let ts = d["timestamp"].as_array().and_then(|a| a.last()).and_then(|t| t.as_i64()).unwrap_or_default();
-        out.push(Quote { symbol: sym.clone(), last, prev_close: prev, ts, spark: closes });
+        out.push(Quote { symbol: sym.clone(), last, prev_close: prev, ts, spark: closes, crypto_source: None });
     }
     Ok(out)
 }

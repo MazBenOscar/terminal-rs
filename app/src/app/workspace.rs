@@ -1703,6 +1703,7 @@ mod tests {
                     definition,
                     universe: tr_data::universe::Universe::Nasdaq,
                     refresh: Some(60),
+                    crypto_filter: Default::default(),
                 }),
                 PaneSettings::Watchlist,
                 PaneSettings::Alerts,

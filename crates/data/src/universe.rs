@@ -45,10 +45,26 @@ pub enum Universe {
     Nasdaq,
     /// NYSE and NYSE American.
     Nyse,
+    BinanceSpot,
+    CoinbaseSpot,
 }
 
 impl Universe {
-    pub const ALL: [Self; 4] = [Self::Watchlist, Self::UsStocks, Self::Nasdaq, Self::Nyse];
+    pub const ALL: [Self; 6] =
+        [Self::Watchlist, Self::UsStocks, Self::Nasdaq, Self::Nyse, Self::BinanceSpot, Self::CoinbaseSpot];
+
+    pub fn crypto_venue(self) -> Option<tr_core::crypto::CryptoVenue> {
+        use tr_core::crypto::CryptoVenue;
+        match self {
+            Self::BinanceSpot => Some(CryptoVenue::Binance),
+            Self::CoinbaseSpot => Some(CryptoVenue::Coinbase),
+            _ => None,
+        }
+    }
+
+    pub fn requires_bulk(self) -> bool {
+        matches!(self, Self::UsStocks | Self::Nasdaq | Self::Nyse)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -56,12 +72,14 @@ impl Universe {
             Self::UsStocks => "All US stocks",
             Self::Nasdaq => "Nasdaq stocks",
             Self::Nyse => "NYSE stocks",
+            Self::BinanceSpot => "Binance spot",
+            Self::CoinbaseSpot => "Coinbase spot",
         }
     }
 
     pub fn includes(self, venue: Venue) -> bool {
         match self {
-            Self::Watchlist => false,
+            Self::Watchlist | Self::BinanceSpot | Self::CoinbaseSpot => false,
             Self::UsStocks => true,
             Self::Nasdaq => venue == Venue::Nasdaq,
             Self::Nyse => matches!(venue, Venue::Nyse | Venue::NyseAmerican),

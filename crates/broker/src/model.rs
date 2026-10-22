@@ -227,17 +227,38 @@ pub fn market_key(kind: InstrumentKind, symbol: &str, currency: &str) -> Option<
                 ),
             }
         }
-        InstrumentKind::Crypto => {
-            let base = s.split(['-', '/']).next().unwrap_or(&s).to_string();
-            let quote = match currency.trim().to_ascii_uppercase().as_str() {
-                "" | "USDT" | "USDC" => "USD".to_string(),
-                c => c.to_string(),
-            };
-            let pair = if base.ends_with(&quote) && base.len() > quote.len() { base } else { format!("{base}{quote}") };
-            Some(Security::new(pair, AssetClass::Crypto).key())
-        }
+        InstrumentKind::Crypto => crypto_market_key(&s, currency),
         _ => None,
     }
+}
+
+/// A broker's settlement currency does not identify an exchange. Preserve any
+/// explicit product quote and never turn stablecoins into dollars or infer a venue.
+fn crypto_market_key(symbol: &str, currency: &str) -> Option<String> {
+    let currency = currency.trim().to_ascii_uppercase();
+    if symbol.contains(':') {
+        let instrument = tr_core::crypto::CryptoInstrument::parse(symbol).ok()?;
+        instrument.require_spot().ok()?;
+        return (currency.is_empty() || currency == instrument.quote).then(|| instrument.security().key());
+    }
+    let (base, quote) = if let Some(pair) = symbol.split_once(['-', '/']) {
+        pair
+    } else if let Some(pair) = tr_core::crypto::split_pair(symbol) {
+        pair
+    } else {
+        (symbol, currency.as_str())
+    };
+    if base.is_empty()
+        || quote.is_empty()
+        || base == quote
+        || base.len() > 24
+        || quote.len() > 24
+        || !base.bytes().chain(quote.bytes()).all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        || (!currency.is_empty() && currency != quote)
+    {
+        return None;
+    }
+    Some(Security::new(format!("{base}{quote}"), AssetClass::Crypto).key())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,7 +306,11 @@ impl Order {
     }
 
     pub fn market_key(&self) -> Option<String> {
-        market_key(self.kind, self.underlying.as_deref().unwrap_or(&self.symbol), "USD")
+        market_key(
+            self.kind,
+            self.underlying.as_deref().unwrap_or(&self.symbol),
+            if self.kind == InstrumentKind::Crypto { "" } else { "USD" },
+        )
     }
 
     pub fn short_label(&self) -> String {
@@ -679,11 +704,35 @@ mod tests {
         assert_eq!(market_key(InstrumentKind::Stock, "VAB.TO", "CAD"), None, "foreign listings are not charted");
         assert_eq!(market_key(InstrumentKind::Crypto, "BTC", "USD").as_deref(), Some("BTCUSD Curncy"));
         assert_eq!(market_key(InstrumentKind::Crypto, "ETH-USD", "").as_deref(), Some("ETHUSD Curncy"));
-        assert_eq!(market_key(InstrumentKind::Crypto, "SOL", "USDT").as_deref(), Some("SOLUSD Curncy"));
+        assert_eq!(market_key(InstrumentKind::Crypto, "SOL", "USDT").as_deref(), Some("SOLUSDT Curncy"));
         assert_eq!(market_key(InstrumentKind::Bond, "US912828", "USD"), None);
         let mut opt = pos(InstrumentKind::Option, "AAPL  261218C00240000", 1.0, 1.0, 1.0);
         opt.underlying = Some("AAPL".into());
         assert_eq!(opt.market_key().as_deref(), Some("AAPL US Equity"), "options chart their underlying");
+    }
+
+    #[test]
+    fn crypto_keys_preserve_quote_and_only_explicit_venues() {
+        for (symbol, currency, expected) in [
+            ("ETH-USDC", "USDC", "ETHUSDC Curncy"),
+            ("BTC/USDT", "", "BTCUSDT Curncy"),
+            ("BTCUSDT", "USDT", "BTCUSDT Curncy"),
+            ("COINBASE:BTC-USDT", "USDT", "COINBASE:BTC-USDT Curncy"),
+        ] {
+            assert_eq!(market_key(InstrumentKind::Crypto, symbol, currency).as_deref(), Some(expected));
+        }
+        for (symbol, currency) in [
+            ("BTC-USDT", "USD"),
+            ("BTC", ""),
+            ("BTC--USD", "USD"),
+            ("OTHER:BTCUSD", "USD"),
+            ("BINANCE:BTCUSDT.P", "USDT"),
+        ] {
+            assert_eq!(market_key(InstrumentKind::Crypto, symbol, currency), None);
+        }
+        for symbol in ["btcUSD", "COINBASE:BTC-USD", "BINANCE:BTCUSDT", "OTHER:BTCUSD"] {
+            assert_eq!(market_key(InstrumentKind::Stock, symbol, "USD"), None);
+        }
     }
 
     #[test]

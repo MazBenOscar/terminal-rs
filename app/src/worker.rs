@@ -98,6 +98,7 @@ pub enum Request {
         generation: u64,
         definition: ScanDefinition,
         universe: Universe,
+        crypto_filter: tr_core::crypto::CryptoUniverseFilter,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     },
     /// Load the brokerage portfolio through SnapTrade (`None` = the simulated sample).
@@ -329,6 +330,19 @@ pub struct Profile {
 }
 
 pub enum Response {
+    CryptoScanStats {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        result: Result<tr_data::crypto_catalog::Rolling24h, String>,
+    },
+    ScanUniverseInfo {
+        pane: PaneId,
+        generation: u64,
+        available: usize,
+        selected: usize,
+        fetched_at: i64,
+    },
     SecurityNames(crate::security_names::Names),
     WatchlistColumns {
         revision: u64,
@@ -413,6 +427,8 @@ pub enum Response {
         tf: Timeframe,
         bars: Arc<Vec<Bar>>,
         gpu: SeriesGpu,
+        /// Resolved contract belonging to these bars (also applies to cached/live bars).
+        crypto_source: Option<tr_core::crypto::CryptoInstrument>,
         /// Number of bars prepended (paging), 0 otherwise.
         prepended: usize,
         from_cache: bool,
@@ -554,6 +570,8 @@ type StudyFetches = HashMap<(String, Timeframe), Arc<Mutex<()>>>;
 
 struct Shared {
     provider: Provider,
+    /// Shared across scanner panes; opening more panes cannot multiply exchange load.
+    scan_slots: tokio::sync::Semaphore,
     names: Mutex<Option<crate::security_names::Names>>,
     study_histories: std::sync::Mutex<HashMap<(String, Timeframe), StudyHistory>>,
     study_fetches: std::sync::Mutex<StudyFetches>,
@@ -606,6 +624,7 @@ impl Worker {
         let (out, rx) = mpsc::channel();
         let shared = Arc::new(Shared {
             provider,
+            scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
@@ -972,8 +991,8 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 .await;
             s.send(Response::WatchlistColumns { revision, cells, computed_at: chrono::Utc::now().timestamp() });
         }
-        Request::ScanUniverse { pane, generation, definition, universe, cancel } => {
-            let rows = scan_universe(s, pane, generation, &definition, universe, &cancel).await;
+        Request::ScanUniverse { pane, generation, definition, universe, crypto_filter, cancel } => {
+            let rows = scan_universe(s, pane, generation, &definition, universe, &crypto_filter, &cancel).await;
             s.send(Response::Scan { pane, generation, rows });
         }
         Request::Scan { pane, generation, definition, symbols, cancel } => {
@@ -1011,6 +1030,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 let bars = Arc::new(bars);
                 let gpu = build_gpu(bars.clone()).await;
                 s.send(Response::History {
+                    crypto_source: s.provider.crypto_instrument(&symbol),
                     pane,
                     generation,
                     symbol: symbol.clone(),
@@ -1046,6 +1066,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     let Some(bars) = current_series(s, pane, generation) else { return };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
+                        crypto_source: s.provider.crypto_instrument(&symbol),
                         pane,
                         generation,
                         symbol: symbol.clone(),
@@ -1108,6 +1129,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
+                        crypto_source: s.provider.crypto_instrument(&symbol),
                         pane,
                         generation,
                         symbol,
@@ -1258,7 +1280,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::ExportChart { pane, result });
         }
         Request::ExportChart { pane, symbol, title, bars, image } => {
-            let title = format!("{title} · source {}", s.provider.name());
+            let title = format!("{title} · source {}", s.provider.scan_cache_key(&symbol));
             let result = tokio::task::spawn_blocking(move || {
                 let content =
                     if image { crate::chart_export::svg(&title, &bars) } else { crate::chart_export::csv(&bars) };
@@ -1544,7 +1566,16 @@ fn column_history_plan(columns: &[tr_core::columns::ColumnDef]) -> Vec<(Timefram
     plan
 }
 
+fn scan_snapshot_fresh(symbol: &str, fetched_at: i64, now: i64) -> bool {
+    if Security::parse(symbol).is_some_and(|s| s.class.trades_24_7()) {
+        now.checked_sub(fetched_at).is_some_and(|age| (0..60).contains(&age))
+    } else {
+        tr_data::scanstore::is_fresh(fetched_at, now)
+    }
+}
+
 async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize) -> Result<(Vec<Bar>, bool), String> {
+    let _slot = s.scan_slots.acquire().await.map_err(|_| "Scanner stopped".to_string())?;
     let now = chrono::Utc::now().timestamp();
     let route = s.provider.scan_cache_key(symbol);
     let source =
@@ -1558,7 +1589,7 @@ async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize)
     if let Some(f) = &fetched
         && stored.len() >= limit
         && f.source == source
-        && tr_data::scanstore::is_fresh(f.at, now)
+        && scan_snapshot_fresh(symbol, f.at, now)
     {
         return Ok((stored, f.simulated));
     }
@@ -1579,12 +1610,48 @@ async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize)
     Ok((store.load(symbol, tf, limit).map_err(|e| format!("scan store: {e:#}"))?, history.simulated))
 }
 
+/// Freeze a validated, deterministically ordered exchange snapshot for this run.
+/// The cap is explicit in ScanUniverseInfo; it is not a liquidity ranking.
+fn crypto_scan_symbols(
+    catalog: &tr_data::crypto_catalog::Catalog,
+    venue: tr_core::crypto::CryptoVenue,
+    filter: &tr_core::crypto::CryptoUniverseFilter,
+    now: i64,
+) -> Result<(Vec<String>, usize), String> {
+    filter.validate()?;
+    if catalog.venue != venue
+        || catalog.products.len() > 30_000
+        || catalog.fetched_at > now.saturating_add(30)
+        || catalog.fetched_at < now.saturating_sub(15 * 60)
+    {
+        return Err("Crypto product snapshot is stale or invalid; run discovery again".into());
+    }
+    let mut symbols = std::collections::BTreeMap::new();
+    for instrument in &catalog.products {
+        instrument.validate()?;
+        if instrument.venue != venue || instrument.kind != tr_core::crypto::CryptoMarketKind::Spot {
+            return Err("Crypto discovery returned a product from another venue or market kind".into());
+        }
+        let key = instrument.canonical_ticker();
+        if let Some(previous) = symbols.insert(key, instrument)
+            && previous != instrument
+        {
+            return Err("Crypto discovery returned conflicting product metadata".into());
+        }
+    }
+    let matching: Vec<_> =
+        symbols.into_iter().filter(|(_, instrument)| filter.matches(instrument)).map(|(key, _)| key).collect();
+    let available = matching.len();
+    Ok((matching.into_iter().skip(filter.page * filter.limit).take(filter.limit).collect(), available))
+}
+
 async fn scan_universe(
     s: &Shared,
     pane: PaneId,
     generation: u64,
     definition: &ScanDefinition,
     universe: Universe,
+    crypto_filter: &tr_core::crypto::CryptoUniverseFilter,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Vec<ScanRow> {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1602,12 +1669,59 @@ async fn scan_universe(
     if let Err(e) = definition.validate() {
         return failed(format!("Invalid scan: {e}"));
     }
-    let listings =
-        match tr_data::universe::load_or_fetch(&data_dir().join("universe.json"), Duration::from_secs(86_400)).await {
-            Ok(l) => l,
-            Err(e) => return failed(format!("Could not load the US symbol directory: {e:#}")),
+    if cancel.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    let stopped = async {
+        while !cancel.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let symbols: Vec<String> = if let Some(venue) = universe.crypto_venue() {
+        if let Err(e) = crypto_filter.validate() {
+            return failed(format!("Invalid crypto filters: {e}"));
+        }
+        let catalog = tokio::select! {
+            () = stopped => return Vec::new(),
+            result = tokio::time::timeout(Duration::from_secs(30), s.provider.crypto_catalog(venue)) => {
+                match result {
+                    Ok(Ok(catalog)) => catalog,
+                    Ok(Err(e)) => return failed(format!("Could not discover {}: {e:#}", universe.label())),
+                    Err(_) => return failed("Crypto discovery timed out after 30 seconds".into()),
+                }
+            }
         };
-    let symbols: Vec<String> = listings.iter().filter(|l| universe.includes(l.venue)).map(|l| l.key()).collect();
+        let (symbols, available) =
+            match crypto_scan_symbols(&catalog, venue, crypto_filter, chrono::Utc::now().timestamp()) {
+                Ok(selected) => selected,
+                Err(e) => return failed(e),
+            };
+        s.send(Response::ScanUniverseInfo {
+            pane,
+            generation,
+            available,
+            selected: symbols.len(),
+            fetched_at: catalog.fetched_at,
+        });
+        if symbols.iter().any(|symbol| {
+            s.provider.crypto_instrument(symbol).is_none_or(|instrument| instrument.canonical_ticker() != *symbol)
+        }) {
+            return failed("The active provider cannot serve the discovered crypto products".into());
+        }
+        symbols
+    } else {
+        let directory_path = data_dir().join("universe.json");
+        let listings = tokio::select! {
+            () = stopped => return Vec::new(),
+            result = tr_data::universe::load_or_fetch(&directory_path, Duration::from_secs(86_400)) => {
+                match result {
+                    Ok(listings) => listings,
+                    Err(e) => return failed(format!("Could not load the US symbol directory: {e:#}")),
+                }
+            }
+        };
+        listings.iter().filter(|l| universe.includes(l.venue)).map(|l| l.key()).collect()
+    };
     let total = symbols.len();
     let done = AtomicUsize::new(0);
     s.send(Response::ScanProgress { pane, generation, done: 0, total });
@@ -1618,7 +1732,27 @@ async fn scan_universe(
             let row = if cancel.load(Ordering::Relaxed) {
                 ScanRow { symbol, evaluation: None, ts: None, simulated: false, error: Some("Stopped".into()) }
             } else {
-                match universe_history(s, &symbol, definition.timeframe, limit).await {
+                let history = universe_history(s, &symbol, definition.timeframe, limit);
+                let stats = async {
+                    if universe.crypto_venue().is_some() {
+                        let result = tokio::time::timeout(Duration::from_secs(20), s.provider.crypto_stats(&symbol))
+                            .await
+                            .map_err(|_| "Rolling 24-hour statistics timed out".to_string())
+                            .and_then(|result| result.map_err(|e| format!("{e:#}")));
+                        s.send(Response::CryptoScanStats { pane, generation, symbol: symbol.clone(), result });
+                    }
+                };
+                let (history, ()) = tokio::join!(history, stats);
+                match history {
+                    Ok((_, true)) if universe.crypto_venue().is_some() => ScanRow {
+                        symbol,
+                        evaluation: None,
+                        ts: None,
+                        simulated: false,
+                        error: Some(
+                            "Crypto market scans require exchange observations; simulated history was rejected".into(),
+                        ),
+                    },
                     Ok((bars, simulated)) => {
                         let series = Series::new(symbol.clone(), definition.timeframe, bars);
                         let ts = series.bars.last().map(|b| b.ts);
@@ -1626,7 +1760,9 @@ async fn scan_universe(
                         for tf in definition.timeframes().into_iter().skip(1) {
                             let limit =
                                 definition.required_bars_for(tf).saturating_mul(3).clamp(300, MAX_SCAN_HISTORY_BARS);
-                            if let Ok((bars, _)) = universe_history(s, &symbol, tf, limit).await {
+                            if let Ok((bars, simulated)) = universe_history(s, &symbol, tf, limit).await
+                                && (!simulated || universe.crypto_venue().is_none())
+                            {
                                 set.insert(tf, Series::new(symbol.clone(), tf, bars));
                             }
                         }
@@ -1645,7 +1781,16 @@ async fn scan_universe(
     .buffered(4);
     let mut rows = Vec::with_capacity(total);
     let mut batch = Vec::new();
-    while let Some(row) = stream.next().await {
+    loop {
+        let stopped = async {
+            while !cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let row = tokio::select! {
+            () = stopped => break,
+            row = stream.next() => match row { Some(row) => row, None => break },
+        };
         batch.push(row.clone());
         rows.push(row);
         if batch.len() == 50 {
@@ -1852,6 +1997,7 @@ fn start_live(
                     let Some(bars) = current_series(&s, pane, generation) else { break };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
+                    crypto_source: s.provider.crypto_instrument(&symbol),
                         pane,
                         generation,
                         symbol: symbol.clone(),
@@ -1947,6 +2093,7 @@ mod tests {
         (
             Arc::new(Shared {
                 provider,
+                scan_slots: tokio::sync::Semaphore::new(4),
                 study_histories: Default::default(),
                 study_fetches: Default::default(),
                 names: Mutex::new(None),
@@ -2377,6 +2524,7 @@ mod tests {
         let (out, rx) = mpsc::channel();
         let shared = Arc::new(Shared {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)),
+            scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
@@ -2517,6 +2665,7 @@ mod tests {
         let (out, rx) = mpsc::channel();
         let s = Arc::new(Shared {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 20)),
+            scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
@@ -2594,6 +2743,7 @@ mod tests {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 400)),
+            scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
@@ -2666,6 +2816,7 @@ mod tests {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
             provider: fixture.clone(),
+            scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
@@ -2693,7 +2844,15 @@ mod tests {
             rows.iter()
                 .all(|row| row.error.as_ref() == Some(&expected) && row.evaluation.is_none() && row.ts.is_none())
         );
-        let rows = rt.block_on(scan_universe(&s, 1, 1, &invalid, Universe::default(), &AtomicBool::new(false)));
+        let rows = rt.block_on(scan_universe(
+            &s,
+            1,
+            1,
+            &invalid,
+            Universe::default(),
+            &Default::default(),
+            &AtomicBool::new(false),
+        ));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].error.as_ref(), Some(&expected));
         assert!(fixture.requests.lock().unwrap().is_empty(), "Invalid scans must not fetch history");
@@ -2737,6 +2896,7 @@ mod tests {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
+            scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
@@ -2765,5 +2925,204 @@ mod tests {
             i * 2
         })));
         assert_eq!(out, (0..20).map(|i| i * 2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn crypto_discovery_selection_is_exact_bounded_and_rejects_bad_snapshots() {
+        use tr_core::crypto::{CryptoInstrument, CryptoUniverseFilter, CryptoVenue};
+        let now = chrono::Utc::now().timestamp();
+        let mut catalog = tr_data::crypto_catalog::Catalog {
+            venue: CryptoVenue::Coinbase,
+            fetched_at: now,
+            products: ["COINBASE:ETH-USD", "COINBASE:BTC-USDT", "COINBASE:BTC-USD", "COINBASE:BTC-USD"]
+                .map(|s| CryptoInstrument::parse(s).unwrap())
+                .to_vec(),
+        };
+        let filter = CryptoUniverseFilter { quote: "USD".into(), limit: 1, ..Default::default() };
+        let (symbols, available) = crypto_scan_symbols(&catalog, CryptoVenue::Coinbase, &filter, now).unwrap();
+        assert_eq!(symbols, ["COINBASE:BTC-USD"]);
+        assert_eq!(available, 2);
+        let second = CryptoUniverseFilter { page: 1, ..filter.clone() };
+        assert_eq!(crypto_scan_symbols(&catalog, CryptoVenue::Coinbase, &second, now).unwrap().0, ["COINBASE:ETH-USD"]);
+        assert!(crypto_scan_symbols(&catalog, CryptoVenue::Binance, &filter, now).is_err());
+        catalog.fetched_at = now - 901;
+        assert!(crypto_scan_symbols(&catalog, CryptoVenue::Coinbase, &filter, now).is_err());
+        catalog.fetched_at = now;
+        catalog.products[3].price_increment = Some("0.01".into());
+        assert!(crypto_scan_symbols(&catalog, CryptoVenue::Coinbase, &filter, now).is_err());
+        catalog.products[3] = CryptoInstrument::parse("BINANCE:BTCUSDT.P").unwrap();
+        assert!(crypto_scan_symbols(&catalog, CryptoVenue::Coinbase, &filter, now).is_err());
+        catalog.products.clear();
+        assert_eq!(crypto_scan_symbols(&catalog, CryptoVenue::Coinbase, &filter, now).unwrap(), (vec![], 0));
+        assert!(
+            crypto_scan_symbols(
+                &catalog,
+                CryptoVenue::Coinbase,
+                &CryptoUniverseFilter { limit: 201, ..Default::default() },
+                now
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn crypto_scan_cache_expires_during_equity_weekends_and_overnights() {
+        let at = |s| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        let friday = at("2026-10-23T22:00:00Z");
+        let saturday = at("2026-10-24T12:00:00Z");
+        assert!(scan_snapshot_fresh("AAPL US Equity", friday, saturday));
+        for symbol in ["BTCUSD Curncy", "COINBASE:BTC-USD", "BINANCE:BTCUSDT"] {
+            assert!(!scan_snapshot_fresh(symbol, friday, saturday));
+            assert!(scan_snapshot_fresh(symbol, saturday - 59, saturday));
+            assert!(!scan_snapshot_fresh(symbol, saturday - 60, saturday));
+            assert!(!scan_snapshot_fresh(symbol, saturday + 1, saturday));
+            let night = at("2026-10-22T02:00:00Z");
+            assert!(!scan_snapshot_fresh(symbol, night - 3600, night));
+        }
+    }
+
+    #[tokio::test]
+    async fn crypto_universe_scans_keep_exact_keys_isolate_errors_and_cancel() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tr_core::crypto::{CryptoInstrument, CryptoUniverseFilter, CryptoVenue};
+        struct Fixture {
+            simulated: AtomicBool,
+            calls: AtomicUsize,
+            delayed: AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Fixture {
+            fn name(&self) -> &str {
+                "crypto-fixture"
+            }
+            fn crypto_instrument(&self, symbol: &str) -> Option<CryptoInstrument> {
+                CryptoInstrument::parse(symbol).ok()
+            }
+            fn scan_cache_key(&self, symbol: &str) -> String {
+                format!("fixture:{}:{}", symbol, self.simulated.load(Ordering::Relaxed))
+            }
+            async fn crypto_catalog(&self, venue: CryptoVenue) -> anyhow::Result<tr_data::crypto_catalog::Catalog> {
+                Ok(tr_data::crypto_catalog::Catalog {
+                    venue,
+                    fetched_at: chrono::Utc::now().timestamp(),
+                    products: ["COINBASE:BTC-USD", "COINBASE:ETH-USD", "COINBASE:SOL-USDT"]
+                        .map(|s| CryptoInstrument::parse(s).unwrap())
+                        .to_vec(),
+                })
+            }
+            async fn history(
+                &self,
+                symbol: &str,
+                tf: Timeframe,
+                _: Option<i64>,
+                limit: usize,
+            ) -> anyhow::Result<Vec<Bar>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if self.delayed.load(Ordering::Relaxed) {
+                    std::future::pending::<()>().await;
+                }
+                if symbol == "COINBASE:ETH-USD" {
+                    anyhow::bail!("fixture market unavailable");
+                }
+                Ok((0..limit)
+                    .map(|i| Bar::new(1_700_000_000 + i as i64 * tf.seconds(), 100.0, 101.0, 99.0, 100.0, 10.0))
+                    .collect())
+            }
+            async fn scan_history(
+                &self,
+                symbol: &str,
+                tf: Timeframe,
+                limit: usize,
+            ) -> anyhow::Result<tr_data::ScanHistory> {
+                Ok(tr_data::ScanHistory {
+                    bars: self.history(symbol, tf, None, limit).await?,
+                    simulated: self.simulated.load(Ordering::Relaxed),
+                })
+            }
+        }
+        let provider = Arc::new(Fixture {
+            simulated: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+            delayed: AtomicBool::new(false),
+        });
+        let (mut shared, rx) = backfill_shared(provider.clone());
+        Arc::get_mut(&mut shared).unwrap().scan_store =
+            std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap()));
+        let definition = ScanDefinition::default();
+        let filter = CryptoUniverseFilter { quote: "USD".into(), ..Default::default() };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rows = scan_universe(&shared, 1, 5, &definition, Universe::CoinbaseSpot, &filter, &cancel).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].symbol, "COINBASE:BTC-USD");
+        assert!(rows[0].evaluation.is_some() && !rows[0].simulated);
+        assert_eq!(rows[1].symbol, "COINBASE:ETH-USD");
+        assert!(rows[1].evaluation.is_none() && rows[1].error.as_ref().unwrap().contains("unavailable"));
+        assert!(
+            rx.try_iter()
+                .any(|r| matches!(r, Response::ScanUniverseInfo { generation: 5, available: 2, selected: 2, .. }))
+        );
+        provider.simulated.store(true, Ordering::Relaxed);
+        let rows = scan_universe(&shared, 1, 6, &definition, Universe::CoinbaseSpot, &filter, &cancel).await;
+        assert!(rows.iter().all(|r| r.evaluation.is_none()));
+        assert!(rows[0].error.as_ref().unwrap().contains("simulated history was rejected"));
+        let calls = provider.calls.load(Ordering::Relaxed);
+        cancel.store(true, Ordering::Relaxed);
+        assert!(scan_universe(&shared, 1, 7, &definition, Universe::CoinbaseSpot, &filter, &cancel).await.is_empty());
+        assert_eq!(provider.calls.load(Ordering::Relaxed), calls);
+        provider.simulated.store(false, Ordering::Relaxed);
+        provider.delayed.store(true, Ordering::Relaxed);
+        shared.scan_store.lock().unwrap().take();
+        *shared.scan_store.lock().unwrap() = Some(ScanStore::open_in_memory().unwrap());
+        cancel.store(false, Ordering::Relaxed);
+        let stop = cancel.clone();
+        let run = scan_universe(&shared, 1, 8, &definition, Universe::CoinbaseSpot, &filter, &cancel);
+        let stop = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stop.store(true, Ordering::Relaxed);
+        };
+        let (rows, ()) = tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(run, stop) }).await.unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(shared.scan_slots.available_permits(), 4, "Cancellation releases in-flight scan slots");
+    }
+
+    #[tokio::test]
+    #[ignore = "uses public exchange endpoints; availability depends on network and region"]
+    async fn live_crypto_universes_evaluate_exact_products_and_publish_metrics() {
+        use tr_core::crypto::CryptoUniverseFilter;
+        let (mut shared, rx) = backfill_shared(Arc::new(tr_data::markets::Markets::new(None).unwrap()));
+        Arc::get_mut(&mut shared).unwrap().scan_store =
+            std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap()));
+        for (generation, universe, quote) in [(1, Universe::BinanceSpot, "USDT"), (2, Universe::CoinbaseSpot, "USD")] {
+            let definition = ScanDefinition { timeframe: Timeframe::H1, ..Default::default() };
+            let filter =
+                CryptoUniverseFilter { base: "BTC".into(), quote: quote.into(), limit: 1, ..Default::default() };
+            let rows = scan_universe(
+                &shared,
+                1,
+                generation,
+                &definition,
+                universe,
+                &filter,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .await;
+            assert_eq!(rows.len(), 1, "{universe:?}: {rows:?}");
+            assert!(rows[0].error.is_none() && rows[0].evaluation.is_some() && !rows[0].simulated, "{rows:?}");
+            let source = shared.provider.crypto_instrument(&rows[0].symbol).unwrap();
+            assert_eq!(source.venue, universe.crypto_venue().unwrap());
+            assert_eq!(source.quote, quote);
+            let mut received_stats = false;
+            for response in rx.try_iter() {
+                if let Response::CryptoScanStats { generation: response_generation, symbol, result, .. } = response {
+                    assert_eq!(response_generation, generation);
+                    assert_eq!(symbol, rows[0].symbol);
+                    let stats = result.unwrap();
+                    stats.validate().unwrap();
+                    assert_eq!(stats.instrument.canonical_ticker(), source.canonical_ticker());
+                    received_stats = true;
+                }
+            }
+            assert!(received_stats, "The scanner must publish the selected product's rolling metrics");
+        }
     }
 }

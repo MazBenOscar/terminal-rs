@@ -29,6 +29,10 @@ Labels used in every note:
 
 ## Notes
 
+- [Crypto C01/C02 delivery](crypto-delivery.md) — implementation guide, source
+  identity migration, exchange discovery/scanning, rolling metrics, validation
+  results and remaining boundaries. This is a delivery record, not REA evidence.
+
 - [Quick tools and Auto/Log follow-up](toolbar-scale-followup.md) — 2026-10-21
   REA website runtime tests of drawing favorites, reload, scale-state transitions
   and indicator access; includes explicit account/interaction limits.

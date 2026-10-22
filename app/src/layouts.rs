@@ -207,11 +207,13 @@ pub struct ScanSettings {
     pub universe: tr_data::universe::Universe,
     #[serde(default)]
     pub refresh: Option<u32>,
+    #[serde(default)]
+    pub crypto_filter: tr_core::crypto::CryptoUniverseFilter,
 }
 
 impl From<tr_core::scanner::ScanDefinition> for ScanSettings {
     fn from(definition: tr_core::scanner::ScanDefinition) -> Self {
-        Self { definition, universe: Default::default(), refresh: None }
+        Self { definition, universe: Default::default(), refresh: None, crypto_filter: Default::default() }
     }
 }
 
@@ -296,6 +298,11 @@ impl LayoutDoc {
     /// Make a loaded document self-consistent: unique pane ids, a dock that references
     /// only known docked panes, every docked pane placed, and at least one pane.
     pub fn repair(&mut self) {
+        for pane in &mut self.panes {
+            if let PaneSettings::Scanner(settings) = &mut pane.settings {
+                settings.crypto_filter.sanitize();
+            }
+        }
         if self.watchlists.is_none() {
             self.watchlists =
                 self.watchlist.take().map(|symbols| vec![crate::app::NamedWatchlist { name: "Main".into(), symbols }]);
@@ -600,10 +607,42 @@ mod tests {
     fn scanner_conditions_survive_workspace_roundtrip() {
         let definition = tr_core::scanner::ScanDefinition::default();
         let mut doc = LayoutDoc::default_workspace("Scanner", &PanelDefaults::default());
-        let settings = ScanSettings { definition, universe: tr_data::universe::Universe::Nasdaq, refresh: None };
+        let settings = ScanSettings {
+            definition,
+            universe: tr_data::universe::Universe::Nasdaq,
+            refresh: None,
+            crypto_filter: Default::default(),
+        };
         doc.panes[0].settings = PaneSettings::Scanner(settings.clone());
         let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
         assert_eq!(restored.panes[0].settings, PaneSettings::Scanner(settings));
+    }
+
+    #[test]
+    fn crypto_scan_filters_roundtrip_and_legacy_settings_default_safely() {
+        let definition = tr_core::scanner::ScanDefinition::default();
+        let legacy: ScanSettings = serde_json::from_value(serde_json::to_value(&definition).unwrap()).unwrap();
+        assert_eq!(legacy.crypto_filter, tr_core::crypto::CryptoUniverseFilter::default());
+        let mut doc = LayoutDoc::default_workspace("Crypto scanner", &PanelDefaults::default());
+        let settings = ScanSettings {
+            definition,
+            universe: tr_data::universe::Universe::CoinbaseSpot,
+            refresh: Some(5),
+            crypto_filter: tr_core::crypto::CryptoUniverseFilter {
+                base: "btc".into(),
+                quote: " usd ".into(),
+                limit: 25,
+                page: 0,
+            },
+        };
+        doc.panes[0].settings = PaneSettings::Scanner(settings);
+        let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        let PaneSettings::Scanner(settings) = &restored.panes[0].settings else { panic!("scanner expected") };
+        assert_eq!(settings.crypto_filter.base, "BTC");
+        assert_eq!(settings.crypto_filter.quote, "USD");
+        assert_eq!(settings.crypto_filter.limit, 25);
+        assert_eq!(settings.refresh, Some(5));
+        assert_eq!(settings.universe, tr_data::universe::Universe::CoinbaseSpot);
     }
 
     #[test]
@@ -614,6 +653,7 @@ mod tests {
             definition: definition.clone(),
             universe: tr_data::universe::Universe::Nasdaq,
             refresh: None,
+            crypto_filter: Default::default(),
         })
         .unwrap();
         legacy.as_object_mut().unwrap().remove("refresh");
@@ -621,7 +661,12 @@ mod tests {
         assert_eq!(loaded.refresh, None);
         // An explicit interval survives the workspace round trip.
         let mut doc = LayoutDoc::default_workspace("Scanner", &PanelDefaults::default());
-        let settings = ScanSettings { definition, universe: tr_data::universe::Universe::Nyse, refresh: Some(15) };
+        let settings = ScanSettings {
+            definition,
+            universe: tr_data::universe::Universe::Nyse,
+            refresh: Some(15),
+            crypto_filter: Default::default(),
+        };
         doc.panes[0].settings = PaneSettings::Scanner(settings.clone());
         let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
         assert_eq!(restored.panes[0].settings, PaneSettings::Scanner(settings));

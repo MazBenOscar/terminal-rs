@@ -274,6 +274,7 @@ impl PaneKind {
                 definition: s.definition.clone(),
                 universe: s.universe,
                 refresh: s.refresh,
+                crypto_filter: s.crypto_filter.clone(),
             }),
             PaneKind::Help => PaneSettings::Help,
             PaneKind::Wei => PaneSettings::Wei,
@@ -1433,6 +1434,20 @@ impl TerminalApp {
                         s.partial(generation, rows);
                     }
                 }
+                Response::CryptoScanStats { pane, generation, symbol, result } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::Scanner(s) = &mut p.kind
+                    {
+                        s.crypto_stats(generation, symbol, result);
+                    }
+                }
+                Response::ScanUniverseInfo { pane, generation, available, selected, fetched_at } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::Scanner(s) = &mut p.kind
+                    {
+                        s.catalog_info(generation, available, selected, fetched_at);
+                    }
+                }
                 Response::ScanProgress { pane, generation, done, total } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
                         && let PaneKind::Scanner(s) = &mut p.kind
@@ -1452,12 +1467,14 @@ impl TerminalApp {
                     from_cache,
                     exhausted,
                     live,
+                    crypto_source,
                 } => {
                     let worker = &self.worker;
                     if let Some(PaneKind::Chart(c)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                         && c.symbol == symbol
                         && c.tf == tf
                     {
+                        c.on_crypto_source(generation, crypto_source);
                         c.on_history(generation, bars, gpu, prepended, from_cache, exhausted, live, worker);
                     }
                 }

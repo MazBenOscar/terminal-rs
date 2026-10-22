@@ -5,7 +5,7 @@
 //! - `TR_PROVIDER=sample` forces deterministic sample data (fully offline, with simulated
 //!   live ticks).
 //! - Otherwise [`markets::Markets`] routes each asset class to a free source: Binance public
-//!   REST/websocket (Coinbase as fallback) for crypto, Treasury.gov (FRED fallback) for US
+//!   REST/websocket for explicit Binance or Coinbase crypto products, Treasury.gov (FRED fallback) for US
 //!   Treasury yields, Yahoo Finance for FX, indices, futures, ETFs and stocks, or Alpaca for
 //!   US stocks/ETFs when `APCA_API_KEY_ID` + `APCA_API_SECRET_KEY` are set.
 //!
@@ -15,6 +15,7 @@
 pub mod alpaca;
 pub mod cache;
 pub mod crypto;
+pub mod crypto_catalog;
 pub mod markets;
 pub mod questrade;
 pub mod rss;
@@ -86,6 +87,9 @@ pub struct Quote {
     /// Recent daily closes (oldest first) for sparklines; may be empty.
     #[serde(default)]
     pub spark: Vec<f64>,
+    /// Actual fixed crypto product; absent for non-crypto and explicitly simulated quotes.
+    #[serde(default)]
+    pub crypto_source: Option<tr_core::crypto::CryptoInstrument>,
 }
 
 /// A symbol-search result.
@@ -281,6 +285,20 @@ pub trait MarketData: Send + Sync {
         self.name().to_string()
     }
 
+    /// Exact crypto contract used by this source, never an inferred cross-venue alias.
+    /// Sample/non-crypto sources return `None`; timestamps remain on bars and quotes.
+    fn crypto_instrument(&self, _symbol: &str) -> Option<tr_core::crypto::CryptoInstrument> {
+        None
+    }
+
+    /// Active exchange spot products. Unsupported/sample providers fail explicitly.
+    async fn crypto_catalog(&self, _venue: tr_core::crypto::CryptoVenue) -> Result<crypto_catalog::Catalog> {
+        anyhow::bail!("Crypto discovery requires a live exchange data provider")
+    }
+    async fn crypto_stats(&self, _symbol: &str) -> Result<crypto_catalog::Rolling24h> {
+        anyhow::bail!("Rolling 24-hour crypto statistics are unavailable from this provider")
+    }
+
     /// Up to `limit` bars at `tf` ending at or before `end` (Unix seconds; `None` = now),
     /// ascending by time. Paging older history means calling again with `end` set to the
     /// oldest bar already held.
@@ -319,7 +337,14 @@ pub trait MarketData: Send + Sync {
             let bars = self.history(s, Timeframe::D1, None, 2).await?;
             if let Some(last) = bars.last() {
                 let prev = if bars.len() > 1 { bars[bars.len() - 2].close } else { last.open };
-                out.push(Quote { symbol: s.clone(), last: last.close, prev_close: prev, ts: last.ts, spark: vec![] });
+                out.push(Quote {
+                    symbol: s.clone(),
+                    last: last.close,
+                    prev_close: prev,
+                    ts: last.ts,
+                    spark: vec![],
+                    crypto_source: None,
+                });
             }
         }
         Ok(out)
@@ -431,6 +456,16 @@ impl<P: MarketData> MarketData for Fallback<P> {
     fn scan_cache_key(&self, symbol: &str) -> String {
         self.primary.scan_cache_key(symbol)
     }
+
+    fn crypto_instrument(&self, symbol: &str) -> Option<tr_core::crypto::CryptoInstrument> {
+        self.primary.crypto_instrument(symbol)
+    }
+    async fn crypto_catalog(&self, venue: tr_core::crypto::CryptoVenue) -> Result<crypto_catalog::Catalog> {
+        self.primary.crypto_catalog(venue).await
+    }
+    async fn crypto_stats(&self, symbol: &str) -> Result<crypto_catalog::Rolling24h> {
+        self.primary.crypto_stats(symbol).await
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -449,8 +484,11 @@ impl<P: MarketData> MarketData for Fallback<P> {
             // If the primary produced nothing at all (offline), serve sample quotes rather
             // than an empty panel; partial results are never mixed with synthetic prices.
             Ok(mut q) => {
-                let missing: Vec<String> =
-                    symbols.iter().filter(|s| !q.iter().any(|x| &x.symbol == *s)).cloned().collect();
+                let missing: Vec<String> = symbols
+                    .iter()
+                    .filter(|s| !crypto_request(s) && !q.iter().any(|x| &x.symbol == *s))
+                    .cloned()
+                    .collect();
                 if !missing.is_empty() && q.is_empty() {
                     q.extend(self.sample.quotes(&missing).await.unwrap_or_default());
                 }
@@ -458,7 +496,11 @@ impl<P: MarketData> MarketData for Fallback<P> {
             }
             Err(e) => {
                 tracing::warn!("{} quotes failed, using sample data: {e:#}", self.name);
-                self.sample.quotes(symbols).await
+                let eligible: Vec<_> = symbols.iter().filter(|s| !crypto_request(s)).cloned().collect();
+                if eligible.is_empty() {
+                    return Err(e);
+                }
+                self.sample.quotes(&eligible).await
             }
         }
     }
@@ -478,6 +520,7 @@ impl<P: MarketData> MarketData for Fallback<P> {
     async fn options(&self, symbol: &str, expiration: Option<i64>) -> Result<OptionChain> {
         match self.primary.options(symbol, expiration).await {
             Ok(c) => Ok(c),
+            Err(e) if crypto_request(symbol) => Err(e),
             Err(e) => {
                 tracing::warn!("{} options {symbol}: {e:#}; simulating", self.name);
                 self.sample.options(symbol, expiration).await
@@ -489,6 +532,7 @@ impl<P: MarketData> MarketData for Fallback<P> {
     async fn order_book(&self, symbol: &str, depth: usize) -> Result<OrderBook> {
         match self.primary.order_book(symbol, depth).await {
             Ok(b) => Ok(b),
+            Err(e) if crypto_request(symbol) => Err(e),
             Err(e) => {
                 tracing::debug!("{} order book {symbol}: {e:#}; simulating", self.name);
                 self.sample.order_book(symbol, depth).await
@@ -505,6 +549,11 @@ impl<P: MarketData> MarketData for Fallback<P> {
             }
         }
     }
+}
+
+/// A malformed explicit venue key must not be disguised as a simulated equity.
+fn crypto_request(symbol: &str) -> bool {
+    symbol.contains(':') || Security::parse(symbol).is_some_and(|s| s.class == AssetClass::Crypto)
 }
 
 /// Resolve a market key or bare ticker.
@@ -705,8 +754,31 @@ mod tests {
 
     #[test]
     fn quote_change() {
-        let q = Quote { symbol: "X".into(), last: 110.0, prev_close: 100.0, ts: 0, spark: vec![] };
+        let q = Quote { symbol: "X".into(), last: 110.0, prev_close: 100.0, ts: 0, spark: vec![], crypto_source: None };
         assert_eq!(q.change(), 10.0);
         assert!((q.change_pct() - 10.0).abs() < 1e-9);
+    }
+    #[tokio::test]
+    async fn crypto_failures_are_not_disguised_as_sample_quotes_books_or_options() {
+        let provider = Fallback::new(Broken);
+        for symbol in ["BTCUSD Curncy", "BINANCE:BTCUSDT Curncy", "BINANCE:BTCUSDT.P Curncy", "UNKNOWN:BTCUSD"] {
+            assert!(provider.quotes(&[symbol.into()]).await.is_err(), "{symbol}");
+            assert!(provider.order_book(symbol, 10).await.is_err(), "{symbol}");
+            assert!(provider.options(symbol, None).await.is_err(), "{symbol}");
+        }
+        let mixed = provider.quotes(&["BTCUSD Curncy".into(), "AAPL US Equity".into()]).await.unwrap();
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].symbol, "AAPL US Equity");
+    }
+
+    #[test]
+    fn old_quotes_load_without_crypto_metadata_and_invalid_contracts_are_rejected() {
+        let quote: Quote =
+            serde_json::from_str(r#"{"symbol":"BTCUSD Curncy","last":1,"prev_close":1,"ts":0}"#).unwrap();
+        assert!(quote.crypto_source.is_none());
+        let mut json = serde_json::to_value(&quote).unwrap();
+        json["crypto_source"] =
+            serde_json::json!({"venue":"Binance","kind":"Spot","native_symbol":"BTCUSDT","base":"ETH","quote":"USD"});
+        assert!(serde_json::from_value::<Quote>(json).is_err());
     }
 }

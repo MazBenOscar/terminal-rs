@@ -160,6 +160,9 @@ impl Ticket {
     /// The order the ticket describes, or why it is incomplete.
     pub fn request(&self) -> Result<OrderRequest, String> {
         let account = self.account.clone().ok_or("Choose an account.")?;
+        if self.market_key().is_none() {
+            return Err("Trading supports US equities and ETFs only; crypto market data cannot be traded here.".into());
+        }
         let q = parse_num(&self.qty).ok_or(if self.dollars { "Enter an amount." } else { "Enter a quantity." })?;
         let field = |s: &str, needed: bool, what: &str| -> Result<Option<f64>, String> {
             if !needed {
@@ -2085,6 +2088,22 @@ mod tests {
         t.side = Side::Buy;
         let placed = trading::simulate_place(&mut pf, t.current_preview().unwrap(), chrono::Utc::now()).unwrap();
         assert_eq!(placed.status, "EXECUTED");
+    }
+
+    #[test]
+    fn crypto_tickets_are_refused_for_both_demo_and_live_accounts() {
+        for account in [demo::ACCOUNT_ID, "live-account"] {
+            for symbol in ["BTCUSD", "ethusd", "COINBASE:BTC-USD", "BINANCE:BTCUSDT", "OTHER:BTCUSD"] {
+                let mut t = ticket();
+                t.account = Some(account.into());
+                t.symbol = symbol.into();
+                assert!(t.request().is_err(), "{account}: {symbol}");
+                assert!(t.market_key().is_none());
+            }
+        }
+        let mut t = ticket();
+        t.symbol = "BRK.B".into();
+        assert_eq!(t.request().unwrap().symbol, "BRK.B");
     }
 
     #[test]
