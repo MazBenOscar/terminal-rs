@@ -152,6 +152,9 @@ pub enum Icon {
     Trash,
     Grip,
     ChevronSmall,
+    ChevronRight,
+    ChevronDown,
+    ChevronLeft,
 }
 
 /// Original measure-family glyphs on a 12-unit grid.
@@ -561,6 +564,14 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
                 }
             }
         }
+        Icon::ChevronRight | Icon::ChevronDown | Icon::ChevronLeft => {
+            let points = match icon {
+                Icon::ChevronDown => vec![pt(-4., -2.), pt(0., 2.), pt(4., -2.)],
+                Icon::ChevronLeft => vec![pt(2., -4.), pt(-2., 0.), pt(2., 4.)],
+                _ => vec![pt(-2., -4.), pt(2., 0.), pt(-2., 4.)],
+            };
+            p.add(Shape::line(points, s));
+        }
         Icon::ChevronSmall => {
             p.add(Shape::convex_polygon(vec![pt(-3., 3.), pt(3., -3.), pt(3., 3.)], color, Stroke::NONE));
         }
@@ -702,6 +713,16 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
     }
 }
 
+/// A compact keyboard hint, shared by the status bar and dialogs.
+pub fn keycap(painter: &egui::Painter, left_center: Pos2, label: &str) -> Rect {
+    let g = painter.layout_no_wrap(label.to_string(), theme::mono(10.0), theme::text());
+    let cap = Rect::from_min_size(left_center - vec2(0.0, 8.0), vec2(g.size().x + 8.0, 16.0));
+    painter.rect_filled(cap, 4.0, theme::control());
+    painter.rect_stroke(cap, 4.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
+    painter.galley(left_center + vec2(4.0, -g.size().y / 2.0), g, theme::text());
+    cap
+}
+
 /// Borderless toolbar button with an animated hover/press wash.
 pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, active: bool) -> Response {
     // Fill the space given (toolbars pass compact rects), up to a 28×24 button.
@@ -835,6 +856,30 @@ pub fn buy_sell_pills() -> [Pill<'static>; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_bar_keycaps_preserve_labels_and_geometry() {
+        let ctx = egui::Context::default();
+        let labels = ["F1", "⌘K", "⇧", "Enter"];
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            for (index, label) in labels.iter().enumerate() {
+                let pos = pos2(10.0, 20.0 + index as f32 * 20.0);
+                let g = ui.painter().layout_no_wrap((*label).into(), theme::mono(10.0), theme::text());
+                let rect = keycap(ui.painter(), pos, label);
+                assert_eq!(rect, Rect::from_min_size(pos - vec2(0.0, 8.0), vec2(g.size().x + 8.0, 16.0)));
+            }
+        });
+        let rendered: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                Shape::Text(t) => Some(t.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, labels);
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn color_lerp() {

@@ -7,7 +7,9 @@ use tr_core::AssetClass;
 use tr_core::crypto::{CryptoInstrument, CryptoVenue};
 use tr_data::SearchHit;
 
-use crate::{theme, watch_sections};
+use crate::{theme, watch_sections, widgets};
+use theme::{dp, mono, ui_font};
+use widgets::Icon;
 
 const LIMIT: usize = 500;
 
@@ -113,6 +115,30 @@ pub struct Outcome {
     pub close: bool,
 }
 
+/// Familiar asset and currency names; unknown codes remain literal.
+fn asset_name(code: &str) -> &str {
+    match code {
+        "BTC" => "Bitcoin",
+        "ETH" => "Ethereum",
+        "SOL" => "Solana",
+        "XRP" => "XRP",
+        "ADA" => "Cardano",
+        "DOGE" => "Dogecoin",
+        "USDT" => "Tether",
+        "USDC" => "USD Coin",
+        "USD" => "US Dollar",
+        "EUR" => "Euro",
+        "GBP" => "British Pound",
+        "JPY" => "Japanese Yen",
+        "BRL" => "Brazilian Real",
+        "TRY" => "Turkish Lira",
+        "INR" => "Indian Rupee",
+        "AUD" => "Australian Dollar",
+        "CAD" => "Canadian Dollar",
+        _ => code,
+    }
+}
+
 fn venue_index(venue: CryptoVenue) -> usize {
     match venue {
         CryptoVenue::Binance => 0,
@@ -194,6 +220,7 @@ enum SourceKind {
     #[expect(dead_code, reason = "Reserved for decentralized source registry entries")]
     DecentralizedExchange,
     StockExchange,
+    FuturesExchange,
     BuiltIn,
 }
 
@@ -202,7 +229,8 @@ impl SourceKind {
         match self {
             Self::CentralizedExchange => "Centralized exchange · spot crypto",
             Self::DecentralizedExchange => "Decentralized exchange · spot crypto",
-            Self::StockExchange => "US stock exchange",
+            Self::StockExchange => "Stock exchange",
+            Self::FuturesExchange => "Futures exchange",
             Self::BuiltIn => "Built-in catalog",
         }
     }
@@ -228,10 +256,17 @@ impl SourceInfo {
 
     fn from_name(name: &str) -> Self {
         SOURCE_REGISTRY.iter().find(|(id, _, _)| *id == name).map_or_else(
-            || Self::new(name, SourceKind::StockExchange, theme::muted()),
+            || Self::new(name, exchange_kind(name), theme::muted()),
             |(_, kind, color)| Self::new(name, *kind, *color),
         )
     }
+}
+
+/// Provider exchange names are free text; the futures venues are recognisable by name.
+fn exchange_kind(name: &str) -> SourceKind {
+    let upper = name.to_uppercase();
+    let futures = ["MERCANTILE", "BOARD OF TRADE", "CME", "CBOT", "NYMEX", "COMEX", "ICE FUTURES"];
+    if futures.iter().any(|f| upper.contains(f)) { SourceKind::FuturesExchange } else { SourceKind::StockExchange }
 }
 
 fn source_order(name: &str) -> (usize, String) {
@@ -254,45 +289,198 @@ impl Group {
     }
 }
 
+fn badge_sources(group: &Group) -> Vec<String> {
+    // Badges identify crypto venues; stock and catalog rows already name their source.
+    let mut names: Vec<_> = group
+        .members
+        .iter()
+        .map(source)
+        .filter(|name| {
+            matches!(
+                SourceInfo::from_name(name).kind,
+                SourceKind::CentralizedExchange | SourceKind::DecentralizedExchange
+            )
+        })
+        .collect();
+    names.dedup();
+    names
+}
+
 #[derive(Clone, Copy)]
 struct VisibleRow {
     group: usize,
     member: Option<usize>,
 }
 
-fn search_field(ui: &mut egui::Ui, text: &mut String, autofocus: &mut bool) -> bool {
+struct RowColumns {
+    ticker: egui::Rect,
+    name: egui::Rect,
+    label: egui::Rect,
+    badges: egui::Rect,
+    chevron: egui::Rect,
+    action: egui::Rect,
+}
+
+impl RowColumns {
+    fn new(row: egui::Rect, subrow: bool) -> Self {
+        let slot =
+            |left, width| egui::Rect::from_min_size(egui::pos2(left, row.top()), egui::vec2(width, row.height()));
+        let action = slot(row.right() - dp(8.0 + 28.0), dp(28.0));
+        let chevron = slot(action.left() - dp(22.0), dp(22.0));
+        let badges = slot(chevron.left() - dp(90.0), dp(90.0));
+        let label = slot(badges.left() - dp(150.0 + 8.0), dp(150.0));
+        let ticker = slot(row.left() + dp(12.0) + if subrow { dp(24.0) } else { 0.0 }, dp(120.0));
+        let name_left = ticker.right() + dp(12.0);
+        let name = slot(name_left, (label.left() - dp(12.0) - name_left).max(0.0));
+        Self { ticker, name, label, badges, chevron, action }
+    }
+}
+
+fn elided(
+    ui: &egui::Ui,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.into(), font, color);
+    job.wrap.max_width = width;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    ui.painter().layout_job(job)
+}
+
+fn row_text(ui: &egui::Ui, rect: egui::Rect, text: &str, font: egui::FontId, color: egui::Color32, right: bool) {
+    let galley = elided(ui, text, font, color, rect.width());
+    let x = if right { rect.right() - galley.size().x } else { rect.left() };
+    ui.painter().galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, color);
+}
+
+fn row_icon(ui: &mut egui::Ui, rect: egui::Rect, icon: Icon, tooltip: &str) -> egui::Response {
+    let rect = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), rect.height().min(24.0)));
+    let mut child =
+        ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    widgets::icon_button(&mut child, icon, tooltip, false)
+}
+
+fn filter_label<'a>(value: &'a str, all: &'a str) -> &'a str {
+    if value.is_empty() { all } else { value }
+}
+
+fn filter_button(ui: &mut egui::Ui, value: &str, all: &str, tooltip: &str) -> egui::Response {
+    let label = filter_label(value, all);
+    let galley = ui.painter().layout_no_wrap(label.into(), ui_font(12.0), theme::text());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(galley.size().x + dp(38.0), dp(26.0)), egui::Sense::click());
+    let fill = if !value.is_empty() {
+        theme::accent_wash()
+    } else if response.hovered() {
+        theme::control_hover()
+    } else {
+        theme::control()
+    };
+    ui.painter().rect_filled(rect, theme::CONTROL_RADIUS, fill);
+    ui.painter().galley(
+        egui::pos2(rect.left() + dp(10.0), rect.center().y - galley.size().y / 2.0),
+        galley,
+        theme::text(),
+    );
+    widgets::draw_icon(
+        ui.painter(),
+        egui::Rect::from_center_size(
+            egui::pos2(rect.right() - dp(12.0), rect.center().y),
+            egui::vec2(dp(14.0), dp(14.0)),
+        ),
+        Icon::ChevronDown,
+        theme::muted(),
+    );
+    response.on_hover_text(tooltip)
+}
+
+fn footer(ui: &mut egui::Ui, adding: bool) {
+    let parts: &[(bool, &str)] = if adding {
+        &[
+            (true, "⇧"),
+            (false, " + "),
+            (true, "Click"),
+            (false, " or "),
+            (true, "⇧"),
+            (false, " + "),
+            (true, "Enter"),
+            (false, " to add symbol and close dialog"),
+        ]
+    } else {
+        &[
+            (true, "Enter"),
+            (false, " to open · "),
+            (true, "⇧"),
+            (false, " "),
+            (true, "Enter"),
+            (false, " to open and close"),
+        ]
+    };
+    let widths: Vec<_> = parts
+        .iter()
+        .map(|(cap, text)| {
+            ui.painter()
+                .layout_no_wrap((*text).into(), if *cap { mono(10.0) } else { ui_font(11.0) }, theme::muted())
+                .size()
+                .x
+                + if *cap { 8.0 } else { 0.0 }
+        })
+        .collect();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), dp(24.0)), egui::Sense::hover());
+    let mut x = rect.center().x - widths.iter().sum::<f32>() / 2.0;
+    for ((cap, text), width) in parts.iter().zip(widths) {
+        let pos = egui::pos2(x, rect.center().y);
+        if *cap {
+            widgets::keycap(ui.painter(), pos, text);
+        } else {
+            ui.painter().text(pos, egui::Align2::LEFT_CENTER, text, ui_font(11.0), theme::muted());
+        }
+        x += width;
+    }
+    response.on_hover_text("↑/↓ select · → expand sources · ← collapse · Enter activates · Esc closes");
+}
+
+fn search_field(ui: &mut egui::Ui, text: &mut String, autofocus: &mut bool, hint: &str) -> bool {
     let mut changed = false;
-    egui::Frame::new().fill(theme::header()).corner_radius(5).inner_margin(5.0).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            // Drawn icons: the UI font has no magnifier or circled-x glyphs.
-            let (icon, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-            crate::widgets::draw_icon(ui.painter(), icon, crate::widgets::Icon::Search, theme::muted());
-            let width = (ui.available_width() - 30.0).max(20.0);
-            let field = ui.add_sized(
-                [width, 24.0],
-                egui::TextEdit::singleline(text).frame(egui::Frame::NONE).hint_text("Symbol or name"),
-            );
-            if *autofocus {
-                field.request_focus();
-                *autofocus = false;
-            }
-            if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                field.request_focus();
-            }
-            changed = field.changed();
-            let clear = (!text.is_empty())
-                .then(|| crate::widgets::icon_button(ui, crate::widgets::Icon::Close, "Clear search", false));
-            #[cfg(test)]
-            if let Some(clear) = &clear {
-                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("symbol-search-clear"), clear.rect));
-            }
-            if clear.is_some_and(|clear| clear.clicked_by(egui::PointerButton::Primary)) {
-                text.clear();
-                field.request_focus();
-                changed = true;
-            }
+    egui::Frame::new()
+        .fill(theme::header())
+        .corner_radius(theme::CONTROL_RADIUS)
+        .inner_margin(egui::Margin::symmetric(dp(5.0) as i8, dp(4.0) as i8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Drawn icons: the UI font has no magnifier or circled-x glyphs.
+                let (icon, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                crate::widgets::draw_icon(ui.painter(), icon, crate::widgets::Icon::Search, theme::muted());
+                let width = (ui.available_width() - 30.0).max(20.0);
+                let field = ui.add_sized(
+                    [width, dp(24.0)],
+                    egui::TextEdit::singleline(text).frame(egui::Frame::NONE).hint_text(hint),
+                );
+                if *autofocus {
+                    field.request_focus();
+                    *autofocus = false;
+                }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    field.request_focus();
+                }
+                changed = field.changed();
+                let clear = (!text.is_empty())
+                    .then(|| crate::widgets::icon_button(ui, crate::widgets::Icon::Close, "Clear search", false));
+                #[cfg(test)]
+                if let Some(clear) = &clear {
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("symbol-search-clear"), clear.rect));
+                }
+                if clear.is_some_and(|clear| clear.clicked_by(egui::PointerButton::Primary)) {
+                    text.clear();
+                    field.request_focus();
+                    changed = true;
+                }
+            });
         });
-    });
     changed
 }
 
@@ -391,7 +579,13 @@ impl Dialog {
         }
         for hit in &mut hits {
             let security = tr_data::security(&hit.key);
-            hit.key = security.crypto_instrument().map_or_else(|_| security.key(), |c| c.security().key());
+            hit.key = security.crypto_instrument().map_or_else(
+                |_| security.key(),
+                |c| {
+                    hit.name = format!("{} / {}", asset_name(&c.base), asset_name(&c.quote));
+                    c.security().key()
+                },
+            );
         }
         let query = self.query.trim().to_uppercase();
         let mut unique: Vec<SearchHit> = Vec::new();
@@ -484,7 +678,7 @@ impl Dialog {
     }
 
     fn show_sources(&mut self, ui: &mut egui::Ui) {
-        if search_field(ui, &mut self.source_query, &mut self.autofocus) {
+        if search_field(ui, &mut self.source_query, &mut self.autofocus, "Search sources") {
             self.selected = 0;
         }
         egui::ScrollArea::vertical().id_salt("source-list").auto_shrink([false, false]).show(ui, |ui| {
@@ -494,34 +688,45 @@ impl Dialog {
                 choices[0].id.clear();
             }
             let column_width = (ui.available_width() - 12.0) / 2.0;
-            egui::Grid::new("sources-grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+            egui::Grid::new("sources-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 for (index, info) in choices.iter().enumerate() {
-                    let mut text = egui::text::LayoutJob::default();
-                    text.append(
-                        &format!("{}\n", info.name),
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::proportional(14.0),
-                            color: ui.visuals().text_color(),
-                            ..Default::default()
-                        },
-                    );
+                    let (rect, response) = ui.allocate_exact_size(egui::vec2(column_width, 48.0), egui::Sense::click());
+                    let selected = self.source == info.id;
+                    widgets::hover_wash(ui, rect, &response, selected);
+                    let painter = ui.painter_at(rect);
+                    let badge = egui::pos2(rect.left() + 22.0, rect.center().y);
                     if !info.id.is_empty() {
-                        text.append(
+                        painter.circle_filled(badge, 12.0, info.badge.1);
+                        painter.text(badge, egui::Align2::CENTER_CENTER, info.badge.0, ui_font(11.0), theme::card());
+                    }
+                    let left = rect.left() + if info.id.is_empty() { 12.0 } else { 44.0 };
+                    let (name_y, kind_y) = if info.id.is_empty() {
+                        (rect.center().y, None)
+                    } else {
+                        (rect.center().y - 8.0, Some(rect.center().y + 9.0))
+                    };
+                    painter.text(
+                        egui::pos2(left, name_y),
+                        egui::Align2::LEFT_CENTER,
+                        &info.name,
+                        ui_font(13.5),
+                        theme::text(),
+                    );
+                    if let Some(y) = kind_y {
+                        painter.text(
+                            egui::pos2(left, y),
+                            egui::Align2::LEFT_CENTER,
                             info.kind.label(),
-                            0.0,
-                            egui::TextFormat {
-                                font_id: egui::FontId::proportional(11.0),
-                                color: theme::muted(),
-                                ..Default::default()
-                            },
+                            ui_font(11.0),
+                            theme::muted(),
                         );
                     }
-                    if ui
-                        .add_sized([column_width, 52.0], egui::Button::selectable(self.source == info.id, text))
-                        .on_hover_text(format!("Show symbols from {}", info.name))
-                        .clicked()
-                    {
+                    let tip = if info.id.is_empty() {
+                        "Show symbols from every source".to_owned()
+                    } else {
+                        format!("Show symbols from {}", info.name)
+                    };
+                    if response.on_hover_text(tip).clicked() {
                         self.choose_source(info.id.clone());
                     }
                     if index % 2 == 1 {
@@ -560,12 +765,13 @@ impl Dialog {
     }
 
     fn show_results(&mut self, ui: &mut egui::Ui, present: &[String], out: &mut Outcome) {
-        if search_field(ui, &mut self.query, &mut self.autofocus) {
+        if search_field(ui, &mut self.query, &mut self.autofocus, "Symbol or name") {
             self.network.clear();
             self.pending = Some(Instant::now());
             self.selected = 0;
             self.expanded.clear();
         }
+        ui.add_space(dp(10.0));
         ui.horizontal_wrapped(|ui| {
             for (label, class) in CATEGORIES {
                 let tooltip = if class.is_none() { "Show all categories".into() } else { format!("Show only {label}") };
@@ -577,12 +783,9 @@ impl Dialog {
                 }
             }
         });
+        ui.add_space(dp(6.0));
         ui.horizontal(|ui| {
-            if ui
-                .button(if self.source.is_empty() { "All sources" } else { &self.source })
-                .on_hover_text("Filter by source")
-                .clicked()
-            {
+            if filter_button(ui, &self.source, "All sources", "Filter by source").clicked() {
                 self.sources_view = true;
                 self.source_query.clear();
                 self.autofocus = true;
@@ -590,29 +793,29 @@ impl Dialog {
             let mut types: Vec<_> = self.candidates().iter().map(|h| kind(h.class)).collect();
             types.sort();
             types.dedup();
-            egui::ComboBox::from_id_salt("symbol-type")
-                .selected_text(if self.kind.is_empty() { "All types" } else { &self.kind })
-                .show_ui(ui, |ui| {
+            let response = filter_button(ui, &self.kind, "All types", "Filter by type");
+            egui::Popup::menu(&response).show(|ui| {
+                if ui
+                    .selectable_value(&mut self.kind, String::new(), "All types")
+                    .on_hover_text("Show all types")
+                    .clicked()
+                {
+                    self.selected = 0;
+                    ui.close();
+                }
+                for t in types {
                     if ui
-                        .selectable_value(&mut self.kind, String::new(), "All types")
-                        .on_hover_text("Show all types")
+                        .selectable_value(&mut self.kind, t.into(), t)
+                        .on_hover_text(format!("Show only {t}"))
                         .clicked()
                     {
                         self.selected = 0;
+                        ui.close();
                     }
-                    for t in types {
-                        if ui
-                            .selectable_value(&mut self.kind, t.into(), t)
-                            .on_hover_text(format!("Show only {t}"))
-                            .clicked()
-                        {
-                            self.selected = 0;
-                        }
-                    }
-                })
-                .response
-                .on_hover_text("Filter by instrument type");
+                }
+            });
         });
+        ui.add_space(dp(10.0));
         let groups = self.groups();
         let rows = self.keyboard(ui, &groups, out);
         let footer_height = if groups.len() > LIMIT { 60.0 } else { 38.0 };
@@ -658,13 +861,9 @@ impl Dialog {
         if groups.len() > LIMIT {
             ui.label(format!("Showing first {LIMIT} — refine your search"));
         }
+        ui.add_space(dp(8.0));
         ui.separator();
-        ui.small(if self.target.is_some() {
-            "⇧ + Click or ⇧ + Enter to add symbol and close dialog"
-        } else {
-            "Enter to open · ⇧ Enter to open and close"
-        })
-        .on_hover_text("↑/↓ select · → expand sources · ← collapse · Enter activates · Esc closes");
+        footer(ui, self.target.is_some());
     }
 
     fn show_row(
@@ -680,73 +879,74 @@ impl Dialog {
         let sec = tr_data::security(&hit.key);
         let ticker = sec.crypto_instrument().map_or(sec.ticker.clone(), |c| format!("{}/{}", c.base, c.quote));
         let remove = self.target.is_some() && present.iter().any(|s| same_key(s, &hit.key));
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 42.0), egui::Sense::click());
-        if index == self.selected || response.hovered() {
-            ui.painter().rect_filled(rect, 4.0, theme::header());
-        }
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt((&group.id, row.member))
-                .max_rect(rect)
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        let subrow = row.member.is_some();
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), dp(if subrow { 30.0 } else { 36.0 })),
+            egui::Sense::click(),
         );
-        let mut clicked = false;
-        if row.member.is_some() {
-            child.add_space(18.0);
-        }
-        clicked |= child
-            .add_sized(
-                [130.0, 36.0],
-                egui::Button::new(egui::RichText::new(&ticker).monospace().color(theme::amber())).frame(false),
-            )
-            .clicked();
-        let name_width = (child.available_width() - 300.0).max(30.0);
-        clicked |= child
-            .add_sized(
-                [name_width, 36.0],
-                egui::Label::new(
-                    egui::RichText::new(if row.member.is_none() { group.name() } else { &hit.name })
-                        .color(theme::muted()),
-                )
-                .truncate()
-                .sense(egui::Sense::click()),
-            )
-            .clicked();
-        clicked |= child
-            .add(
-                egui::Label::new(egui::RichText::new(format!("{} · {}", kind(hit.class), source(hit))).small())
-                    .truncate()
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_text(source(hit))
-            .clicked();
-        if row.member.is_none() {
-            let mut names: Vec<_> = group.members.iter().map(source).collect();
-            names.dedup();
+        widgets::hover_wash(ui, rect, &response, index == self.selected);
+        let columns = RowColumns::new(rect, subrow);
+        let ticker_color = if !subrow {
+            theme::amber()
+        } else if index == self.selected || response.hovered() {
+            theme::text()
+        } else {
+            theme::muted()
+        };
+        row_text(ui, columns.ticker, &ticker, mono(if subrow { 12.0 } else { 12.5 }), ticker_color, false);
+        row_text(ui, columns.name, if subrow { &hit.name } else { group.name() }, ui_font(12.5), theme::text(), false);
+        row_text(
+            ui,
+            columns.label,
+            &format!("{} · {}", kind(hit.class), source(hit)),
+            ui_font(11.0),
+            theme::muted(),
+            true,
+        );
+        if !subrow {
+            let names = badge_sources(group);
+            let extra = (names.len() > 3).then(|| format!("+{}", names.len() - 3));
+            let extra_width = extra.as_ref().map_or(0.0, |s| {
+                ui.painter().layout_no_wrap(s.clone(), ui_font(11.0), theme::muted()).size().x + dp(4.0)
+            });
+            let count = names.len().min(3);
+            let mut x = columns.badges.right() - count as f32 * dp(22.0) + dp(4.0) - extra_width;
             for name in names.iter().take(3) {
                 let info = SourceInfo::from_name(name);
-                let (badge, response) = child.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-                child.painter().circle_filled(badge.center(), 9.0, info.badge.1);
-                child.painter().text(
+                let badge = egui::Rect::from_center_size(
+                    egui::pos2(x + dp(9.0), rect.center().y),
+                    egui::vec2(dp(18.0), dp(18.0)),
+                );
+                ui.painter().circle_filled(badge.center(), dp(9.0), info.badge.1);
+                ui.painter().text(
                     badge.center(),
                     egui::Align2::CENTER_CENTER,
                     info.badge.0,
-                    egui::FontId::proportional(11.0),
+                    ui_font(11.0),
                     egui::Color32::BLACK,
                 );
-                response.on_hover_text(info.name);
+                ui.interact(badge, response.id.with(name), egui::Sense::hover()).on_hover_text(info.name);
+                x += dp(22.0);
             }
-            if names.len() > 3 {
-                child.small(format!("+{}", names.len() - 3)).on_hover_text(names.join(", "));
+            if let Some(extra) = extra {
+                ui.painter().text(
+                    egui::pos2(columns.badges.right(), rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    extra,
+                    ui_font(11.0),
+                    theme::muted(),
+                );
             }
         }
-        if row.member.is_none() && group.members.len() > 1 {
+        if !subrow && group.members.len() > 1 {
             let expanded = self.expanded.contains(&group.id);
-            if child
-                .small_button(if expanded { "⌄" } else { "›" })
-                .on_hover_text(format!("Show all {} sources", group.members.len()))
-                .clicked()
-            {
+            let tooltip =
+                if expanded { "Hide sources".into() } else { format!("Show all {} sources", group.members.len()) };
+            let chevron =
+                row_icon(ui, columns.chevron, if expanded { Icon::ChevronDown } else { Icon::ChevronRight }, &tooltip);
+            #[cfg(test)]
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("symbol-chevron", index)), chevron.rect));
+            if chevron.clicked() {
                 self.selected = index;
                 if expanded {
                     self.expanded.remove(&group.id);
@@ -755,15 +955,18 @@ impl Dialog {
                 }
             }
         }
-        let list = &self.list_name;
-        clicked |= child
-            .button(if remove { "🗑" } else { "+" })
-            .on_hover_text(if remove {
-                format!("Remove {ticker} from {list}")
-            } else {
-                format!("Add {ticker} from {}", source(hit))
-            })
-            .clicked();
+        let tooltip = if remove {
+            format!("Remove {ticker} from {}", self.list_name)
+        } else {
+            format!("Add {ticker} from {}", source(hit))
+        };
+        let action = row_icon(ui, columns.action, if remove { Icon::Trash } else { Icon::Plus }, &tooltip);
+        #[cfg(test)]
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(egui::Id::new(("symbol-action", index)), action.rect);
+            d.insert_temp(egui::Id::new(("symbol-remove", index)), remove);
+        });
+        let clicked = action.clicked();
         if clicked || response.clicked() {
             self.selected = index;
             out.key = Some(hit.key.clone());
@@ -803,31 +1006,52 @@ impl Dialog {
             .fixed_size(size)
             .collapsible(false)
             .resizable(false)
-            .frame(egui::Frame::new().fill(theme::card()).corner_radius(12).inner_margin(16.0).shadow(egui::Shadow {
-                offset: [0, 8],
-                blur: 24,
-                spread: 0,
-                color: egui::Color32::from_black_alpha(90),
-            }))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::card())
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin {
+                        left: dp(16.0) as i8,
+                        right: dp(16.0) as i8,
+                        top: dp(14.0) as i8,
+                        bottom: dp(18.0) as i8,
+                    })
+                    .shadow(egui::Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(90),
+                    }),
+            )
             .show(ctx, |ui| {
                 ui.set_min_size(size);
                 ui.set_max_size(size);
+                ui.spacing_mut().item_spacing.y = 0.0;
                 ui.horizontal(|ui| {
-                    if self.sources_view && ui.button("‹").on_hover_text("Back").clicked() {
+                    if self.sources_view && widgets::icon_button(ui, Icon::ChevronLeft, "Back", false).clicked() {
                         self.sources_view = false;
                         self.autofocus = true;
                     }
-                    ui.heading(if self.sources_view {
-                        "Sources"
-                    } else if self.target.is_some() {
-                        "Add symbol"
-                    } else {
-                        "Symbol search"
-                    });
+                    ui.label(
+                        egui::RichText::new(if self.sources_view {
+                            "Sources"
+                        } else if self.target.is_some() {
+                            "Add symbol"
+                        } else {
+                            "Symbol search"
+                        })
+                        .font(ui_font(16.0))
+                        .strong()
+                        .color(theme::text()),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        out.close |= ui.button("×").on_hover_text("Close (Esc)").clicked();
+                        let close = widgets::icon_button(ui, Icon::Close, "Close (Esc)", false);
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("symbol-search-close"), close.rect));
+                        out.close |= close.clicked();
                     });
                 });
+                ui.add_space(dp(10.0));
                 if self.sources_view {
                     self.show_sources(ui);
                 } else {
@@ -980,8 +1204,8 @@ mod tests {
         assert!(add.key.is_some());
         assert!(!add.close);
         let present = vec![add.key.unwrap()];
-        let (_, labels) = frame(&mut dialog, &ctx, None, false, &present);
-        assert!(labels.iter().any(|s| s == "🗑"));
+        frame(&mut dialog, &ctx, None, false, &present);
+        assert_eq!(rendered_removals(&dialog, &ctx), 1);
         frame(&mut dialog, &ctx, None, false, &present);
         let (remove, _) = frame(&mut dialog, &ctx, Some(egui::Key::Enter), true, &present);
         assert_eq!(remove.key.as_ref(), present.first());
@@ -1247,7 +1471,7 @@ mod tests {
         snapshot(&mut dialog, &ctx, vec![], &[]);
         let view = snapshot(&mut dialog, &ctx, vec![], &[]);
         let title = text_rect(&view, "Add symbol");
-        let close = text_rect(&view, "×");
+        let close = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("symbol-search-close"))).unwrap();
         assert!(close.left() > title.right());
         assert!((close.center().y - title.center().y).abs() < 5.0);
         assert!(click(&mut dialog, &ctx, close.center()).outcome.close);
@@ -1317,8 +1541,9 @@ mod tests {
         frame(&mut dialog, &ctx, Some(egui::Key::ArrowLeft), false, &[]);
         assert_eq!(dialog.selected, 0);
         assert_eq!(dialog.visible_rows(&dialog.groups()).len(), 1);
-        let view = snapshot(&mut dialog, &ctx, vec![], &[]);
-        let out = click(&mut dialog, &ctx, text_rect(&view, "›").center()).outcome;
+        snapshot(&mut dialog, &ctx, vec![], &[]);
+        let chevron = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("symbol-chevron", 0_usize)))).unwrap();
+        let out = click(&mut dialog, &ctx, chevron.center()).outcome;
         assert!(out.key.is_none());
         assert_eq!(dialog.visible_rows(&dialog.groups()).len(), 3);
         frame(&mut dialog, &ctx, Some(egui::Key::ArrowDown), false, &[]);
@@ -1336,15 +1561,15 @@ mod tests {
         let primary = groups[0].members[0].key.clone();
         let secondary = groups[0].members[1].key.clone();
         snapshot(&mut dialog, &ctx, vec![], &[]);
-        let view = snapshot(&mut dialog, &ctx, vec![], std::slice::from_ref(&secondary));
-        assert!(!view.texts.iter().any(|(s, _)| s == "🗑"));
-        let view = snapshot(&mut dialog, &ctx, vec![], std::slice::from_ref(&primary));
-        assert_eq!(view.texts.iter().filter(|(s, _)| s == "🗑").count(), 1);
+        snapshot(&mut dialog, &ctx, vec![], std::slice::from_ref(&secondary));
+        assert_eq!(rendered_removals(&dialog, &ctx), 0);
+        snapshot(&mut dialog, &ctx, vec![], std::slice::from_ref(&primary));
+        assert_eq!(rendered_removals(&dialog, &ctx), 1);
         dialog.expanded.insert(groups[0].id.clone());
-        let view = snapshot(&mut dialog, &ctx, vec![], &[secondary]);
-        assert_eq!(view.texts.iter().filter(|(s, _)| s == "🗑").count(), 1);
-        let view = snapshot(&mut dialog, &ctx, vec![], &[primary]);
-        assert_eq!(view.texts.iter().filter(|(s, _)| s == "🗑").count(), 2);
+        snapshot(&mut dialog, &ctx, vec![], &[secondary]);
+        assert_eq!(rendered_removals(&dialog, &ctx), 1);
+        snapshot(&mut dialog, &ctx, vec![], &[primary]);
+        assert_eq!(rendered_removals(&dialog, &ctx), 2);
     }
 
     #[test]
@@ -1359,7 +1584,7 @@ mod tests {
         assert_eq!(dialog.source_choices().len(), 1);
         assert_eq!(dialog.source_choices()[0].id, "Coinbase");
         let view = snapshot(&mut dialog, &ctx, vec![], &[]);
-        let choice = view.texts.iter().find(|(s, _)| s.starts_with("Coinbase\n")).unwrap().1;
+        let choice = view.texts.iter().find(|(s, _)| s == "Coinbase").unwrap().1;
         click(&mut dialog, &ctx, choice.center());
         assert_eq!(dialog.source, "Coinbase");
         assert!(!dialog.sources_view);
@@ -1400,6 +1625,162 @@ mod tests {
                 hits.iter().map(|h| &h.key).collect::<Vec<_>>()
             );
         }
+    }
+
+    fn rendered_removals(dialog: &Dialog, ctx: &egui::Context) -> usize {
+        (0..dialog.visible_rows(&dialog.groups()).len())
+            .filter(|index| ctx.data(|d| d.get_temp::<bool>(egui::Id::new(("symbol-remove", *index)))).unwrap_or(false))
+            .count()
+    }
+
+    #[test]
+    fn action_and_ticker_columns_align_across_source_counts_and_chevrons() {
+        let ctx = egui::Context::default();
+        let mut dialog = btc();
+        let pair = |key: &str| SearchHit {
+            key: tr_data::security(key).key(),
+            name: "Bitcoin / Tether".into(),
+            class: AssetClass::Crypto,
+            exchange: None,
+        };
+        let mut groups = [
+            Group { id: "one".into(), members: vec![hit("A", "Alpha")] },
+            Group { id: "three".into(), members: vec![hit("B", "Beta"), hit("C", "Gamma"), hit("D", "Delta")] },
+            Group { id: "venues".into(), members: vec![pair("COINBASE:BTC-USDT"), pair("BINANCE:BTCUSDT")] },
+        ];
+        groups[1].members[1].exchange = Some("NYSE".into());
+        groups[1].members[2].exchange = Some("LSE".into());
+        assert!(badge_sources(&groups[0]).is_empty() && badge_sources(&groups[1]).is_empty());
+        assert_eq!(badge_sources(&groups[2]).len(), 2, "crypto venues keep their badges");
+        let mut actions = Vec::new();
+        let mut tickers = Vec::new();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            for (index, group) in groups.iter().enumerate() {
+                let mut out = Outcome { key: None, close: false };
+                dialog.show_row(ui, group, VisibleRow { group: index, member: None }, index, &[], &mut out);
+                actions.push(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("symbol-action", index)))).unwrap());
+            }
+            let mut out = Outcome { key: None, close: false };
+            dialog.show_row(
+                ui,
+                &groups[1],
+                VisibleRow { group: 1, member: Some(1) },
+                2,
+                &[groups[1].members[1].key.clone()],
+                &mut out,
+            );
+            actions.push(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("symbol-action", 2_usize)))).unwrap());
+            dialog.show_row(ui, &groups[2], VisibleRow { group: 2, member: None }, 3, &[], &mut out);
+            actions.push(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("symbol-action", 3_usize)))).unwrap());
+        });
+        for shape in &output.shapes {
+            if let egui::Shape::Text(t) = &shape.shape
+                && ["A", "B"].contains(&t.galley.job.text.as_str())
+                // Venue badges draw letters too; tickers live in the left column.
+                && t.pos.x < dp(60.0)
+            {
+                tickers.push(t.pos.x);
+            }
+        }
+        output.textures_delta.clear();
+        assert!(actions.iter().all(|rect| rect.left() == actions[0].left()));
+        assert_eq!(tickers.len(), 2);
+        assert_eq!(tickers[0], tickers[1]);
+    }
+
+    #[test]
+    fn long_name_is_elided_before_right_cluster() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(728.0, 36.0));
+            let columns = RowColumns::new(row, false);
+            let name = "Grayscale Bitcoin Mini Trust (BTC) with a very long descriptive name";
+            let galley = elided(ui, name, ui_font(12.5), theme::text(), columns.name.width());
+            assert!(galley.elided);
+            assert_eq!(galley.rows[0].glyphs.last().unwrap().chr, '…');
+            assert!(columns.name.left() + galley.size().x <= columns.label.left());
+            assert_eq!(columns.ticker.left(), row.left() + dp(12.0));
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn only_crypto_venues_get_badges() {
+        let mut member = hit("A", "Alpha");
+        member.exchange = Some("Built-in".into());
+        let mut group = Group { id: "A".into(), members: vec![member] };
+        assert!(badge_sources(&group).is_empty());
+        let ctx = egui::Context::default();
+        let mut dialog = btc();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            dialog.show_row(
+                ui,
+                &group,
+                VisibleRow { group: 0, member: None },
+                0,
+                &[],
+                &mut Outcome { key: None, close: false },
+            );
+        });
+        assert!(!output.shapes.iter().any(|s| matches!(s.shape, egui::Shape::Circle(_))));
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == "stock · Built-in"))
+        );
+        output.textures_delta.clear();
+        group.members.push(hit("B", "Beta"));
+        assert!(badge_sources(&group).is_empty(), "stock rows name their exchange in the label");
+        group.members.push(SearchHit {
+            key: tr_data::security("BINANCE:BTCUSDT").key(),
+            name: "Bitcoin / Tether".into(),
+            class: AssetClass::Crypto,
+            exchange: None,
+        });
+        assert_eq!(badge_sources(&group), ["Binance"]);
+    }
+
+    #[test]
+    fn filters_render_active_values_and_footer_renders_keycaps() {
+        let ctx = egui::Context::default();
+        let mut dialog = btc();
+        dialog.source = "Binance".into();
+        dialog.kind = "spot crypto".into();
+        frame(&mut dialog, &ctx, None, false, &[]);
+        let (_, labels) = frame(&mut dialog, &ctx, None, false, &[]);
+        for value in ["Binance", "spot crypto", "⇧", "Click", "Enter"] {
+            assert!(labels.iter().any(|label| label == value), "Missing {value}");
+        }
+        assert!(!labels.iter().any(|label| label == "All sources" || label == "All types"));
+    }
+
+    #[test]
+    fn type_filter_popup_selects_value_and_closes() {
+        let ctx = egui::Context::default();
+        let mut dialog = btc();
+        snapshot(&mut dialog, &ctx, vec![], &[]);
+        let view = snapshot(&mut dialog, &ctx, vec![], &[]);
+        click(&mut dialog, &ctx, text_rect(&view, "All types").center());
+        let view = snapshot(&mut dialog, &ctx, vec![], &[]);
+        let choice = text_rect(&view, "spot crypto");
+        dialog.selected = 1;
+        click(&mut dialog, &ctx, choice.center());
+        assert_eq!(dialog.kind, "spot crypto");
+        assert_eq!(dialog.selected, 0);
+        let view = snapshot(&mut dialog, &ctx, vec![], &[]);
+        assert!(!view.texts.iter().any(|(text, _)| text == "All types"));
+    }
+
+    #[test]
+    fn crypto_names_use_known_assets_and_literal_unknown_codes() {
+        let mut dialog = btc();
+        dialog.catalog(CryptoVenue::Binance, Ok(vec![CryptoInstrument::parse("BINANCE:PEPEUSDT").unwrap()]));
+        dialog.query.clear();
+        let hits = dialog.candidates();
+        assert!(hits.iter().any(|h| h.name == "Bitcoin / Tether"));
+        assert!(hits.iter().any(|h| h.name == "PEPE / Tether"));
+        assert_eq!(asset_name("CAD"), "Canadian Dollar");
     }
 
     #[test]

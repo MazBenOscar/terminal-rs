@@ -881,11 +881,7 @@ impl TerminalApp {
                 if x > rect.center().x {
                     break;
                 }
-                let g = p.layout_no_wrap(k.to_string(), mono(10.0), text());
-                let cap = Rect::from_min_size(pos2(x, cy - 8.0), vec2(g.size().x + 8.0, 16.0));
-                p.rect_filled(cap, 4.0, theme::control());
-                p.rect_stroke(cap, 4.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
-                p.galley(pos2(x + 4.0, cy - g.size().y / 2.0), g, text());
+                let cap = widgets::keycap(&p, pos2(x, cy), &k);
                 x = cap.right() + 5.0;
                 let g = p.layout_no_wrap(label.to_string(), ui_font(11.0), muted());
                 p.galley(pos2(x, cy - g.size().y / 2.0), g.clone(), muted());
@@ -1084,6 +1080,47 @@ fn nav_row(ui: &mut Ui, icon: Icon, label: &str, trailing: Option<&str>, selecte
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_bar_keeps_hotkey_and_action_labels() {
+        use crate::prefs::Action as A;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/status-keycap-test");
+        let app = TerminalApp::test_workspace(&root);
+        let expected: Vec<_> = [
+            (A::Help, "Help"),
+            (A::Congress, "Congress"),
+            (A::Watchlist, "Watchlist"),
+            (A::NextPane, "Next Pane"),
+            (A::SplitRight, "Split"),
+            (A::PopOut, "Pop Out"),
+            (A::SaveLayout, "Save Layout"),
+            (A::Settings, "Settings"),
+        ]
+        .into_iter()
+        .filter_map(|(action, label)| Some([app.prefs.hotkeys.chord(action)?.display(), label.into()]))
+        .flatten()
+        .collect();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(10000.0, 100.0))),
+                ..Default::default()
+            },
+            |ui| {
+                app.status_bar(ui, Rect::from_min_size(pos2(0.0, 20.0), vec2(10000.0, 24.0)));
+            },
+        );
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(&labels[..expected.len()], expected.as_slice());
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn clicking_a_suggestion_loads_it_even_though_the_press_takes_focus() {
