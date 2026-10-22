@@ -413,6 +413,8 @@ pub enum Response {
         tf: Timeframe,
         bars: Arc<Vec<Bar>>,
         gpu: SeriesGpu,
+        /// Resolved contract belonging to these bars (also applies to cached/live bars).
+        crypto_source: Option<tr_core::crypto::CryptoInstrument>,
         /// Number of bars prepended (paging), 0 otherwise.
         prepended: usize,
         from_cache: bool,
@@ -1011,6 +1013,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 let bars = Arc::new(bars);
                 let gpu = build_gpu(bars.clone()).await;
                 s.send(Response::History {
+                    crypto_source: s.provider.crypto_instrument(&symbol),
                     pane,
                     generation,
                     symbol: symbol.clone(),
@@ -1046,6 +1049,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     let Some(bars) = current_series(s, pane, generation) else { return };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
+                        crypto_source: s.provider.crypto_instrument(&symbol),
                         pane,
                         generation,
                         symbol: symbol.clone(),
@@ -1108,6 +1112,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
+                        crypto_source: s.provider.crypto_instrument(&symbol),
                         pane,
                         generation,
                         symbol,
@@ -1258,7 +1263,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::ExportChart { pane, result });
         }
         Request::ExportChart { pane, symbol, title, bars, image } => {
-            let title = format!("{title} · source {}", s.provider.name());
+            let title = format!("{title} · source {}", s.provider.scan_cache_key(&symbol));
             let result = tokio::task::spawn_blocking(move || {
                 let content =
                     if image { crate::chart_export::svg(&title, &bars) } else { crate::chart_export::csv(&bars) };
@@ -1852,6 +1857,7 @@ fn start_live(
                     let Some(bars) = current_series(&s, pane, generation) else { break };
                     let gpu = build_gpu(bars.clone()).await;
                     s.send(Response::History {
+                    crypto_source: s.provider.crypto_instrument(&symbol),
                         pane,
                         generation,
                         symbol: symbol.clone(),

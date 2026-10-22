@@ -175,6 +175,9 @@ impl OrderRequest {
         if clean_symbol(&self.symbol).is_none() {
             return Err("Enter a symbol.".into());
         }
+        if model::market_key(InstrumentKind::Stock, &self.symbol, "USD").is_none() {
+            return Err("Trading supports US equities and ETFs only; crypto market data cannot be traded here.".into());
+        }
         match self.amount {
             Amount::Units(u) if !positive(u) => return Err("Quantity must be greater than zero.".into()),
             Amount::Notional(n) if !positive(n) => return Err("Amount must be greater than zero.".into()),
@@ -285,6 +288,14 @@ pub fn parse_symbols(v: &Value) -> Vec<SymbolMatch> {
         .into_iter()
         .flatten()
         .filter_map(|s| {
+            // A broker can return a crypto product whose symbol looks like an
+            // unfamiliar stock. Honor explicit asset metadata before previewing.
+            let kind = s["type"]["code"].as_str().or_else(|| s["type"].as_str());
+            if kind
+                .is_some_and(|kind| !matches!(InstrumentKind::parse(kind), InstrumentKind::Stock | InstrumentKind::Etf))
+            {
+                return None;
+            }
             let id = text(&s["id"]);
             (!id.is_empty()).then(|| SymbolMatch {
                 id,
@@ -552,6 +563,7 @@ impl SnapTrade {
     /// error, a lost or unreadable response, or a 5xx may hide an order the broker accepted, so
     /// those come back as [`PlaceError::Unknown`] and must not be retried blindly.
     pub async fn place_previewed(&self, preview: &OrderPreview) -> Result<Option<Order>, PlaceError> {
+        preview.request.validate().map_err(PlaceError::NotSent)?;
         if preview.simulated {
             return Err(PlaceError::NotSent("a simulated preview cannot be placed with a broker".into()));
         }
@@ -657,6 +669,7 @@ pub fn simulate_preview(
 /// Record a simulated order in the sample portfolio. Market orders fill at once (updating
 /// cash); other orders rest as `PENDING` until cancelled.
 pub fn simulate_place(pf: &mut Portfolio, preview: &OrderPreview, now: DateTime<Utc>) -> Result<Order, String> {
+    preview.request.validate()?;
     if !preview.simulated || !pf.simulated {
         return Err("Only simulated previews can be placed in the sample portfolio.".into());
     }
@@ -804,6 +817,21 @@ mod tests {
     }
 
     #[test]
+    fn crypto_cannot_be_submitted_as_stock_through_api_validation() {
+        for symbol in ["BTCUSD", "ethusd", "COINBASE:BTC-USD", "BINANCE:BTCUSDT", "OTHER:BTCUSD"] {
+            let mut request = req();
+            request.symbol = symbol.into();
+            assert!(request.validate().is_err(), "{symbol}");
+            assert!(simulate_preview(&crate::sample::portfolio(), &request, Some(100.0), Utc::now()).is_err());
+        }
+        for symbol in ["BRK.B", "SPY", "TUSD"] {
+            let mut request = req();
+            request.symbol = symbol.into();
+            assert!(request.validate().is_ok(), "Do not reject a stock merely for a currency suffix: {symbol}");
+        }
+    }
+
+    #[test]
     fn impact_body_sends_only_relevant_prices() {
         let mut r = req();
         r.limit = Some(150.0);
@@ -841,6 +869,13 @@ mod tests {
         assert_eq!(pick_symbol(&brk, "BRK/B").unwrap().id, "9");
         assert_eq!(clean_symbol(" brk.b "), Some("BRK.B".into()));
         assert_eq!(clean_symbol("A;B"), None);
+        assert!(
+            parse_symbols(&json!([
+                {"id":"crypto", "symbol":"NEWCOINUSDT", "type":{"code":"crypto"}},
+                {"id":"future", "symbol":"FUT", "type":{"code":"future"}}
+            ]))
+            .is_empty()
+        );
         assert!(valid_id("917c8734-8470-4a3e-a18f-57c3f2ee6631") && valid_id("1234567890"));
         assert!(!valid_id("../trade") && !valid_id("a/b") && !valid_id(""));
     }

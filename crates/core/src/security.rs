@@ -134,8 +134,25 @@ impl Security {
     /// Returns the security and how many input tokens it consumed.
     pub fn resolve_tokens(tokens: &[&str]) -> Option<(Self, usize)> {
         let (&head, rest) = tokens.split_first()?;
+        if head.chars().any(char::is_control) {
+            return None;
+        }
         // `BTC/USD` is a pair; `BRK/B` is a share class.
         let up = head.trim().to_ascii_uppercase();
+        if up.contains(':') {
+            let instrument = crate::crypto::CryptoInstrument::parse(&up).ok()?;
+            let mut used = 1;
+            if rest.first().is_some_and(|word| word.eq_ignore_ascii_case("US")) {
+                return None;
+            }
+            if let Some(key) = rest.first().and_then(|word| YellowKey::parse(word)) {
+                if key != YellowKey::Curncy {
+                    return None;
+                }
+                used += 1;
+            }
+            return Some((instrument.security(), used));
+        }
         let ticker = match up.split_once('/') {
             Some((a, b)) if a.len() >= 3 && b.len() >= 3 => format!("{a}{b}"),
             Some((a, b)) => format!("{a}.{b}"),
@@ -167,8 +184,19 @@ impl Security {
 
     /// Parse a full key or bare ticker (e.g. persisted settings).
     pub fn parse(input: &str) -> Option<Self> {
+        if input.len() > 256 || input.chars().any(char::is_control) {
+            return None;
+        }
         let tokens: Vec<&str> = input.split_whitespace().collect();
-        Self::resolve_tokens(&tokens).map(|(s, _)| s)
+        let (security, consumed) = Self::resolve_tokens(&tokens)?;
+        if tokens.first().is_some_and(|head| head.contains(':')) && consumed != tokens.len() {
+            return None;
+        }
+        Some(security)
+    }
+
+    pub fn crypto_instrument(&self) -> Result<crate::crypto::CryptoInstrument, String> {
+        crate::crypto::CryptoInstrument::from_security(self)
     }
 
     fn classify(ticker: &str, key: Option<YellowKey>) -> Self {
@@ -189,6 +217,11 @@ impl Security {
             }
             Some(YellowKey::Equity) => AssetClass::Equity,
             None if ticker.len() == 6 && is_fiat(&ticker[..3]) && is_fiat(&ticker[3..]) => AssetClass::Fx,
+            None if ["USDT", "USDC", "FDUSD"].iter().any(|quote| ticker.ends_with(quote))
+                && crate::crypto::split_pair(ticker).is_some() =>
+            {
+                AssetClass::Crypto
+            }
             None => AssetClass::Equity,
         };
         Self::new(ticker, class)
@@ -203,6 +236,16 @@ impl Security {
     pub fn pair(&self) -> Option<(&str, &str)> {
         if !matches!(self.class, AssetClass::Fx | AssetClass::Crypto) {
             return None;
+        }
+        if self.class == AssetClass::Crypto && self.ticker.contains(':') {
+            self.crypto_instrument().ok()?;
+            let (venue, product) = self.ticker.split_once(':')?;
+            let product = product.strip_suffix(".P").unwrap_or(product);
+            return match venue {
+                "COINBASE" => product.split_once('-'),
+                "BINANCE" => crate::crypto::split_pair(product),
+                _ => None,
+            };
         }
         for q in ["USDT", "USDC", "USD", "EUR", "GBP", "JPY", "BTC", "ETH"] {
             if let Some(base) = self.ticker.strip_suffix(q).filter(|b| !b.is_empty()) {
@@ -299,5 +342,41 @@ mod tests {
         assert_eq!(Security::new("USDJPY", AssetClass::Fx).decimals(150.0), 3);
         assert!(!Security::new("BTCUSD", AssetClass::Crypto).has_congress_trades());
         assert_eq!(r("BTCUSD Curncy").name(), Some("Bitcoin / US Dollar"));
+    }
+
+    #[test]
+    fn qualified_crypto_round_trips_without_equity_fallback() {
+        for ticker in ["BINANCE:BTCUSDT", "COINBASE:BTC-USDT", "BINANCE:BTCUSDT.P"] {
+            let security = r(ticker);
+            assert_eq!(security.class, AssetClass::Crypto);
+            assert_eq!(r(&security.key()), security);
+            assert_eq!(security.pair(), Some(("BTC", "USDT")));
+            assert_eq!(Security::resolve_tokens(&[ticker, "CURNCY", "GP"]).unwrap().1, 2);
+        }
+        for input in [
+            "OTHER:BTCUSD",
+            "BINANCE:BTC-USDT",
+            "COINBASE:BTCUSD",
+            "BINANCE:BTCUSDT EQUITY",
+            "BINANCE:BTCUSDT US Equity",
+            "BINANCE:BTCUSDT CURNCY OB",
+            "BINANCE:BTCUSDT unexpected",
+        ] {
+            assert!(Security::parse(input).is_none(), "{input}");
+        }
+        assert_eq!(Security::resolve_tokens(&["BINANCE:BTCUSDT", "OB"]).unwrap().1, 1);
+        assert!(Security::resolve_tokens(&["BINANCE:BTCUSDT", "US", "Equity"]).is_none());
+        assert!(Security::resolve_tokens(&["BINANCE:BTCUSDT", "Index"]).is_none());
+    }
+
+    #[test]
+    fn legacy_security_persistence_is_unchanged() {
+        let value = r("BTCUSD Curncy");
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(json, r#"{"ticker":"BTCUSD","class":"Crypto"}"#);
+        assert_eq!(serde_json::from_str::<Security>(&json).unwrap(), value);
+        assert_eq!(value.key(), "BTCUSD Curncy");
+        assert_eq!(value.crypto_instrument().unwrap().canonical_ticker(), "COINBASE:BTC-USD");
+        assert_eq!(r("BTCUSDT").crypto_instrument().unwrap().canonical_ticker(), "BINANCE:BTCUSDT");
     }
 }

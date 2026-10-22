@@ -2,7 +2,7 @@
 //!
 //! | class | history | quotes | live |
 //! |---|---|---|---|
-//! | Crypto | Binance klines (Coinbase fallback) | Binance 24h ticker | Binance kline websocket (Coinbase ticker fallback) |
+//! | Crypto | Explicit venue candles | Same-venue ticker | Same-venue websocket |
 //! | Govt | Treasury.gov daily curve (FRED fallback); Yahoo `^TNX` etc. intraday | Treasury.gov | — |
 //! | Equity/ETF | Questrade if a token is set (scans use it exclusively), then Alpaca if keyed, else Yahoo | Yahoo spark | — |
 //! | FX/Index/Comdty | Yahoo (`EURUSD=X`, `^GSPC`, `CL=F`) | Yahoo spark | — |
@@ -19,6 +19,17 @@ use crate::yahoo::{YahooProvider, yahoo_symbol};
 use crate::{
     LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, ScanHistory, SearchHit, YieldCurves, security,
 };
+
+fn checked_security(symbol: &str) -> Result<Security> {
+    let sec = security(symbol);
+    if symbol.contains(':') {
+        if sec.class != AssetClass::Crypto {
+            bail!("Invalid qualified crypto instrument: {symbol}");
+        }
+        crate::crypto::resolved_instrument(&sec)?;
+    }
+    Ok(sec)
+}
 
 pub struct Markets {
     yahoo: YahooProvider,
@@ -43,7 +54,7 @@ impl Markets {
         if alpaca.is_some() {
             name.push_str("alpaca+");
         }
-        name.push_str("yahoo+binance+ust");
+        name.push_str("yahoo+crypto-v2+ust");
         Ok(Self {
             yahoo: YahooProvider::new()?,
             crypto: CryptoProvider::new()?,
@@ -69,7 +80,7 @@ impl MarketData for Markets {
         limit: usize,
         options: crate::HistoryOptions,
     ) -> Result<Vec<Bar>> {
-        let sec = security(symbol);
+        let sec = checked_security(symbol)?;
         let options = options.for_chart(sec.class, tf);
         if matches!(sec.class, AssetClass::Equity | AssetClass::Etf) && tf.session_aligned(options.session) {
             let source_options = crate::HistoryOptions { session: Default::default(), ..options };
@@ -102,7 +113,7 @@ impl MarketData for Markets {
         }
     }
     async fn chart_events(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<crate::ChartEvent>> {
-        let sec = security(symbol);
+        let sec = checked_security(symbol)?;
         if !matches!(sec.class, AssetClass::Equity | AssetClass::Etf) {
             bail!("No corporate events for this asset class");
         }
@@ -113,7 +124,7 @@ impl MarketData for Markets {
         Ok(events)
     }
     async fn alert_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
-        let sec = security(symbol);
+        let sec = checked_security(symbol)?;
         let session = tr_core::session::Session::UsRegular;
         if matches!(sec.class, AssetClass::Equity | AssetClass::Etf) && tf.session_aligned(session) {
             let factor = (tf.seconds() / Timeframe::M30.seconds()) as usize;
@@ -133,6 +144,10 @@ impl MarketData for Markets {
         }
     }
     fn scan_cache_key(&self, symbol: &str) -> String {
+        if security(symbol).class == AssetClass::Crypto {
+            return crate::crypto::route_key(&security(symbol))
+                .unwrap_or_else(|_| format!("crypto-v2:unsupported:{symbol}"));
+        }
         if matches!(security(symbol).class, AssetClass::Equity | AssetClass::Etf)
             && self.questrade().is_none()
             && let Some(a) = &self.alpaca
@@ -149,18 +164,21 @@ impl MarketData for Markets {
                 "alpaca-stream"
             }
             AssetClass::Equity | AssetClass::Etf if self.alpaca.is_some() => "alpaca+yahoo",
-            AssetClass::Crypto => "binance+coinbase",
+            AssetClass::Crypto => unreachable!("crypto route resolved above"),
             AssetClass::Govt => "treasury+yahoo+fred",
             _ => "yahoo",
         }
         .into()
+    }
+    fn crypto_instrument(&self, symbol: &str) -> Option<tr_core::crypto::CryptoInstrument> {
+        crate::crypto::resolved_instrument(&checked_security(symbol).ok()?).ok()
     }
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
-        let sec = security(symbol);
+        let sec = checked_security(symbol)?;
         match sec.class {
             AssetClass::Crypto => self.crypto.history(&sec, tf, end, limit).await,
             AssetClass::Govt if tf.is_intraday() => match catalog::by_security(&sec).and_then(|l| l.yahoo) {
@@ -194,7 +212,7 @@ impl MarketData for Markets {
     }
 
     async fn scan_history(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<ScanHistory> {
-        let sec = security(symbol);
+        let sec = checked_security(symbol)?;
         let session = tr_core::session::Session::UsRegular;
         if matches!(sec.class, AssetClass::Equity | AssetClass::Etf) && tf.session_aligned(session) {
             let factor = (tf.seconds() / Timeframe::M30.seconds()) as usize;
@@ -240,7 +258,7 @@ impl MarketData for Markets {
     }
 
     async fn alert_observation(&self, symbol: &str) -> Result<tr_core::price_alerts::Observation> {
-        let sec = security(symbol);
+        let sec = checked_security(symbol)?;
         // Keep the chosen stock source stable; scanner history may fall back from
         // Alpaca to Yahoo, which would obscure provenance for a crossing baseline.
         let (history, source) = match (sec.class, self.questrade(), self.alpaca.as_ref()) {
@@ -268,7 +286,13 @@ impl MarketData for Markets {
     async fn quotes(&self, symbols: &[String]) -> Result<Vec<Quote>> {
         let (mut crypto, mut govt, mut other) = (Vec::new(), Vec::new(), Vec::new());
         for key in symbols {
-            let sec = security(key);
+            let sec = match checked_security(key) {
+                Ok(sec) => sec,
+                Err(error) => {
+                    tracing::debug!("invalid quote key {key}: {error:#}");
+                    continue;
+                }
+            };
             match sec.class {
                 AssetClass::Crypto => crypto.push((key.clone(), sec)),
                 AssetClass::Govt => govt.push((key.clone(), sec)),
@@ -304,26 +328,42 @@ impl MarketData for Markets {
                 Err(e) => errors.push(format!("{e:#}")),
             }
         }
-        if out.is_empty() && !errors.is_empty() {
+        if out.is_empty() && !symbols.is_empty() {
+            if errors.is_empty() {
+                errors.push("no quotes available for requested instruments".into());
+            }
             return Err(anyhow!(errors.join("; ")));
         }
         Ok(out)
     }
 
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
-        let sec = security(symbol);
+        let sec = checked_security(symbol).ok()?;
         if matches!(sec.class, AssetClass::Equity | AssetClass::Etf) && self.questrade().is_none() {
             return self.alpaca.as_ref().and_then(|a| a.live(&sec.ticker, tf));
         }
-        (sec.class == AssetClass::Crypto && tf.source_interval().is_none()).then(|| CryptoProvider::live(&sec, tf))
+        if sec.class == AssetClass::Crypto && tf.source_interval().is_none() {
+            CryptoProvider::live(&sec, tf)
+        } else {
+            None
+        }
     }
 
     async fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
+        if query.contains(':') {
+            let sec = checked_security(query)?;
+            return Ok(vec![SearchHit {
+                key: sec.key(),
+                name: query.to_string(),
+                class: sec.class,
+                exchange: Some(crate::crypto::resolved_instrument(&sec)?.venue.label().into()),
+            }]);
+        }
         self.yahoo.search(query).await
     }
 
     async fn news(&self, symbol: Option<&str>) -> Result<Vec<NewsItem>> {
-        let q = match symbol.map(security) {
+        let q = match symbol.map(checked_security).transpose()? {
             Some(sec) => match sec.class {
                 // Yahoo has no crypto headlines; use CoinDesk's feed.
                 AssetClass::Crypto => return self.crypto.news(&sec).await,
@@ -337,7 +377,7 @@ impl MarketData for Markets {
 
     /// Listed options on US equities, ETFs and indices (Yahoo).
     async fn options(&self, symbol: &str, expiration: Option<i64>) -> Result<OptionChain> {
-        let sec = security(symbol);
+        let sec = checked_security(symbol)?;
         match sec.class {
             AssetClass::Equity | AssetClass::Etf | AssetClass::Index => {
                 let y = yahoo_symbol(&sec);
@@ -350,7 +390,7 @@ impl MarketData for Markets {
     }
 
     async fn order_book(&self, symbol: &str, depth: usize) -> Result<OrderBook> {
-        let sec = security(symbol);
+        let sec = checked_security(symbol)?;
         match sec.class {
             AssetClass::Crypto => self.crypto.order_book(symbol, &sec, depth).await,
             _ => bail!("no free public order book for {}", sec.key()),
@@ -370,6 +410,26 @@ pub fn key(sec: &Security) -> String {
 #[cfg(test)]
 mod scanner_cache_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn qualified_routes_cannot_leak_to_another_asset_provider() {
+        let provider = Markets::new(None).unwrap();
+        assert!(
+            provider
+                .history("UNKNOWN:BTCUSD", Timeframe::M1, None, 1)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid qualified")
+        );
+        assert!(provider.quotes(&["UNKNOWN:BTCUSD".into()]).await.is_err());
+        assert!(provider.search("BINANCE:BTCUSDT.P").await.is_err());
+        assert!(provider.history("BINANCE:BTCUSDT.P", Timeframe::M1, None, 1).await.is_err());
+        assert!(provider.live("BINANCE:BTCUSDT.P", Timeframe::M1).is_none());
+        assert_eq!(provider.scan_cache_key("BTCUSD Crypto"), provider.scan_cache_key("COINBASE:BTC-USD Crypto"));
+        assert_ne!(provider.scan_cache_key("BTCUSD Crypto"), provider.scan_cache_key("BTCUSDT Crypto"));
+        assert_eq!(provider.crypto_instrument("BTCUSD Crypto").unwrap().native_symbol, "BTC-USD");
+    }
 
     #[tokio::test]
     async fn extended_history_routes_to_alpaca_without_silent_fallback() {

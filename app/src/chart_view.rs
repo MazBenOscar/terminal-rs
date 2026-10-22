@@ -371,6 +371,7 @@ pub struct ChartState {
     markers_key: u64,
     loading: bool,
     cached_history: bool,
+    crypto_source: Option<tr_core::crypto::CryptoInstrument>,
     paging: bool,
     exhausted: bool,
     error: Option<String>,
@@ -482,6 +483,7 @@ impl ChartState {
             markers_key: 0,
             loading: false,
             cached_history: false,
+            crypto_source: None,
             paging: false,
             exhausted: false,
             error: None,
@@ -600,6 +602,7 @@ impl ChartState {
         self.generation += 1;
         self.loading = true;
         self.cached_history = false;
+        self.crypto_source = None;
         self.paging = false;
         self.exhausted = false;
         self.error = None;
@@ -1516,6 +1519,12 @@ impl ChartState {
             self.ha_gpu = Some((bars, Some(gpu)));
         }
     }
+    pub fn on_crypto_source(&mut self, generation: u64, source: Option<tr_core::crypto::CryptoInstrument>) {
+        if generation == self.generation {
+            self.crypto_source = source;
+        }
+    }
+
     pub fn on_live_status(&mut self, generation: u64, message: Option<String>) {
         if generation == self.generation {
             self.live_notice = message;
@@ -1873,7 +1882,7 @@ impl ChartState {
             }
             rx = lr.right();
         }
-        let status = match (&self.error, self.loading, self.paging) {
+        let mut status = match (&self.error, self.loading, self.paging) {
             (Some(e), _, _) => format!("ERR {e}"),
             (_, true, _) => "loading…".into(),
             (_, _, true) => "loading history…".into(),
@@ -1893,7 +1902,10 @@ impl ChartState {
                 }
             ),
         };
-        painter.text(
+        if let Some(source) = &self.crypto_source {
+            status.push_str(&format!(" · {} spot {}", source.venue.label(), source.native_symbol));
+        }
+        painter.with_clip_rect(Rect::from_min_max(pos2(rx + 6., range_row.top()), range_row.max)).text(
             pos2(range_row.right() - 6.0, range_row.center().y),
             Align2::RIGHT_CENTER,
             status,
@@ -7595,5 +7607,16 @@ mod tests {
         assert_eq!((g.from, g.to.right), (shown, shown.right - 40.0));
         c.reset_view();
         assert_eq!(c.glide.map(|g| g.to), Some(Viewport::fit_last(500, DEFAULT_VISIBLE, 800.0)));
+    }
+    #[test]
+    fn resolved_crypto_source_does_not_cross_symbol_load_generations() {
+        let mut chart = ChartState::new(1, "BTCUSD Curncy", Timeframe::D1);
+        let source = tr_core::crypto::CryptoInstrument::parse("COINBASE:BTC-USD").unwrap();
+        chart.on_crypto_source(chart.generation.wrapping_add(1), Some(source.clone()));
+        assert!(chart.crypto_source.is_none());
+        chart.on_crypto_source(chart.generation, Some(source));
+        assert_eq!(chart.crypto_source.as_ref().unwrap().quote, "USD");
+        chart.on_crypto_source(chart.generation, None);
+        assert!(chart.crypto_source.is_none());
     }
 }

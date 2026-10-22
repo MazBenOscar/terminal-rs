@@ -1452,12 +1452,14 @@ impl TerminalApp {
                     from_cache,
                     exhausted,
                     live,
+                    crypto_source,
                 } => {
                     let worker = &self.worker;
                     if let Some(PaneKind::Chart(c)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                         && c.symbol == symbol
                         && c.tf == tf
                     {
+                        c.on_crypto_source(generation, crypto_source);
                         c.on_history(generation, bars, gpu, prepended, from_cache, exhausted, live, worker);
                     }
                 }

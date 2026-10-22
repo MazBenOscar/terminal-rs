@@ -27,6 +27,15 @@ pub struct Snapshot {
     pub chart_mark: bool,
     status_error: bool,
 }
+
+/// A venue-less broker pair cannot establish the mark price of a venue-specific
+/// chart. Only plot crypto overlays when the broker supplies the exact venue key.
+fn matches_market(kind: InstrumentKind, broker_key: Option<String>, chart_key: &str) -> bool {
+    broker_key.is_some_and(|key| {
+        key == chart_key
+            && (kind != InstrumentKind::Crypto || key.split_whitespace().next().is_some_and(|t| t.contains(':')))
+    })
+}
 impl Snapshot {
     pub fn build(
         pf: Option<&Portfolio>,
@@ -78,7 +87,7 @@ impl Snapshot {
                         p.kind,
                         InstrumentKind::Stock | InstrumentKind::Etf | InstrumentKind::Fund | InstrumentKind::Crypto
                     )
-                    || p.market_key().as_deref() != Some(symbol)
+                    || !matches_market(p.kind, p.market_key(), symbol)
                     || p.units == 0.
                     || !p.units.is_finite()
                     || !p.multiplier.is_finite()
@@ -106,7 +115,7 @@ impl Snapshot {
                         o.kind,
                         InstrumentKind::Stock | InstrumentKind::Etf | InstrumentKind::Fund | InstrumentKind::Crypto
                     )
-                    || o.market_key().as_deref() != Some(symbol)
+                    || !matches_market(o.kind, o.market_key(), symbol)
                 {
                     continue;
                 }
@@ -280,5 +289,28 @@ mod tests {
         assert!(snap.levels.iter().all(|l| l.label.contains("40")));
         pf.orders[0].status = "CANCELED".into();
         assert!(Snapshot::build(Some(&pf), "AAPL US Equity", &settings, false, None, false).levels.is_empty());
+    }
+
+    #[test]
+    fn crypto_overlays_need_a_broker_supplied_exact_venue_and_quote() {
+        let mut pf = tr_broker::sample::portfolio();
+        let mut p = pf.positions[0].clone();
+        p.kind = InstrumentKind::Crypto;
+        p.symbol = "BTC".into();
+        p.currency = "USDT".into();
+        p.cost_basis = Some(60_000.0);
+        p.units = 1.0;
+        pf.positions = vec![p];
+        pf.orders.clear();
+        let settings = Settings { positions: true, orders: true, account: None };
+        for chart in ["BTCUSDT Curncy", "BINANCE:BTCUSDT Curncy", "COINBASE:BTC-USD Curncy"] {
+            assert!(Snapshot::build(Some(&pf), chart, &settings, false, None, false).levels.is_empty());
+        }
+        pf.positions[0].symbol = "BINANCE:BTCUSDT".into();
+        assert_eq!(Snapshot::build(Some(&pf), "BINANCE:BTCUSDT Curncy", &settings, false, None, false).levels.len(), 1);
+        assert!(
+            Snapshot::build(Some(&pf), "COINBASE:BTC-USDT Curncy", &settings, false, None, false).levels.is_empty()
+        );
+        assert!(Snapshot::build(Some(&pf), "BINANCE:BTCUSD Curncy", &settings, false, None, false).levels.is_empty());
     }
 }

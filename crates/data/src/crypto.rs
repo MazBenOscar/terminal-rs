@@ -1,6 +1,5 @@
-//! Crypto market data from free public endpoints: Binance spot REST and websocket kline
-//! streams (via the public market-data mirror, then the main API), with Coinbase Exchange
-//! REST candles and its websocket ticker channel as fallback.
+//! Venue-specific crypto spot data. Binance mirrors may fail over within Binance;
+//! a failed request never changes the exchange, market type, or quote currency.
 
 use std::time::Duration;
 
@@ -10,7 +9,8 @@ use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tr_core::{Bar, Security, Timeframe, catalog};
+use tr_core::crypto::{CryptoInstrument, CryptoVenue};
+use tr_core::{Bar, Security, Timeframe};
 
 use crate::{LiveFeed, Quote};
 
@@ -19,26 +19,17 @@ const BINANCE_WS: [&str; 2] = ["wss://data-stream.binance.vision/ws", "wss://str
 const COINBASE_REST: &str = "https://api.exchange.coinbase.com";
 const COINBASE_WS: &str = "wss://ws-feed.exchange.coinbase.com";
 
-/// Binance spot symbol for a crypto security (`BTCUSD` -> `BTCUSDT`).
-pub fn binance_symbol(sec: &Security) -> String {
-    if let Some(s) = catalog::by_security(sec).and_then(|l| l.binance) {
-        return s.to_string();
-    }
-    match sec.ticker.strip_suffix("USD") {
-        Some(base) => format!("{base}USDT"),
-        None => sec.ticker.clone(),
-    }
+/// Resolve legacy aliases once into a concrete venue and product. Unsupported market
+/// types fail before any network access.
+pub fn resolved_instrument(sec: &Security) -> Result<CryptoInstrument> {
+    let instrument = CryptoInstrument::from_security(sec).map_err(anyhow::Error::msg)?;
+    instrument.require_spot().map_err(anyhow::Error::msg)?;
+    Ok(instrument)
 }
 
-/// Coinbase product id (`BTCUSD` -> `BTC-USD`).
-pub fn coinbase_product(sec: &Security) -> String {
-    if let Some(s) = catalog::by_security(sec).and_then(|l| l.coinbase) {
-        return s.to_string();
-    }
-    match sec.pair() {
-        Some((base, quote)) => format!("{base}-{}", if quote == "USDT" { "USD" } else { quote }),
-        None => sec.ticker.clone(),
-    }
+/// Versioned route identity invalidates histories written before explicit venues.
+pub fn route_key(sec: &Security) -> Result<String> {
+    Ok(format!("crypto-v2:{}", resolved_instrument(sec)?.canonical_ticker()))
 }
 
 pub fn binance_interval(tf: Timeframe) -> &'static str {
@@ -59,20 +50,39 @@ pub fn binance_interval(tf: Timeframe) -> &'static str {
 }
 
 fn num(v: &Value) -> Option<f64> {
-    match v {
+    let value = match v {
         Value::String(s) => s.parse().ok(),
         Value::Number(n) => n.as_f64(),
         _ => None,
+    }?;
+    value.is_finite().then_some(value)
+}
+
+fn valid_bar(b: &Bar) -> bool {
+    b.ts > 0
+        && [b.open, b.high, b.low, b.close, b.volume].iter().all(|v| v.is_finite())
+        && b.low > 0.0
+        && b.high >= b.open.max(b.close)
+        && b.low <= b.open.min(b.close)
+        && b.volume >= 0.0
+}
+
+fn checked_bars(mut bars: Vec<Bar>) -> Result<Vec<Bar>> {
+    if bars.iter().any(|b| !valid_bar(b)) {
+        bail!("invalid crypto candle values");
     }
+    bars.sort_by_key(|b| b.ts);
+    bars.dedup_by_key(|b| b.ts);
+    Ok(bars)
 }
 
 /// Parse `/api/v3/klines`: arrays of `[open_ms, o, h, l, c, v, close_ms, ...]` with
 /// prices as strings.
 pub fn parse_binance_klines(json: &str) -> Result<Vec<Bar>> {
     let rows: Vec<Vec<Value>> = serde_json::from_str(json).context("parsing Binance klines")?;
-    Ok(rows
+    let bars: Option<Vec<_>> = rows
         .iter()
-        .filter_map(|r| {
+        .map(|r| {
             Some(Bar::new(
                 r.first()?.as_i64()? / 1000,
                 num(r.get(1)?)?,
@@ -82,7 +92,8 @@ pub fn parse_binance_klines(json: &str) -> Result<Vec<Bar>> {
                 num(r.get(5)?)?,
             ))
         })
-        .collect())
+        .collect();
+    checked_bars(bars.ok_or_else(|| anyhow!("malformed Binance candle"))?)
 }
 
 /// Parse `/api/v3/ticker/24hr`: `(symbol, last, open_24h)`.
@@ -98,18 +109,29 @@ pub fn parse_binance_24hr(json: &str) -> Result<Vec<(String, f64, f64)>> {
 pub fn parse_binance_ws(text: &str) -> Option<Bar> {
     let v: Value = serde_json::from_str(text).ok()?;
     let k = v.get("k")?;
-    Some(Bar::new(k["t"].as_i64()? / 1000, num(&k["o"])?, num(&k["h"])?, num(&k["l"])?, num(&k["c"])?, num(&k["v"])?))
+    let bar =
+        Bar::new(k["t"].as_i64()? / 1000, num(&k["o"])?, num(&k["h"])?, num(&k["l"])?, num(&k["c"])?, num(&k["v"])?);
+    valid_bar(&bar).then_some(bar)
 }
 
 /// Parse Coinbase `/products/{id}/candles`: `[time, low, high, open, close, volume]`,
 /// newest first. Returned ascending.
 pub fn parse_coinbase_candles(json: &str) -> Result<Vec<Bar>> {
-    let rows: Vec<Vec<f64>> = serde_json::from_str(json).context("parsing Coinbase candles")?;
-    let mut bars: Vec<Bar> =
-        rows.iter().filter(|r| r.len() >= 6).map(|r| Bar::new(r[0] as i64, r[3], r[2], r[1], r[4], r[5])).collect();
-    bars.sort_by_key(|b| b.ts);
-    bars.dedup_by_key(|b| b.ts);
-    Ok(bars)
+    let rows: Vec<Vec<Value>> = serde_json::from_str(json).context("parsing Coinbase candles")?;
+    let bars: Option<Vec<_>> = rows
+        .iter()
+        .map(|r| {
+            Some(Bar::new(
+                r.first()?.as_i64()?,
+                num(r.get(3)?)?,
+                num(r.get(2)?)?,
+                num(r.get(1)?)?,
+                num(r.get(4)?)?,
+                num(r.get(5)?)?,
+            ))
+        })
+        .collect();
+    checked_bars(bars.ok_or_else(|| anyhow!("malformed Coinbase candle"))?)
 }
 
 /// Parse Coinbase `/products/{id}/stats`: `(last, open_24h)`.
@@ -125,7 +147,9 @@ pub fn parse_coinbase_ws(text: &str) -> Option<(i64, f64, f64)> {
         return None;
     }
     let ts = DateTime::parse_from_rfc3339(v["time"].as_str()?).ok()?.timestamp();
-    Some((ts, num(&v["price"])?, num(&v["last_size"]).unwrap_or(0.0)))
+    let price = num(&v["price"])?;
+    let size = num(&v["last_size"])?;
+    (ts > 0 && price > 0.0 && size >= 0.0).then_some((ts, price, size))
 }
 
 /// Coinbase granularity used to build `tf` bars, and whether resampling is needed.
@@ -145,18 +169,18 @@ fn coinbase_granularity(tf: Timeframe) -> (i64, bool) {
     }
 }
 
-fn parse_levels(v: &serde_json::Value) -> Vec<crate::Level> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|l| {
-                    let p = l.get(0)?.as_str()?.parse().ok()?;
-                    let q = l.get(1)?.as_str()?.parse().ok()?;
-                    Some((p, q))
-                })
-                .collect()
+fn parse_levels(v: &Value) -> Result<Vec<crate::Level>> {
+    let rows = v.as_array().ok_or_else(|| anyhow!("missing crypto book levels"))?;
+    rows.iter()
+        .map(|level| {
+            let price = level.get(0).and_then(num).ok_or_else(|| anyhow!("invalid book price"))?;
+            let size = level.get(1).and_then(num).ok_or_else(|| anyhow!("invalid book size"))?;
+            if price <= 0.0 || size < 0.0 {
+                bail!("invalid crypto book level");
+            }
+            Ok((price, size))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Parse a Binance `/api/v3/depth` snapshot.
@@ -167,8 +191,8 @@ pub fn parse_binance_depth(json: &str, symbol: &str) -> Result<crate::OrderBook>
     }
     Ok(crate::OrderBook {
         symbol: symbol.into(),
-        bids: parse_levels(&v["bids"]),
-        asks: parse_levels(&v["asks"]),
+        bids: parse_levels(&v["bids"])?,
+        asks: parse_levels(&v["asks"])?,
         source: "Binance".into(),
         simulated: false,
     })
@@ -182,8 +206,8 @@ pub fn parse_coinbase_book(json: &str, symbol: &str, depth: usize) -> Result<cra
     }
     let mut b = crate::OrderBook {
         symbol: symbol.into(),
-        bids: parse_levels(&v["bids"]),
-        asks: parse_levels(&v["asks"]),
+        bids: parse_levels(&v["bids"])?,
+        asks: parse_levels(&v["asks"])?,
         source: "Coinbase".into(),
         simulated: false,
     };
@@ -194,6 +218,8 @@ pub fn parse_coinbase_book(json: &str, symbol: &str, depth: usize) -> Result<cra
 
 pub struct CryptoProvider {
     client: reqwest::Client,
+    #[cfg(test)]
+    test_rest: Option<String>,
 }
 
 impl CryptoProvider {
@@ -202,15 +228,30 @@ impl CryptoProvider {
             .user_agent(concat!("terminal-rs/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(20))
             .build()?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            #[cfg(test)]
+            test_rest: None,
+        })
     }
 
     async fn get(&self, url: &str, query: &[(&str, String)]) -> Result<String> {
-        let resp = self.client.get(url).query(query).send().await?;
+        let mut resp = self.client.get(url).query(query).send().await?;
         if !resp.status().is_success() {
             bail!("GET {url}: HTTP {}", resp.status());
         }
-        Ok(resp.text().await?)
+        const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+        if resp.content_length().is_some_and(|n| n > MAX_RESPONSE as u64) {
+            bail!("crypto response exceeds size limit");
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE {
+                bail!("crypto response exceeds size limit");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        String::from_utf8(bytes).context("crypto response is not UTF-8")
     }
 
     async fn binance_history(
@@ -222,8 +263,11 @@ impl CryptoProvider {
         limit: usize,
     ) -> Result<Vec<Bar>> {
         let mut out: Vec<Bar> = Vec::new();
-        let mut end_ms = end.map(|e| e * 1000 - 1);
-        while out.len() < limit {
+        let mut end_ms = end.map(|e| e.saturating_mul(1000).saturating_sub(1));
+        for _ in 0..100 {
+            if out.len() >= limit {
+                break;
+            }
             let n = (limit - out.len()).min(1000);
             let mut q = vec![
                 ("symbol", symbol.to_string()),
@@ -235,7 +279,11 @@ impl CryptoProvider {
             }
             let page = parse_binance_klines(&self.get(&format!("{host}/api/v3/klines"), &q).await?)?;
             let Some(first) = page.first() else { break };
-            end_ms = Some(first.ts * 1000 - 1);
+            let next = first.ts.saturating_mul(1000).saturating_sub(1);
+            if end_ms.is_some_and(|previous| next >= previous) {
+                bail!("Binance history did not advance");
+            }
+            end_ms = Some(next);
             let got = page.len();
             out.splice(0..0, page);
             if got < n {
@@ -248,7 +296,7 @@ impl CryptoProvider {
     async fn coinbase_history(&self, product: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
         let (gran, resample) = coinbase_granularity(tf);
         let per_bar = (tf.seconds() / gran).max(1) as usize;
-        let want = limit * per_bar;
+        let want = limit.saturating_mul(per_bar);
         let mut end_ts = end.unwrap_or_else(|| chrono::Utc::now().timestamp());
         let mut out: Vec<Bar> = Vec::new();
         // Coinbase returns at most 300 candles per request; bound the walk.
@@ -280,87 +328,156 @@ impl CryptoProvider {
     /// Crypto headlines from CoinDesk, narrowed to the asset when it is mentioned.
     pub async fn news(&self, sec: &Security) -> Result<Vec<crate::NewsItem>> {
         let items = crate::rss::parse_rss(&self.get(crate::rss::COINDESK, &[]).await?, "CoinDesk")?;
-        let base = sec.ticker.trim_end_matches("USD").trim_end_matches("USDT");
+        let instrument = resolved_instrument(sec)?;
+        let base = instrument.base.as_str();
         let name = sec.name().unwrap_or(base).split(['/', ' ']).next().unwrap_or(base).to_string();
         Ok(crate::rss::filter_relevant(items, &[base, &name]))
     }
 
-    /// Order book snapshot: Binance first, Coinbase as fallback.
+    /// Order book snapshot from the requested venue only.
     pub async fn order_book(&self, key: &str, sec: &Security, depth: usize) -> Result<crate::OrderBook> {
+        let route = resolved_instrument(sec)?;
+        let depth = depth.clamp(1, 500);
         let limit = [5, 10, 20, 50, 100, 500].into_iter().find(|&l| l >= depth).unwrap_or(500);
-        let mut last_err = None;
+        if route.venue == CryptoVenue::Coinbase {
+            let text = self
+                .get(&format!("{COINBASE_REST}/products/{}/book", route.native_symbol), &[("level", "2".into())])
+                .await?;
+            return parse_coinbase_book(&text, key, depth);
+        }
+        let mut last_error = None;
         for host in BINANCE_REST {
-            let q = [("symbol", binance_symbol(sec)), ("limit", limit.to_string())];
+            let q = [("symbol", route.native_symbol.clone()), ("limit", limit.to_string())];
             match self.get(&format!("{host}/api/v3/depth"), &q).await.and_then(|j| parse_binance_depth(&j, key)) {
-                Ok(mut b) => {
-                    b.bids.truncate(depth);
-                    b.asks.truncate(depth);
-                    return Ok(b);
+                Ok(mut book) => {
+                    book.bids.truncate(depth);
+                    book.asks.truncate(depth);
+                    return Ok(book);
                 }
-                Err(e) => last_err = Some(e),
+                Err(error) => last_error = Some(error),
             }
         }
-        let product = coinbase_product(sec);
-        match self.get(&format!("{COINBASE_REST}/products/{product}/book"), &[("level", "2".into())]).await {
-            Ok(j) => parse_coinbase_book(&j, key, depth),
-            Err(e) => Err(last_err.unwrap_or(e)),
-        }
+        Err(last_error.unwrap_or_else(|| anyhow!("no Binance depth response")))
     }
 
     pub async fn history(&self, sec: &Security, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        let route = resolved_instrument(sec)?;
+        if end.is_some_and(|ts| ts <= 0 || DateTime::from_timestamp(ts, 0).is_none()) {
+            bail!("invalid crypto history end timestamp");
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if limit > 100_000 {
+            bail!("crypto history limit exceeds 100000 bars");
+        }
         if let Some((base, factor)) = tf.source_interval() {
-            let bars = Box::pin(self.history(sec, base, end, limit.saturating_add(1).saturating_mul(factor))).await?;
+            let count = limit.saturating_add(1).saturating_mul(factor).min(100_000);
+            let bars = Box::pin(self.history(sec, base, end, count)).await?;
             return Ok(crate::clip(tf.resample(&bars), end, limit));
         }
-        let symbol = binance_symbol(sec);
-        let mut last_err = None;
+        if route.venue == CryptoVenue::Coinbase {
+            let bars = self.coinbase_history(&route.native_symbol, tf, end, limit).await?;
+            if bars.is_empty() {
+                bail!("no Coinbase candles for {}", route.native_symbol);
+            }
+            return checked_bars(bars);
+        }
+        let mut last_error = None;
         for host in BINANCE_REST {
-            match self.binance_history(host, &symbol, tf, end, limit).await {
-                Ok(b) if !b.is_empty() => return Ok(b),
-                Ok(_) => last_err = Some(anyhow!("{host}: no klines for {symbol}")),
-                Err(e) => last_err = Some(e),
+            match self.binance_history(host, &route.native_symbol, tf, end, limit).await.and_then(checked_bars) {
+                Ok(bars) if !bars.is_empty() => return Ok(crate::clip(bars, end, limit)),
+                Ok(_) => last_error = Some(anyhow!("no Binance candles for {}", route.native_symbol)),
+                Err(error) => last_error = Some(error),
             }
         }
-        match self.coinbase_history(&coinbase_product(sec), tf, end, limit).await {
-            Ok(b) if !b.is_empty() => Ok(b),
-            Ok(_) => Err(last_err.unwrap_or_else(|| anyhow!("no crypto data for {}", sec.ticker))),
-            Err(e) => Err(e.context(format!("binance: {}", last_err.map(|e| e.to_string()).unwrap_or_default()))),
-        }
+        Err(last_error.unwrap_or_else(|| anyhow!("no Binance history response")))
     }
 
-    /// Quotes keyed by the caller's market keys; change is versus 24 hours ago.
+    fn quote_host<'a>(&'a self, default: &'a str) -> &'a str {
+        #[cfg(test)]
+        if let Some(host) = &self.test_rest {
+            return host;
+        }
+        default
+    }
+
+    async fn quote_for_route(&self, route: &CryptoInstrument) -> Result<Quote> {
+        let (last, prev) = if route.venue == CryptoVenue::Coinbase {
+            let text = self
+                .get(&format!("{}/products/{}/stats", self.quote_host(COINBASE_REST), route.native_symbol), &[])
+                .await?;
+            parse_coinbase_stats(&text)?
+        } else {
+            let mut result = Err(anyhow!("no Binance quote response"));
+            for host in BINANCE_REST {
+                let host = self.quote_host(host);
+                result = async {
+                    let text = self
+                        .get(&format!("{host}/api/v3/ticker/24hr"), &[("symbol", route.native_symbol.clone())])
+                        .await?;
+                    let value: Value = serde_json::from_str(&text)?;
+                    if value["symbol"].as_str() != Some(route.native_symbol.as_str()) {
+                        bail!("wrong Binance quote product");
+                    }
+                    Ok((
+                        num(&value["lastPrice"]).ok_or_else(|| anyhow!("invalid last price"))?,
+                        num(&value["openPrice"]).ok_or_else(|| anyhow!("invalid open price"))?,
+                    ))
+                }
+                .await;
+                if result.is_ok() {
+                    break;
+                }
+            }
+            result?
+        };
+        if !last.is_finite() || !prev.is_finite() || last <= 0.0 || prev <= 0.0 {
+            bail!("invalid crypto quote for {}", route.canonical_ticker());
+        }
+        Ok(Quote {
+            symbol: route.security().key(),
+            last,
+            prev_close: prev,
+            ts: chrono::Utc::now().timestamp(),
+            spark: Vec::new(),
+            crypto_source: Some(route.clone()),
+        })
+    }
+
+    /// Bound work by concrete product, isolate failed products, and cancel pending
+    /// requests at the batch deadline. Duplicate aliases reuse one observation.
     pub async fn quotes(&self, secs: &[(String, Security)]) -> Result<Vec<Quote>> {
-        let symbols: Vec<String> = secs.iter().map(|(_, s)| binance_symbol(s)).collect();
-        let list = serde_json::to_string(&symbols)?;
-        let mut rows = None;
-        for host in BINANCE_REST {
-            if let Ok(t) = self.get(&format!("{host}/api/v3/ticker/24hr"), &[("symbols", list.clone())]).await
-                && let Ok(r) = parse_binance_24hr(&t)
-            {
-                rows = Some(r);
-                break;
+        let mut routes: std::collections::BTreeMap<String, (CryptoInstrument, Vec<String>)> =
+            std::collections::BTreeMap::new();
+        for (key, sec) in secs {
+            match resolved_instrument(sec) {
+                Ok(route) => {
+                    let id = route.canonical_ticker();
+                    if routes.len() >= 256 && !routes.contains_key(&id) {
+                        continue;
+                    }
+                    routes.entry(id).or_insert_with(|| (route, Vec::new())).1.push(key.clone());
+                }
+                Err(error) => tracing::debug!("crypto quote {key}: {error:#}"),
             }
         }
-        let now = chrono::Utc::now().timestamp();
+        let mut requests = futures::stream::iter(routes.into_values())
+            .map(|(route, keys)| async move { (keys, self.quote_for_route(&route).await) })
+            .buffer_unordered(8);
+        let deadline = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(deadline);
         let mut out = Vec::new();
-        for (key, sec) in secs {
-            let sym = binance_symbol(sec);
-            let hit = rows.as_ref().and_then(|r| r.iter().find(|(s, _, _)| *s == sym).map(|(_, l, o)| (*l, *o)));
-            let (last, prev) = match hit {
-                Some(x) => x,
-                None => match self.get(&format!("{COINBASE_REST}/products/{}/stats", coinbase_product(sec)), &[]).await
-                {
-                    Ok(t) => parse_coinbase_stats(&t)?,
-                    Err(_) => continue,
-                },
+        loop {
+            let result = tokio::select! {
+                _ = &mut deadline => break,
+                result = requests.next() => result,
             };
-            // Daily closes for the sparkline (best effort).
-            let spark = self
-                .history(sec, Timeframe::D1, None, 8)
-                .await
-                .map(|b| b.iter().map(|x| x.close).collect())
-                .unwrap_or_default();
-            out.push(Quote { symbol: key.clone(), last, prev_close: prev, ts: now, spark });
+            let Some((keys, result)) = result else { break };
+            match result {
+                Ok(quote) => out.extend(keys.into_iter().map(|symbol| Quote { symbol, ..quote.clone() })),
+                Err(error) => tracing::debug!("crypto quote failed: {error:#}"),
+            }
         }
         if out.is_empty() && !secs.is_empty() {
             bail!("no crypto quotes available");
@@ -368,39 +485,57 @@ impl CryptoProvider {
         Ok(out)
     }
 
-    /// Live bars over websocket, reconnecting with backoff and rotating endpoints.
-    pub fn live(sec: &Security, tf: Timeframe) -> LiveFeed {
+    /// Reconnect only within the resolved venue. Invalid/unsupported instruments
+    /// produce no feed instead of switching products.
+    pub fn live(sec: &Security, tf: Timeframe) -> Option<LiveFeed> {
+        let route = resolved_instrument(sec).ok()?;
         let (tx, rx) = mpsc::channel(256);
-        let stream = format!("{}@kline_{}", binance_symbol(sec).to_ascii_lowercase(), binance_interval(tf));
-        let product = coinbase_product(sec);
+        let stream = format!("{}@kline_{}", route.native_symbol.to_ascii_lowercase(), binance_interval(tf));
         tokio::spawn(async move {
             let mut backoff = 1;
             let mut attempt = 0usize;
             while !tx.is_closed() {
-                let res = match attempt % 3 {
-                    i @ (0 | 1) => binance_ws(&format!("{}/{stream}", BINANCE_WS[i]), &tx).await,
-                    _ => coinbase_ws(&product, tf, &tx).await,
+                let res = match route.venue {
+                    CryptoVenue::Binance => {
+                        binance_ws(
+                            &format!("{}/{stream}", BINANCE_WS[attempt % BINANCE_WS.len()]),
+                            &route.native_symbol,
+                            &tx,
+                        )
+                        .await
+                    }
+                    CryptoVenue::Coinbase => coinbase_ws(&route.native_symbol, tf, &tx).await,
                 };
                 if tx.is_closed() {
                     break;
                 }
-                if let Err(e) = res {
-                    tracing::debug!("live feed {stream}: {e:#}");
+                if let Err(error) = res {
+                    tracing::debug!("live feed {}: {error:#}", route.canonical_ticker());
                 }
-                attempt += 1;
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                attempt = attempt.wrapping_add(1);
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                }
                 backoff = (backoff * 2).min(30);
             }
         });
-        rx
+        Some(rx)
     }
 }
 
-async fn binance_ws(url: &str, tx: &mpsc::Sender<crate::LiveUpdate>) -> Result<()> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.context("binance websocket")?;
+async fn binance_ws(url: &str, symbol: &str, tx: &mpsc::Sender<crate::LiveUpdate>) -> Result<()> {
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::connect_async(url))
+        .await
+        .context("Binance websocket connection timeout")?
+        .context("binance websocket")?;
     while let Some(msg) = ws.next().await {
         match msg? {
             Message::Text(t) => {
+                let value: Value = serde_json::from_str(t.as_str())?;
+                if value["k"]["s"].as_str() != Some(symbol) {
+                    continue;
+                }
                 if let Some(bar) = parse_binance_ws(t.as_str())
                     && tx.send(crate::LiveUpdate::Partial(bar)).await.is_err()
                 {
@@ -415,13 +550,20 @@ async fn binance_ws(url: &str, tx: &mpsc::Sender<crate::LiveUpdate>) -> Result<(
 }
 
 async fn coinbase_ws(product: &str, tf: Timeframe, tx: &mpsc::Sender<crate::LiveUpdate>) -> Result<()> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(COINBASE_WS).await.context("coinbase websocket")?;
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::connect_async(COINBASE_WS))
+        .await
+        .context("Coinbase websocket connection timeout")?
+        .context("coinbase websocket")?;
     let sub = serde_json::json!({"type": "subscribe", "product_ids": [product], "channels": ["ticker"]});
     ws.send(Message::Text(sub.to_string().into())).await?;
     // Aggregate ticks into the current bar; the chart merges partial bars into history.
     let mut bar: Option<Bar> = None;
     while let Some(msg) = ws.next().await {
         let Message::Text(t) = msg? else { continue };
+        let value: Value = serde_json::from_str(t.as_str())?;
+        if value["product_id"].as_str() != Some(product) {
+            continue;
+        }
         let Some((ts, px, size)) = parse_coinbase_ws(t.as_str()) else { continue };
         let bucket = tf.bucket_start(ts);
         let b = match bar.as_mut() {
@@ -466,14 +608,89 @@ mod tests {
     }
 
     #[test]
-    fn symbols() {
+    fn symbols_preserve_venue_and_quote_currency() {
         let btc = Security::new("BTCUSD", AssetClass::Crypto);
-        assert_eq!(binance_symbol(&btc), "BTCUSDT");
-        assert_eq!(coinbase_product(&btc), "BTC-USD");
-        let pepe = Security::new("PEPEUSD", AssetClass::Crypto);
-        assert_eq!(binance_symbol(&pepe), "PEPEUSDT");
-        assert_eq!(coinbase_product(&pepe), "PEPE-USD");
+        let route = resolved_instrument(&btc).unwrap();
+        assert_eq!(route.venue, CryptoVenue::Coinbase);
+        assert_eq!(route.native_symbol, "BTC-USD");
+        let usdt = Security::new("BTCUSDT", AssetClass::Crypto);
+        assert_eq!(resolved_instrument(&usdt).unwrap().native_symbol, "BTCUSDT");
+        assert_ne!(route_key(&btc).unwrap(), route_key(&usdt).unwrap());
+        assert_eq!(
+            route_key(&btc).unwrap(),
+            route_key(&Security::new("COINBASE:BTC-USD", AssetClass::Crypto)).unwrap()
+        );
+        assert!(resolved_instrument(&Security::new("BINANCE:BTCUSDT.P", AssetClass::Crypto)).is_err());
         assert_eq!(binance_interval(Timeframe::MN1), "1M");
+    }
+
+    #[test]
+    fn rejects_invalid_candle_values() {
+        assert!(checked_bars(vec![Bar::new(1, 2.0, 3.0, 1.0, f64::NAN, 1.0)]).is_err());
+        assert!(checked_bars(vec![Bar::new(1, 2.0, 3.0, 1.0, 2.0, -1.0)]).is_err());
+        assert!(checked_bars(vec![Bar::new(1, 2.0, 1.0, 1.0, 2.0, 1.0)]).is_err());
+    }
+
+    #[test]
+    fn malformed_exchange_payloads_fail_closed() {
+        assert!(parse_binance_klines("[[1000,\"NaN\",2,1,2,1]]").is_err());
+        assert!(parse_binance_klines("[[1000]]").is_err());
+        assert!(parse_coinbase_candles("[[1000,1,3,2,2,-1]]").is_err());
+        assert!(parse_coinbase_candles("[[1000.5,1,3,2,2,1]]").is_err());
+        assert!(parse_binance_depth(r#"{ "bids": [["NaN","1"]], "asks": [] }"#, "BTC").is_err());
+        assert!(parse_binance_depth(r#"{ "bids": [], "asks": null }"#, "BTC").is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_http_failure_and_oversized_payload_before_decoding() {
+        use std::io::{Read, Write};
+        for response in [
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\nConnection: close\r\n\r\n",
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer);
+                socket.write_all(response.as_bytes()).unwrap();
+            });
+            let error = CryptoProvider::new().unwrap().get(&url, &[]).await.unwrap_err();
+            assert!(error.to_string().contains("429") || error.to_string().contains("size limit"));
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn quotes_isolate_failed_products_and_share_alias_observations() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = [0; 4096];
+                let len = socket.read(&mut request).unwrap();
+                let valid = String::from_utf8_lossy(&request[..len]).contains("BTC-USD");
+                let (status, body) =
+                    if valid { ("200 OK", r#"{"last":"100","open":"95"}"#) } else { ("404 Not Found", "{}") };
+                let response =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let mut provider = CryptoProvider::new().unwrap();
+        provider.test_rest = Some(host);
+        let keys = ["BTCUSD", "COINBASE:BTC-USD", "ZZZUSD", "BAD:BTCUSD"];
+        let secs: Vec<_> = keys.iter().map(|key| (key.to_string(), Security::new(*key, AssetClass::Crypto))).collect();
+        let quotes = provider.quotes(&secs).await.unwrap();
+        assert_eq!(quotes.len(), 2);
+        assert!(quotes.iter().all(|q| q.last == 100.0 && q.crypto_source.as_ref().unwrap().native_symbol == "BTC-USD"));
+        assert_eq!(quotes[0].ts, quotes[1].ts);
+        server.join().unwrap();
     }
 
     #[test]

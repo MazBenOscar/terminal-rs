@@ -428,7 +428,17 @@ impl TerminalApp {
                 let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
                 widgets::hover_wash(ui, r, &resp, false);
                 let p = ui.painter();
-                p.text(pos2(col(r, 0), r.center().y), Align2::LEFT_CENTER, &sec.ticker, mono(12.5), amber());
+                let ticker = sec.crypto_instrument().ok().map_or_else(
+                    || sec.ticker.clone(),
+                    |instrument| format!("{}/{}", instrument.base, instrument.quote),
+                );
+                p.with_clip_rect(Rect::from_min_max(r.min, pos2(col(r, 0) + 70., r.bottom()))).text(
+                    pos2(col(r, 0), r.center().y),
+                    Align2::LEFT_CENTER,
+                    ticker,
+                    mono(12.5),
+                    amber(),
+                );
                 p.text(
                     pos2(col(r, 0) + 74.0, r.center().y),
                     Align2::LEFT_CENTER,
@@ -438,8 +448,21 @@ impl TerminalApp {
                 );
                 let name = self.security_names.name(s);
                 let ticker_hit = Rect::from_min_max(r.min, pos2(name_left, r.bottom()));
-                ui.interact(ticker_hit, ui.id().with(("ticker-name", s)), Sense::hover())
-                    .on_hover_text(crate::security_names::hover(&sec.ticker, name));
+                let mut description = crate::security_names::hover(&sec.ticker, name);
+                if let Some(quote) = self.quotes.get(s)
+                    && let Some(source) = &quote.crypto_source
+                {
+                    let observed = chrono::DateTime::from_timestamp(quote.ts, 0)
+                        .map(|ts| ts.to_rfc3339())
+                        .unwrap_or_else(|| "unavailable".into());
+                    description.push_str(&format!(
+                        "\n{} spot · {} · quote {}\nObserved {observed}",
+                        source.venue.label(),
+                        source.native_symbol,
+                        source.quote
+                    ));
+                }
+                ui.interact(ticker_hit, ui.id().with(("ticker-name", s)), Sense::hover()).on_hover_text(description);
                 if show_name {
                     let hit = Rect::from_min_max(
                         pos2(name_left, r.top()),
