@@ -603,8 +603,52 @@ enum WatchEntryKind {
 #[derive(Clone)]
 struct WatchItemEntry {
     kind: WatchEntryKind,
-    index: usize,
+    list: String,
+    anchor: WatchEntryAnchor,
+    focus: bool,
     text: String,
+}
+
+#[derive(Clone)]
+enum WatchEntryAnchor {
+    End,
+    Symbol(String, bool),
+    Section { name: String, occurrence: usize, after: bool },
+}
+
+impl WatchEntryAnchor {
+    fn at(items: &[crate::watch_sections::Item], index: usize, after: bool) -> Self {
+        use crate::watch_sections::Item;
+        match items.get(index) {
+            Some(Item::Symbol(key)) => Self::Symbol(key.clone(), after),
+            Some(Item::Section { name, .. }) => Self::Section {
+                name: name.clone(),
+                occurrence: items[..index]
+                    .iter()
+                    .filter(|item| matches!(item, Item::Section { name: n, .. } if n == name))
+                    .count(),
+                after,
+            },
+            None => Self::End,
+        }
+    }
+
+    fn resolve(&self, items: &[crate::watch_sections::Item]) -> Option<usize> {
+        use crate::watch_sections::{self, Item};
+        match self {
+            Self::End => Some(items.len()),
+            Self::Symbol(key, after) => items
+                .iter()
+                .position(|item| matches!(item, Item::Symbol(k) if k == key))
+                .map(|i| i + usize::from(*after)),
+            Self::Section { name, occurrence, after } => items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| matches!(item, Item::Section { name: n, .. } if n == name))
+                .nth(*occurrence)
+                .map(|(i, _)| if *after { watch_sections::block(items, i).end } else { i }),
+        }
+    }
 }
 
 /// How long an alert toast stays up.
@@ -1030,6 +1074,8 @@ impl TerminalApp {
             self.toasts.retain(|(_, time)| *time != at);
         }
         self.watch_item_entry = None;
+        self.watchlist_entry = None;
+        self.watch_drag = None;
         self.active_watchlist = index;
         self.watchlist = self.watchlists[index].symbols.clone();
         self.watchlist_delete = false;
@@ -1088,10 +1134,25 @@ impl TerminalApp {
 
     fn apply_watch_item_entry(&mut self) -> Result<(), String> {
         let Some(entry) = self.watch_item_entry.clone() else { return Ok(()) };
+        if entry.list != self.watchlists[self.active_watchlist].name {
+            self.watch_item_entry = None;
+            return Err("The watchlist being edited is no longer active".into());
+        }
         let mut items = self.watchlists[self.active_watchlist].items();
+        let index = match entry.anchor.resolve(&items) {
+            Some(index) => index,
+            None if matches!(entry.kind, WatchEntryKind::Symbol) => {
+                self.status = "The entry target no longer exists; symbol appended".into();
+                items.len()
+            }
+            None => {
+                self.watch_item_entry = None;
+                return Err("The entry target no longer exists".into());
+            }
+        };
         match entry.kind {
-            WatchEntryKind::Section => crate::watch_sections::insert_section(&mut items, entry.index, &entry.text)?,
-            WatchEntryKind::Rename => crate::watch_sections::rename_section(&mut items, entry.index, &entry.text)?,
+            WatchEntryKind::Section => crate::watch_sections::insert_section(&mut items, index, &entry.text)?,
+            WatchEntryKind::Rename => crate::watch_sections::rename_section(&mut items, index, &entry.text)?,
             WatchEntryKind::Symbol => {
                 let tokens: Vec<_> = entry.text.split_whitespace().collect();
                 let symbol = tr_core::Security::resolve_tokens(&tokens)
@@ -1108,7 +1169,7 @@ impl TerminalApp {
                 if self.watchlist.len() >= 200 {
                     return Err("At most 200 symbols are allowed".into());
                 }
-                items.insert(entry.index.min(items.len()), crate::watch_sections::Item::Symbol(symbol));
+                items.insert(index, crate::watch_sections::Item::Symbol(symbol));
             }
         }
         self.set_watchlist_items(&items);
@@ -1122,11 +1183,10 @@ impl TerminalApp {
         };
         match target {
             Some(key) => {
-                let index = self
-                    .watchlists
-                    .iter()
-                    .position(|l| watchlist_name_key(&l.name) == key)
-                    .ok_or_else(|| "The watchlist being renamed no longer exists".to_string())?;
+                let Some(index) = self.watchlists.iter().position(|l| watchlist_name_key(&l.name) == key) else {
+                    self.watchlist_entry = None;
+                    return Err("The watchlist being renamed no longer exists".into());
+                };
                 self.rename_watchlist(index, name)?;
             }
             None => self.create_watchlist(name, Vec::new())?,
@@ -1150,12 +1210,11 @@ impl TerminalApp {
             return Err("Cannot delete the last watchlist".into());
         }
         self.watchlists.remove(index);
-        let active = if index < self.active_watchlist {
-            self.active_watchlist - 1
-        } else {
-            self.active_watchlist.min(self.watchlists.len() - 1)
-        };
-        self.switch_watchlist(active);
+        if index == self.active_watchlist {
+            self.switch_watchlist(index.min(self.watchlists.len() - 1));
+        } else if index < self.active_watchlist {
+            self.active_watchlist -= 1;
+        }
         Ok(())
     }
 

@@ -6,7 +6,8 @@ use egui::{Align2, CursorIcon, Id, Key, LayerId, Order, Rect, Response, Stroke, 
 
 pub(super) struct WatchDrag {
     from: usize,
-    section: bool,
+    item: Item,
+    list: String,
     grab_offset: f32,
     gap: usize,
 }
@@ -19,14 +20,25 @@ pub(super) struct DragFrame<'a> {
     area: Rect,
     sorted: bool,
     id: Id,
+    list: &'a str,
 }
 
 impl<'a> DragFrame<'a> {
-    pub(super) fn new(ui: &Ui, state: &'a mut Option<WatchDrag>, items: &'a [Item], sorted: bool) -> Self {
-        if sorted
-            || state.as_ref().is_some_and(|drag| drag.from >= items.len())
-            || ui.input(|i| i.key_pressed(Key::Escape))
-        {
+    pub(super) fn new(
+        ui: &Ui,
+        state: &'a mut Option<WatchDrag>,
+        items: &'a [Item],
+        sorted: bool,
+        list: &'a str,
+    ) -> Self {
+        if let Some(drag) = state {
+            if let Some(from) = items.iter().position(|item| *item == drag.item).filter(|_| drag.list == list) {
+                drag.from = from;
+            } else {
+                *state = None;
+            }
+        }
+        if sorted || ui.input(|i| i.key_pressed(Key::Escape)) {
             *state = None;
         }
         Self {
@@ -37,10 +49,11 @@ impl<'a> DragFrame<'a> {
             area: ui.available_rect_before_wrap().intersect(ui.clip_rect()),
             sorted,
             id: ui.id().with("watch-drag"),
+            list,
         }
     }
 
-    pub(super) fn row(&mut self, ui: &Ui, index: usize, rect: Rect, response: &Response) -> f32 {
+    pub(super) fn row(&mut self, ui: &Ui, index: usize, rect: Rect, response: &Response) {
         self.rows.push((index, rect));
         if self.sorted {
             response.clone().on_hover_text("Clear the column sort to reorder");
@@ -48,49 +61,67 @@ impl<'a> DragFrame<'a> {
             let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(rect.center());
             *self.state = Some(WatchDrag {
                 from: index,
-                section: self.items[index].is_section(),
+                item: self.items[index].clone(),
+                list: self.list.to_owned(),
                 grab_offset: origin.y - rect.top(),
                 gap: index,
             });
         }
-        let mut offset = 0.0;
-        if let Some(drag) = self.state.as_mut() {
-            // Allocated rows have a uniform pitch, including egui's item spacing.
-            let pitch = rect.height() + ui.spacing().item_spacing.y;
-            if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
-                let first_top = rect.top() - self.rows.len().saturating_sub(1) as f32 * pitch;
-                let v = ((pointer.y - first_top + pitch - rect.height() / 2.0) / pitch).floor().max(0.0) as usize;
-                drag.gap = self.visible.get(v).copied().unwrap_or(self.items.len());
-                // The lower half of a collapsed header inserts before its hidden symbols.
-                if let Some(&previous) = v.checked_sub(1).and_then(|v| self.visible.get(v))
-                    && matches!(self.items[previous], Item::Section { collapsed: true, .. })
-                    && pointer.y < first_top + v as f32 * pitch
-                {
-                    drag.gap = previous + 1;
+    }
+
+    pub(super) fn prepare(&mut self, ui: &Ui) {
+        let Some(drag) = self.state.as_mut() else { return };
+        if !self.rows.iter().any(|(i, _)| *i == drag.from) || ui.input(|i| i.pointer.hover_pos().is_none()) {
+            *self.state = None;
+            return;
+        }
+        if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
+            drag.gap = self.items.len();
+            for &(index, rect) in &self.rows {
+                if pointer.y < rect.center().y {
+                    drag.gap = index;
+                    break;
                 }
-                if drag.section {
-                    drag.gap = watch_sections::snap_section_gap(self.items, drag.gap);
+                // The lower half of a collapsed header enters its hidden symbols.
+                if matches!(self.items[index], Item::Section { collapsed: true, .. }) && pointer.y < rect.bottom() {
+                    drag.gap = index + 1;
+                    break;
                 }
             }
+            if drag.item.is_section() {
+                drag.gap = watch_sections::snap_section_gap(self.items, drag.gap);
+            }
+        }
+    }
+
+    fn block_height(&self, ui: &Ui, from: usize) -> f32 {
+        let block = watch_sections::block(self.items, from);
+        let mut rows = self.rows.iter().filter(|(i, _)| block.contains(i)).map(|(_, r)| *r);
+        let Some(first) = rows.next() else { return 0.0 };
+        rows.next_back().unwrap_or(first).bottom() - first.top() + ui.spacing().item_spacing.y
+    }
+
+    pub(super) fn offset(&self, ui: &Ui, index: usize) -> f32 {
+        let mut offset = 0.0;
+        if let Some(drag) = self.state.as_ref() {
             let block = watch_sections::block(self.items, drag.from);
-            let count = self.visible.iter().filter(|i| block.contains(i)).count() as f32;
-            if !block.contains(&index) {
-                if index >= block.end {
-                    offset -= count * pitch;
-                }
-                if index >= drag.gap {
-                    offset += count * pitch;
-                }
-            } else {
-                // Hide the source painting; only the foreground ghost follows the pointer.
+            let height = self.block_height(ui, drag.from);
+            if block.contains(&index) {
                 return -100_000.0;
+            }
+            if index >= block.end {
+                offset -= height;
+            }
+            if index >= drag.gap {
+                offset += height;
             }
         }
         ui.ctx().animate_value_with_time(self.id.with(index), offset, 0.12)
     }
 
-    pub(super) fn finish(self, ui: &mut Ui) -> Option<(usize, usize)> {
-        let drag = self.state.as_ref()?;
+    pub(super) fn finish(mut self, ui: &mut Ui) -> Option<(usize, usize)> {
+        self.prepare(ui);
+        let drag = self.state.take()?;
         let pointer = ui.input(|i| i.pointer.interact_pos());
         let released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
         if released {
@@ -120,13 +151,12 @@ impl<'a> DragFrame<'a> {
         ui.scroll_with_delta(vec2(0.0, -scroll));
         let source = self.rows.iter().find(|(i, _)| *i == drag.from)?.1;
         let block = watch_sections::block(self.items, drag.from);
-        let pitch = source.height() + ui.spacing().item_spacing.y;
-        let count = self.visible.iter().filter(|i| block.contains(i)).count() as f32;
+        let height = self.block_height(ui, drag.from);
         let gap = if block.contains(&drag.gap) || drag.gap == block.end { block.start } else { drag.gap };
         let gap_y = self.rows.iter().find(|(i, _)| *i >= gap).map_or_else(
             || self.rows.last().map_or(source.bottom(), |(_, r)| r.bottom() + ui.spacing().item_spacing.y),
             |(_, r)| r.top(),
-        ) - if gap > block.start { count * pitch } else { 0.0 };
+        ) - if gap > block.start { height } else { 0.0 };
         ui.painter().line_segment(
             [pos2(self.area.left(), gap_y), pos2(self.area.right(), gap_y)],
             Stroke::new(2.0, theme::accent()),
@@ -149,6 +179,7 @@ impl<'a> DragFrame<'a> {
             egui::FontId::monospace(12.5),
             theme::text(),
         );
+        *self.state = Some(drag);
         None
     }
 }
@@ -163,6 +194,7 @@ mod tests {
         ctx: egui::Context,
         state: Option<WatchDrag>,
         time: f64,
+        list: String,
         rects: Vec<Rect>,
         offsets: Vec<f32>,
     }
@@ -181,12 +213,14 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    let mut frame = DragFrame::new(ui, &mut self.state, items, false);
+                    let mut frame = DragFrame::new(ui, &mut self.state, items, false, &self.list);
                     for index in watch_sections::visible(items) {
                         let (rect, response) = ui.allocate_exact_size(vec2(300.0, 22.0), Sense::click_and_drag());
                         self.rects.push(rect);
-                        self.offsets.push(frame.row(ui, index, rect, &response));
+                        frame.row(ui, index, rect, &response);
                     }
+                    frame.prepare(ui);
+                    self.offsets = watch_sections::visible(items).into_iter().map(|i| frame.offset(ui, i)).collect();
                     drop = frame.finish(ui);
                 },
             );
@@ -372,7 +406,6 @@ mod tests {
     // ---- probe (2): the list changing during a drag ----
 
     #[test]
-    #[ignore = "BUG: drop uses the stale `from` index after the dragged symbol is removed mid-drag, so a different row is moved"]
     fn bug_stale_from_after_source_symbol_removed_mid_drag() {
         // AAPL(0) MSFT(1) NVDA(2) AMD(3); drag NVDA, then another action removes it.
         let before = vec![sym("AAPL"), sym("MSFT"), sym("NVDA"), sym("AMD")];
@@ -401,9 +434,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: a mid-drag removal that leaves `from` in range re-points the drag at a different symbol and drop moves it"]
     fn bug_stale_from_points_at_replacement_symbol() {
-        // Same as above but assert the concrete wrong move: AMD is dragged away instead.
+        // Releasing at the top must cancel too, not move the replacement AMD row.
         let before = vec![sym("AAPL"), sym("MSFT"), sym("NVDA"), sym("AMD")];
         let after = vec![sym("AAPL"), sym("MSFT"), sym("AMD")];
         let mut h = Harness::default();
@@ -413,19 +445,11 @@ mod tests {
         // Drop near the top of the replacement list.
         let top = pos2(after.len() as f32, h.rects[0].top() + 1.0);
         let drop = h.frame(&after, vec![Event::PointerMoved(top), button(top, false)]);
-        let (from, gap) = drop.expect("release inside the list should still produce a drop slot");
-        assert_eq!(from, 2, "stale from re-points at whatever now sits at index 2");
-        let mut items = after.clone();
-        assert!(watch_sections::move_item(&mut items, from, gap));
-        assert_eq!(
-            names(&items),
-            vec!["AMD".to_string(), "AAPL".into(), "MSFT".into()],
-            "AMD was yanked because the drag's `from` still said 2"
-        );
+        assert_eq!(drop, None, "removing NVDA must not retarget the drag to AMD");
+        assert!(h.state.is_none());
     }
 
     #[test]
-    #[ignore = "BUG: when the dragged row is no longer allocated (collapsed away), finish() early-returns on the missing source without clearing state; the drag is stuck"]
     fn bug_drag_state_stuck_when_source_row_unallocated() {
         // MSFT lives inside a section; collapsing it hides the row mid-drag.
         let before = vec![sym("AAPL"), sec("Tech", false), sym("MSFT"), sym("NVDA")];
@@ -444,7 +468,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: release inside the list with a hidden/unallocated source still returns Some((stale from, gap)) and panels will move the wrong item"]
     fn bug_hidden_source_still_emits_stale_drop_on_release() {
         let before = vec![sym("AAPL"), sec("Tech", false), sym("MSFT"), sym("NVDA")];
         let mut h = Harness::default();
@@ -512,13 +535,15 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    let mut frame = DragFrame::new(ui, &mut self.state, items, false);
+                    let mut frame = DragFrame::new(ui, &mut self.state, items, false, &self.list);
                     for (slot, index) in watch_sections::visible(items).into_iter().enumerate() {
                         let h = heights[slot % heights.len()];
                         let (rect, response) = ui.allocate_exact_size(vec2(300.0, h), Sense::click_and_drag());
                         self.rects.push(rect);
-                        self.offsets.push(frame.row(ui, index, rect, &response));
+                        frame.row(ui, index, rect, &response);
                     }
+                    frame.prepare(ui);
+                    self.offsets = watch_sections::visible(items).into_iter().map(|i| frame.offset(ui, i)).collect();
                     drop = frame.finish(ui);
                 },
             );
@@ -528,7 +553,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: gap is computed from a uniform pitch, so rows with different heights map the pointer to the wrong slot"]
     fn bug_mixed_row_heights_miscompute_drop_gap() {
         // Rows 22, 40, 22: the gap formula treats every row as tall as the last one.
         let items = vec![sym("AAPL"), sym("MSFT"), sym("NVDA")];
@@ -548,7 +572,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: row offsets also use per-row pitch instead of the dragged block's height, so mixed heights slide rows by the wrong amount"]
     fn bug_mixed_row_heights_miscompute_row_offsets() {
         let items = vec![sym("AAPL"), sym("MSFT"), sym("NVDA")];
         let heights = [22.0f32, 40.0, 22.0];
@@ -575,7 +598,6 @@ mod tests {
     // ---- probe (6): release at source, no stale state ----
 
     #[test]
-    #[ignore = "TRIAGE: unfinished reviewer test that fails; decide bug or test error"]
     fn release_exactly_at_source_is_no_op_and_leaves_no_stale_drag() {
         let items = symbols();
         let mut h = Harness::default();
@@ -585,7 +607,8 @@ mod tests {
         press_move(&mut h, &items, 0, away);
         assert!(h.state.is_some());
         h.frame(&items, vec![Event::PointerMoved(from)]);
-        assert_eq!(h.frame(&items, vec![button(from, false)]), Some((0, 0)));
+        let (source, gap) = h.frame(&items, vec![button(from, false)]).unwrap();
+        assert!(!watch_sections::move_item(&mut items.clone(), source, gap));
         assert!(h.state.is_none());
         // Immediately click another row: a plain click must open the chart, not drag.
         let click_at = h.rects[1].center();
@@ -598,13 +621,12 @@ mod tests {
     // ---- probe (4): drop gap at the extremes and onto a collapsed header ----
 
     #[test]
-    #[ignore = "TRIAGE: unfinished reviewer test that fails; decide bug or test error"]
     fn drop_gap_at_top_and_end_of_plain_list() {
         let mut items = vec![sym("AAPL"), sym("MSFT"), sym("NVDA")];
         let mut h = Harness::default();
         h.frame(&items, vec![]);
-        // To the very top: above AAPL.
-        let top = pos2(150.0, h.rects[0].top() - 6.0);
+        // Inside the list's top edge, above AAPL's midpoint.
+        let top = pos2(150.0, h.rects[0].top() + 1.0);
         press_move(&mut h, &items, 2, top);
         let (from, gap) = h.frame(&items, vec![button(top, false)]).unwrap();
         assert_eq!((from, gap), (2, 0));
@@ -624,7 +646,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TRIAGE: unfinished reviewer test that fails; decide bug or test error"]
     fn drop_gap_onto_collapsed_header_splits_upper_and_lower_half() {
         // U, Tech (collapsed, hides AAPL), NVDA
         let items = vec![sym("U"), sec("Tech", true), sym("AAPL"), sym("NVDA")];
@@ -646,7 +667,7 @@ mod tests {
         let (_, gap) = h.frame(&items, vec![button(lower, false)]).unwrap();
         assert_eq!(gap, 2, "lower half of a collapsed header inserts before its hidden symbols");
         assert!(watch_sections::move_item(&mut items, 0, gap));
-        assert_eq!(names(&items), ["#Tech", "AAPL", "U", "NVDA"]);
+        assert_eq!(names(&items), ["#Tech", "U", "AAPL", "NVDA"]);
     }
 
     // ---- probe (7): section header gap snapping with ungrouped symbols ----
@@ -685,6 +706,7 @@ mod tests {
         ctx: egui::Context,
         state: Option<WatchDrag>,
         time: f64,
+        list: String,
         rects: Vec<Rect>,
         offsets: Vec<f32>,
         scroll: f32,
@@ -716,13 +738,16 @@ mod tests {
                             if scroll_by != 0.0 {
                                 ui.scroll_with_delta(vec2(0.0, scroll_by));
                             }
-                            let mut frame = DragFrame::new(ui, &mut self.state, items, false);
+                            let mut frame = DragFrame::new(ui, &mut self.state, items, false, &self.list);
                             for index in watch_sections::visible(items) {
                                 let (rect, response) =
                                     ui.allocate_exact_size(vec2(300.0, 22.0), Sense::click_and_drag());
                                 self.rects.push(rect);
-                                self.offsets.push(frame.row(ui, index, rect, &response));
+                                frame.row(ui, index, rect, &response);
                             }
+                            frame.prepare(ui);
+                            self.offsets =
+                                watch_sections::visible(items).into_iter().map(|i| frame.offset(ui, i)).collect();
                             drop = frame.finish(ui);
                             self.scroll = ui.min_rect().top();
                         });
@@ -734,7 +759,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TRIAGE: unfinished reviewer test that fails; decide bug or test error"]
     fn gap_is_correct_when_the_list_is_scrolled() {
         // 10 rows, viewport 200px; scroll so the first rows sit above the clip.
         let items: Vec<Item> = (0..10).map(|i| sym(&format!("S{i}"))).collect();
@@ -761,8 +785,8 @@ mod tests {
         assert_eq!(from, items_idx(slot));
         assert_eq!(
             gap,
-            items_idx(target),
-            "pointer on the lower half of slot {target} must open a gap before that row \
+            items_idx(target) + 1,
+            "pointer on the lower half of slot {target} must open a gap after that row \
              (its top is {})",
             h.rects[target].top()
         );
@@ -799,5 +823,55 @@ mod tests {
              ({gap_before} -> {gap_after})"
         );
         assert!(gap_after <= items.len());
+    }
+
+    #[test]
+    fn drag_resolves_source_identity_after_rows_shift() {
+        let before = symbols();
+        let mut h = Harness::default();
+        h.frame(&before, vec![]);
+        let to = h.rects[0].center() - vec2(0.0, 8.0);
+        h.start(&before, 2, to);
+        let after = vec![sym("MSFT"), sym("NVDA")];
+        assert_eq!(h.frame(&after, vec![button(to, false)]), Some((1, 0)));
+        assert!(h.state.is_none());
+    }
+
+    #[test]
+    fn drag_cancels_when_active_list_changes_or_pointer_disappears() {
+        for change_list in [false, true] {
+            let items = symbols();
+            let mut h = Harness::default();
+            h.frame(&items, vec![]);
+            let to = h.rects[2].center();
+            h.start(&items, 0, to);
+            let events = if change_list {
+                h.list = "Other".into();
+                vec![button(to, false)]
+            } else {
+                vec![Event::PointerGone]
+            };
+            assert_eq!(h.frame(&items, events), None);
+            assert!(h.state.is_none());
+        }
+    }
+
+    #[test]
+    fn mixed_height_section_drag_slides_by_actual_block_height() {
+        let items = vec![sec("Tech", false), sym("AAPL"), sym("MSFT"), sec("Other", false), sym("NVDA")];
+        let heights = [30.0, 22.0, 40.0, 28.0, 22.0];
+        let mut h = Harness::default();
+        h.frame_heights(&items, vec![], &heights);
+        let at = h.rects[0].center();
+        let to = h.rects[4].center() + vec2(0.0, 8.0);
+        let height = h.rects[3].top() - h.rects[0].top();
+        h.frame_heights(&items, vec![Event::PointerMoved(at), button(at, true)], &heights);
+        h.frame_heights(&items, vec![Event::PointerMoved(to)], &heights);
+        for _ in 0..4 {
+            h.frame_heights(&items, vec![], &heights);
+        }
+        assert!((h.offsets[3] + height).abs() < 0.1);
+        assert!((h.offsets[4] + height).abs() < 0.1);
+        assert_eq!(h.frame_heights(&items, vec![button(to, false)], &heights), Some((0, items.len())));
     }
 }

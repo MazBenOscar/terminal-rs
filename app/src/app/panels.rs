@@ -248,11 +248,15 @@ impl TerminalApp {
             }
             if ui.small_button("+").on_hover_text("Add symbol").clicked() {
                 self.start_watch_entry(WatchEntryKind::Symbol, self.watchlists[active].items().len(), String::new());
+                if let Some(entry) = &mut self.watch_item_entry {
+                    entry.anchor = super::WatchEntryAnchor::End;
+                }
             }
             let response = widgets::icon_button(ui, widgets::Icon::More, "Watchlist options", false);
             egui::Popup::menu(&response).show(|ui| {
                 if ui.button("New list…").clicked() {
                     self.watchlist_entry = Some((None, String::new()));
+                    ui.memory_mut(|m| m.request_focus(egui::Id::new("watch-list-name-entry")));
                     ui.close();
                 }
                 if ui.button("Rename…").clicked() {
@@ -260,6 +264,7 @@ impl TerminalApp {
                         Some(super::watchlist_name_key(&self.watchlists[active].name)),
                         self.watchlists[active].name.clone(),
                     ));
+                    ui.memory_mut(|m| m.request_focus(egui::Id::new("watch-list-name-entry")));
                     ui.close();
                 }
                 if ui.add_enabled(self.watchlists.len() < 50, egui::Button::new("Duplicate")).clicked() {
@@ -304,8 +309,8 @@ impl TerminalApp {
                 }
             });
         });
-        let mut accept = false;
-        let mut cancel = false;
+        let mut accept = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
         if let Some((_, name)) = &mut self.watchlist_entry {
             ui.horizontal(|ui| {
                 egui::Frame::new()
@@ -315,22 +320,23 @@ impl TerminalApp {
                     .show(ui, |ui| {
                         let response = ui.add(
                             egui::TextEdit::singleline(name)
+                                .id(egui::Id::new("watch-list-name-entry"))
                                 .frame(egui::Frame::NONE)
                                 .hint_text("List name")
                                 .char_limit(40),
                         );
-                        accept = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if !response.has_focus() && ui.memory(|m| m.focused().is_none()) {
+                            response.request_focus();
+                        }
                     });
                 accept |= ui.button("Save").clicked();
-                cancel = ui.button("Cancel").clicked();
+                cancel |= ui.button("Cancel").clicked();
             });
         }
-        if accept {
-            if let Err(e) = self.apply_watchlist_entry() {
-                self.status = e;
-            }
-        } else if cancel {
+        if cancel {
             self.watchlist_entry = None;
+        } else if accept && let Err(e) = self.apply_watchlist_entry() {
+            self.status = e;
         }
         self.watch_item_entry_ui(ui);
         let row_h = dp(22.0);
@@ -452,15 +458,30 @@ impl TerminalApp {
         let mut drag_state = self.watch_drag.take();
         let mut drop = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(height).show(ui, |ui| {
-            let mut drag =
-                super::watchlist_drag::DragFrame::new(ui, &mut drag_state, &items, self.watch_sort.is_some());
+            ui.set_min_height(height);
+            let list_name = self.watchlists[self.active_watchlist].name.clone();
+            let area = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+            let background = ui.interact(area, ui.id().with("watch-empty"), Sense::click());
+            let mut drag = super::watchlist_drag::DragFrame::new(
+                ui,
+                &mut drag_state,
+                &items,
+                self.watch_sort.is_some(),
+                &list_name,
+            );
+            let mut rows = Vec::new();
             for index in order {
                 let (rect, response) = ui.allocate_exact_size(vec2(w, row_h), Sense::click_and_drag());
-                let offset = drag.row(ui, index, rect, &response);
-                let rect = rect.translate(vec2(0.0, offset));
-                self.draw_watch_item(ui, index, &items[index], (rect, response), &layout, &mut out);
+                drag.row(ui, index, rect, &response);
+                rows.push((index, rect, response));
+            }
+            drag.prepare(ui);
+            for (index, rect, response) in &rows {
+                let rect = rect.translate(vec2(0.0, drag.offset(ui, *index)));
+                self.draw_watch_item(ui, *index, &items[*index], (rect, response.clone()), &layout, &mut out);
             }
             drop = drag.finish(ui);
+            background.context_menu(|ui| self.watch_empty_menu(ui));
             ui.add_space(4.0);
             ui.label(
                 RichText::new("WL ADD <KEY> to add · right-click a row for options").font(ui_font(11.0)).color(muted()),
@@ -477,6 +498,24 @@ impl TerminalApp {
             self.watch_details_card(ui);
         }
         out
+    }
+
+    fn watch_empty_menu(&mut self, ui: &mut Ui) {
+        for (label, kind) in [("Add symbol…", WatchEntryKind::Symbol), ("Add section…", WatchEntryKind::Section)] {
+            if ui.button(label).clicked() {
+                self.start_watch_entry(kind, self.watchlists[self.active_watchlist].items().len(), String::new());
+                if let Some(entry) = &mut self.watch_item_entry {
+                    entry.anchor = super::WatchEntryAnchor::End;
+                }
+                ui.close();
+            }
+        }
+        for (label, collapsed) in [("Collapse all sections", true), ("Expand all sections", false)] {
+            if ui.button(label).clicked() {
+                self.collapse_watch_sections(collapsed);
+                ui.close();
+            }
+        }
     }
 
     fn watch_display_order(&self, items: &[Item]) -> Vec<usize> {
@@ -717,12 +756,25 @@ impl TerminalApp {
     }
 
     fn start_watch_entry(&mut self, kind: WatchEntryKind, index: usize, text: String) {
-        self.watch_item_entry = Some(WatchItemEntry { kind, index, text });
+        let items = self.watchlists[self.active_watchlist].items();
+        let anchor = if matches!(kind, WatchEntryKind::Symbol) && index > 0 && index <= items.len() {
+            super::WatchEntryAnchor::at(&items, index - 1, true)
+        } else {
+            super::WatchEntryAnchor::at(&items, index, false)
+        };
+        self.watch_item_entry = Some(WatchItemEntry {
+            kind,
+            list: self.watchlists[self.active_watchlist].name.clone(),
+            anchor,
+            focus: true,
+            text,
+        });
     }
 
     fn watch_item_entry_ui(&mut self, ui: &mut Ui) {
-        let mut accept = false;
-        let mut cancel = false;
+        // TextEdit consumes Enter, so capture it before drawing the field.
+        let mut accept = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
         if let Some(entry) = &mut self.watch_item_entry {
             ui.horizontal(|ui| {
                 let hint = match entry.kind {
@@ -731,12 +783,12 @@ impl TerminalApp {
                 };
                 let response =
                     ui.add(egui::TextEdit::singleline(&mut entry.text).hint_text(hint).desired_width(dp(160.0)));
-                if !response.has_focus() && ui.memory(|m| m.focused().is_none()) {
+                if entry.focus {
                     response.request_focus();
+                    entry.focus = false;
                 }
-                accept = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 accept |= ui.button("Save").clicked();
-                cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                cancel |= ui.button("Cancel").clicked();
             });
         }
         if cancel {
@@ -763,6 +815,9 @@ impl TerminalApp {
         ] {
             if ui.button(label).clicked() {
                 self.start_watch_entry(kind, target, text);
+                if let Some(entry) = &mut self.watch_item_entry {
+                    entry.anchor = super::WatchEntryAnchor::at(&items, index, !matches!(kind, WatchEntryKind::Rename));
+                }
                 ui.close();
             }
         }
@@ -1493,7 +1548,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: inline entry keeps a stale row index after the list is edited and renames the wrong section"]
     fn inline_rename_entry_must_not_rename_a_different_section_after_list_edits() {
         let mut app = two_headers_app();
         // Rename "First" (item index 1).
@@ -1512,7 +1566,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: inline symbol entry keeps a stale row index after the list is edited and inserts into the wrong section"]
     fn inline_symbol_entry_must_stay_in_its_section_after_list_edits() {
         let mut app = sections_app();
         // "Add symbol" below AAPL (item 3) targets gap 4 — the end of Tech.
@@ -1533,7 +1586,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: removing a section while an inline entry is open leaves a stale index that inserts into a different section"]
     fn inline_entry_after_removing_its_section_must_not_insert_into_another() {
         let mut app = sections_app();
         // "Add symbol to section…" on Tech targets gap 4 (end of Tech's block).
@@ -1552,8 +1604,8 @@ mod tests {
                 let names = row_names(&items);
                 let mac = names.iter().position(|n| n == "#Macro").unwrap();
                 assert!(
-                    pos < mac,
-                    "a symbol opened for the removed Tech section must not land inside Macro: {names:?}"
+                    pos == items.len() - 1 && pos > mac,
+                    "a symbol opened for the removed Tech section must fall back to appending: {names:?}"
                 );
             }
         }
@@ -1844,5 +1896,120 @@ mod tests {
         watch_frame(&ctx, &mut app, vec![watch_pointer(to, false)]);
         assert_eq!(app.watchlist, ["AAPL", "MSFT", "NVDA"]);
         assert!(app.watch_drag.is_none());
+    }
+
+    fn entry_key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn inline_section_names_save_typed_text_on_enter() {
+        for kind in [WatchEntryKind::Section, WatchEntryKind::Rename] {
+            let mut app = sections_app();
+            app.start_watch_entry(kind, 1, String::new());
+            let ctx = egui::Context::default();
+            ui_frame(&ctx, vec![], &mut |ui| app.watch_item_entry_ui(ui));
+            ui_frame(&ctx, vec![egui::Event::Text("Typed name".into())], &mut |ui| app.watch_item_entry_ui(ui));
+            ui_frame(&ctx, vec![entry_key(egui::Key::Enter)], &mut |ui| app.watch_item_entry_ui(ui));
+            assert!(app.watch_item_entry.is_none(), "Enter must save, not just move focus");
+            assert_eq!(app.watchlists[0].sections[0].name, "Typed name");
+        }
+    }
+
+    #[test]
+    fn inline_list_names_save_typed_text_on_enter_and_escape_cancels() {
+        for rename in [false, true] {
+            let mut app = sections_app();
+            let target = rename.then(|| super::super::watchlist_name_key(&app.watchlists[0].name));
+            app.watchlist_entry = Some((target, String::new()));
+            let ctx = egui::Context::default();
+            watch_frame(&ctx, &mut app, vec![]);
+            watch_frame(&ctx, &mut app, vec![egui::Event::Text("Typed list".into())]);
+            watch_frame(&ctx, &mut app, vec![entry_key(egui::Key::Enter)]);
+            assert!(app.watchlist_entry.is_none());
+            assert_eq!(app.watchlists[app.active_watchlist].name, "Typed list");
+
+            app.watchlist_entry = Some((None, String::new()));
+            watch_frame(&ctx, &mut app, vec![]);
+            watch_frame(&ctx, &mut app, vec![egui::Event::Text("Discard list".into())]);
+            watch_frame(&ctx, &mut app, vec![entry_key(egui::Key::Escape)]);
+            assert!(app.watchlist_entry.is_none());
+            assert!(!app.watchlists.iter().any(|list| list.name == "Discard list"));
+        }
+    }
+
+    #[test]
+    fn empty_watchlist_space_opens_context_menu_and_appends_section() {
+        for empty in [false, true] {
+            let mut app = sections_app();
+            if empty {
+                app.set_watchlist_items(&[]);
+            }
+            let ctx = egui::Context::default();
+            let mut draw = |ui: &mut Ui| {
+                app.watchlist(ui);
+            };
+            ui_frame(&ctx, vec![], &mut draw);
+            let at = pos2(250.0, 350.0);
+            for pressed in [true, false] {
+                ui_frame(
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Secondary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    &mut draw,
+                );
+            }
+            let output = ui_frame(&ctx, vec![], &mut draw);
+            let text = labels(&output);
+            for label in ["Add symbol…", "Add section…", "Collapse all sections", "Expand all sections"] {
+                assert!(text.iter().any(|s| s == label), "missing {label}: {text:?}");
+            }
+            let add = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.job.text == "Add section…" => {
+                        Some(t.pos + t.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            for pressed in [true, false] {
+                ui_frame(&ctx, vec![egui::Event::PointerMoved(add), watch_pointer(add, pressed)], &mut draw);
+            }
+            assert!(app.watch_item_entry.is_some());
+            save_entry(&mut app, "Last section");
+            assert!(
+                matches!(app.watchlists[0].items().last(), Some(Item::Section { name, .. }) if name == "Last section")
+            );
+        }
+    }
+
+    #[test]
+    fn inline_entries_resolve_duplicate_headers_by_occurrence_and_cancel_missing_targets() {
+        let mut app = sections_app();
+        app.set_watchlist_items(&[
+            Item::Symbol(key("SPY")),
+            Item::Section { name: "Same".into(), collapsed: false },
+            Item::Section { name: "Same".into(), collapsed: false },
+        ]);
+        app.start_watch_entry(WatchEntryKind::Rename, 2, "Second".into());
+        app.set_watchlist(vec![]);
+        app.apply_watch_item_entry().unwrap();
+        assert_eq!(app.watchlists[0].sections[0].name, "Same");
+        assert_eq!(app.watchlists[0].sections[1].name, "Second");
+        app.start_watch_entry(WatchEntryKind::Rename, 1, "Gone".into());
+        let mut items = app.watchlists[0].items();
+        watch_sections::remove_section(&mut items, 1);
+        app.set_watchlist_items(&items);
+        assert!(app.apply_watch_item_entry().is_err());
+        assert!(app.watch_item_entry.is_none());
     }
 }
