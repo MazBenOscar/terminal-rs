@@ -647,7 +647,7 @@ async fn crypto_ws(
             }
             _ => continue,
         };
-        let value: Value = serde_json::from_str(text.as_str())?;
+        let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else { continue };
         let bar = match route.venue {
             CryptoVenue::Binance => {
                 if value["k"]["s"].as_str() != Some(&route.native_symbol) {
@@ -1032,7 +1032,6 @@ mod tests {
     /// Binance connection. One garbage frame forces a full reconnect cycle
     /// (status churn, backoff, Reconnected backfill) for no reason.
     #[tokio::test]
-    #[ignore = "BUG: non-JSON text frame tears down an otherwise healthy connection via serde_json::from_str(text)?"]
     async fn non_json_text_frame_should_not_kill_connection() {
         let (listener, url) = loopback().await;
         let server = tokio::spawn(async move {
@@ -1048,10 +1047,11 @@ mod tests {
         });
         let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_secs(2));
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60));
-        // BUG: the next event is a disconnect status instead of the next Partial.
-        // Correct behaviour: Partial(120) arrives and the connection stays up.
-        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 120),
-            "connection must survive a non-JSON text frame");
+        // The non-JSON frame is skipped: Partial(120) arrives and the connection stays up.
+        assert!(
+            matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 120),
+            "connection must survive a non-JSON text frame"
+        );
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 180));
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
@@ -1195,8 +1195,10 @@ mod tests {
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s)
             if s == "Binance live stream restored; filling missed bars"));
         // since must be 120 (last delivered bar), not None or a wrong-product ts.
-        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Reconnected { since: Some(120) }),
-            "since must be the bucket of the last delivered bar");
+        assert!(
+            matches!(update(&mut rx).await, crate::LiveUpdate::Reconnected { since: Some(120) }),
+            "since must be the bucket of the last delivered bar"
+        );
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 180));
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
@@ -1236,7 +1238,9 @@ mod tests {
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s) if s.contains("restored")));
         // Heartbeat-triggered Reconnected carries the pre-gap bar bucket.
         match update(&mut rx).await {
-            crate::LiveUpdate::Reconnected { since } => assert!(since.is_some(), "heartbeat recovery must report since"),
+            crate::LiveUpdate::Reconnected { since } => {
+                assert!(since.is_some(), "heartbeat recovery must report since")
+            }
             other => panic!("expected Reconnected, got {other:?}"),
         }
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(_)));
@@ -1319,9 +1323,8 @@ mod tests {
         }
         // rest of the cycle
         for _ in 0..3 {
-            match update(&mut rx).await {
-                crate::LiveUpdate::Status(s) => statuses.push(s),
-                _ => {}
+            if let crate::LiveUpdate::Status(s) = update(&mut rx).await {
+                statuses.push(s);
             }
         }
         assert!(!statuses.is_empty());
@@ -1331,10 +1334,7 @@ mod tests {
             assert!(!s.contains('{') && !s.contains('}'), "status leaked a JSON payload: {s}");
             assert!(!s.contains("127.0.0.1") && !s.contains("localhost"), "status leaked a host: {s}");
             // Only the three fixed templates (plus worker templates elsewhere).
-            assert!(
-                s.starts_with("Binance live stream "),
-                "unexpected status template: {s}"
-            );
+            assert!(s.starts_with("Binance live stream "), "unexpected status template: {s}");
         }
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
