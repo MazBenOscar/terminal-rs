@@ -1086,6 +1086,19 @@ fn ready_stats<'a>(pane: &'a ScannerPane, symbol: &str, now: i64) -> Option<&'a 
         .filter(|stats| stats.observed_at <= now.saturating_add(30) && stats.observed_at >= now.saturating_sub(60))
 }
 
+/// Metrics from this scan, with whether they are still within the freshness window.
+/// Older values stay visible (dimmed) so a manual snapshot remains readable; they are
+/// never shown as current.
+fn shown_stats<'a>(
+    pane: &'a ScannerPane,
+    symbol: &str,
+    now: i64,
+) -> Option<(&'a tr_data::crypto_catalog::Rolling24h, bool)> {
+    let ticker = tr_core::Security::parse(symbol)?.ticker;
+    let stats = pane.crypto_stats.get(&ticker)?.as_ref().ok()?;
+    (stats.observed_at <= now.saturating_add(30)).then(|| (stats, stats.observed_at >= now.saturating_sub(60)))
+}
+
 fn rolling_order(a: Option<f64>, b: Option<f64>, descending: bool) -> std::cmp::Ordering {
     match (a, b) {
         (Some(a), Some(b)) => {
@@ -1113,7 +1126,7 @@ fn stats_hint(pane: &ScannerPane, symbol: &str, now: i64) -> String {
             let state = if ready_stats(pane, symbol, now).is_some() {
                 "Rolling 24h"
             } else {
-                "Stale 24h metrics; refresh the scan"
+                "Older than 60 seconds (dimmed); run the scan again for current 24h metrics"
             };
             format!(
                 "{state} · observed {observed}\nBase volume: {} · quote volume: {}\nExchange window: {} to {}. Change uses the exchange's rolling 24h window. Missing metrics are unavailable.",
@@ -1250,8 +1263,8 @@ fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec
     if crypto && let Some(descending) = sort {
         rows.sort_by(|a, b| {
             rolling_order(
-                ready_stats(pane, &a.symbol, now).and_then(|s| s.change_percent),
-                ready_stats(pane, &b.symbol, now).and_then(|s| s.change_percent),
+                shown_stats(pane, &a.symbol, now).and_then(|(s, _)| s.change_percent),
+                shown_stats(pane, &b.symbol, now).and_then(|(s, _)| s.change_percent),
                 descending,
             )
             .then_with(|| a.symbol.cmp(&b.symbol))
@@ -1330,21 +1343,14 @@ fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec
         let detail_color = if row.error.is_some() { theme::down() } else { muted() };
         p.text(pos2(r.left() + x[4], y), Align2::LEFT_CENTER, &detail, mono(12.0), detail_color);
         if crypto {
-            let stats = ready_stats(pane, &row.symbol, now);
-            let change = stats.and_then(|s| s.change_percent).map_or_else(
-                || {
-                    if stats.is_none() && pane.crypto_stats.get(&ticker).is_some_and(Result::is_ok) {
-                        "Stale".into()
-                    } else {
-                        "—".into()
-                    }
-                },
-                |v| format!("{v:+.2}%"),
-            );
+            let shown = shown_stats(pane, &row.symbol, now);
+            let stats = shown.map(|(stats, _)| stats);
+            let color = if shown.is_some_and(|(_, fresh)| fresh) { text() } else { muted() };
+            let change = stats.and_then(|s| s.change_percent).map_or_else(|| "—".into(), |v| format!("{v:+.2}%"));
             let base = stats.map_or_else(|| "—".into(), |s| compact(s.base_volume));
             let quote = stats.and_then(|s| s.quote_volume).map_or_else(|| "—".into(), compact);
             for ((left, _), value) in metrics.iter().zip([change, base, quote]) {
-                p.text(pos2(r.left() + left, y), Align2::LEFT_CENTER, value, mono(12.0), text());
+                p.text(pos2(r.left() + left, y), Align2::LEFT_CENTER, value, mono(12.0), color);
             }
         }
         let source = if row.simulated {
@@ -1421,7 +1427,10 @@ mod tests {
         pane.crypto_stats(3, "COINBASE:BTC-USD".into(), Ok(crypto_metrics("COINBASE:BTC-USD", now)));
         assert!(ready_stats(&pane, "COINBASE:BTC-USD Curncy", now).unwrap().quote_volume.is_none());
         assert!(ready_stats(&pane, "COINBASE:BTC-USD", now + 61).is_none());
-        assert!(stats_hint(&pane, "COINBASE:BTC-USD", now + 61).contains("Stale"));
+        assert!(stats_hint(&pane, "COINBASE:BTC-USD", now + 61).contains("Older than 60 seconds"));
+        // Older values stay readable but are flagged as not current.
+        assert!(shown_stats(&pane, "COINBASE:BTC-USD", now).is_some_and(|(_, fresh)| fresh));
+        assert!(shown_stats(&pane, "COINBASE:BTC-USD", now + 61).is_some_and(|(_, fresh)| !fresh));
         pane.crypto_stats(3, "COINBASE:ETH-USD".into(), Ok(crypto_metrics("COINBASE:BTC-USD", now)));
         assert!(pane.crypto_stats["COINBASE:ETH-USD"].is_err());
         pane.crypto_stats(3, "COINBASE:SOL-USD".into(), Ok(crypto_metrics("COINBASE:SOL-USD", now - 61)));

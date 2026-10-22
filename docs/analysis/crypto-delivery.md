@@ -76,7 +76,7 @@ equity-session cache behavior is unchanged. Scheduled scans reuse the existing
 no-overlap and overrun-backoff logic.
 
 Result columns show rolling 24-hour change and volumes in each product's native
-base and quote units. Sorting by 24h change keeps missing/stale values last.
+base and quote units. Sorting by 24h change keeps missing values last.
 Binance supplies both volumes and rolling window bounds. Coinbase supplies base
 volume and opening/last prices; percentage is derived from those prices, while
 quote volume and exact window boundaries remain unavailable. Never substitute
@@ -87,8 +87,9 @@ daily OHLCV conditions. They are informational columns, not new condition operan
 Metric requests share a four-request semaphore with a 20-second deadline. Typed
 observations validate price, finite values, source/product identity and timestamps;
 declared windows must be 24 hours ±60 seconds and end near observation time
-(−120/+30 seconds, an application validation policy). UI metrics become stale
-after 60 seconds. Each run obtains fresh metrics; missing statistics do not
+(−120/+30 seconds, an application validation policy). After 60 seconds UI metrics
+are dimmed and their tooltip says they are not current; the values stay visible so a
+manual snapshot remains readable and sortable. Each run obtains fresh metrics; missing statistics do not
 invalidate independently available OHLCV scan results. Region/network restrictions
 remain visible errors, with no other-exchange or simulated substitution.
 
