@@ -437,8 +437,25 @@ impl TerminalApp {
             self.cmd_hist_pos = Some(pos);
             self.cmd = self.cmd_history[pos].clone();
         }
-        if focused && !self.cmd.is_empty() {
-            self.dropdown(ui.ctx(), field, &suggestions);
+        // Pressing a suggestion takes focus from the field before the click completes, so
+        // keep the popover up while the pointer is over it or the click is lost.
+        let popover_id = id.with("popover-rect");
+        let over_popover = ui
+            .ctx()
+            .data(|d| d.get_temp::<Rect>(popover_id))
+            .is_some_and(|r| ui.ctx().pointer_latest_pos().is_some_and(|p| r.contains(p)));
+        if (focused || over_popover) && !self.cmd.is_empty() {
+            let rect = self.dropdown(ui.ctx(), field, &suggestions);
+            ui.ctx().data_mut(|d| match rect {
+                Some(r) => {
+                    d.insert_temp(popover_id, r);
+                }
+                None => {
+                    d.remove::<Rect>(popover_id);
+                }
+            });
+        } else {
+            ui.ctx().data_mut(|d| d.remove::<Rect>(popover_id));
         }
         focused
     }
@@ -458,14 +475,15 @@ impl TerminalApp {
     }
 
     /// Autocomplete popover under the command field.
-    fn dropdown(&mut self, ctx: &egui::Context, below: Rect, hits: &[SearchHit]) {
+    /// Returns the popover's screen rect when it is shown.
+    fn dropdown(&mut self, ctx: &egui::Context, below: Rect, hits: &[SearchHit]) -> Option<Rect> {
         if hits.is_empty() {
-            return;
+            return None;
         }
         let mut clicked = None;
         let width = below.width().clamp(420.0, 680.0);
         let shown = anim::ease_out(anim::appear(ctx, Id::new("cmd-suggestions-in"), 0.18));
-        egui::Area::new(Id::new("cmd-suggestions"))
+        let area = egui::Area::new(Id::new("cmd-suggestions"))
             .order(egui::Order::Foreground)
             .fixed_pos(below.left_bottom() + vec2(0.0, 6.0 - 6.0 * (1.0 - shown)))
             .show(ctx, |ui| {
@@ -529,6 +547,7 @@ impl TerminalApp {
             self.execute(&key);
             self.focus_cmd = true;
         }
+        Some(area.response.rect)
     }
 
     // ---- sidebar -------------------------------------------------------------------------
@@ -1049,4 +1068,50 @@ fn nav_row(ui: &mut Ui, icon: Icon, label: &str, trailing: Option<&str>, selecte
         }
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clicking_a_suggestion_loads_it_even_though_the_press_takes_focus() {
+        let root = std::env::temp_dir().join(format!("cmd-suggestion-click-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        let ctx = egui::Context::default();
+        let field = Rect::from_min_size(pos2(100.0, 10.0), vec2(600.0, 24.0));
+        let frame = |app: &mut TerminalApp, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1000.0, 600.0))),
+                time: Some(ctx.input(|i| i.time) + 0.1),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                app.command_field(ui, field);
+            });
+            output.textures_delta.clear();
+        };
+        app.cmd = "BTC".into();
+        app.focus_cmd = true;
+        for _ in 0..4 {
+            frame(&mut app, vec![]);
+        }
+        let first = app.suggestions().first().expect("BTC has suggestions").key.clone();
+        let popover = ctx
+            .data(|d| d.get_temp::<Rect>(Id::new("command-line").with("popover-rect")))
+            .expect("the suggestion popover is shown while the field has focus");
+        let at = pos2(popover.left() + 120.0, popover.top() + 6.0 + 13.0);
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+        frame(&mut app, vec![pointer(true)]);
+        frame(&mut app, vec![pointer(false)]);
+        assert_eq!(app.cmd_history.last(), Some(&first));
+        assert!(app.cmd.is_empty());
+    }
 }
