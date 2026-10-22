@@ -534,6 +534,41 @@ mod tests {
     }
 
     #[test]
+    fn review_eviction_missed_far_edit_and_binding_clipping_match_full_upload() {
+        let Some(mut h) = Headless::new(400, 240) else {
+            eprintln!("review GPU coverage skipped: no headless adapter available");
+            return;
+        };
+        eprintln!("review GPU coverage adapter: {}", h.adapter_info.name);
+        for max_binding in [u64::MAX, 128, 3200] {
+            h.renderer.max_binding = max_binding.min(h.device.limits().max_storage_buffer_binding_size);
+            let mut bars = tr_core::sample::generate("EVICT", tr_core::Timeframe::M1, 1000, 1_790_000_000);
+            let mut series = SeriesGpu::build(&bars);
+            render(&mut h, &series);
+            for evict in [false, true] {
+                // First patch is far enough from the next one that uploading only
+                // the latest dirty ranges would leave stale level-0 instances.
+                for from in [800, 999, 998] {
+                    bars[from].close += 3.;
+                    bars[from].high = bars[from].high.max(bars[from].close);
+                    series.update_tail(&bars, from).unwrap();
+                    if evict && from == 800 {
+                        h.renderer.buffers.remove(&(false, series.bars.key));
+                        h.renderer.buffers.remove(&(true, series.closes.key));
+                    }
+                }
+                render(&mut h, &series);
+                let actual = h.read_pixels();
+                let cached = &h.renderer.buffers[&(false, series.bars.key)];
+                assert_eq!(cached.version, series.bars.version);
+                assert!(cached.buffer.size() <= h.renderer.max_binding as u64);
+                render(&mut h, &SeriesGpu::build(&bars));
+                assert_eq!(actual, h.read_pixels(), "evict={evict}, max_binding={max_binding}");
+            }
+        }
+    }
+
+    #[test]
     fn patched_uploads_and_missed_versions_match_full_render() {
         let Some(mut h) = Headless::new(400, 240) else { return };
         let mut bars = tr_core::sample::generate("GPU", tr_core::Timeframe::M1, 1000, 1_790_000_000);

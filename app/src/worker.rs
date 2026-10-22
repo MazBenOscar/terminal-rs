@@ -2224,6 +2224,23 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "BUG: LiveBars gaps set an error without requesting history, so suffix-only updates cannot recover"]
+    fn review_live_gap_requests_authoritative_history() {
+        let mut worker = Worker::inert();
+        let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        worker.tx = tx;
+        let mut chart = crate::chart_view::ChartState::new(1, "AAA", Timeframe::M1);
+        let bars = Arc::new(vec![Bar::new(60, 1., 2., 0., 1., 1.)]);
+        chart.on_history(0, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &worker);
+        while requests.try_recv().is_ok() {}
+        chart.on_live_bars(0, 2, vec![Bar::new(180, 1., 2., 0., 1., 1.)], 3, &worker);
+        assert!(
+            std::iter::from_fn(|| requests.try_recv().ok()).any(|r| matches!(r, Request::History { .. })),
+            "a missing prefix cannot be recovered from future suffix-only patches; request a full snapshot"
+        );
+    }
+
+    #[test]
     fn history_absorbs_only_last_bucket_and_replaces_completed_volume() {
         let current = [Bar::new(60, 100., 130., 70., 120., 20.), Bar::new(120, 105., 125., 75., 115., 13.)];
         let fetched = [Bar::new(60, 90., 110., 80., 100., 10.), Bar::new(120, 95., 110., 90., 100., 10.)];
@@ -3786,6 +3803,65 @@ mod tests {
             15.,
             "the larger volume wins; nothing is added on top"
         );
+    }
+
+    #[tokio::test]
+    async fn review_random_live_batches_reconstruct_authoritative_worker_series() {
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let provider = Arc::new(LowerVolumeFeed(std::sync::Mutex::new(Some(rx)), 0.));
+        let (s, responses) = backfill_shared(provider.clone());
+        let source = chart_options_key(provider.as_ref(), "AAA", Default::default());
+        claim_series(&s, 1, 2, &source);
+        let mut reconstructed: Vec<_> = (0..129).map(|i| Bar::new(i * 60, 1., 2., 0., 1., 1.)).collect();
+        store_series(&s, 1, 2, Arc::new(reconstructed.clone()));
+        start_live(s.clone(), 1, 2, "AAA".into(), Timeframe::M1, Default::default());
+        let mut seed = 19u64;
+        let mut expected = reconstructed.clone();
+        for _ in 0..16 {
+            for _ in 0..80 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let mut bar = *expected.last().unwrap();
+                if seed % 3 == 0 {
+                    bar.ts += 60;
+                }
+                bar.close += (seed >> 40) as f64 / 1_000_000.;
+                bar.high = bar.high.max(bar.close);
+                bar.volume += 1.;
+                let update = if seed % 7 == 0 {
+                    Series::apply_snapshot(&mut expected, bar);
+                    tr_data::LiveUpdate::Snapshot(bar)
+                } else {
+                    Series::apply_live(&mut expected, bar);
+                    tr_data::LiveUpdate::Partial(bar)
+                };
+                tx.send(update).await.unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    for response in responses.try_iter() {
+                        match response {
+                            Response::LiveBars { from, bars, len, .. } => {
+                                assert!(from <= reconstructed.len());
+                                reconstructed.truncate(from);
+                                reconstructed.extend(bars);
+                                assert_eq!(reconstructed.len(), len);
+                            }
+                            Response::History { bars, .. } => reconstructed = bars.as_ref().clone(),
+                            _ => {}
+                        }
+                    }
+                    if reconstructed == expected {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let map = s.series.lock().unwrap();
+            assert_eq!(map[&1].1.as_ref(), &reconstructed);
+            assert_eq!(Arc::strong_count(&map[&1].1), 1);
+        }
     }
 
     #[tokio::test]

@@ -8115,6 +8115,168 @@ mod tests {
     }
 
     #[test]
+    fn review_seeded_worker_merges_and_ui_patches_stay_identical() {
+        let worker = Worker::inert();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::M1);
+        let mut authoritative = tr_core::sample::generate("AAPL", Timeframe::M1, 129, 1_790_000_000);
+        let initial = Arc::new(authoritative.clone());
+        chart.on_history(
+            chart.generation,
+            initial.clone(),
+            SeriesGpu::build(&initial),
+            0,
+            false,
+            false,
+            false,
+            &worker,
+        );
+        let mut seed = 71u64;
+        for batch in 0..400 {
+            let mut dirty_from = usize::MAX;
+            let mut full = false;
+            for _ in 0..3 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let snapshot = seed % 7 == 0;
+                let mut bar = authoritative[authoritative.len() - 1];
+                if seed % 3 == 0 {
+                    bar.ts += 60;
+                }
+                if snapshot && seed % 5 == 0 {
+                    bar = authoritative[authoritative.len() / 2];
+                }
+                bar.close += (seed >> 40) as f64 / 1_000_000.;
+                bar.high = bar.high.max(bar.close);
+                bar.volume += 1.;
+                let from = authoritative.partition_point(|b| b.ts < bar.ts);
+                let changed = if snapshot {
+                    tr_core::Series::apply_snapshot(&mut authoritative, bar)
+                } else {
+                    tr_core::Series::apply_live(&mut authoritative, bar)
+                };
+                if changed {
+                    dirty_from = dirty_from.min(from);
+                    full |= snapshot && from < authoritative.len().saturating_sub(1);
+                }
+            }
+            if full {
+                let source = Arc::new(authoritative.clone());
+                chart.on_history(
+                    chart.generation,
+                    source.clone(),
+                    SeriesGpu::build(&source),
+                    0,
+                    false,
+                    false,
+                    true,
+                    &worker,
+                );
+            } else if dirty_from != usize::MAX {
+                chart.on_live_bars(
+                    chart.generation,
+                    dirty_from,
+                    authoritative[dirty_from..].to_vec(),
+                    authoritative.len(),
+                    &worker,
+                );
+            }
+            assert_eq!(*chart.source_bars, authoritative, "batch {batch}");
+            assert_eq!(*chart.bars, authoritative, "batch {batch}");
+            let actual = chart.gpu.as_ref().unwrap().bars.pyramid.read().unwrap();
+            let fresh = tr_chart::lod::BarPyramid::build(&authoritative);
+            for k in 0..fresh.levels() {
+                assert_eq!(actual.level(k), fresh.level(k));
+            }
+        }
+    }
+
+    #[test]
+    fn review_renko_live_tail_rebuild_rejects_obsolete_view_reply() {
+        let worker = Worker::inert();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::M1);
+        chart.chart_type = ChartType::Renko;
+        chart.data.analytics.renko_size = 1.;
+        let initial = Arc::new(tr_core::sample::generate("AAPL", Timeframe::M1, 100, 1_790_000_000));
+        chart.on_history(
+            chart.generation,
+            initial.clone(),
+            SeriesGpu::build(&initial),
+            0,
+            false,
+            false,
+            false,
+            &worker,
+        );
+        let old_revision = chart.view_revision;
+        let mut updated = initial.as_ref().clone();
+        updated[99].close += 10.;
+        chart.on_live_bars(chart.generation, 99, updated[99..].to_vec(), updated.len(), &worker);
+        assert!(chart.view_revision > old_revision);
+        let transform = |source: &[Bar]| {
+            let bars = Arc::new(tr_core::chart_analytics::renko(source, 1.).unwrap());
+            let gpu = SeriesGpu::build(&bars);
+            Ok((bars, gpu))
+        };
+        chart.on_view(chart.generation, old_revision, initial.clone(), transform(&initial), &worker);
+        assert!(chart.bars.is_empty(), "obsolete build must not become visible");
+        chart.on_view(chart.generation, chart.view_revision, chart.source_bars.clone(), transform(&updated), &worker);
+        assert_eq!(*chart.bars, tr_core::chart_analytics::renko(&updated, 1.).unwrap());
+        assert_eq!(*chart.source_bars, updated);
+        assert!(chart.last_live.is_some());
+    }
+
+    #[test]
+    fn review_heikin_reply_for_pre_patch_source_is_rejected() {
+        let worker = Worker::inert();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.chart_type = ChartType::HeikinAshi;
+        let old = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 100, 1_790_000_000));
+        chart.on_history(chart.generation, old.clone(), SeriesGpu::build(&old), 0, false, false, false, &worker);
+        // An HA build started for `old`; a live patch wins the race before it replies.
+        let mut updated = old.as_ref().clone();
+        updated[99].close += 10.;
+        updated[99].high = updated[99].high.max(updated[99].close);
+        chart.on_live_bars(chart.generation, 99, updated[99..].to_vec(), updated.len(), &worker);
+        chart.on_heikin(chart.generation, old.clone(), SeriesGpu::build(&old));
+        assert!(
+            chart.ha_gpu.as_ref().is_none_or(|(source, ready)| ready.is_none() || Arc::ptr_eq(source, &chart.bars)),
+            "a same-generation HA reply must still match the current live source"
+        );
+    }
+
+    #[test]
+    #[ignore = "BUG: paging History built asynchronously can roll back newer LiveBars in the same generation"]
+    fn review_delayed_prepend_history_preserves_newer_live_tail() {
+        let worker = Worker::inert();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::M1);
+        let initial = tr_core::sample::generate("AAPL", Timeframe::M1, 100, 1_790_000_000);
+        let source = Arc::new(initial.clone());
+        chart.on_history(chart.generation, source.clone(), SeriesGpu::build(&source), 0, false, false, false, &worker);
+        // MoreHistory merged its prefix under the worker lock, then released that
+        // lock while build_gpu awaited. The live timer can publish in that window.
+        let mut older = initial[0];
+        older.ts -= 60;
+        let mut paged = vec![older];
+        paged.extend_from_slice(&initial);
+        let snapshot = Arc::new(paged.clone());
+        paged[100].close += 5.;
+        chart.on_live_bars(chart.generation, 100, paged[100..].to_vec(), paged.len(), &worker);
+        chart.on_history(
+            chart.generation,
+            snapshot.clone(),
+            SeriesGpu::build(&snapshot),
+            1,
+            false,
+            false,
+            false,
+            &worker,
+        );
+        assert_eq!(
+            *chart.source_bars, paged,
+            "a delayed paging snapshot must not roll back a live update published after it was captured"
+        );
+    }
+
+    #[test]
     fn live_tail_apply_matches_history_updates_badge_legend_and_viewport() {
         let worker = Worker::inert();
         let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
@@ -8161,6 +8323,44 @@ mod tests {
         chart.on_live_bars(chart.generation, 0, expected.clone(), expected.len(), &worker);
         assert_ne!(chart.gpu.as_ref().unwrap().bars.key, key, "old backfills rebuild");
         assert_eq!(*chart.bars, expected);
+    }
+
+    #[test]
+    fn review_filtered_live_overlaps_cross_regular_and_after_hours() {
+        let worker = Worker::inert();
+        let mut chart = ChartState::new(1, "AAPL US Equity", Timeframe::M1);
+        chart.data.session = tr_core::session::Session::UsRegular;
+        let start = chrono::DateTime::parse_from_rfc3339("2026-10-19T12:00:00Z").unwrap().timestamp();
+        let mut raw: Vec<_> = (0..120).map(|i| Bar::new(start + i * 60, 1., 2., 0., 1., 1.)).collect();
+        let initial = Arc::new(raw.clone());
+        chart.on_history(
+            chart.generation,
+            initial.clone(),
+            SeriesGpu::build(&initial),
+            0,
+            false,
+            false,
+            false,
+            &worker,
+        );
+        assert!(!chart.bars.is_empty());
+        let mut saw_regular = false;
+        let mut saw_excluded = false;
+        for _ in 0..600 {
+            let from = raw.len() - 7;
+            raw[from].close += 0.25;
+            let mut next = *raw.last().unwrap();
+            next.ts += 60;
+            raw.push(next);
+            let old_display_len = chart.bars.len();
+            chart.on_live_bars(chart.generation, from, raw[from..].to_vec(), raw.len(), &worker);
+            assert_eq!(chart.live_source.as_ref().unwrap().as_ref(), &raw);
+            assert_eq!(*chart.bars, chart.effective_session().filter(&raw, chart.tf));
+            saw_regular |= chart.bars.len() > old_display_len;
+            saw_excluded |= chart.bars.len() == old_display_len;
+            assert!(chart.error.is_none());
+        }
+        assert!(saw_regular && saw_excluded);
     }
 
     #[test]

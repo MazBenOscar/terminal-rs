@@ -346,6 +346,56 @@ mod tests {
     }
 
     #[test]
+    fn review_capacity_boundaries_long_growth_and_far_edit_match_rebuilds() {
+        for start in [0, 1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 1000] {
+            let mut input = bars(start);
+            let mut p = BarPyramid::build(&input);
+            let mut line = LinePyramid::build(&input.iter().map(|b| b.close).collect::<Vec<_>>());
+            let mut markers = LinePyramid::build_markers(&input.iter().map(|b| b.close).collect::<Vec<_>>());
+            for step in 0..300 {
+                // Force an old-prefix rebuild, then resume tail-only edits.
+                let from = if step == 150 { 0 } else { input.len().saturating_sub(1) };
+                if let Some(b) = input.get_mut(from) {
+                    b.close += 0.5;
+                    b.high = b.high.max(b.close);
+                }
+                input.push(Bar::new(input.len() as i64, 2., 4., 0., 3., 1.));
+                let values: Vec<_> =
+                    input.iter().enumerate().map(|(i, b)| if i % 3 == 0 { f64::NAN } else { b.close }).collect();
+                if p.update_tail(&input, from).is_none() {
+                    p = BarPyramid::build(&input);
+                }
+                if line.update_closes(&input, from).is_none() {
+                    line = LinePyramid::build(&input.iter().map(|b| b.close).collect::<Vec<_>>());
+                }
+                // The first patch must initialize all marker values from this oracle.
+                if step == 0 || markers.update_tail(&values, from).is_none() {
+                    markers = LinePyramid::build_markers(&values);
+                }
+                let fresh = BarPyramid::build(&input);
+                let fresh_line = LinePyramid::build(&input.iter().map(|b| b.close).collect::<Vec<_>>());
+                let fresh_markers = LinePyramid::build_markers(&values);
+                assert_eq!(p.levels(), fresh.levels());
+                for k in 0..fresh.levels() {
+                    assert_eq!(p.level(k), fresh.level(k), "start={start}, step={step}, level={k}");
+                    let n = line.level_len(k);
+                    assert_eq!(
+                        &line.data[line.offsets[k]..line.offsets[k] + n],
+                        &fresh_line.data[fresh_line.offsets[k]..fresh_line.offsets[k] + n]
+                    );
+                    for (a, b) in markers.data[markers.offsets[k]..markers.offsets[k] + n]
+                        .iter()
+                        .zip(&fresh_markers.data[fresh_markers.offsets[k]..fresh_markers.offsets[k] + n])
+                    {
+                        assert_eq!(a[0], b[0]);
+                        assert!(a[1] == b[1] || a[1].is_nan() && b[1].is_nan());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pyramid_levels_merge_ohlcv() {
         let p = BarPyramid::build(&bars(5));
         assert_eq!(p.levels(), 4); // 5, 3, 2, 1
