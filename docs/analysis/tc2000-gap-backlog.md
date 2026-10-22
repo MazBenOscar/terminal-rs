@@ -144,7 +144,7 @@ tests ignored.
 |---|---|---|---|
 | T02 | Unverified parity | Formula and indicator parity against attributed TC2000 exports | Remote agent (holds the TC2000 export files) |
 | C03b | Implementation gap | Crypto current-bar seeding and Coinbase volume accounting after connect/reconnect (see crypto delivery, C03 remaining limits) | Not started |
-| P1–P6 | Performance | Incremental live updates, idle throttling, virtualized tables, batched alerts, overlay caching, distribution build profile (see [performance audit](performance-audit.md)) | Not started; measure before and after |
+| P1–P6 | Performance | Incremental live updates, idle throttling, virtualized tables, batched alerts, overlay caching, distribution build profile (see [performance audit](performance-audit.md)) | P2 measured: autosave part kept, throttling shelved (no gain on macOS); P1 next; P4 offered to the remote agent |
 | T07 | External data/validation | Live Alpaca entitlements, broader stock streaming, earnings and full exchange calendars | Needs accounts and data |
 | T09 | External data | Actual volume at price from trade data | Needs a data source |
 | F01 | Follow-up | Details card and chart tab show raw crypto keys (`COINBASE:BTC-USD`) instead of `BTC/USD` | Small |

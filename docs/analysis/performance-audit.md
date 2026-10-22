@@ -64,3 +64,28 @@ options lists draw only visible rows; most refreshes run only for visible panels
 Measure before and after each step with a repeatable scenario: a live chart with
 about 100k bars and five studies, plus a large scanner run; the repo's
 `framebench` example covers part of that.
+
+## P2 results (2026-10-22)
+
+P2 was built (branch `codex/perf-idle`, `debcf6a`) and measured against
+`personal/main` on the same machine and layout, 60 s windows, release builds:
+
+| Condition | `personal/main` | P2 as built | P2 with immediate rate-limited repaints |
+|---|---|---|---|
+| Window behind another app | 0.01 s CPU | 0.44 s | 0.02 s |
+| Foreground idle, live AAVE chart (back-to-back A/B) | 1.36–1.49 s | — | 1.75–1.83 s |
+
+- macOS already throttles a background window: `personal/main` is near zero there,
+  so finding 4's background cost does not reproduce on macOS.
+- P2's first build regressed the background case: a 250 ms *timer* repaint
+  (`request_repaint_after`) wakes and paints the window even while macOS throttles
+  it (profiled with `sample`: full UI passes and indicator rebuilds while hidden).
+  Immediate, rate-limited `request_repaint` calls restored near-zero CPU.
+- Foreground idle cost is dominated by live data handling (findings 1 and 2: full
+  rebuilds and indicator recomputation per tick), not repaint cadence; it varies
+  roughly fivefold with the charted market's activity (0.26 s on a quiet chart,
+  about 1.4 s on a busy one).
+
+Decision: ship only P2's autosave part (change-only writes off the UI thread,
+branch `codex/autosave`); shelve the repaint/polling policy; prioritise P1. Use a
+busy live chart at foreground idle as the P1 benchmark, measured A/B back to back.
