@@ -874,15 +874,16 @@ impl TerminalApp {
         self.preset = None;
         self.drag = None;
         self.renaming_tab = None;
-        self.last_saved = self.current_doc().to_json();
+        let path = self.store.path(&self.layout_name);
+        if let Ok(bytes) = std::fs::read(&path) {
+            self.saves.written.insert(path, bytes);
+        }
     }
 
     pub(super) fn save_layout(&mut self) {
-        let doc = self.current_doc();
-        match self.store.save(&doc) {
-            Ok(_) => self.last_saved = doc.to_json(),
-            Err(e) => self.status = format!("Could not save layout: {e:#}"),
-        }
+        self.finish_save();
+        let write = (self.store.path(&self.layout_name), self.current_doc().to_json());
+        self.save_sync(vec![write]);
         self.refresh_layout_names();
     }
 
@@ -955,6 +956,7 @@ impl TerminalApp {
     }
 
     pub(super) fn layout_op(&mut self, op: LayoutOp) {
+        self.finish_save();
         let result: anyhow::Result<String> = (|| match op {
             LayoutOp::Switch(name) => {
                 self.switch_layout(&name);
@@ -987,6 +989,7 @@ impl TerminalApp {
                     self.save_layout();
                 }
                 let doc = self.store.rename(&old, &new)?;
+                self.saves.written.remove(&self.store.path(&old));
                 if old.eq_ignore_ascii_case(&self.layout_name) {
                     self.layout_name = doc.name.clone();
                     self.save_settings();
@@ -1004,6 +1007,7 @@ impl TerminalApp {
             }
             LayoutOp::Delete(name) => {
                 self.store.delete(&name)?;
+                self.saves.written.remove(&self.store.path(&name));
                 self.refresh_layout_names();
                 if name.eq_ignore_ascii_case(&self.layout_name) {
                     match self.layout_names.first().cloned() {
