@@ -413,6 +413,8 @@ pub struct ChartState {
     /// header row and give the plot the space.
     pub controls_in_strip: bool,
     indicator_editor: bool,
+    /// Expand the indicator window on its next frame, even if the user collapsed it.
+    reveal_indicator_editor: bool,
     indicator_focus: Option<u32>,
     compare_picker: crate::chart_compare::Picker,
     compare_revision: u64,
@@ -519,6 +521,7 @@ impl ChartState {
             hover_enabled: true,
             controls_in_strip: false,
             indicator_editor: false,
+            reveal_indicator_editor: false,
             indicator_focus: None,
             compare_picker: Default::default(),
             compare_revision: 0,
@@ -1648,6 +1651,7 @@ impl ChartState {
             .clicked()
         {
             self.indicator_editor = true;
+            self.reveal_indicator_editor = true;
             clicked = true;
         }
         if ui
@@ -1856,6 +1860,7 @@ impl ChartState {
                     hui.menu_button("Chart…", |ui| {
                         if ui.button("Indicators…").clicked() {
                             self.indicator_editor = true;
+                            self.reveal_indicator_editor = true;
                             ui.close();
                         }
                         if ui.button("Compare symbol…").clicked() {
@@ -2731,6 +2736,7 @@ impl ChartState {
         match action {
             Action::Edit(_) => {
                 self.indicator_editor = true;
+                self.reveal_indicator_editor = true;
                 self.indicator_focus = Some(id);
             }
             Action::Visibility(_, visible) => {
@@ -2824,8 +2830,18 @@ impl ChartState {
         }
         let field_w = theme::dp(220.0);
         let content = ctx.content_rect();
+        let window_id = egui::Id::new((self.id, "indicator-editor"));
+        if std::mem::take(&mut self.reveal_indicator_editor) {
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ctx,
+                window_id.with("collapsing"),
+                true,
+            );
+            state.set_open(true);
+            state.store(ctx);
+        }
         egui::Window::new(RichText::new(format!("Indicators · {}", self.sec.ticker)).font(ui_font(13.0)))
-            .id(egui::Id::new((self.id, "indicator-editor")))
+            .id(window_id)
             .open(&mut open)
             .default_width(theme::dp(380.0))
             .default_height(theme::dp(560.0))
@@ -3852,6 +3868,7 @@ impl ChartState {
             ui.set_min_width(220.0);
             if ui.button("Manage indicators…").clicked() {
                 self.indicator_editor = true;
+                self.reveal_indicator_editor = true;
                 ui.close();
             }
             if ui.button("Search indicators…").clicked() {
@@ -7081,6 +7098,50 @@ mod tests {
         chart_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(legend)]);
         let texts = chart_frame(&ctx, &mut chart, vec![]);
         assert!(texts.iter().any(|(text, _)| text == "Reset view"), "the menu closed over the legend");
+    }
+
+    #[test]
+    fn editing_an_indicator_expands_a_collapsed_indicator_window() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart.indicators.push(IndicatorSpec::new("RSI", &[14.]).unwrap());
+        study::assign_ids(&mut chart.indicators);
+        chart.built = crate::worker::build_indicators(&chart.bars, chart.tf, &chart.indicators, &theme::palette());
+        let collapsing = egui::Id::new((chart.id, "indicator-editor")).with("collapsing");
+        let is_open = |ctx: &egui::Context| {
+            egui::collapsing_header::CollapsingState::load(ctx, collapsing).is_some_and(|state| state.is_open())
+        };
+        let edit = |ctx: &egui::Context, chart: &mut ChartState| {
+            let texts = chart_frame(ctx, chart, vec![]);
+            let row = texts.iter().find(|(text, _)| text.starts_with("RSI 14")).expect("legend row").1.center();
+            chart_frame(ctx, chart, vec![egui::Event::PointerMoved(row)]);
+            for pressed in [true, false] {
+                chart_frame(
+                    ctx,
+                    chart,
+                    vec![egui::Event::PointerButton {
+                        pos: row,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            let menu = chart_frame(ctx, chart, vec![]);
+            let at = menu.iter().find(|(text, _)| text == "Edit indicator…").unwrap().1.center();
+            chart_frame(ctx, chart, vec![egui::Event::PointerMoved(at), pointer_button(at, true)]);
+            chart_frame(ctx, chart, vec![pointer_button(at, false)]);
+            chart_frame(ctx, chart, vec![]);
+        };
+        edit(&ctx, &mut chart);
+        assert!(chart.indicator_editor && is_open(&ctx));
+        let mut state = egui::collapsing_header::CollapsingState::load(&ctx, collapsing).unwrap();
+        state.set_open(false);
+        state.store(&ctx);
+        chart_frame(&ctx, &mut chart, vec![]);
+        assert!(!is_open(&ctx), "the user collapsed the window");
+        edit(&ctx, &mut chart);
+        assert!(is_open(&ctx), "Edit indicator… must expand the collapsed window");
     }
 
     #[test]
