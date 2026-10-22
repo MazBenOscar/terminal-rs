@@ -149,9 +149,48 @@ pub enum PaneSettings {
 }
 
 fn deserialize_drawings<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Drawing>, D::Error> {
-    let mut drawings = Vec::<Drawing>::deserialize(deserializer)?;
-    drawings.retain_mut(Drawing::sanitize);
-    Ok(drawings)
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(values.into_iter().filter_map(parse_drawing).collect())
+}
+
+fn parse_drawing(value: serde_json::Value) -> Option<Drawing> {
+    let mut drawing: Drawing = serde_json::from_value(value).ok()?;
+    drawing.sanitize().then_some(drawing)
+}
+
+/// Raw JSON keeps overflowing numbers inside individual drawings until we can
+/// reject just that element. Other fields remain untouched and strictly parsed.
+fn filter_layout_drawings(json: &[u8]) -> Result<(Vec<u8>, usize)> {
+    use serde_json::value::{RawValue, to_raw_value};
+    type Object = std::collections::BTreeMap<String, Box<RawValue>>;
+
+    let mut layout: Object = serde_json::from_slice(json)?;
+    let mut skipped = 0;
+    if let Some(raw_panes) = layout.get_mut("panes") {
+        let mut panes: Vec<Object> = serde_json::from_str(raw_panes.get())?;
+        for pane in &mut panes {
+            let Some(raw_chart) = pane.get_mut("Chart") else { continue };
+            let mut chart: Object = serde_json::from_str(raw_chart.get())?;
+            if let Some(raw_drawings) = chart.get_mut("drawings") {
+                let values: Vec<Box<RawValue>> = serde_json::from_str(raw_drawings.get())?;
+                let mut drawings = Vec::new();
+                for value in values {
+                    let drawing = serde_json::from_str::<Drawing>(value.get())
+                        .ok()
+                        .and_then(|mut drawing| drawing.sanitize().then_some(drawing));
+                    if let Some(drawing) = drawing {
+                        drawings.push(drawing);
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                *raw_drawings = to_raw_value(&drawings)?;
+            }
+            *raw_chart = to_raw_value(&chart)?;
+        }
+        *raw_panes = to_raw_value(&panes)?;
+    }
+    Ok((serde_json::to_vec(&layout)?, skipped))
 }
 
 fn yes() -> bool {
@@ -223,6 +262,9 @@ pub struct WindowGeometry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayoutDoc {
+    /// Load-only diagnostics; never persisted into the layout file.
+    #[serde(skip)]
+    pub skipped_drawings: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchlists: Option<Vec<crate::app::NamedWatchlist>>,
     #[serde(default)]
@@ -292,7 +334,9 @@ impl LayoutDoc {
     }
 
     pub fn from_json(json: &[u8]) -> Result<LayoutDoc> {
-        let mut doc: LayoutDoc = serde_json::from_slice(json).context("parsing layout JSON")?;
+        let (json, skipped) = filter_layout_drawings(json).context("parsing layout JSON")?;
+        let mut doc: LayoutDoc = serde_json::from_slice(&json).context("parsing layout JSON")?;
+        doc.skipped_drawings = skipped;
         if doc.version > FORMAT_VERSION {
             bail!("layout format v{} is newer than this build supports (v{FORMAT_VERSION})", doc.version);
         }
@@ -323,6 +367,7 @@ impl LayoutDoc {
             .collect();
         let ids: Vec<PaneId> = panes.iter().map(|p| p.id).collect();
         LayoutDoc {
+            skipped_drawings: 0,
             watchlists: None,
             active_watchlist: 0,
             watchlist: None,
@@ -965,5 +1010,126 @@ mod tests {
         // Serialization always rewrites version=1.
         let json = serde_json::to_value(&set).unwrap();
         assert_eq!(json["version"], 1);
+    }
+
+    #[test]
+    fn hostile_drawing_payloads_are_sanitized_without_killing_the_layout() {
+        let raw = r#"{
+            "name": "Hostile",
+            "dock": {"type": "tabs", "panes": [1]},
+            "panes": [{
+                "id": 1,
+                "Chart": {
+                    "symbol": "AAPL", "tf": "D1", "chart_type": "Line", "log": false,
+                    "indicators": [], "compare": null,
+                    "drawings": [
+                        {"tool": "Callout", "a": {"ts": 1, "price": 10}, "b": {"ts": 2, "price": 20},
+                         "text": "Hi\u0000\n\té", "width": 1.0},
+                        {"tool": "FixedRangeVolumeProfile", "a": {"ts": 1, "price": 10}, "b": {"ts": 2, "price": 20},
+                         "profile_rows": 0, "width": 1.0},
+                        {"tool": "FixedRangeVolumeProfile", "a": {"ts": 1, "price": 10}, "b": {"ts": 2, "price": 20},
+                         "profile_rows": 9999, "width": 1.0},
+                        {"tool": "Brush", "a": {"ts": 1, "price": 10}, "b": {"ts": 2, "price": 20},
+                         "vertices": [{"ts": 1, "price": 10}, {"ts": 2, "price": 10}, {"ts": 3, "price": 20}],
+                         "width": 1.0},
+                        {"tool": "Path", "a": {"ts": 1, "price": 10}, "b": {"ts": 2, "price": 20},
+                         "vertices": [{"ts": 1, "price": 1}], "arrow_end": true, "width": 1.0}
+                    ]
+                }
+            }]
+        }"#;
+        let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
+        let PaneSettings::Chart { drawings, .. } = &doc.panes[0].settings else { panic!("chart") };
+        // Incomplete Path is dropped; the other four survive sanitised.
+        assert_eq!(drawings.len(), 4);
+        assert_eq!(drawings[0].text, "Hi\né");
+        assert_eq!(drawings[1].profile_rows, 4);
+        assert_eq!(drawings[2].profile_rows, 200);
+        assert_eq!(drawings[3].vertices.len(), 3);
+        let again = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(again.panes[0].settings, doc.panes[0].settings);
+    }
+
+    #[test]
+    fn one_unparseable_drawing_does_not_abort_the_whole_layout() {
+        let raw = r#"{
+            "name": "Mixed",
+            "dock": {"type": "tabs", "panes": [1]},
+            "panes": [{
+                "id": 1,
+                "Chart": {
+                    "symbol": "AAPL", "tf": "D1", "chart_type": "Line", "log": false,
+                    "indicators": [], "compare": null,
+                    "drawings": [
+                        {"tool": "Text", "a": {"ts": 1, "price": 10}, "b": {"ts": 1, "price": 10},
+                         "text": "keep me", "width": 1.0},
+                        {"tool": "PriceNote", "a": {"ts": 1, "price": 1e999}, "b": {"ts": 1, "price": 10},
+                         "text": "drop me", "width": 1.0},
+                        {"tool": "ArrowMarkUp", "a": {"ts": 2, "price": 11}, "b": {"ts": 2, "price": 11},
+                         "width": 1.0}
+                    ]
+                }
+            }]
+        }"#;
+        let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
+        let PaneSettings::Chart { drawings, .. } = &doc.panes[0].settings else { panic!("chart") };
+        assert_eq!(drawings.len(), 2);
+        assert_eq!(drawings[0].text, "keep me");
+        assert_eq!(drawings[1].tool, tr_chart::drawings::Tool::ArrowMarkUp);
+        assert_eq!(doc.skipped_drawings, 1);
+        assert_eq!(doc.name, "Mixed");
+        assert!(
+            matches!(&doc.panes[0].settings, PaneSettings::Chart { symbol, tf: Timeframe::D1, .. } if symbol == "AAPL")
+        );
+        assert_eq!(LayoutDoc::from_json(&doc.to_json()).unwrap().skipped_drawings, 0);
+
+        // Type/range errors and sanitisation failures have the same isolation.
+        for invalid in [
+            r#"{"tool":"Text","a":{"ts":1,"price":10},"b":{"ts":1,"price":10},"text":123}"#,
+            r#"{"tool":"FixedRangeVolumeProfile","a":{"ts":1,"price":10},"b":{"ts":1,"price":10},"profile_rows":-1}"#,
+            r#"{"tool":"Path","a":{"ts":1,"price":10},"b":{"ts":1,"price":10},"vertices":[]}"#,
+        ] {
+            let start = raw.find(r#"{"tool": "PriceNote""#).unwrap();
+            let end = start + raw[start..].find(r#""width": 1.0}"#).unwrap() + r#""width": 1.0}"#.len();
+            let mut mixed = raw.to_string();
+            mixed.replace_range(start..end, invalid);
+            let loaded = LayoutDoc::from_json(mixed.as_bytes()).unwrap();
+            assert_eq!(loaded.skipped_drawings, 1, "{invalid}");
+            assert_eq!(loaded.panes, doc.panes);
+        }
+    }
+
+    #[test]
+    fn drawing_new_tools_round_trip_through_layout_documents() {
+        use tr_chart::drawings::{Anchor, Drawing, Tool};
+        let mut doc = LayoutDoc::default_workspace("New tools", &PanelDefaults::default());
+        let PaneSettings::Chart { drawings, .. } = &mut doc.panes[0].settings else { panic!("chart") };
+        for tool in [
+            Tool::PriceRange,
+            Tool::DateRange,
+            Tool::DatePriceRange,
+            Tool::AnchoredVwap,
+            Tool::FixedRangeVolumeProfile,
+            Tool::Arrow,
+            Tool::ArrowMarkUp,
+            Tool::ArrowMarkDown,
+            Tool::Brush,
+            Tool::Circle,
+            Tool::Path,
+            Tool::PriceNote,
+            Tool::Callout,
+            Tool::FlagMark,
+        ] {
+            let mut d = Drawing::new(tool, Anchor { ts: 1, price: 10. }, Anchor { ts: 2, price: 20. });
+            d.text = "Note\nline".into();
+            d.profile_rows = 16;
+            if matches!(tool, Tool::Path | Tool::Brush) {
+                d.vertices = vec![d.a, d.b, Anchor { ts: 3, price: 30. }];
+                d.arrow_end = tool == Tool::Path;
+            }
+            drawings.push(d);
+        }
+        let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(restored.panes[0].settings, doc.panes[0].settings);
     }
 }

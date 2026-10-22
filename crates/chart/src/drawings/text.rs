@@ -80,4 +80,27 @@ mod tests {
         assert_eq!(sanitised, format!("é\n{}", "界".repeat(498)));
         assert_eq!(sanitised.chars().count(), 500);
     }
+
+    #[test]
+    fn price_note_and_callout_labels_keep_newlines_unicode_and_respect_the_cap() {
+        use super::super::{Anchor, Drawing, Tool};
+        let a = Anchor { ts: 1, price: 12.345 };
+        let mut note = Drawing::new(Tool::PriceNote, a, a);
+        note.text = "first\nsecond\u{0}\tthird".into();
+        assert_eq!(super::label(&note), "12.35 first\nsecondthird");
+        note.text.clear();
+        assert_eq!(super::label(&note), "12.35");
+        note.text = "界".repeat(600);
+        assert!(super::label(&note).ends_with(&"界".repeat(500)));
+        assert_eq!(super::label(&note).chars().filter(|c| *c == '界').count(), 500);
+        note.text = "A\u{2028}B".into();
+        assert_eq!(super::label(&note), "12.35 A\u{2028}B", "unicode separators are not control chars");
+
+        let mut callout = Drawing::new(Tool::Callout, a, a);
+        callout.text = "line1\r\nline2\rline3\u{7}".into();
+        assert_eq!(super::label(&callout), "line1\nline2\nline3");
+        assert!(super::editable(Tool::PriceNote) && super::editable(Tool::Callout) && !super::editable(Tool::FlagMark));
+        assert_eq!(super::point_count(Tool::Callout), 2);
+        assert_eq!(super::point_count(Tool::PriceNote), 1);
+    }
 }

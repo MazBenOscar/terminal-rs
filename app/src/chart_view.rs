@@ -4183,10 +4183,12 @@ impl ChartState {
         } else {
             [0., 0.]
         };
-        let bars = (self.index_of_ts(d.b.ts) - self.index_of_ts(d.a.ts)).abs().round() as usize;
+        // Timestamp projection uses bar centers; data lookups need the containing bar.
+        let bar_index = |ts| (self.index_of_ts(ts).floor().max(0.) as usize).min(self.bars.len().saturating_sub(1));
+        let ia = bar_index(d.a.ts);
+        let ib = bar_index(d.b.ts);
+        let bars = ia.abs_diff(ib);
         let closes: Vec<_> = if d.tool == Tool::RegressionTrend {
-            let ia = self.index_of_ts(d.a.ts).round().max(0.) as usize;
-            let ib = self.index_of_ts(d.b.ts).round().max(0.) as usize;
             self.bars.iter().skip(ia.min(ib)).take(ia.max(ib) - ia.min(ib) + 1).map(|bar| bar.close).collect()
         } else {
             Vec::new()
@@ -4198,9 +4200,12 @@ impl ChartState {
                 {
                     let mut anchor = d.a;
                     if matches!(d.tool, Tool::ArrowMarkUp | Tool::ArrowMarkDown | Tool::FlagMark)
-                        && let Some(bar) = self.bars.get(self.index_of_ts(anchor.ts).round().max(0.) as usize)
+                        && let Some(bar) = self.bars.get(bar_index(anchor.ts))
                     {
-                        anchor.price = if d.tool == Tool::ArrowMarkUp { bar.low } else { bar.high };
+                        let extreme = if d.tool == Tool::ArrowMarkUp { bar.low } else { bar.high };
+                        if extreme.is_finite() {
+                            anchor.price = extreme;
+                        }
                     }
                     px(&anchor)
                 },
@@ -5687,6 +5692,10 @@ mod tests {
         let mut hostile = Vec::new();
         for tool in Tool::ALL {
             let mut drawing = Drawing::new(tool, a, b);
+            drawing.c = Some(a);
+            if drawings::patterns::point_count(tool) > 0 {
+                drawing.pattern_points = vec![a; tool.points()];
+            }
             drawing.vertices = vec![a; 8];
             drawing.arrow_end = true;
             hostile.push(drawing);
@@ -5806,6 +5815,103 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn markers_snap_to_the_anchor_bar_not_the_next_one() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        let mut bars = chart.bars.as_ref().clone();
+        // Distinct extremes so a wrong bar is obvious on a 100..200 scale (400px).
+        bars[50] = Bar::new(50 * 86400, 150., 151., 149., 150., 10.);
+        bars[51] = Bar::new(51 * 86400, 150., 200., 100., 150., 10.);
+        chart.bars = Arc::new(bars);
+        ui_frame(&ctx, vec![], |ui| {
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(800., 400.));
+            let v = Viewport { right: 100., bar_px: 8., width_px: 800. };
+            let scale = PriceScale::new(100., 200., false, 400.);
+            let a = Anchor { ts: 50 * 86400, price: 150. };
+            let up = Drawing::new(Tool::ArrowMarkUp, a, a);
+            let shapes = chart.drawing_shapes(ui, &up, rect, &v, &scale);
+            let Shape::Polygon(points) = &shapes.last().unwrap().0 else { panic!("marker") };
+            assert!(
+                points.iter().all(|p| p[1] < scale.y_of(120.)),
+                "ArrowMarkUp must sit at bar 50 low=149, not bar 51 low=100: {points:?}"
+            );
+            let down = Drawing::new(Tool::ArrowMarkDown, a, a);
+            let shapes = chart.drawing_shapes(ui, &down, rect, &v, &scale);
+            let Shape::Polygon(points) = &shapes.last().unwrap().0 else { panic!("marker") };
+            assert!(
+                points.iter().all(|p| p[1] > scale.y_of(180.)),
+                "ArrowMarkDown must sit at bar 50 high=151, not bar 51 high=200: {points:?}"
+            );
+            let last = chart.bars.last().unwrap();
+            for (tool, extreme) in
+                [(Tool::ArrowMarkUp, last.low), (Tool::ArrowMarkDown, last.high), (Tool::FlagMark, last.high)]
+            {
+                let a = Anchor { ts: last.ts, price: 190. };
+                let d = Drawing::new(tool, a, a);
+                let shapes = chart.drawing_shapes(ui, &d, rect, &v, &scale);
+                let Shape::Polygon(points) = &shapes.last().unwrap().0 else { panic!("marker") };
+                assert!(
+                    points.iter().all(|p| (p[1] - scale.y_of(extreme)).abs() < 40.),
+                    "{tool:?} must use the last bar's extreme, not the placed price: {points:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn markers_on_bars_with_nonfinite_extremes_keep_finite_hit_testable_geometry() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        let mut bars = chart.bars.as_ref().clone();
+        bars[50] = Bar::new(50 * 86400, 150., f64::NAN, f64::NAN, 150., 10.);
+        bars[51] = Bar::new(51 * 86400, 150., f64::INFINITY, f64::NEG_INFINITY, 150., 10.);
+        chart.bars = Arc::new(bars);
+        ui_frame(&ctx, vec![], |ui| {
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(800., 400.));
+            let v = Viewport { right: 100., bar_px: 8., width_px: 800. };
+            let scale = PriceScale::new(100., 200., false, 400.);
+            for (ts, tool) in [
+                (50 * 86400, Tool::ArrowMarkUp),
+                (50 * 86400, Tool::ArrowMarkDown),
+                (50 * 86400, Tool::FlagMark),
+                (51 * 86400, Tool::ArrowMarkUp),
+                (51 * 86400, Tool::FlagMark),
+            ] {
+                let a = Anchor { ts, price: 150. };
+                let d = Drawing::new(tool, a, a);
+                let shapes = chart.drawing_shapes(ui, &d, rect, &v, &scale);
+                assert!(!shapes.is_empty(), "{tool:?} on broken bar must still draw");
+                for (shape, _) in &shapes {
+                    let points: Vec<[f64; 2]> = match shape {
+                        Shape::Polygon(points) => points.to_vec(),
+                        Shape::Segment(a, b) => vec![*a, *b],
+                        Shape::Rect(a, b) => vec![*a, *b],
+                        Shape::HLine(_) | Shape::VLine(_) | Shape::DashedSegment(..) => continue,
+                    };
+                    assert!(
+                        points.iter().flatten().all(|v| v.is_finite()),
+                        "{tool:?} produced non-finite geometry: {shape:?}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn date_range_paints_its_elapsed_and_volume_label_like_the_other_measurers() {
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.start_tool(Tool::DateRange);
+        click_drawing(&ctx, &mut chart, pos2(320., 300.), false);
+        let labels = click_drawing(&ctx, &mut chart, pos2(480., 100.), false);
+        assert_eq!(chart.drawings.len(), 1);
+        assert!(
+            labels.iter().any(|(s, _)| s.contains("bars") && s.contains("Volume")),
+            "DateRange must paint its range label, got {labels:?}"
+        );
     }
 
     #[test]
@@ -6149,6 +6255,183 @@ mod tests {
             chart.redo_drawings();
             assert_eq!(chart.drawings.len(), 1);
         }
+    }
+
+    fn ramp_chart() -> ChartState {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        // Distinct per-bar extremes so an off-by-one bar lookup is visible.
+        chart.bars = Arc::new(
+            (0..30)
+                .map(|i| {
+                    let c = 1000. + i as f64;
+                    Bar::new(i * 86400, c, c + 0.5, c - 0.5, c, 1.)
+                })
+                .collect(),
+        );
+        chart
+    }
+
+    #[test]
+    fn regression_and_marker_extremes_use_containing_bar_not_the_next_one() {
+        let ctx = egui::Context::default();
+        let chart = ramp_chart();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800., 400.));
+        let v = Viewport { right: 30., bar_px: 8., width_px: 800. };
+        let scale = PriceScale::new(990., 1035., false, 400.);
+
+        // Regression from bar 10 (close 1010) to bar 20 (close 1020).
+        // Correct fit: intercept 1010, slope 1, end 1020 at the two anchor x positions.
+        let d = Drawing::new(
+            Tool::RegressionTrend,
+            Anchor { ts: 10 * 86400, price: 1010. },
+            Anchor { ts: 20 * 86400, price: 1020. },
+        );
+        let mut mid = None;
+        ui_frame(&ctx, vec![], |ui| {
+            let shapes = chart.drawing_shapes(ui, &d, rect, &v, &scale);
+            // Three ±k·sd bands then the slope label; the middle band is the fit line.
+            if let Shape::Segment(a, b) = shapes[1].0 {
+                mid = Some((a[1], b[1]));
+            }
+        });
+        let (y0, y1) = mid.expect("regression fit segment");
+        let expect_y = |price: f64| scale.y_of(price);
+        assert!(
+            (y0 - expect_y(1010.)).abs() < 0.5 && (y1 - expect_y(1020.)).abs() < 0.5,
+            "regression used the wrong closes: got y {y0},{y1} want {},{}",
+            expect_y(1010.),
+            expect_y(1020.)
+        );
+
+        // ArrowMarkUp on bar 5 (low 1004.5) must snap to that bar's low, not bar 6's.
+        let a = Anchor { ts: 5 * 86400, price: 1005. };
+        let mark = Drawing::new(Tool::ArrowMarkUp, a, a);
+        ui_frame(&ctx, vec![], |ui| {
+            let shapes = chart.drawing_shapes(ui, &mark, rect, &v, &scale);
+            let Shape::Polygon(points) = &shapes.last().unwrap().0 else {
+                panic!("Expected marker polygon");
+            };
+            let tip_y = points[0][1];
+            assert!(
+                (tip_y - (scale.y_of(1004.5) + 5.)).abs() < 0.5,
+                "marker snapped to the next bar's low (tip_y={tip_y}, bar5 low y={})",
+                scale.y_of(1004.5) + 5.
+            );
+        });
+
+        // Anchor on the final bar: extreme snap must still apply.
+        let last = Anchor { ts: 29 * 86400, price: 1029. };
+        let mark = Drawing::new(Tool::ArrowMarkUp, last, last);
+        ui_frame(&ctx, vec![], |ui| {
+            let shapes = chart.drawing_shapes(ui, &mark, rect, &v, &scale);
+            let Shape::Polygon(points) = &shapes.last().unwrap().0 else {
+                panic!("Expected marker polygon");
+            };
+            assert!(
+                (points[0][1] - (scale.y_of(1028.5) + 5.)).abs() < 0.5,
+                "last-bar marker must use bar 29's low (1028.5)"
+            );
+        });
+    }
+
+    #[test]
+    fn new_line_fib_and_pattern_tools_respect_lock_hide_and_edit_every_handle() {
+        for log in [false, true] {
+            let ctx = egui::Context::default();
+            let mut chart = drawing_chart();
+            chart.magnet = false;
+            // Place one representative tool from each new family.
+            chart.start_tool(Tool::RegressionTrend);
+            click_drawing(&ctx, &mut chart, pos2(200., 280.), log);
+            click_drawing(&ctx, &mut chart, pos2(500., 160.), log);
+            chart.start_tool(Tool::FibChannel);
+            click_drawing(&ctx, &mut chart, pos2(240., 300.), log);
+            click_drawing(&ctx, &mut chart, pos2(480., 180.), log);
+            click_drawing(&ctx, &mut chart, pos2(520., 260.), log);
+            chart.start_tool(Tool::Abcd);
+            for x in [120., 220., 320., 420.] {
+                click_drawing(&ctx, &mut chart, pos2(x, 200.), log);
+            }
+            chart.start_tool(Tool::InfoLine);
+            click_drawing(&ctx, &mut chart, pos2(160., 220.), log);
+            click_drawing(&ctx, &mut chart, pos2(360., 180.), log);
+            assert_eq!(chart.drawings.len(), 4);
+            let originals = chart.drawings.clone();
+            chart.cancel();
+
+            // Hide: no selection, no drags.
+            chart.drawings_hidden = true;
+            click_drawing(&ctx, &mut chart, pos2(220., 200.), log);
+            assert!(chart.draw.selected.is_none() && chart.draw.drag.is_none());
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(pos2(220., 200.), true)], log);
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(pos2(240., 210.))], log);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(pos2(240., 210.), false)], log);
+            assert_eq!(chart.drawings, originals);
+            chart.drawings_hidden = false;
+
+            // Lock: no selection, no drags, but a fresh drawing still places.
+            chart.drawings_locked = true;
+            click_drawing(&ctx, &mut chart, pos2(220., 200.), log);
+            assert!(chart.draw.selected.is_none());
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(pos2(220., 200.), true)], log);
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(pos2(240., 210.))], log);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(pos2(240., 210.), false)], log);
+            assert_eq!(chart.drawings, originals);
+            chart.start_tool(Tool::HorizontalRay);
+            click_drawing(&ctx, &mut chart, pos2(300., 150.), log);
+            assert_eq!(chart.drawings.len(), 5);
+            chart.undo_drawings();
+            chart.drawings_locked = false;
+
+            // Edit every pattern handle on the ABCD drawing (index 2).
+            let pattern = &chart.drawings[2];
+            assert_eq!(pattern.pattern_points.len(), 4);
+            let before = pattern.pattern_points.clone();
+            for i in 0..4 {
+                let from = pos2(120. + i as f32 * 100., 200.);
+                let to = from + vec2(24., 36.);
+                drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(from)], log);
+                drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], log);
+                drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], log);
+                drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], log);
+                let edited = &chart.drawings[2];
+                assert_ne!(edited.pattern_points[i], before[i], "handle {i} must move");
+                for (j, (a, b)) in edited.pattern_points.iter().zip(before.iter()).enumerate() {
+                    if j != i {
+                        assert_eq!(a, b, "handle {j} must stay put while dragging {i}");
+                    }
+                }
+                chart.undo_drawings();
+                assert_eq!(chart.drawings, originals);
+            }
+        }
+    }
+
+    #[test]
+    fn info_line_percent_and_fib_time_zone_placement_cover_edge_prices() {
+        use tr_chart::drawings::measure_label;
+        let a = Anchor { ts: 0, price: 0. };
+        let b = Anchor { ts: 86_400, price: 10. };
+        assert!(measure_label(a, b, 1, 2).contains("(n/a)"));
+        assert!(measure_label(Anchor { price: -0., ..a }, b, 1, 2).contains("(n/a)"));
+        let neg = measure_label(Anchor { ts: 0, price: -50. }, Anchor { ts: 86_400, price: -100. }, 1, 2);
+        assert!(neg.contains("(-100.00%)"), "{neg}");
+
+        let ctx = egui::Context::default();
+        let mut chart = drawing_chart();
+        chart.start_tool(Tool::FibTimeZone);
+        // p2 left of p1: levels extend leftward and still commit as one undo step.
+        click_drawing(&ctx, &mut chart, pos2(500., 200.), false);
+        click_drawing(&ctx, &mut chart, pos2(300., 200.), false);
+        assert_eq!(chart.drawings.len(), 1);
+        chart.undo_drawings();
+        assert!(chart.drawings.is_empty());
+        // Zero bar distance (same x) still places.
+        chart.start_tool(Tool::FibTimeZone);
+        click_drawing(&ctx, &mut chart, pos2(400., 180.), false);
+        click_drawing(&ctx, &mut chart, pos2(400., 220.), false);
+        assert_eq!(chart.drawings.len(), 1);
+        assert_eq!(chart.drawings[0].a.ts, chart.drawings[0].b.ts);
     }
 
     fn rail_frame(ctx: &egui::Context, chart: &mut ChartState, events: Vec<egui::Event>) -> Vec<(String, Rect)> {

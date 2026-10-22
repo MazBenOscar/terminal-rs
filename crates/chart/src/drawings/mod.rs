@@ -224,7 +224,11 @@ impl Drawing {
             self.vertices.len() >= 2
         } else {
             self.vertices.clear();
-            true
+            if patterns::point_count(self.tool) > 0 {
+                self.pattern_points.len() == self.tool.points()
+            } else {
+                self.tool.points() != 3 || self.c.is_some()
+            }
         }
     }
 
@@ -422,6 +426,10 @@ mod dispatch_tests {
         let a = Anchor { ts: 1, price: 100. };
         for tool in Tool::ALL {
             let mut drawing = Drawing::new(tool, a, a);
+            drawing.c = Some(a);
+            if patterns::point_count(tool) > 0 {
+                drawing.pattern_points = vec![a; tool.points()];
+            }
             drawing.vertices = vec![a; shapes::MAX_POINTS + 500];
             drawing.arrow_end = true;
             assert!(drawing.sanitize());
@@ -438,6 +446,56 @@ mod dispatch_tests {
         }
         assert!(patterns::label_above(&[], 0));
         assert!(patterns::label_above(&[[0., 0.]], usize::MAX));
+    }
+
+    #[test]
+    fn sanitizing_keeps_complete_pattern_and_three_point_drawings() {
+        let a = Anchor { ts: 1, price: 100. };
+        let b = Anchor { ts: 2, price: 90. };
+        for tool in [
+            Tool::Xabcd,
+            Tool::Abcd,
+            Tool::HeadAndShoulders,
+            Tool::TrianglePattern,
+            Tool::ElliottImpulse,
+            Tool::ElliottCorrection,
+        ] {
+            let mut drawing = Drawing::new(tool, a, b);
+            drawing.pattern_points = (0..tool.points()).map(|i| Anchor { ts: i as i64, price: 100. }).collect();
+            assert!(drawing.sanitize(), "{tool:?}");
+            assert_eq!(drawing.pattern_points.len(), tool.points());
+        }
+        for tool in [Tool::Channel, Tool::FibChannel, Tool::FibExtension, Tool::Pitchfork] {
+            let mut drawing = Drawing::new(tool, a, b);
+            drawing.c = Some(Anchor { ts: 3, price: 110. });
+            assert!(drawing.sanitize(), "{tool:?}");
+            assert_eq!(handles(&drawing).len(), tool.points());
+        }
+    }
+
+    #[test]
+    fn sanitize_rejects_incomplete_pattern_and_three_point_drawings() {
+        let a = Anchor { ts: 1, price: 100. };
+        let b = Anchor { ts: 2, price: 90. };
+        for tool in [
+            Tool::Xabcd,
+            Tool::Abcd,
+            Tool::HeadAndShoulders,
+            Tool::TrianglePattern,
+            Tool::ElliottImpulse,
+            Tool::ElliottCorrection,
+        ] {
+            let mut drawing = Drawing::new(tool, a, b);
+            assert!(!drawing.sanitize(), "empty pattern_points must be rejected for {tool:?}");
+            drawing.pattern_points = vec![a; tool.points().saturating_sub(1)];
+            assert!(!drawing.sanitize(), "short pattern_points must be rejected for {tool:?}");
+            drawing.pattern_points = vec![a; tool.points() + 1];
+            assert!(!drawing.sanitize(), "excess pattern_points must be rejected for {tool:?}");
+        }
+        for tool in [Tool::Channel, Tool::FibChannel, Tool::FibExtension, Tool::Pitchfork] {
+            let mut drawing = Drawing::new(tool, a, b);
+            assert!(!drawing.sanitize(), "missing c must be rejected for {tool:?}");
+        }
     }
 
     #[test]
@@ -469,6 +527,59 @@ mod dispatch_tests {
             assert_eq!(handles(&drawing).len(), tool.points(), "{tool:?}");
             assert!(hit_distance(&g, [40., 100.]).is_finite(), "{tool:?}");
             assert!((1..=7).contains(&tool.points()));
+        }
+    }
+
+    #[test]
+    fn new_tool_drawings_serde_round_trip_and_sanitize_hostile_payloads() {
+        let a = Anchor { ts: 1, price: 100. };
+        let b = Anchor { ts: 2, price: 90. };
+        for tool in [
+            Tool::PriceRange,
+            Tool::DateRange,
+            Tool::DatePriceRange,
+            Tool::AnchoredVwap,
+            Tool::FixedRangeVolumeProfile,
+            Tool::Arrow,
+            Tool::ArrowMarkUp,
+            Tool::ArrowMarkDown,
+            Tool::Brush,
+            Tool::Circle,
+            Tool::Path,
+            Tool::PriceNote,
+            Tool::Callout,
+            Tool::FlagMark,
+        ] {
+            let mut d = Drawing::new(tool, a, b);
+            d.text = "Note\nline".into();
+            d.profile_rows = 12;
+            d.width = 2.5;
+            if matches!(tool, Tool::Path | Tool::Brush) {
+                d.vertices = vec![a, b, Anchor { ts: 3, price: 80. }];
+                d.arrow_end = tool == Tool::Path;
+            }
+            let json = serde_json::to_string(&d).unwrap();
+            let loaded: Drawing = serde_json::from_str(&json).unwrap();
+            assert_eq!(loaded, d, "{tool:?}");
+            // Hostile vertex / text / rows payloads never panic and stay bounded.
+            let mut hostile = d.clone();
+            hostile.text = "x\u{0}\r\n".repeat(400);
+            hostile.profile_rows = usize::MAX;
+            hostile.vertices = (0..2_500)
+                .map(|i| Anchor { ts: i as i64, price: if i % 3 == 0 { f64::NAN } else { i as f64 } })
+                .collect();
+            hostile.arrow_end = true;
+            assert!(hostile.sanitize(), "{tool:?}");
+            assert!(hostile.text.chars().count() <= 500);
+            // Use-site row_count is the bound; serde load also clamps via deserialize_rows.
+            assert_eq!(measure::row_count(hostile.profile_rows), 200);
+            assert_eq!(hostile.arrow_end, tool == Tool::Path);
+            if matches!(tool, Tool::Path | Tool::Brush) {
+                assert!((2..=shapes::MAX_POINTS).contains(&hostile.vertices.len()));
+                assert!(hostile.vertices.iter().all(|p| p.price.is_finite()));
+            } else {
+                assert!(hostile.vertices.is_empty());
+            }
         }
     }
 }

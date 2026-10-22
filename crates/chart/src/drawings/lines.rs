@@ -214,6 +214,74 @@ mod tests {
     }
 
     #[test]
+    fn regression_rejects_non_finite_and_treats_tiny_samples_as_defined() {
+        assert_eq!(regression_fit(&[f64::NAN, 1.]), None);
+        assert_eq!(regression_fit(&[1., f64::INFINITY]), None);
+        assert_eq!(regression_fit(&[1., f64::NEG_INFINITY]), None);
+        // One bar: slope 0, residual 0, r² conventionally 1 (flat is a perfect fit).
+        let one = regression_fit(&[42.]).unwrap();
+        assert_eq!(one.slope, 0.);
+        assert_eq!(one.intercept, 42.);
+        assert_eq!(one.residual_sd, 0.);
+        assert_eq!(one.r_squared, 1.);
+        // Two points always fit exactly.
+        let two = regression_fit(&[10., 20.]).unwrap();
+        assert_eq!(two.slope, 10.);
+        assert_eq!(two.r_squared, 1.);
+        // Nearly-flat series must not yield NaN r².
+        let flat = regression_fit(&[100., 100. + 1e-15]).unwrap();
+        assert!(flat.r_squared.is_finite() && (0. ..=1.).contains(&flat.r_squared));
+    }
+
+    #[test]
+    fn clip_line_handles_vertical_zero_length_and_boundaries() {
+        let r = [0., 0., 100., 100.];
+        // Vertical infinite line inside / outside the viewport.
+        assert_eq!(clip_line([50., 10.], [50., 20.], r, true, true), Some(([50., 0.], [50., 100.])));
+        assert_eq!(clip_line([150., 10.], [150., 20.], r, true, true), None);
+        // Zero-length respects the inside test and ignores extension flags.
+        assert_eq!(clip_line([0., 0.], [0., 0.], r, true, true), Some(([0., 0.], [0., 0.])));
+        assert_eq!(clip_line([100., 100.], [100., 100.], r, true, true), Some(([100., 100.], [100., 100.])));
+        assert_eq!(clip_line([100.0001, 50.], [100.0001, 50.], r, true, true), None);
+        // Degenerate axis-aligned ray starting exactly on the right edge.
+        assert_eq!(clip_line([100., 50.], [101., 50.], r, false, true), Some(([100., 50.], [100., 50.])));
+    }
+
+    #[test]
+    fn info_line_and_extended_line_keep_finite_geometry_on_degenerate_inputs() {
+        use crate::drawings::{Anchor, Drawing};
+        let drawing = Drawing::new(Tool::InfoLine, Anchor { ts: 0, price: 0. }, Anchor { ts: 0, price: 0. });
+        let g = Geometry {
+            drawing: &drawing,
+            points: [[50., 50.], [50., 50.], [50., 50.]],
+            pattern_points: Vec::new(),
+            bounds: [0., 0., 100., 100.],
+            price_y: &|p| p,
+            measure_label: "+0.00 (n/a) · 0 bars · 0s".into(),
+            text_size: [0., 0.],
+            closes: &[],
+            project: &|a| [a.ts as f64, a.price],
+        };
+        let shapes = geometry(&g);
+        assert_eq!(shapes[0].0, Shape::Segment([50., 50.], [50., 50.]));
+        assert!(
+            shapes
+                .iter()
+                .flat_map(|(s, _)| match s {
+                    Shape::Segment(a, b) => vec![*a, *b],
+                    Shape::Rect(a, b) => vec![*a, *b],
+                    _ => vec![],
+                })
+                .flatten()
+                .all(|v| v.is_finite())
+        );
+        let extended = Drawing { tool: Tool::ExtendedLine, ..drawing.clone() };
+        let g = Geometry { drawing: &extended, ..g };
+        // Zero-length extended line inside the viewport is a single point, not None.
+        assert_eq!(geometry(&g)[0].0, Shape::Segment([50., 50.], [50., 50.]));
+    }
+
+    #[test]
     fn new_lines_clip_and_regression_recomputes_from_closes() {
         use crate::drawings::{Anchor, Drawing};
         let drawing = Drawing::new(Tool::HorizontalRay, Anchor { ts: 0, price: 20. }, Anchor { ts: 1, price: 40. });
