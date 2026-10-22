@@ -36,8 +36,9 @@ Full workspace formatting and strict Clippy passed; 797 tests passed, with five
 existing network tests ignored. Commit: `7abce7d`. These checks do not establish
 desktop visual QA.
 
-Remaining boundaries: reconnect recovery is C03; derivatives, crypto execution,
-and volume-at-price data are separate work. Exchange access can be region-restricted.
+Remaining boundaries: derivatives, crypto execution and volume-at-price data are
+separate work. Exchange access can be region-restricted. Live recovery is described
+in C03 below.
 
 ## C02 — discovery and scanning
 
@@ -117,8 +118,8 @@ cargo test -p terminal-rs live_crypto_universes_evaluate_exact_products_and_publ
 ```
 
 The new paths have headless UI coverage; a running-app visual review on the target
-desktop is still needed. C03 streaming/reconnect recovery, derivatives metrics,
-coin capitalization/categories, execution and order-flow data remain separate work.
+desktop is still needed. Derivatives metrics, coin capitalization/categories,
+execution and order-flow data remain separate work; C03 below covers live recovery.
 
 Reference API contracts:
 
@@ -127,3 +128,45 @@ Reference API contracts:
 - [Coinbase Exchange products](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-all-known-trading-pairs)
 
 These are public metadata/data interfaces; discovery does not grant trading permissions.
+
+## C03 — live-stream recovery
+
+Crypto chart feeds keep the resolved venue and native product for their lifetime.
+Binance endpoints still rotate within Binance; there is no exchange or quote
+substitution. A closed connection (including Binance's normal 24-hour close),
+connection error or 30 seconds without any websocket message triggers a retry.
+Coinbase subscribes to both `ticker` and `heartbeats` for the exact product so an
+illiquid product can stay healthy without trades. Heartbeats never generate bars;
+other products are ignored. Websocket Ping receives the automatically queued Pong.
+
+A connection becomes healthy only after a valid product bar, tick or heartbeat,
+not at the websocket handshake. Failures before the feed has ever been healthy
+report `<Venue> live stream unavailable; retrying…`. Later failures report
+`<Venue> live stream disconnected; reconnecting…`. These short chart notices
+contain no URLs, server payloads or error bodies. The chart displays its STREAM
+WAITING badge until the next bar clears the notice.
+
+After a failure of a previously healthy feed, the first valid product message
+emits `<Venue> live stream restored; filling missed bars`, then one `Reconnected`
+event, before delivering the new bar (if any). The event carries the last bar
+bucket delivered before the failure, or None for a heartbeat-only feed. The
+worker fetches REST chart history using the existing bounded backfill limit,
+merges exact buckets, preserves the live tail and reports `Filled N missed bars`.
+Coinbase starts a fresh tick aggregate on each connection; partial-bar merges
+retain the original open and larger volume, while REST backfill replaces exact
+buckets. No `Bar::absorb` or chart live-merge semantics change.
+
+Retry delays start at one second, double through 2, 4, 8 and 16 seconds, and cap
+at 30 seconds. A healthy product message resets the delay to one second. Dropping
+the feed receiver cancels connection/read/retry work without further attempts.
+Loopback websocket tests exercise recovery ordering and timestamps, idle retries,
+initial failures, exact-product heartbeat subscriptions, automatic Pong, backoff
+reset and receiver shutdown. The existing provider-agnostic worker test
+`reconnects_coalesce_one_fetch_while_live_updates_continue` covers the backfill
+fetch and merge; no crypto-specific duplicate is needed.
+
+Remaining limits: recovery depends on REST history availability and its bounded
+history window; it cannot guarantee every missed bar during a long outage.
+Order-book streams are out of scope. Alerts use polled quotes and already reject
+stale or out-of-order prices. These tests use no public network and do not replace
+running-app visual QA.

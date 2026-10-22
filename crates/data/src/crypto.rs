@@ -532,98 +532,157 @@ impl CryptoProvider {
     /// produce no feed instead of switching products.
     pub fn live(sec: &Security, tf: Timeframe) -> Option<LiveFeed> {
         let route = resolved_instrument(sec).ok()?;
-        let (tx, rx) = mpsc::channel(256);
-        let stream = format!("{}@kline_{}", route.native_symbol.to_ascii_lowercase(), binance_interval(tf));
-        tokio::spawn(async move {
-            let mut backoff = 1;
-            let mut attempt = 0usize;
-            while !tx.is_closed() {
-                let res = match route.venue {
-                    CryptoVenue::Binance => {
-                        binance_ws(
-                            &format!("{}/{stream}", BINANCE_WS[attempt % BINANCE_WS.len()]),
-                            &route.native_symbol,
-                            &tx,
-                        )
-                        .await
-                    }
-                    CryptoVenue::Coinbase => coinbase_ws(&route.native_symbol, tf, &tx).await,
-                };
-                if tx.is_closed() {
-                    break;
-                }
-                if let Err(error) = res {
-                    tracing::debug!("live feed {}: {error:#}", route.canonical_ticker());
-                }
-                attempt = attempt.wrapping_add(1);
-                tokio::select! {
-                    _ = tx.closed() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
-                }
-                backoff = (backoff * 2).min(30);
-            }
-        });
-        Some(rx)
+        let endpoints = match route.venue {
+            CryptoVenue::Binance => BINANCE_WS.iter().map(|url| (*url).to_string()).collect(),
+            CryptoVenue::Coinbase => vec![COINBASE_WS.to_string()],
+        };
+        Some(live_with(route, tf, endpoints, Duration::from_secs(30)))
     }
 }
 
-async fn binance_ws(url: &str, symbol: &str, tx: &mpsc::Sender<crate::LiveUpdate>) -> Result<()> {
-    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::connect_async(url))
-        .await
-        .context("Binance websocket connection timeout")?
-        .context("binance websocket")?;
-    while let Some(msg) = ws.next().await {
-        match msg? {
-            Message::Text(t) => {
-                let value: Value = serde_json::from_str(t.as_str())?;
-                if value["k"]["s"].as_str() != Some(symbol) {
+struct Recovery {
+    backoff: u64,
+    healthy: bool,
+    failed: bool,
+    last: Option<i64>,
+}
+
+impl Recovery {
+    fn new() -> Self {
+        Self { backoff: 1, healthy: false, failed: false, last: None }
+    }
+
+    async fn healthy(&mut self, venue: &str, tx: &mpsc::Sender<crate::LiveUpdate>) -> Result<()> {
+        if self.healthy && self.failed {
+            tx.send(crate::LiveUpdate::Status(format!("{venue} live stream restored; filling missed bars"))).await?;
+            tx.send(crate::LiveUpdate::Reconnected { since: self.last }).await?;
+        }
+        self.healthy = true;
+        self.failed = false;
+        self.backoff = 1;
+        Ok(())
+    }
+}
+
+fn next_backoff(seconds: u64) -> u64 {
+    seconds.saturating_mul(2).min(30)
+}
+
+fn live_with(route: CryptoInstrument, tf: Timeframe, endpoints: Vec<String>, idle: Duration) -> LiveFeed {
+    let (tx, rx) = mpsc::channel(256);
+    tokio::spawn(async move {
+        let mut recovery = Recovery::new();
+        let mut attempt = 0usize;
+        let venue = match route.venue {
+            CryptoVenue::Binance => "Binance",
+            CryptoVenue::Coinbase => "Coinbase",
+        };
+        while !tx.is_closed() {
+            let endpoint = &endpoints[attempt % endpoints.len()];
+            let url = match route.venue {
+                CryptoVenue::Binance => {
+                    format!("{endpoint}/{}@kline_{}", route.native_symbol.to_ascii_lowercase(), binance_interval(tf))
+                }
+                CryptoVenue::Coinbase => endpoint.clone(),
+            };
+            tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                _ = crypto_ws(&url, &route, tf, &tx, &mut recovery, idle) => {}
+            }
+            if tx.is_closed() {
+                break;
+            }
+            recovery.failed = true;
+            let message = if recovery.healthy {
+                format!("{venue} live stream disconnected; reconnecting…")
+            } else {
+                format!("{venue} live stream unavailable; retrying…")
+            };
+            if tx.send(crate::LiveUpdate::Status(message)).await.is_err() {
+                break;
+            }
+            attempt = attempt.wrapping_add(1);
+            tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                _ = tokio::time::sleep(Duration::from_secs(recovery.backoff)) => {}
+            }
+            recovery.backoff = next_backoff(recovery.backoff);
+        }
+    });
+    rx
+}
+
+async fn crypto_ws(
+    url: &str,
+    route: &CryptoInstrument,
+    tf: Timeframe,
+    tx: &mpsc::Sender<crate::LiveUpdate>,
+    recovery: &mut Recovery,
+    idle: Duration,
+) -> Result<()> {
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::connect_async(url)).await??;
+    let venue = match route.venue {
+        CryptoVenue::Binance => "Binance",
+        CryptoVenue::Coinbase => {
+            let sub = serde_json::json!({
+                "type": "subscribe", "product_ids": [&route.native_symbol],
+                "channels": ["ticker", "heartbeats"]
+            });
+            ws.send(Message::Text(sub.to_string().into())).await?;
+            "Coinbase"
+        }
+    };
+    // Each connection starts a fresh aggregate; history/backfill merges preserve the original open.
+    let mut aggregate: Option<Bar> = None;
+    while let Some(msg) = tokio::time::timeout(idle, ws.next()).await? {
+        let text = match msg? {
+            Message::Text(text) => text,
+            Message::Close(_) => break,
+            // Tungstenite queues Pong automatically on read; flush it without sending a duplicate.
+            Message::Ping(_) => {
+                ws.flush().await?;
+                continue;
+            }
+            _ => continue,
+        };
+        let value: Value = serde_json::from_str(text.as_str())?;
+        let bar = match route.venue {
+            CryptoVenue::Binance => {
+                if value["k"]["s"].as_str() != Some(&route.native_symbol) {
                     continue;
                 }
-                if let Some(bar) = parse_binance_ws(t.as_str())
-                    && tx.send(crate::LiveUpdate::Partial(bar)).await.is_err()
-                {
-                    return Ok(());
+                let Some(bar) = parse_binance_ws(text.as_str()) else { continue };
+                bar
+            }
+            CryptoVenue::Coinbase => {
+                if value["product_id"].as_str() != Some(&route.native_symbol) {
+                    continue;
+                }
+                if value["type"] == "heartbeat" {
+                    recovery.healthy(venue, tx).await?;
+                    continue;
+                }
+                let Some((ts, px, size)) = parse_coinbase_ws(text.as_str()) else { continue };
+                let bucket = tf.bucket_start(ts);
+                match aggregate.as_mut() {
+                    Some(b) if b.ts == bucket => {
+                        b.high = b.high.max(px);
+                        b.low = b.low.min(px);
+                        b.close = px;
+                        b.volume += size;
+                        *b
+                    }
+                    _ => *aggregate.insert(Bar::new(bucket, px, px, px, px, size)),
                 }
             }
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-    bail!("binance websocket closed")
-}
-
-async fn coinbase_ws(product: &str, tf: Timeframe, tx: &mpsc::Sender<crate::LiveUpdate>) -> Result<()> {
-    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::connect_async(COINBASE_WS))
-        .await
-        .context("Coinbase websocket connection timeout")?
-        .context("coinbase websocket")?;
-    let sub = serde_json::json!({"type": "subscribe", "product_ids": [product], "channels": ["ticker"]});
-    ws.send(Message::Text(sub.to_string().into())).await?;
-    // Aggregate ticks into the current bar; the chart merges partial bars into history.
-    let mut bar: Option<Bar> = None;
-    while let Some(msg) = ws.next().await {
-        let Message::Text(t) = msg? else { continue };
-        let value: Value = serde_json::from_str(t.as_str())?;
-        if value["product_id"].as_str() != Some(product) {
-            continue;
-        }
-        let Some((ts, px, size)) = parse_coinbase_ws(t.as_str()) else { continue };
-        let bucket = tf.bucket_start(ts);
-        let b = match bar.as_mut() {
-            Some(b) if b.ts == bucket => {
-                b.high = b.high.max(px);
-                b.low = b.low.min(px);
-                b.close = px;
-                b.volume += size;
-                *b
-            }
-            _ => *bar.insert(Bar::new(bucket, px, px, px, px, size)),
         };
-        if tx.send(crate::LiveUpdate::Partial(b)).await.is_err() {
-            return Ok(());
-        }
+        recovery.healthy(venue, tx).await?;
+        tx.send(crate::LiveUpdate::Partial(bar)).await?;
+        recovery.last = Some(bar.ts);
     }
-    bail!("coinbase websocket closed")
+    bail!("crypto websocket closed")
 }
 
 #[cfg(test)]
@@ -809,5 +868,150 @@ mod tests {
         assert_eq!(size, 0.0012);
         assert_eq!(ts, 1_791_777_838);
         assert!(parse_coinbase_ws("{\"type\":\"subscriptions\"}").is_none());
+    }
+
+    async fn loopback() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        (listener, url)
+    }
+
+    fn test_feed(symbol: &str, url: String, idle: Duration) -> LiveFeed {
+        let route = resolved_instrument(&Security::new(symbol, AssetClass::Crypto)).unwrap();
+        live_with(route, Timeframe::M1, vec![url], idle)
+    }
+
+    async fn update(rx: &mut LiveFeed) -> crate::LiveUpdate {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap()
+    }
+
+    fn kline(ts: i64) -> Message {
+        Message::Text(
+            serde_json::json!({
+                "k": {"s": "BTCUSDT", "t": ts * 1000, "o": "2", "h": "3",
+                      "l": "1", "c": "2", "v": "1"}
+            })
+            .to_string()
+            .into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn binance_recovers_after_valid_message_with_last_delivered_bucket() {
+        let (listener, url) = loopback().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(kline(60)).await.unwrap();
+            ws.send(kline(120)).await.unwrap();
+            ws.close(None).await.unwrap();
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(kline(180)).await.unwrap();
+            while ws.next().await.is_some_and(|m| m.is_ok()) {}
+        });
+        let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_secs(2));
+        for ts in [60, 120] {
+            assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == ts));
+        }
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s)
+            if s == "Binance live stream disconnected; reconnecting…"));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s)
+            if s == "Binance live stream restored; filling missed bars"));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Reconnected { since: Some(120) }));
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 180));
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_retries_and_receiver_drop_stops_attempts() {
+        let (listener, url) = loopback().await;
+        let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_millis(100));
+        let (tcp, _) = listener.accept().await.unwrap();
+        let _first = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s)
+            if s == "Binance live stream unavailable; retrying…"));
+        let (tcp, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
+        let _second = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(_)));
+        drop(rx);
+        assert!(tokio::time::timeout(Duration::from_millis(2100), listener.accept()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn coinbase_heartbeats_keep_idle_product_healthy_and_ping_has_one_pong() {
+        let (listener, url) = loopback().await;
+        let mut rx = test_feed("COINBASE:BTC-USD", url, Duration::from_millis(200));
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let Message::Text(sub) = ws.next().await.unwrap().unwrap() else { panic!("missing subscribe") };
+        let sub: Value = serde_json::from_str(sub.as_str()).unwrap();
+        assert_eq!(sub["product_ids"], serde_json::json!(["BTC-USD"]));
+        assert_eq!(sub["channels"], serde_json::json!(["ticker", "heartbeats"]));
+        ws.send(Message::Ping(vec![1, 2].into())).await.unwrap();
+        assert!(matches!(tokio::time::timeout(Duration::from_millis(100), ws.next()).await.unwrap(),
+            Some(Ok(Message::Pong(bytes))) if bytes.as_ref() == [1, 2]));
+        for _ in 0..6 {
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "heartbeat", "product_id": "BTC-USD"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            let mut other: Value = serde_json::from_str(&fix("coinbase_ws_ticker.json")).unwrap();
+            other["product_id"] = serde_json::json!("ETH-USD");
+            ws.send(Message::Text(other.to_string().into())).await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(20), ws.next()).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(20), listener.accept()).await.is_err());
+        drop(rx);
+        assert!(tokio::time::timeout(Duration::from_millis(100), ws.next()).await.unwrap().is_some());
+        assert!(tokio::time::timeout(Duration::from_millis(1100), listener.accept()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_initial_handshake_is_unavailable_not_reconnected() {
+        let (listener, url) = loopback().await;
+        let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_secs(2));
+        let (tcp, _) = listener.accept().await.unwrap();
+        drop(tcp);
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s)
+            if s == "Binance live stream unavailable; retrying…"));
+        let (tcp, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        ws.send(kline(60)).await.unwrap();
+        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60));
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn backoff_caps_and_resets_only_after_healthy() {
+        let mut recovery = Recovery::new();
+        let mut delays = vec![recovery.backoff];
+        for _ in 0..6 {
+            recovery.backoff = next_backoff(recovery.backoff);
+            delays.push(recovery.backoff);
+        }
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+        let (tx, mut rx) = mpsc::channel(4);
+        recovery.failed = true;
+        recovery.healthy("Coinbase", &tx).await.unwrap();
+        assert_eq!(recovery.backoff, 1);
+        assert!(rx.try_recv().is_err());
+        recovery.failed = true;
+        recovery.backoff = 30;
+        recovery.healthy("Coinbase", &tx).await.unwrap();
+        assert_eq!(recovery.backoff, 1);
+        assert!(matches!(rx.try_recv().unwrap(), crate::LiveUpdate::Status(s)
+            if s == "Coinbase live stream restored; filling missed bars"));
+        assert!(matches!(rx.try_recv().unwrap(), crate::LiveUpdate::Reconnected { since: None }));
+        recovery.healthy("Coinbase", &tx).await.unwrap();
+        assert!(rx.try_recv().is_err());
     }
 }
