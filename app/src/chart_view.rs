@@ -223,6 +223,10 @@ const MAX_SUB_PANES: usize = 6;
 const REVEAL_SECS: f32 = 0.7;
 /// Length of an eased jump (quick ranges, reset, keyboard zoom and pan).
 const GLIDE_SECS: f32 = 0.32;
+/// Press and hold on a candle this long, without moving, to open its details popup.
+const HOLD_SECS: f64 = 0.25;
+/// Pointer travel (points) that turns a hold into a pan.
+const HOLD_SLOP: f32 = 4.0;
 /// Time constant of the autoscale easing.
 const SCALE_TAU: f64 = 0.07;
 
@@ -2695,6 +2699,9 @@ impl ChartState {
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
             }
         }
+        if let Some(i) = self.held_bar(ui, &plot_resp, local_bar) {
+            self.candle_popup(ui, plot_all, i);
+        }
         self.paint_legend(ui, price_rect, hovered_bar.unwrap_or(len.saturating_sub(1)), &legend_rows);
         self.favorites_bar(ui, favorites_rect);
         self.scale_chips(ui, axis_rect);
@@ -4007,6 +4014,94 @@ impl ChartState {
         }
     }
 
+    /// The bar under a press-and-hold on the plot: the primary button has been down for
+    /// [`HOLD_SECS`] without moving more than [`HOLD_SLOP`] (which would make it a pan).
+    fn held_bar(&self, ui: &Ui, plot: &egui::Response, bar: Option<usize>) -> Option<usize> {
+        let moved_id = ui.id().with((self.id, "hold-moved"));
+        let (down, pressed, held, travel) = ui.input(|i| {
+            let p = &i.pointer;
+            let travel = p.press_origin().zip(p.latest_pos()).map_or(0.0, |(a, b)| a.distance(b));
+            (p.primary_down(), p.any_pressed(), p.press_start_time().map(|t| i.time - t), travel)
+        });
+        let moved = ui.data_mut(|d| {
+            let moved = d.get_temp_mut_or_default::<bool>(moved_id);
+            *moved = !pressed && (*moved || travel > HOLD_SLOP);
+            *moved
+        });
+        if !down || moved || !plot.is_pointer_button_down_on() || self.draw.tool.is_some() || self.draw.hover.is_some()
+        {
+            return None;
+        }
+        let held = held?;
+        if held < HOLD_SECS {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(HOLD_SECS - held));
+            return None;
+        }
+        bar
+    }
+
+    /// Details card for the held candle, placed beside the pointer inside the plot.
+    fn candle_popup(&self, ui: &Ui, plot: Rect, i: usize) {
+        let (Some(info), Some(at)) = (candle_info(&self.bars, i), ui.input(|i| i.pointer.latest_pos())) else {
+            return;
+        };
+        ui.ctx().set_cursor_icon(CursorIcon::Default);
+        let dec = self.sec.decimals(info.close);
+        let price = |v: f64| format!("{v:.dec$}");
+        let (change, percent, color) = match info.change {
+            Some((abs, pct)) => (
+                format!("{abs:+.dec$}"),
+                pct.map_or("—".into(), |p| format!("{p:+.2}%")),
+                if abs >= 0.0 { theme::up() } else { theme::down() },
+            ),
+            None => ("—".into(), "—".into(), muted()),
+        };
+        let rows = [
+            ("Open", price(info.open), text()),
+            ("High", price(info.high), text()),
+            ("Low", price(info.low), text()),
+            ("Close", price(info.close), text()),
+            ("Change", change, color),
+            ("Change %", percent, color),
+            ("Volume", scale::format_volume(info.volume), text()),
+        ];
+        let right = at.x > plot.center().x;
+        let below = at.y < plot.center().y;
+        let offset = vec2(if right { -16.0 } else { 16.0 }, if below { 16.0 } else { -16.0 });
+        let pivot = Align2([
+            if right { egui::Align::Max } else { egui::Align::Min },
+            if below { egui::Align::Min } else { egui::Align::Max },
+        ]);
+        let label = scale::crosshair_label(self.data.zone.label_timestamp(self.bars[i].ts, self.tf), self.tf);
+        egui::Area::new(ui.id().with((self.id, "candle-popup")))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .fixed_pos(at + offset)
+            .pivot(pivot)
+            .constrain_to(plot)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme::card())
+                    .stroke(Stroke::new(1.0, theme::border()))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(60) })
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(label).font(mono(11.0)).color(amber()));
+                        ui.add_space(4.0);
+                        egui::Grid::new("candle-popup-rows").num_columns(2).spacing(vec2(18.0, 3.0)).show(ui, |ui| {
+                            for (name, value, color) in rows {
+                                ui.label(egui::RichText::new(name).font(ui_font(11.5)).color(muted()));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(egui::RichText::new(value).font(mono(11.5)).color(color));
+                                });
+                                ui.end_row();
+                            }
+                        });
+                    });
+            });
+    }
+
     fn paint_legend(&self, ui: &Ui, price_rect: Rect, i: usize, rows: &[crate::chart_legend::Row]) {
         let Some(b) = self.bars.get(i) else { return };
         let p = ui.painter_at(price_rect);
@@ -4724,6 +4819,28 @@ fn dashed_h(p: &egui::Painter, x: egui::Rangef, y: f32, s: Stroke) {
         p.hline(a..=(a + 4.0).min(x.max), y, s);
         a += 7.0;
     }
+}
+
+/// One candle's values for the press-and-hold popup.
+#[derive(Debug, PartialEq)]
+struct CandleInfo {
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    /// Close minus the previous candle's close, and that as a percentage of the previous
+    /// close (None when it is zero). None for the first candle.
+    change: Option<(f64, Option<f64>)>,
+}
+
+fn candle_info(bars: &[Bar], i: usize) -> Option<CandleInfo> {
+    let b = bars.get(i)?;
+    let change = i.checked_sub(1).map(|p| bars[p].close).map(|prev| {
+        let abs = b.close - prev;
+        (abs, (prev != 0.0).then(|| abs / prev * 100.0))
+    });
+    Some(CandleInfo { open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, change })
 }
 
 /// Crosshair axis tag fill and label colours: a dark tag in every theme, so the
@@ -7626,5 +7743,32 @@ mod tests {
         assert_eq!(chart.crypto_source.as_ref().unwrap().quote, "USD");
         chart.on_crypto_source(chart.generation, None);
         assert!(chart.crypto_source.is_none());
+    }
+
+    #[test]
+    fn candle_info_reports_change_against_the_previous_close() {
+        let bars = [
+            Bar::new(0, 10.0, 12.0, 9.0, 0.0, 5.0),
+            Bar::new(1, 0.0, 11.0, 0.0, 10.0, 7.0),
+            Bar::new(2, 10.0, 12.5, 9.5, 12.0, 1_500.0),
+            Bar::new(3, 12.0, 12.0, 10.5, 10.8, 0.0),
+        ];
+        assert_eq!(candle_info(&bars, 0).unwrap().change, None);
+        assert_eq!(candle_info(&bars, 1).unwrap().change, Some((10.0, None)), "zero previous close has no percent");
+        let up = candle_info(&bars, 2).unwrap();
+        assert_eq!(
+            up,
+            CandleInfo {
+                open: 10.0,
+                high: 12.5,
+                low: 9.5,
+                close: 12.0,
+                volume: 1_500.0,
+                change: Some((2.0, Some(20.0)))
+            }
+        );
+        let (abs, pct) = candle_info(&bars, 3).unwrap().change.unwrap();
+        assert!((abs + 1.2).abs() < 1e-9 && (pct.unwrap() + 10.0).abs() < 1e-9);
+        assert_eq!(candle_info(&bars, 4), None);
     }
 }
