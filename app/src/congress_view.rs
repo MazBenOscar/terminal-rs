@@ -23,6 +23,11 @@ pub enum Action {
     OpenProfile(String),
     Track(String, bool),
     AddToWatchlist(String),
+    /// Add a symbol to the named watchlist, which need not be the active one.
+    AddToNamedWatchlist {
+        list: String,
+        symbol: String,
+    },
     SaveMatchesAsWatchlist(String, Vec<String>),
     AddMatchesToWatchlist(Vec<String>),
     ReplaceWatchlistWithMatches(Vec<String>),

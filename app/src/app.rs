@@ -1077,6 +1077,28 @@ impl TerminalApp {
         self.toasts.push((format!("Watchlist: {message}"), Instant::now()));
     }
 
+    /// Add to any saved watchlist. The active list goes through the usual path (undo,
+    /// quote refresh); another list is updated in place and saved with the settings.
+    fn add_to_named_watchlist(&mut self, name: &str, symbol: String) {
+        let Some(index) = self.watchlists.iter().position(|list| list.name == name) else {
+            self.status = format!("Watchlist {name} no longer exists");
+            return;
+        };
+        if index == self.active_watchlist {
+            return self.add_watchlist_symbols(vec![symbol]);
+        }
+        let ticker = tr_data::security(&symbol).ticker;
+        let (next, added, truncated) = watchlist_append(&self.watchlists[index].symbols, vec![symbol]);
+        self.watchlists[index].symbols = next;
+        let message = match (added, truncated) {
+            (0, true) => format!("{name} is full (200 symbols); {ticker} was not added"),
+            (0, false) => format!("{ticker} is already in {name}"),
+            _ => format!("Added {ticker} to {name}"),
+        };
+        self.status = message.clone();
+        self.toasts.push((format!("Watchlist: {message}"), Instant::now()));
+    }
+
     fn undo_watchlist(&mut self) {
         if let Some((at, _, _)) = &self.watchlist_undo {
             self.toasts.retain(|(_, time)| time != at);
@@ -1103,6 +1125,7 @@ impl TerminalApp {
                 }
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
                 Action::AddToWatchlist(s) => self.add_watchlist_symbols(vec![s]),
+                Action::AddToNamedWatchlist { list, symbol } => self.add_to_named_watchlist(&list, symbol),
                 Action::SaveMatchesAsWatchlist(name, symbols) => {
                     let name = unique_watchlist_name(name.trim(), &self.watchlists);
                     let result = self.create_watchlist(name, symbols);
@@ -2393,6 +2416,30 @@ mod tests {
         assert_eq!(app.active_watchlist, 1);
         assert_eq!(app.watchlist, vec![tr_data::security("NVDA").key()]);
         assert_eq!(app.current_doc().watchlists, Some(app.watchlists.clone()));
+    }
+
+    #[test]
+    fn adding_to_a_named_watchlist_leaves_the_active_list_alone() {
+        let root = std::env::temp_dir().join(format!("named-watchlist-add-{}", std::process::id()));
+        let mut app = TerminalApp::test_workspace(&root);
+        app.create_watchlist("Crypto".into(), Vec::new()).unwrap();
+        app.create_watchlist("Tech".into(), vec!["NVDA".into()]).unwrap();
+        let active = app.active_watchlist;
+        let before = app.watchlist.clone();
+        let crypto = app.watchlists.iter().position(|l| l.name == "Crypto").unwrap();
+        app.run_actions(vec![Action::AddToNamedWatchlist { list: "Crypto".into(), symbol: "SOLUSD Curncy".into() }]);
+        assert_eq!(app.watchlists[crypto].symbols, vec![tr_data::security("SOLUSD Curncy").key()]);
+        assert_eq!((app.active_watchlist, &app.watchlist), (active, &before));
+        assert!(app.status.contains("Added SOLUSD to Crypto"), "{}", app.status);
+        app.run_actions(vec![Action::AddToNamedWatchlist { list: "Crypto".into(), symbol: "SOLUSD Curncy".into() }]);
+        assert_eq!(app.watchlists[crypto].symbols.len(), 1);
+        assert!(app.status.contains("already in Crypto"), "{}", app.status);
+        app.run_actions(vec![Action::AddToNamedWatchlist { list: "Gone".into(), symbol: "AAPL".into() }]);
+        assert!(app.status.contains("no longer exists"));
+        let tech = app.watchlists[active].name.clone();
+        app.run_actions(vec![Action::AddToNamedWatchlist { list: tech, symbol: "AAPL".into() }]);
+        assert!(app.watchlist.contains(&tr_data::security("AAPL").key()), "the active list uses the usual path");
+        assert_eq!(app.watchlists[active].symbols, app.watchlist);
     }
 
     #[test]

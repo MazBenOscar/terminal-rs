@@ -51,6 +51,17 @@ impl TerminalApp {
                 .filter(|a| a.symbol == c.symbol && a.simulated == self.price_alerts.simulated)
                 .cloned()
                 .collect();
+            let key = tr_data::security(&c.symbol).key();
+            c.watchlists = self
+                .watchlists
+                .iter()
+                .enumerate()
+                .map(|(index, list)| crate::chart_view::WatchlistTarget {
+                    name: list.name.clone(),
+                    active: index == self.active_watchlist,
+                    contains: list.symbols.contains(&key),
+                })
+                .collect();
             c.hover_enabled = !dragging;
             let clicked = c.show(ui, rect, focused, &self.worker);
             actions.append(&mut c.actions);

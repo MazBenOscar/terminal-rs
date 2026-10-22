@@ -395,6 +395,8 @@ pub struct ChartState {
     indicator_revision: u64,
     /// App-level actions requested from this chart (context menu), drained by the app.
     pub actions: Vec<Action>,
+    /// Saved watchlists for the "Add to watchlist" menu, refreshed by the app each frame.
+    pub watchlists: Vec<WatchlistTarget>,
     pub price_alerts: Vec<tr_core::price_alerts::Alert>,
     pub price_alert_actions: Vec<crate::price_alerts::Action>,
     pub account_overlay: crate::chart_account::Snapshot,
@@ -507,6 +509,7 @@ impl ChartState {
             last_indicator_req: None,
             indicator_revision: 0,
             actions: Vec::new(),
+            watchlists: Vec::new(),
             price_alerts: Vec::new(),
             price_alert_actions: Vec::new(),
             account_overlay: Default::default(),
@@ -3471,10 +3474,7 @@ impl ChartState {
         self.navigation_menu(ui, w);
         self.data_navigation_menu(ui, w);
         ui.separator();
-        if ui.button("Add to Watchlist").clicked() {
-            self.actions.push(Action::AddToWatchlist(self.symbol.clone()));
-            ui.close();
-        }
+        self.watchlist_menu(ui);
         if self.sec.has_congress_trades() {
             ui.checkbox(&mut self.show_congress, "Congress Trade Markers");
             if ui.button("Who in Congress Traded This…").clicked() {
@@ -4031,6 +4031,32 @@ impl ChartState {
             self.draw = DrawState::default();
             ui.close();
         }
+    }
+
+    /// "Add to watchlist" lists every saved watchlist; lists that already hold the symbol
+    /// are shown checked and disabled. Without any (headless use) it adds to the active list.
+    fn watchlist_menu(&mut self, ui: &mut Ui) {
+        if self.watchlists.is_empty() {
+            if ui.button("Add to Watchlist").clicked() {
+                self.actions.push(Action::AddToWatchlist(self.symbol.clone()));
+                ui.close();
+            }
+            return;
+        }
+        ui.menu_button("Add to watchlist", |ui| {
+            ui.set_min_width(180.0);
+            for list in &self.watchlists {
+                let label = if list.active { format!("{} (active)", list.name) } else { list.name.clone() };
+                if list.contains {
+                    ui.add_enabled(false, egui::Button::new(format!("✓ {label}")))
+                        .on_disabled_hover_text("Already in this watchlist");
+                } else if ui.button(label).clicked() {
+                    self.actions
+                        .push(Action::AddToNamedWatchlist { list: list.name.clone(), symbol: self.symbol.clone() });
+                    ui.close();
+                }
+            }
+        });
     }
 
     /// The bar under a press-and-hold on the plot: the primary button has been down for
@@ -4839,6 +4865,15 @@ fn dashed_h(p: &egui::Painter, x: egui::Rangef, y: f32, s: Stroke) {
         p.hline(a..=(a + 4.0).min(x.max), y, s);
         a += 7.0;
     }
+}
+
+/// A saved watchlist offered by the chart's "Add to watchlist" menu.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchlistTarget {
+    pub name: String,
+    pub active: bool,
+    /// The chart's symbol is already in this list.
+    pub contains: bool,
 }
 
 /// One candle's values for the press-and-hold popup.
@@ -7329,6 +7364,38 @@ mod tests {
         let rendered: Vec<_> = texts.iter().filter(|(text, _)| headers.contains(&text.as_str())).collect();
         assert_eq!(rendered.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>(), headers);
         assert!(rendered.windows(2).all(|pair| pair[0].1.top() < pair[1].1.top()));
+    }
+
+    #[test]
+    fn context_menu_adds_the_symbol_to_a_chosen_saved_watchlist() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        let target = |name: &str, active, contains| WatchlistTarget { name: name.into(), active, contains };
+        chart.watchlists =
+            vec![target("Main", true, false), target("Crypto", false, false), target("Tech", false, true)];
+        let worker = Worker::inert();
+        let click = |chart: &mut ChartState, label: &str| {
+            let texts = ui_frame(&ctx, vec![], |ui| chart.context_menu(ui, &worker));
+            let at = texts.iter().find(|(text, _)| text == label).unwrap_or_else(|| panic!("{label}")).1.center();
+            ui_frame(&ctx, vec![egui::Event::PointerMoved(at), pointer_button(at, true)], |ui| {
+                chart.context_menu(ui, &worker)
+            });
+            ui_frame(&ctx, vec![pointer_button(at, false)], |ui| chart.context_menu(ui, &worker));
+        };
+        click(&mut chart, "Add to watchlist");
+        let texts = ui_frame(&ctx, vec![], |ui| chart.context_menu(ui, &worker));
+        assert!(texts.iter().any(|(text, _)| text == "Main (active)"));
+        assert!(texts.iter().any(|(text, _)| text == "✓ Tech"), "lists holding the symbol are marked");
+        click(&mut chart, "✓ Tech");
+        assert!(chart.actions.is_empty(), "a list that already has the symbol is disabled");
+        if !ui_frame(&ctx, vec![], |ui| chart.context_menu(ui, &worker)).iter().any(|(text, _)| text == "Crypto") {
+            click(&mut chart, "Add to watchlist");
+        }
+        click(&mut chart, "Crypto");
+        assert_eq!(
+            chart.actions,
+            vec![Action::AddToNamedWatchlist { list: "Crypto".into(), symbol: chart.symbol.clone() }]
+        );
     }
 
     #[test]
