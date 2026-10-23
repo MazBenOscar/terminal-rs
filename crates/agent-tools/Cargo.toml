@@ -1,0 +1,15 @@
+[package]
+name = "tr-agent-tools"
+description = "Headless agent tool registry and deterministic chart analytics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tr-core.workspace = true
+tr-data.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
