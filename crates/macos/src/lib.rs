@@ -172,12 +172,40 @@ pub fn reduce_motion() -> bool {
     }
 }
 
+/// Local timezone abbreviation at this instant (including daylight saving time).
+/// Chrono's `Local` retains only an offset, so `%Z` cannot supply this name.
+pub fn local_timezone_abbreviation(timestamp: i64) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::{NSDate, NSTimeZone};
+        let date = NSDate::dateWithTimeIntervalSince1970(timestamp as f64);
+        NSTimeZone::localTimeZone().abbreviationForDate(&date).map(|name| name.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = timestamp;
+        None
+    }
+}
+
 pub fn is_macos() -> bool {
     cfg!(target_os = "macos")
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn timezone_abbreviations_follow_the_dates_daylight_saving_rules() {
+        use objc2_foundation::{NSDate, NSString, NSTimeZone};
+        let zone = NSTimeZone::timeZoneWithName(&NSString::from_str("America/New_York")).unwrap();
+        for (timestamp, expected) in [(1_792_713_600, "EDT"), (1_767_225_600, "EST")] {
+            let date = NSDate::dateWithTimeIntervalSince1970(timestamp as f64);
+            assert_eq!(zone.abbreviationForDate(&date).unwrap().to_string(), expected);
+        }
+        assert!(super::local_timezone_abbreviation(1_792_713_600).is_some());
+    }
+
     #[test]
     fn stubs_are_safe_off_macos() {
         if !super::is_macos() {

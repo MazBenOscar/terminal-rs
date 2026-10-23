@@ -232,6 +232,27 @@ impl TerminalApp {
                  every asset class appear as you type; Up/Down selects, Tab completes.",
             );
 
+            section(ui, "Agent");
+            let shortcut = self
+                .prefs
+                .hotkeys
+                .chord(Action::FocusAgentInput)
+                .map_or_else(|| "unassigned".into(), |chord| chord.display());
+            para(
+                ui,
+                &format!(
+                    "Focus agent input: {shortcut} when an Agent pane exists. Rebind it in the shortcut list below."
+                ),
+            );
+            command_table(
+                ui,
+                "help-agent",
+                &[(
+                    &["AGENT", "NEW AGENT"],
+                    "Open the chart agent; its input shortcut focuses the existing conversation.",
+                )],
+            );
+
             section(ui, "Securities");
             command_table(
                 ui,

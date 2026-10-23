@@ -2,6 +2,7 @@
 //! congressional (STOCK Act) trade tracking.
 
 pub use app::agent_bridge;
+mod agent_demo;
 mod agent_markdown;
 mod agent_pane;
 pub mod agent_queue;
@@ -47,6 +48,26 @@ pub mod worker;
 use std::time::Instant;
 
 fn main() -> eframe::Result {
+    let demo = agent_demo::Config::from_env().map_err(demo_error)?;
+    let shot_requested = demo.as_ref().is_some_and(|demo| demo.shot.is_some());
+    let outcome: agent_demo::Outcome = Default::default();
+    let window_outcome = outcome.clone();
+    let _scratch = if demo.is_some() {
+        let parent = std::env::var_os("TR_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"));
+        let scratch = agent_demo::Scratch::create(&parent).map_err(|e| demo_error(e.to_string()))?;
+        // SAFETY: startup is still single-threaded, before tracing, eframe, workers,
+        // provider construction, or any other reader of the process environment.
+        unsafe {
+            std::env::set_var("TR_DATA_DIR", &scratch.0);
+            std::env::set_var("TR_PROVIDER", "sample");
+            std::env::set_var("TR_CONGRESS_REFRESH_MIN", "0");
+        }
+        Some(scratch)
+    } else {
+        None
+    };
     let _app_lock = tr_alerts::storage::Lock::acquire_app(&tr_alerts::data_dir().join("app.lock"))
         .map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
     let t0 = Instant::now();
@@ -69,6 +90,12 @@ fn main() -> eframe::Result {
         .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("app icon"))
         .with_inner_size([1600.0, 960.0])
         .with_min_inner_size([900.0, 560.0]);
+    if let Some(demo) = &demo {
+        viewport = viewport
+            .with_inner_size([demo.size[0] as f32, demo.size[1] as f32])
+            .with_min_inner_size([320.0, 240.0])
+            .with_clamp_size_to_monitor_size(false);
+    }
     if cfg!(target_os = "macos") {
         // Content extends under a transparent title bar; tr-macos adds the unified
         // toolbar (inset traffic lights) and sidebar vibrancy on the first frame.
@@ -94,6 +121,12 @@ fn main() -> eframe::Result {
                 rs.target_format,
                 u32::from(msaa),
             ));
+            if let Some(demo) = demo {
+                let provider: tr_data::Provider =
+                    std::sync::Arc::new(tr_data::sample::SampleProvider::at(agent_demo::SAMPLE_NOW, 300));
+                let worker = worker::Worker::spawn(cc.egui_ctx.clone(), provider)?;
+                return Ok(Box::new(app::TerminalApp::new_agent_demo(&cc.egui_ctx, worker, demo, window_outcome)));
+            }
             let questrade = app::questrade_handle();
             let provider = tr_data::from_env_with(questrade.clone());
             let name = provider.name().to_string();
@@ -101,5 +134,18 @@ fn main() -> eframe::Result {
             tracing::info!("window + GPU ready in {:?} (adapter: {})", t0.elapsed(), rs.adapter.get_info().name);
             Ok(Box::new(app::TerminalApp::new(&cc.egui_ctx, worker, name, questrade)))
         }),
-    )
+    )?;
+    if shot_requested {
+        outcome
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Err("Demo window closed before a PNG was written".into()))
+            .map_err(demo_error)?;
+    }
+    Ok(())
+}
+
+fn demo_error(message: String) -> eframe::Error {
+    eframe::Error::AppCreation(Box::new(std::io::Error::other(message)))
 }

@@ -12,10 +12,32 @@ use tr_agent::transport::WireEvent;
 use tr_agent_tools::ToolSet;
 
 use crate::agent_markdown::{self, Block};
+use crate::theme::{self, dp};
+use crate::widgets::{self, Icon};
+
+pub use tr_agent::codex::ResponseStyle;
 
 pub const STREAM_INTERVAL: Duration = Duration::from_millis(33);
 pub const UNDO_UNAVAILABLE: &str = "undo for this agent turn is no longer available (layout changed/app restarted)";
-const PRIVACY: &str = "Your prompts, the pinned chart's data and tool results leave this machine and go to OpenAI under your ChatGPT account. In Can edit charts mode the agent can add, change and remove its own drawings, indicators and comparisons on the pinned chart; they are badged Agent and undoable. It cannot edit your own or kept objects. Screenshots require separate consent; capture is currently unavailable. Codex stores local conversation rollouts for recovery (7 days / newest 50 bridge threads). Layouts contain choices only, never conversation or sign-in details.";
+const CHART_EDITS_HELP: &str = "The agent can add, change and remove its own drawings, indicators and comparisons on the pinned chart. Your objects are never changed, and every agent edit can be undone.";
+pub(crate) const INSTALLATION_URL: &str = "https://developers.openai.com/codex";
+const CHECKING_STATUS: &str = "Checking Codex, your account and chart tools…";
+const RETRY_HELP: &str = "Sends the same prompt again and starts a new answer.";
+const INTERRUPTED: &str = "Stopped. This answer is incomplete.";
+const PRIVACY_GROUPS: &[(&str, &str)] = &[
+    (
+        "What is sent",
+        "Your prompts, the pinned chart’s data and tool results go to OpenAI under your ChatGPT account. Screenshots only with your consent; not available yet.",
+    ),
+    (
+        "What the agent can change",
+        "In Chart edits mode: only its own drawings, indicators and comparisons on the pinned chart. Your objects are never changed. Every agent edit can be undone.",
+    ),
+    (
+        "What is stored on this Mac",
+        "Codex keeps conversations for recovery for 7 days, up to the newest 50. Layouts store your choices only, never conversations or sign-in details.",
+    ),
+];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolsMode {
@@ -31,12 +53,13 @@ pub struct Settings {
     pub effort: String,
     pub tools: ToolsMode,
     pub pinned_chart: Option<u64>,
+    pub response_style: ResponseStyle,
 }
 impl ToolsMode {
     fn label(self) -> &'static str {
         match self {
             Self::ReadOnly => "Read only",
-            Self::Edit => "Can edit charts",
+            Self::Edit => "Chart edits",
         }
     }
 }
@@ -95,44 +118,83 @@ pub enum Onboarding {
 impl Onboarding {
     pub fn primary(&self) -> &'static str {
         match self {
-            Self::Dormant => "Start agent",
+            Self::Dormant => "Start",
             Self::Checking => "Checking…",
             Self::Missing | Self::Unsupported { .. } => "Check again",
             Self::SignedOut => "Sign in with ChatGPT",
             Self::SigningIn => "Cancel",
             Self::Ready => "Send",
             Self::RateLimited { .. } => "Check limits",
-            Self::ToolsUnavailable { .. } => "Retry",
-            Self::Stopped { unsafe_backend: true, .. } => "Close agent",
-            Self::Stopped { unsafe_backend: false, .. } => "Restart agent",
+            Self::ToolsUnavailable { .. } => "Retry response",
+            Self::Stopped { unsafe_backend: true, .. } => "Close",
+            Self::Stopped { unsafe_backend: false, .. } => "Restart",
+        }
+    }
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::Dormant => "Chart analyst",
+            Self::Checking => "Checking the agent",
+            Self::Missing => "Codex isn't installed",
+            Self::Unsupported { .. } => "Codex version not supported",
+            Self::SignedOut => "Sign in with ChatGPT",
+            Self::SigningIn => "Finish signing in",
+            Self::Ready => "Ready",
+            Self::RateLimited { .. } => "Usage limit reached",
+            Self::ToolsUnavailable { .. } => "Chart data unavailable",
+            Self::Stopped { unsafe_backend: true, .. } => "Agent stopped for safety",
+            Self::Stopped { .. } => "Agent disconnected",
         }
     }
     fn description(&self) -> String {
         match self {
-            Self::Dormant => "Use the isolated local Codex backend with your ChatGPT account.".into(),
-            Self::Checking => "Checking isolated Codex, account and chart-tool readiness…".into(),
-            Self::Missing => {
-                "Codex is not installed. Install Codex CLI from developers.openai.com/codex/cli, then check again."
+            Self::Dormant => {
+                "Answers questions about your pinned chart using your ChatGPT account. Chart tools run locally in a sandbox; prompts and chart data are sent to OpenAI."
                     .into()
             }
+            Self::Checking => "Nothing is sent yet.".into(),
+            Self::Missing => "Install the Codex CLI, then check again.".into(),
             Self::Unsupported { found } => {
-                format!("Unsupported Codex. Found: {found}. Tested: codex-cli 0.163.0. No agent was started.")
+                format!("Found {}; this build is tested with 0.163.0.", found.trim_start_matches("codex-cli "))
             }
-            Self::SignedOut => "Sign in with your ChatGPT account. API-key accounts are not supported.".into(),
-            Self::SigningIn => "Waiting for ChatGPT sign-in in your browser…".into(),
-            Self::Ready => "Ready".into(),
-            Self::RateLimited { reset } => format!("Rate-limited. Resets {reset}. Queued prompts are paused."),
-            Self::ToolsUnavailable { reason } => format!("Chart tools unavailable: {reason}"),
-            Self::Stopped { reason, unsafe_backend } => format!(
-                "Agent {}: {reason}. No prompt will be replayed. {}",
-                if *unsafe_backend { "unsafe" } else { "stopped" },
-                if *unsafe_backend {
-                    "Safety state cannot be cleared in this pane."
-                } else {
-                    "Use Restart agent to create a new isolated session; the queue stays paused."
-                }
-            ),
+            Self::SignedOut => "API-key accounts aren't supported.".into(),
+            Self::SigningIn => "Complete ChatGPT sign-in in your browser, then return here.".into(),
+            Self::Ready => String::new(),
+            Self::RateLimited { reset } => format!("Resets {reset}. Queued prompts stay paused until you resume them."),
+            Self::ToolsUnavailable { .. } => "No analysis was completed.".into(),
+            Self::Stopped { unsafe_backend: true, .. } => {
+                "A safety check failed, so this session was stopped. Close it and start a new one.".into()
+            }
+            Self::Stopped { .. } => "Restart to continue; nothing is resent. The queue stays paused.".into(),
         }
+    }
+    fn composer_placeholder(&self) -> &'static str {
+        match self {
+            Self::SignedOut => "Sign in to ask about this chart",
+            Self::Missing | Self::Unsupported { .. } => "Install Codex to start",
+            Self::Checking | Self::SigningIn => "Starting…",
+            Self::RateLimited { .. } => "Usage limit reached",
+            Self::Stopped { .. } => "Agent stopped",
+            Self::Dormant => "Start the agent to ask about this chart",
+            Self::Ready | Self::ToolsUnavailable { .. } => "Ask about the pinned chart",
+        }
+    }
+
+    fn accepts_input(&self) -> bool {
+        matches!(self, Self::Ready | Self::ToolsUnavailable { .. })
+    }
+
+    fn action(&self) -> Option<Action> {
+        Some(match self {
+            Self::Dormant | Self::Missing | Self::Unsupported { .. } | Self::Stopped { unsafe_backend: false, .. } => {
+                Action::Check
+            }
+            Self::SignedOut => Action::SignIn,
+            Self::SigningIn => Action::CancelLogin,
+            Self::RateLimited { .. } => Action::RefreshLimits,
+            Self::ToolsUnavailable { .. } => Action::Retry,
+            Self::Stopped { unsafe_backend: true, .. } => Action::Close,
+            Self::Ready | Self::Checking => return None,
+        })
     }
 }
 
@@ -160,8 +222,18 @@ pub struct ConversationTurn {
     pub prompt_index: usize,
     pub finished: bool,
     pub made_edits: bool,
+    pub chart_changes: Option<usize>,
     pub undo_available: bool,
     pub undo_summary: Option<String>,
+    pub reverted_changes: Option<usize>,
+    pub local_time: String,
+}
+
+impl ConversationTurn {
+    fn reverted_summary(&self) -> Option<&str> {
+        let count = self.reverted_changes?;
+        self.undo_summary.as_deref().filter(|summary| summary.starts_with(&tool_group_label(&[], Some(count))))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,11 +275,31 @@ pub struct Limit {
     pub reset: String,
     pub minutes: u64,
 }
+pub(crate) fn local_time(timestamp: i64) -> String {
+    let Some(time) = chrono::DateTime::from_timestamp(timestamp, 0) else { return "time unavailable".into() };
+    let time = time.with_timezone(&chrono::Local);
+    let zone = tr_macos::local_timezone_abbreviation(timestamp)
+        // Some zones have numeric names. Omit those rather than showing a raw offset.
+        .filter(|name| !name.is_empty() && name.chars().all(|c| c.is_alphabetic() || c == ' '))
+        .or_else(|| (time.offset().local_minus_utc() == 0).then(|| "UTC".into()));
+    format!("{}{}", time.format("%H:%M"), zone.map_or(String::new(), |name| format!(" {name}")))
+}
+
+pub(crate) fn reset_time_at(timestamp: Option<i64>, now: i64) -> String {
+    let Some(time) = timestamp.and_then(|t| chrono::DateTime::from_timestamp(t, 0)) else {
+        return "time unavailable".into();
+    };
+    let date = time.with_timezone(&chrono::Local).date_naive();
+    let today = chrono::DateTime::from_timestamp(now, 0).map(|t| t.with_timezone(&chrono::Local).date_naive());
+    let day = if Some(date) == today { String::new() } else { format!("{} ", date.format("%b %d")) };
+    let minutes = ((time.timestamp() - now).max(0) + 59) / 60;
+    let relative =
+        if minutes == 0 { "now".into() } else { format!("in {minutes} minute{}", if minutes == 1 { "" } else { "s" }) };
+    format!("{relative} · {day}{}", local_time(time.timestamp()))
+}
+
 fn reset_time(timestamp: Option<i64>) -> String {
-    timestamp
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map(|t| t.with_timezone(&chrono::Local).format("%b %d %H:%M %Z").to_string())
-        .unwrap_or_else(|| "time unavailable".into())
+    reset_time_at(timestamp, chrono::Local::now().timestamp())
 }
 pub fn limits(value: &Value) -> Vec<Limit> {
     let snapshots = std::iter::once(("ordinary", &value["rateLimits"])).chain(
@@ -267,6 +359,32 @@ struct ReplyMessage {
     dirty: bool,
 }
 
+/// Projection of the pinned chart, refreshed from chart state rather than answer text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DataBasis {
+    pub sample: bool,
+    pub last_bar: Option<i64>,
+    pub incomplete: Option<String>,
+}
+impl DataBasis {
+    pub fn from_chart(chart: &crate::chart_view::ChartState, sample: bool) -> Self {
+        let bars = chart.source_bars();
+        Self {
+            sample,
+            last_bar: bars.bars.last().map(|bar| bar.ts),
+            incomplete: bars.last_in_progress.then(|| match chart.tf.to_string().as_str() {
+                "1W" => "Weekly".into(),
+                "1D" => "Daily".into(),
+                other => other.to_owned(),
+            }),
+        }
+    }
+
+    fn freshness(&self) -> Option<String> {
+        self.last_bar.map(|ts| format!("as of {}", local_time(ts)))
+    }
+}
+
 pub struct AgentPane {
     pub settings: Settings,
     pub state: Onboarding,
@@ -284,6 +402,9 @@ pub struct AgentPane {
     pub session: Option<crate::agent_session::Session>,
     pub session_tools: Option<ToolSet>,
     pub turns: Vec<ConversationTurn>,
+    pub data_basis: DataBasis,
+    pub queue_review: bool,
+    pub focus_shortcut: String,
     active_turn: Option<usize>,
     header_undo: Option<String>,
     header_undo_available: bool,
@@ -292,6 +413,9 @@ pub struct AgentPane {
     limits_value: Value,
     coalescer: Coalescer,
     queue_paused: bool,
+    retryable: bool,
+    notice_levels: HashMap<usize, Severity>,
+    pub expanded_tools: std::collections::HashSet<usize>,
 }
 impl Default for AgentPane {
     fn default() -> Self {
@@ -312,6 +436,9 @@ impl Default for AgentPane {
             session: None,
             session_tools: None,
             turns: Vec::new(),
+            data_basis: DataBasis::default(),
+            queue_review: false,
+            focus_shortcut: "Cmd/Ctrl+L".into(),
             active_turn: None,
             header_undo: None,
             header_undo_available: false,
@@ -320,6 +447,9 @@ impl Default for AgentPane {
             limits_value: Value::Null,
             coalescer: Coalescer::default(),
             queue_paused: false,
+            retryable: false,
+            notice_levels: HashMap::new(),
+            expanded_tools: Default::default(),
         }
     }
 }
@@ -329,6 +459,7 @@ pub enum Action {
     SignIn,
     CancelLogin,
     ReopenLogin,
+    InstallationInstructions,
     RefreshLimits,
     Interrupt,
     Retry,
@@ -359,10 +490,7 @@ impl AgentPane {
         }
         self.settings.tools = mode;
         self.queue_paused = true;
-        self.notice(&format!(
-            "Tools mode: {}. Applies to the next isolated session start; an open session will restart. Queue stays paused; no prompt is resent.",
-            mode.label()
-        ));
+        self.notice(&format!("{} on restart. Queue stays paused; nothing is resent.", mode.label()));
         true
     }
 
@@ -395,17 +523,25 @@ impl AgentPane {
     }
 
     pub fn undo_result(&mut self, id: &str, result: Result<crate::agent_bridge::UndoSummary, String>) {
+        let reverted = result.as_ref().ok().map(|summary| summary.reverted);
         let text = match result {
             Ok(summary) => format!(
-                "Undo: {} reverted · {} conflicts skipped · {} charts",
+                "{} change{} reverted{}",
                 summary.reverted,
-                summary.skipped.len(),
-                summary.charts
+                if summary.reverted == 1 { "" } else { "s" },
+                if summary.skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {} kept because you edited them", summary.skipped.len())
+                }
             ),
             Err(reason) => scrub_text(&reason),
         };
         if let Some(turn) = self.turns.iter_mut().find(|turn| turn.id.as_deref() == Some(id)) {
             turn.undo_summary = Some(text);
+            if let Some(reverted) = reverted {
+                turn.reverted_changes = Some(reverted);
+            }
         } else {
             self.notice(&text);
         }
@@ -418,7 +554,13 @@ impl AgentPane {
     }
 
     pub fn notice(&mut self, text: &str) {
+        self.notice_levels.insert(self.blocks.len(), notice_severity(text));
         self.blocks.push(RenderedBlock::Notice(scrub_text(text)));
+    }
+
+    pub fn error_notice(&mut self, text: &str) {
+        self.notice(text);
+        self.notice_levels.insert(self.blocks.len() - 1, Severity::Error);
     }
 
     pub fn transition(&mut self, state: Onboarding) {
@@ -443,6 +585,7 @@ impl AgentPane {
     }
 
     pub fn interrupt(&mut self) {
+        self.retryable = true;
         self.queue_paused = true;
         self.interrupt_tools();
     }
@@ -491,9 +634,13 @@ impl AgentPane {
             prompt_index: self.blocks.len(),
             finished: false,
             made_edits: false,
+            chart_changes: None,
             undo_available: false,
             undo_summary: None,
+            reverted_changes: None,
+            local_time: local_time(chrono::Local::now().timestamp()),
         });
+        self.retryable = false;
         self.blocks.push(RenderedBlock::Prompt(prompt.text.clone()));
         self.running = true;
         Some(prompt)
@@ -521,7 +668,7 @@ impl AgentPane {
     pub fn event(&mut self, event: BridgeEvent) {
         match event {
             BridgeEvent::Wire(WireEvent::Notification { method, params }) => self.wire(&method, &params),
-            BridgeEvent::Wire(WireEvent::Error(reason)) => self.notice(&reason),
+            BridgeEvent::Wire(WireEvent::Error(reason)) => self.error_notice(&reason),
             BridgeEvent::Started { turn } => {
                 if let Some(index) = self.active_turn {
                     self.turns[index].id.get_or_insert(turn);
@@ -536,16 +683,21 @@ impl AgentPane {
                 self.flush(Instant::now());
                 self.running = false;
                 if status != "completed" {
+                    self.retryable = true;
                     self.interrupt_tools();
                     self.queue_paused = true;
-                    self.notice(&format!("Turn {status}. Reply is provisional; retry only on request."));
+                    if matches!(status.as_str(), "interrupted" | "cancelled") {
+                        self.notice(INTERRUPTED);
+                    } else {
+                        self.notice(&format!("Turn {status}. Answer is provisional; retry when you're ready."));
+                    }
                 }
             }
             BridgeEvent::ToolsUnavailable { reason } => {
                 self.finish_turn();
                 self.flush(Instant::now());
                 self.running = false;
-                self.notice(&format!("Tools unavailable: {reason}. Reply is provisional."));
+                self.retryable = true;
                 self.transition(Onboarding::ToolsUnavailable { reason: scrub_text(&reason) });
             }
             BridgeEvent::Recovered(recovery) => {
@@ -597,7 +749,13 @@ impl AgentPane {
             "item/completed" | "item/started" if params["item"]["type"] == "dynamicToolCall" => {
                 let item = &params["item"];
                 let name = item["tool"].as_str().unwrap_or("chart tool");
-                let summary = item["editSummary"].as_str().map(short_label).or_else(|| edit_tool_summary(item));
+                let summary =
+                    item["editSummary"].as_str().map(short_label).or_else(|| edit_tool_summary(item)).or_else(|| {
+                        let args = &item["arguments"];
+                        Some(short_label(
+                            args["symbol"].as_str().or_else(|| args["query"].as_str()).unwrap_or("Pinned chart"),
+                        ))
+                    });
                 let trace = Trace {
                     id: scrub_text(item["id"].as_str().unwrap_or_default()),
                     name: scrub_text(name),
@@ -625,7 +783,7 @@ impl AgentPane {
             "account/rateLimits/updated" => self.set_limits(params),
             "error" => {
                 if let Some(reason) = params["error"]["message"].as_str() {
-                    self.notice(reason);
+                    self.error_notice(reason);
                 }
             }
             _ => {}
@@ -646,6 +804,10 @@ impl AgentPane {
     }
 
     pub fn show(&mut self, ui: &mut Ui, pin_label: &str, pane_id: egui::Id) -> Vec<Action> {
+        egui::Frame::new().inner_margin(dp(12.0)).show(ui, |ui| self.show_content(ui, pin_label, pane_id)).inner
+    }
+
+    fn show_content(&mut self, ui: &mut Ui, pin_label: &str, pane_id: egui::Id) -> Vec<Action> {
         let mut actions = Vec::new();
         if let Some(delay) = self.coalescer.due_in(Instant::now(), true) {
             if delay.is_zero() {
@@ -654,259 +816,1073 @@ impl AgentPane {
                 ui.ctx().request_repaint_after(delay);
             }
         }
+        ui.spacing_mut().item_spacing = egui::vec2(dp(8.0), dp(8.0));
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.style_mut().visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, theme::accent());
+        // Recompute relative reset copy on event-driven frames, without a countdown timer.
+        if matches!(self.state, Onboarding::RateLimited { .. }) && !self.limits_value.is_null() {
+            self.set_limits(&self.limits_value.clone());
+        }
         let old_model = self.settings.model.clone();
-        self.header(ui, &mut actions);
+        self.header(ui, pin_label, &mut actions);
         if old_model != self.settings.model {
             self.set_limits(&self.limits_value.clone());
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.label(pin_label);
-            if ui.small_button("Pin active chart").clicked() {
-                actions.push(Action::Pin);
-            }
-            if ui.small_button("Privacy info").clicked() {
-                self.disclosure = !self.disclosure;
-            }
-        });
-        if self.disclosure {
-            ui.label(PRIVACY);
-        }
-        if !self.acknowledged {
-            if ui.button("Continue").clicked() {
-                self.acknowledged = true;
-                self.disclosure = false;
-            }
-            ui.small("Not investment advice");
-            return actions;
-        }
-        ui.label(self.state.description());
-        for limit in &self.limits {
-            let window = match limit.minutes {
-                300 => "5-hour".into(),
-                10080 => "Weekly".into(),
-                n => format!("{n}-minute window"),
-            };
-            ui.add(
-                egui::ProgressBar::new(limit.used / 100.0)
-                    .text(format!("{} · {window}: {:.0}% used · resets {}", limit.id, limit.used, limit.reset)),
-            );
-        }
-        if self.state == Onboarding::SigningIn && ui.small_button("Open sign-in page again").clicked() {
-            actions.push(Action::ReopenLogin);
-        }
-        let height = (ui.available_height() - 150.0).max(40.0);
+        ui.add_space(dp(6.0));
+
+        // Reserve the measured composer height, rather than a fixed empty footer.
+        let input_width = (ui.available_width() - self.composer_controls_width(ui) - dp(18.0)).max(dp(40.0));
+        let input_text = if self.input.is_empty() { "Ask about the pinned chart" } else { &self.input };
+        let input_job = agent_markdown::wrapped_job(input_text, input_width, theme::body_font(13.0), theme::text());
+        let text_height = ui.fonts_mut(|f| f.layout_job(input_job)).size().y;
+        let line_height = ui.fonts_mut(|f| f.row_height(&theme::body_font(13.0)));
+        let input_height = text_height.clamp(line_height, line_height * 6.0);
+        let queue_height =
+            if self.queue.is_empty() { 0.0 } else { dp(28.0) + if self.queue_review { dp(104.0) } else { 0.0 } };
+        let footer_height =
+            if self.acknowledged { input_height.max(dp(24.0)) + dp(72.0) + queue_height } else { dp(24.0) };
+        let height = (ui.available_height() - footer_height).max(dp(20.0));
         egui::ScrollArea::vertical()
-            .id_salt("conversation")
+            .id_salt(pane_id.with("conversation"))
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .max_height(height)
             .show(ui, |ui| {
-                for (i, block) in self.blocks.iter().enumerate() {
-                    match block {
-                        RenderedBlock::Prompt(text) => {
-                            ui.label(RichText::new(format!("You: {text}")).strong());
-                            if let Some(turn) = self.turns.iter().find(|turn| turn.prompt_index == i) {
-                                if turn.finished && turn.made_edits {
-                                    let enabled = turn.undo_available && !self.running;
-                                    if undo_button(ui, "Undo this turn", enabled, self.running).clicked()
-                                        && let Some(id) = &turn.id
-                                    {
-                                        actions.push(Action::UndoTurn(id.clone()));
-                                    }
-                                }
-                                if let Some(summary) = &turn.undo_summary {
-                                    ui.label(RichText::new(summary).color(crate::theme::amber()));
-                                }
-                            }
-                        }
-                        RenderedBlock::Reply(_) => {
-                            if let Some(cached) = self.reply_cache.get(&i) {
-                                agent_markdown::show(ui, cached);
-                            }
-                        }
-                        RenderedBlock::Notice(text) => {
-                            ui.label(RichText::new(text).color(crate::theme::amber()));
-                        }
-                        RenderedBlock::Tool(trace) => {
-                            let status = if trace.interrupted {
-                                "interrupted"
-                            } else {
-                                match trace.success {
-                                    Some(true) => "ok",
-                                    Some(false) => "failed",
-                                    None => "running",
-                                }
-                            };
-                            let duration = trace.duration_ms.map(|ms| format!(" · {ms} ms")).unwrap_or_default();
-                            let summary = trace.summary.as_ref().map(|s| format!(" · {s}")).unwrap_or_default();
-                            egui::CollapsingHeader::new(format!("{} · {status}{duration}{summary}", trace.name))
-                                .id_salt(("tool", i))
-                                .show(ui, |ui| {
-                                    ui.monospace(&trace.arguments);
-                                });
+                ui.set_max_width(ui.available_width());
+                if self.disclosure || !self.acknowledged {
+                    agent_markdown::wrapped(ui, "Privacy", theme::text());
+                    for (heading, body) in PRIVACY_GROUPS {
+                        ui.label(RichText::new(*heading).font(theme::ui_font(10.5)).color(theme::text()));
+                        agent_markdown::wrapped(ui, body, theme::text());
+                    }
+                    if !self.acknowledged && control(ui, "Continue").clicked() {
+                        self.acknowledged = true;
+                        self.disclosure = false;
+                    }
+                    ui.add_space(dp(6.0));
+                }
+                if !self.acknowledged {
+                    return;
+                }
+                if self.blocks.is_empty() && self.state == Onboarding::Ready {
+                    agent_markdown::wrapped(
+                        ui,
+                        "Read trends, levels and momentum on the pinned chart; Chart edits also lets you mark it up.",
+                        readable(theme::muted()),
+                    );
+                    for prompt in ["What's the trend?", "Find support and resistance", "Summarise the last 20 bars"] {
+                        if control(ui, prompt).clicked() {
+                            actions.push(Action::Send(Prompt { text: prompt.into(), requires_tools: true }));
                         }
                     }
                 }
-            });
-        if self.blocks.is_empty() && self.state == Onboarding::Ready {
-            ui.horizontal_wrapped(|ui| {
-                for prompt in ["What's the trend?", "Find support and resistance", "Summarise the last 20 bars"] {
-                    if ui.small_button(prompt).clicked() {
-                        actions.push(Action::Send(Prompt { text: prompt.into(), requires_tools: true }));
+                self.conversation(ui, &mut actions);
+                if self.state != Onboarding::Ready {
+                    if !self.blocks.is_empty() {
+                        ui.add_space(dp(9.0));
                     }
+                    self.onboarding(ui, &mut actions);
+                }
+                for limit in &self.limits {
+                    let window = match limit.minutes {
+                        300 => "5-hour".into(),
+                        10080 => "Weekly".into(),
+                        n => format!("{n}-minute"),
+                    };
+                    let source = if limit.id == "ordinary" { String::new() } else { format!("{} · ", limit.id) };
+                    let usage = format!("{source}{window} limit · {:.0}% used", limit.used);
+                    let label = if matches!(self.state, Onboarding::RateLimited { .. }) {
+                        usage
+                    } else {
+                        format!("{usage} · resets {}", limit.reset)
+                    };
+                    agent_markdown::wrapped(ui, &label, readable(theme::muted()));
                 }
             });
+        if self.acknowledged {
+            self.queue_row(ui);
+            self.composer(ui, pane_id, input_height, &mut actions);
         }
-        ui.horizontal(|ui| {
-            ui.label(format!("{} queued{}", self.queue.len(), if self.queue_paused { " · paused" } else { "" }));
-            if !self.queue.is_empty() {
-                if ui.small_button("Clear queue").clicked() {
-                    self.queue.clear();
-                }
-                if self.queue_paused && ui.small_button("Resume queue").clicked() {
-                    self.resume_queue();
-                }
-            }
-            if self.last_prompt.is_some()
-                && !self.running
-                && (self.state == Onboarding::Ready || matches!(self.state, Onboarding::ToolsUnavailable { .. }))
-                && ui.small_button("Retry last prompt").clicked()
-            {
-                actions.push(Action::Retry);
-            }
-            if self.running && ui.button("Interrupt (Esc)").clicked() {
-                actions.push(Action::Interrupt);
-            }
-        });
-        let input_id = input_id(pane_id);
-        let focused = ui.memory(|m| m.has_focus(input_id));
-        let enter =
-            focused
-                && ui.input_mut(|i| {
-                    let plain = i.events.iter().any(|event| matches!(event,
-                egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } if modifiers.is_none()
-            ));
-                    plain && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                });
-        // Esc is owned by app hotkeys (which also knows about the palette and
-        // other text fields). Leave idle Esc for TextEdit to release its focus.
         ui.add(
-            egui::TextEdit::multiline(&mut self.input)
-                .id(input_id)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .hint_text("Ask the agent · Enter sends · Shift+Enter newline")
-                .char_limit(16000),
-        );
-        let ready = self.state == Onboarding::Ready;
-        let has_input = !self.input.trim().is_empty();
-        let tools_unavailable = matches!(self.state, Onboarding::ToolsUnavailable { .. });
-        let can_send = (ready || tools_unavailable) && has_input;
-        if self.queue_paused {
-            ui.small("New prompts append to the paused queue. Only Resume queue releases it.");
-        }
-        let clicked = ui
-            .add_enabled(
-                self.state != Onboarding::Checking && (!ready || has_input),
-                egui::Button::new(if tools_unavailable && has_input { "Send" } else { self.state.primary() }),
+            egui::Label::new(
+                RichText::new("Not investment advice").font(theme::ui_font(10.5)).color(readable(theme::muted())),
             )
-            .clicked();
-        if clicked || (enter && can_send) {
-            let action = match self.state {
-                Onboarding::Dormant | Onboarding::Missing | Onboarding::Unsupported { .. } => Action::Check,
-                Onboarding::SignedOut => Action::SignIn,
-                Onboarding::SigningIn => Action::CancelLogin,
-                Onboarding::Ready => {
-                    Action::Send(Prompt { text: std::mem::take(&mut self.input), requires_tools: false })
-                }
-                Onboarding::RateLimited { .. } => Action::RefreshLimits,
-                Onboarding::ToolsUnavailable { .. } if has_input => {
-                    Action::Send(Prompt { text: std::mem::take(&mut self.input), requires_tools: false })
-                }
-                Onboarding::ToolsUnavailable { .. } => Action::Retry,
-                Onboarding::Stopped { unsafe_backend: false, .. } => Action::Check,
-                Onboarding::Stopped { unsafe_backend: true, .. } => Action::Close,
-                Onboarding::Checking => return actions,
-            };
-            actions.push(action);
-        }
-        ui.small("Not investment advice");
+            .wrap(),
+        );
         actions
     }
 
-    fn header(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        ui.horizontal_wrapped(|ui| {
-            egui::ComboBox::from_id_salt("agent-backend").selected_text("Codex").show_ui(ui, |ui| {
-                ui.selectable_label(true, "Codex").on_hover_text("Local isolated backend");
+    fn onboarding(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        agent_markdown::show(ui, &[agent_markdown::DisplayBlock::Heading(2, self.state.title().into())]);
+        let response = agent_markdown::wrapped(ui, &self.state.description(), theme::text());
+        match &self.state {
+            Onboarding::ToolsUnavailable { reason } | Onboarding::Stopped { reason, .. } => {
+                response.on_hover_text(reason);
+            }
+            _ => {}
+        }
+        ui.add_space(dp(3.0));
+        if matches!(self.state, Onboarding::Checking | Onboarding::SigningIn) {
+            ui.horizontal_top(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(dp(14.0), dp(18.0)), egui::Sense::hover());
+                // Static, drawn activity: progress follows events, never an idle animation timer.
+                widgets::draw_icon(ui.painter(), rect, Icon::Running, readable(theme::muted()));
+                agent_markdown::wrapped(ui, CHECKING_STATUS, theme::text());
             });
-            let old = self.settings.model.clone();
-            let label = self.models.iter().find(|m| m.id == old).map_or("Model", |m| m.display_name.as_str());
-            egui::ComboBox::from_id_salt("agent-model").selected_text(label).show_ui(ui, |ui| {
-                for model in &self.models {
-                    ui.selectable_value(&mut self.settings.model, model.id.clone(), &model.display_name);
+        }
+        if self.state == Onboarding::Checking {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            let primary = ui.add(primary_button(self.state.primary()));
+            let primary = if matches!(self.state, Onboarding::ToolsUnavailable { .. }) {
+                primary.on_hover_text(RETRY_HELP)
+            } else {
+                primary
+            };
+            focus_ring(ui, &primary);
+            if primary.clicked()
+                && let Some(action) = self.state.action()
+            {
+                actions.push(action);
+            }
+            if matches!(self.state, Onboarding::Missing | Onboarding::Unsupported { .. })
+                && control(ui, "Installation instructions")
+                    .on_hover_text(format!("Open {INSTALLATION_URL} in your browser"))
+                    .clicked()
+            {
+                actions.push(Action::InstallationInstructions);
+            }
+        });
+        if self.state == Onboarding::SigningIn && control(ui, "Open sign-in page again").clicked() {
+            actions.push(Action::ReopenLogin);
+        }
+    }
+
+    fn conversation(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        for i in 0..self.blocks.len() {
+            match &self.blocks[i] {
+                RenderedBlock::Prompt(text) => {
+                    if i > 0 {
+                        // Two related-element gaps plus a hairline: 16–24 dp between turns.
+                        ui.add(egui::Separator::default().spacing(dp(1.0)));
+                    }
+                    let turn = self.turns.iter().find(|t| t.prompt_index == i);
+                    let time = turn.map_or("", |t| t.local_time.as_str());
+                    prompt_header(ui, time);
+                    agent_markdown::wrapped(ui, text, theme::text());
+                    if let Some(turn) = turn
+                        && let Some(summary) = &turn.undo_summary
+                        && turn.reverted_summary() != Some(summary.as_str())
+                    {
+                        notice_row(ui, summary, notice_severity(summary));
+                    }
+                    let end = self.blocks[i + 1..]
+                        .iter()
+                        .position(|b| matches!(b, RenderedBlock::Prompt(_)))
+                        .map_or(self.blocks.len(), |n| i + 1 + n);
+                    self.tools(ui, i, i + 1..end, actions);
+                    ui.add_space(dp(3.0));
+                }
+                RenderedBlock::Reply(blocks) => {
+                    if self
+                        .turns
+                        .iter()
+                        .rev()
+                        .find(|turn| turn.prompt_index < i)
+                        .is_some_and(|turn| turn.reverted_changes.is_some_and(|n| n > 0))
+                    {
+                        ui.label(RichText::new("Reverted").font(theme::ui_font(10.5)).color(readable(theme::muted())));
+                    }
+                    ui.push_id(("reply", i), |ui| {
+                        if let Some(cached) = self.reply_cache.get(&i) {
+                            agent_markdown::show(ui, cached);
+                        } else {
+                            agent_markdown::show(ui, &agent_markdown::prepare(blocks));
+                        }
+                    });
+                }
+                RenderedBlock::Notice(text) => {
+                    // A stop has one block and one adjacent action; its diagnostic stays in the tooltip.
+                    if !matches!(&self.state, Onboarding::Stopped { reason, .. } if reason == text) {
+                        if text == INTERRUPTED || (text.starts_with("Turn ") && text.contains("Answer is provisional"))
+                        {
+                            ui.horizontal_wrapped(|ui| {
+                                notice_row(ui, text, Severity::Warning);
+                                if self.show_retry()
+                                    && self.turns.last().is_some_and(|turn| i > turn.prompt_index)
+                                    && ui.add(primary_button("Retry response")).on_hover_text(RETRY_HELP).clicked()
+                                {
+                                    actions.push(Action::Retry);
+                                }
+                            });
+                        } else {
+                            notice_row(
+                                ui,
+                                text,
+                                self.notice_levels.get(&i).copied().unwrap_or_else(|| notice_severity(text)),
+                            );
+                        }
+                    }
+                }
+                RenderedBlock::Tool(_) => {
+                    // Tool blocks stay in event order in memory; one inspector row per turn in the UI.
+                    if !self.blocks[..i].iter().any(|b| matches!(b, RenderedBlock::Prompt(_) | RenderedBlock::Tool(_)))
+                    {
+                        self.tools(ui, i, i..self.blocks.len(), actions);
+                    }
+                }
+            }
+        }
+    }
+
+    fn tools(&mut self, ui: &mut Ui, key: usize, range: std::ops::Range<usize>, actions: &mut Vec<Action>) {
+        let traces: Vec<_> = self.blocks[range]
+            .iter()
+            .filter_map(|b| if let RenderedBlock::Tool(t) = b { Some(t) } else { None })
+            .collect();
+        let turn = self.turns.iter().find(|turn| turn.prompt_index == key);
+        if traces.is_empty() && !turn.is_some_and(|turn| turn.made_edits) {
+            return;
+        }
+        let reverted = turn.and_then(|turn| turn.reverted_changes);
+        let label = if traces.is_empty() && reverted.is_none() {
+            "Chart changes".into()
+        } else {
+            turn.and_then(ConversationTurn::reverted_summary)
+                .map_or_else(|| tool_group_label(&traces, reverted), str::to_owned)
+        };
+        let expanded = self.expanded_tools.contains(&key);
+        let wash = ui.painter().add(egui::Shape::Noop);
+        let response = ui
+            .with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                if let Some(turn) =
+                    turn.filter(|turn| turn.finished && turn.made_edits && turn.reverted_changes.is_none())
+                {
+                    let changes = turn.chart_changes.unwrap_or_else(|| {
+                        traces.iter().filter(|trace| is_edit_tool(&trace.name) && trace.success == Some(true)).count()
+                    });
+                    let label = if changes == 0 {
+                        "Undo chart changes".into()
+                    } else {
+                        format!("Undo {changes} chart change{}", if changes == 1 { "" } else { "s" })
+                    };
+                    if undo_button(ui, &label, turn.undo_available && !self.running, self.running).clicked()
+                        && let Some(id) = &turn.id
+                    {
+                        actions.push(Action::UndoTurn(id.clone()));
+                    }
+                }
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 0.0),
+                    egui::Layout::left_to_right(egui::Align::Min),
+                    |ui| {
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(dp(14.0), dp(18.0)), egui::Sense::hover());
+                        widgets::draw_icon(
+                            ui.painter(),
+                            rect,
+                            if expanded { Icon::ChevronDown } else { Icon::ChevronRight },
+                            readable(theme::muted()),
+                        );
+                        if reverted.is_some()
+                            || traces.iter().any(|trace| trace.success.is_none() && !trace.interrupted)
+                        {
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(dp(14.0), dp(18.0)), egui::Sense::hover());
+                            widgets::draw_icon(
+                                ui.painter(),
+                                rect,
+                                if reverted.is_some() { Icon::Revert } else { Icon::Running },
+                                readable(theme::muted()),
+                            );
+                        }
+                        agent_markdown::wrapped(ui, &label, readable(theme::muted()));
+                    },
+                )
+                .response
+            })
+            .inner;
+        let click = ui.interact(response.rect, ui.id().with(("tools", key)), egui::Sense::click());
+        if click.hovered() {
+            ui.painter()
+                .set(wash, egui::epaint::RectShape::filled(click.rect, theme::CONTROL_RADIUS, theme::control()));
+        }
+        focus_ring(ui, &click);
+        if click.clicked() {
+            if expanded {
+                self.expanded_tools.remove(&key);
+            } else {
+                self.expanded_tools.insert(key);
+            }
+        }
+        if expanded {
+            for trace in traces {
+                tool_row_with_history(ui, trace, reverted.is_some_and(|n| n > 0));
+            }
+        }
+    }
+
+    fn show_retry(&self) -> bool {
+        self.last_prompt.is_some()
+            && !self.running
+            && (self.retryable || matches!(self.state, Onboarding::ToolsUnavailable { .. }))
+            && (self.state == Onboarding::Ready || matches!(self.state, Onboarding::ToolsUnavailable { .. }))
+    }
+
+    fn queue_label(&self) -> String {
+        format!("{} queued{}", self.queue.len(), if self.queue_paused { " · Paused" } else { "" })
+    }
+
+    fn queue_row(&mut self, ui: &mut Ui) {
+        if self.queue.is_empty() {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(self.queue_label()).font(theme::ui_font(10.5)).color(readable(theme::muted())));
+            if control(ui, if self.queue_review { "Hide queue" } else { "Review" }).clicked() {
+                self.queue_review = !self.queue_review;
+            }
+            if self.queue_paused && control(ui, "Resume").clicked() {
+                self.resume_queue();
+            }
+            if control(ui, "Clear").clicked() {
+                self.queue.clear();
+            }
+        });
+        if self.queue_review && !self.queue.is_empty() {
+            egui::ScrollArea::vertical().id_salt("queue-review").max_height(dp(96.0)).show(ui, |ui| {
+                let mut remove = None;
+                for (index, prompt) in self.queue.iter().enumerate() {
+                    ui.push_id(index, |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            if control(ui, "Remove").on_hover_text("Remove this queued prompt").clicked() {
+                                remove = Some(index);
+                            }
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 0.0),
+                                egui::Layout::left_to_right(egui::Align::Min),
+                                |ui| {
+                                    agent_markdown::wrapped(ui, &format!("{}.", index + 1), theme::text());
+                                    agent_markdown::wrapped(ui, &prompt.text, theme::text());
+                                },
+                            );
+                        });
+                    });
+                }
+                if let Some(index) = remove {
+                    self.queue.remove(index);
                 }
             });
+        }
+    }
+
+    fn composer_label(&self) -> &'static str {
+        if self.running {
+            "Stop"
+        } else if self.state.accepts_input() && self.queue_paused && !self.queue.is_empty() {
+            "Add to queue"
+        } else {
+            "Send"
+        }
+    }
+
+    fn send_blocked_reason(&self) -> Option<&'static str> {
+        Some(match self.state {
+            Onboarding::Dormant => "Start the agent before sending a prompt.",
+            Onboarding::Missing => "Install Codex, then check again before sending.",
+            Onboarding::Unsupported { .. } => "Install a supported Codex version, then check again before sending.",
+            Onboarding::SignedOut => "Sign in with ChatGPT before sending a prompt.",
+            Onboarding::SigningIn => "Finish signing in before sending a prompt.",
+            Onboarding::Checking => "Wait for Codex, account and chart-tool checks to finish.",
+            Onboarding::RateLimited { .. } => "Wait for the usage limit to reset, then check limits.",
+            Onboarding::Stopped { unsafe_backend: true, .. } => "Close this unsafe session and start a new one.",
+            Onboarding::Stopped { .. } => "Restart the agent before sending a prompt.",
+            _ if self.queue.len() >= 32 => "The queue is full. Remove a prompt or clear the queue first.",
+            _ if self.input.trim().is_empty() => "Enter a prompt first.",
+            _ => return None,
+        })
+    }
+
+    fn composer_button(&self, ui: &mut Ui) -> egui::Response {
+        let blocked = self.send_blocked_reason();
+        let enabled = self.running || blocked.is_none();
+        let button = if self.running {
+            egui::Button::new(self.composer_label()).wrap()
+        } else if enabled {
+            primary_button(self.composer_label())
+        } else {
+            egui::Button::new(RichText::new(self.composer_label()).color(readable(theme::muted())))
+                .fill(theme::control())
+                .wrap()
+        };
+        let response = ui.add_enabled(enabled, button);
+        focus_ring(ui, &response);
+        response
+            .on_hover_text(if self.running {
+                "Interrupt (Esc)"
+            } else if self.queue_paused && !self.queue.is_empty() {
+                "Add this prompt to the queue. It will wait for Resume."
+            } else {
+                "Send (Enter)"
+            })
+            .on_disabled_hover_text(blocked.unwrap_or("Enter a prompt first."))
+    }
+
+    fn composer_controls_width(&self, ui: &Ui) -> f32 {
+        ui.painter()
+            .layout_no_wrap(self.composer_label().into(), egui::TextStyle::Button.resolve(ui.style()), theme::text())
+            .size()
+            .x
+            .ceil()
+            + ui.spacing().button_padding.x * 2.0
+            + dp(8.0)
+    }
+
+    fn composer(&mut self, ui: &mut Ui, pane_id: egui::Id, height: f32, actions: &mut Vec<Action>) {
+        let input_id = input_id(pane_id);
+        let enter = ui.memory(|m| m.has_focus(input_id))
+            && ui.input_mut(|i| {
+                let plain = i.events.iter().any(|event| {
+                    matches!(event,
+                egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } if modifiers.is_none())
+                });
+                plain && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+            });
+        let accepts_input = self.state.accepts_input();
+        let placeholder = self.state.composer_placeholder();
+        let input_help = format!(
+            "{} focuses agent input · Enter sends · Shift+Enter adds a line · Esc interrupts",
+            self.focus_shortcut
+        );
+        let mut send = false;
+        let mut field = egui::Frame::new()
+            .fill(theme::control())
+            .stroke(egui::Stroke::new(dp(1.0), theme::border()))
+            .corner_radius(dp(6.0) as u8)
+            .inner_margin(egui::Margin::symmetric(dp(8.0) as i8, dp(6.0) as i8))
+            .begin(ui);
+        field.content_ui.set_min_width(field.content_ui.available_width());
+        field.content_ui.horizontal_top(|ui| {
+            let width = (ui.available_width() - self.composer_controls_width(ui)).max(dp(40.0));
+            ui.allocate_ui_with_layout(egui::vec2(width, height), egui::Layout::top_down(egui::Align::Min), |ui| {
+                // Esc stays owned by app hotkeys; idle Esc releases TextEdit focus.
+                egui::ScrollArea::vertical()
+                    .id_salt(pane_id.with("input-scroll"))
+                    .max_height(height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.add_enabled(
+                            accepts_input,
+                            egui::TextEdit::multiline(&mut self.input)
+                                .id(input_id)
+                                .font(theme::body_font(13.0))
+                                .frame(egui::Frame::NONE)
+                                .margin(egui::Vec2::ZERO)
+                                .desired_rows(1)
+                                .desired_width(ui.available_width())
+                                .hint_text(RichText::new(placeholder).color(readable(theme::muted())))
+                                .char_limit(16000),
+                        )
+                        .on_hover_text(&input_help)
+                        .on_disabled_hover_text(&input_help);
+                    });
+            });
+            if self.composer_button(ui).clicked() {
+                if self.running {
+                    actions.push(Action::Interrupt);
+                } else {
+                    send = true;
+                }
+            }
+        });
+        if ui.memory(|m| m.has_focus(input_id)) {
+            field.frame.stroke.color = theme::accent();
+        }
+        field.end(ui);
+        // Enter still appends to the queue during a running turn.
+        if (send || enter) && self.send_blocked_reason().is_none() {
+            actions.push(Action::Send(Prompt { text: std::mem::take(&mut self.input), requires_tools: false }));
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        if self.running {
+            return "Working";
+        }
+        match self.state {
+            Onboarding::Ready if self.queue_paused && !self.queue.is_empty() => "Paused",
+            Onboarding::Ready => "Ready",
+            Onboarding::Dormant => "Idle",
+            Onboarding::SignedOut => "Signed out",
+            Onboarding::SigningIn => "Signing in",
+            Onboarding::Checking => "Checking",
+            Onboarding::Missing | Onboarding::Unsupported { .. } => "Unavailable",
+            Onboarding::RateLimited { .. } => "Paused",
+            Onboarding::ToolsUnavailable { .. } => "Unverified",
+            Onboarding::Stopped { .. } => "Stopped",
+        }
+    }
+
+    fn header(&mut self, ui: &mut Ui, pin_label: &str, actions: &mut Vec<Action>) {
+        self.settings.select_defaults(&self.models);
+        let model = self.models.iter().find(|m| m.id == self.settings.model);
+        let model_label = format!(
+            "{} · {}",
+            model.map_or("Model", |m| m.display_name.as_str()),
+            if self.settings.effort.is_empty() { "effort" } else { &self.settings.effort }
+        );
+        let pin_label = pin_label.trim_start_matches("Pinned: ");
+        let width_of = |text: &str| {
+            ui.painter().layout_no_wrap(text.into(), theme::ui_font(10.5), theme::text()).size().x + dp(12.0)
+        };
+        let model_width = width_of(&model_label) + dp(16.0);
+        let mode_width = width_of("Read only") + width_of("Chart edits");
+        let style_width = width_of(self.settings.response_style.label()) + dp(16.0);
+        let status_width = width_of(self.status()) + dp(8.0);
+        let more_width = dp(22.0);
+        let total = model_width + mode_width + style_width + status_width + more_width + dp(32.0);
+        let narrow = header_rows(ui.available_width(), total) == 2;
+        let budget = (ui.available_width() - mode_width - status_width - more_width - dp(32.0)).max(dp(36.0));
+        ui.horizontal_top(|ui| {
+            self.model_picker(ui, &model_label, if narrow { model_width.min(budget) } else { model_width });
+            self.mode_switch(ui, actions);
+            if !narrow {
+                self.style_switch(ui);
+            }
+            let severity = match self.state {
+                Onboarding::Stopped { unsafe_backend: true, .. } => Severity::Error,
+                Onboarding::RateLimited { .. } | Onboarding::ToolsUnavailable { .. } => Severity::Warning,
+                _ if self.status() == "Paused" => Severity::Warning,
+                _ => Severity::Info,
+            };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = dp(3.0);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(dp(5.0), dp(18.0)), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), dp(2.0), severity.color());
+                ui.label(RichText::new(self.status()).font(theme::ui_font(10.5)).color(readable(theme::muted())));
+            });
+            self.overflow(ui, actions);
+        });
+        ui.horizontal_wrapped(|ui| {
+            let pin_budget = (ui.available_width() - if narrow { style_width + dp(8.0) } else { 0.0 }).max(dp(40.0));
+            if icon_control(
+                ui,
+                pin_label,
+                compact_width(ui, pin_label).min(pin_budget) + dp(16.0),
+                Icon::Pin,
+                false,
+                true,
+            )
+            .on_hover_text("Pin the active chart. Prompts and chart tools use this chart until you pin another.")
+            .clicked()
+            {
+                actions.push(Action::Pin);
+            }
+            if narrow {
+                self.style_switch(ui);
+            }
+        });
+        if self.data_basis.sample || self.data_basis.last_bar.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                if self.data_basis.sample {
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(dp(1.0), theme::border()))
+                        .corner_radius(theme::CONTROL_RADIUS)
+                        .inner_margin(egui::Margin::symmetric(dp(6.0) as i8, dp(2.0) as i8))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Sample data").font(theme::ui_font(10.5)).color(readable(theme::muted())),
+                            );
+                        });
+                }
+                if let Some(freshness) = self.data_basis.freshness() {
+                    ui.label(RichText::new(freshness).font(theme::ui_font(10.5)).color(readable(theme::muted())));
+                }
+                if let Some(word) = &self.data_basis.incomplete {
+                    ui.label(
+                        RichText::new(format!("{word} bar incomplete"))
+                            .font(theme::ui_font(10.5))
+                            .color(readable(theme::muted())),
+                    );
+                }
+            });
+        }
+    }
+
+    fn model_picker(&mut self, ui: &mut Ui, label: &str, width: f32) {
+        let response = ui
+            .add_enabled_ui(!self.models.is_empty(), |ui| {
+                icon_control(ui, label, width, Icon::ChevronDown, true, false)
+            })
+            .inner
+            .on_hover_text("Model and reasoning effort; costly efforts use more of your subscription and take longer.")
+            .on_disabled_hover_text("Start the agent to load available models and reasoning efforts.");
+        egui::Popup::menu(&response).show(|ui| {
+            let old = self.settings.model.clone();
+            for model in &self.models {
+                ui.selectable_value(&mut self.settings.model, model.id.clone(), &model.display_name);
+            }
             if old != self.settings.model {
                 self.settings.effort.clear();
             }
             self.settings.select_defaults(&self.models);
             if let Some(model) = self.models.iter().find(|m| m.id == self.settings.model) {
-                egui::ComboBox::from_id_salt("agent-effort").selected_text(&self.settings.effort).show_ui(ui, |ui| {
+                ui.separator();
+                ui.menu_button("Reasoning effort", |ui| {
                     for effort in &model.supported_reasoning_efforts {
-                        if effort.reasoning_effort == "ultra" {
-                            continue;
+                        if effort.reasoning_effort != "ultra" {
+                            ui.selectable_value(
+                                &mut self.settings.effort,
+                                effort.reasoning_effort.clone(),
+                                effort_label(effort),
+                            )
+                            .on_hover_text(format!(
+                                "{}{}",
+                                effort.description,
+                                if effort.costly || effort.reasoning_effort == "max" {
+                                    " Higher subscription usage and latency."
+                                } else {
+                                    ""
+                                }
+                            ));
                         }
-                        let label = effort_label(effort);
-                        ui.selectable_value(&mut self.settings.effort, effort.reasoning_effort.clone(), label)
-                            .on_hover_text(&effort.description);
                     }
                 });
             }
-            let available = crate::agent_bridge::agent_edit_tools_available();
-            let mut selected = self.settings.tools;
-            egui::ComboBox::from_id_salt("agent-tools")
-                .selected_text(format!("Next session: {}", selected.label()))
-                .show_ui(ui, |ui| {
-                    for mode in [ToolsMode::ReadOnly, ToolsMode::Edit] {
-                        ui.add_enabled_ui(self.can_change_tools(mode, available), |ui| {
-                            ui.selectable_value(&mut selected, mode, mode.label());
-                        })
-                        .response
-                        .on_disabled_hover_text(if mode == ToolsMode::Edit && !available {
-                            "Chart-edit execution is not available in this build. Sessions use Read only."
+        });
+    }
+
+    fn mode_switch(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let available = crate::agent_bridge::agent_edit_tools_available();
+        let group = egui::Frame::new()
+            .fill(theme::control())
+            .stroke(egui::Stroke::new(dp(1.0), theme::border()))
+            .corner_radius(theme::CONTROL_RADIUS)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    for (mode, label) in [(ToolsMode::ReadOnly, "Read only"), (ToolsMode::Edit, "Chart edits")] {
+                        let selected = self.settings.tools == mode;
+                        let response = ui
+                            .add_enabled_ui(self.can_change_tools(mode, available), |ui| {
+                                ui.spacing_mut().button_padding = egui::vec2(dp(6.0), dp(3.0));
+                                ui.add(
+                                    egui::Button::new(RichText::new(label).font(theme::ui_font(10.5)))
+                                        .corner_radius(0)
+                                        .selected(selected),
+                                )
+                            })
+                            .inner;
+                        focus_ring(ui, &response);
+                        let help = if mode == ToolsMode::Edit {
+                            CHART_EDITS_HELP
                         } else {
-                            "Wait for the turn or sign-in checks to finish. Unsafe sessions require an app restart."
-                        });
+                            "The agent can read the pinned chart, but cannot change chart objects."
+                        };
+                        let response = response.on_hover_text(help).on_disabled_hover_text(format!(
+                            "{help}\n{}",
+                            if mode == ToolsMode::Edit && !available {
+                                "Chart-edit tools aren't available in this build."
+                            } else {
+                                "Wait for the current turn or account check. Unsafe sessions must be closed."
+                            }
+                        ));
+                        if response.clicked() && !selected {
+                            actions.push(Action::SetTools(mode));
+                        }
                     }
                 });
-            if selected != self.settings.tools {
-                actions.push(Action::SetTools(selected));
+            });
+        ui.painter().rect_stroke(
+            group.response.rect,
+            theme::CONTROL_RADIUS,
+            egui::Stroke::new(dp(1.0), theme::border()),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    fn style_switch(&mut self, ui: &mut Ui) {
+        let label = self.settings.response_style.label();
+        let response =
+            icon_control(ui, label, compact_width(ui, label) + dp(16.0), Icon::ChevronDown, true, false).on_hover_text(
+                format!("{} Applies to the next prompt; no restart.", self.settings.response_style.instruction()),
+            );
+        egui::Popup::menu(&response).show(|ui| {
+            for style in [ResponseStyle::Terse, ResponseStyle::Analyst, ResponseStyle::Detailed] {
+                if ui
+                    .selectable_value(&mut self.settings.response_style, style, style.label())
+                    .on_hover_text(style.instruction())
+                    .clicked()
+                {
+                    ui.close();
+                }
             }
-            let current = match self.session_tools {
-                Some(ToolSet::Edit) => "Can edit charts",
-                Some(_) => "Read only",
-                None => "Not started",
-            };
-            ui.strong(format!("Current mode: {current}"));
+        });
+    }
+
+    fn overflow(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(dp(22.0), dp(20.0)), egui::Sense::click());
+        if response.hovered() {
+            ui.painter().rect_filled(rect, theme::CONTROL_RADIUS, theme::control_hover());
+        }
+        widgets::draw_icon(ui.painter(), rect.shrink(dp(4.0)), Icon::More, theme::text());
+        focus_ring(ui, &response);
+        let response = response.on_hover_text("Agent menu");
+        egui::Popup::menu(&response).show(|ui| {
+            ui.menu_button("Backend", |ui| {
+                ui.selectable_label(true, "Codex").on_hover_text("Runs locally in a sandbox");
+            });
+            if control(ui, "Privacy info").clicked() {
+                self.disclosure = !self.disclosure;
+                ui.close();
+            }
             if undo_button(ui, "Undo last agent turn", self.header_undo_available && !self.running, self.running)
                 .clicked()
                 && let Some(id) = &self.header_undo
             {
                 actions.push(Action::UndoTurn(id.clone()));
+                ui.close();
+            }
+            let restart = !self.running
+                && !matches!(
+                    self.state,
+                    Onboarding::Checking | Onboarding::SigningIn | Onboarding::Stopped { unsafe_backend: true, .. }
+                );
+            if ui
+                .add_enabled(restart, primary_button("Restart agent"))
+                .on_disabled_hover_text("Finish the current operation, or close an unsafe session.")
+                .clicked()
+            {
+                actions.push(Action::Check);
+                ui.close();
+            }
+            if control(ui, "Close").clicked() {
+                actions.push(Action::Close);
+                ui.close();
             }
         });
-        if self.models.iter().find(|m| m.id == self.settings.model).is_some_and(|m| {
-            m.supported_reasoning_efforts
+    }
+}
+
+fn prompt_header(ui: &mut Ui, time: &str) {
+    // Explicit tracks keep the author at the left even when later markdown widens
+    // a scroll area. Neither label can wrap or displace the other in narrow panes.
+    let ink = readable(theme::muted());
+    let author = ui.painter().layout_no_wrap("You".into(), theme::ui_font(10.5), ink);
+    let time = ui.painter().layout_no_wrap(time.into(), theme::body_font(10.5), ink);
+    let height = author.size().y.max(time.size().y);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    ui.painter().galley(rect.min, author.clone(), ink);
+    ui.painter().galley(rect.min + egui::vec2(dp(0.25), 0.0), author.clone(), ink);
+    let time_x = (rect.right() - time.size().x).max(rect.left() + author.size().x + dp(8.0));
+    ui.painter().galley(egui::pos2(time_x, rect.top()), time, ink);
+}
+
+fn header_rows(available: f32, required: f32) -> usize {
+    if required <= available { 1 } else { 2 }
+}
+
+fn compact_width(ui: &Ui, label: &str) -> f32 {
+    ui.painter().layout_no_wrap(label.into(), theme::ui_font(10.5), theme::text()).size().x + dp(12.0)
+}
+fn icon_control(ui: &mut Ui, label: &str, width: f32, icon: Icon, trailing: bool, outline: bool) -> egui::Response {
+    let (rect, response) = ui
+        .allocate_exact_size(egui::vec2(width.min(ui.available_width()).max(dp(24.0)), dp(22.0)), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, theme::CONTROL_RADIUS, theme::control_hover());
+    }
+    if outline {
+        ui.painter().rect_stroke(
+            rect,
+            theme::CONTROL_RADIUS,
+            egui::Stroke::new(dp(1.0), theme::border()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let icon_x = if trailing { rect.right() - dp(12.0) } else { rect.left() + dp(12.0) };
+    let icon_rect = egui::Rect::from_center_size(egui::pos2(icon_x, rect.center().y), egui::vec2(dp(12.0), dp(12.0)));
+    widgets::draw_icon(ui.painter(), icon_rect, icon, readable(theme::muted()));
+    let mut job =
+        agent_markdown::wrapped_job(label, (rect.width() - dp(28.0)).max(dp(1.0)), theme::ui_font(10.5), theme::text());
+    job.wrap.max_rows = 1;
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let left = rect.left() + if trailing { dp(6.0) } else { dp(22.0) };
+    ui.painter().galley(egui::pos2(left, rect.center().y - galley.size().y / 2.0), galley, theme::text());
+    focus_ring(ui, &response);
+    response
+}
+fn primary_button(label: &str) -> egui::Button<'_> {
+    let ink = if contrast(theme::text(), theme::accent()) >= contrast(theme::card(), theme::accent()) {
+        theme::text()
+    } else {
+        theme::card()
+    };
+    egui::Button::new(RichText::new(label).color(ink)).fill(theme::accent()).wrap()
+}
+fn control(ui: &mut Ui, label: &str) -> egui::Response {
+    let response = ui.add(egui::Button::new(label).wrap());
+    focus_ring(ui, &response);
+    response
+}
+fn focus_ring(ui: &Ui, response: &egui::Response) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect,
+            theme::CONTROL_RADIUS,
+            egui::Stroke::new(1.0, theme::accent()),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Severity {
+    Info,
+    Warning,
+    Error,
+}
+impl Severity {
+    fn color(self) -> egui::Color32 {
+        readable(match self {
+            Self::Info => theme::muted(),
+            Self::Warning => theme::amber_dim(),
+            Self::Error => theme::down(),
+        })
+    }
+    fn icon(self) -> Icon {
+        match self {
+            Self::Info => Icon::Info,
+            Self::Warning => Icon::Warning,
+            Self::Error => Icon::Close,
+        }
+    }
+}
+fn notice_severity(text: &str) -> Severity {
+    let text = text.to_ascii_lowercase();
+    if ["unsafe", "safety", "failed", "error", "could not", "unavailable", "no longer available", "ended"]
+        .iter()
+        .any(|s| text.contains(s))
+    {
+        Severity::Error
+    } else if ["paused", "provisional", "interrupted", "history lost", "kept because"].iter().any(|s| text.contains(s))
+    {
+        Severity::Warning
+    } else {
+        Severity::Info
+    }
+}
+fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
+    let luminance = |c: egui::Color32| {
+        let linear = |n: u8| {
+            let v = f32::from(n) / 255.0;
+            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+    };
+    let a = luminance(a);
+    let b = luminance(b);
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+pub(crate) fn readable(color: egui::Color32) -> egui::Color32 {
+    // Theme-derived ink, not a bright ticker warning or an unreadable dim tint.
+    (0..=20)
+        .map(|i| widgets::lerp_color(color, theme::text(), i as f32 / 20.0))
+        .find(|c| contrast(*c, theme::card()) >= 4.5)
+        .unwrap_or(theme::text())
+}
+fn notice_row(ui: &mut Ui, text: &str, severity: Severity) {
+    ui.horizontal_top(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(dp(14.0), dp(18.0)), egui::Sense::hover());
+        widgets::draw_icon(ui.painter(), rect, severity.icon(), severity.color());
+        agent_markdown::wrapped(ui, text, severity.color());
+    });
+}
+fn tool_label(name: &str) -> &str {
+    match name {
+        "read_chart" => "Read chart",
+        "read_data" => "Read bars",
+        "analyze" => "Analyze",
+        "indicator_values" => "Indicator values",
+        "find_symbol" => "Find symbol",
+        "read_user_actions" => "Recent actions",
+        "screenshot" => "Screenshot",
+        "create_drawing" => "Draw",
+        "update_drawing" => "Edit drawing",
+        "delete_drawing" => "Delete drawing",
+        "add_indicator" => "Add indicator",
+        "remove_indicator" => "Remove indicator",
+        "set_view" => "Change view",
+        "compare" => "Compare",
+        _ => "Chart tool",
+    }
+}
+
+fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
+    if let Some(n) = reverted {
+        return format!("{n} change{} reverted", if n == 1 { "" } else { "s" });
+    }
+    if let Some(trace) = traces.iter().rev().find(|trace| trace.success.is_none() && !trace.interrupted) {
+        return match trace.name.as_str() {
+            "read_chart" => "Reading chart…".into(),
+            "read_data" => "Reading bars…".into(),
+            "analyze" => "Analyzing…".into(),
+            "create_drawing" => "Drawing…".into(),
+            _ => format!("{}…", tool_label(&trace.name)),
+        };
+    }
+    let summary = if traces.iter().any(|trace| trace.interrupted) {
+        "Stopped before finishing".into()
+    } else if traces.iter().any(|trace| trace.success == Some(false)) {
+        "Chart tools failed".into()
+    } else {
+        let edits: Vec<_> =
+            traces.iter().filter(|trace| is_edit_tool(&trace.name) && trace.success == Some(true)).collect();
+        if edits.is_empty() {
+            if traces.iter().any(|trace| trace.name == "analyze") {
+                "Analyzed chart".into()
+            } else {
+                "Read chart data".into()
+            }
+        } else {
+            let lines = edits
                 .iter()
-                .any(|e| e.reasoning_effort == self.settings.effort && (e.costly || e.reasoning_effort == "max"))
-        }) {
-            ui.small("Costly effort: higher subscription usage and latency.");
+                .filter(|trace| {
+                    trace.name == "create_drawing"
+                        && trace.summary.as_deref().is_some_and(|s| s.to_ascii_lowercase().contains("line"))
+                })
+                .count();
+            let indicators: Vec<_> = edits.iter().filter(|trace| trace.name == "add_indicator").collect();
+            if lines + indicators.len() == edits.len() && indicators.len() <= 1 {
+                let mut parts = Vec::new();
+                if lines > 0 {
+                    parts.push(format!("Drew {lines} line{}", if lines == 1 { "" } else { "s" }));
+                }
+                if let Some(trace) = indicators.first() {
+                    let object = main_tool_label(trace.summary.as_deref().unwrap_or("indicator"));
+                    parts.push(format!("{} {object}", if parts.is_empty() { "Added" } else { "added" }));
+                }
+                parts.join(" and ")
+            } else {
+                "Chart edit tools finished".into()
+            }
+        }
+    };
+    format!("{summary} · {} step{}", traces.len(), if traces.len() == 1 { "" } else { "s" })
+}
+
+fn tool_status(trace: &Trace) -> &'static str {
+    if trace.interrupted {
+        "interrupted"
+    } else {
+        match trace.success {
+            Some(true) => "ok",
+            Some(false) => "failed",
+            None => "running",
         }
     }
 }
 
+#[cfg(test)]
+fn tool_row(ui: &mut Ui, trace: &Trace) {
+    tool_row_with_history(ui, trace, false);
+}
+
+fn tool_row_with_history(ui: &mut Ui, trace: &Trace, reverted: bool) {
+    let status = tool_status(trace);
+    let duration = trace.duration_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "—".into());
+    let duration = ui.painter().layout_no_wrap(duration, theme::mono(10.5), readable(theme::muted()));
+    let object = main_tool_label(trace.summary.as_deref().unwrap_or(""));
+    let label = if object.is_empty() {
+        tool_label(&trace.name).to_owned()
+    } else {
+        format!("{} · {object}", tool_label(&trace.name))
+    };
+    let width = ui.available_width();
+    let mut job = agent_markdown::wrapped_job(
+        &label,
+        (width - duration.size().x - dp(32.0)).max(dp(1.0)),
+        theme::ui_font(12.0),
+        theme::text(),
+    );
+    job.wrap.max_rows = 1;
+    let label = ui.fonts_mut(|f| f.layout_job(job));
+    let height = dp(20.0).max(label.size().y).max(duration.size().y);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let icon = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + dp(7.0), rect.center().y),
+        egui::vec2(dp(12.0), dp(12.0)),
+    );
+    match status {
+        "ok" => {
+            let stroke = egui::Stroke::new(dp(1.0), readable(if reverted { theme::muted() } else { theme::up() }));
+            ui.painter()
+                .add(egui::Shape::line(vec![icon.left_center(), icon.center_bottom(), icon.right_top()], stroke));
+        }
+        "failed" => widgets::draw_icon(ui.painter(), icon, Icon::Close, Severity::Error.color()),
+        "interrupted" => widgets::draw_icon(ui.painter(), icon, Icon::Pause, Severity::Warning.color()),
+        _ => {
+            // A static clock, not a spinner: tool status never adds idle repaints.
+            let stroke = egui::Stroke::new(dp(1.0), readable(theme::muted()));
+            ui.painter().circle_stroke(icon.center(), dp(5.0), stroke);
+            ui.painter().line_segment([icon.center_top(), icon.center()], stroke);
+            ui.painter().line_segment([icon.center(), icon.right_center()], stroke);
+        }
+    }
+    ui.painter().galley(
+        egui::pos2(rect.left() + dp(20.0), rect.center().y - label.size().y / 2.0),
+        label,
+        theme::text(),
+    );
+    ui.painter().galley(
+        egui::pos2(rect.right() - duration.size().x, rect.center().y - duration.size().y / 2.0),
+        duration,
+        theme::text(),
+    );
+    response.on_hover_text(format!(
+        "{} · {status}\n{}\nCall: {}\n{}",
+        trace.name,
+        trace.summary.as_deref().unwrap_or(""),
+        trace.id,
+        trace.arguments,
+    ));
+}
+
+fn main_tool_label(summary: &str) -> String {
+    let label =
+        if summary.starts_with('#') { summary.split_once(" · ").map_or("", |(_, label)| label) } else { summary };
+    let mut chars = label.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().collect::<String>() + chars.as_str())
+}
+
+pub(crate) fn price_label(price: f64) -> String {
+    let text = format!("{price:.2}");
+    let (whole, fraction) = text.split_once('.').unwrap_or((&text, "00"));
+    let mut result = String::new();
+    for (i, ch) in whole.chars().enumerate() {
+        if i > 0
+            && (whole.len() - i).is_multiple_of(3)
+            && ch.is_ascii_digit()
+            && whole.as_bytes()[i - 1].is_ascii_digit()
+        {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    format!("{result}.{fraction}")
+}
+
 fn undo_button(ui: &mut Ui, label: &str, enabled: bool, running: bool) -> egui::Response {
-    ui.add_enabled(enabled, egui::Button::new(label))
+    let response = if label.starts_with("Undo ") && label.contains("chart change") {
+        ui.scope(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(dp(6.0), dp(3.0));
+            ui.add_enabled(enabled, egui::Button::new(RichText::new(label).font(theme::ui_font(10.5))).frame(false))
+        })
+        .inner
+    } else {
+        ui.add_enabled(enabled, egui::Button::new(label))
+    };
+    focus_ring(ui, &response);
+    response
         .on_hover_text("Undo the whole agent turn on all affected charts; preserve conflicting user changes.")
         .on_disabled_hover_text(if running { "Wait for the active turn to finish." } else { UNDO_UNAVAILABLE })
 }
@@ -950,8 +1926,8 @@ pub(crate) fn edit_tool_summary(item: &Value) -> Option<String> {
             "horizontal" => args["anchors"][0]["price"]
                 .as_f64()
                 .filter(|p| p.is_finite())
-                .map_or_else(|| "horizontal line".into(), |price| format!("horizontal line at {price:.2}")),
-            "trend_line" => "trend line (2 anchors)".into(),
+                .map_or_else(|| "Horizontal line".into(), |price| format!("Horizontal line at {}", price_label(price))),
+            "trend_line" => "Trend line".into(),
             "vertical" => "vertical line".into(),
             "ray" => "ray (2 anchors)".into(),
             "rectangle" => "rectangle (2 anchors)".into(),
@@ -1027,6 +2003,1270 @@ fn safe_arguments(value: &Value) -> String {
 }
 
 #[cfg(test)]
+mod polish_tests {
+    use super::*;
+
+    fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().into(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let mut result = Vec::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, &mut result);
+        }
+        result
+    }
+
+    fn render(
+        ctx: &egui::Context,
+        width: f32,
+        events: Vec<egui::Event>,
+        mut draw: impl FnMut(&mut Ui),
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 900.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| draw(ui),
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn pointer(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    fn immediate_tooltips(ctx: &egui::Context) {
+        ctx.all_styles_mut(|style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.tooltip_grace_time = 0.0;
+        });
+    }
+
+    #[test]
+    fn unavailable_send_is_neutral_in_every_blocked_state_with_reason_and_no_hover_or_action() {
+        for theme_name in ["Terminal Dark", "Terminal Light", "Bloomberg"] {
+            for state in [
+                "dormant",
+                "missing",
+                "unsupported",
+                "signed-out",
+                "signing-in",
+                "checking",
+                "rate-limited",
+                "stopped-unsafe",
+                "stopped-recoverable",
+                "empty-ready",
+                "tools-unavailable",
+            ] {
+                for input in ["", "   ", "Question"] {
+                    let ctx = egui::Context::default();
+                    let themes = crate::themes::builtins();
+                    theme::configure(
+                        &ctx,
+                        themes.iter().find(|t| t.name == theme_name).unwrap(),
+                        theme::DEFAULT_ACCENT,
+                    );
+                    immediate_tooltips(&ctx);
+                    let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse(state).unwrap(), 1);
+                    pane.input = input.into();
+                    let blocked = pane.send_blocked_reason();
+                    let mut rect = egui::Rect::NOTHING;
+                    let mut clicked = false;
+                    let mut enabled = false;
+                    let output = render(&ctx, 360.0, vec![], |ui| {
+                        let response = pane.composer_button(ui);
+                        rect = response.rect;
+                        enabled = response.enabled();
+                    });
+                    assert_eq!(enabled, blocked.is_none(), "{state} {input:?}");
+                    assert_eq!(
+                        output
+                            .shapes
+                            .iter()
+                            .any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == theme::accent())),
+                        blocked.is_none()
+                    );
+                    let Some(reason) = blocked else { continue };
+                    assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+                        egui::Shape::Text(t) if t.galley.text() == "Send" && t.galley.job.sections[0].format.color == readable(theme::muted())
+                    )), "disabled ink: {state}");
+                    let fill = |output: &egui::FullOutput| {
+                        output
+                            .shapes
+                            .iter()
+                            .find_map(|s| match &s.shape {
+                                egui::Shape::Rect(r) if r.rect == rect => Some(r.fill),
+                                _ => None,
+                            })
+                            .unwrap()
+                    };
+                    let original_fill = fill(&output);
+                    let mut tooltip_seen = false;
+                    for _ in 0..4 {
+                        let output = render(&ctx, 360.0, vec![egui::Event::PointerMoved(rect.center())], |ui| {
+                            clicked |= pane.composer_button(ui).clicked();
+                        });
+                        assert_eq!(fill(&output), original_fill, "disabled hover {state}");
+                        tooltip_seen |= texts(&output).iter().any(|(s, _)| s == reason);
+                    }
+                    assert!(tooltip_seen, "missing disabled tooltip: {state}");
+                    for pressed in [true, false] {
+                        render(&ctx, 360.0, pointer(rect.center(), pressed), |ui| {
+                            clicked |= pane.composer_button(ui).clicked();
+                        });
+                    }
+                    assert!(!clicked);
+                }
+            }
+        }
+        let mut full = crate::agent_demo::pane(crate::agent_demo::State::parse("empty-ready").unwrap(), 1);
+        full.input = "Question".into();
+        for _ in 0..32 {
+            full.enqueue(Prompt { text: "queued".into(), requires_tools: false });
+        }
+        assert!(full.send_blocked_reason().unwrap().contains("queue is full"));
+    }
+
+    #[test]
+    fn paused_composer_adds_to_queue_waits_for_resume_and_measures_the_longer_label() {
+        for width in [360.0, 450.0, 660.0] {
+            let ctx = egui::Context::default();
+            immediate_tooltips(&ctx);
+            let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("queue").unwrap(), 1);
+            let original = pane.queue.clone();
+            let mut actions = Vec::new();
+            let mut draw = |pane: &mut AgentPane, events| {
+                render(&ctx, width, events, |ui| {
+                    actions = Vec::new();
+                    pane.composer(ui, egui::Id::new("paused-composer"), dp(48.0), &mut actions);
+                })
+            };
+            draw(&mut pane, vec![]);
+            let output = draw(&mut pane, vec![]);
+            let text = texts(&output);
+            let button = text.iter().find(|(s, _)| s == "Add to queue").unwrap().1;
+            assert!(button.right() <= width && !text.iter().any(|(s, _)| s == "Send"));
+            let mut tooltip_seen = false;
+            for _ in 0..4 {
+                let output = draw(&mut pane, vec![egui::Event::PointerMoved(button.center())]);
+                tooltip_seen |=
+                    texts(&output).iter().any(|(s, _)| s == "Add this prompt to the queue. It will wait for Resume.");
+            }
+            assert!(tooltip_seen);
+            for pressed in [true, false] {
+                draw(&mut pane, pointer(button.center(), pressed));
+            }
+            let prompt =
+                actions.into_iter().find_map(|a| if let Action::Send(p) = a { Some(p) } else { None }).unwrap();
+            pane.enqueue(prompt);
+            assert_eq!(pane.queue.len(), original.len() + 1);
+            assert_eq!(pane.queue[0], original[0]);
+            assert!(pane.next_prompt().is_none());
+            pane.resume_queue();
+            assert_eq!(pane.composer_label(), "Send");
+            assert_eq!(pane.next_prompt(), Some(original[0].clone()));
+        }
+    }
+
+    #[test]
+    fn privacy_has_three_small_headings_body_ink_and_the_existing_continue_action() {
+        for name in ["Terminal Dark", "Terminal Light", "Bloomberg"] {
+            for width in [360.0, 450.0, 660.0] {
+                let ctx = egui::Context::default();
+                let themes = crate::themes::builtins();
+                theme::configure(&ctx, themes.iter().find(|t| t.name == name).unwrap(), theme::DEFAULT_ACCENT);
+                let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("privacy").unwrap(), 1);
+                let draw = |pane: &mut AgentPane, events| {
+                    render(&ctx, width, events, |ui| {
+                        assert!(pane.show(ui, "BTC/USD · 1W", egui::Id::new("privacy-test")).is_empty());
+                    })
+                };
+                draw(&mut pane, vec![]);
+                let output = draw(&mut pane, vec![]);
+                let text = texts(&output);
+                let mut previous = 0.0;
+                for (heading, body) in PRIVACY_GROUPS {
+                    let heading_rect = text.iter().find(|(s, _)| s == heading).unwrap().1;
+                    let body_rect = text.iter().find(|(s, _)| s == body).unwrap().1;
+                    assert!(heading_rect.top() >= previous && body_rect.top() >= heading_rect.bottom());
+                    assert!(body_rect.right() <= width);
+                    previous = body_rect.bottom();
+                    for shape in &output.shapes {
+                        if let egui::Shape::Text(t) = &shape.shape {
+                            if t.galley.text() == *body {
+                                assert!(
+                                    t.galley.job.sections.iter().all(|s| s.format.color == theme::text()
+                                        && s.format.font_id == theme::body_font(13.0))
+                                );
+                            } else if t.galley.text() == *heading {
+                                assert_eq!(t.galley.job.sections[0].format.font_id, theme::ui_font(10.5));
+                            }
+                        }
+                    }
+                }
+                let pos = text.iter().find(|(s, _)| s == "Continue").unwrap().1.center();
+                for pressed in [true, false] {
+                    draw(&mut pane, pointer(pos, pressed));
+                }
+                assert!(pane.acknowledged && !pane.disclosure);
+            }
+        }
+        assert_eq!(
+            PRIVACY_GROUPS.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            ["What is sent", "What the agent can change", "What is stored on this Mac"]
+        );
+    }
+
+    #[test]
+    fn installation_instructions_are_secondary_adjacent_and_only_emit_on_click() {
+        for state in ["missing", "unsupported"] {
+            let ctx = egui::Context::default();
+            let pane = crate::agent_demo::pane(crate::agent_demo::State::parse(state).unwrap(), 1);
+            let mut actions = Vec::new();
+            render(&ctx, 660.0, vec![], |ui| pane.onboarding(ui, &mut actions));
+            assert!(actions.is_empty());
+            let output = render(&ctx, 660.0, vec![], |ui| pane.onboarding(ui, &mut actions));
+            let text = texts(&output);
+            let check = text.iter().find(|(s, _)| s == "Check again").unwrap().1;
+            let help = text.iter().find(|(s, _)| s == "Installation instructions").unwrap().1;
+            assert!(help.left() > check.right() && (help.center().y - check.center().y).abs() < dp(1.0));
+            assert!(!output.shapes.iter().any(
+                |s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == theme::accent() && r.rect.contains_rect(help))
+            ));
+            for pressed in [true, false] {
+                render(&ctx, 660.0, pointer(help.center(), pressed), |ui| pane.onboarding(ui, &mut actions));
+            }
+            assert_eq!(actions.len(), 1);
+            assert!(matches!(actions[0], Action::InstallationInstructions));
+        }
+    }
+
+    #[test]
+    fn checking_and_signing_in_use_static_drawn_status_and_keep_login_actions() {
+        for state in ["checking", "signing-in"] {
+            let ctx = egui::Context::default();
+            let pane = crate::agent_demo::pane(crate::agent_demo::State::parse(state).unwrap(), 1);
+            let mut actions = Vec::new();
+            let output = render(&ctx, 360.0, vec![], |ui| pane.onboarding(ui, &mut actions));
+            let text = texts(&output);
+            assert_eq!(text.iter().filter(|(s, _)| s == CHECKING_STATUS).count(), 1);
+            assert!(!text.iter().any(|(s, _)| s == "Checking…"));
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|s| matches!(&s.shape, egui::Shape::Circle(c) if c.stroke.color == readable(theme::muted())))
+            );
+            assert!(actions.is_empty());
+            assert_eq!(pane.coalescer.due_in(Instant::now(), true), None);
+            if state == "checking" {
+                assert!(
+                    !output
+                        .shapes
+                        .iter()
+                        .any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == theme::accent()))
+                );
+            } else {
+                for (label, reopen) in [("Cancel", false), ("Open sign-in page again", true)] {
+                    let output = render(&ctx, 360.0, vec![], |ui| pane.onboarding(ui, &mut actions));
+                    let pos = texts(&output).iter().find(|(s, _)| s == label).unwrap().1.center();
+                    actions.clear();
+                    for pressed in [true, false] {
+                        render(&ctx, 360.0, pointer(pos, pressed), |ui| pane.onboarding(ui, &mut actions));
+                    }
+                    assert_eq!(actions.len(), 1);
+                    assert!(matches!(
+                        (&actions[0], reopen),
+                        (Action::ReopenLogin, true) | (Action::CancelLogin, false)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chart_edits_mode_uses_the_same_name_at_all_widths_and_in_restart_notices() {
+        for width in [360.0, 450.0, 660.0] {
+            let ctx = egui::Context::default();
+            immediate_tooltips(&ctx);
+            let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("empty-ready").unwrap(), 1);
+            let output = render(&ctx, width, vec![], |ui| pane.mode_switch(ui, &mut Vec::new()));
+            let text = texts(&output);
+            let pos = text.iter().find(|(s, _)| s == "Chart edits").unwrap().1.center();
+            assert!(text.iter().any(|(s, _)| s == "Read only"));
+            let mut seen = false;
+            for _ in 0..4 {
+                let output = render(&ctx, width, vec![egui::Event::PointerMoved(pos)], |ui| {
+                    pane.mode_switch(ui, &mut Vec::new())
+                });
+                seen |= texts(&output).iter().any(|(s, _)| s == CHART_EDITS_HELP);
+            }
+            assert!(seen);
+            assert!(pane.select_tools(ToolsMode::Edit, true));
+            assert!(
+                matches!(pane.blocks.last(), Some(RenderedBlock::Notice(s)) if s == "Chart edits on restart. Queue stays paused; nothing is resent.")
+            );
+        }
+    }
+
+    #[test]
+    fn every_user_turn_keeps_you_at_the_left_across_demo_states_widths_and_long_markdown() {
+        for state in crate::agent_demo::STATES {
+            for width in [240.0, 360.0, 450.0, 660.0] {
+                let ctx = egui::Context::default();
+                let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse(state).unwrap(), 1);
+                // Add a second turn after a long answer to exercise both author rows,
+                // including fixtures that have no conversation to start with.
+                pane.running = false;
+                pane.state = Onboarding::Ready;
+                pane.start_prompt(Prompt { text: "A long user prompt ".repeat(8), requires_tools: false });
+                pane.blocks.push(RenderedBlock::Reply(agent_markdown::parse(&crate::agent_demo::MARKDOWN.repeat(3))));
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 20000.0))),
+                        ..Default::default()
+                    },
+                    |ui| pane.conversation(ui, &mut Vec::new()),
+                );
+                output.textures_delta.clear();
+                let text = texts(&output);
+                let prompts = text
+                    .iter()
+                    .filter(|(s, _)| pane.blocks.iter().any(|b| matches!(b, RenderedBlock::Prompt(p) if p == s)))
+                    .collect::<Vec<_>>();
+                let authors = text.iter().filter(|(s, _)| s == "You").collect::<Vec<_>>();
+                assert_eq!(prompts.len(), pane.turns.len(), "{state} {width}");
+                // Two fractional ink passes per author, not a second visible label.
+                assert_eq!(authors.len(), pane.turns.len() * 2, "{state} {width}");
+                for (prompt, author) in prompts.iter().zip(authors.iter().step_by(2)) {
+                    assert!((author.1.left() - prompt.1.left()).abs() < dp(1.0), "{state} {width}");
+                    assert!(author.1.bottom() <= prompt.1.top());
+                    assert!(author.1.left() >= 0.0 && author.1.right() <= width);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn data_basis_uses_source_bars_provider_flag_and_timeframe_progress() {
+        use std::sync::Arc;
+        use tr_core::{Bar, Timeframe};
+        for (tf, word) in [(Timeframe::W1, "Weekly"), (Timeframe::D1, "Daily"), (Timeframe::H4, "4H")] {
+            let mut chart = crate::chart_view::ChartState::new(1, "BTCUSD Crypto", tf);
+            assert_eq!(DataBasis::from_chart(&chart, false), DataBasis::default());
+            let now = chrono::Utc::now().timestamp();
+            let ts = tf.bucket_start(now);
+            let bars = Arc::new(vec![Bar::new(ts, 1., 2., 1., 2., 3.)]);
+            chart.on_history(
+                0,
+                bars.clone(),
+                tr_chart::scene::SeriesGpu::build(&bars),
+                0,
+                false,
+                false,
+                false,
+                &crate::worker::Worker::inert(),
+            );
+            let basis = DataBasis::from_chart(&chart, true);
+            assert!(basis.sample);
+            assert_eq!(basis.last_bar, Some(ts));
+            assert_eq!(basis.incomplete.as_deref(), Some(word));
+            assert_eq!(basis.freshness(), Some(format!("as of {}", local_time(ts))));
+            assert!(!DataBasis::from_chart(&chart, false).sample);
+            let old = Arc::new(vec![Bar::new(ts - 2 * tf.seconds(), 1., 2., 1., 2., 3.)]);
+            chart.on_history(
+                0,
+                old.clone(),
+                tr_chart::scene::SeriesGpu::build(&old),
+                0,
+                false,
+                false,
+                false,
+                &crate::worker::Worker::inert(),
+            );
+            assert!(DataBasis::from_chart(&chart, true).incomplete.is_none());
+        }
+    }
+
+    #[test]
+    fn reverted_turn_has_historical_label_muted_checks_and_no_redo() {
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("answer").unwrap(), 1);
+        crate::agent_demo::tool(&mut pane, "line", "create_drawing", Some(true), Some("Horizontal line"));
+        pane.undo_result(
+            crate::agent_demo::TURN,
+            Ok(crate::agent_bridge::UndoSummary { charts: 1, reverted: 1, skipped: vec![] }),
+        );
+        pane.expanded_tools.insert(0);
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| pane.conversation(ui, &mut Vec::new()));
+        output.textures_delta.clear();
+        let text = texts(&output);
+        for label in ["1 change reverted", "Reverted"] {
+            assert_eq!(text.iter().filter(|(s, _)| s == label).count(), 1, "{text:?}");
+        }
+        assert!(!text.iter().any(|(s, _)| s.starts_with("Undid")));
+        assert!(!text.iter().any(|(s, _)| s.contains("Redo") || s.starts_with("Undo ")));
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Path(path) if path.points.len() == 3 && path.stroke.color == egui::epaint::ColorMode::Solid(readable(theme::muted())))));
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Path(path) if path.stroke.color == egui::epaint::ColorMode::Solid(readable(theme::up())))));
+        pane.undo_result(crate::agent_demo::TURN, Err("unavailable".into()));
+        assert_eq!(pane.turns[0].reverted_changes, Some(1));
+    }
+
+    #[test]
+    fn tool_group_progress_is_event_driven_short_and_truthful() {
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("streaming").unwrap(), 1);
+        let label = |pane: &AgentPane| {
+            tool_group_label(
+                &pane
+                    .blocks
+                    .iter()
+                    .filter_map(|b| if let RenderedBlock::Tool(t) = b { Some(t) } else { None })
+                    .collect::<Vec<_>>(),
+                None,
+            )
+        };
+        assert_eq!(label(&pane), "Analyzing…");
+        crate::agent_demo::tool(&mut pane, "analyze", "analyze", Some(true), None);
+        assert_eq!(label(&pane), "Analyzed chart · 3 steps");
+        for (name, expected) in
+            [("read_chart", "Reading chart…"), ("read_data", "Reading bars…"), ("create_drawing", "Drawing…")]
+        {
+            let mut running = AgentPane::default();
+            crate::agent_demo::tool(&mut running, "running", name, None, None);
+            assert_eq!(label(&running), expected);
+            assert_eq!(running.coalescer.due_in(Instant::now(), true), None, "static running icons add no timer");
+        }
+    }
+
+    #[test]
+    fn state_specific_placeholders_disable_input_and_primary_actions_use_accent() {
+        for (state, expected) in [
+            (Onboarding::SignedOut, "Sign in to ask about this chart"),
+            (Onboarding::Missing, "Install Codex to start"),
+            (Onboarding::Unsupported { found: "old".into() }, "Install Codex to start"),
+            (Onboarding::Checking, "Starting…"),
+            (Onboarding::SigningIn, "Starting…"),
+            (Onboarding::RateLimited { reset: "later".into() }, "Usage limit reached"),
+            (Onboarding::Stopped { reason: "stopped".into(), unsafe_backend: false }, "Agent stopped"),
+        ] {
+            assert!(!state.accepts_input());
+            assert_eq!(state.composer_placeholder(), expected);
+        }
+        for name in ["signed-out", "empty-ready", "interrupted", "stopped-recoverable"] {
+            let ctx = egui::Context::default();
+            let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse(name).unwrap(), 1);
+            if name == "empty-ready" {
+                pane.input = "trend?".into();
+            }
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                pane.show(ui, "BTC/USD · 1W", egui::Id::new("primary"));
+            });
+            output.textures_delta.clear();
+            assert!(
+                output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == theme::accent())),
+                "{name}"
+            );
+        }
+        assert_eq!(RETRY_HELP, "Sends the same prompt again and starts a new answer.");
+        assert_eq!(
+            CHART_EDITS_HELP,
+            "The agent can add, change and remove its own drawings, indicators and comparisons on the pinned chart. Your objects are never changed, and every agent edit can be undone."
+        );
+    }
+
+    #[test]
+    fn clearing_rate_limit_never_resumes_queue_and_failed_turn_keeps_retry() {
+        let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
+        pane.enqueue(Prompt { text: "queued".into(), requires_tools: true });
+        pane.set_limits(&serde_json::json!({"rateLimits":{"primary":{"usedPercent":100,"resetsAt":crate::agent_demo::SAMPLE_NOW + 42 * 60}}}));
+        assert!(pane.queue_paused);
+        pane.set_limits(&serde_json::json!({"rateLimits":{"primary":{"usedPercent":0}}}));
+        assert_eq!(pane.state, Onboarding::Ready);
+        assert!(pane.next_prompt().is_none());
+        pane.resume_queue();
+        assert_eq!(pane.next_prompt().unwrap().text, "queued");
+        crate::agent_demo::complete(&mut pane, "failed");
+        assert!(pane.show_retry());
+        assert!(matches!(pane.blocks.last(), Some(RenderedBlock::Notice(text)) if text.starts_with("Turn failed.")));
+    }
+
+    #[test]
+    fn queue_review_remove_resume_and_clear_are_explicit_and_hide_when_empty() {
+        fn frame(pane: &mut AgentPane, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+            let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| pane.queue_row(ui));
+            output.textures_delta.clear();
+            output
+        }
+        fn click(pane: &mut AgentPane, ctx: &egui::Context, label: &str) {
+            frame(pane, ctx, vec![]);
+            let output = frame(pane, ctx, vec![]);
+            let pos = texts(&output).iter().find(|(s, _)| s == label).unwrap().1.center();
+            for pressed in [true, false] {
+                frame(
+                    pane,
+                    ctx,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("queue").unwrap(), 1);
+        assert!(pane.queue_review);
+        let first = pane.queue[0].text.clone();
+        let output = frame(&mut pane, &ctx, vec![]);
+        let text = texts(&output);
+        let rect = |label: &str| text.iter().find(|(s, _)| s == label).unwrap().1;
+        assert!(rect("1.").left() < rect(&first).left());
+        assert!(rect(&first).right() < rect("Remove").left());
+        assert!((rect(&first).left() - rect(&pane.queue[1].text).left()).abs() < dp(1.0));
+        assert!(rect("1.").left() == rect("2.").left());
+        assert!(text.iter().any(|(s, _)| s == "Hide queue"));
+        click(&mut pane, &ctx, "Hide queue");
+        let output = frame(&mut pane, &ctx, vec![]);
+        assert!(texts(&output).iter().any(|(s, _)| s == "Review"));
+        assert!(!texts(&output).iter().any(|(s, _)| s == &first));
+        click(&mut pane, &ctx, "Review");
+        click(&mut pane, &ctx, "Remove");
+        assert_eq!(pane.queue.len(), 1);
+        assert!(!pane.queue.iter().any(|prompt| prompt.text == first));
+        assert!(pane.queue_paused);
+        click(&mut pane, &ctx, "Resume");
+        assert!(!pane.queue_paused);
+        let output = frame(&mut pane, &ctx, vec![]);
+        assert!(!texts(&output).iter().any(|(s, _)| s == "Resume"));
+        click(&mut pane, &ctx, "Clear");
+        assert!(pane.queue.is_empty());
+        assert!(texts(&frame(&mut pane, &ctx, vec![])).is_empty());
+    }
+
+    #[test]
+    fn interrupted_retry_is_adjacent_and_emits_retry_not_resume() {
+        let ctx = egui::Context::default();
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("interrupted").unwrap(), 1);
+        let mut actions = Vec::new();
+        let mut render = |pane: &mut AgentPane, events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(660., 800.))),
+                    ..Default::default()
+                },
+                |ui| {
+                    actions = pane.show(ui, "BTC/USD · 1W", egui::Id::new("retry-adjacent"));
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        render(&mut pane, vec![]);
+        let output = render(&mut pane, vec![]);
+        let text = texts(&output);
+        let notice = text.iter().find(|(s, _)| s == INTERRUPTED).unwrap().1;
+        let retry = text.iter().find(|(s, _)| s == "Retry response").unwrap().1;
+        assert_eq!(text.iter().filter(|(s, _)| s == "Retry response").count(), 1);
+        assert!((notice.center().y - retry.center().y).abs() <= dp(5.0));
+        assert!(retry.left() >= notice.right());
+        let pos = retry.center();
+        for pressed in [true, false] {
+            render(
+                &mut pane,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(actions.iter().any(|action| matches!(action, Action::Retry)));
+        assert!(pane.queue_paused);
+        let original = pane.last_prompt.clone().unwrap();
+        let turn_count = pane.turns.len();
+        assert_eq!(pane.start_prompt(original.clone()), Some(original));
+        assert_eq!(pane.turns.len(), turn_count + 1);
+        assert!(pane.queue_paused);
+    }
+
+    #[test]
+    fn user_prompt_has_small_you_label_strong_ink_hairline_and_no_caret_rule() {
+        let ctx = egui::Context::default();
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("answer").unwrap(), 1);
+        pane.start_prompt(Prompt { text: "Second question".into(), requires_tools: true });
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(dp(8.0), dp(8.0));
+            pane.conversation(ui, &mut Vec::new());
+        });
+        output.textures_delta.clear();
+        let text = texts(&output);
+        let previous = text.iter().find(|(s, _)| s.starts_with("These are synthetic sample bars")).unwrap().1;
+        let next_you = text.iter().filter(|(s, _)| s == "You").map(|(_, rect)| rect.top()).fold(0.0_f32, f32::max);
+        let gap = next_you - previous.bottom();
+        assert!((dp(16.0)..=dp(24.0)).contains(&gap), "turn gap {gap}");
+        let you = text.iter().find(|(s, _)| s == "You").unwrap().1;
+        let prompt = text.iter().find(|(s, _)| s.starts_with("What's the weekly")).unwrap().1;
+        assert!(you.bottom() <= prompt.top());
+        let question = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Second question" => Some(t),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(question.galley.job.sections[0].format.color, theme::text());
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::LineSegment { points, .. } if points[0].y == points[1].y && points[0].y > prompt.bottom())));
+        assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::LineSegment { points, .. } if points[0].x == prompt.left() && points[1].x == prompt.left() && points[0].y <= prompt.top() && points[1].y >= prompt.bottom())));
+    }
+
+    #[test]
+    fn response_style_defaults_and_all_choices_persist_without_conversation() {
+        assert_eq!(Settings::default().response_style, ResponseStyle::Analyst);
+        assert_eq!(serde_json::from_str::<Settings>("{}").unwrap().response_style, ResponseStyle::Analyst);
+        for (serialized, expected) in [
+            ("Terse", ResponseStyle::Terse),
+            ("Brief", ResponseStyle::Terse),
+            ("Analyst", ResponseStyle::Analyst),
+            ("Standard", ResponseStyle::Analyst),
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({"response_style": serialized})).unwrap();
+            assert_eq!(settings.response_style, expected);
+            assert_eq!(serde_json::to_value(&settings).unwrap()["response_style"], expected.label());
+        }
+        assert!(
+            ResponseStyle::Terse
+                .instruction()
+                .contains("Lead with numbers; use minimal prose, key levels and timestamps")
+        );
+        assert!(
+            ResponseStyle::Analyst.instruction().contains("brief plain English with key numbers and a bottom line")
+        );
+        assert!(ResponseStyle::Detailed.instruction().contains("reasoning and concepts"));
+        for style in [ResponseStyle::Terse, ResponseStyle::Analyst, ResponseStyle::Detailed] {
+            let settings = Settings { response_style: style, ..Default::default() };
+            let json = serde_json::to_string(&crate::layouts::PaneSettings::Agent(settings.clone())).unwrap();
+            let saved: crate::layouts::PaneSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(saved, crate::layouts::PaneSettings::Agent(settings));
+        }
+    }
+
+    #[test]
+    fn notices_use_meaning_only_ink_with_readable_contrast_in_every_theme() {
+        for (text, severity) in [
+            ("3 changes reverted", Severity::Info),
+            ("Read only on restart", Severity::Info),
+            ("Queue paused", Severity::Warning),
+            ("Turn interrupted. Answer is provisional", Severity::Warning),
+            ("Recovered with history lost", Severity::Warning),
+            ("Safety check failed", Severity::Error),
+            ("Could not open sign-in", Severity::Error),
+            (UNDO_UNAVAILABLE, Severity::Error),
+        ] {
+            assert_eq!(notice_severity(text), severity, "{text}");
+        }
+        let mut pane = AgentPane::default();
+        pane.event(BridgeEvent::Wire(WireEvent::Error("opaque diagnostic".into())));
+        assert_eq!(pane.notice_levels.get(&0), Some(&Severity::Error));
+        let original = theme::palette();
+        for t in crate::themes::builtins() {
+            theme::set_palette(t.palette(theme::DEFAULT_ACCENT));
+            for ink in [theme::text(), readable(theme::muted())] {
+                assert!(contrast(ink, theme::card()) >= 4.5, "{} user/tool/status ink", t.name);
+            }
+            for severity in [Severity::Info, Severity::Warning, Severity::Error] {
+                assert!(contrast(severity.color(), theme::card()) >= 4.5, "{} {severity:?}", t.name);
+            }
+        }
+        theme::set_palette(original);
+    }
+
+    #[test]
+    fn composer_queue_and_retry_visibility_follows_turn_outcome() {
+        let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
+        assert!(pane.queue.is_empty());
+        assert!(!pane.show_retry());
+        pane.start_prompt(Prompt { text: "trend".into(), requires_tools: true });
+        assert!(!pane.show_retry());
+        pane.event(BridgeEvent::Completed {
+            turn: "one".into(),
+            status: "completed".into(),
+            calls: 0,
+            interrupt_elapsed: None,
+        });
+        assert!(!pane.show_retry());
+        pane.start_prompt(pane.last_prompt.clone().unwrap());
+        pane.interrupt();
+        pane.event(BridgeEvent::Completed {
+            turn: "two".into(),
+            status: "interrupted".into(),
+            calls: 0,
+            interrupt_elapsed: None,
+        });
+        assert!(pane.show_retry());
+        pane.enqueue(Prompt { text: "next".into(), requires_tools: false });
+        assert_eq!(pane.queue.len(), 1);
+        pane.state = Onboarding::ToolsUnavailable { reason: "test".into() };
+        assert!(pane.show_retry());
+        pane.state = Onboarding::SignedOut;
+        assert!(!pane.show_retry());
+    }
+
+    #[test]
+    fn onboarding_copy_and_primary_action_are_one_adjacent_block() {
+        for (state, title, copy, primary) in [
+            (
+                Onboarding::Dormant,
+                "Chart analyst",
+                "Chart tools run locally in a sandbox; prompts and chart data are sent to OpenAI.",
+                "Start",
+            ),
+            (Onboarding::Missing, "Codex isn't installed", "Install the Codex CLI", "Check again"),
+            (
+                Onboarding::Unsupported { found: "0.160.0".into() },
+                "Codex version not supported",
+                "Found 0.160.0; this build is tested with 0.163.0.",
+                "Check again",
+            ),
+            (
+                Onboarding::SignedOut,
+                "Sign in with ChatGPT",
+                "API-key accounts aren't supported.",
+                "Sign in with ChatGPT",
+            ),
+            (Onboarding::SigningIn, "Finish signing in", "your browser", "Cancel"),
+            (Onboarding::RateLimited { reset: "18:00 UTC".into() }, "Usage limit reached", "18:00 UTC", "Check limits"),
+            (
+                Onboarding::ToolsUnavailable { reason: "router".into() },
+                "Chart data unavailable",
+                "No analysis was completed.",
+                "Retry response",
+            ),
+            (
+                Onboarding::Stopped { reason: "tripwire".into(), unsafe_backend: true },
+                "Agent stopped for safety",
+                "Close it and start a new one.",
+                "Close",
+            ),
+            (
+                Onboarding::Stopped { reason: "lost".into(), unsafe_backend: false },
+                "Agent disconnected",
+                "nothing is resent",
+                "Restart",
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let pane = AgentPane { state, ..Default::default() };
+            assert_eq!(pane.state.title(), title);
+            assert!(pane.state.description().contains(copy));
+            let mut output = ctx.run_ui(Default::default(), |ui| pane.onboarding(ui, &mut Vec::new()));
+            output.textures_delta.clear();
+            let text = texts(&output);
+            let body = text.iter().find(|(s, _)| *s == pane.state.description()).unwrap().1;
+            let action = text.iter().rfind(|(s, _)| s == primary).unwrap().1;
+            let last_line = if pane.state == Onboarding::SigningIn {
+                text.iter().find(|(s, _)| s == CHECKING_STATUS).unwrap().1
+            } else {
+                body
+            };
+            assert!(action.top() >= last_line.bottom());
+            assert!(action.top() - last_line.bottom() <= dp(16.0), "{title}");
+            if pane.state == Onboarding::Dormant {
+                assert_eq!(
+                    pane.state.description(),
+                    "Answers questions about your pinned chart using your ChatGPT account. Chart tools run locally in a sandbox; prompts and chart data are sent to OpenAI."
+                );
+            }
+            if pane.state == Onboarding::SigningIn {
+                assert!(text.iter().any(|(s, _)| s == "Open sign-in page again"));
+            }
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn header_controls_and_data_context_wrap_without_clipping_in_desk_themes() {
+        for name in ["Terminal Dark", "Terminal Light", "Bloomberg"] {
+            for width in [360.0, 450.0, 660.0] {
+                let ctx = egui::Context::default();
+                let themes = crate::themes::builtins();
+                let t = themes.iter().find(|t| t.name == name).unwrap();
+                theme::configure(&ctx, t, theme::DEFAULT_ACCENT);
+                let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("empty-ready").unwrap(), 1);
+                let mut bottom = 0.0;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.0))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        pane.header(ui, "BTC/USD · 1W", &mut Vec::new());
+                        bottom = ui.min_rect().bottom();
+                    },
+                );
+                output.textures_delta.clear();
+                let text = texts(&output);
+                assert!(bottom <= dp(108.0), "{name} {width}: {bottom} {text:?}");
+                for label in [
+                    "Read only",
+                    "Chart edits",
+                    "BTC/USD · 1W",
+                    "Standard",
+                    "Ready",
+                    "Sample data",
+                    "Weekly bar incomplete",
+                ] {
+                    let rect = text
+                        .iter()
+                        .find(|(s, _)| s == label)
+                        .unwrap_or_else(|| panic!("{name} {width}: missing {label}: {text:?}"))
+                        .1;
+                    assert!(rect.right() <= width && rect.left() >= 0.0, "{name} {width}: {label} {rect:?}");
+                }
+                assert!(!text.iter().any(|(s, _)| ["Brief", "Detailed", "Terse", "Analyst"].contains(&s.as_str())));
+                for (_, rect) in &text {
+                    assert!(rect.right() <= width + 0.5, "{name} {width}: {text:?}");
+                }
+                output.textures_delta.clear();
+            }
+        }
+        assert_eq!(header_rows(360.0, 600.0), 2);
+        assert_eq!(header_rows(660.0, 600.0), 1);
+    }
+
+    #[test]
+    fn context_chip_has_outline_hover_and_emits_pin_while_dropdowns_have_chevrons() {
+        let ctx = egui::Context::default();
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("empty-ready").unwrap(), 1);
+        let mut actions = Vec::new();
+        let mut frame = |pane: &mut AgentPane, events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                pane.header(ui, "BTC/USD · 1W", &mut actions);
+            });
+            output.textures_delta.clear();
+            output
+        };
+        frame(&mut pane, vec![]);
+        let output = frame(&mut pane, vec![]);
+        let chip = texts(&output).iter().find(|(s, _)| s == "BTC/USD · 1W").unwrap().1;
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.rect.contains_rect(chip) && r.stroke.color == theme::border())));
+        // Model and style both paint line-path chevrons, not text glyphs.
+        assert!(
+            output.shapes.iter().filter(|s| matches!(&s.shape, egui::Shape::Path(p) if p.points.len() == 3)).count()
+                >= 2
+        );
+        let pos = chip.center();
+        let hover = frame(&mut pane, vec![egui::Event::PointerMoved(pos)]);
+        assert!(hover.shapes.iter().any(
+            |s| matches!(&s.shape, egui::Shape::Rect(r) if r.rect.contains(pos) && r.fill == theme::control_hover())
+        ));
+        for pressed in [true, false] {
+            frame(
+                &mut pane,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        assert!(actions.iter().any(|action| matches!(action, Action::Pin)));
+    }
+
+    #[test]
+    fn tool_inspector_expands_on_click_and_keeps_object_ids_in_tooltips() {
+        fn frame(pane: &mut AgentPane, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(450.0, 700.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    pane.show(ui, "BTC/USD · 1W", egui::Id::new("tool-inspector"));
+                },
+            );
+            output.textures_delta.clear();
+            output
+        }
+        let ctx = egui::Context::default();
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("answer").unwrap(), 1);
+        crate::agent_demo::tool(
+            &mut pane,
+            "line",
+            "create_drawing",
+            Some(true),
+            Some("#1:3 · Horizontal line at 27,534.92"),
+        );
+        frame(&mut pane, &ctx, vec![]);
+        let output = frame(&mut pane, &ctx, vec![]);
+        let text = texts(&output);
+        assert!(!text.iter().any(|(s, _)| s.contains("Horizontal line")));
+        let pos = text.iter().find(|(s, _)| s == "Drew 1 line · 4 steps").unwrap().1.center();
+        let click = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut pane, &ctx, vec![egui::Event::PointerMoved(pos), click(true)]);
+        frame(&mut pane, &ctx, vec![click(false)]);
+        let output = frame(&mut pane, &ctx, vec![]);
+        assert!(pane.expanded_tools.contains(&0));
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s == "Draw · Horizontal line at 27,534.92"));
+        assert!(text.iter().any(|(s, _)| s == "42 ms"));
+        assert!(!text.iter().any(|(s, _)| s.contains("#1:3") || s == "Details" || s.contains("chart_id")));
+        assert!(text.iter().any(|(s, _)| s == "Drew 1 line · 4 steps"));
+        assert_eq!(price_label(27534.92), "27,534.92");
+        assert_eq!(main_tool_label("#1:3 · RSI 14"), "RSI 14");
+    }
+
+    #[test]
+    fn tool_rows_use_human_verbs_status_icons_and_aligned_mono_durations() {
+        let names = [
+            ("read_chart", "Read chart"),
+            ("read_data", "Read bars"),
+            ("analyze", "Analyze"),
+            ("indicator_values", "Indicator values"),
+            ("find_symbol", "Find symbol"),
+            ("read_user_actions", "Recent actions"),
+            ("screenshot", "Screenshot"),
+            ("create_drawing", "Draw"),
+            ("update_drawing", "Edit drawing"),
+            ("delete_drawing", "Delete drawing"),
+            ("add_indicator", "Add indicator"),
+            ("remove_indicator", "Remove indicator"),
+            ("set_view", "Change view"),
+            ("compare", "Compare"),
+        ];
+        for (name, expected) in names {
+            assert_eq!(tool_label(name), expected);
+        }
+        for width in [360.0, 450.0, 660.0] {
+            let ctx = egui::Context::default();
+            ctx.all_styles_mut(|style| {
+                style.interaction.tooltip_delay = 0.0;
+                style.interaction.tooltip_grace_time = 0.0;
+            });
+            let mut row_rect = egui::Rect::NOTHING;
+            let trace = Trace {
+                id: "internal-call".into(),
+                name: "create_drawing".into(),
+                success: Some(true),
+                duration_ms: Some(42),
+                arguments: "safe projected arguments".into(),
+                summary: Some("#1:3 · Horizontal line at 27,534.92".into()),
+                interrupted: false,
+            };
+            for (success, interrupted, expected) in [
+                (Some(true), false, "ok"),
+                (Some(false), false, "failed"),
+                (None, false, "running"),
+                (None, true, "interrupted"),
+            ] {
+                let trace = Trace { success, interrupted, ..trace.clone() };
+                assert_eq!(tool_status(&trace), expected);
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.0))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let start = ui.next_widget_position();
+                        tool_row(ui, &trace);
+                        row_rect = egui::Rect::from_min_max(start, ui.min_rect().max);
+                    },
+                );
+                output.textures_delta.clear();
+                let text = texts(&output);
+                let label = text.iter().find(|(s, _)| s.starts_with("Draw · ")).unwrap();
+                let duration = text.iter().find(|(s, _)| s == "42 ms").unwrap();
+                assert!(label.1.right() + dp(6.0) <= duration.1.left());
+                assert!((duration.1.right() - width).abs() < 0.1);
+                assert!(row_rect.height() <= dp(24.0));
+                assert!(!text.iter().any(|(s, _)| s.contains("#1:3") || s.contains("internal-call") || s == "Details"));
+                assert!(output.shapes.iter().any(|s| !matches!(s.shape, egui::Shape::Text(_) | egui::Shape::Noop)));
+                let duration = output
+                    .shapes
+                    .iter()
+                    .find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text() == "42 ms" => Some(t),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(duration.galley.job.sections[0].format.font_id.family, egui::FontFamily::Monospace);
+            }
+            // Hover anywhere on the row exposes diagnostics without a second disclosure.
+            let pos = row_rect.center();
+            for _ in 0..3 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.0))),
+                        events: vec![egui::Event::PointerMoved(pos)],
+                        ..Default::default()
+                    },
+                    |ui| tool_row(ui, &trace),
+                );
+                output.textures_delta.clear();
+                if texts(&output).iter().any(|(s, _)| {
+                    s.contains("internal-call") && s.contains("#1:3") && s.contains("safe projected arguments")
+                }) {
+                    row_rect = egui::Rect::NOTHING;
+                    break;
+                }
+            }
+            assert_eq!(row_rect, egui::Rect::NOTHING, "missing row tooltip at {width}");
+        }
+    }
+
+    #[test]
+    fn queue_row_is_above_composer_and_retry_stays_with_interruption() {
+        for width in [360.0, 450.0, 660.0] {
+            let ctx = egui::Context::default();
+            let mut pane =
+                AgentPane { state: Onboarding::Ready, acknowledged: true, disclosure: false, ..Default::default() };
+            pane.start_prompt(Prompt { text: "trend".into(), requires_tools: true });
+            pane.enqueue(Prompt { text: "next".into(), requires_tools: false });
+            pane.event(BridgeEvent::Completed {
+                turn: "failed".into(),
+                status: "failed".into(),
+                calls: 0,
+                interrupt_elapsed: None,
+            });
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    pane.show(ui, "BTC/USD · 1W", egui::Id::new("queue-composer"));
+                },
+            );
+            output.textures_delta.clear();
+            let text = texts(&output);
+            let rect =
+                |label: &str| text.iter().find(|(s, _)| s == label).unwrap_or_else(|| panic!("missing {label}")).1;
+            let send = rect("Add to queue");
+            for label in ["1 queued · Paused", "Review", "Resume", "Clear"] {
+                assert!(rect(label).bottom() < send.top());
+                assert!(rect(label).right() <= width);
+            }
+            assert!(rect("Retry response").top() < rect("1 queued · Paused").top());
+            assert!(rect("Not investment advice").bottom() <= 700.0);
+            assert!(!text.iter().any(|(s, _)| s == "Retry"));
+        }
+    }
+
+    #[test]
+    fn composer_is_a_padded_focus_bordered_field_that_grows_to_six_lines() {
+        for name in ["Terminal Dark", "Terminal Light", "Bloomberg"] {
+            for width in [360.0, 450.0, 660.0] {
+                let ctx = egui::Context::default();
+                let themes = crate::themes::builtins();
+                theme::configure(&ctx, themes.iter().find(|t| t.name == name).unwrap(), theme::DEFAULT_ACCENT);
+                let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("empty-ready").unwrap(), 1);
+                let id = egui::Id::new("field-test");
+                let mut heights = Vec::new();
+                for (lines, focused) in [(0, false), (3, true), (12, true)] {
+                    pane.input = (0..lines).map(|_| "Sample line").collect::<Vec<_>>().join("\n");
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.0))),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            if focused {
+                                ui.memory_mut(|m| m.request_focus(input_id(id)));
+                            }
+                            pane.show(ui, "BTC/USD · 1W", id);
+                        },
+                    );
+                    output.textures_delta.clear();
+                    let text = texts(&output);
+                    let send = text.iter().find(|(s, _)| s == "Send").unwrap().1;
+                    let field = output
+                        .shapes
+                        .iter()
+                        .find_map(|s| match &s.shape {
+                            egui::Shape::Rect(r)
+                                if r.fill == theme::control()
+                                    && r.stroke.width == dp(1.0)
+                                    && r.rect.contains_rect(send) =>
+                            {
+                                Some(r)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("missing composer field: {name} {width}"));
+                    assert_eq!(field.stroke.color, if focused { theme::accent() } else { theme::border() });
+                    assert_eq!(field.corner_radius, egui::CornerRadius::same(dp(6.0) as u8));
+                    let text = texts(&output);
+                    let send = text.iter().find(|(s, _)| s == "Send").unwrap().1;
+                    assert!(field.rect.contains_rect(send));
+                    assert!(field.rect.right() - send.right() >= dp(8.0));
+                    assert!(field.rect.right() <= width - dp(12.0) && width - field.rect.right() <= dp(13.0));
+                    let line_height = ctx.fonts_mut(|fonts| fonts.row_height(&theme::body_font(13.0)));
+                    assert!(field.rect.height() <= line_height * 6.0 + dp(18.0));
+                    if lines == 0 {
+                        let hint = text.iter().find(|(s, _)| s == "Ask about the pinned chart").unwrap().1;
+                        assert!(hint.left() - field.rect.left() >= dp(8.0));
+                        assert!(hint.right() <= send.left());
+                    }
+                    let disclaimer = text.iter().find(|(s, _)| s == "Not investment advice").unwrap().1;
+                    assert!(
+                        disclaimer.bottom() <= 700.0,
+                        "{name} {width} {lines} lines: field {:?}, disclaimer {disclaimer:?}",
+                        field.rect
+                    );
+                    heights.push(field.rect.height());
+                }
+                assert!(heights[0] < heights[1] && heights[1] < heights[2], "{name} {width}: {heights:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn undo_is_at_tool_results_right_edge_below_prompt_and_proportional_time() {
+        for width in [360.0, 450.0, 660.0] {
+            let ctx = egui::Context::default();
+            let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("edits").unwrap(), 1);
+            for (id, name, summary) in [
+                ("one", "create_drawing", "Horizontal line"),
+                ("two", "create_drawing", "Trend line"),
+                ("three", "add_indicator", "RSI 14"),
+            ] {
+                crate::agent_demo::tool(&mut pane, id, name, Some(true), Some(summary));
+            }
+            crate::agent_demo::complete(&mut pane, "completed");
+            pane.refresh_undo(&[crate::agent_demo::TURN.into()], Some(crate::agent_demo::TURN));
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    pane.show(ui, "BTC/USD · 1W", egui::Id::new("inline-undo"));
+                },
+            );
+            output.textures_delta.clear();
+            let text = texts(&output);
+            let undo = text.iter().find(|(s, _)| s == "Undo 3 chart changes").unwrap().1;
+            let prompt = text.iter().find(|(s, _)| s.starts_with("Mark support")).unwrap().1;
+            let time = text.iter().find(|(s, _)| s == &pane.turns[0].local_time).unwrap().1;
+            let tools = text.iter().find(|(s, _)| s == "Drew 2 lines and added RSI 14 · 3 steps").unwrap().1;
+            assert!(undo.top() >= prompt.bottom());
+            assert!(time.bottom() <= prompt.top());
+            assert!(tools.right() <= undo.left());
+            assert!((tools.top() - undo.top()).abs() <= dp(5.0));
+            assert!(
+                undo.right() <= width && width - undo.right() <= dp(24.0),
+                "{width}: {undo:?}, time {time:?}, prompt {prompt:?}"
+            );
+            let time = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(t) if t.galley.text() == pane.turns[0].local_time => Some(t),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(time.galley.job.sections[0].format.font_id, theme::body_font(10.5));
+        }
+    }
+
+    #[test]
+    fn local_times_and_rate_limit_copy_never_show_raw_offsets() {
+        let timestamp = crate::agent_demo::SAMPLE_NOW;
+        let time = local_time(timestamp);
+        assert!(!time.contains('+') && !time.contains('-'), "{time}");
+        let reset = reset_time_at(Some(timestamp + 42 * 60), timestamp);
+        assert!(reset.starts_with("in 42 minutes · "), "{reset}");
+        assert!(reset.ends_with(&local_time(timestamp + 42 * 60)));
+        assert!(!reset.contains("AM") && !reset.contains("PM"));
+        let clock = &time[..5];
+        assert_eq!(clock.as_bytes()[2], b':');
+        assert!(clock[..2].parse::<u8>().unwrap() < 24);
+        assert!(!reset.contains('+'));
+        assert_eq!(reset_time_at(None, timestamp), "time unavailable");
+        assert_eq!(local_time(i64::MAX), "time unavailable");
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("rate-limited").unwrap(), 1);
+        pane.limits[0].reset = "in 42 minutes · 20:42 EDT".into();
+        pane.state = Onboarding::RateLimited { reset: "in 42 minutes · 20:42 EDT".into() };
+        assert_eq!(
+            pane.state.description(),
+            "Resets in 42 minutes · 20:42 EDT. Queued prompts stay paused until you resume them."
+        );
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            pane.show(ui, "Pinned", egui::Id::new("times"));
+        });
+        output.textures_delta.clear();
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s == "5-hour limit · 100% used"));
+        assert_eq!(text.iter().filter(|(s, _)| s.contains("20:42 EDT")).count(), 1);
+        assert_eq!(text.iter().filter(|(s, _)| s.contains("in 42 minutes")).count(), 1);
+    }
+
+    #[test]
+    fn conversation_wraps_and_composer_stays_visible_at_review_widths() {
+        for name in ["Terminal Dark", "Terminal Light", "Bloomberg"] {
+            for width in [360.0, 450.0, 660.0] {
+                let ctx = egui::Context::default();
+                let themes = crate::themes::builtins();
+                theme::configure(&ctx, themes.iter().find(|t| t.name == name).unwrap(), theme::DEFAULT_ACCENT);
+                let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("answer").unwrap(), 1);
+                pane.notice(&"unbroken".repeat(100));
+                pane.input = "line\n".repeat(20);
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.0))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        pane.show(ui, "BTC/USD · 1W", egui::Id::new("wrap-test"));
+                    },
+                );
+                output.textures_delta.clear();
+                let text = texts(&output);
+                for (label, rect) in &text {
+                    assert!(rect.right() <= width + 1.0 && rect.left() >= -1.0, "{name} {width}: {label} {rect:?}");
+                }
+                let disclaimer = text.iter().find(|(s, _)| s == "Not investment advice").unwrap().1;
+                assert!(disclaimer.bottom() <= 700.0, "composer offscreen: {disclaimer:?}");
+                assert!(!text.iter().any(|(s, _)| s.contains("0 queued") || s == "Retry"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1055,7 +3295,7 @@ mod tests {
         }
         pane.transition(Onboarding::Ready);
         assert!(matches!(pane.state, Onboarding::Stopped { unsafe_backend: true, .. }));
-        assert_eq!(pane.state.primary(), "Close agent");
+        assert_eq!(pane.state.primary(), "Close");
     }
 
     #[test]
@@ -1114,10 +3354,15 @@ mod tests {
 
     #[test]
     fn settings_roundtrip_contains_only_choices_and_edit_requires_availability() {
-        let settings =
-            Settings { model: "m".into(), effort: "max".into(), tools: ToolsMode::Edit, pinned_chart: Some(41) };
+        let settings = Settings {
+            model: "m".into(),
+            effort: "max".into(),
+            tools: ToolsMode::Edit,
+            pinned_chart: Some(41),
+            response_style: ResponseStyle::Detailed,
+        };
         let value = serde_json::to_value(crate::layouts::PaneSettings::Agent(settings.clone())).unwrap();
-        assert_eq!(value["Agent"].as_object().unwrap().len(), 4);
+        assert_eq!(value["Agent"].as_object().unwrap().len(), 5);
         assert_eq!(
             serde_json::from_value::<crate::layouts::PaneSettings>(value).unwrap(),
             crate::layouts::PaneSettings::Agent(settings.clone())
@@ -1450,14 +3695,33 @@ mod wire_tests {
 
     #[test]
     fn both_undo_buttons_emit_app_actions_and_summary_stays_inline_when_disabled() {
-        for label in ["Undo this turn", "Undo last agent turn"] {
+        for label in ["Undo 1 chart change", "Undo last agent turn"] {
             let mut pane = AgentPane { state: Onboarding::Ready, acknowledged: true, ..Default::default() };
             completed_edit(&mut pane, "canonical");
             pane.refresh_undo(&["canonical".into()], Some("canonical"));
             let ctx = egui::Context::default();
             // Let egui settle wrapping/layout before pointing at the button.
             frame(&mut pane, &ctx, vec![]);
-            let (_, output) = frame(&mut pane, &ctx, vec![]);
+            let (_, mut output) = frame(&mut pane, &ctx, vec![]);
+            if label == "Undo last agent turn" {
+                let menu = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Circle(c) if c.radius > 0.5 && c.radius < 1.5 => Some(c.center),
+                        _ => None,
+                    })
+                    .expect("drawn overflow menu");
+                let click_menu = |pressed| egui::Event::PointerButton {
+                    pos: menu,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                frame(&mut pane, &ctx, vec![egui::Event::PointerMoved(menu), click_menu(true)]);
+                frame(&mut pane, &ctx, vec![click_menu(false)]);
+                (_, output) = frame(&mut pane, &ctx, vec![]);
+            }
             let pos = text_position(&output, label);
             let click = |pressed| egui::Event::PointerButton {
                 pos,
@@ -1474,7 +3738,7 @@ mod wire_tests {
             );
             pane.refresh_undo(&[], None);
             let (_, output) = frame(&mut pane, &ctx, vec![]);
-            text_position(&output, "Undo: 2 reverted · 1 conflicts skipped · 1 charts");
+            text_position(&output, "2 changes reverted · 1 kept because you edited them");
             frame(&mut pane, &ctx, vec![click(true)]);
             let (actions, _) = frame(&mut pane, &ctx, vec![click(false)]);
             assert!(!actions.iter().any(|a| matches!(a, Action::UndoTurn(_))));

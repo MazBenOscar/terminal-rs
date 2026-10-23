@@ -11,6 +11,7 @@ mod broker;
 mod chrome;
 mod columns_view;
 mod demo;
+mod demo_harness;
 mod hotkeys_view;
 mod options_view;
 mod palette_view;
@@ -727,6 +728,7 @@ pub struct TerminalApp {
     pub agent_queue: crate::agent_queue::AgentToolQueue,
     pub pinned_agent_chart: Option<u64>,
     pub(crate) agent_pane: crate::agent_pane::AgentPane,
+    agent_demo: Option<crate::agent_demo::Demo>,
     agent_turns: Vec<String>,
     agent_save_pending: bool,
     pub edit_log: crate::edit_log::EditLog,
@@ -969,6 +971,7 @@ impl TerminalApp {
             agent_queue: crate::agent_queue::AgentToolQueue::new(ctx.clone()),
             pinned_agent_chart: None,
             agent_pane: crate::agent_pane::AgentPane::default(),
+            agent_demo: None,
             agent_turns: Vec::new(),
             agent_save_pending: false,
             edit_log: Default::default(),
@@ -1150,6 +1153,9 @@ impl TerminalApp {
     }
 
     fn save_prefs(&mut self) {
+        if self.agent_demo.is_some() {
+            return;
+        }
         if let Err(e) = self.prefs.save(&prefs_path()) {
             self.status = format!("Could not save preferences: {e}");
         }
@@ -2272,6 +2278,25 @@ impl TerminalApp {
     /// Global and chart hotkeys. Runs before the command line so it can claim keys; when
     /// the command line holds text, keys belong to it.
     fn hotkeys(&mut self, ctx: &egui::Context) {
+        // A rebindable chord, checked before text-field ownership; never steals palette/rebinding keys.
+        if self.rebinding.is_none() && !self.palette.open {
+            let focus = ctx.input(|input| {
+                input.events.iter().find_map(|event| match event {
+                    Event::Key { key, modifiers, pressed: true, repeat: false, .. }
+                        if self.prefs.hotkeys.action_for(*key, *modifiers) == Some(prefs::Action::FocusAgentInput) =>
+                    {
+                        Some((*key, *modifiers))
+                    }
+                    _ => None,
+                })
+            });
+            if let Some((key, modifiers)) = focus
+                && self.focus_agent_input(ctx)
+            {
+                ctx.input_mut(|input| input.consume_key(modifiers, key));
+                return;
+            }
+        }
         if self.agent_escape(ctx) || (!self.palette.open && self.agent_captures_focus(ctx)) {
             return;
         }
@@ -2520,6 +2545,9 @@ impl TerminalApp {
     }
 
     fn periodic(&mut self) {
+        if self.agent_demo.is_some() {
+            return;
+        }
         self.refresh_columns();
         self.price_alerts.periodic(&self.worker);
         let visible = self.visible_panes();
@@ -2615,6 +2643,10 @@ impl TerminalApp {
 
     /// Compare snapshots every tick, including edits with no explicit dirty marking.
     fn autosave(&mut self) {
+        if self.agent_demo.is_some() {
+            self.agent_save_pending = false;
+            return;
+        }
         if self.saves.job.as_ref().is_some_and(|job| !job.is_finished()) {
             return;
         }
@@ -2665,6 +2697,9 @@ impl TerminalApp {
     }
 
     fn save_sync(&mut self, writes: Vec<SaveWrite>) {
+        if self.agent_demo.is_some() {
+            return;
+        }
         let writes = self.saves.changed(writes);
         let results = SaveState::write(writes, &self.saves.writer);
         self.complete_save(results);
@@ -2717,6 +2752,7 @@ impl eframe::App for TerminalApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.agent_logic(ctx);
         self.process_logic();
+        self.populate_agent_demo(ctx);
         // An edit arriving during an in-flight save still needs a fresh snapshot
         // while hidden. Poll only until that snapshot can start; never tick idle.
         if self.agent_save_pending {
@@ -2738,7 +2774,7 @@ impl eframe::App for TerminalApp {
         if !self.window_styled {
             self.window_styled = true;
             self.vibrancy = style_native_window(frame, self.prefs.appearance.vibrancy);
-        } else if !self.updater_started {
+        } else if !self.updater_started && self.agent_demo.is_none() {
             // From the second frame, so loading Sparkle doesn't delay the first.
             self.updater_started = true;
             tr_macos::updater::start();
@@ -2866,7 +2902,9 @@ impl eframe::App for TerminalApp {
         self.toasts(&ctx);
 
         // TR_SMOKE_SECS=N: render for N seconds, log frame stats and quit (CI smoke test).
-        if let Some(secs) = std::env::var("TR_SMOKE_SECS").ok().and_then(|v| v.parse::<f64>().ok()) {
+        if self.agent_demo.is_none()
+            && let Some(secs) = std::env::var("TR_SMOKE_SECS").ok().and_then(|v| v.parse::<f64>().ok())
+        {
             ctx.request_repaint();
             if !self.smoke_done && self.started.elapsed().as_secs_f64() > secs {
                 self.smoke_done = true;
@@ -2883,6 +2921,7 @@ impl eframe::App for TerminalApp {
             }
         }
         self.observe_edits(true);
+        self.capture_agent_demo(&ctx, screen);
         let cpu = frame_start.elapsed().as_secs_f64() * 1e3;
         self.perf_cpu_ms = self.perf_cpu_ms * 0.9 + cpu * 0.1;
         if self.show_perf {
@@ -2897,6 +2936,9 @@ impl eframe::App for TerminalApp {
     }
 
     fn on_exit(&mut self) {
+        if self.agent_demo.is_some() {
+            return;
+        }
         // Drop signals shutdown and waits at most 1.5 s; any remaining cleanup
         // stays with the detached owner instead of blocking the UI's exit/save.
         self.agent_pane.session = None;
@@ -2908,15 +2950,21 @@ impl eframe::App for TerminalApp {
     }
 }
 
-#[cfg(test)]
 impl TerminalApp {
     /// Inert workspace with all disk-backed dependencies confined to the fixture.
+    #[cfg(test)]
     pub(crate) fn test_workspace(root: &std::path::Path) -> Self {
+        Self::isolated_workspace(root, Worker::inert())
+    }
+
+    /// Shared by the offline review harness and session-free workspace tests.
+    fn isolated_workspace(root: &std::path::Path, worker: Worker) -> Self {
         Self {
             drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(egui::Context::default()),
             pinned_agent_chart: None,
             agent_pane: crate::agent_pane::AgentPane::default(),
+            agent_demo: None,
             agent_turns: Vec::new(),
             agent_save_pending: false,
             edit_log: Default::default(),
@@ -2927,7 +2975,7 @@ impl TerminalApp {
             ),
             trading: Default::default(),
             demo: demo::DemoState::load(root.join("demo.json")).0,
-            worker: Worker::inert(),
+            worker,
             provider: "sample".into(),
             panes: Vec::new(),
             dock: Node::default(),

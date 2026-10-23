@@ -155,6 +155,11 @@ pub enum Icon {
     ChevronRight,
     ChevronDown,
     ChevronLeft,
+    Info,
+    Warning,
+    Pin,
+    Revert,
+    Running,
 }
 
 /// Original measure-family glyphs on a 12-unit grid.
@@ -293,6 +298,23 @@ pub fn tool_icon(tool: tr_chart::drawings::Tool) -> Icon {
 #[cfg(test)]
 mod drawing_icon_tests {
     use super::*;
+
+    #[test]
+    fn agent_context_history_and_activity_icons_are_distinct_drawn_shapes() {
+        let ctx = egui::Context::default();
+        let mut signatures = Vec::new();
+        for icon in [Icon::Pin, Icon::Revert, Icon::Running, Icon::ChevronDown] {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                draw_icon(ui.painter(), Rect::from_min_size(Pos2::ZERO, vec2(24., 24.)), icon, theme::text());
+            });
+            output.textures_delta.clear();
+            assert!(!output.shapes.is_empty());
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, Shape::Text(_))));
+            let signature = format!("{:?}", output.shapes);
+            assert!(!signatures.contains(&signature));
+            signatures.push(signature);
+        }
+    }
 
     #[test]
     fn every_tool_has_a_distinct_nonempty_line_icon() {
@@ -480,6 +502,31 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
     let u = r.height().min(r.width()) / 16.0;
     let pt = |x: f32, y: f32| pos2(c.x + x * u, c.y + y * u);
     match icon {
+        Icon::Pin => {
+            p.add(Shape::line(
+                vec![pt(-3., -6.), pt(3., -6.), pt(2., -1.), pt(5., 2.), pt(-5., 2.), pt(-2., -1.), pt(-3., -6.)],
+                s,
+            ));
+            p.line_segment([pt(0., 2.), pt(0., 7.)], s);
+        }
+        Icon::Revert => {
+            p.add(Shape::line(vec![pt(-5., -2.), pt(1., -2.), pt(5., 1.), pt(5., 4.), pt(1., 6.)], s));
+            p.add(Shape::line(vec![pt(-1., -6.), pt(-5., -2.), pt(-1., 2.)], s));
+        }
+        Icon::Running => {
+            p.circle_stroke(c, 6. * u, s);
+            p.line_segment([pt(0., -4.), c], s);
+            p.line_segment([c, pt(4., 0.)], s);
+        }
+        Icon::Info | Icon::Warning => {
+            if icon == Icon::Info {
+                p.circle_stroke(c, 6.0 * u, s);
+            } else {
+                p.add(Shape::closed_line(vec![pt(0., -6.), pt(6., 5.), pt(-6., 5.)], s));
+            }
+            p.line_segment([pt(0., -2.), pt(0., 1.)], s);
+            p.circle_filled(pt(0., 3.), u * 0.7, color);
+        }
         Icon::Crosshair => {
             for d in [-1., 1.] {
                 p.line_segment([pt(d * 2., 0.), pt(d * 6., 0.)], s);

@@ -1112,6 +1112,7 @@ impl TerminalApp {
         if self.dock.is_empty() {
             self.empty_state(ui, area, &mut cmds);
         }
+        self.size_agent_demo_dock(area, gap);
         let (mut groups, dividers) = self.dock.layout(area, gap);
         let appear = self.dock_motion.apply(ui.ctx(), &self.dock, &mut groups);
         for (g, a) in groups.iter().zip(appear) {
@@ -1182,6 +1183,11 @@ impl TerminalApp {
         cmds: &mut Vec<GroupCmd>,
     ) {
         let Some(active) = g.active_pane() else { return };
+        if self.idx(active).is_some_and(|i| matches!(self.panes[i].kind, PaneKind::Agent(_)))
+            && let Some(demo) = &mut self.agent_demo
+        {
+            demo.pane_rect = Some(g.rect);
+        }
         let focused = active == self.focus;
         let focus_t = anim::spring_bool(ui.ctx(), Id::new(("group-focus", active)), focused);
         let inner = widgets::card(ui, g.rect, focus_t);

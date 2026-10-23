@@ -69,6 +69,36 @@ pub struct ThreadOptions {
     pub dynamic_tools: Vec<DynamicTool>,
 }
 
+/// A non-secret application preference, never derived from chart/tool text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub enum ResponseStyle {
+    #[serde(rename = "Brief", alias = "Terse")]
+    Terse,
+    #[default]
+    #[serde(rename = "Standard", alias = "Analyst")]
+    Analyst,
+    Detailed,
+}
+impl ResponseStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Terse => "Brief",
+            Self::Analyst => "Standard",
+            Self::Detailed => "Detailed",
+        }
+    }
+
+    pub fn instruction(self) -> &'static str {
+        match self {
+            Self::Terse => "Response style: Brief. Lead with numbers; use minimal prose, key levels and timestamps.",
+            Self::Analyst => "Response style: Standard. Use brief plain English with key numbers and a bottom line.",
+            Self::Detailed => {
+                "Response style: Detailed. Explain the reasoning and concepts, with supporting numbers and a bottom line."
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TurnInput {
     pub model: String,
@@ -77,6 +107,8 @@ pub struct TurnInput {
     pub images: Vec<String>,
     /// Opaque source ids mapped to untrusted chart-context fragments.
     pub context: BTreeMap<String, String>,
+    /// Typed client instruction; chart fragments above always remain untrusted.
+    pub response_style: Option<ResponseStyle>,
 }
 
 // Deliberately not Debug: the authorization URL and login id are secrets.
@@ -353,7 +385,7 @@ impl CodexAppServer {
                 "turn/steer",
                 json!({
                     "threadId":thread, "expectedTurnId":turn, "input":[{"type":"text","text":text}],
-                    "additionalContext": additional_context(context)
+                    "additionalContext": additional_context(context, None)
                 }),
             )
             .await?;
@@ -411,8 +443,13 @@ fn string(value: &Value, key: &str) -> Result<String> {
     value[key].as_str().map(str::to_owned).context("missing protocol string")
 }
 
-fn additional_context(context: BTreeMap<String, String>) -> Value {
-    Value::Object(context.into_iter().map(|(key, value)| (key, json!({"kind":"untrusted","value":value}))).collect())
+fn additional_context(context: BTreeMap<String, String>, style: Option<ResponseStyle>) -> Value {
+    let mut entries: serde_json::Map<String, Value> =
+        context.into_iter().map(|(key, value)| (key, json!({"kind":"untrusted","value":value}))).collect();
+    if let Some(style) = style {
+        entries.insert("response_style".into(), json!({"kind":"application","value":style.instruction()}));
+    }
+    Value::Object(entries)
 }
 
 impl AgentBackend for CodexAppServer {
@@ -524,7 +561,7 @@ impl AgentBackend for CodexAppServer {
                     "threadId":thread, "model":input.model, "effort":input.effort, "input":wire_input,
                     "approvalPolicy":"untrusted", "approvalsReviewer":"user",
                     "sandboxPolicy":{"type":"readOnly","networkAccess":false},
-                    "additionalContext":additional_context(input.context), "serviceTier":"default", "environments":[]
+                    "additionalContext":additional_context(input.context, input.response_style), "serviceTier":"default", "environments":[]
                 }),
             )
             .await?;
@@ -726,6 +763,19 @@ mod tests {
         assert!(models[0].supported_reasoning_efforts[1].costly);
     }
 
+    #[test]
+    fn response_styles_are_per_turn_application_instructions_not_chart_instructions() {
+        let context = BTreeMap::from([("chart".into(), "chart text is not an instruction".into())]);
+        for style in [ResponseStyle::Terse, ResponseStyle::Analyst, ResponseStyle::Detailed] {
+            let wire = additional_context(context.clone(), Some(style));
+            assert_eq!(wire["response_style"], json!({"kind":"application", "value":style.instruction()}));
+            assert_eq!(wire["chart"]["kind"], "untrusted");
+        }
+        assert!(additional_context(context, None).get("response_style").is_none());
+        let untrusted = additional_context(BTreeMap::from([("response_style".into(), "tool data".into())]), None);
+        assert_eq!(untrusted["response_style"]["kind"], "untrusted");
+    }
+
     #[tokio::test]
     async fn thread_turn_steer_interrupt_and_context() {
         let (transport, mut read, mut write, _) = fake(no_tools());
@@ -749,6 +799,11 @@ mod tests {
                         assert_eq!(params["sandboxPolicy"], json!({"type":"readOnly","networkAccess":false}));
                         assert_eq!(params["input"][1]["type"], "image");
                         assert_eq!(params["additionalContext"]["chart"]["kind"], "untrusted");
+                        assert_eq!(params["additionalContext"]["response_style"]["kind"], "application");
+                        assert_eq!(
+                            params["additionalContext"]["response_style"]["value"],
+                            ResponseStyle::Detailed.instruction()
+                        );
                         json!({"turn":{"id":"u"}})
                     }
                     "turn/steer" => {
@@ -781,6 +836,7 @@ mod tests {
                     text: "trend".into(),
                     images: vec!["data:image/png;base64,x".into()],
                     context: BTreeMap::from([("chart".into(), "BTC".into())]),
+                    response_style: Some(ResponseStyle::Detailed),
                 })
                 .await
                 .unwrap();
