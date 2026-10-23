@@ -151,7 +151,7 @@ impl Drop for Session {
     }
 }
 impl Session {
-    pub fn start(ctx: egui::Context, executor: AppExecutor, parent: PathBuf) -> Self {
+    pub fn start(ctx: egui::Context, executor: AppExecutor, parent: PathBuf, tools: tr_agent_tools::ToolSet) -> Self {
         let (sender, receive) = mpsc::unbounded_channel();
         let (shutdown, stopping) = watch::channel(());
         let (finished, completion) = std::sync::mpsc::channel();
@@ -169,7 +169,7 @@ impl Session {
                     return Ok(());
                 }
                 let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-                runtime.block_on(owner(receive, stopping, &background, executor, parent))
+                runtime.block_on(owner(receive, stopping, &background, executor, parent, tools))
             };
             if let Err(error) = run() {
                 background.state(failure_state(error));
@@ -342,12 +342,21 @@ fn classify(result: Result<()>, unsafe_backend: bool) -> Result<()> {
     }
 }
 
+pub(crate) fn bridge_options(cwd: String, tools: tr_agent_tools::ToolSet) -> BridgeOptions {
+    let mut options = BridgeOptions::new(cwd);
+    if tools == tr_agent_tools::ToolSet::Edit && crate::agent_bridge::agent_edit_tools_available() {
+        options.tools = tr_agent_tools::ToolSet::Edit;
+    }
+    options
+}
+
 async fn owner(
     mut receive: mpsc::UnboundedReceiver<Command>,
     mut stopping: watch::Receiver<()>,
     inbox: &Inbox,
     executor: AppExecutor,
     parent: PathBuf,
+    tools: tr_agent_tools::ToolSet,
 ) -> Result<()> {
     let Some(binary) = binary() else {
         inbox.state(Onboarding::Missing);
@@ -375,7 +384,7 @@ async fn owner(
         }
         let connector = connector(&parent, binary.clone(), SessionMode::Normal)?;
         let cwd = connector.launch.home.cwd.to_string_lossy().into_owned();
-        let mut bridge = executor.start(connector, BridgeOptions::new(cwd)).await?;
+        let mut bridge = executor.start(connector, bridge_options(cwd, tools)).await?;
         let result = tokio::select! {
             biased;
             _ = stopping.changed() => Ok(()),
@@ -410,11 +419,16 @@ async fn run_bridge(
             }
             command = receive.recv() => match command {
                 Some(Command::Turn(turn)) => {
-                    if let Err(error) = bridge.send(*turn).await {
-                        inbox.push(Event::Notice(scrub_text(&error.to_string())));
-                        // Recovery is bridge-controlled; it never replays the failed turn.
-                        let recovery = bridge.recover().await?;
-                        inbox.push(Event::Bridge(BridgeEvent::Recovered(recovery)));
+                    match bridge.send(*turn).await {
+                        // The ack already returns the canonical key. Do not depend on
+                        // a later wire turn/started notification to retain partial edits.
+                        Ok(turn) => inbox.push(Event::Bridge(BridgeEvent::Started { turn })),
+                        Err(error) => {
+                            inbox.push(Event::Notice(scrub_text(&error.to_string())));
+                            // Recovery is bridge-controlled; it never replays the failed turn.
+                            let recovery = bridge.recover().await?;
+                            inbox.push(Event::Bridge(BridgeEvent::Recovered(recovery)));
+                        }
                     }
                 }
                 Some(Command::Interrupt) => { if let Err(error) = bridge.interrupt().await { inbox.push(Event::Notice(scrub_text(&error.to_string()))); } }
@@ -432,10 +446,15 @@ fn project(event: BridgeEvent) -> Option<BridgeEvent> {
             // Only visible text, tool metadata, limits and failures wake the pane.
             match method.as_str() {
                 "item/started" | "item/completed" if params["item"]["type"] == "dynamicToolCall" => {
+                    let summary = crate::agent_pane::edit_tool_summary(&params["item"]);
                     if let Some(map) = params["item"].as_object_mut() {
                         map.retain(|key, _| {
                             matches!(key.as_str(), "id" | "type" | "tool" | "arguments" | "success" | "durationMs")
                         });
+                        if let Some(summary) = summary {
+                            map.remove("arguments");
+                            map.insert("editSummary".into(), summary.into());
+                        }
                     }
                 }
                 "item/started" | "item/completed" if params["item"]["type"] == "agentMessage" => {
@@ -594,6 +613,207 @@ mod tests {
         assert_eq!(replies, [crate::agent_markdown::parse(&expected_text)]);
         assert!(!format!("{:?}", pane.blocks).contains("base64"));
         client.shutdown();
+    }
+
+    #[test]
+    fn edit_rows_project_ids_and_short_labels_without_raw_results_or_coordinates() {
+        for (name, args, result, expected) in [
+            (
+                "create_drawing",
+                json!({"kind":"horizontal","anchors":[{"time":123456789,"price":227.123456}]}),
+                json!({"id":42}),
+                "#42 · horizontal line at 227.12",
+            ),
+            (
+                "create_drawing",
+                json!({"kind":"trend_line","anchors":[{"time":123456789,"price":227.123456},{"time":987654321,"price":228.123456}]}),
+                json!({"id":43}),
+                "#43 · trend line (2 anchors)",
+            ),
+            (
+                "update_drawing",
+                json!({"id":42,"anchors":[{"time":123456789,"price":229.123456}]}),
+                json!({"id":42}),
+                "#42 · drawing update",
+            ),
+            ("delete_drawing", json!({"id":42}), json!({"id":42}), "#42 · drawing removed"),
+            ("add_indicator", json!({"code":"rsi","params":[14]}), json!({"id":"7:4"}), "#7:4 · RSI 14"),
+            ("remove_indicator", json!({"id":"7:4"}), json!({"id":"7:4"}), "#7:4 · indicator removed"),
+            (
+                "set_view",
+                json!({"from":123456789,"to":987654321,"timeframe":"1W"}),
+                json!({"uid":7,"from":123456789,"to":987654321}),
+                "#7 · chart view 1W",
+            ),
+            (
+                "compare",
+                json!({"symbol":"MSFT","action":"add"}),
+                json!({"symbol":"MSFT US Equity"}),
+                "comparison MSFT US Equity · add",
+            ),
+        ] {
+            let event = project(BridgeEvent::Wire(WireEvent::Notification {
+                method: "item/completed".into(), params: json!({"item":{
+                    "type":"dynamicToolCall", "id":"call", "tool":name, "arguments":args, "success":true,
+                    "contentItems":[{"type":"inputText","text":result.to_string()},{"type":"inputImage","imageUrl":"data:image/png;base64,never-forward"}]
+                }}),
+            })).unwrap();
+            let mut pane = crate::agent_pane::AgentPane::default();
+            pane.event(event);
+            let crate::agent_pane::RenderedBlock::Tool(trace) = &pane.blocks[0] else { panic!("tool row") };
+            assert_eq!(trace.summary.as_deref(), Some(expected));
+            let rendered = format!("{:?}", pane.blocks);
+            for private in
+                ["123456789", "987654321", "227.123456", "contentItems", "base64", "never-forward", "\"anchors\""]
+            {
+                assert!(!rendered.contains(private), "{name} leaked {private}");
+            }
+        }
+    }
+
+    #[test]
+    fn pane_session_start_options_keep_readonly_inventory_and_reject_edits_over_transport() {
+        use tr_agent::bridge::{ToolCall, ToolExecutor, dynamic_tools};
+        use tr_agent_tools::{Registry, ToolSet};
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/agent-wire-readonly");
+        let app = crate::app::TerminalApp::test_workspace(&root);
+        // Drop the inert app's worker runtime outside the async test runtime.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut pane = crate::agent_pane::AgentPane::default();
+        let tools = pane.prepare_session_start().unwrap();
+        let options = bridge_options("empty-test-cwd".into(), tools);
+        assert_eq!(options.tools, ToolSet::ReadOnly);
+        let registry = Arc::new(Registry::new(options.tools));
+        let inventory = dynamic_tools(&registry);
+        let executor = AppExecutor::new(&app);
+        let canonical = tr_agent::bridge::TurnIds::new().unwrap().allocate().unwrap();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(client_io);
+        let client = CodexAppServer::new(Transport::connect(
+            read,
+            write,
+            Arc::new(move |params| {
+                let executor = executor.clone();
+                let registry = registry.clone();
+                let canonical = canonical.clone();
+                Box::pin(async move {
+                    let result = executor
+                        .execute(
+                            registry,
+                            ToolCall {
+                                turn: canonical,
+                                pin: tr_agent::bridge::ChartPin {
+                                    uid: 0,
+                                    symbol: "AAA".into(),
+                                    timeframe: "1D".into(),
+                                    visible_range: None,
+                                },
+                                name: params["tool"].as_str().unwrap().into(),
+                                arguments: params["arguments"].to_string(),
+                                confirmed: false,
+                            },
+                        )
+                        .await;
+                    let content: Vec<_> = result
+                        .content
+                        .into_iter()
+                        .map(|content| {
+                            let tr_agent_tools::Content::Text(text) = content else {
+                                panic!("ReadOnly rejection must be text")
+                            };
+                            json!({"type":"inputText","text":text})
+                        })
+                        .collect();
+                    Ok(json!({"success":result.success,"contentItems":content}))
+                })
+            }),
+            Arc::new(|| {}),
+            None,
+        ));
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server_io);
+            let mut read = BufReader::new(read).lines();
+            while let Some(line) = read.next_line().await.unwrap() {
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let result = match request["method"].as_str().unwrap_or_default() {
+                    "initialized" => continue,
+                    "initialize" => json!({}),
+                    "skills/list" => {
+                        json!({"data":[{"errors":[],"skills":tr_agent::codex::BUNDLED_SKILLS.iter().map(|name| json!({"name":name,"enabled":false})).collect::<Vec<_>>()}]})
+                    }
+                    "account/read" => json!({"account":{"type":"chatgpt"}}),
+                    "thread/start" => {
+                        let tools = request["params"]["dynamicTools"][0]["tools"].as_array().unwrap();
+                        assert_eq!(tools.len(), Registry::new(ToolSet::ReadOnly).schemas().len());
+                        assert!(
+                            !tools.iter().any(|tool| crate::agent_pane::is_edit_tool(tool["name"].as_str().unwrap()))
+                        );
+                        json!({"thread":{"id":"thread"}})
+                    }
+                    "turn/start" => json!({"turn":{"id":"wire-turn"}}),
+                    _ => panic!("unexpected request"),
+                };
+                write.write_all(format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes()).await.unwrap();
+                if request["method"] == "turn/start" {
+                    for name in [
+                        "create_drawing",
+                        "add_indicator",
+                        "compare",
+                        "set_view",
+                        "update_drawing",
+                        "delete_drawing",
+                        "remove_indicator",
+                    ] {
+                        write
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    json!({"id":900,"method":"item/tool/call","params":{
+                                        "namespace":"chart","threadId":"thread","turnId":"wire-turn","tool":name,
+                                        "arguments":{"code":"RSI","params":[14]}
+                                    }})
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        let reply: serde_json::Value =
+                            serde_json::from_str(&read.next_line().await.unwrap().unwrap()).unwrap();
+                        assert_eq!(reply["result"]["success"], false);
+                        assert!(reply.to_string().contains("tool_disabled"), "{reply}");
+                    }
+                    return;
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            client.initialize().await.unwrap();
+            client
+                .start_thread(tr_agent::ThreadOptions {
+                    cwd: options.cwd,
+                    base_instructions: options.base_instructions,
+                    ephemeral: true,
+                    dynamic_tools: inventory,
+                })
+                .await
+                .unwrap();
+            client
+                .send_turn(tr_agent::TurnInput {
+                    model: "fake".into(),
+                    text: "please edit".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.agent_queue.len(), 0, "ReadOnly mutations must never reach UI work");
+        client.shutdown();
+        assert_eq!(bridge_options("empty".into(), ToolSet::Edit).tools, ToolSet::Edit);
+        assert_eq!(bridge_options("empty".into(), ToolSet::Workflows).tools, ToolSet::ReadOnly);
+        });
     }
 
     #[test]

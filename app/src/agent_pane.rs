@@ -14,8 +14,8 @@ use tr_agent_tools::ToolSet;
 use crate::agent_markdown::{self, Block};
 
 pub const STREAM_INTERVAL: Duration = Duration::from_millis(33);
-pub const EDIT_EXECUTION_AVAILABLE: bool = false;
-const PRIVACY: &str = "Your prompts, the pinned chart's data and tool results leave this machine and go to OpenAI under your ChatGPT account. Screenshots require separate consent; capture is currently unavailable. Codex stores local conversation rollouts for recovery (7 days / newest 50 bridge threads). Layouts contain choices only, never conversation or sign-in details.";
+pub const UNDO_UNAVAILABLE: &str = "undo for this agent turn is no longer available (layout changed/app restarted)";
+const PRIVACY: &str = "Your prompts, the pinned chart's data and tool results leave this machine and go to OpenAI under your ChatGPT account. In Can edit charts mode the agent can add, change and remove its own drawings, indicators and comparisons on the pinned chart; they are badged Agent and undoable. It cannot edit your own or kept objects. Screenshots require separate consent; capture is currently unavailable. Codex stores local conversation rollouts for recovery (7 days / newest 50 bridge threads). Layouts contain choices only, never conversation or sign-in details.";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolsMode {
@@ -32,9 +32,22 @@ pub struct Settings {
     pub tools: ToolsMode,
     pub pinned_chart: Option<u64>,
 }
+impl ToolsMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read only",
+            Self::Edit => "Can edit charts",
+        }
+    }
+}
+
 impl Settings {
     pub fn tool_set(&self) -> ToolSet {
-        if EDIT_EXECUTION_AVAILABLE && self.tools == ToolsMode::Edit { ToolSet::Edit } else { ToolSet::ReadOnly }
+        self.tool_set_if_available(crate::agent_bridge::agent_edit_tools_available())
+    }
+
+    fn tool_set_if_available(&self, available: bool) -> ToolSet {
+        if available && self.tools == ToolsMode::Edit { ToolSet::Edit } else { ToolSet::ReadOnly }
     }
 
     pub fn select_defaults(&mut self, models: &[Model]) {
@@ -107,7 +120,7 @@ impl Onboarding {
             }
             Self::SignedOut => "Sign in with your ChatGPT account. API-key accounts are not supported.".into(),
             Self::SigningIn => "Waiting for ChatGPT sign-in in your browser…".into(),
-            Self::Ready => "Ready · read-only chart tools".into(),
+            Self::Ready => "Ready".into(),
             Self::RateLimited { reset } => format!("Rate-limited. Resets {reset}. Queued prompts are paused."),
             Self::ToolsUnavailable { reason } => format!("Chart tools unavailable: {reason}"),
             Self::Stopped { reason, unsafe_backend } => format!(
@@ -136,7 +149,19 @@ pub struct Trace {
     pub success: Option<bool>,
     pub duration_ms: Option<u64>,
     pub arguments: String,
+    pub summary: Option<String>,
     pub interrupted: bool,
+}
+
+/// Local conversation metadata, never part of Settings or a layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationTurn {
+    pub id: Option<String>,
+    pub prompt_index: usize,
+    pub finished: bool,
+    pub made_edits: bool,
+    pub undo_available: bool,
+    pub undo_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +282,11 @@ pub struct AgentPane {
     pub initialized: bool,
     pub active_chart: Option<u64>,
     pub session: Option<crate::agent_session::Session>,
+    pub session_tools: Option<ToolSet>,
+    pub turns: Vec<ConversationTurn>,
+    active_turn: Option<usize>,
+    header_undo: Option<String>,
+    header_undo_available: bool,
     replies: HashMap<String, ReplyMessage>,
     reply_cache: HashMap<usize, Vec<agent_markdown::DisplayBlock>>,
     limits_value: Value,
@@ -280,6 +310,11 @@ impl Default for AgentPane {
             initialized: false,
             active_chart: None,
             session: None,
+            session_tools: None,
+            turns: Vec::new(),
+            active_turn: None,
+            header_undo: None,
+            header_undo_available: false,
             replies: HashMap::new(),
             reply_cache: HashMap::new(),
             limits_value: Value::Null,
@@ -298,6 +333,8 @@ pub enum Action {
     Interrupt,
     Retry,
     Send(Prompt),
+    SetTools(ToolsMode),
+    UndoTurn(String),
     Pin,
     Close,
 }
@@ -305,6 +342,79 @@ pub enum Action {
 impl AgentPane {
     pub fn tool_set(&self) -> ToolSet {
         self.settings.tool_set()
+    }
+
+    pub fn can_change_tools(&self, mode: ToolsMode, available: bool) -> bool {
+        !self.running
+            && !matches!(
+                self.state,
+                Onboarding::Checking | Onboarding::SigningIn | Onboarding::Stopped { unsafe_backend: true, .. }
+            )
+            && (mode == ToolsMode::ReadOnly || available)
+    }
+
+    pub fn select_tools(&mut self, mode: ToolsMode, available: bool) -> bool {
+        if self.settings.tools == mode || !self.can_change_tools(mode, available) {
+            return false;
+        }
+        self.settings.tools = mode;
+        self.queue_paused = true;
+        self.notice(&format!(
+            "Tools mode: {}. Applies to the next isolated session start; an open session will restart. Queue stays paused; no prompt is resent.",
+            mode.label()
+        ));
+        true
+    }
+
+    /// Freeze the registry for this session. Every replacement uses normal onboarding.
+    pub fn prepare_session_start(&mut self) -> Option<ToolSet> {
+        if self.running || matches!(self.state, Onboarding::Stopped { unsafe_backend: true, .. }) {
+            return None;
+        }
+        self.queue_paused |= self.session_tools.is_some();
+        self.models.clear();
+        self.session_tools = Some(self.tool_set());
+        self.transition(Onboarding::Checking);
+        self.session_tools
+    }
+
+    pub fn refresh_undo(&mut self, available: &[String], last: Option<&str>) {
+        for i in 0..self.turns.len() {
+            let end = self.turns.get(i + 1).map_or(self.blocks.len(), |turn| turn.prompt_index);
+            let turn = &mut self.turns[i];
+            let retained = turn.id.as_ref().is_some_and(|id| available.contains(id));
+            turn.made_edits |= retained || self.blocks[turn.prompt_index + 1..end].iter().any(|block| {
+                matches!(block, RenderedBlock::Tool(trace) if is_edit_tool(&trace.name) && trace.success == Some(true))
+            });
+            turn.undo_available = retained && turn.finished;
+        }
+        self.header_undo = last.map(str::to_owned).or_else(|| {
+            self.turns.iter().rev().find(|turn| turn.finished && turn.made_edits).and_then(|turn| turn.id.clone())
+        });
+        self.header_undo_available = self.header_undo.as_ref().is_some_and(|id| available.contains(id));
+    }
+
+    pub fn undo_result(&mut self, id: &str, result: Result<crate::agent_bridge::UndoSummary, String>) {
+        let text = match result {
+            Ok(summary) => format!(
+                "Undo: {} reverted · {} conflicts skipped · {} charts",
+                summary.reverted,
+                summary.skipped.len(),
+                summary.charts
+            ),
+            Err(reason) => scrub_text(&reason),
+        };
+        if let Some(turn) = self.turns.iter_mut().find(|turn| turn.id.as_deref() == Some(id)) {
+            turn.undo_summary = Some(text);
+        } else {
+            self.notice(&text);
+        }
+    }
+
+    fn finish_turn(&mut self) {
+        if let Some(index) = self.active_turn.take() {
+            self.turns[index].finished = true;
+        }
     }
 
     pub fn notice(&mut self, text: &str) {
@@ -322,6 +432,7 @@ impl AgentPane {
             self.flush(Instant::now());
             self.running = false;
             self.interrupt_tools();
+            self.finish_turn();
         }
         self.state = state;
     }
@@ -365,6 +476,15 @@ impl AgentPane {
         self.flush(Instant::now());
         self.replies.clear();
         self.last_prompt = Some(prompt.clone());
+        self.active_turn = Some(self.turns.len());
+        self.turns.push(ConversationTurn {
+            id: None,
+            prompt_index: self.blocks.len(),
+            finished: false,
+            made_edits: false,
+            undo_available: false,
+            undo_summary: None,
+        });
         self.blocks.push(RenderedBlock::Prompt(prompt.text.clone()));
         self.running = true;
         Some(prompt)
@@ -393,9 +513,17 @@ impl AgentPane {
         match event {
             BridgeEvent::Wire(WireEvent::Notification { method, params }) => self.wire(&method, &params),
             BridgeEvent::Wire(WireEvent::Error(reason)) => self.notice(&reason),
-            // Canonical turn id (provenance and undo); the pane does not use it yet.
-            BridgeEvent::Started { .. } => {}
-            BridgeEvent::Completed { status, .. } => {
+            BridgeEvent::Started { turn } => {
+                if let Some(index) = self.active_turn {
+                    self.turns[index].id.get_or_insert(turn);
+                }
+            }
+            BridgeEvent::Completed { turn, status, .. } => {
+                // Completion also supplies the canonical id if Started was absent.
+                if let Some(index) = self.active_turn {
+                    self.turns[index].id.get_or_insert(turn);
+                }
+                self.finish_turn();
                 self.flush(Instant::now());
                 self.running = false;
                 if status != "completed" {
@@ -405,12 +533,14 @@ impl AgentPane {
                 }
             }
             BridgeEvent::ToolsUnavailable { reason } => {
+                self.finish_turn();
                 self.flush(Instant::now());
                 self.running = false;
                 self.notice(&format!("Tools unavailable: {reason}. Reply is provisional."));
                 self.transition(Onboarding::ToolsUnavailable { reason: scrub_text(&reason) });
             }
             BridgeEvent::Recovered(recovery) => {
+                self.finish_turn();
                 self.flush(Instant::now());
                 self.running = false;
                 self.interrupt_tools();
@@ -457,16 +587,23 @@ impl AgentPane {
             }
             "item/completed" | "item/started" if params["item"]["type"] == "dynamicToolCall" => {
                 let item = &params["item"];
+                let name = item["tool"].as_str().unwrap_or("chart tool");
+                let summary = item["editSummary"].as_str().map(short_label).or_else(|| edit_tool_summary(item));
                 let trace = Trace {
                     id: scrub_text(item["id"].as_str().unwrap_or_default()),
-                    name: scrub_text(item["tool"].as_str().unwrap_or("chart tool")),
+                    name: scrub_text(name),
                     success: item["success"].as_bool(),
                     duration_ms: item["durationMs"].as_u64(),
-                    arguments: safe_arguments(&item["arguments"]),
+                    arguments: if is_edit_tool(name) {
+                        summary.clone().unwrap_or_default()
+                    } else {
+                        safe_arguments(&item["arguments"])
+                    },
+                    summary,
                     interrupted: false,
                 };
-                if let Some(RenderedBlock::Tool(old)) = self
-                    .blocks
+                let start = self.active_turn.map_or(0, |index| self.turns[index].prompt_index + 1);
+                if let Some(RenderedBlock::Tool(old)) = self.blocks[start..]
                     .iter_mut()
                     .rev()
                     .find(|b| matches!(b, RenderedBlock::Tool(old) if old.id == trace.id && old.success.is_none()))
@@ -509,7 +646,7 @@ impl AgentPane {
             }
         }
         let old_model = self.settings.model.clone();
-        self.header(ui);
+        self.header(ui, &mut actions);
         if old_model != self.settings.model {
             self.set_limits(&self.limits_value.clone());
         }
@@ -559,6 +696,19 @@ impl AgentPane {
                     match block {
                         RenderedBlock::Prompt(text) => {
                             ui.label(RichText::new(format!("You: {text}")).strong());
+                            if let Some(turn) = self.turns.iter().find(|turn| turn.prompt_index == i) {
+                                if turn.finished && turn.made_edits {
+                                    let enabled = turn.undo_available && !self.running;
+                                    if undo_button(ui, "Undo this turn", enabled, self.running).clicked()
+                                        && let Some(id) = &turn.id
+                                    {
+                                        actions.push(Action::UndoTurn(id.clone()));
+                                    }
+                                }
+                                if let Some(summary) = &turn.undo_summary {
+                                    ui.label(RichText::new(summary).color(crate::theme::amber()));
+                                }
+                            }
                         }
                         RenderedBlock::Reply(_) => {
                             if let Some(cached) = self.reply_cache.get(&i) {
@@ -579,7 +729,8 @@ impl AgentPane {
                                 }
                             };
                             let duration = trace.duration_ms.map(|ms| format!(" · {ms} ms")).unwrap_or_default();
-                            egui::CollapsingHeader::new(format!("{} · {status}{duration}", trace.name))
+                            let summary = trace.summary.as_ref().map(|s| format!(" · {s}")).unwrap_or_default();
+                            egui::CollapsingHeader::new(format!("{} · {status}{duration}{summary}", trace.name))
                                 .id_salt(("tool", i))
                                 .show(ui, |ui| {
                                     ui.monospace(&trace.arguments);
@@ -674,7 +825,7 @@ impl AgentPane {
         actions
     }
 
-    fn header(&mut self, ui: &mut Ui) {
+    fn header(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("agent-backend").selected_text("Codex").show_ui(ui, |ui| {
                 ui.selectable_label(true, "Codex").on_hover_text("Local isolated backend");
@@ -702,21 +853,38 @@ impl AgentPane {
                     }
                 });
             }
+            let available = crate::agent_bridge::agent_edit_tools_available();
+            let mut selected = self.settings.tools;
             egui::ComboBox::from_id_salt("agent-tools")
-                .selected_text(match self.settings.tools {
-                    ToolsMode::ReadOnly => "Read only",
-                    ToolsMode::Edit => "Can edit charts (unavailable)",
-                })
+                .selected_text(format!("Next session: {}", selected.label()))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.settings.tools, ToolsMode::ReadOnly, "Read only");
-                    ui.add_enabled_ui(EDIT_EXECUTION_AVAILABLE, |ui| {
-                        ui.selectable_value(&mut self.settings.tools, ToolsMode::Edit, "Can edit charts");
-                    })
-                    .response
-                    .on_disabled_hover_text(
-                        "Chart-edit execution is not available in this build. The bridge always uses ReadOnly.",
-                    );
+                    for mode in [ToolsMode::ReadOnly, ToolsMode::Edit] {
+                        ui.add_enabled_ui(self.can_change_tools(mode, available), |ui| {
+                            ui.selectable_value(&mut selected, mode, mode.label());
+                        })
+                        .response
+                        .on_disabled_hover_text(if mode == ToolsMode::Edit && !available {
+                            "Chart-edit execution is not available in this build. Sessions use Read only."
+                        } else {
+                            "Wait for the turn or sign-in checks to finish. Unsafe sessions require an app restart."
+                        });
+                    }
                 });
+            if selected != self.settings.tools {
+                actions.push(Action::SetTools(selected));
+            }
+            let current = match self.session_tools {
+                Some(ToolSet::Edit) => "Can edit charts",
+                Some(_) => "Read only",
+                None => "Not started",
+            };
+            ui.strong(format!("Current mode: {current}"));
+            if undo_button(ui, "Undo last agent turn", self.header_undo_available && !self.running, self.running)
+                .clicked()
+                && let Some(id) = &self.header_undo
+            {
+                actions.push(Action::UndoTurn(id.clone()));
+            }
         });
         if self.models.iter().find(|m| m.id == self.settings.model).is_some_and(|m| {
             m.supported_reasoning_efforts
@@ -726,6 +894,92 @@ impl AgentPane {
             ui.small("Costly effort: higher subscription usage and latency.");
         }
     }
+}
+
+fn undo_button(ui: &mut Ui, label: &str, enabled: bool, running: bool) -> egui::Response {
+    ui.add_enabled(enabled, egui::Button::new(label))
+        .on_hover_text("Undo the whole agent turn on all affected charts; preserve conflicting user changes.")
+        .on_disabled_hover_text(if running { "Wait for the active turn to finish." } else { UNDO_UNAVAILABLE })
+}
+
+pub(crate) fn is_edit_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "create_drawing"
+            | "update_drawing"
+            | "delete_drawing"
+            | "add_indicator"
+            | "remove_indicator"
+            | "set_view"
+            | "compare"
+    )
+}
+
+fn short_label(text: &str) -> String {
+    scrub_text(text).chars().filter(|ch| !ch.is_control()).take(180).collect()
+}
+
+/// Whitelist a tiny result projection, never forward raw contentItems or anchor arrays.
+pub(crate) fn edit_tool_summary(item: &Value) -> Option<String> {
+    let name = item["tool"].as_str()?;
+    if !is_edit_tool(name) {
+        return None;
+    }
+    let args = &item["arguments"];
+    let result = item["contentItems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|content| {
+            (content["type"] == "inputText")
+                .then(|| content["text"].as_str().and_then(|text| serde_json::from_str::<Value>(text).ok()))
+                .flatten()
+        })
+        .unwrap_or(Value::Null);
+    let label = match name {
+        "create_drawing" | "update_drawing" => match args["kind"].as_str().unwrap_or("drawing") {
+            "horizontal" => args["anchors"][0]["price"]
+                .as_f64()
+                .filter(|p| p.is_finite())
+                .map_or_else(|| "horizontal line".into(), |price| format!("horizontal line at {price:.2}")),
+            "trend_line" => "trend line (2 anchors)".into(),
+            "vertical" => "vertical line".into(),
+            "ray" => "ray (2 anchors)".into(),
+            "rectangle" => "rectangle (2 anchors)".into(),
+            "text" => "text annotation".into(),
+            _ => "drawing update".into(),
+        },
+        "delete_drawing" => "drawing removed".into(),
+        "add_indicator" => {
+            let code = args["code"].as_str().unwrap_or("indicator").to_uppercase();
+            let params = args["params"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(4)
+                .filter_map(|p| p.as_f64().filter(|p| p.is_finite()))
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>();
+            format!("{code} {}", params.join(", ")).trim().to_owned()
+        }
+        "remove_indicator" => "indicator removed".into(),
+        "compare" => format!(
+            "comparison {} · {}",
+            result["symbol"].as_str().or_else(|| args["symbol"].as_str()).unwrap_or_default(),
+            args["action"].as_str().unwrap_or_default()
+        ),
+        _ => format!("chart view {}", args["timeframe"].as_str().unwrap_or_default()).trim().to_owned(),
+    };
+    let id = if item["success"] == true {
+        result.get("id").or_else(|| args.get("id")).or_else(|| result.get("uid"))
+    } else {
+        args.get("id")
+    };
+    let id = id.and_then(|id| id.as_str().map(str::to_owned).or_else(|| id.as_u64().map(|id| id.to_string())));
+    Some(short_label(&match id {
+        Some(id) => format!("#{id} · {label}"),
+        None => label,
+    }))
 }
 
 fn effort_label(effort: &tr_agent::codex::ReasoningOption) -> String {
@@ -850,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_roundtrip_contains_only_choices_and_edit_is_noop() {
+    fn settings_roundtrip_contains_only_choices_and_edit_requires_availability() {
         let settings =
             Settings { model: "m".into(), effort: "max".into(), tools: ToolsMode::Edit, pinned_chart: Some(41) };
         let value = serde_json::to_value(crate::layouts::PaneSettings::Agent(settings.clone())).unwrap();
@@ -859,7 +1113,10 @@ mod tests {
             serde_json::from_value::<crate::layouts::PaneSettings>(value).unwrap(),
             crate::layouts::PaneSettings::Agent(settings.clone())
         );
-        assert_eq!(settings.tool_set(), ToolSet::ReadOnly);
+        assert_eq!(settings.tool_set_if_available(false), ToolSet::ReadOnly);
+        assert_eq!(settings.tool_set_if_available(true), ToolSet::Edit);
+        assert_eq!(settings.tool_set(), ToolSet::Edit);
+        assert_eq!(Settings::default().tool_set(), ToolSet::ReadOnly);
         assert!(serde_json::from_str::<Settings>("{\"token\":\"never\"}").is_err());
     }
 
@@ -1053,6 +1310,170 @@ mod fix_tests {
                 .any(|a| matches!(a, Action::Send(Prompt { text, .. }) if text == "A new user-defined question"))
         );
         assert!(!actions.iter().any(|a| matches!(a, Action::Retry)));
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mode_switch_is_gated_never_mid_turn_and_restart_keeps_queue_paused() {
+        let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
+        pane.enqueue(Prompt { text: "queued".into(), requires_tools: false });
+        assert!(!pane.can_change_tools(ToolsMode::Edit, false));
+        assert!(!pane.select_tools(ToolsMode::Edit, false));
+        assert!(pane.can_change_tools(ToolsMode::Edit, true));
+        pane.running = true;
+        assert!(!pane.select_tools(ToolsMode::Edit, true));
+        assert_eq!(pane.settings.tools, ToolsMode::ReadOnly);
+        assert_eq!(pane.prepare_session_start(), None);
+        pane.running = false;
+        assert_eq!(pane.prepare_session_start(), Some(ToolSet::ReadOnly));
+        pane.transition(Onboarding::Ready);
+        assert!(pane.select_tools(ToolsMode::Edit, true));
+        assert_eq!(pane.session_tools, Some(ToolSet::ReadOnly), "selection must not mutate a running registry");
+        assert!(
+            matches!(pane.blocks.last(), Some(RenderedBlock::Notice(text)) if text.contains("Queue stays paused") && text.contains("restart"))
+        );
+        assert_eq!(pane.prepare_session_start(), Some(ToolSet::Edit));
+        pane.transition(Onboarding::Ready);
+        assert!(pane.next_prompt().is_none());
+        pane.resume_queue();
+        assert_eq!(pane.next_prompt().unwrap().text, "queued");
+        pane.running = false;
+        pane.transition(Onboarding::Stopped { reason: "tripwire".into(), unsafe_backend: true });
+        assert!(!pane.select_tools(ToolsMode::ReadOnly, true));
+        assert_eq!(pane.prepare_session_start(), None);
+    }
+
+    fn completed_edit(pane: &mut AgentPane, id: &str) {
+        pane.start_prompt(Prompt { text: "support".into(), requires_tools: false }).unwrap();
+        pane.event(BridgeEvent::Started { turn: id.into() });
+        pane.wire(
+            "item/completed",
+            &json!({"turnId":"wire-id-not-an-undo-key", "item":{
+                "id":"call", "type":"dynamicToolCall", "tool":"create_drawing", "success":true,
+                "arguments":{"kind":"horizontal", "anchors":[{"time":86400, "price":227.12345}]},
+                "contentItems":[{"type":"inputText","text":"{\"id\":42}"}]
+            }}),
+        );
+        pane.event(BridgeEvent::Completed {
+            turn: id.into(),
+            status: "completed".into(),
+            calls: 1,
+            interrupt_elapsed: None,
+        });
+    }
+
+    #[test]
+    fn started_attaches_canonical_id_to_each_prompt_and_not_the_wire_id() {
+        let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
+        let mut ids = tr_agent::bridge::TurnIds::new().unwrap();
+        let first = ids.allocate().unwrap();
+        let second = ids.allocate().unwrap();
+        completed_edit(&mut pane, &first);
+        completed_edit(&mut pane, &second);
+        assert_eq!(
+            pane.turns.iter().map(|t| t.id.as_deref()).collect::<Vec<_>>(),
+            [Some(first.as_str()), Some(second.as_str())]
+        );
+        for turn in &pane.turns {
+            assert!(turn.finished);
+            assert!(matches!(&pane.blocks[turn.prompt_index], RenderedBlock::Prompt(text) if text == "support"));
+        }
+        pane.refresh_undo(&[first.clone(), second.clone()], Some(&second));
+        assert!(pane.turns.iter().all(|t| t.made_edits && t.undo_available));
+        pane.refresh_undo(&[], None);
+        assert!(pane.turns.iter().all(|t| t.made_edits && !t.undo_available));
+        assert_eq!(pane.header_undo.as_deref(), Some(second.as_str()));
+        assert!(!pane.header_undo_available);
+    }
+
+    #[test]
+    fn undo_availability_alone_detects_edits_without_tool_notifications() {
+        let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
+        pane.start_prompt(Prompt { text: "RSI".into(), requires_tools: false }).unwrap();
+        pane.event(BridgeEvent::Started { turn: "canonical".into() });
+        pane.refresh_undo(&["canonical".into()], Some("canonical"));
+        assert!(pane.turns[0].made_edits);
+        assert!(!pane.turns[0].undo_available, "active turn cannot be undone");
+        pane.event(BridgeEvent::Completed {
+            turn: "canonical".into(),
+            status: "interrupted".into(),
+            calls: 1,
+            interrupt_elapsed: None,
+        });
+        pane.refresh_undo(&["canonical".into()], Some("canonical"));
+        assert!(pane.turns[0].undo_available, "partial edits remain undoable");
+    }
+
+    fn frame(pane: &mut AgentPane, ctx: &egui::Context, events: Vec<egui::Event>) -> (Vec<Action>, egui::FullOutput) {
+        let mut actions = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                actions.extend(pane.show(ui, "Pinned", egui::Id::new("undo-test")));
+            },
+        );
+        output.textures_delta.clear();
+        (actions, output)
+    }
+
+    fn text_position(output: &egui::FullOutput, text: &str) -> egui::Pos2 {
+        fn find(shape: &egui::epaint::Shape, text: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::epaint::Shape::Text(s) if s.galley.text() == text => {
+                    Some(s.pos + s.galley.rect.center().to_vec2())
+                }
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
+                _ => None,
+            }
+        }
+        output.shapes.iter().find_map(|s| find(&s.shape, text)).unwrap_or_else(|| panic!("missing UI text: {text}"))
+    }
+
+    #[test]
+    fn both_undo_buttons_emit_app_actions_and_summary_stays_inline_when_disabled() {
+        for label in ["Undo this turn", "Undo last agent turn"] {
+            let mut pane = AgentPane { state: Onboarding::Ready, acknowledged: true, ..Default::default() };
+            completed_edit(&mut pane, "canonical");
+            pane.refresh_undo(&["canonical".into()], Some("canonical"));
+            let ctx = egui::Context::default();
+            // Let egui settle wrapping/layout before pointing at the button.
+            frame(&mut pane, &ctx, vec![]);
+            let (_, output) = frame(&mut pane, &ctx, vec![]);
+            let pos = text_position(&output, label);
+            let click = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(&mut pane, &ctx, vec![egui::Event::PointerMoved(pos), click(true)]);
+            let (actions, _) = frame(&mut pane, &ctx, vec![click(false)]);
+            assert!(actions.iter().any(|a| matches!(a, Action::UndoTurn(id) if id == "canonical")), "{label}");
+            pane.undo_result(
+                "canonical",
+                Ok(crate::agent_bridge::UndoSummary { charts: 1, reverted: 2, skipped: vec!["kept".into()] }),
+            );
+            pane.refresh_undo(&[], None);
+            let (_, output) = frame(&mut pane, &ctx, vec![]);
+            text_position(&output, "Undo: 2 reverted · 1 conflicts skipped · 1 charts");
+            frame(&mut pane, &ctx, vec![click(true)]);
+            let (actions, _) = frame(&mut pane, &ctx, vec![click(false)]);
+            assert!(!actions.iter().any(|a| matches!(a, Action::UndoTurn(_))));
+            assert!(!pane.turns[0].undo_available);
+            assert_eq!(
+                UNDO_UNAVAILABLE,
+                "undo for this agent turn is no longer available (layout changed/app restarted)"
+            );
+        }
     }
 }
 

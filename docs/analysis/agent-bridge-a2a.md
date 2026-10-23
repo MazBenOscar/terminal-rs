@@ -302,17 +302,19 @@ After acknowledgement each onboarding state has one primary action:
 | Ready | Send | One active turn; later prompts join the FIFO queue |
 | RateLimited | Check limits | Read limits again; Ready if quota permits |
 | ToolsUnavailable | Retry | Explicitly retry the last prompt; no silent replay |
-| Stopped / unsafe | Close agent | Close the pane, retaining the failure/safety state |
+| Stopped / ordinary failure | Restart agent | New isolated session; queue stays paused |
+| Stopped / unsafe | Close agent | Close the pane, retaining the sticky safety state |
 
 SigningIn also offers the secondary **Open sign-in page again** action. Only the
 URL returned by `account/login/start` goes through the existing app opener. It is
 never drawn, logged or serialized. Login start/wait/cancel, account reads, model
 listing, launches and bridge RPCs run on the owner thread. Login uses the existing
 login-only sandbox, then waits for the supervisor's cleanup before starting the
-normal bridge. Scrubbed login failures are inline notices. A stopped/unsafe bridge
-has no API to reset its sticky safety state: consequently this pane deliberately
-**does not offer Restart agent**. Restart the app after resolving the cause; the
-pane never constructs a replacement to evade a bridge refusal.
+normal bridge. Scrubbed login failures are inline notices. Ordinary RPC/recovery
+failures offer Restart agent through that same path, with the queue paused. An
+**unsafe** bridge has no API to reset its sticky safety state and offers only Close
+agent. Restart the app after resolving that cause; neither Check nor a tools-mode
+change can construct a replacement to evade a known safety refusal.
 
 Recovery and history loss are inline notices. The active prompt is not resent,
 and remaining queued prompts are paused. Resume queue or Retry last prompt is an
@@ -333,23 +335,60 @@ Labels use `security_names::label`, including crypto's BASE/QUOTE and venue.
 
 Models come from `model/list`, with `isDefault` first and per-model supported
 efforts; `ultra` remains excluded and `max`/costly efforts carry a usage/latency
-warning. The backend picker currently contains Codex only. `Settings::tool_set`
-and `AgentPane::tool_set` are the A3 hooks. They are a TODO-free ReadOnly no-op
-while `EDIT_EXECUTION_AVAILABLE` is false. The persisted Can edit charts option is
-disabled with an explanatory tooltip, and the executor still starts a ReadOnly
-registry. A3 must integrate its execution/registry/thread-switch hook before
-setting availability true; simply changing the UI constant is not integration.
-No drawing, indicator, set_view, or undo-agent-turn internals are implemented here.
+warning. The backend picker currently contains Codex only. **Read only** is the
+default. **Can edit charts** is selectable only when
+`agent_edit_tools_available()` is true. `Settings::tool_set` / `AgentPane::tool_set`
+feed the background session's `BridgeOptions.tools`; only an explicit persisted
+Edit choice enables `ToolSet::Edit`. The header distinguishes **Next session**
+(the saved choice) from **Current mode** (the session's frozen registry).
+
+Changing tools mode while idle confirms the change with an inline notice and
+restarts an open session through the same login-only cleanup and normal isolated
+launch path as Start/Restart agent. It never changes a registry mid-turn. The
+picker is disabled during turns, sign-in/checking, and sticky unsafe stops; the
+app action enforces the same guards. Queued prompts stay paused across restart,
+models are fetched again, and nothing is resent. Choosing before Start changes
+only the next start's options and does not launch a child. A restored layout choice
+also cannot mutate the existing session's registry. A new bridge starts a new A3
+ownership session; reconnect/resume within a bridge retains ownership.
+
+The privacy disclosure explains that Edit can add, change and remove the agent's
+own drawings, indicators and comparisons on the pinned chart. Objects are badged
+Agent and undoable; user-owned and kept objects are not granted to the agent.
 Screenshots remain refused by the existing executor: this build has no capture
 consent flow, sends `screenshot_consent = false`, and never claims to send images.
 
 The tiny markdown parser renders paragraphs, star-delimited bold/italic, inline
 code, fenced blocks, headings, bullet/numbered lists, and pipe tables as monospace
 grids. Links are visible text only; they do not open automatically or execute HTML.
-Tool rows contain name, success/failure, duration and collapsible scrubbed arguments;
-image content is removed before UI marshalling and image arguments are omitted.
-The rate-limit projection contains only percent, window duration and reset time,
-never credit balances, plan names or account identifiers.
+Read tool rows contain name, success/failure, duration and collapsible scrubbed
+arguments. Edit rows instead contain a bounded, scrubbed object id and short label,
+for example `#42 · horizontal line at 227.12`, `#43 · trend line (2 anchors)` or
+`#7:4 · RSI 14`. The session projects only that edit summary from returned text;
+raw result content, image bytes and anchor arrays never reach the pane inbox.
+Comparison rows use the symbol as their object identity. The rate-limit projection
+contains only percent, window duration and reset time, never credit balances,
+plan names or account identifiers.
+
+`BridgeEvent::Started { turn }` attaches the canonical A3 id to the local user
+prompt's conversation turn, never a Codex wire id. The successful send ack also
+projects Started so partial edits retain an undo key even without a subsequent
+wire start notification. Completion supplies the same key as a fallback. These
+ids, turn metadata, and undo summaries stay in memory, outside layout settings.
+
+Each finished turn with edits (successful edit-tool rows or retained A3 inverse
+state) shows **Undo this turn**. The header offers **Undo last agent turn**, using
+A3's latest undoable turn, not the last read/chat message. Both emit the same app
+`Action::UndoTurn` and call `TerminalApp::undo_agent_turn` on the UI thread. Undo
+covers the whole turn on all affected charts, preserving conflicting user edits.
+The result appears inline on that prompt as reverted / conflicts skipped / chart
+counts. Interrupted or failed turns can also undo their partial edits. No undo is
+enabled during an active turn. Availability is refreshed from A3 before rendering
+and after undo; exhausted/pruned history or layout replacement disables the action
+with the exact A3 tooltip:
+`undo for this agent turn is no longer available (layout changed/app restarted)`.
+App restarts retain neither conversation nor inverse state; saved Agent provenance
+never reconstructs undo permission.
 
 `App::logic` drains the session inbox as well as the existing A1a live-tool queue.
 Only rendered events wake the pane; reasoning/advisory/unused wire events do not.
@@ -389,29 +428,52 @@ TR_DATA_DIR="$PWD/target/a2b-manager" TR_PROVIDER=sample cargo run --offline -p 
    the same current login URL, login progress remains responsive, and a failed/
    stale login supplies only a scrubbed inline reason. Do not inspect/copy auth
    files or use the user's normal Codex home.
-3. Pin the active sample chart. Click What's the trend? Verify read_chart/read_data
-   trace rows cite loaded sample bars and prices. Expand arguments: no image bytes,
-   account data or secrets. Type `Hello` as ordinary chat: a no-tool reply must not
-   become ToolsUnavailable. Check the quota meter shows percentages/reset times,
-   no plan or credits balance. Not investment advice remains visible.
-4. Ask for a long answer. While text streams, queue two labelled prompts; verify
-   queue count, order, Clear queue, and interrupt using Esc after the first delta.
-   Verify the interrupted reply is provisional and queued prompts pause. Explicitly
-   Retry last prompt; never silently retry on failure/recovery.
-5. Switch model and effort. Verify that model's default/supported efforts, costly
-   warning, default-first model ordering and Codex-only backend picker. Can edit
-   charts must remain disabled; screenshots must refuse, not acquire consent from
-   prompt text. No edit or undo execution is expected from this branch.
-6. Focus the input and type chart hotkeys and the command-palette chord: chart,
+3. Pin the active sample chart. Verify **Current mode: Read only**, then click
+   **What's the trend?** (or send `What is the trend on the pinned chart? Read the
+   chart and loaded bars, cite timestamps and prices, and label sample data.`).
+   Verify read_chart/read_data rows and a data-backed answer, with no chart edits.
+   Expand read arguments: no image bytes, account data or secrets. Send `Hello`:
+   a no-tool reply must not become ToolsUnavailable. Check quota percentages/reset
+   times, no plan/credits balance, and visible Not investment advice.
+4. With no turn running, select **Next session: Can edit charts**. Verify the inline
+   restart notice, responsive Checking/login readiness, **Current mode: Can edit
+   charts** after readiness, and a paused queue with no resent prompt. Send exactly:
+   `Read the pinned chart and read_data with limit 20. Using only loaded bar
+   timestamps and prices, create one horizontal support line at a recent low, one
+   trend_line with two loaded anchors, and add_indicator RSI with params [14]. Use
+   at most five tool calls. Report each returned object id and label sample data.`
+   Since mode changes pause the queue, click **Resume queue** after enqueueing it.
+   Verify two Agent-badged drawings and RSI, plus edit rows showing returned ids and
+   short labels, never full anchor arrays or raw result payloads. During the turn,
+   verify the tools picker and undo buttons are disabled.
+5. Add a user drawing. On that completed edit turn click **Undo this turn** and
+   verify the inline reverted / conflicts skipped counts, Agent objects removed,
+   the user drawing preserved, and that turn's action now disabled. Repeat the
+   prompt explicitly and use the header's **Undo last agent turn**; it must select
+   the edit turn even if a later read-only question/chat completed. Optionally Keep
+   an Agent drawing/study before undo: the kept object survives and conflicts
+   skipped increases. Reload a layout while retaining the local conversation:
+   old undo actions disable with the exact layout-changed/app-restarted tooltip.
+6. Ask `Read the chart and write a long, detailed bar-by-bar explanation of every
+   loaded bar.` After the first delta, queue two labelled prompts, then click
+   **Interrupt (Esc)** or press Esc with the Agent input focused. Verify provisional
+   interrupted text, paused queue, Clear queue behavior, and no automatic retry.
+   Use Retry last prompt only explicitly. Switch back to Read only while idle:
+   another normal isolated restart is required and the queue must remain paused.
+7. Switch model and effort. Verify supported/default efforts, costly warning,
+   default-first model ordering and Codex-only backend picker. Screenshots still
+   refuse; prompt text is not capture consent. Privacy info mentions own-object
+   editing, Agent badges and undo.
+8. Focus the input and type chart hotkeys and the command-palette chord: chart,
    command bar and palette must not act. Check Enter versus Shift+Enter. Open
    another Agent pane: it must show the already-open explanation and no new child.
-7. Close the pinned chart: pin clears. Save/export/reload the layout: only the four
+9. Close the pinned chart: pin clears. Save/export/reload the layout: only the four
    choices above survive; no conversation or sign-in information is exported.
-8. During a long reply, kill **only this app's** sandboxed app-server in Activity
+10. During a long reply, kill **only this app's** sandboxed app-server in Activity
    Monitor. Verify Recovered or history-lost notice, no resend, and paused queue.
    A subsequent explicitly requested data question must still satisfy tool proof.
    For a safety failure, verify Close agent only, never an in-pane safety reset.
-9. Observe Activity Monitor / existing performance readout while streaming, idle,
+11. Observe Activity Monitor / existing performance readout while streaming, idle,
    on a hidden Agent tab, minimized, and with the app hidden. Expect roughly 30 Hz
    text updates only while foreground-visible, no agent timer while idle/hidden,
    and accumulated text on return. Close the app and verify its child is reaped.
@@ -420,14 +482,37 @@ These are manager-only live acceptance checks; no login, real Codex execution,
 real agent home access, network test, or CPU/latency measurement was performed by
 this implementation worker.
 
-### A2b verification
+### A23-WIRE verification (2026-10-23)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | PASS; test counts N/A |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS; zero warnings; test counts N/A |
+| `cargo test --workspace` | PASS: **1,300 passed, 0 failed, 7 pre-existing network tests ignored**, including the sealed-Connector compile-fail doctest |
+
+Eight added offline regressions cover availability-gated/persisted mode choices,
+next-start registry freezing and paused queues, canonical Started-to-prompt ids,
+partial-edit undo, actual clicks on both undo buttons, inline summary rendering,
+real A3 undo with a kept-object conflict, layout invalidation, projected edit ids/
+labels without raw coordinates/results, and ReadOnly session options through the
+duplex transport and app executor (all seven edit tools rejected before UI work).
+The focused `cargo test -p terminal-rs agent_ --offline` run passes 79 tests, with
+0 failed and 0 ignored. The shared inert workspace fixture is exposed only under
+`cfg(test)` for the session regression; no unchecked Connector was added.
+
+No new crate, real Codex launch, real agent-home access, or live/network acceptance
+check was used. The seven network-dependent ignores remain unchanged. A3 ownership,
+limits, isolation, tripwire, scrubbers, caps and readiness are unchanged. Git state
+was not changed; the work is uncommitted.
+
 ## A3 agent edits
 
 The app executor and sample driver now execute the Edit preset through the same
 registry and shared edit validation. App mutations use the existing 8-job / 4-ms
 logic drain. Isolation, readiness, tripwire, scrubbing, result caps and the
-eight-attempt bridge turn budget are unchanged. No agent pane is included here;
-A2b owns that UI.
+eight-attempt bridge turn budget are unchanged. A2b now exposes the Edit choice
+through its persisted tools picker and new isolated session starts (A23-WIRE);
+A3 remains the source of ownership, mutation bounds and undo availability.
 
 ### Ownership, identity and bounds
 
@@ -568,11 +653,17 @@ TR_PROVIDER=sample cargo run --offline -p tr-agent --example agent_bridge -- \
   --transcript "$HOME/Library/Application Support/terminal-rs-agent-spike/raw-a3-undo-1.jsonl"
 ```
 
-In the app, after A2b wires the Edit toggle: send that first prompt, add/move a user
-drawing during the agent turn, then enter **`UNDO AGENT`**. Check that Agent objects
-from that turn disappear/revert while the user drawing and its z-order survive.
-Use Keep on an Agent drawing/study before undo to check conflict preservation.
-The offline tests cover these behaviors without a real child or network.
+In the app, follow the exact A2b in-app checks above: sign in through the pane,
+prove a Read only trend answer, switch to Can edit charts and wait for the isolated
+restart, explicitly resume the queued support-line + trend-line + RSI prompt, then
+use **Undo this turn** or **Undo last agent turn**. Both actions call the same A3
+API as **`UNDO AGENT`** and report reverted/conflicts skipped inline. Add/move a user
+drawing during the agent turn and check its z-order survives. Keep an Agent
+object before undo to check conflict preservation. Also interrupt a streaming long
+answer and confirm the queue pauses. Layout reload disables old turn actions;
+app restart has no conversation or undo stacks to restore. No ownership grant,
+creation cap, readiness guard or screenshot consent policy changes with the toggle.
+These live checks remain manager-run; offline regressions use no real child or network.
 
 ### A3 verification (2026-10-23; original implementation, historical)
 
