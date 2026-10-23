@@ -79,6 +79,16 @@ impl Template {
         Ok(())
     }
 
+    /// Applying a saved setup creates the user's studies/comparisons, not a
+    /// continuation of the saving agent session. Drawings are excluded entirely.
+    pub fn make_user_owned(&mut self) {
+        for settings in self.indicators.iter_mut().filter_map(|s| s.chart.as_mut()) {
+            settings.created_by = tr_chart::drawings::Author::User;
+            settings.turn_id = None;
+        }
+        self.data.comparison_provenance.clear();
+    }
+
     pub fn load(dir: &Path, name: &str) -> Result<Self, String> {
         let path = path(dir, name)?;
         if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > 1_048_576 {
@@ -87,6 +97,7 @@ impl Template {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         let mut template: Self = serde_json::from_slice(&bytes).map_err(|e| format!("Reading template: {e}"))?;
         template.validate()?;
+        template.make_user_owned();
         Ok(template)
     }
 
@@ -111,6 +122,7 @@ impl Template {
         }
         let mut template = self.clone();
         template.validate()?;
+        template.make_user_owned();
         let mut merged = current.clone();
         study::assign_ids(&mut merged);
         let mut used: HashSet<_> = merged.iter().filter_map(|s| s.chart.as_ref().map(|c| c.id)).collect();
@@ -174,6 +186,34 @@ mod tests {
             data: Default::default(),
         }
     }
+    #[test]
+    fn applying_and_merging_templates_transfers_only_imported_objects_to_the_user() {
+        use tr_chart::drawings::Author;
+        let mut saved = template();
+        for settings in saved.indicators.iter_mut().filter_map(|s| s.chart.as_mut()) {
+            settings.created_by = Author::Agent;
+            settings.turn_id = Some("earlier-session".into());
+        }
+        saved.data.comparison_provenance.push(tr_agent_tools::edits::Comparison {
+            symbol: "MSFT US Equity".into(),
+            created_by: Author::Agent,
+            turn_id: Some("earlier-session".into()),
+        });
+        let mut current = saved.indicators.clone();
+        saved.merge_into(&mut current).unwrap();
+        assert_eq!(current[0].chart.as_ref().unwrap().created_by, Author::Agent, "merge leaves existing objects alone");
+        for settings in current[2..].iter().filter_map(|s| s.chart.as_ref()) {
+            assert_eq!(settings.created_by, Author::User);
+            assert_eq!(settings.turn_id, None);
+        }
+        saved.make_user_owned();
+        for settings in saved.indicators.iter().filter_map(|s| s.chart.as_ref()) {
+            assert_eq!(settings.created_by, Author::User);
+            assert_eq!(settings.turn_id, None);
+        }
+        assert!(saved.data.comparison_provenance.is_empty());
+    }
+
     #[test]
     fn merging_keeps_existing_ports_and_remaps_all_imported_edges() {
         let t = template();

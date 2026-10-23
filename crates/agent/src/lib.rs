@@ -1,3 +1,13 @@
+#[cfg(test)]
+extern crate self as tr_agent;
+
+// Compile the actual example adapter into the bridge's offline unit harness;
+// the sealed Connector boundary remains unchanged in production and tests.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../examples/agent_bridge.rs"]
+mod sample_driver_tests;
+
 pub mod bridge;
 pub mod codex;
 pub mod isolation;

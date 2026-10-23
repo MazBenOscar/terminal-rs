@@ -11,6 +11,8 @@ pub struct ChartData {
     pub refresh_seconds: u32,
     pub account: crate::chart_account::Settings,
     pub comparisons: Vec<String>,
+    /// Primary and extra comparison provenance; legacy/missing entries are user-owned.
+    pub comparison_provenance: Vec<tr_agent_tools::edits::Comparison>,
     #[serde(default)]
     pub compare_slots: Vec<(String, u8)>,
     pub hidden_comparisons: Vec<String>,

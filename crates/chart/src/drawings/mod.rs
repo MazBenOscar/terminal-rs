@@ -144,12 +144,7 @@ impl Tool {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Author {
-    #[default]
-    User,
-    Agent,
-}
+pub use tr_core::indicators::study::Author;
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -239,6 +234,10 @@ fn line_width() -> f32 {
     1.3
 }
 impl Drawing {
+    pub fn agent_highlight(&self) -> bool {
+        self.created_by == Author::Agent
+    }
+
     pub fn new(tool: Tool, a: Anchor, b: Anchor) -> Self {
         Self {
             id: next_id(),

@@ -4457,6 +4457,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tr-agent-tools",
+ "tr-chart",
  "tr-core",
  "tr-data",
 ]
@@ -4469,6 +4470,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tr-chart",
  "tr-core",
  "tr-data",
 ]

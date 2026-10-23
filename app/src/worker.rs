@@ -1369,7 +1369,14 @@ async fn handle_agent(s: &Shared, request: AgentRequest) {
                             ),
                             Err(error) => (Vec::new(), Some(error)),
                         };
-                        crate::chart_view::StudyRead { id: spec.chart.as_ref().map(|c| c.id), spec, outputs, error }
+                        crate::chart_view::StudyRead {
+                            id: spec.chart.as_ref().map(|c| c.id),
+                            tool_id: None,
+                            agent_highlight: spec.chart.as_ref().is_some_and(|c| c.agent_highlight()),
+                            spec,
+                            outputs,
+                            error,
+                        }
                     })
                     .collect()
             })
