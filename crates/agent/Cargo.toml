@@ -5,8 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+tr-agent-tools = { path = "../agent-tools" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
+rusqlite.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tr-core.workspace = true
+tr-data.workspace = true

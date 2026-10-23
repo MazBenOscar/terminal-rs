@@ -49,7 +49,7 @@ impl CallBudget {
     pub fn remaining(&self) -> usize {
         self.remaining
     }
-    fn take(&mut self) -> bool {
+    pub fn take(&mut self) -> bool {
         if self.remaining == 0 {
             false
         } else {
@@ -99,29 +99,43 @@ impl Registry {
         if !ctx.budget.take() {
             return ToolResult::error("budget_exhausted", "Per-turn tool call budget exhausted", None);
         }
+        let value = match self.validate_call(name, args_json) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let spec = self.specs.iter().find(|spec| spec.name == name).unwrap();
+        self.execute(spec, value, ctx).await
+    }
+
+    /// Validate before crossing an executor boundary. Execution validates again so
+    /// adapters cannot bypass the registry's typed and consent checks.
+    pub fn validate_call(&self, name: &str, args_json: &str) -> Result<Value, ToolResult> {
         let Some(spec) = self.specs.iter().find(|spec| spec.name == name) else {
-            return if catalog().iter().any(|spec| spec.name == name) {
+            return Err(if catalog().iter().any(|spec| spec.name == name) {
                 ToolResult::error("tool_disabled", "Tool is not enabled in this preset", Some("name"))
             } else {
                 ToolResult::error("unknown_tool", "Unknown tool", Some("name"))
-            };
+            });
         };
         if args_json.len() > 64 * 1024 {
-            return ToolResult::error("invalid_args", "Arguments exceed 64 KiB", None);
+            return Err(ToolResult::error("invalid_args", "Arguments exceed 64 KiB", None));
         }
         let value: Value = match serde_json::from_str(args_json) {
             Ok(value) => value,
-            Err(error) => return invalid(error.to_string(), None),
+            Err(error) => return Err(invalid(error.to_string(), None)),
         };
-        if let Err(error) = validate(&value, &spec.input_schema, "") {
-            return error;
-        }
+        validate(&value, &spec.input_schema, "")?;
         if let (Some(from), Some(to)) =
             (value.get("from").and_then(Value::as_i64), value.get("to").and_then(Value::as_i64))
             && from > to
         {
-            return invalid("from must not exceed to".into(), Some("from"));
+            return Err(invalid("from must not exceed to".into(), Some("from")));
         }
+        Ok(value)
+    }
+
+    async fn execute(&self, spec: &ToolSpec, value: Value, ctx: &mut CallContext<'_>) -> ToolResult {
+        let name = spec.name.as_str();
         if spec.kind == ToolKind::Data {
             return match name {
                 "read_data" => match serde_json::from_value::<args::ReadData>(value) {

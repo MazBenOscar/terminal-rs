@@ -251,6 +251,10 @@ fn validate_home_entries(path: &Path, root: bool) -> Result<()> {
             validate_system_skills(&entry.path())?;
             continue;
         }
+        if root && name == "thread-writer-locks" && directory {
+            validate_thread_locks(&entry.path())?;
+            continue;
+        }
         if root && name == "home" && directory {
             // The private HOME must stay empty: anything Codex or a session leaves there
             // (dotfiles, AGENTS.md, skills) is refused until reviewed.
@@ -285,6 +289,9 @@ fn validate_home_entries(path: &Path, root: bool) -> Result<()> {
                         | "logs_2.sqlite"
                         | "logs_2.sqlite-shm"
                         | "logs_2.sqlite-wal"
+                        | "thread_history_1.sqlite"
+                        | "thread_history_1.sqlite-shm"
+                        | "thread_history_1.sqlite-wal"
                         | ".codex-global-state.json"
                         | ".sqlite-maintenance.lock"
                         | ".sandbox_migration"
@@ -312,6 +319,25 @@ fn validate_home_entries(path: &Path, root: bool) -> Result<()> {
         }
         if directory {
             validate_home_entries(&entry.path(), false)?;
+        }
+    }
+    Ok(())
+}
+
+/// Persistent threads (needed for `thread/resume`) keep empty writer locks: one
+/// `.coordination.lock` and one `<thread uuid>.lock` per thread. Nothing else.
+#[cfg(unix)]
+fn validate_thread_locks(locks: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(locks)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or_default();
+        let metadata = owned_path(&entry.path())?;
+        let uuid = name
+            .strip_suffix(".lock")
+            .is_some_and(|stem| stem.len() == 36 && stem.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-'));
+        if !(name == ".coordination.lock" || uuid) || !metadata.is_file() || metadata.len() != 0 {
+            bail!("private home thread locks contain unexpected entries; refusing startup");
         }
     }
     Ok(())
@@ -389,6 +415,226 @@ impl PrivateHome {
             bail!("private home paths changed");
         }
         Ok(())
+    }
+}
+
+/// Privacy retention applies only to threads recorded by this bridge, not other
+/// private-home users. The ledger is itself a validator-accepted session file.
+pub const SESSION_RETENTION_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const SESSION_RETENTION_THREADS: usize = 50;
+const RETENTION_LEDGER: &str = "rollout-bridge-retention.jsonl";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedThread {
+    id: String,
+    created: u64,
+}
+
+fn thread_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(
+            |(n, b)| {
+                if [8, 13, 18, 23].contains(&n) { b == b'-' } else { b.is_ascii_hexdigit() }
+            },
+        )
+}
+
+#[cfg(unix)]
+fn session_file(path: &Path, write: bool) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    #[cfg(target_os = "macos")]
+    const NOFOLLOW: i32 = 0x100;
+    #[cfg(not(target_os = "macos"))]
+    const NOFOLLOW: i32 = 0x20000;
+    let file = std::fs::OpenOptions::new()
+        .read(!write)
+        .write(write)
+        .create(write)
+        .mode(0o600)
+        .custom_flags(NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        bail!("session retention requires regular, unlinked files");
+    }
+    if write {
+        file.set_len(0)?;
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+impl PrivateHome {
+    fn bridge_threads(&self) -> Result<Vec<RetainedThread>> {
+        use std::io::Read;
+        let path = self.path.join("sessions").join(RETENTION_LEDGER);
+        if !path.try_exists()? {
+            return Ok(Vec::new());
+        }
+        owned_path(&path)?;
+        let mut bytes = Vec::new();
+        session_file(&path, false)?.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 {
+            bail!("session retention ledger too large")
+        }
+        let threads: Vec<RetainedThread> = serde_json::from_slice(&bytes)?;
+        let unique: std::collections::BTreeSet<_> = threads.iter().map(|t| &t.id).collect();
+        if threads.iter().any(|t| !thread_uuid(&t.id)) || unique.len() != threads.len() {
+            bail!("invalid bridge thread ledger")
+        }
+        Ok(threads)
+    }
+
+    fn save_bridge_threads(&self, threads: &[RetainedThread]) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::DirBuilderExt;
+        let sessions = self.path.join("sessions");
+        if !sessions.try_exists()? {
+            std::fs::DirBuilder::new().mode(0o700).create(&sessions)?;
+        }
+        if !owned_path(&sessions)?.is_dir() {
+            bail!("invalid session directory")
+        }
+        let path = sessions.join(RETENTION_LEDGER);
+        if path.try_exists()? {
+            owned_path(&path)?;
+        }
+        let mut file = session_file(&path, true)?;
+        serde_json::to_writer(&mut file, threads)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn remember_bridge_thread(&self, id: &str) -> Result<()> {
+        self.recheck()?;
+        if !thread_uuid(id) {
+            bail!("invalid bridge thread id")
+        }
+        let mut threads = self.bridge_threads()?;
+        if !threads.iter().any(|thread| thread.id == id) {
+            threads.push(RetainedThread {
+                id: id.into(),
+                created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+            });
+        }
+        self.save_bridge_threads(&threads)
+    }
+
+    /// Run before the first spawn, never concurrently with a live session. Only
+    /// ledger-owned UUIDs and the existing validator's session files are removed.
+    pub(crate) fn retain_bridge_sessions(&self) -> Result<()> {
+        self.retain_bridge_sessions_at(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())
+    }
+
+    fn retain_bridge_sessions_at(&self, now: u64) -> Result<()> {
+        self.recheck()?; // Validate the entire tree BEFORE deleting anything.
+        let mut threads = self.bridge_threads()?;
+        threads.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| b.id.cmp(&a.id)));
+        let mut expired = Vec::new();
+        let mut kept = Vec::new();
+        for (index, thread) in threads.into_iter().enumerate() {
+            if index >= SESSION_RETENTION_THREADS
+                || now.saturating_sub(thread.created) > SESSION_RETENTION_AGE.as_secs()
+            {
+                expired.push(thread.id);
+            } else {
+                kept.push(thread);
+            }
+        }
+        if expired.is_empty() {
+            return Ok(());
+        }
+        let mut stack = vec![self.path.join("sessions")];
+        let mut rollouts = Vec::new();
+        while let Some(dir) = stack.pop() {
+            if !owned_path(&dir)?.is_dir() {
+                bail!("invalid session directory")
+            }
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let metadata = owned_path(&entry.path())?;
+                if metadata.is_dir() {
+                    stack.push(entry.path());
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_str().context("non-UTF8 session file")?;
+                if name.starts_with("rollout-")
+                    && name.ends_with(".jsonl")
+                    && expired.iter().any(|id| name.ends_with(&format!("-{id}.jsonl")))
+                {
+                    // Open without following a link; this also refuses hard links.
+                    session_file(&entry.path(), false)?;
+                    rollouts.push(entry.path());
+                }
+            }
+        }
+        // Reuse the workspace's SQLite dependency. Delete rows, never DB files:
+        // retained/newer and untracked threads must survive. Unknown schemas fail
+        // startup instead of silently claiming that history has been pruned.
+        for name in ["thread_history_1.sqlite", "state_5.sqlite"] {
+            let path = self.path.join(name);
+            if !path.try_exists()? {
+                continue;
+            }
+            if !owned_path(&path)?.is_file() {
+                bail!("invalid thread database")
+            }
+            session_file(&path, false)?;
+            for suffix in ["-wal", "-shm"] {
+                let sidecar = self.path.join(format!("{name}{suffix}"));
+                if sidecar.try_exists()? {
+                    session_file(&sidecar, false)?;
+                }
+            }
+            let mut db = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            db.busy_timeout(Duration::from_secs(1))?;
+            db.execute_batch("PRAGMA secure_delete=ON; PRAGMA foreign_keys=ON;")?;
+            let mut tables = db
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // Remove child records before their parent thread (also works for
+            // schemas with restrictive rather than cascading foreign keys).
+            tables.sort_by_key(|table| table == "threads");
+            let tx = db.transaction()?;
+            let mut recognized = false;
+            for table in tables {
+                let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+                let columns = tx
+                    .prepare(&format!("PRAGMA table_info({quoted})"))?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let column = if columns.iter().any(|c| c == "thread_id") {
+                    "thread_id"
+                } else if table == "threads" && columns.iter().any(|c| c == "id") {
+                    "id"
+                } else {
+                    continue;
+                };
+                recognized = true;
+                for id in &expired {
+                    tx.execute(&format!("DELETE FROM {quoted} WHERE \"{column}\" = ?1"), [id])?;
+                }
+            }
+            if !recognized {
+                bail!("unrecognized thread history schema; refusing retention/startup")
+            }
+            tx.commit()?;
+            // Remove free-page copies and truncate WAL, including message bodies.
+            db.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
+        for path in rollouts {
+            owned_path(&path)?;
+            std::fs::remove_file(path)?;
+        }
+        self.save_bridge_threads(&kept)?;
+        self.recheck()
     }
 }
 
@@ -737,7 +983,9 @@ pub async fn spawn_session(
     range.check(&version).map_err(|_| WrongVersion)?;
     // No caller can widen the pinned protocol version through VersionRange.
     VersionRange::default().check(&version).map_err(|_| WrongVersion)?;
-    verify_features(&probe(&binary, home, &profile, &["features", "list"]).await?)?;
+    let features = probe(&binary, home, &profile, &["features", "list"]).await?;
+    verify_features(&features)?;
+    crate::bridge::verify_readiness(&version, &features, &std::fs::read_to_string(home.path.join("config.toml"))?)?;
     // Codex's own diagnostics go to a private 0600 log so failures stay explainable.
     let log = {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -792,9 +1040,12 @@ pub async fn spawn_session(
                 }
             }
         }
-        if let Err(error) = group.check().and_then(|()| checked_home.recheck()) {
-            report(format!("session cleanup findings: {error}"));
-        }
+        report(
+            group
+                .check()
+                .and_then(|()| checked_home.recheck())
+                .map_err(|error| format!("session cleanup findings: {error}")),
+        );
     });
     Ok(transport)
 }
@@ -965,6 +1216,26 @@ mod tests {
         ] {
             std::fs::write(home.path.join(file), "{}").unwrap();
         }
+        std::fs::set_permissions(home.path.join("auth.json"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::create_dir(home.path.join("thread-writer-locks")).unwrap();
+        for lock in [".coordination.lock", "01a16930-6797-71f2-a43e-664498eb2172.lock"] {
+            std::fs::write(home.path.join("thread-writer-locks").join(lock), "").unwrap();
+        }
+        for file in ["thread_history_1.sqlite", "thread_history_1.sqlite-wal"] {
+            std::fs::write(home.path.join(file), "{}").unwrap();
+        }
+        home.recheck().unwrap();
+        for bad in [("notes.lock", ""), (".coordination.lock", "x"), ("AGENTS.md", "")] {
+            let path = home.path.join("thread-writer-locks").join(bad.0);
+            let previous = std::fs::read(&path).ok();
+            std::fs::write(&path, bad.1).unwrap();
+            assert!(home.recheck().is_err(), "thread lock {}", bad.0);
+            match previous {
+                Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+                None => std::fs::remove_file(&path).unwrap(),
+            }
+        }
+        home.recheck().unwrap();
         let auth = home.path.join("auth.json");
         std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(home.recheck().is_err(), "readable credential file");
@@ -1111,6 +1382,101 @@ mod tests {
         assert!(descendant_tree("bad table", 10).is_err());
         assert!(descendant_tree("1 0", 10).is_err());
         assert!(descendant_tree("1 0 1", 99).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_prunes_only_owned_threads_by_age_and_newest_fifty_with_history() {
+        let parent =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("retention-{}", std::process::id()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let home = PrivateHome::create(&parent).unwrap();
+        let now = 2_000_000;
+        let threads: Vec<_> = (0..56)
+            .map(|n| RetainedThread {
+                id: format!("00000000-0000-0000-0000-{n:012}"),
+                created: if n == 55 { now - SESSION_RETENTION_AGE.as_secs() - 1 } else { now - n },
+            })
+            .collect();
+        home.save_bridge_threads(&threads).unwrap();
+        let dated = home.path.join("sessions/2026/10/23");
+        std::fs::create_dir_all(&dated).unwrap();
+        for thread in &threads {
+            std::fs::write(dated.join(format!("rollout-test-{}.jsonl", thread.id)), "private body").unwrap();
+        }
+        let untracked = dated.join("rollout-untracked.jsonl");
+        std::fs::write(&untracked, "not created by bridge").unwrap();
+        let log = home.path.join("log");
+        std::fs::create_dir(&log).unwrap();
+        std::fs::write(log.join("codex.log"), "not session history").unwrap();
+        for name in ["thread_history_1.sqlite", "state_5.sqlite"] {
+            let db = rusqlite::Connection::open(home.path.join(name)).unwrap();
+            db.execute_batch(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, body TEXT);
+                CREATE TABLE turns(thread_id TEXT REFERENCES threads(id) ON DELETE CASCADE, body TEXT);",
+            )
+            .unwrap();
+            for thread in &threads {
+                db.execute("INSERT INTO threads VALUES (?1, 'private body')", [&thread.id]).unwrap();
+                db.execute("INSERT INTO turns VALUES (?1, 'private body')", [&thread.id]).unwrap();
+            }
+            db.execute("INSERT INTO threads VALUES ('untracked', 'keep')", []).unwrap();
+        }
+        home.retain_bridge_sessions_at(now).unwrap();
+        assert_eq!(home.bridge_threads().unwrap().len(), SESSION_RETENTION_THREADS);
+        for (n, thread) in threads.iter().enumerate() {
+            assert_eq!(dated.join(format!("rollout-test-{}.jsonl", thread.id)).exists(), n < 50);
+        }
+        assert!(untracked.exists() && log.join("codex.log").exists());
+        for name in ["thread_history_1.sqlite", "state_5.sqlite"] {
+            let db = rusqlite::Connection::open(home.path.join(name)).unwrap();
+            assert_eq!(db.query_row("SELECT count(*) FROM threads", [], |r| r.get::<_, i64>(0)).unwrap(), 51);
+            assert_eq!(db.query_row("SELECT count(*) FROM turns", [], |r| r.get::<_, i64>(0)).unwrap(), 50);
+        }
+        home.retain_bridge_sessions_at(now).unwrap(); // idempotent
+        home.retain_bridge_sessions_at(now + SESSION_RETENTION_AGE.as_secs() + 1).unwrap();
+        assert!(home.bridge_threads().unwrap().is_empty());
+        assert!(untracked.exists());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_refuses_links_and_unknown_entries_before_deleting_anything() {
+        use std::os::unix::fs::symlink;
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("retention-links-{}", std::process::id()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let home = PrivateHome::create(&parent).unwrap();
+        let id = "00000000-0000-0000-0000-000000000001";
+        home.save_bridge_threads(&[RetainedThread { id: id.into(), created: 0 }]).unwrap();
+        let rollout = home.path.join("sessions").join(format!("rollout-old-{id}.jsonl"));
+        std::fs::write(&rollout, "private").unwrap();
+        let bad = home.path.join("sessions/AGENTS.md");
+        std::fs::write(&bad, "unreviewed").unwrap();
+        assert!(home.retain_bridge_sessions_at(1_000_000).is_err());
+        assert!(rollout.exists());
+        std::fs::remove_file(&bad).unwrap();
+        let link = home.path.join("sessions/2026");
+        symlink(&home.cwd, &link).unwrap();
+        assert!(home.retain_bridge_sessions_at(1_000_000).is_err());
+        assert!(rollout.exists());
+        std::fs::remove_file(link).unwrap();
+        let db = home.path.join("thread_history_1.sqlite");
+        symlink(&rollout, &db).unwrap();
+        assert!(home.retain_bridge_sessions_at(1_000_000).is_err());
+        assert_eq!(std::fs::read_to_string(&rollout).unwrap(), "private");
+        std::fs::remove_file(db).unwrap();
+        // Refuse hard-linked session files too, without truncating their contents.
+        let alias = home.path.join("sessions/rollout-alias.jsonl");
+        std::fs::hard_link(&rollout, &alias).unwrap();
+        assert!(home.retain_bridge_sessions_at(1_000_000).is_err());
+        assert_eq!(std::fs::read_to_string(&rollout).unwrap(), "private");
+        std::fs::remove_file(alias).unwrap();
+        home.retain_bridge_sessions_at(1_000_000).unwrap();
+        assert!(!rollout.exists());
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

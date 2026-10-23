@@ -1,6 +1,7 @@
 //! terminal-rs: a keyboard-driven, Bloomberg-style market terminal with GPU charts and
 //! congressional (STOCK Act) trade tracking.
 
+pub use app::agent_bridge;
 pub mod agent_queue;
 mod alert_delivery;
 mod anim;

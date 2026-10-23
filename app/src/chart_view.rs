@@ -616,6 +616,10 @@ impl ChartState {
         }
     }
 
+    pub fn source_instrument(&self) -> Option<&tr_core::crypto::CryptoInstrument> {
+        self.crypto_source.as_ref()
+    }
+
     pub fn source_bars(&self) -> BarsRead<'_> {
         self.read_bars(&self.source_bars)
     }
@@ -644,8 +648,18 @@ impl ChartState {
     }
 
     pub fn studies(&self) -> Vec<StudyRead> {
+        self.study_reads(None, usize::MAX)
+    }
+
+    /// Filter and slice while borrowing, before cloning any study values on the UI thread.
+    pub fn studies_tail(&self, id: Option<&str>, tail: usize) -> Vec<StudyRead> {
+        self.study_reads(id, tail)
+    }
+
+    fn study_reads(&self, id: Option<&str>, tail: usize) -> Vec<StudyRead> {
         self.indicators
             .iter()
+            .filter(|spec| id.is_none_or(|id| spec.chart.as_ref().is_some_and(|c| c.id.to_string() == id)))
             .map(|spec| {
                 let id = spec.chart.as_ref().map(|c| c.id);
                 let built = self.built.iter().find(|b| b.spec == *spec);
@@ -654,9 +668,8 @@ impl ChartState {
                         .values
                         .iter()
                         .map(|(name, values)| {
-                            let values = values
-                                .read()
-                                .expect("study values lock")
+                            let values = values.read().expect("study values lock");
+                            let values = values[values.len().saturating_sub(tail)..]
                                 .iter()
                                 .map(|value| value.is_finite().then_some(*value))
                                 .collect();
@@ -9840,6 +9853,22 @@ mod tests {
         chart.drawings.push(added.clone());
         chart.undo_drawings();
         assert_eq!(chart.drawings, [vec![added], original].concat());
+    }
+
+    #[test]
+    fn agent_study_tail_filters_and_slices_before_copying() {
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        let bars: Vec<_> = (0..1000).map(|n| Bar::new(n * 86400, 1., 3., 1., n as f64, 10.)).collect();
+        chart.indicators = vec![IndicatorSpec::new("SMA", &[1.]).unwrap(), IndicatorSpec::new("SMA", &[2.]).unwrap()];
+        study::assign_ids(&mut chart.indicators);
+        chart.built = crate::worker::build_indicators(&bars, chart.tf, &chart.indicators, &theme::palette());
+        let full = chart.studies();
+        let id = full[0].id.unwrap().to_string();
+        let tail = chart.studies_tail(Some(&id), 200);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].outputs[0].values, full[0].outputs[0].values[800..]);
+        assert!(chart.studies_tail(Some("no-such-id"), 200).is_empty());
+        assert!(chart.studies_tail(None, 0).iter().all(|s| s.outputs.iter().all(|o| o.values.is_empty())));
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! drag and drop, pop-out windows, link groups, saved layouts), `panels` (per-kind pane
 //! content) and `settings_view` (preferences UI).
 
+#[path = "agent_bridge.rs"]
+pub mod agent_bridge;
 mod broker;
 mod chrome;
 mod columns_view;
@@ -4362,5 +4364,67 @@ mod tests {
         assert!(!outcome.added && outcome.truncated);
         assert_eq!(outcome.message, "Full is full (200 symbols); BTC/USD was not added");
         assert_eq!(app.watchlists[1].symbols.len(), 200);
+    }
+
+    #[test]
+    fn bridge_executor_reads_loaded_bars_and_live_tools_from_logic_without_ui() {
+        use std::sync::Arc;
+        use tr_agent::bridge::{ToolCall, ToolExecutor};
+        use tr_agent_tools::{Content, Registry, ToolSet};
+        let mut app = agent_fixture("bridge-hidden-logic");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (out, rx) = std::sync::mpsc::channel();
+            app.worker.rx = rx;
+            let bars = Arc::new(vec![
+                tr_core::Bar::new(86400, 1., 2., 0., 1., 10.),
+                tr_core::Bar::new(172800, 2., 3., 1., 2.5, 20.),
+            ]);
+            out.send(Response::History {
+                pane: 1,
+                generation: 0,
+                revision: 1,
+                symbol: tr_data::security("AAA").key(),
+                tf: Timeframe::D1,
+                bars: bars.clone(),
+                gpu: tr_chart::scene::SeriesGpu::build(&bars),
+                prepended: 0,
+                from_cache: false,
+                exhausted: false,
+                live: false,
+                crypto_source: None,
+            })
+            .unwrap();
+            logic_only(&mut app);
+            let executor = agent_bridge::AppExecutor::new(&app);
+            let pin = agent_bridge::AppExecutor::pin(&app).unwrap();
+            let registry = Arc::new(Registry::new(ToolSet::ReadOnly));
+            for (name, arguments) in [
+                ("read_chart", "{}"),
+                ("read_data", r#"{"symbol":"AAA","limit":10}"#),
+                ("indicator_values", "{}"),
+                ("read_user_actions", "{}"),
+            ] {
+                let call = ToolCall {
+                    turn: "turn".into(),
+                    pin: pin.clone(),
+                    name: name.into(),
+                    arguments: arguments.into(),
+                    confirmed: false,
+                };
+                let mut future = Box::pin(executor.execute(registry.clone(), call));
+                let polled = futures::poll!(future.as_mut());
+                assert!(polled.is_pending(), "{name}: {polled:?}; pin={pin:?}");
+                logic_only(&mut app);
+                let result = future.await;
+                assert!(result.success, "{name}: {result:?}");
+                if name == "read_data" {
+                    let Content::Text(text) = &result.content[0] else { panic!("text") };
+                    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+                    assert_eq!(value["count"], 2);
+                    assert_eq!(value["bars"][1][4], 2.5);
+                }
+            }
+        });
     }
 }
