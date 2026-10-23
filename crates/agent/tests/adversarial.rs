@@ -322,7 +322,7 @@ async fn thread_start_pins_approval_policy_and_user_reviewer() {
         send(&mut write, json!({"id":init["id"],"result":{}})).await;
         receive(&mut read).await; // initialized
         let skills = receive(&mut read).await;
-        send(&mut write, json!({"id":skills["id"],"result":{"data":[]}})).await;
+        send(&mut write, json!({"id":skills["id"],"result":{"data":[{"skills":[{"name":"imagegen","enabled":false},{"name":"openai-docs","enabled":false},{"name":"review-agent","enabled":false},{"name":"skill-creator","enabled":false},{"name":"skill-installer","enabled":false}]}]}})).await;
         let account = receive(&mut read).await;
         send(&mut write, json!({"id":account["id"],"result":{"account":{"type":"chatgpt"}}})).await;
         let start = receive(&mut read).await;

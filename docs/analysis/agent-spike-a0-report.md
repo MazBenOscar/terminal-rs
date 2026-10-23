@@ -417,7 +417,8 @@ made from what the live run showed:
   the metadata of each ancestor of the private home (to canonicalize `CODEX_HOME`),
   `/etc/codex/requirements.toml` and `managed_config.toml` (admin policy; absent on
   this machine), and managed preferences (`user-preference-read`, `cfprefsd`
-  mach services and `apple.cfprefs.*` shared memory), plus `opendirectoryd.libinfo`
+  mach services and read-only `apple.cfprefs.*` shared memory; preference reads are
+  limited to the `com.openai.codex` domain), plus `opendirectoryd.libinfo`
   (user lookup) and `notification_center`. The install-directory subpath grant was
   removed: only the `codex` binary itself is readable (the directory also holds
   `codex-code-mode-host`). `diagnosticd` and `logd` stay denied.
@@ -425,7 +426,8 @@ made from what the live run showed:
   ignored by the check. `unified_exec` cannot be disabled by `--disable` or
   `-c features.unified_exec=false` in 0.163.0; it is the only named exception
   (`UNDISABLEABLE_FEATURES`), mitigated by the disabled shell tool, the exec-only-codex
-  sandbox and the tripwire, and re-proved by the canary turn. `codex features` rejects
+  sandbox and the tripwire, and re-proved by the canary turn. Retired features that
+  still report enabled are an explicit reviewed list (`RETIRED_ENABLED_FEATURES`). `codex features` rejects
   `--strict-config`, so that probe omits it.
 - **Remote control.** Codex sends `remoteControl/status/changed` at startup. It is
   accepted only with status `disabled`; any other status trips.
@@ -435,7 +437,8 @@ made from what the live run showed:
   Fixes: the child gets a private, empty `HOME` (`<private home>/home`), the config
   disables each bundled skill with `[[skills.config]]`, the home validator accepts
   only a link-free `skills/.system` tree, and `initialize` calls `skills/list` and
-  fails closed if any skill is enabled. `skip_host_skill_discovery` had no effect.
+  fails closed unless all five bundled skills are reported, all disabled, with no
+  discovery errors and nothing else enabled. `skip_host_skill_discovery` had no effect.
 - **Home entries.** Codex also creates `installation_id`, `goals_1`, `memories_1`
   and `queue_1` SQLite files (memories and goals stay disabled) and `tmp/arg0-macos`
   links back to its own binary; these exact shapes are accepted.

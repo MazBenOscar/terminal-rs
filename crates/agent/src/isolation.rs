@@ -59,17 +59,11 @@ pub fn parse_features(output: &str) -> Result<BTreeMap<String, bool>> {
 /// The canary turn re-proves this per version. Adding a name here needs review.
 pub const UNDISABLEABLE_FEATURES: &[&str] = &["unified_exec"];
 
-/// Features the registry lists at stage `removed`: retired, report `true`, do nothing.
-fn removed_features() -> std::collections::BTreeSet<&'static str> {
-    FEATURE_REGISTRY
-        .lines()
-        .filter_map(|line| {
-            let mut words = line.split_whitespace();
-            let name = words.next()?;
-            words.any(|word| word == "removed").then_some(name)
-        })
-        .collect()
-}
+/// Retired features (stage `removed` in 0.163.0) that report enabled whatever flags are
+/// passed and have no effect (verified live 2026-10-23). Reviewed list; any other enabled
+/// feature fails the check.
+pub const RETIRED_ENABLED_FEATURES: &[&str] =
+    &["resize_all_images", "terminal_resize_reflow", "tool_search_always_defer_mcp_tools", "tui_app_server"];
 
 pub fn verify_features(output: &str) -> Result<()> {
     let actual = parse_features(output)?;
@@ -83,7 +77,7 @@ pub fn verify_features(output: &str) -> Result<()> {
             **enabled
                 && !ALLOWED_FEATURES.contains(&name.as_str())
                 && !UNDISABLEABLE_FEATURES.contains(&name.as_str())
-                && !removed_features().contains(name.as_str())
+                && !RETIRED_ENABLED_FEATURES.contains(&name.as_str())
         })
         .map(|(name, _)| name.as_str())
         .collect();
@@ -464,7 +458,7 @@ pub fn sandbox_profile_for(private_home: &Path, binary: &Path, user_home: &Path,
 (allow sysctl-read)
 (allow mach-lookup (global-name "com.apple.dnssd.service"))
 (allow mach-lookup (global-name "com.apple.cfprefsd.daemon") (global-name "com.apple.cfprefsd.agent"))
-(allow user-preference-read)
+(allow user-preference-read (preference-domain "com.openai.codex"))
 (allow ipc-posix-shm-read-data (ipc-posix-name-prefix "apple.cfprefs."))
 (allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.system.notification_center"))
 (allow mach-lookup (global-name "com.apple.SecurityServer"))

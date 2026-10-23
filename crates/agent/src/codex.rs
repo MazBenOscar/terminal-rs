@@ -3,6 +3,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
+
+/// Skills codex-cli 0.163.0 installs into its home on every start; each is disabled in
+/// the private config and must be reported, disabled, by `skills/list`.
+pub const BUNDLED_SKILLS: &[&str] = &["imagegen", "openai-docs", "review-agent", "skill-creator", "skill-installer"];
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -222,6 +226,20 @@ impl CodexAppServer {
     async fn verify_no_skills(&self) -> Result<()> {
         let result = self.transport()?.request("skills/list", json!({"cwds": [], "forceReload": true})).await?;
         let entries = result["data"].as_array().context("skills/list returned no data")?;
+        // An empty or erroring listing proves nothing: require the bundled skills to be
+        // reported, each disabled, and no discovery errors.
+        if entries.is_empty() || entries.iter().any(|entry| entry["errors"].as_array().is_some_and(|e| !e.is_empty())) {
+            bail!("skills/list returned no entries or discovery errors");
+        }
+        let listed: std::collections::BTreeSet<_> = entries
+            .iter()
+            .flat_map(|entry| entry["skills"].as_array().into_iter().flatten())
+            .filter_map(|skill| skill["name"].as_str())
+            .collect();
+        let missing: Vec<_> = BUNDLED_SKILLS.iter().filter(|name| !listed.contains(**name)).copied().collect();
+        if !missing.is_empty() {
+            bail!("skills/list is missing bundled skills: {}", missing.join(", "));
+        }
         let enabled: Vec<_> = entries
             .iter()
             .flat_map(|entry| entry["skills"].as_array().into_iter().flatten())
@@ -549,7 +567,7 @@ mod tests {
             assert_eq!(receive(&mut read).await["method"], "initialized");
             let skills = receive(&mut read).await;
             assert_eq!(skills["method"], "skills/list");
-            let disabled = json!({"data":[{"skills":[{"name":"imagegen","enabled":false}]}]});
+            let disabled = json!({"data":[{"skills":[{"name":"imagegen","enabled":false},{"name":"openai-docs","enabled":false},{"name":"review-agent","enabled":false},{"name":"skill-creator","enabled":false},{"name":"skill-installer","enabled":false}]}]});
             send(&mut write, json!({"id":skills["id"],"result":disabled})).await;
             let account = receive(&mut read).await;
             assert_eq!(account["method"], "account/read");
@@ -571,7 +589,7 @@ mod tests {
             assert_eq!(receive(&mut read).await["method"], "initialized");
             let skills = receive(&mut read).await;
             let listed = json!({"data":[{"skills":[
-                {"name":"imagegen","enabled":false},
+                {"name":"imagegen","enabled":false},{"name":"openai-docs","enabled":false},{"name":"review-agent","enabled":false},{"name":"skill-creator","enabled":false},{"name":"skill-installer","enabled":false},
                 {"name":"gmail","enabled":true},
                 {"name":"unknown"}
             ]}]});
