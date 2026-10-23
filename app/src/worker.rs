@@ -5186,6 +5186,97 @@ mod tests {
         assert!(ui.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn a1a_agent_dropped_receivers_and_errors_leave_existing_pane_generation_untouched() {
+        let (s, ui) = backfill_shared(Arc::new(AgentUnavailable));
+        let bars = Arc::new(vec![Bar::new(60, 1., 2., 0.5, 1.5, 10.)]);
+        assert!(claim_series(&s, 41, 7, "existing-pane-route"));
+        assert!(store_series(&s, 41, 7, bars.clone()));
+        let existing = s.series.lock().unwrap()[&41].clone();
+        let (reply, mut receive) = tokio::sync::oneshot::channel();
+        handle(
+            &s,
+            Request::Agent(AgentRequest::History {
+                symbol: "AAA".into(),
+                tf: Timeframe::M1,
+                end: None,
+                limit: 10,
+                options: Default::default(),
+                reply,
+            }),
+        )
+        .await;
+        assert!(receive.try_recv().unwrap().unwrap_err().contains("offline fixture"));
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        drop(receive);
+        handle(
+            &s,
+            Request::Agent(AgentRequest::History {
+                symbol: "AAA".into(),
+                tf: Timeframe::M1,
+                end: Some(60),
+                limit: 10,
+                options: Default::default(),
+                reply,
+            }),
+        )
+        .await;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        drop(receive);
+        handle(&s, Request::Agent(AgentRequest::Search { query: "AAA".into(), reply })).await;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        drop(receive);
+        handle(&s, Request::Agent(AgentRequest::Quotes { symbols: vec!["AAA".into()], reply })).await;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        drop(receive);
+        handle(
+            &s,
+            Request::Agent(AgentRequest::Indicators {
+                bars: bars.as_ref().clone(),
+                tf: Timeframe::M1,
+                specs: vec![IndicatorSpec::new("SMA", &[1.]).unwrap()],
+                session: tr_core::session::Session::Provider,
+                reply,
+            }),
+        )
+        .await;
+        assert_eq!(s.series.lock().unwrap()[&41], existing);
+        assert!(Arc::ptr_eq(&s.series.lock().unwrap()[&41].1, &existing.1));
+        assert_eq!(current_series(&s, 41, 7).unwrap().as_ref(), bars.as_ref());
+        assert!(current_series(&s, 41, 6).is_none());
+        assert_eq!(s.series.lock().unwrap().len(), 1);
+        assert!(s.study_outputs.lock().unwrap().is_empty());
+        assert!(s.compare_outputs.lock().unwrap().is_empty());
+        assert!(matches!(ui.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn a1a_successful_agent_history_populates_the_shared_cache_without_pane_delivery() {
+        let bars = vec![Bar::new(60, 1., 2., 0., 1., 10.), Bar::new(120, 2., 3., 1., 2., 20.)];
+        let provider =
+            Arc::new(ComparisonFixture { bars: std::sync::Mutex::new(bars.clone()), limits: Default::default() });
+        let (s, ui) = backfill_shared(provider);
+        *s.cache.lock().unwrap() = Some(BarCache::open_in_memory().unwrap());
+        let source = chart_options_key(s.provider.as_ref(), "AAA", Default::default());
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle(
+            &s,
+            Request::Agent(AgentRequest::History {
+                symbol: "AAA".into(),
+                tf: Timeframe::M1,
+                end: None,
+                limit: 2,
+                options: Default::default(),
+                reply,
+            }),
+        )
+        .await;
+        assert_eq!(receive.await.unwrap().unwrap(), bars);
+        assert_eq!(s.cache.lock().unwrap().as_ref().unwrap().load(&source, Timeframe::M1, 10).unwrap(), bars);
+        assert!(s.series.lock().unwrap().is_empty());
+        assert!(matches!(ui.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
     #[test]
     fn exact_study_values_patch_shared_tails_without_full_array_copies() {
         let mut cache = StudyPaneCache::default();

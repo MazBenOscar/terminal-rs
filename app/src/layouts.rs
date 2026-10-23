@@ -1244,6 +1244,40 @@ mod tests {
     }
 
     #[test]
+    fn a1a_legacy_without_ids_is_byte_stable_after_first_save() {
+        let chart = serde_json::json!({
+            "symbol": "AAA", "tf": "D1", "chart_type": "Candles", "log": false,
+            "indicators": [], "compare": null, "drawings": [
+                { "tool": "Horizontal", "a": {"ts": 86400, "price": 10.}, "b": {"ts": 86400, "price": 10.} },
+                { "tool": "Fib", "a": {"ts": 86400, "price": 10.}, "b": {"ts": 172800, "price": 20.}, "all_symbols": true }
+            ]
+        });
+        let raw = serde_json::json!({"name": "Pre-agent layout", "focus": 2,
+            "dock": {"type": "tabs", "panes": [1, 2]},
+            "panes": [{"id": 1, "Chart": chart.clone()}, {"id": 2, "Chart": chart}]
+        });
+        let first = LayoutDoc::from_json(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        let canonical = first.to_json();
+        let mut bytes = canonical.clone();
+        for _ in 0..10 {
+            let loaded = LayoutDoc::from_json(&bytes).unwrap();
+            assert_eq!(loaded, first, "all ids, geometry and attribution must survive");
+            bytes = loaded.to_json();
+            assert_eq!(bytes, canonical, "no identity churn after migration");
+        }
+        let mut chart_ids = HashSet::new();
+        let mut drawing_ids = HashSet::new();
+        for pane in first.panes {
+            let PaneSettings::Chart { uid, drawings, .. } = pane.settings else { panic!("chart") };
+            assert!(uid != 0 && chart_ids.insert(uid));
+            assert!(drawings[1].all_symbols);
+            for drawing in drawings {
+                assert!(drawing.id != 0 && drawing_ids.insert(drawing.id));
+            }
+        }
+    }
+
+    #[test]
     fn legacy_layout_assigns_chart_and_drawing_ids_and_repairs_duplicates() {
         let chart = serde_json::json!({ "symbol": "AAA", "tf": "D1", "chart_type": "Candles", "log": false,
             "indicators": [], "compare": null, "drawings": [

@@ -2,7 +2,12 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+// Yield to rendering/input after eight jobs or four milliseconds, whichever comes
+// first. A running job is not preempted; expiry scans are cheap and unbudgeted.
+pub(crate) const MAX_JOBS_PER_FRAME: usize = 8;
+pub(crate) const MAX_JOB_TIME_PER_FRAME: Duration = Duration::from_millis(4);
 
 use crate::app::TerminalApp;
 
@@ -66,6 +71,34 @@ impl AgentToolQueue {
         };
         for job in cancelled {
             let _ = job.reply.send(AgentReply::error("cancelled"));
+        }
+    }
+
+    /// Expire the entire backlog, including jobs beyond this frame's work budget.
+    pub(crate) fn expire(&self) {
+        let now = Instant::now();
+        let expired = {
+            let mut jobs = self.jobs.lock().unwrap();
+            let mut expired = Vec::new();
+            let mut kept = VecDeque::new();
+            while let Some(job) = jobs.pop_front() {
+                if job.deadline <= now {
+                    expired.push(job);
+                } else {
+                    kept.push_back(job);
+                }
+            }
+            *jobs = kept;
+            expired
+        };
+        for job in expired {
+            let _ = job.reply.send(AgentReply::error("timeout"));
+        }
+    }
+
+    pub(crate) fn repaint_pending(&self) {
+        if self.len() > 0 {
+            self.ctx.request_repaint();
         }
     }
 

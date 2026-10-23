@@ -708,6 +708,7 @@ pub struct Drag {
 }
 
 pub struct TerminalApp {
+    drawing_ids: crate::drawing_history::SharedDrawingIds,
     pub agent_queue: crate::agent_queue::AgentToolQueue,
     pub pinned_agent_chart: Option<u64>,
     pub edit_log: crate::edit_log::EditLog,
@@ -941,6 +942,7 @@ impl TerminalApp {
             provider.eq_ignore_ascii_case("sample"),
         );
         let mut app = Self {
+            drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(ctx.clone()),
             pinned_agent_chart: None,
             edit_log: Default::default(),
@@ -1644,7 +1646,11 @@ impl TerminalApp {
 
     fn chart_mut(&mut self, pane: PaneId) -> Option<&mut ChartState> {
         match self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
-            Some(PaneKind::Chart(c)) => Some(c),
+            Some(PaneKind::Chart(c)) => {
+                c.drawing_ids.attach(self.drawing_ids.clone());
+                c.drawing_ids.repair(&mut c.drawings);
+                Some(c)
+            }
             _ => None,
         }
     }
@@ -1689,10 +1695,11 @@ impl TerminalApp {
 
     pub fn agent_chart_mut(&mut self, target: crate::agent_queue::ChartTarget) -> Option<&mut ChartState> {
         let uid = self.agent_chart_uid(target)?;
-        self.panes.iter_mut().find_map(|p| match &mut p.kind {
-            PaneKind::Chart(c) if c.uid == uid => Some(c.as_mut()),
+        let pane = self.panes.iter().find_map(|p| match &p.kind {
+            PaneKind::Chart(c) if c.uid == uid => Some(p.id),
             _ => None,
-        })
+        })?;
+        self.chart_mut(pane)
     }
 
     /// The target resolved immediately before the current queued job started.
@@ -1706,6 +1713,8 @@ impl TerminalApp {
             .retain(|uid, _| self.panes.iter().any(|p| matches!(&p.kind, PaneKind::Chart(c) if c.uid == *uid)));
         for pane in &mut self.panes {
             let PaneKind::Chart(chart) = &mut pane.kind else { continue };
+            chart.drawing_ids.attach(self.drawing_ids.clone());
+            chart.drawing_ids.repair(&mut chart.drawings);
             chart.finish_drawing_edit();
             for edit in chart.drawing_events.drain(..) {
                 for operation in edit.operations {
@@ -1748,13 +1757,18 @@ impl TerminalApp {
     }
 
     fn process_logic(&mut self) {
-        use crate::agent_queue::AgentReply;
+        use crate::agent_queue::{AgentReply, MAX_JOB_TIME_PER_FRAME, MAX_JOBS_PER_FRAME};
         use tr_chart::drawings::Author;
         self.observe_edits(true);
         self.drain();
         // History/live changes are not user edits.
         self.observe_edits(false);
-        for _ in 0..self.agent_queue.len() {
+        self.agent_queue.expire();
+        let started = Instant::now();
+        for _ in 0..self.agent_queue.len().min(MAX_JOBS_PER_FRAME) {
+            if started.elapsed() >= MAX_JOB_TIME_PER_FRAME {
+                break;
+            }
             let Some(job) = self.agent_queue.pop() else { break };
             let reply = if job.deadline <= Instant::now() {
                 AgentReply::error("timeout")
@@ -1783,6 +1797,8 @@ impl TerminalApp {
             };
             let _ = job.reply.send(reply);
         }
+        self.agent_queue.expire();
+        self.agent_queue.repaint_pending();
     }
 
     fn drain(&mut self) {
@@ -2753,6 +2769,7 @@ impl TerminalApp {
     /// Inert workspace with all disk-backed dependencies confined to the fixture.
     fn test_workspace(root: &std::path::Path) -> Self {
         Self {
+            drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(egui::Context::default()),
             pinned_agent_chart: None,
             edit_log: Default::default(),
@@ -3658,7 +3675,7 @@ mod tests {
     }
 
     #[test]
-    fn chart_uids_survive_layout_reload_popout_and_rearrangement() {
+    fn chart_uids_survive_rearrangement_but_layout_replacement_clears_pin() {
         use crate::agent_queue::ChartTarget;
         let mut app = agent_fixture("agent-chart-identity");
         let uid = app.chart_mut(1).unwrap().uid;
@@ -3674,11 +3691,456 @@ mod tests {
         let saved = app.current_doc();
         let loaded = LayoutDoc::from_json(&saved.to_json()).unwrap();
         app.apply_doc(loaded);
-        assert_eq!(app.agent_chart_uid(ChartTarget::Pinned), Some(uid));
-        assert!(app.agent_chart_mut(ChartTarget::Uid(second_uid)).is_some());
+        assert_eq!(app.pinned_agent_chart, None);
+        let active_uid = app.peek_chart().unwrap().uid;
+        assert_ne!(active_uid, uid);
+        assert_ne!(active_uid, second_uid);
+        assert_eq!(app.agent_chart_uid(ChartTarget::Pinned), Some(active_uid));
+        assert!(app.agent_chart_mut(ChartTarget::Uid(uid)).is_none());
+        assert!(app.agent_chart_mut(ChartTarget::Uid(second_uid)).is_none());
         app.pinned_agent_chart = Some(u64::MAX);
-        assert_eq!(app.agent_chart_uid(ChartTarget::Pinned), Some(second_uid));
+        assert_eq!(app.agent_chart_uid(ChartTarget::Pinned), Some(active_uid));
         assert!(app.agent_chart_mut(ChartTarget::Uid(u64::MAX)).is_none());
+    }
+
+    #[test]
+    fn a1a_hidden_drain_then_paint_matches_old_ui_time_drain_after_resize() {
+        use tr_chart::scene::SeriesGpu;
+        use tr_core::Bar;
+        let mut hidden = agent_fixture("a1a-hidden-parity");
+        let mut old = agent_fixture("a1a-ui-drain-parity");
+        old.chart_mut(1).unwrap().uid = hidden.chart_mut(1).unwrap().uid;
+        let (hidden_tx, hidden_rx) = std::sync::mpsc::channel();
+        let (old_tx, old_rx) = std::sync::mpsc::channel();
+        hidden.worker.rx = hidden_rx;
+        old.worker.rx = old_rx;
+        let bars =
+            std::sync::Arc::new((0..100).map(|i| Bar::new(i * 86400, 100., 110., 90., 105., 10.)).collect::<Vec<_>>());
+        for tx in [&hidden_tx, &old_tx] {
+            tx.send(Response::History {
+                pane: 1,
+                generation: 0,
+                revision: 1,
+                symbol: tr_data::security("AAA").key(),
+                tf: Timeframe::D1,
+                bars: bars.clone(),
+                gpu: SeriesGpu::build(&bars),
+                prepended: 0,
+                from_cache: false,
+                exhausted: false,
+                live: false,
+                crypto_source: None,
+            })
+            .unwrap();
+            tx.send(Response::LiveBars {
+                pane: 1,
+                generation: 0,
+                revision: 2,
+                from: 100,
+                bars: vec![Bar::new(100 * 86400, 105., 115., 95., 110., 20.)],
+                len: 101,
+            })
+            .unwrap();
+        }
+        logic_only(&mut hidden); // No Ui, layout, input or viewport measurement exists yet.
+        assert_eq!(hidden.chart_mut(1).unwrap().displayed_bars().bars.len(), 101);
+        assert!(hidden.read_user_actions(200).is_empty());
+        let hidden_ctx = egui::Context::default();
+        let old_ctx = egui::Context::default();
+        for width in [900., 1500., 1000.] {
+            for (ctx, app, drain_in_ui) in [(&hidden_ctx, &mut hidden, false), (&old_ctx, &mut old, true)] {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 600.))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        if drain_in_ui {
+                            app.drain();
+                        }
+                        let worker = &app.worker;
+                        let PaneKind::Chart(chart) = &mut app.panes[0].kind else { panic!("chart") };
+                        chart.show(ui, ui.max_rect(), true, worker);
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            assert_eq!(
+                serde_json::to_value(hidden.chart_mut(1).unwrap().read_chart()).unwrap(),
+                serde_json::to_value(old.chart_mut(1).unwrap().read_chart()).unwrap(),
+                "width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn a1a_logic_applies_responses_before_jobs_and_later_user_input_invalidates_old_generation() {
+        use crate::agent_queue::{AgentJob, AgentReply, ChartTarget};
+        use tr_chart::scene::SeriesGpu;
+        use tr_core::Bar;
+        let mut app = agent_fixture("a1a-frame-order");
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.worker.rx = rx;
+        let bars = std::sync::Arc::new(vec![Bar::new(86400, 1., 2., 0., 1., 10.)]);
+        let send_history = || {
+            tx.send(Response::History {
+                pane: 1,
+                generation: 0,
+                revision: 1,
+                symbol: tr_data::security("AAA").key(),
+                tf: Timeframe::D1,
+                bars: bars.clone(),
+                gpu: SeriesGpu::build(&bars),
+                prepended: 0,
+                from_cache: false,
+                exhausted: false,
+                live: false,
+                crypto_source: None,
+            })
+            .unwrap()
+        };
+        send_history();
+        let (reply, mut receive) = tokio::sync::oneshot::channel();
+        app.agent_queue.push(AgentJob {
+            id: "read".into(),
+            turn: "t".into(),
+            chart: ChartTarget::Pinned,
+            deadline: Instant::now() + Duration::from_secs(60),
+            reply,
+            run: Box::new(|app| AgentReply {
+                success: true,
+                value: serde_json::json!(app.job_chart_mut().unwrap().displayed_bars().bars.len()),
+            }),
+        });
+        logic_only(&mut app);
+        assert_eq!(receive.try_recv().unwrap().value, serde_json::json!(1));
+        // The same frame's command input is processed after logic, as in ui().
+        app.execute("MSFT");
+        assert_eq!(app.chart_mut(1).unwrap().symbol, "MSFT US Equity");
+        send_history(); // Late response for the previous generation/symbol.
+        logic_only(&mut app);
+        assert!(app.chart_mut(1).unwrap().displayed_bars().bars.is_empty());
+        assert!(app.read_user_actions(200).iter().any(|e| e.kind == "symbol"));
+    }
+
+    #[test]
+    fn a1a_cancel_during_run_cancels_pending_siblings_without_rolling_back_started_job() {
+        use crate::agent_queue::{AgentJob, AgentReply, ChartTarget};
+        let mut app = agent_fixture("a1a-cancel-running");
+        let mut receivers = Vec::new();
+        for index in 0..2 {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            receivers.push(receive);
+            app.agent_queue.push(AgentJob {
+                id: index.to_string(),
+                turn: "same-turn".into(),
+                chart: ChartTarget::Pinned,
+                deadline: Instant::now() + Duration::from_secs(60),
+                reply,
+                run: Box::new(move |app| {
+                    assert_eq!(index, 0, "pending sibling must never run");
+                    app.job_chart_mut().unwrap().log = true;
+                    app.agent_queue.cancel("same-turn");
+                    AgentReply { success: true, value: serde_json::Value::Null }
+                }),
+            });
+        }
+        logic_only(&mut app);
+        assert!(receivers[0].try_recv().unwrap().success);
+        assert_eq!(receivers[1].try_recv().unwrap().value["error"], "cancelled");
+        assert!(app.chart_mut(1).unwrap().log);
+        assert_eq!(app.agent_queue.len(), 0);
+    }
+
+    #[test]
+    fn a1a_idle_logic_does_not_request_repaints() {
+        let ctx = egui::Context::default();
+        let mut app = agent_fixture("a1a-idle-logic");
+        app.agent_queue = crate::agent_queue::AgentToolQueue::new(ctx.clone());
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = wakes.clone();
+        ctx.set_request_repaint_callback(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        for _ in 0..100 {
+            eframe::App::logic(&mut app, &ctx, &mut eframe::Frame::_new_kittest());
+        }
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(app.read_user_actions(200).is_empty());
+    }
+
+    #[test]
+    fn a1a_bug_layout_uid_collision_retargets_pin() {
+        use crate::agent_queue::ChartTarget;
+        let mut app = agent_fixture("a1a-pin-layout-collision");
+        let old_uid = app.chart_mut(1).unwrap().uid;
+        app.pinned_agent_chart = Some(old_uid);
+        let mut unrelated = app.current_doc();
+        unrelated.name = "Unrelated imported layout".into();
+        let PaneSettings::Chart { symbol, .. } = &mut unrelated.panes[0].settings else { panic!("chart") };
+        *symbol = "MSFT US Equity".into(); // Imported uid happens to collide with the old pin.
+        let mut active = unrelated.panes[0].clone();
+        active.id = 2;
+        let PaneSettings::Chart { uid, symbol, .. } = &mut active.settings else { panic!("chart") };
+        *uid = tr_chart::drawings::next_id();
+        *symbol = "NVDA US Equity".into();
+        let active_uid = *uid;
+        unrelated.panes.push(active);
+        unrelated.dock = Node::leaf(2);
+        unrelated.focus = Some(2);
+        app.apply_doc(unrelated);
+        assert_eq!(
+            app.agent_chart_uid(ChartTarget::Pinned),
+            Some(active_uid),
+            "closing the pinned chart must fall back to active, not alias another layout's uid"
+        );
+    }
+
+    #[test]
+    fn a1a_queue_boundary_dropped_reply_nested_push_and_panic_edit_history() {
+        use crate::agent_queue::{AgentJob, AgentReply, ChartTarget};
+        use tr_chart::drawings::{Anchor, Author, Drawing, Tool};
+        let mut app = agent_fixture("a1a-queue-boundaries");
+        let (expired_reply, mut expired) = tokio::sync::oneshot::channel();
+        app.agent_queue.push(AgentJob {
+            id: "boundary".into(),
+            turn: "expired".into(),
+            chart: ChartTarget::Pinned,
+            deadline: Instant::now(),
+            reply: expired_reply,
+            run: Box::new(|_| panic!("a deadline equal to now must not execute")),
+        });
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        drop(receive);
+        app.agent_queue.push(AgentJob {
+            id: "dropped-receiver".into(),
+            turn: "partial".into(),
+            chart: ChartTarget::Pinned,
+            deadline: Instant::now() + Duration::from_secs(60),
+            reply,
+            run: Box::new(|app| {
+                let a = Anchor { ts: 86400, price: 100. };
+                app.job_chart_mut().unwrap().drawings.push(Drawing::new(Tool::Horizontal, a, a));
+                let (reply, receive) = tokio::sync::oneshot::channel();
+                drop(receive);
+                app.agent_queue.push(AgentJob {
+                    id: "nested".into(),
+                    turn: "nested".into(),
+                    chart: ChartTarget::Pinned,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                    reply,
+                    run: Box::new(|app| {
+                        app.job_chart_mut().unwrap().log = true;
+                        AgentReply { success: true, value: serde_json::Value::Null }
+                    }),
+                });
+                panic!("after a complete drawing mutation");
+            }),
+        });
+        logic_only(&mut app);
+        assert_eq!(expired.try_recv().unwrap().value["error"], "timeout");
+        assert_eq!(app.agent_queue.len(), 1, "new jobs wait for the next frame");
+        assert!(!app.chart_mut(1).unwrap().log);
+        let chart = app.chart_mut(1).unwrap();
+        assert_eq!(chart.drawings[0].created_by, Author::Agent);
+        assert_eq!(chart.edit_author, Author::User, "panic must restore mutation attribution");
+        assert_eq!(chart.undo_turn("partial").reverted, 1);
+        assert!(chart.drawings.is_empty());
+        logic_only(&mut app);
+        assert!(app.chart_mut(1).unwrap().log);
+    }
+
+    #[test]
+    fn a1a_layout_reload_preserves_ids_but_not_session_undo_history() {
+        use tr_chart::drawings::{Anchor, Author, Drawing, Tool};
+        let mut app = agent_fixture("a1a-history-reload");
+        let uid = app.chart_mut(1).unwrap().uid;
+        app.chart_mut(1).unwrap().edit_drawings(Author::Agent, Some("t".into()), |d| {
+            let a = Anchor { ts: 86400, price: 100. };
+            let mut drawing = Drawing::new(Tool::Horizontal, a, a);
+            drawing.symbol = Some("AAA".into());
+            d.push(drawing);
+        });
+        let before = app.chart_mut(1).unwrap().drawings.clone();
+        let bytes = app.current_doc().to_json();
+        app.apply_doc(LayoutDoc::from_json(&bytes).unwrap());
+        assert!(app.agent_chart_mut(crate::agent_queue::ChartTarget::Uid(uid)).is_none());
+        let chart = app.agent_chart_mut(crate::agent_queue::ChartTarget::Pinned).unwrap();
+        assert_ne!(chart.uid, uid, "loading replaces the live chart, not its drawings' identities");
+        assert_eq!(chart.drawings, before);
+        // LayoutDoc never persisted snapshot undo either. Attribution persists,
+        // but undo_turn, like ordinary undo, is scoped to this loaded session.
+        assert_eq!(chart.undo_turn("t").reverted, 0);
+        chart.undo_drawings();
+        assert_eq!(chart.drawings, before);
+    }
+
+    #[test]
+    fn a1a_bug_agent_backlog_has_no_frame_budget() {
+        use crate::agent_queue::{AgentJob, AgentReply, ChartTarget};
+        let mut app = agent_fixture("a1a-queue-budget");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for index in 0..4096 {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            drop(receive);
+            let calls = calls.clone();
+            app.agent_queue.push(AgentJob {
+                id: index.to_string(),
+                turn: "t".into(),
+                chart: ChartTarget::Pinned,
+                deadline: Instant::now() + Duration::from_secs(60),
+                reply,
+                run: Box::new(move |_| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    AgentReply { success: true, value: serde_json::Value::Null }
+                }),
+            });
+        }
+        logic_only(&mut app);
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) < 4096,
+            "a large backlog must yield to rendering/input, not execute every job in one frame"
+        );
+        assert!(app.agent_queue.len() > 0);
+    }
+
+    #[test]
+    fn a1a_bug_layout_load_records_user_actions() {
+        let mut app = agent_fixture("a1a-layout-log");
+        logic_only(&mut app);
+        assert!(app.read_user_actions(200).is_empty());
+        let mut doc = app.current_doc();
+        let PaneSettings::Chart { symbol, .. } = &mut doc.panes[0].settings else { panic!("chart") };
+        *symbol = "MSFT US Equity".into();
+        app.apply_doc(doc);
+        logic_only(&mut app);
+        assert!(app.read_user_actions(200).is_empty(), "loading a layout is not a user chart edit");
+    }
+
+    #[test]
+    fn a1a_bug_cross_chart_insertion_duplicates_drawing_id() {
+        use tr_chart::drawings::{Anchor, Author, Drawing, Tool};
+        let mut app = agent_fixture("a1a-cross-chart-ids");
+        app.chart_mut(1).unwrap().edit_drawings(Author::User, None, |d| {
+            let a = Anchor { ts: 86400, price: 100. };
+            let mut drawing = Drawing::new(Tool::Horizontal, a, a);
+            drawing.symbol = Some("AAA".into());
+            drawing.all_symbols = true;
+            d.push(drawing);
+        });
+        let copied = app.chart_mut(1).unwrap().drawings[0].clone();
+        let second = app.new_pane(PaneKind::Chart(Box::new(ChartState::new(0, "BBB", Timeframe::D1))));
+        app.chart_mut(second).unwrap().edit_drawings(Author::User, None, |d| d.push(copied.clone()));
+        assert_ne!(
+            app.chart_mut(second).unwrap().drawings[0].id,
+            copied.id,
+            "two independently editable drawings cannot share an id"
+        );
+    }
+
+    #[test]
+    fn agent_budget_expires_jobs_beyond_budget_and_preserves_pending_deadlines() {
+        use crate::agent_queue::{AgentJob, AgentReply, ChartTarget, MAX_JOBS_PER_FRAME};
+        let mut app = agent_fixture("agent-budget-expiry");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for index in 0..MAX_JOBS_PER_FRAME * 3 {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            drop(receive);
+            let calls = calls.clone();
+            app.agent_queue.push(AgentJob {
+                id: index.to_string(),
+                turn: "t".into(),
+                chart: ChartTarget::Pinned,
+                deadline,
+                reply,
+                run: Box::new(move |_| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    AgentReply { success: true, value: serde_json::Value::Null }
+                }),
+            });
+        }
+        let (reply, mut expired) = tokio::sync::oneshot::channel();
+        app.agent_queue.push(AgentJob {
+            id: "expired-at-back".into(),
+            turn: "t".into(),
+            chart: ChartTarget::Pinned,
+            deadline: Instant::now(),
+            reply,
+            run: Box::new(|_| panic!("expired jobs cannot run")),
+        });
+        logic_only(&mut app);
+        assert_eq!(expired.try_recv().unwrap().value["error"], "timeout");
+        let completed = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((1..=MAX_JOBS_PER_FRAME).contains(&completed));
+        assert_eq!(app.agent_queue.len(), MAX_JOBS_PER_FRAME * 3 - completed);
+        // Inspect without changing order or renewing any deadline.
+        for index in completed..MAX_JOBS_PER_FRAME * 3 {
+            let job = app.agent_queue.pop().unwrap();
+            assert_eq!(job.id, index.to_string());
+            assert_eq!(job.deadline, deadline);
+            app.agent_queue.push(job);
+        }
+        while app.agent_queue.len() > 0 {
+            logic_only(&mut app);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), MAX_JOBS_PER_FRAME * 3);
+    }
+
+    #[test]
+    fn agent_time_budget_yields_and_expires_jobs_that_age_during_execution() {
+        use crate::agent_queue::{AgentJob, AgentReply, ChartTarget, MAX_JOB_TIME_PER_FRAME};
+        let mut app = agent_fixture("agent-time-budget");
+        let mut replies = Vec::new();
+        for index in 0..3 {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            replies.push(receive);
+            app.agent_queue.push(AgentJob {
+                id: index.to_string(),
+                turn: "t".into(),
+                chart: ChartTarget::Pinned,
+                deadline: Instant::now() + if index == 2 { Duration::from_millis(1) } else { Duration::from_secs(60) },
+                reply,
+                run: Box::new(move |_| {
+                    assert_ne!(index, 2, "job must expire even beyond the work budget");
+                    if index == 0 {
+                        std::thread::sleep(MAX_JOB_TIME_PER_FRAME + Duration::from_millis(1));
+                    }
+                    AgentReply { success: true, value: serde_json::Value::Null }
+                }),
+            });
+        }
+        logic_only(&mut app);
+        assert!(replies[0].try_recv().unwrap().success);
+        assert!(matches!(replies[1].try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert_eq!(replies[2].try_recv().unwrap().value["error"], "timeout");
+        assert_eq!(app.agent_queue.len(), 1);
+        logic_only(&mut app);
+        assert!(replies[1].try_recv().unwrap().success);
+    }
+
+    #[test]
+    fn closing_or_replacing_a_pin_never_rebinds_it_to_a_reused_uid() {
+        use crate::agent_queue::ChartTarget;
+        for replace in [false, true] {
+            let mut app = agent_fixture(if replace { "pin-replaced" } else { "pin-closed" });
+            let uid = app.chart_mut(1).unwrap().uid;
+            let active = app.new_pane(PaneKind::Chart(Box::new(ChartState::new(0, "BBB", Timeframe::D1))));
+            app.dock_pane(active, Some(1), crate::dock::Zone::Right);
+            let active_uid = app.chart_mut(active).unwrap().uid;
+            app.pinned_agent_chart = Some(uid);
+            if replace {
+                app.replace_pane(1, PaneKind::Help);
+            } else {
+                app.close_pane(1);
+            }
+            assert_eq!(app.pinned_agent_chart, None);
+            let mut unrelated = ChartState::new(0, "CCC", Timeframe::D1);
+            unrelated.uid = uid;
+            let later = app.new_pane(PaneKind::Chart(Box::new(unrelated)));
+            assert_eq!(app.chart_mut(later).unwrap().uid, uid);
+            assert_eq!(app.agent_chart_uid(ChartTarget::Pinned), Some(active_uid));
+        }
     }
 
     #[test]
