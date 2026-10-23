@@ -1,7 +1,9 @@
 //! Manager-run sample-data bridge. Never launched by offline tests.
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -89,7 +91,7 @@ fn find_codex() -> Result<PathBuf> {
 
 #[derive(Clone)]
 struct SampleHost {
-    data: Arc<MarketDataHost<SampleProvider>>,
+    data: Arc<dyn DataHost>,
     loaded: History,
     pin: ChartPin,
     state: Arc<Mutex<SampleState>>,
@@ -102,6 +104,7 @@ struct SampleState {
     indicators: Vec<tr_core::indicators::registry::Spec>,
     comparisons: Vec<tr_agent_tools::edits::Comparison>,
     timeframe: Option<Timeframe>,
+    loaded: Option<History>,
     range: Option<(i64, i64)>,
     events: Vec<serde_json::Value>,
     history: Vec<SampleEdit>,
@@ -114,6 +117,7 @@ struct SampleEdit {
     studies_after: Vec<tr_core::indicators::registry::Spec>,
     comparisons_before: Vec<tr_agent_tools::edits::Comparison>,
     comparisons_after: Vec<tr_agent_tools::edits::Comparison>,
+    loaded_before: Option<History>,
     timeframe_before: Option<Timeframe>,
     timeframe_after: Option<Timeframe>,
     range_before: Option<(i64, i64)>,
@@ -198,6 +202,7 @@ impl SampleState {
             }
             if self.timeframe == edit.timeframe_after {
                 self.timeframe = edit.timeframe_before;
+                self.loaded = edit.loaded_before;
             }
             if self.range == edit.range_after {
                 self.range = edit.range_before;
@@ -242,19 +247,24 @@ impl LiveHost for TurnHost<'_> {
             if tr_agent_tools::edits::chart_id(&args).is_some_and(|id| id != self.host.pin.uid.to_string()) {
                 return ToolResult::error("chart_not_found", "Unknown chart uid", None);
             }
-            let mut state = self.host.state.lock().unwrap();
+            // One async lock covers planning, loading and application. Parallel
+            // calls cannot plan against a stale timeframe or overwrite an inverse;
+            // awaiting sample history never blocks an executor thread.
+            let mut state = self.host.state.lock().await;
+            let loaded_before = state.loaded.clone();
             let before = state.drawings.clone();
             let studies_before = state.indicators.clone();
             let range_before = state.range;
             let comparisons_before = state.comparisons.clone();
             let timeframe_before = state.timeframe;
             let timeframe = state.timeframe.unwrap_or(Timeframe::D1);
-            let bars = timeframe.resample_session(&self.host.loaded.bars, self.host.loaded.session);
+            let loaded = state.loaded.as_ref().unwrap_or(&self.host.loaded).clone();
+            let bars = &loaded.bars;
             let chart = Chart {
                 uid: self.host.pin.uid,
                 symbol: &self.host.pin.symbol,
                 timeframe,
-                bars: &bars,
+                bars,
                 drawings: &before,
                 indicators: &studies_before,
                 comparisons: &comparisons_before,
@@ -274,9 +284,48 @@ impl LiveHost for TurnHost<'_> {
                 }
                 Plan::View { symbol, timeframe, from, to } => {
                     debug_assert_eq!(symbol, self.host.pin.symbol);
+                    // Validate/plan before touching the provider. A wrong symbol,
+                    // invalid range or unsupported timeframe must never fetch.
+                    let fresh = if timeframe != chart.timeframe {
+                        match tokio::time::timeout(
+                            Duration::from_secs(20),
+                            self.host.data.history(&symbol, timeframe, None, 1000),
+                        )
+                        .await
+                        {
+                            Ok(Ok(history)) => Some(history),
+                            Ok(Err(reason)) => return tr_agent::bridge::provider_error(&reason),
+                            Err(_) => {
+                                return ToolResult::error(
+                                    "data_loading_timeout",
+                                    "Sample data loading timed out",
+                                    None,
+                                );
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let from_cache = fresh.is_none();
+                    if let Some(history) = fresh {
+                        state.loaded = Some(history);
+                    }
+                    let history = state.loaded.as_ref().unwrap_or(&self.host.loaded);
+                    let (Some(first), Some(last)) = (history.bars.first(), history.bars.last()) else {
+                        return ToolResult::error("data_loading_timeout", "Sample chart has no bars", None);
+                    };
+                    let range = (
+                        from.unwrap_or(first.ts).clamp(first.ts, last.ts),
+                        to.unwrap_or(last.ts).clamp(first.ts, last.ts),
+                    );
+                    let metadata =
+                        json!({"loaded_bars":history.bars.len(),"first_bar_time":first.ts,"last_bar_time":last.ts});
                     state.timeframe = Some(timeframe);
-                    state.range = Some((from, to));
-                    json!({"uid":self.host.pin.uid,"symbol":symbol,"timeframe":timeframe,"from":from,"to":to,"linked_panes":[]})
+                    state.range = Some(range);
+                    json!({"uid":self.host.pin.uid,"symbol":symbol,"timeframe":timeframe,
+                        "loaded_bars":metadata["loaded_bars"],"first_bar_time":metadata["first_bar_time"],"last_bar_time":metadata["last_bar_time"],
+                        "visible_range":{"start":range.0,"end":range.1},"from_cache":from_cache,
+                        "data_source":if from_cache {"cache"} else {"fresh_load"},"linked_panes":[]})
                 }
                 Plan::Compare(args) => {
                     match args.action {
@@ -307,6 +356,7 @@ impl LiveHost for TurnHost<'_> {
                 studies_after,
                 comparisons_before,
                 comparisons_after,
+                loaded_before,
                 timeframe_before,
                 timeframe_after,
                 range_before,
@@ -327,10 +377,14 @@ impl DataHost for SampleHost {
         limit: usize,
     ) -> HostFuture<'a, History> {
         Box::pin(async move {
-            if symbol != self.pin.symbol || tf != Timeframe::D1 {
+            let loaded = {
+                let state = self.state.lock().await;
+                (symbol == self.pin.symbol && tf == state.timeframe.unwrap_or(Timeframe::D1))
+                    .then(|| state.loaded.as_ref().unwrap_or(&self.loaded).clone())
+            };
+            let Some(mut result) = loaded else {
                 return self.data.history(symbol, tf, end, limit).await;
-            }
-            let mut result = self.loaded.clone();
+            };
             result.bars.retain(|bar| end.is_none_or(|end| bar.ts < end));
             let skip = result.bars.len().saturating_sub(limit);
             result.bars.drain(..skip);
@@ -384,9 +438,9 @@ impl LiveHost for SampleHost {
             if chart.as_ref().is_some_and(|id| id != &self.pin.uid.to_string()) {
                 return ToolResult::error("chart_not_found", "Unknown chart uid", Some("chart_id"));
             }
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().await;
             let timeframe = state.timeframe.unwrap_or(Timeframe::D1);
-            let bars = timeframe.resample_session(&self.loaded.bars, self.loaded.session);
+            let bars = &state.loaded.as_ref().unwrap_or(&self.loaded).bars;
             match args {
                 LiveArgs::ReadChart(_) => {
                     let studies: Vec<_> = state
@@ -405,7 +459,7 @@ impl LiveHost for SampleHost {
                     "first_bar":bars.first(),"last_bar":bars.last(),"drawings":state.drawings,"studies":studies,"comparisons":state.comparisons,"visible_range":state.range}]}))
                 }
                 LiveArgs::IndicatorValues(_) => ToolResult::json(
-                    json!({"uid":self.pin.uid,"studies":state.indicators.iter().map(|spec| json!({"tool_id":format!("{}:{}",self.pin.uid,spec.chart.as_ref().unwrap().id),"spec":spec,"agent_highlight":spec.chart.as_ref().unwrap().agent_highlight(),"values":spec.compute(&tr_core::indicators::registry::Input::new(&bars, timeframe)).iter().map(|output| json!({"name":output.name,"last":output.values.last().filter(|v| v.is_finite())})).collect::<Vec<_>>()})).collect::<Vec<_>>()}),
+                    json!({"uid":self.pin.uid,"studies":state.indicators.iter().map(|spec| json!({"tool_id":format!("{}:{}",self.pin.uid,spec.chart.as_ref().unwrap().id),"spec":spec,"agent_highlight":spec.chart.as_ref().unwrap().agent_highlight(),"values":spec.compute(&tr_core::indicators::registry::Input::new(bars, timeframe)).iter().map(|output| json!({"name":output.name,"last":output.values.last().filter(|v| v.is_finite())})).collect::<Vec<_>>()})).collect::<Vec<_>>()}),
                 ),
                 LiveArgs::ReadUserActions(_) => ToolResult::json(
                     json!({"events":state.events.iter().filter(|event| event["author"] == "User").collect::<Vec<_>>()}),
@@ -493,7 +547,7 @@ async fn run() -> Result<()> {
                     _ => {}
                 },
                 BridgeEvent::Completed { turn, status, calls, interrupt_elapsed } => {
-                    let mut state = state.lock().unwrap();
+                    let mut state = state.lock().await;
                     println!(
                         "{}",
                         json!({"drawings":state.drawings,"indicators":state.indicators,"comparisons":state.comparisons,"timeframe":state.timeframe.unwrap_or(Timeframe::D1),"range":state.range,"events":state.events})
@@ -576,6 +630,130 @@ pub(crate) mod tests {
     use super::*;
     use tr_agent_tools::{CallBudget, CallContext, Content};
 
+    type HistoryRequest = (Timeframe, tokio::sync::oneshot::Sender<Result<History, String>>);
+
+    struct ControlledData(tokio::sync::mpsc::UnboundedSender<HistoryRequest>);
+    impl DataHost for ControlledData {
+        fn history<'a>(&'a self, _: &'a str, tf: Timeframe, _: Option<i64>, _: usize) -> HostFuture<'a, History> {
+            Box::pin(async move {
+                let (send, receive) = tokio::sync::oneshot::channel();
+                self.0.send((tf, send)).unwrap();
+                receive.await.unwrap()
+            })
+        }
+        fn search<'a>(&'a self, _: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn quotes<'a>(&'a self, _: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+    }
+
+    async fn controlled_host() -> (SampleHost, tokio::sync::mpsc::UnboundedReceiver<HistoryRequest>) {
+        let data = MarketDataHost {
+            market: SampleProvider::at(1_790_000_000, 1000),
+            price_basis: PriceBasis::Unknown,
+            session: Default::default(),
+        };
+        let loaded = data.history("AAPL US Equity", Timeframe::D1, None, 40).await.unwrap();
+        let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+        (
+            SampleHost {
+                data: Arc::new(ControlledData(send)),
+                loaded,
+                pin: ChartPin { uid: 1, symbol: "AAPL US Equity".into(), timeframe: "1D".into(), visible_range: None },
+                state: Default::default(),
+            },
+            receive,
+        )
+    }
+
+    fn value(result: &ToolResult) -> serde_json::Value {
+        let Content::Text(text) = &result.content[0] else { panic!("text") };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sample_invalid_view_is_planned_before_fetching_history() {
+        let (host, mut requests) = controlled_host().await;
+        let live = TurnHost { host: &host, turn: "invalid" };
+        for args in [
+            json!({"symbol":"MSFT","timeframe":"4H"}),
+            json!({"timeframe":"not-a-timeframe"}),
+            json!({"timeframe":"4H","from":20,"to":10}),
+        ] {
+            let result = live.call_live("set_view", LiveArgs::SetView(serde_json::from_value(args).unwrap())).await;
+            assert!(!result.success);
+            assert_eq!(value(&result)["error"]["code"], "invalid_args");
+            assert!(requests.try_recv().is_err(), "invalid views must not fetch history");
+        }
+        let state = host.state.lock().await;
+        assert!(state.history.is_empty());
+        assert!(state.loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn sample_provider_failure_is_scrubbed_and_not_a_loading_timeout() {
+        let (host, mut requests) = controlled_host().await;
+        let live = TurnHost { host: &host, turn: "error" };
+        let args = LiveArgs::SetView(serde_json::from_value(json!({"timeframe":"4H"})).unwrap());
+        let call = live.call_live("set_view", args);
+        let provider = async {
+            let (tf, reply) = requests.recv().await.unwrap();
+            assert_eq!(tf, Timeframe::H4);
+            reply.send(Err(format!("provider unavailable: Bearer private-token; {}", "🦀".repeat(400)))).unwrap();
+        };
+        let (result, ()) = tokio::join!(call, provider);
+        assert!(!result.success);
+        let result = value(&result);
+        assert_eq!(result["error"]["code"], "provider_error");
+        let message = result["error"]["message"].as_str().unwrap();
+        assert!(message.contains("provider unavailable") && message.contains("[REDACTED]"));
+        assert!(!message.contains("private-token"));
+        assert!(message.chars().count() <= 300);
+        let state = host.state.lock().await;
+        assert!(state.history.is_empty());
+        assert!(state.loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn sample_parallel_views_serialize_planning_loading_and_inverses() {
+        let (host, mut requests) = controlled_host().await;
+        let first_host = host.clone();
+        let first = tokio::spawn(async move {
+            TurnHost { host: &first_host, turn: "parallel" }
+                .call_live("set_view", LiveArgs::SetView(serde_json::from_value(json!({"timeframe":"1W"})).unwrap()))
+                .await
+        });
+        let (tf, reply) = requests.recv().await.unwrap();
+        assert_eq!(tf, Timeframe::W1);
+        let second_host = host.clone();
+        let second = tokio::spawn(async move {
+            TurnHost { host: &second_host, turn: "parallel" }
+                .call_live("set_view", LiveArgs::SetView(serde_json::from_value(json!({"timeframe":"4H"})).unwrap()))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(requests.try_recv().is_err(), "the second call must wait for the first application");
+        reply.send(Ok(host.loaded.clone())).unwrap();
+        assert!(first.await.unwrap().success);
+        let (tf, reply) = requests.recv().await.unwrap();
+        assert_eq!(tf, Timeframe::H4);
+        reply.send(Ok(host.loaded.clone())).unwrap();
+        assert!(second.await.unwrap().success);
+        let mut state = host.state.lock().await;
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.history[1].timeframe_before, Some(Timeframe::W1));
+        assert!(state.history[1].loaded_before.is_some());
+        assert_eq!(state.timeframe, Some(Timeframe::H4));
+        // No object edits were made, but even an all-view undo must restore the
+        // chain. The driver's existing no-object report does not affect state.
+        let _ = state.undo("parallel");
+        assert_eq!(state.timeframe, None);
+        assert_eq!(state.range, None);
+        assert!(state.loaded.is_none());
+    }
+
     #[tokio::test]
     async fn sample_driver_tools_reference_loaded_bars_without_network_or_window() {
         let data = MarketDataHost {
@@ -620,6 +798,53 @@ pub(crate) mod tests {
         }
         ctx.confirmed = true;
         assert!(!registry.call("screenshot", "{}", &mut ctx).await.success);
+    }
+
+    #[tokio::test]
+    async fn sample_weekly_to_four_hour_switch_reads_and_draws_the_generated_bars() {
+        let data = MarketDataHost {
+            market: SampleProvider::at(1_790_000_000, 1000),
+            price_basis: PriceBasis::Unknown,
+            session: Default::default(),
+        };
+        let loaded = data.history("AAPL US Equity", Timeframe::W1, None, 1000).await.unwrap();
+        let range = loaded.bars.first().zip(loaded.bars.last()).map(|(a, b)| (a.ts, b.ts));
+        let host = SampleHost {
+            data: Arc::new(data),
+            loaded,
+            pin: ChartPin { uid: 1, symbol: "AAPL US Equity".into(), timeframe: "1W".into(), visible_range: range },
+            state: Arc::new(Mutex::new(SampleState { timeframe: Some(Timeframe::W1), range, ..Default::default() })),
+        };
+        let live = TurnHost { host: &host, turn: "switch" };
+        let registry = Registry::new(ToolSet::Edit);
+        let mut budget = CallBudget::default();
+        let mut ctx = CallContext::new(&host, &live, &mut budget);
+        let switched = registry.call("set_view", r#"{"timeframe":"4H","from":0,"to":2000000000}"#, &mut ctx).await;
+        assert!(switched.success, "{switched:?}");
+        let Content::Text(text) = &switched.content[0] else { panic!("text") };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["loaded_bars"], 1000);
+        assert_eq!(value["from_cache"], false);
+        assert_eq!(value["linked_panes"], json!([]));
+        let bars = host.history("AAPL US Equity", Timeframe::H4, None, 1000).await.unwrap().bars;
+        assert_eq!(value["first_bar_time"], bars[0].ts);
+        assert_eq!(value["last_bar_time"], bars[999].ts);
+        let read =
+            registry.call("read_data", r#"{"symbol":"AAPL US Equity","timeframe":"4H","limit":2}"#, &mut ctx).await;
+        assert!(read.success);
+        let Content::Text(text) = &read.content[0] else { panic!("text") };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["bars"][1][4], bars[999].close);
+        let draw = json!({"symbol":"AAPL US Equity","kind":"horizontal","anchors":[{"time":bars[999].ts,"price":bars[999].low}]});
+        assert!(registry.call("create_drawing", &draw.to_string(), &mut ctx).await.success);
+        {
+            let mut state = host.state.lock().await;
+            assert_eq!(state.drawings[0].a.ts, bars[999].ts);
+            assert_eq!(state.undo("switch").unwrap(), 1);
+            assert_eq!(state.timeframe, Some(Timeframe::W1));
+            assert_eq!(state.range, range);
+        }
+        assert_eq!(host.history("AAPL US Equity", Timeframe::W1, None, 1000).await.unwrap().bars, host.loaded.bars);
     }
 
     /// Invoked from the library's sealed-connector bridge harness, not with
@@ -699,7 +924,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(sent, completed);
         {
-            let state = state.lock().unwrap();
+            let state = state.lock().await;
             assert_eq!(state.drawings.len(), 2);
             assert_eq!(state.indicators.len(), 1);
             assert!(state.drawings.iter().all(|d| d.created_by == tr_chart::drawings::Author::Agent
@@ -710,13 +935,13 @@ pub(crate) mod tests {
             assert_eq!(settings.turn_id.as_deref(), Some(completed.as_str()));
         }
         {
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().await;
             assert_eq!(state.comparisons[0].turn_id.as_deref(), Some(completed.as_str()));
             assert!(state.undo("unknown-turn").is_err());
             assert_eq!(state.undo(&completed).unwrap(), 4);
             assert!(state.undo(&completed).is_err(), "a no-op must fail the driver");
         }
-        let state = state.lock().unwrap();
+        let state = state.lock().await;
         assert!(state.drawings.is_empty());
         assert!(state.indicators.is_empty());
         assert_eq!(state.range, None);

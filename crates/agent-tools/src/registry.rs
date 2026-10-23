@@ -321,7 +321,10 @@ fn catalog() -> Vec<ToolSpec> {
                 ("Read all chart panes, view context and entity ids; chart_id defaults to the pinned chart.", false)
             }
             "indicator_values" => ("Read built study values from the pinned or specified chart.", false),
-            "set_view" => ("Set symbol, timeframe or range; report linked panes that also moved.", true),
+            "set_view" => (
+                "Switch the pinned chart to any supported timeframe, including finer timeframes (e.g. weekly to 4H), and/or set its range. Symbol must stay unchanged. Waits for loaded bars; range is then clamped to them. Never moves linked panes. After switching, call read_data with the new timeframe before drawing support/resistance or other anchors.",
+                true,
+            ),
             "create_drawing" => (
                 "Create a drawing for an explicit symbol; host rejects anchors outside loaded bars. all_symbols defaults false.",
                 true,

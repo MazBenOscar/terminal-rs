@@ -13,12 +13,32 @@ use tr_agent_tools::{
 use tr_core::Timeframe;
 use tr_data::{Quote, SearchHit};
 
-use crate::agent_queue::{AgentJob, AgentReply, AgentToolQueue, ChartTarget};
+use crate::agent_queue::{AgentJob, AgentReply, AgentToolQueue, AgentWaitJob, ChartTarget};
 use crate::app::{PaneKind, TerminalApp};
 use crate::worker::{AgentRequest, Request};
 
 const UI_TIMEOUT: Duration = Duration::from_secs(10);
 const DATA_TIMEOUT: Duration = Duration::from_secs(30);
+const VIEW_LOAD_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ViewLoad {
+    uid: u64,
+    generation: u64,
+    symbol: String,
+    timeframe: Timeframe,
+}
+
+fn loading_timeout(mut view: Value) -> ToolResult {
+    view["error"] = json!({
+        "code":"data_loading_timeout",
+        "message":"Data loading timed out; the timeframe is left switched. Data and the clamped range may finish loading later. Undo this agent turn to restore the previous view."
+    });
+    view["timeframe_left_switched"] = json!(true);
+    let mut result = ToolResult::json(view);
+    result.success = false;
+    result
+}
 static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -76,6 +96,9 @@ impl TerminalApp {
         }
         let Some(selected) = self.agent_chart(target) else { return error("chart_not_found", "Chart was closed") };
         let uid = selected.uid;
+        if matches!(args, LiveArgs::SetView(_)) && uid != call.pin.uid {
+            return error("wrong_chart", "set_view only changes the pinned chart");
+        }
         let comparisons = selected.comparison_objects();
         let chart = Chart {
             uid,
@@ -98,7 +121,10 @@ impl TerminalApp {
                 _ => None,
             })
             .unwrap();
-        let value = pane.apply_agent_plan(plan, &call.turn, &self.worker);
+        let mut value = pane.apply_agent_plan(plan, &call.turn, &self.worker);
+        if pane.finish_agent_view().is_some() {
+            value = pane.agent_view_result();
+        }
         if uid == call.pin.uid {
             expected.insert(call.turn.clone(), (pane.symbol.clone(), pane.tf.to_string()));
         }
@@ -252,6 +278,58 @@ impl ScopedHost {
         drop(pending);
         if result.success { Ok(result.value) } else { Err(result.value.to_string()) }
     }
+    async fn wait_view(&self, load: ViewLoad, deadline: Instant) -> ToolResult {
+        let id = format!("agent-view-{}", NEXT_JOB.fetch_add(1, Ordering::Relaxed));
+        let (reply, receive) = oneshot::channel();
+        let pending = PendingJob { queue: self.app.queue.clone(), id: id.clone() };
+        let fallback = json!({"uid":load.uid,"symbol":load.symbol,"timeframe":load.timeframe.to_string(),
+            "loaded_bars":0,"first_bar_time":null,"last_bar_time":null,"visible_range":null,
+            "from_cache":null,"data_source":null,"linked_panes":[]});
+        self.app.queue.push_wait(AgentWaitJob {
+            id,
+            turn: self.call.turn.clone(),
+            deadline,
+            check: Box::new(move |app, expired| {
+                let result = if app.agent_chart_uid(ChartTarget::Pinned) != Some(load.uid) {
+                    tr_agent_tools::edits::error("pin_changed", "Chart pin changed while loading data")
+                } else if let Some(chart) = app.agent_chart(ChartTarget::Uid(load.uid)) {
+                    if chart.agent_view_generation() != load.generation
+                        || chart.symbol != load.symbol
+                        || chart.tf != load.timeframe
+                    {
+                        tr_agent_tools::edits::error(
+                            "pin_changed",
+                            "Chart symbol or timeframe changed while loading data",
+                        )
+                    } else if !chart.agent_view_pending() && !chart.source_bars().bars.is_empty() {
+                        // A response delivered on the deadline tick wins over expiry.
+                        ToolResult::json(chart.agent_view_result())
+                    } else if let Some(reason) = chart.agent_view_error() {
+                        tr_agent::bridge::provider_error(reason)
+                    } else if expired {
+                        loading_timeout(chart.agent_view_result())
+                    } else {
+                        return None;
+                    }
+                } else {
+                    tr_agent_tools::edits::error("chart_not_found", "Chart was closed while loading data")
+                };
+                Some(AgentReply { success: true, value: serde_json::to_value(result).unwrap() })
+            }),
+            reply,
+        });
+        let result = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), receive).await;
+        drop(pending);
+        match result {
+            Ok(Ok(reply)) => serde_json::from_value(reply.value)
+                .unwrap_or_else(|_| ToolResult::error("host_error", "Invalid view reply", None)),
+            Ok(Err(_)) => {
+                ToolResult::error("host_error", "View load cancelled; partial timeframe edit may remain", None)
+            }
+            Err(_) => loading_timeout(fallback),
+        }
+    }
+
     fn target(&self, chart: &Option<String>) -> Result<ChartTarget, String> {
         chart.as_ref().map_or(Ok(ChartTarget::Uid(self.call.pin.uid)), |id| {
             id.parse().map(ChartTarget::Uid).map_err(|_| "chart_id must be a chart uid".into())
@@ -274,11 +352,18 @@ impl DataHost for ScopedHost {
         limit: usize,
     ) -> HostFuture<'a, History> {
         Box::pin(async move {
-            if tr_data::security(symbol).key() == tr_data::security(&self.call.pin.symbol).key()
-                && tf.to_string() == self.call.pin.timeframe
+            let (expected_symbol, expected_tf) = self
+                .app
+                .expected
+                .lock()
+                .unwrap()
+                .get(&self.call.turn)
+                .cloned()
+                .unwrap_or_else(|| (self.call.pin.symbol.clone(), self.call.pin.timeframe.clone()));
+            if tr_data::security(symbol).key() == tr_data::security(&expected_symbol).key()
+                && tf.to_string() == expected_tf
             {
                 let uid = self.call.pin.uid;
-                let expected_symbol = self.call.pin.symbol.clone();
                 let value = self
                     .job(ChartTarget::Uid(uid), move |app| {
                         let Some(chart) = app.agent_chart(ChartTarget::Uid(uid)) else {
@@ -365,6 +450,9 @@ impl LiveHost for ScopedHost {
                     let edits = self.app.edits.clone();
                     let expected = self.app.expected.clone();
                     let call = self.call.clone();
+                    let is_view = matches!(args, LiveArgs::SetView(_));
+                    // Absolute call deadline includes the initial UI queue wait.
+                    let deadline = Instant::now() + VIEW_LOAD_TIMEOUT;
                     return match self
                         .job(target, move |app| {
                             let result = app.execute_agent_edit(
@@ -374,12 +462,27 @@ impl LiveHost for ScopedHost {
                                 target,
                                 args,
                             );
-                            AgentReply { success: true, value: serde_json::to_value(result).unwrap() }
+                            let load = app
+                                .agent_chart(target)
+                                .filter(|chart| is_view && result.success && chart.agent_view_pending())
+                                .map(|chart| ViewLoad {
+                                    uid: chart.uid,
+                                    generation: chart.agent_view_generation(),
+                                    symbol: chart.symbol.clone(),
+                                    timeframe: chart.tf,
+                                });
+                            AgentReply { success: true, value: json!({"result":result,"load":load}) }
                         })
                         .await
                     {
-                        Ok(value) => serde_json::from_value(value)
-                            .unwrap_or_else(|_| ToolResult::error("host_error", "Invalid UI reply", None)),
+                        Ok(value) => {
+                            if let Ok(load) = serde_json::from_value::<ViewLoad>(value["load"].clone()) {
+                                self.wait_view(load, deadline).await
+                            } else {
+                                serde_json::from_value(value["result"].clone())
+                                    .unwrap_or_else(|_| ToolResult::error("host_error", "Invalid UI reply", None))
+                            }
+                        }
                         Err(error) => ToolResult::error(
                             if error.contains("chart not found") { "chart_not_found" } else { "host_error" },
                             &error,
@@ -877,32 +980,391 @@ mod tests {
         });
     }
 
+    struct ViewFixture {
+        app: TerminalApp,
+        executor: AppExecutor,
+        pin: ChartPin,
+        requests: mpsc::UnboundedReceiver<Request>,
+        out: std::sync::mpsc::Sender<crate::worker::Response>,
+        weekly: Arc<Vec<tr_core::Bar>>,
+        observed_requests: Vec<Request>,
+    }
+
+    fn view_bars(tf: Timeframe) -> Arc<Vec<tr_core::Bar>> {
+        let start = if tf == Timeframe::W1 { 1_000_000 } else { 100_000_000 };
+        Arc::new((0..1000).map(|n| tr_core::Bar::new(start + n * tf.seconds(), 20., 24., 16., 22., 100.)).collect())
+    }
+
+    impl ViewFixture {
+        fn new(tag: &str) -> Self {
+            let (mut app, _, _) = edit_fixture(tag);
+            let (worker, requests) = crate::worker::Worker::recording();
+            app.worker = worker;
+            let (out, rx) = std::sync::mpsc::channel();
+            app.worker.rx = rx;
+            if let PaneKind::Chart(chart) = &mut app.panes[0].kind {
+                chart.set_timeframe(Timeframe::W1, &app.worker);
+                chart.navigation.range = true;
+            }
+            let weekly = view_bars(Timeframe::W1);
+            let mut fixture = Self {
+                executor: AppExecutor::new(&app),
+                pin: AppExecutor::pin(&app).unwrap(),
+                app,
+                requests,
+                out,
+                weekly,
+                observed_requests: Vec::new(),
+            };
+            fixture.deliver(fixture.weekly.clone(), false);
+            fixture.app.process_logic();
+            fixture.app.agent_chart_mut(ChartTarget::Pinned).unwrap().apply_linked_range(
+                crate::chart_navigation::DateRange { start: fixture.weekly[200].ts, end: fixture.weekly[600].ts },
+            );
+            fixture.pin = AppExecutor::pin(&fixture.app).unwrap();
+            fixture.app.observe_edits(false);
+            fixture
+        }
+
+        fn call(&self, turn: &str, tf: &str) -> ToolCall {
+            ToolCall {
+                turn: turn.into(),
+                pin: self.pin.clone(),
+                name: "set_view".into(),
+                arguments: json!({"timeframe":tf,"from":0,"to":2_000_000_000_i64}).to_string(),
+                confirmed: false,
+            }
+        }
+
+        fn deliver(&mut self, bars: Arc<Vec<tr_core::Bar>>, from_cache: bool) {
+            let (pane, generation, symbol, tf) = loop {
+                match self.requests.try_recv().expect("user-path history request") {
+                    Request::History { pane, generation, symbol, tf, .. } => break (pane, generation, symbol, tf),
+                    request => self.observed_requests.push(request),
+                }
+            };
+            self.out
+                .send(crate::worker::Response::History {
+                    pane,
+                    generation,
+                    revision: 1,
+                    symbol,
+                    tf,
+                    gpu: tr_chart::scene::SeriesGpu::build(&bars),
+                    bars,
+                    prepended: 0,
+                    from_cache,
+                    exhausted: true,
+                    live: false,
+                    crypto_source: None,
+                })
+                .unwrap();
+        }
+
+        fn session_history(&mut self) {
+            while let Ok(request) = self.requests.try_recv() {
+                if let Request::SessionHistory { history } = request {
+                    let bars = Arc::new(history.session.filter(&history.source, history.tf));
+                    self.out
+                        .send(crate::worker::Response::SessionHistory {
+                            history,
+                            gpu: tr_chart::scene::SeriesGpu::build(&bars),
+                            bars,
+                        })
+                        .unwrap();
+                } else {
+                    self.observed_requests.push(request);
+                }
+            }
+            self.app.process_logic();
+        }
+
+        async fn switch(&mut self, turn: &str, tf: &str, cache: bool) -> ToolResult {
+            let executor = self.executor.clone();
+            let mut future =
+                executor.execute(Arc::new(Registry::new(tr_agent_tools::ToolSet::Edit)), self.call(turn, tf));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            self.app.process_logic();
+            assert!(futures::poll!(future.as_mut()).is_pending(), "must await the new bars");
+            self.deliver(view_bars(tf.parse().unwrap()), cache);
+            self.app.process_logic();
+            self.session_history();
+            future.await
+        }
+    }
+
     #[test]
-    fn set_view_resamples_only_loaded_data_and_preserves_later_user_navigation() {
-        let (mut app, executor, pin) = edit_fixture("a3-view");
+    fn weekly_to_four_hour_waits_for_worker_and_draws_from_new_loaded_bars() {
+        let mut f = ViewFixture::new("a3b-loaded-switch");
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let result = edit_call(
-                &mut app,
-                &executor,
-                &pin,
-                "weekly",
-                "set_view",
-                json!({"timeframe":"1W","from":0,"to":999999999}),
+            let before = f.app.agent_chart(ChartTarget::Pinned).unwrap().visible_date_range();
+            let result = f.switch("switch", "4H", false).await;
+            assert!(result.success, "{result:?}");
+            let value = result_value(&result);
+            let bars = f.app.agent_chart(ChartTarget::Pinned).unwrap().source_bars().bars.to_vec();
+            let last = bars.last().unwrap();
+            assert!(!bars.is_empty());
+            assert_eq!(value["timeframe"], "4H");
+            assert_eq!(value["loaded_bars"], bars.len());
+            assert_eq!(value["first_bar_time"], bars[0].ts);
+            assert_eq!(value["last_bar_time"], last.ts);
+            assert_eq!(value["data_source"], "fresh_load");
+            assert_eq!(value["from_cache"], false);
+            assert_eq!(value["linked_panes"], json!([]));
+            assert!(value["visible_range"]["start"].as_i64().unwrap() >= bars[0].ts);
+            assert!(value["visible_range"]["end"].as_i64().unwrap() <= last.ts);
+            assert!(f.app.edit_log.newest(200, false).iter().any(|event| event.kind == "timeframe"
+                && event.author == tr_chart::drawings::Author::Agent
+                && event.turn_id.as_deref() == Some("switch")));
+            // Same canonical turn still carries its original weekly pin. read_data
+            // must read the newly loaded chart, not independently fetch old bars.
+            let read = edit_call(
+                &mut f.app,
+                &f.executor,
+                &f.pin,
+                "switch",
+                "read_data",
+                json!({"symbol":"AAA","timeframe":"4H","limit":2}),
             )
             .await;
+            assert!(read.success, "{read:?}");
+            assert_eq!(
+                result_value(&read)["bars"][1][0],
+                chrono::DateTime::from_timestamp(last.ts, 0).unwrap().to_rfc3339()
+            );
+            let draw = edit_call(
+                &mut f.app,
+                &f.executor,
+                &f.pin,
+                "switch",
+                "create_drawing",
+                json!({"symbol":"AAA","kind":"horizontal","anchors":[{"time":last.ts,"price":last.low}]}),
+            )
+            .await;
+            assert!(draw.success, "{draw:?}");
+            // This old weekly timestamp is outside the new H4 history.
+            let rejected =
+                edit_call(&mut f.app, &f.executor, &f.pin, "switch", "create_drawing", create_args("horizontal")).await;
+            assert_eq!(result_value(&rejected)["error"]["code"], "invalid_args");
+            f.observed_requests.extend(std::iter::from_fn(|| f.requests.try_recv().ok()));
+            assert!(
+                f.observed_requests
+                    .iter()
+                    .any(|request| matches!(request, Request::Indicators { tf: Timeframe::H4, .. }))
+            );
+            let report = f.app.undo_agent_turn("switch").unwrap();
+            assert_eq!(report.reverted, 2);
+            assert!(report.skipped.is_empty(), "{report:?}");
+            assert_eq!(f.app.agent_chart(ChartTarget::Pinned).unwrap().tf, Timeframe::W1);
+            assert!(
+                f.app.agent_chart(ChartTarget::Pinned).unwrap().source_bars().bars.is_empty(),
+                "undo reloads, never reinstalls a snapshot"
+            );
+            f.deliver(f.weekly.clone(), false);
+            f.app.process_logic();
+            assert_eq!(f.app.agent_chart(ChartTarget::Pinned).unwrap().visible_date_range(), before);
+        });
+    }
+
+    #[test]
+    fn switched_view_uses_cache_and_never_moves_a_linked_pane() {
+        let mut f = ViewFixture::new("a3b-linked-cache");
+        let mut other = crate::chart_view::ChartState::new(2, "AAA", Timeframe::W1);
+        other.navigation.range = true;
+        other.on_history(
+            0,
+            f.weekly.clone(),
+            tr_chart::scene::SeriesGpu::build(&f.weekly),
+            0,
+            false,
+            true,
+            false,
+            &f.app.worker,
+        );
+        let uid = other.uid;
+        f.app.panes[0].link = Some(crate::layouts::Link::Blue);
+        f.app.panes.push(crate::app::Pane {
+            id: 2,
+            kind: PaneKind::Chart(Box::new(other)),
+            link: Some(crate::layouts::Link::Blue),
+            title: None,
+            window: None,
+        });
+        let before = serde_json::to_value(f.app.agent_chart(ChartTarget::Uid(uid)).unwrap().read_chart()).unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let result = f.switch("cache", "4H", true).await;
             assert!(result.success, "{result:?}");
-            let chart = app.agent_chart(ChartTarget::Pinned).unwrap();
-            assert_eq!(chart.tf, Timeframe::W1);
-            assert!(!chart.source_bars().bars.is_empty());
-            assert!(chart.source_bars().bars.len() < 100);
-            let summary = app.undo_agent_turn("weekly").unwrap();
-            assert!(summary.skipped.is_empty(), "{summary:?}");
-            assert_eq!(app.agent_chart(ChartTarget::Pinned).unwrap().tf, Timeframe::D1);
-            assert_eq!(app.agent_chart(ChartTarget::Pinned).unwrap().source_bars().bars.len(), 100);
-            let pin = AppExecutor::pin(&app).unwrap();
+            assert_eq!(result_value(&result)["from_cache"], true);
+            assert_eq!(result_value(&result)["data_source"], "cache");
+            let after = serde_json::to_value(f.app.agent_chart(ChartTarget::Uid(uid)).unwrap().read_chart()).unwrap();
+            assert_eq!(before, after);
+            assert!(f.app.agent_chart(ChartTarget::Pinned).unwrap().range_event.is_none());
+        });
+    }
+
+    #[test]
+    fn user_timeframe_or_symbol_change_after_switch_conflicts_with_undo() {
+        for symbol in [false, true] {
+            let mut f = ViewFixture::new(if symbol { "a3b-symbol-conflict" } else { "a3b-timeframe-conflict" });
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                assert!(f.switch("switch", "4H", false).await.success);
+                if let PaneKind::Chart(chart) = &mut f.app.panes[0].kind {
+                    if symbol {
+                        chart.set_symbol("MSFT", &f.app.worker);
+                    } else {
+                        chart.set_timeframe(Timeframe::D1, &f.app.worker);
+                        chart.set_timeframe(Timeframe::H4, &f.app.worker); // away and back is still a user edit
+                    }
+                }
+                let view = AppExecutor::pin(&f.app).unwrap();
+                let report = f.app.undo_agent_turn("switch").unwrap();
+                assert_eq!(report.reverted, 0);
+                assert_eq!(report.skipped, [format!("view:{}", f.pin.uid)]);
+                assert_eq!(
+                    serde_json::to_value(AppExecutor::pin(&f.app).unwrap()).unwrap(),
+                    serde_json::to_value(view).unwrap()
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn set_view_timeout_is_structured_and_retains_partial_switch_for_undo() {
+        let mut f = ViewFixture::new("a3b-timeout");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut future =
+                f.executor.execute(Arc::new(Registry::new(tr_agent_tools::ToolSet::Edit)), f.call("timeout", "4H"));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            f.app.process_logic();
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            f.app.process_logic(); // an idle check must not complete the call
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            f.app.agent_queue.expire_waits_for_test();
+            f.app.process_logic();
+            let result = future.await;
+            assert!(!result.success);
+            assert_eq!(result_value(&result)["error"]["code"], "data_loading_timeout");
+            assert_eq!(result_value(&result)["timeframe"], "4H");
+            assert_eq!(result_value(&result)["timeframe_left_switched"], true);
+            assert!(f.app.agent_turn_undo_available("timeout"));
+            // A late worker response still applies the range and refreshes the inverse.
+            f.deliver(view_bars(Timeframe::H4), false);
+            f.app.process_logic();
+            f.session_history();
+            let report = f.app.undo_agent_turn("timeout").unwrap();
+            assert_eq!(report.reverted, 1);
+            assert!(report.skipped.is_empty());
+            f.deliver(f.weekly.clone(), false);
+            f.app.process_logic();
+            assert_eq!(AppExecutor::pin(&f.app).unwrap().visible_range, f.pin.visible_range);
+        });
+    }
+
+    #[test]
+    fn cancelled_pending_switch_can_undo_before_data_and_discards_stale_worker_reply() {
+        let mut f = ViewFixture::new("a3b-cancel-load");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let executor = f.executor.clone();
+            let mut future =
+                executor.execute(Arc::new(Registry::new(tr_agent_tools::ToolSet::Edit)), f.call("cancel", "4H"));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            f.app.process_logic();
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            executor.cancel("cancel");
+            assert!(!future.await.success);
+            let report = f.app.undo_agent_turn("cancel").unwrap();
+            assert_eq!(report.reverted, 1);
+            assert!(report.skipped.is_empty());
+            // First request is the cancelled H4 generation, second is the undo's W1.
+            f.deliver(view_bars(Timeframe::H4), false);
+            f.app.process_logic();
+            assert!(f.app.agent_chart(ChartTarget::Pinned).unwrap().source_bars().bars.is_empty());
+            f.deliver(f.weekly.clone(), false);
+            f.app.process_logic();
+            assert_eq!(AppExecutor::pin(&f.app).unwrap().visible_range, f.pin.visible_range);
+        });
+    }
+
+    #[test]
+    fn view_deadline_also_completes_without_a_logic_tick() {
+        let mut f = ViewFixture::new("a3b-no-tick-timeout");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let executor = f.executor.clone();
+            let call = f.call("timeout", "4H");
+            let mut future = executor.execute(Arc::new(Registry::new(tr_agent_tools::ToolSet::Edit)), call.clone());
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            f.app.process_logic();
+            drop(future);
+            let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+            let load = ViewLoad {
+                uid: chart.uid,
+                generation: chart.agent_view_generation(),
+                symbol: chart.symbol.clone(),
+                timeframe: chart.tf,
+            };
+            let host = ScopedHost { app: executor, call };
+            let result = host.wait_view(load, Instant::now()).await;
+            assert_eq!(result_value(&result)["error"]["code"], "data_loading_timeout");
+            assert_eq!(result_value(&result)["timeframe"], "4H");
+            assert_eq!(VIEW_LOAD_TIMEOUT, Duration::from_secs(20));
+        });
+    }
+
+    #[test]
+    fn several_timeframe_switches_in_one_turn_undo_to_the_original_range() {
+        let mut f = ViewFixture::new("a3b-multiple-switches");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(f.switch("switches", "4H", false).await.success);
+            assert!(f.switch("switches", "1D", false).await.success);
+            let report = f.app.undo_agent_turn("switches").unwrap();
+            assert_eq!(report.reverted, 2);
+            assert!(report.skipped.is_empty(), "{report:?}");
+            f.deliver(view_bars(Timeframe::H4), false); // intermediate inverse
+            f.deliver(f.weekly.clone(), false); // final inverse
+            f.app.process_logic();
+            assert_eq!(AppExecutor::pin(&f.app).unwrap().timeframe, "1W");
+            assert_eq!(AppExecutor::pin(&f.app).unwrap().visible_range, f.pin.visible_range);
+        });
+    }
+
+    #[test]
+    fn set_view_readonly_and_symbol_changes_are_still_rejected() {
+        let (mut app, executor, pin) = edit_fixture("a3b-rejections");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let result = executor
+                .execute(
+                    Arc::new(Registry::new(tr_agent_tools::ToolSet::ReadOnly)),
+                    ToolCall {
+                        turn: "readonly".into(),
+                        pin: pin.clone(),
+                        name: "set_view".into(),
+                        arguments: json!({"timeframe":"4H"}).to_string(),
+                        confirmed: false,
+                    },
+                )
+                .await;
+            assert_eq!(result_value(&result)["error"]["code"], "tool_disabled");
+            assert_eq!(app.agent_queue.len(), 0);
             let result =
-                edit_call(&mut app, &executor, &pin, "range", "set_view", json!({"from":86400,"to":864000})).await;
-            assert!(result.success);
+                edit_call(&mut app, &executor, &pin, "symbol", "set_view", json!({"symbol":"MSFT","timeframe":"4H"}))
+                    .await;
+            assert_eq!(result_value(&result)["error"]["code"], "invalid_args");
+            assert_eq!(
+                serde_json::to_value(AppExecutor::pin(&app).unwrap()).unwrap(),
+                serde_json::to_value(pin).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn range_only_view_preserves_later_user_navigation() {
+        let (mut app, executor, pin) = edit_fixture("a3b-range-conflict");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(
+                edit_call(&mut app, &executor, &pin, "range", "set_view", json!({"from":86400,"to":864000}))
+                    .await
+                    .success
+            );
             app.agent_chart_mut(ChartTarget::Pinned)
                 .unwrap()
                 .apply_linked_range(crate::chart_navigation::DateRange { start: 864000, end: 4000000 });
@@ -1189,6 +1651,364 @@ mod tests {
             )
             .await;
             assert!(result.success, "{result:?}");
+        });
+    }
+
+    #[test]
+    fn provider_failure_completes_view_wait_immediately_and_remains_undoable() {
+        let mut f = ViewFixture::new("a3b-provider-error");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let executor = f.executor.clone();
+            let mut future =
+                executor.execute(Arc::new(Registry::new(tr_agent_tools::ToolSet::Edit)), f.call("error", "4H"));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            f.app.process_logic();
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+            let pane = chart.id;
+            let generation = chart.agent_view_generation();
+            // An error from a superseded request must not fail this wait.
+            f.out
+                .send(crate::worker::Response::HistoryError {
+                    pane,
+                    generation: generation - 1,
+                    error: "stale provider failure".into(),
+                })
+                .unwrap();
+            f.app.process_logic();
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            f.out
+                .send(crate::worker::Response::HistoryError {
+                    pane,
+                    generation,
+                    error: format!("provider denied: Bearer private-token; {}", "🦀".repeat(400)),
+                })
+                .unwrap();
+            f.app.process_logic();
+            let std::task::Poll::Ready(result) = futures::poll!(future.as_mut()) else {
+                panic!("provider error must finish on this tick, not wait for expiry")
+            };
+            assert!(!result.success);
+            let value = result_value(&result);
+            assert_eq!(value["error"]["code"], "provider_error");
+            let message = value["error"]["message"].as_str().unwrap();
+            assert!(message.contains("provider denied") && message.contains("[REDACTED]"));
+            assert!(!message.contains("private-token"));
+            assert!(message.chars().count() <= 300);
+            let report = f.app.undo_agent_turn("error").unwrap();
+            assert_eq!(report.reverted, 1);
+            assert!(report.skipped.is_empty(), "{report:?}");
+        });
+    }
+
+    #[test]
+    fn view_completion_on_expiry_tick_wins_over_timeout() {
+        let mut f = ViewFixture::new("a3b-deadline-completion");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let executor = f.executor.clone();
+            let mut future =
+                executor.execute(Arc::new(Registry::new(tr_agent_tools::ToolSet::Edit)), f.call("deadline", "1D"));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            f.app.process_logic();
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            f.app.agent_queue.expire_waits_for_test();
+            f.deliver(view_bars(Timeframe::D1), false);
+            f.app.process_logic();
+            let std::task::Poll::Ready(result) = futures::poll!(future.as_mut()) else {
+                panic!("deadline tick must complete")
+            };
+            assert!(result.success, "{result:?}");
+            assert_eq!(result_value(&result)["loaded_bars"], 1000);
+        });
+    }
+
+    #[test]
+    fn user_navigation_away_and_back_revokes_view_undo_even_for_identical_range() {
+        for gesture in ["pan", "zoom", "range", "linked"] {
+            let (mut app, executor, pin) = edit_fixture(&format!("a3b-touch-{gesture}"));
+            let worker = crate::worker::Worker::inert();
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                assert!(
+                    edit_call(&mut app, &executor, &pin, "view", "set_view", json!({"from":864000,"to":4000000}))
+                        .await
+                        .success
+                );
+                let chart = app.agent_chart_mut(ChartTarget::Pinned).unwrap();
+                let range = chart.visible_date_range().unwrap();
+                match gesture {
+                    "pan" => {
+                        chart.pan_bars(5.);
+                        chart.pan_bars(-5.);
+                    }
+                    "zoom" => {
+                        chart.zoom(1.25);
+                        chart.zoom(0.8);
+                    }
+                    "range" => chart.set_range(crate::command::Range::Y1, &worker),
+                    _ => chart.apply_linked_range(range),
+                }
+                // Restore the exact range without adding another user gesture;
+                // each entry point above must independently revoke ownership.
+                chart.edit_author = tr_chart::drawings::Author::Agent;
+                chart.apply_linked_range(range);
+                chart.edit_author = tr_chart::drawings::Author::User;
+                assert_eq!(chart.visible_date_range(), Some(range));
+                let report = app.undo_agent_turn("view").unwrap();
+                assert_eq!(report.reverted, 0, "{gesture}: {report:?}");
+                assert_eq!(report.skipped, [format!("view:{}", pin.uid)]);
+            });
+        }
+    }
+
+    #[test]
+    fn successive_undos_and_a_new_switch_keep_the_buffered_logical_range() {
+        let mut f = ViewFixture::new("a3b-buffered-range");
+        let original_range = f.pin.visible_range;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(f.switch("t1", "1D", false).await.success);
+            f.pin = AppExecutor::pin(&f.app).unwrap();
+            let daily_range = f.pin.visible_range;
+            assert!(f.switch("t2", "4H", false).await.success);
+            assert!(f.app.undo_agent_turn("t2").unwrap().skipped.is_empty());
+            // Start another agent range change while the undo reload has no bars.
+            f.pin = AppExecutor::pin(&f.app).unwrap();
+            let executor = f.executor.clone();
+            let mut future =
+                executor.execute(Arc::new(Registry::new(tr_agent_tools::ToolSet::Edit)), f.call("t3", "1D"));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            f.app.process_logic();
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            drop(future);
+            assert!(f.app.undo_agent_turn("t3").unwrap().skipped.is_empty());
+            // t3's inverse must retain t2's buffered daily window, not None.
+            f.deliver(view_bars(Timeframe::D1), false);
+            f.app.process_logic();
+            assert_eq!(AppExecutor::pin(&f.app).unwrap().visible_range, daily_range);
+            assert!(f.app.undo_agent_turn("t1").unwrap().skipped.is_empty());
+            f.deliver(f.weekly.clone(), false);
+            f.app.process_logic();
+            assert_eq!(AppExecutor::pin(&f.app).unwrap().timeframe, "1W");
+            assert_eq!(AppExecutor::pin(&f.app).unwrap().visible_range, original_range);
+        });
+    }
+
+    #[test]
+    fn undoing_a_newer_agent_view_does_not_erase_an_older_user_conflict() {
+        let mut f = ViewFixture::new("a3b-monotonic-user-generation");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(f.switch("t1", "1D", false).await.success);
+            let chart = f.app.agent_chart_mut(ChartTarget::Pinned).unwrap();
+            let range = chart.visible_date_range().unwrap();
+            chart.apply_linked_range(range); // Same range, but driven by the user.
+            f.pin = AppExecutor::pin(&f.app).unwrap();
+            assert!(f.switch("t2", "4H", false).await.success);
+            let second = f.app.undo_agent_turn("t2").unwrap();
+            assert_eq!(second.reverted, 1);
+            assert!(second.skipped.is_empty());
+            let first = f.app.undo_agent_turn("t1").unwrap();
+            assert_eq!(first.reverted, 0);
+            assert_eq!(first.skipped, [format!("view:{}", f.pin.uid)]);
+        });
+    }
+
+    #[test]
+    fn anchored_history_paging_does_not_revoke_view_undo() {
+        let mut f = ViewFixture::new("a3b-paging-ownership");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(f.switch("paging", "1D", false).await.success);
+            let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+            let range = chart.visible_date_range();
+            let (pane, generation, symbol) = (chart.id, chart.agent_view_generation(), chart.symbol.clone());
+            let first = chart.source_bars().bars[0];
+            let mut bars: Vec<_> = (1..=10).rev().map(|n| tr_core::Bar { ts: first.ts - n * 86400, ..first }).collect();
+            bars.extend_from_slice(chart.source_bars().bars);
+            let bars = Arc::new(bars);
+            f.out
+                .send(crate::worker::Response::History {
+                    pane,
+                    generation,
+                    revision: 2,
+                    symbol,
+                    tf: Timeframe::D1,
+                    gpu: tr_chart::scene::SeriesGpu::build(&bars),
+                    bars,
+                    prepended: 10,
+                    from_cache: false,
+                    exhausted: true,
+                    live: false,
+                    crypto_source: None,
+                })
+                .unwrap();
+            f.app.process_logic();
+            assert_eq!(f.app.agent_chart(ChartTarget::Pinned).unwrap().visible_date_range(), range);
+            let report = f.app.undo_agent_turn("paging").unwrap();
+            assert_eq!(report.reverted, 1);
+            assert!(report.skipped.is_empty(), "{report:?}");
+        });
+    }
+
+    // ---- A3B review tests ----
+
+    #[test]
+    fn review_live_bar_after_switch_does_not_revoke_undo() {
+        let mut f = ViewFixture::new("a3b-review-live");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(f.switch("live", "1D", false).await.success);
+            let users_before = f.app.edit_log.newest(200, true).len();
+            let (pane, generation, len, last) = {
+                let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+                let bars = chart.source_bars().bars;
+                (chart.id, chart.agent_view_generation(), bars.len(), *bars.last().unwrap())
+            };
+            let next = tr_core::Bar::new(last.ts + 86400, 20., 24., 16., 22., 100.);
+            // Delivered through the worker path, exactly like a provider live tick.
+            f.out
+                .send(crate::worker::Response::LiveBars {
+                    pane,
+                    generation,
+                    revision: 2,
+                    from: len,
+                    bars: vec![next],
+                    len: len + 1,
+                })
+                .unwrap();
+            f.app.process_logic();
+            assert_eq!(f.app.agent_chart(ChartTarget::Pinned).unwrap().source_bars().bars.len(), len + 1);
+            // No user action happened; only worker live data (no new User event).
+            assert_eq!(f.app.edit_log.newest(200, true).len(), users_before);
+            let report = f.app.undo_agent_turn("live").unwrap();
+            assert!(report.skipped.is_empty(), "{report:?}");
+            assert_eq!(report.reverted, 1);
+            assert_eq!(f.app.agent_chart(ChartTarget::Pinned).unwrap().tf, Timeframe::W1);
+        });
+    }
+
+    #[test]
+    fn review_fresh_refresh_after_cached_completion_does_not_revoke_undo() {
+        let mut f = ViewFixture::new("a3b-review-cache-fresh");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let result = f.switch("cache", "1D", true).await;
+            assert!(result.success, "{result:?}");
+            assert_eq!(result_value(&result)["from_cache"], true);
+            // The provider refresh for the same generation arrives with one newer bar.
+            let (pane, generation, symbol) = {
+                let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+                (chart.id, chart.agent_view_generation(), chart.symbol.clone())
+            };
+            let mut fresh = view_bars(Timeframe::D1).to_vec();
+            let last = *fresh.last().unwrap();
+            fresh.push(tr_core::Bar::new(last.ts + 86400, 20., 24., 16., 22., 100.));
+            let fresh = Arc::new(fresh);
+            f.out
+                .send(crate::worker::Response::History {
+                    pane,
+                    generation,
+                    revision: 2,
+                    symbol,
+                    tf: Timeframe::D1,
+                    gpu: tr_chart::scene::SeriesGpu::build(&fresh),
+                    bars: fresh.clone(),
+                    prepended: 0,
+                    from_cache: false,
+                    exhausted: true,
+                    live: false,
+                    crypto_source: None,
+                })
+                .unwrap();
+            f.app.process_logic();
+            assert_eq!(f.app.agent_chart(ChartTarget::Pinned).unwrap().source_bars().bars.len(), fresh.len());
+            let report = f.app.undo_agent_turn("cache").unwrap();
+            assert!(report.skipped.is_empty(), "{report:?}");
+            assert_eq!(report.reverted, 1);
+        });
+    }
+
+    #[test]
+    fn review_successive_turn_undos_before_reload_restore_original_view() {
+        let mut f = ViewFixture::new("a3b-review-successive-undo");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(f.switch("t1", "1D", false).await.success);
+            f.pin = AppExecutor::pin(&f.app).unwrap();
+            assert!(f.switch("t2", "4H", false).await.success);
+            let second = f.app.undo_agent_turn("t2").unwrap();
+            assert_eq!(second.reverted, 1);
+            assert!(second.skipped.is_empty(), "{second:?}");
+            // The user clicks undo again before the 1D reload has answered.
+            let first = f.app.undo_agent_turn("t1").unwrap();
+            assert!(first.skipped.is_empty(), "{first:?}");
+            assert_eq!(first.reverted, 1);
+            assert_eq!(f.app.agent_chart(ChartTarget::Pinned).unwrap().tf, Timeframe::W1);
+        });
+    }
+
+    #[test]
+    fn review_user_timeframe_change_while_loading_fails_wait_and_conflicts_undo() {
+        let mut f = ViewFixture::new("a3b-review-user-tf-loading");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let executor = f.executor.clone();
+            let mut future =
+                executor.execute(Arc::new(Registry::new(tr_agent_tools::ToolSet::Edit)), f.call("load", "4H"));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            f.app.process_logic();
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            if let PaneKind::Chart(chart) = &mut f.app.panes[0].kind {
+                chart.set_timeframe(Timeframe::D1, &f.app.worker);
+            }
+            // The stale 4H response must not satisfy the request.
+            f.deliver(view_bars(Timeframe::H4), false);
+            f.app.process_logic();
+            let result = future.await;
+            assert!(!result.success);
+            assert_eq!(result_value(&result)["error"]["code"], "pin_changed");
+            assert_eq!(f.app.agent_chart(ChartTarget::Pinned).unwrap().tf, Timeframe::D1);
+            assert!(f.app.agent_chart(ChartTarget::Pinned).unwrap().source_bars().bars.is_empty());
+            let report = f.app.undo_agent_turn("load").unwrap();
+            assert_eq!(report.reverted, 0);
+            assert_eq!(report.skipped, [format!("view:{}", f.pin.uid)]);
+            assert_eq!(f.app.agent_chart(ChartTarget::Pinned).unwrap().tf, Timeframe::D1);
+        });
+    }
+
+    #[test]
+    fn review_parallel_set_views_in_one_turn_do_not_misattribute_and_undo_fully() {
+        let mut f = ViewFixture::new("a3b-review-parallel");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let executor = f.executor.clone();
+            let registry = Arc::new(Registry::new(tr_agent_tools::ToolSet::Edit));
+            let mut a = executor.execute(registry.clone(), f.call("par", "4H"));
+            let mut b = executor.execute(registry, f.call("par", "1D"));
+            assert!(futures::poll!(a.as_mut()).is_pending());
+            assert!(futures::poll!(b.as_mut()).is_pending());
+            f.app.process_logic();
+            assert!(futures::poll!(b.as_mut()).is_pending());
+            // Both requests were sent; deliver both in order. Only the 1D generation is current.
+            f.deliver(view_bars(Timeframe::H4), false);
+            f.deliver(view_bars(Timeframe::D1), false);
+            f.app.process_logic();
+            let (a, b) = (a.await, b.await);
+            assert!(!a.success, "superseded switch must not claim success: {a:?}");
+            assert!(b.success, "{b:?}");
+            assert_eq!(result_value(&b)["timeframe"], "1D");
+            let report = f.app.undo_agent_turn("par").unwrap();
+            assert_eq!(report.reverted, 2);
+            assert!(report.skipped.is_empty(), "{report:?}");
+            assert_eq!(f.app.agent_chart(ChartTarget::Pinned).unwrap().tf, Timeframe::W1);
+        });
+    }
+
+    #[test]
+    fn review_agent_switch_on_linked_pane_emits_no_range_event_after_render_state() {
+        let mut f = ViewFixture::new("a3b-review-link-glide");
+        f.app.panes[0].link = Some(crate::layouts::Link::Red);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(f.switch("link", "1D", false).await.success);
+            let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+            assert!(chart.range_event.is_none());
+            let undo = f.app.undo_agent_turn("link").unwrap();
+            assert_eq!(undo.reverted, 1);
+            f.deliver(f.weekly.clone(), false);
+            f.app.process_logic();
+            assert!(f.app.agent_chart(ChartTarget::Pinned).unwrap().range_event.is_none());
         });
     }
 }

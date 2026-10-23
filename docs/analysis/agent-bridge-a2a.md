@@ -552,12 +552,37 @@ A3 remains the source of ownership, mutation bounds and undo availability.
 - Indicators use the existing core catalogue, parameter normalization, built-cache
   refresh and study-removal path. Removing a study with any calculation, pane or
   fill dependents fails rather than cascading into a user's studies.
-- `set_view` clamps both endpoints to loaded data. It operates on the loaded
-  symbol only, with equal or coarser timeframes, using session-aware resampling
-  of loaded bars; it does not fetch/fabricate finer bars or change symbols even
-  though the generic registry schema can express a symbol. Range changes are
-  local; results explicitly report `linked_panes: []`. A changed/closed pin or
-  a user symbol/timeframe change during a turn fails instead of retargeting edits.
+- **A3B:** `set_view` can switch the pinned chart to **any supported timeframe,
+  finer or coarser**, including weekly → `4H`. The symbol must remain the loaded
+  symbol; an explicit different symbol or another chart target is rejected.
+  The app calls the same `ChartState::set_timeframe` → `load` path as user changes:
+  worker history requests, caches, session filtering, transformed views, study
+  recomputation and ordinary autosave. It never resamples weekly bars into fake
+  finer bars. A changed/closed pin or user symbol/timeframe change during a turn
+  still fails instead of retargeting edits.
+- Completion is asynchronous: the UI queue starts the switch under its existing
+  **10-second** initial-job deadline; a pending oneshot job is checked on each
+  logic tick after worker responses. The **20-second absolute set_view deadline**
+  includes that initial queue wait and remains inside the bridge's existing
+  per-call deadline and turn budget (the wait is not another tool attempt).
+  No UI-thread waiting, busy loop or idle repaint timer is added; worker delivery
+  wakes logic, and the executor timeout bounds the result even without a tick.
+  Cache bars may satisfy the load without waiting for a provider refresh. Range
+  endpoints are applied **after** the new displayed/source bars are available and
+  clamped to their timestamps. Empty loads time out rather than claiming success;
+  provider failures immediately return `provider_error` with a scrubbed reason
+  capped at 300 characters. Completion is checked before expiry on each tick, so
+  data delivered on the deadline tick succeeds. `data_loading_timeout` explicitly
+  says the timeframe is **left switched**;
+  late data may still finish the clamped range, and the partial edit remains undoable.
+- Results include `timeframe`, `loaded_bars`, `first_bar_time`, `last_bar_time`
+  (Unix seconds), `visible_range`, `from_cache` and `data_source` (`cache` or
+  `fresh_load`). After switching, call `read_data` **with the new timeframe** before
+  choosing drawing anchors/prices; pinned reads use those actual loaded bars,
+  including when the turn's original pin named the old timeframe.
+- **Linked panes are the sole exception to user-switch behavior:** an agent never
+  moves other panes, even those linked for timeframe/range navigation. No linked
+  range event is broadcast; results retain `linked_panes: []`.
 - Drawings, studies and comparisons persist `created_by` / `turn_id`. Missing legacy
   comparison metadata means User. User remove/re-add creates a new User comparison,
   even with the same symbol; the agent cannot remove it. Drawing/study Agent badges are
@@ -581,6 +606,8 @@ adds the live-host codes listed in `tr_agent_tools::edits::ERROR_CODES`:
 | `pin_changed` | Pin, pinned symbol or timeframe changed during the turn |
 | `turn_object_limit` | Twenty creations already admitted for this turn |
 | `chart_object_limit` | One hundred live agent objects already exist |
+| `data_loading_timeout` | New bars unavailable by the 20-second set_view deadline; timeframe left switched and partial edit undoable |
+| `provider_error` | Provider rejected/failed a view history load; scrubbed reason returned immediately, not as a timeout |
 
 ### A2b APIs and undo
 
@@ -615,10 +642,25 @@ focus or pin, then undoes the **whole turn on all affected charts**. Its interna
 command is `UNDO AGENT CHART <uid>`. The all-chart scope is explicit in the label.
 Undo uses A1a's inverse drawing operations by ID and neighbouring z-order, not a
 whole-chart rollback. Studies are inverted by instance ID and neighbours; view
-rollback compares the expected post-edit state first. Comparison undo checks the
+rollback checks user-navigation ownership rather than exact visible ranges. Comparison undo checks the
 expected author/creation turn, preserves user re-adds, and reports missing or
 conflicting objects in `skipped`; no-op removals are never counted as reverted.
 Interleaved user edits, Keep, user-created studies and changed view state survive.
+A3B timeframe switches and their deferred range completion are logged with
+`Author::Agent` and the canonical `turn_id`. View inverses keep symbol, timeframe,
+logical range and a user-navigation generation, **not a bars snapshot**. Undo restores
+the previous timeframe through the same loading path and buffers the old visible
+range until its bars arrive; the undo API reports the accepted reload immediately.
+That buffered range also counts as the logical range for successive undos and new
+agent edits before reload. It skips/reports `view:<uid>` conflicts if the user
+changed timeframe or symbol (including switching away and back), panned, zoomed,
+issued a range command, or drove linked range navigation from another pane.
+Live bars, cache-then-refresh and paging that preserves the anchor do not advance
+the user generation or revoke undo ownership. Undo does not reset that generation.
+A timeout/interruption/provider failure keeps the partial switch undoable, and
+late completion updates its inverse. The headless driver validates/plans before
+fetching and holds one async state lock across planning, loading and application
+so parallel calls cannot race their history or inverse state.
 Undo history is session-local (drawing history retains A1a's existing 64-step
 bound); layouts save provenance, not undo stacks. Layout replacement clears the
 undoable list. Availability APIs (also exposed per-chart by read_chart) exclude
@@ -651,6 +693,13 @@ TR_PROVIDER=sample cargo run --offline -p tr-agent --example agent_bridge -- \
   --model gpt-6.1-sol --tools edit --undo-agent-turn \
   --prompt "Read the pinned chart and read_data with limit 20. Create a horizontal support level and a two-anchor trend_line using loaded timestamps/prices, then add_indicator RSI with params [14]. Use at most five tool calls; return the ids. The host will undo this turn after completion." \
   --transcript "$HOME/Library/Application Support/terminal-rs-agent-spike/raw-a3-undo-1.jsonl"
+
+# A3B: SampleProvider generates actual finer-timeframe sample history (no network).
+TR_PROVIDER=sample cargo run --offline -p tr-agent --example agent_bridge -- \
+  --home "$HOME/Library/Application Support/terminal-rs-agent-spike" \
+  --model gpt-6.1-sol --tools edit --undo-agent-turn \
+  --prompt "First set_view to 1W. Then switch to 4h and draw support and resistance: use set_view timeframe 4H, read_data on 4H with limit 20, then create two horizontal lines using the returned loaded bar lows/highs. Report loaded bar timestamps and returned ids, label sample data, and use at most six calls. The host will undo this turn after completion." \
+  --transcript "$HOME/Library/Application Support/terminal-rs-agent-spike/raw-a3b-4h-1.jsonl"
 ```
 
 In the app, follow the exact A2b in-app checks above: sign in through the pane,
@@ -724,6 +773,30 @@ No new crates or network tests; no real Codex execution, manager-home access, or
 changes to isolation/tripwire/scrubber/caps/readiness.
 
 
+### A3B verification (2026-10-23)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | PASS; test counts N/A |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS; zero warnings; test counts N/A |
+| `cargo test --workspace` | PASS: **1,312 passed, 0 failed, 7 pre-existing ignored**, including the sealed-Connector compile-fail doctest |
+| `cargo test -p terminal-rs agent_bridge::tests -- --test-threads=1` | PASS: 26 passed, 0 failed, 0 ignored |
+| `cargo test -p tr-agent --example agent_bridge` | PASS: 2 passed, 0 failed, 0 ignored |
+
+Offline regressions cover weekly → 4H worker/session-history delivery and bar
+metadata, pinned read_data/new-bar drawing anchors, study requests, cache results,
+linked-pane isolation, tick and no-tick timeouts, cancellation/late delivery,
+undo before/after loading, multiple switches in one turn, timeframe/symbol user
+conflicts (including away-and-back), range conflicts, and ReadOnly/symbol-change
+refusals. The sealed bridge driver's RSI assertion now checks the calculation on
+freshly loaded weekly bars, not the old insufficient resampled daily seed.
+
+An intermediate workspace run hit the unrelated existing Coinbase heartbeat
+reconnect timing assertion; its isolated rerun and the subsequent complete suite
+passed without changing or ignoring that test. No new crate, network test, real
+Codex execution, real agent-home access, safety/ownership/limit relaxation, commit,
+or git-state change was made. Live A3B commands/checks above remain manager-only.
+
 ## A2a verification (historical)
 
 All commands use offline dependency resolution; no real Codex process, credentials
@@ -761,7 +834,10 @@ the first prompt after sign-in never sent; turns without a pin carried an empty
 chart, so `read_chart` returned "chart not found" (sending now pins the last
 focused chart).
 
-Gap found: `set_view` only allows the loaded symbol and an equal or coarser
-timeframe, so the agent asked the user to switch weekly to 4h manually. Follow-up:
-let `set_view` switch to finer timeframes (and load their data) under the same
-undo and provenance rules.
+Gap found at that acceptance run: `set_view` only allowed the loaded symbol and
+an equal or coarser timeframe, so the agent asked the user to switch weekly to 4h
+manually. **A3B implements this follow-up** with asynchronous finer/coarser loading
+and the same undo/provenance rules, as documented above. The manager should rerun
+that prompt on a weekly pinned chart, verify 4H bar metadata and data-backed lines,
+then undo to the weekly range. Also change the timeframe manually before undo and
+verify a reported conflict. These new live checks have not been run by the worker.
