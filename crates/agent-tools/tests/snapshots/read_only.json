@@ -6,13 +6,21 @@
       "properties": {
         "from": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "limit": {
           "default": 1000,
           "maximum": 10000,
           "minimum": 1,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "mode": {
           "enum": [
@@ -45,19 +53,31 @@
             "1D",
             "1W",
             "1M",
-            "3M"
+            "3M",
+            null
           ],
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "to": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "top": {
           "default": 10,
           "maximum": 100,
           "minimum": 1,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -102,13 +122,19 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "id": {
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [],
@@ -128,7 +154,10 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [],
@@ -146,13 +175,21 @@
       "properties": {
         "from": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "limit": {
           "default": 1000,
           "maximum": 10000,
           "minimum": 1,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "symbol": {
           "maxLength": 2048,
@@ -175,13 +212,22 @@
             "1D",
             "1W",
             "1M",
-            "3M"
+            "3M",
+            null
           ],
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "to": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -203,11 +249,19 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "since": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [],
@@ -227,7 +281,10 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [],

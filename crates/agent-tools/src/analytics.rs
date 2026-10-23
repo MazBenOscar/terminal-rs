@@ -7,7 +7,25 @@ use tr_core::{
     session::{Session, Zone},
 };
 
-use crate::args::Mode;
+use crate::{ToolResult, args::Mode};
+
+pub(crate) fn finite(value: f64, field: &str) -> Result<f64, ToolResult> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(ToolResult::error("invalid_data", "Computed number is not finite", Some(field)))
+    }
+}
+
+/// Scale before summing so a representable mean does not need a representable sum.
+pub(crate) fn mean(values: &[f64]) -> f64 {
+    let scale = values.iter().map(|v| v.abs()).fold(0., f64::max);
+    if scale == 0. { 0. } else { (values.iter().map(|v| v / scale).sum::<f64>() / values.len() as f64) * scale }
+}
+
+fn computed_last(values: &[f64], ready: bool, field: &str) -> Result<Option<f64>, ToolResult> {
+    if ready { values.last().map(|&v| finite(v, field)).transpose() } else { Ok(None) }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SupportResistance {
@@ -110,9 +128,15 @@ pub(crate) fn last_finite(values: &[f64]) -> Option<f64> {
     values.last().copied().filter(|v| v.is_finite())
 }
 
-pub(crate) fn analyze(bars: &[Bar], tf: Timeframe, session: Session, mode: Mode, top: usize) -> Value {
+pub(crate) fn analyze(
+    bars: &[Bar],
+    tf: Timeframe,
+    session: Session,
+    mode: Mode,
+    top: usize,
+) -> Result<Value, ToolResult> {
     let o = Ohlcv::new(bars);
-    match mode {
+    let value = match mode {
         Mode::Swings => {
             let input = indicators::registry::Input::new(bars, tf).with_session(session);
             let fractals = indicators::registry::Spec::new("FRACTALS", &[]).unwrap().compute(&input);
@@ -133,7 +157,7 @@ pub(crate) fn analyze(bars: &[Bar], tf: Timeframe, session: Session, mode: Mode,
             json!({"fractal_periods":2,"highs":points(&fractals[0].values),"lows":points(&fractals[1].values),
                 "zigzag":{"deviation_percent":5,"last_leg_repaints":true,"series":lttb(&line,300)}})
         }
-        Mode::Trend => trend(bars, &o),
+        Mode::Trend => trend(bars, &o)?,
         Mode::Levels => {
             let session_key = |ts| {
                 let ts = if session != Session::Provider && tf.is_intraday() {
@@ -143,62 +167,117 @@ pub(crate) fn analyze(bars: &[Bar], tf: Timeframe, session: Session, mode: Mode,
                 };
                 indicators::session_key(tf)(ts)
             };
-            let pivots: serde_json::Map<_, _> = indicators::pivots(&o, session_key, PivotKind::Classic)
-                .into_iter()
-                .map(|(name, v)| (name.into(), json!(last_finite(&v))))
-                .collect();
+            let ready = bars.windows(2).any(|w| session_key(w[0].ts) != session_key(w[1].ts));
+            let mut pivots = serde_json::Map::new();
+            for (name, values) in indicators::pivots(&o, session_key, PivotKind::Classic) {
+                pivots.insert(name.into(), json!(computed_last(&values, ready, &format!("pivots.{name}"))?));
+            }
+            let levels = support_resistance(bars, top);
+            for (i, level) in levels.iter().enumerate() {
+                for (name, value) in [("price", level.price), ("zone_width", level.zone_width), ("score", level.score)]
+                {
+                    finite(value, &format!("support_resistance[{i}].{name}"))?;
+                }
+            }
             json!({"pivots":pivots,"pivot_kind":"classic","pivot_session":"core timeframe session key",
-                "support_resistance":support_resistance(bars,top)})
+                "support_resistance":levels})
         }
         Mode::VolumeProfile => {
-            let profile = chart_analytics::volume_profile(bars, 48).map(|p| json!({
-                "poc":p.low+(p.poc as f64+0.5)*p.step,
-                "value_area":{"low":p.low+p.value_low as f64*p.step,"high":p.low+(p.value_high+1) as f64*p.step,"fraction":0.7},
-                "bins":p.volume.len(),"estimated_from_ohlcv":true
-            }));
-            let vwap = bars.first().and_then(|b| last_finite(&chart_analytics::anchored_vwap(bars, b.ts)));
+            let profile = chart_analytics::volume_profile(bars, 48)
+                .map(|p| {
+                    finite(p.step, "profile.step")?;
+                    for &volume in &p.volume {
+                        finite(volume, "profile.volume")?;
+                    }
+                    finite(p.volume.iter().sum(), "profile.total_volume")?;
+                    let poc = finite(p.low + (p.poc as f64 + 0.5) * p.step, "profile.poc")?;
+                    let low = finite(p.low + p.value_low as f64 * p.step, "profile.value_area.low")?;
+                    let high = finite(p.low + (p.value_high + 1) as f64 * p.step, "profile.value_area.high")?;
+                    Ok(json!({"poc":poc,"value_area":{"low":low,"high":high,"fraction":0.7},
+                    "bins":p.volume.len(),"estimated_from_ohlcv":true}))
+                })
+                .transpose()?;
+            // Keep core's app behaviour unchanged. Normalizing both units here
+            // avoids overflow in its typical-price sum and price*volume products.
+            let price_scale = bars
+                .iter()
+                .flat_map(|b| [b.high.abs(), b.low.abs(), b.close.abs()])
+                .fold(0., f64::max)
+                .max(f64::MIN_POSITIVE);
+            let volume_scale = bars.iter().map(|b| b.volume).fold(0., f64::max);
+            let vwap = if volume_scale == 0. {
+                None
+            } else {
+                let scaled: Vec<_> = bars
+                    .iter()
+                    .map(|b| Bar {
+                        high: b.high / price_scale,
+                        low: b.low / price_scale,
+                        close: b.close / price_scale,
+                        volume: b.volume / volume_scale,
+                        ..*b
+                    })
+                    .collect();
+                let values = chart_analytics::anchored_vwap(&scaled, bars[0].ts);
+                Some(finite(values.last().unwrap() * price_scale, "anchored_vwap")?)
+            };
             json!({"profile":profile,"anchored_vwap":vwap,"vwap_anchor":bars.first().map(|b|b.ts)})
         }
         Mode::Volatility => {
             let logs: Vec<_> = bars
                 .windows(2)
                 .filter(|w| w[0].close > 0. && w[1].close > 0.)
-                .map(|w| (w[1].close / w[0].close).ln())
+                .map(|w| w[1].close.ln() - w[0].close.ln())
                 .collect();
             let realized = if logs.len() < 2 {
                 None
             } else {
-                let mean = logs.iter().sum::<f64>() / logs.len() as f64;
-                Some((logs.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (logs.len() - 1) as f64).sqrt())
+                let mean = mean(&logs);
+                Some(finite(
+                    (logs.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (logs.len() - 1) as f64).sqrt(),
+                    "realized_volatility_per_bar",
+                )?)
             };
-            let mut ranges: Vec<_> = bars.iter().map(|b| b.high - b.low).collect();
+            let mut ranges: Vec<_> =
+                bars.iter().map(|b| finite(b.high - b.low, "range_percentiles")).collect::<Result<_, _>>()?;
+            let atr = computed_last(&indicators::atr(&o, 14), bars.len() >= 14, "atr")?;
             ranges.sort_by(f64::total_cmp);
             let percentile =
                 |q: f64| ranges.get(((ranges.len().saturating_sub(1)) as f64 * q).round() as usize).copied();
-            json!({"atr_period":14,"atr":last_finite(&indicators::atr(&o,14)),"realized_volatility_per_bar":realized,
+            json!({"atr_period":14,"atr":atr,"realized_volatility_per_bar":realized,
                 "log_return_count":logs.len(),"range_percentiles":{"p10":percentile(0.1),"p50":percentile(0.5),"p90":percentile(0.9)}})
         }
-    }
+    };
+    Ok(value)
 }
 
-fn trend(bars: &[Bar], o: &Ohlcv) -> Value {
+fn trend(bars: &[Bar], o: &Ohlcv) -> Result<Value, ToolResult> {
     if bars.len() < 2 {
-        return json!({"direction":"insufficient_data","slope_per_bar":null,"r_squared":null,"higher_highs":0,"higher_lows":0});
+        return Ok(
+            json!({"direction":"insufficient_data","slope_per_bar":null,"r_squared":null,"higher_highs":0,"higher_lows":0}),
+        );
     }
     let n = bars.len() as f64;
     let mx = (n - 1.) / 2.;
-    let my = bars.iter().map(|b| b.close).sum::<f64>() / n;
+    let max_price = bars.iter().map(|b| b.close.abs()).fold(0., f64::max).max(f64::MIN_POSITIVE);
+    // Power-of-two scaling preserves the original significands exactly.
+    let scale = 2_f64.powi((max_price.log2().floor() as i32).clamp(-1022, 1023));
+    let prices: Vec<_> = bars.iter().map(|b| b.close / scale).collect();
+    let my = prices.iter().sum::<f64>() / n;
     let xx = (0..bars.len()).map(|i| (i as f64 - mx).powi(2)).sum::<f64>();
-    let xy = bars.iter().enumerate().map(|(i, b)| (i as f64 - mx) * (b.close - my)).sum::<f64>();
-    let yy = bars.iter().map(|b| (b.close - my).powi(2)).sum::<f64>();
-    let slope = xy / xx;
+    let xy = prices.iter().enumerate().map(|(i, p)| (i as f64 - mx) * (p - my)).sum::<f64>();
+    let yy = prices.iter().map(|p| (p - my).powi(2)).sum::<f64>();
+    let slope = finite((xy / xx) * scale, "slope_per_bar")?;
+    let r_squared = finite(if yy > 0. { (xy * xy / (xx * yy)).clamp(0., 1.) } else { 1. }, "r_squared")?;
     let (highs, lows) = indicators::fractals(o, 2);
     let higher = |v: Vec<f64>| {
         v.into_iter().filter(|v| v.is_finite()).collect::<Vec<_>>().windows(2).filter(|w| w[1] > w[0]).count()
     };
-    json!({"direction":if slope.abs() <= my.abs().max(1.)*1e-10 {"sideways"} else if slope>0. {"up"} else {"down"},
-        "slope_per_bar":slope,"r_squared":if yy>0. {(xy*xy/(xx*yy)).clamp(0.,1.)} else {1.},
-        "higher_highs":higher(highs),"higher_lows":higher(lows)})
+    Ok(
+        json!({"direction":if slope.abs() <= (my.abs()*scale).max(1.)*1e-10 {"sideways"} else if slope>0. {"up"} else {"down"},
+        "slope_per_bar":slope,"r_squared":r_squared,
+        "higher_highs":higher(highs),"higher_lows":higher(lows)}),
+    )
 }
 
 #[cfg(test)]

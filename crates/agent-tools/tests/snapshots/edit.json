@@ -8,7 +8,10 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "code": {
           "maxLength": 2048,
@@ -40,13 +43,21 @@
       "properties": {
         "from": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "limit": {
           "default": 1000,
           "maximum": 10000,
           "minimum": 1,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "mode": {
           "enum": [
@@ -79,19 +90,31 @@
             "1D",
             "1W",
             "1M",
-            "3M"
+            "3M",
+            null
           ],
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "to": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "top": {
           "default": 10,
           "maximum": 100,
           "minimum": 1,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -121,7 +144,10 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "symbol": {
           "maxLength": 2048,
@@ -159,6 +185,8 @@
               },
               "time": {
                 "description": "Unix seconds UTC",
+                "maximum": 253370764799,
+                "minimum": -62135596800,
                 "type": "integer"
               }
             },
@@ -176,7 +204,10 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "kind": {
           "enum": [
@@ -193,7 +224,10 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "symbol": {
           "maxLength": 2048,
@@ -227,9 +261,14 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "id": {
+          "description": "Drawing ids are issued below 2^53 for exact JSON client representation",
+          "maximum": 9007199254740991,
           "minimum": 0,
           "type": "integer"
         },
@@ -282,13 +321,19 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "id": {
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [],
@@ -308,7 +353,10 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [],
@@ -326,13 +374,21 @@
       "properties": {
         "from": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "limit": {
           "default": 1000,
           "maximum": 10000,
           "minimum": 1,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "symbol": {
           "maxLength": 2048,
@@ -355,13 +411,22 @@
             "1D",
             "1W",
             "1M",
-            "3M"
+            "3M",
+            null
           ],
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "to": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -383,11 +448,19 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "since": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [],
@@ -407,7 +480,10 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "id": {
           "maxLength": 2048,
@@ -435,7 +511,10 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [],
@@ -455,17 +534,28 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "from": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "symbol": {
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "timeframe": {
           "default": "1D",
@@ -482,13 +572,22 @@
             "1D",
             "1W",
             "1M",
-            "3M"
+            "3M",
+            null
           ],
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "to": {
           "description": "Unix seconds UTC",
-          "type": "integer"
+          "maximum": 253370764799,
+          "minimum": -62135596800,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [],
@@ -517,6 +616,8 @@
               },
               "time": {
                 "description": "Unix seconds UTC",
+                "maximum": 253370764799,
+                "minimum": -62135596800,
                 "type": "integer"
               }
             },
@@ -528,15 +629,23 @@
           },
           "maxItems": 8,
           "minItems": 1,
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "chart_id": {
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "id": {
+          "description": "Drawing ids are issued below 2^53 for exact JSON client representation",
+          "maximum": 9007199254740991,
           "minimum": 0,
           "type": "integer"
         },
@@ -544,7 +653,10 @@
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "symbol": {
           "maxLength": 2048,

@@ -168,7 +168,12 @@ fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult>
     {
         return Err(fail("Value is not in the allowed enum"));
     }
-    match schema["type"].as_str().unwrap_or("") {
+    let types = &schema["type"];
+    if value.is_null() && types.as_array().is_some_and(|types| types.iter().any(|t| t == "null")) {
+        return Ok(());
+    }
+    let kind = types.as_str().or_else(|| types.as_array()?.first()?.as_str()).unwrap_or("");
+    match kind {
         "object" => {
             let object = value.as_object().ok_or_else(|| fail("Expected an object"))?;
             let properties = schema["properties"].as_object().unwrap();
@@ -186,19 +191,25 @@ fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult>
         }
         "string" => {
             let text = value.as_str().ok_or_else(|| fail("Expected a string"))?;
-            if text.trim().is_empty() || text.len() > 2048 {
-                return Err(fail("String must contain 1 to 2048 bytes of text"));
+            let length = text.chars().count() as u64;
+            if schema["minLength"].as_u64().is_some_and(|min| length < min)
+                || schema["maxLength"].as_u64().is_some_and(|max| length > max)
+                || schema["pattern"] == "\\S" && text.chars().all(char::is_whitespace)
+            {
+                return Err(fail("String is outside the allowed length or pattern"));
             }
         }
         "integer" => {
-            let number = value.as_i64().ok_or_else(|| fail("Expected a signed 64-bit integer"))?;
-            if schema.get("minimum").and_then(Value::as_i64).is_some_and(|min| number < min)
-                || schema.get("maximum").and_then(Value::as_i64).is_some_and(|max| number > max)
-            {
+            let outside = if let Some(min) = schema["minimum"].as_u64() {
+                let number = value.as_u64().ok_or_else(|| fail("Expected an unsigned 64-bit integer"))?;
+                number < min || schema["maximum"].as_u64().is_some_and(|max| number > max)
+            } else {
+                let number = value.as_i64().ok_or_else(|| fail("Expected a signed 64-bit integer"))?;
+                schema["minimum"].as_i64().is_some_and(|min| number < min)
+                    || schema["maximum"].as_i64().is_some_and(|max| number > max)
+            };
+            if outside {
                 return Err(fail("Integer is outside the allowed range"));
-            }
-            if schema["description"] == "Unix seconds UTC" && !(-62_135_596_800..253_370_764_800).contains(&number) {
-                return Err(fail("Timestamp is outside supported calendar years"));
             }
         }
         "number" => {

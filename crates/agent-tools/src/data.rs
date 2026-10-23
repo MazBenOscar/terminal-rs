@@ -36,7 +36,7 @@ async fn history(host: &dyn DataHost, args: &ReadData, now: i64) -> Result<(Hist
             || b.open > b.high
             || b.close < b.low
             || b.close > b.high
-            || !(-62_135_596_800..253_370_764_800).contains(&b.ts)
+            || !(crate::args::MIN_TIMESTAMP..=crate::args::MAX_TIMESTAMP).contains(&b.ts)
     }) {
         return Err(ToolResult::error("invalid_data", "History contains invalid OHLCV or timestamps", None));
     }
@@ -54,13 +54,37 @@ pub(crate) async fn read_data(host: &dyn DataHost, args: ReadData, now: i64) -> 
         Ok(v) => v,
         Err(e) => return e,
     };
-    ToolResult::json(summary(&history, &args, tf, now))
+    match summary(&history, &args, tf, now) {
+        Ok(value) => ToolResult::json(value),
+        Err(error) => error,
+    }
 }
 
-fn summary(history: &History, args: &ReadData, tf: Timeframe, now: i64) -> Value {
+// History intraday labels use core's bucket grid (only regular H2/H4 are
+// session-aligned). Daily labels name a UTC calendar date, not the previous NY
+// evening; use that date's session close, including early closes and DST.
+fn bar_end(session: tr_core::session::Session, tf: Timeframe, ts: i64) -> i64 {
+    use tr_core::session::{Session, bar_interval};
+    if tf == Timeframe::D1 && session != Session::Provider {
+        let midday = tf.bucket_start(ts) + 12 * 3600;
+        session.interval(tf, midday).1
+    } else {
+        bar_interval(tf, session, ts).1
+    }
+}
+
+fn summary(history: &History, args: &ReadData, tf: Timeframe, now: i64) -> Result<Value, ToolResult> {
     let bars = &history.bars;
     let first = bars.first();
     let last = bars.last();
+    let ohlcv = stats(bars)?;
+    let close_return = first
+        .zip(last)
+        .map(|(a, b)| percent(a.close, b.close, "returns.close_to_close_percent"))
+        .transpose()?
+        .flatten();
+    let open_return =
+        first.zip(last).map(|(a, b)| percent(a.open, b.close, "returns.open_to_close_percent")).transpose()?.flatten();
     let mut value = json!({
         "version":1,"symbol":history.instrument.as_ref().map_or_else(||args.symbol.clone(),CryptoInstrument::canonical_ticker),
         "requested_symbol":args.symbol,"timeframe":tf.label(),"instrument":history.instrument,
@@ -68,10 +92,9 @@ fn summary(history: &History, args: &ReadData, tf: Timeframe, now: i64) -> Value
         "count":bars.len(),"first":first.and_then(|b|iso(b.ts)),"last":last.and_then(|b|iso(b.ts)),
         "requested_range":{"from":args.from.and_then(iso),"to":args.to.and_then(iso),"limit":args.limit},
         "range_note":"Statistics cover returned bars only; provider availability and limit may bound the requested range.",
-        "ohlcv":stats(bars),
-        "returns":{"close_to_close_percent":first.zip(last).and_then(|(a,b)|percent(a.close,b.close)),
-            "open_to_close_percent":first.zip(last).and_then(|(a,b)|percent(a.open,b.close))},
-        "in_progress_last_bar":last.is_some_and(|b| now>=b.ts && now<history.session.interval(tf,b.ts).1),
+        "ohlcv":ohlcv,
+        "returns":{"close_to_close_percent":close_return,"open_to_close_percent":open_return},
+        "in_progress_last_bar":last.is_some_and(|b| now>=b.ts && now<bar_end(history.session,tf,b.ts)),
         "bar_columns":["time","open","high","low","close","volume","in_progress"],
         "close_series_columns":["time","close"],"truncated":false
     });
@@ -87,44 +110,53 @@ fn summary(history: &History, args: &ReadData, tf: Timeframe, now: i64) -> Value
                     b.low,
                     b.close,
                     b.volume,
-                    last.is_some_and(|last| last.ts == b.ts)
-                        && now >= b.ts
-                        && now < history.session.interval(tf, b.ts).1
+                    last.is_some_and(|last| last.ts == b.ts) && now >= b.ts && now < bar_end(history.session, tf, b.ts)
                 ])
             })
             .collect();
         value["close_series"] = analytics::lttb(bars, points).into_iter().map(|(t, v)| json!([iso(t), v])).collect();
         value["emitted"] = json!({"recent_bars":recent,"close_points":value["close_series"].as_array().unwrap().len()});
         if value.to_string().len() <= MAX_TEXT_BYTES {
-            return value;
+            return Ok(value);
         }
         value["truncated"] = true.into();
         value["marker"] =
             "[truncated: recent bars and LTTB points reduced to fit 16 KiB; full-range statistics retained]".into();
         if recent <= 1 && points <= 2 {
-            return value;
+            return Ok(value);
         }
         recent = (recent * 3 / 4).max(1).min(bars.len());
         points = (points * 3 / 4).max(2).min(bars.len());
     }
 }
 
-fn percent(from: f64, to: f64) -> Option<f64> {
-    (from != 0.).then(|| (to / from - 1.) * 100.).filter(|v| v.is_finite())
+fn percent(from: f64, to: f64, field: &str) -> Result<Option<f64>, ToolResult> {
+    if from == 0. {
+        return Ok(None);
+    }
+    analytics::finite((to / from - 1.) * 100., field).map(Some)
 }
 
-fn stats(bars: &[Bar]) -> Value {
+fn stats(bars: &[Bar]) -> Result<Value, ToolResult> {
     if bars.is_empty() {
-        return Value::Null;
+        return Ok(Value::Null);
     }
-    let column = |get: fn(&Bar) -> f64| {
+    let mut columns = serde_json::Map::new();
+    for (name, get) in [
+        ("open", (|b: &Bar| b.open) as fn(&Bar) -> f64),
+        ("high", |b: &Bar| b.high),
+        ("low", |b: &Bar| b.low),
+        ("close", |b: &Bar| b.close),
+        ("volume", |b: &Bar| b.volume),
+    ] {
         let min = bars.iter().map(get).fold(f64::INFINITY, f64::min);
         let max = bars.iter().map(get).fold(f64::NEG_INFINITY, f64::max);
-        let sum = bars.iter().map(get).sum::<f64>();
-        json!({"min":min,"max":max,"mean":sum/bars.len() as f64,"sum":sum})
-    };
-    json!({"open":column(|b|b.open),"high":column(|b|b.high),"low":column(|b|b.low),
-        "close":column(|b|b.close),"volume":column(|b|b.volume)})
+        let mean = analytics::mean(&bars.iter().map(get).collect::<Vec<_>>());
+        analytics::finite(mean, &format!("ohlcv.{name}.mean"))?;
+        let sum = analytics::finite(bars.iter().map(get).sum::<f64>(), &format!("ohlcv.{name}.sum"))?;
+        columns.insert(name.into(), json!({"min":min,"max":max,"mean":mean,"sum":sum}));
+    }
+    Ok(Value::Object(columns))
 }
 
 pub(crate) async fn analyze(host: &dyn DataHost, args: Analyze, now: i64) -> ToolResult {
@@ -143,7 +175,10 @@ pub(crate) async fn analyze(host: &dyn DataHost, args: Analyze, now: i64) -> Too
     if bars.is_empty() {
         return ToolResult::error("no_data", "No bars in the requested range", None);
     }
-    let mut value = analytics::analyze(bars, tf, history.session, args.mode, args.top.unwrap_or(10));
+    let mut value = match analytics::analyze(bars, tf, history.session, args.mode, args.top.unwrap_or(10)) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
     value["version"] = 1.into();
     value["symbol"] =
         history.instrument.as_ref().map_or_else(|| args.symbol.clone(), CryptoInstrument::canonical_ticker).into();

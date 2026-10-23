@@ -6,10 +6,37 @@ pub trait Arguments {
     fn schema() -> Value;
 }
 
+pub(crate) const MIN_TIMESTAMP: i64 = -62_135_596_800;
+pub(crate) const MAX_TIMESTAMP: i64 = 253_370_764_799;
+
+// Derive nullability from the Rust field type, not from whether it has a default.
+trait OptionalArgument {
+    const NULLABLE: bool;
+}
+impl<T> OptionalArgument for Option<T> {
+    const NULLABLE: bool = true;
+}
+impl<T> OptionalArgument for Vec<T> {
+    const NULLABLE: bool = false;
+}
+impl OptionalArgument for bool {
+    const NULLABLE: bool = false;
+}
+fn optional_schema<T: OptionalArgument>(mut schema: Value) -> Value {
+    if T::NULLABLE {
+        schema["type"] = json!([schema["type"], "null"]);
+        if let Some(choices) = schema.get_mut("enum").and_then(Value::as_array_mut) {
+            choices.push(Value::Null);
+        }
+    }
+    schema
+}
+
 macro_rules! field_schema {
     (String) => { json!({"type":"string", "minLength":1, "maxLength":2048, "pattern":"\\S"}) };
     (f64) => { json!({"type":"number"}) };
-    (u64) => { json!({"type":"integer", "minimum":0}) };
+    (u64) => { json!({"type":"integer", "minimum":0, "maximum":9007199254740991_u64,
+        "description":"Drawing ids are issued below 2^53 for exact JSON client representation"}) };
     (bool) => { json!({"type":"boolean", "default":false}) };
     (Timeframe) => { json!({"type":"string", "enum":["1m","2m","3m","5m","15m","30m","1H","2H","4H","1D","1W","1M","3M"], "default":"1D"}) };
     (Mode) => { json!({"type":"string", "enum":["swings","trend","levels","volume_profile","volatility"]}) };
@@ -17,9 +44,10 @@ macro_rules! field_schema {
     (CompareAction) => { json!({"type":"string", "enum":["add","remove"]}) };
     (AlertRule) => { json!({"type":"string", "enum":["above","below","crossing"]}) };
     (Anchors) => { json!({"type":"array", "items":Anchor::schema(), "minItems":1, "maxItems":8}) };
-    (Symbols) => { json!({"type":"array", "items":{"type":"string", "minLength":1}, "minItems":1, "maxItems":200}) };
+    (Symbols) => { json!({"type":"array", "items":field_schema!(String), "minItems":1, "maxItems":200}) };
     (Params) => { json!({"type":"array", "items":{"type":"number"}}) };
-    (Timestamp) => { json!({"type":"integer", "description":"Unix seconds UTC"}) };
+    (Timestamp) => { json!({"type":"integer", "description":"Unix seconds UTC",
+        "minimum":MIN_TIMESTAMP, "maximum":MAX_TIMESTAMP}) };
     (Limit) => { json!({"type":"integer", "minimum":1, "maximum":10000, "default":1000}) };
     (Top) => { json!({"type":"integer", "minimum":1, "maximum":100, "default":10}) };
 }
@@ -36,7 +64,7 @@ macro_rules! args {
             fn schema() -> Value {
                 let mut properties = serde_json::Map::new();
                 $(properties.insert(stringify!($field).into(), field_schema!($schema));)*
-                $(properties.insert(stringify!($optional).into(), field_schema!($opt_schema));)*
+                $(properties.insert(stringify!($optional).into(), optional_schema::<$opt_ty>(field_schema!($opt_schema)));)*
                 let required: Vec<&str> = vec![$(stringify!($field)),*];
                 json!({"type":"object", "properties":properties, "required":required, "additionalProperties":false})
             }
