@@ -53,17 +53,46 @@ pub fn parse_features(output: &str) -> Result<BTreeMap<String, bool>> {
     Ok(features)
 }
 
+/// Enabled in 0.163.0 even with `--disable`/`-c features.<name>=false` (verified live
+/// 2026-10-23). `unified_exec` only backs the shell tool, which is disabled; Seatbelt
+/// allows exec of codex alone and the tripwire kills the session on any command item.
+/// The canary turn re-proves this per version. Adding a name here needs review.
+pub const UNDISABLEABLE_FEATURES: &[&str] = &["unified_exec"];
+
+/// Features the registry lists at stage `removed`: retired, report `true`, do nothing.
+fn removed_features() -> std::collections::BTreeSet<&'static str> {
+    FEATURE_REGISTRY
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let name = words.next()?;
+            words.any(|word| word == "removed").then_some(name)
+        })
+        .collect()
+}
+
 pub fn verify_features(output: &str) -> Result<()> {
     let actual = parse_features(output)?;
     let registry = parse_features(FEATURE_REGISTRY)?;
     if actual.keys().ne(registry.keys()) {
         bail!("feature registry changed");
     }
-    if actual.iter().any(|(name, enabled)| *enabled && !ALLOWED_FEATURES.contains(&name.as_str())) {
-        bail!("unapproved feature enabled");
+    let unapproved: Vec<_> = actual
+        .iter()
+        .filter(|(name, enabled)| {
+            **enabled
+                && !ALLOWED_FEATURES.contains(&name.as_str())
+                && !UNDISABLEABLE_FEATURES.contains(&name.as_str())
+                && !removed_features().contains(name.as_str())
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !unapproved.is_empty() {
+        bail!("unapproved feature enabled: {}", unapproved.join(", "));
     }
-    if ALLOWED_FEATURES.iter().any(|name| actual.get(*name) != Some(&true)) {
-        bail!("required feature disabled");
+    let missing: Vec<_> = ALLOWED_FEATURES.iter().filter(|name| actual.get(**name) != Some(&true)).copied().collect();
+    if !missing.is_empty() {
+        bail!("required feature disabled: {}", missing.join(", "));
     }
     Ok(())
 }
@@ -81,7 +110,7 @@ pub fn feature_argv() -> Vec<OsString> {
 }
 
 // Config and CLI feature names are not described by the app-server schema. Live verification required.
-pub const CONFIG: &str = "sandbox_mode = \"read-only\"\nweb_search = \"disabled\"\nforced_login_method = \"chatgpt\"\ncli_auth_credentials_store = \"keyring\"\n\n[features]\nsecret_auth_storage = true\n";
+pub const CONFIG: &str = "sandbox_mode = \"read-only\"\nweb_search = \"disabled\"\nforced_login_method = \"chatgpt\"\ncli_auth_credentials_store = \"keyring\"\n\n[features]\nsecret_auth_storage = true\n\n[[skills.config]]\nname = \"imagegen\"\nenabled = false\n\n[[skills.config]]\nname = \"openai-docs\"\nenabled = false\n\n[[skills.config]]\nname = \"review-agent\"\nenabled = false\n\n[[skills.config]]\nname = \"skill-creator\"\nenabled = false\n\n[[skills.config]]\nname = \"skill-installer\"\nenabled = false\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(pub u32, pub u32, pub u32);
@@ -170,6 +199,7 @@ impl PrivateHome {
                 .context("private home must be new; use PrivateHome::open for an existing login")?;
             let cwd = path.join("empty");
             std::fs::DirBuilder::new().mode(0o700).create(&cwd)?;
+            std::fs::DirBuilder::new().mode(0o700).create(path.join("home"))?;
             let mut file =
                 std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path.join("config.toml"))?;
             use std::io::Write;
@@ -193,6 +223,10 @@ impl PrivateHome {
                 bail!("private home must be a real 0700 directory");
             }
             validate_home_entries(&path, true)?;
+            if !path.join("home").exists() {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new().mode(0o700).create(path.join("home"))?;
+            }
             let config = path.join("config.toml");
             let config_metadata = owned_path(&config)?;
             if !config_metadata.is_file()
@@ -222,6 +256,22 @@ fn validate_home_entries(path: &Path, root: bool) -> Result<()> {
         let name = name.to_str().context("non-UTF8 private home entry")?;
         let metadata = owned_path(&entry.path())?;
         let directory = metadata.is_dir();
+        if root && name == "tmp" && directory {
+            validate_arg0_links(&entry.path())?;
+            continue;
+        }
+        if root && name == "skills" && directory {
+            validate_system_skills(&entry.path())?;
+            continue;
+        }
+        if root && name == "home" && directory {
+            // The private HOME must stay empty: anything Codex or a session leaves there
+            // (dotfiles, AGENTS.md, skills) is refused until reviewed.
+            if std::fs::read_dir(entry.path())?.next().is_some() {
+                bail!("private HOME is not empty; refusing startup");
+            }
+            continue;
+        }
         let allowed = if root {
             if directory {
                 matches!(name, "empty" | "sessions" | "log" | "logs")
@@ -229,6 +279,16 @@ fn validate_home_entries(path: &Path, root: bool) -> Result<()> {
                 matches!(
                     name,
                     "config.toml"
+                        | "installation_id"
+                        | "goals_1.sqlite"
+                        | "goals_1.sqlite-shm"
+                        | "goals_1.sqlite-wal"
+                        | "memories_1.sqlite"
+                        | "memories_1.sqlite-shm"
+                        | "memories_1.sqlite-wal"
+                        | "queue_1.sqlite"
+                        | "queue_1.sqlite-shm"
+                        | "queue_1.sqlite-wal"
                         | "auth.json"
                         | "version.json"
                         | "models_cache.json"
@@ -255,6 +315,70 @@ fn validate_home_entries(path: &Path, root: bool) -> Result<()> {
         }
         if directory {
             validate_home_entries(&entry.path(), false)?;
+        }
+    }
+    Ok(())
+}
+
+/// Codex installs its bundled skills under `skills/.system` on every start. Accept only
+/// that tree (regular files and directories, no links); the config disables each skill and
+/// the client verifies with `skills/list` that none is enabled.
+#[cfg(unix)]
+fn validate_system_skills(skills: &Path) -> Result<()> {
+    let refuse = || anyhow::anyhow!("private home skills contain non-bundled entries; refusing startup");
+    for entry in std::fs::read_dir(skills)? {
+        let entry = entry?;
+        if entry.file_name() != ".system" || !std::fs::symlink_metadata(entry.path())?.is_dir() {
+            return Err(refuse());
+        }
+        let mut stack = vec![entry.path()];
+        while let Some(dir) = stack.pop() {
+            for item in std::fs::read_dir(dir)? {
+                let item = item?;
+                let kind = std::fs::symlink_metadata(item.path())?.file_type();
+                if kind.is_dir() {
+                    stack.push(item.path());
+                } else if !kind.is_file() {
+                    return Err(refuse());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Codex re-execs itself through `tmp/arg0-macos/codex-arg0*/{apply_patch,applypatch}`
+/// symlinks created at startup. Accept exactly that shape: lock files and symlinks to an
+/// absolute `codex` binary; anything else fails closed.
+#[cfg(unix)]
+fn validate_arg0_links(tmp: &Path) -> Result<()> {
+    let refuse = || anyhow::anyhow!("private home tmp contains unexpected entries; refusing startup");
+    for entry in std::fs::read_dir(tmp)? {
+        let entry = entry?;
+        if entry.file_name() != "arg0-macos" || !owned_path(&entry.path())?.is_dir() {
+            return Err(refuse());
+        }
+        for dir in std::fs::read_dir(entry.path())? {
+            let dir = dir?;
+            let name = dir.file_name();
+            if !name.to_str().is_some_and(|n| n.starts_with("codex-arg0")) || !owned_path(&dir.path())?.is_dir() {
+                return Err(refuse());
+            }
+            for item in std::fs::read_dir(dir.path())? {
+                let item = item?;
+                let metadata = std::fs::symlink_metadata(item.path())?;
+                let ok = match item.file_name().to_str() {
+                    Some(".lock") => metadata.is_file(),
+                    Some("apply_patch" | "applypatch") if metadata.file_type().is_symlink() => {
+                        let target = std::fs::read_link(item.path())?;
+                        target.is_absolute() && target.file_name().is_some_and(|n| n == "codex")
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    return Err(refuse());
+                }
+            }
         }
     }
     Ok(())
@@ -315,22 +439,34 @@ pub fn sandbox_profile_for(private_home: &Path, binary: &Path, user_home: &Path,
         ),
     };
     let home = quote(private_home)?;
+    // Codex canonicalizes CODEX_HOME, which needs metadata (not contents) of each ancestor.
+    let ancestors = private_home
+        .ancestors()
+        .skip(1)
+        .map(|dir| quote(dir).map(|q| format!("(literal {q})")))
+        .collect::<Result<Vec<_>>>()?
+        .join(" ");
     let executable = quote(binary)?;
-    let install = quote(binary.parent().context("binary has no install directory")?)?;
     let ssh = quote(&user_home.join(".ssh"))?;
     let codex = quote(&user_home.join(".codex"))?;
     let documents = quote(&user_home.join("Documents"))?;
     Ok(format!(
         r#"(version 1)
 (deny default)
-(allow file-read* (subpath {home}) (literal {executable}) (subpath {install})
+(allow file-read* (subpath {home}) (literal {executable})
     (subpath "/System/Library") (subpath "/usr/lib") (subpath "/Library/Apple/System/Library")
-    (literal "/dev/urandom") (literal "/dev/null"))
+    (literal "/") (literal "/dev/urandom") (literal "/dev/null"))
+(allow file-read-metadata {ancestors} (literal "/etc") (literal "/private/etc") (literal "/private/etc/codex"))
+(allow file-read* (literal "/private/etc/codex/requirements.toml") (literal "/private/etc/codex/managed_config.toml"))
 (allow file-write* (subpath {home}))
 (allow process-exec (literal {executable}))
 (allow process-fork)
 (allow sysctl-read)
 (allow mach-lookup (global-name "com.apple.dnssd.service"))
+(allow mach-lookup (global-name "com.apple.cfprefsd.daemon") (global-name "com.apple.cfprefsd.agent"))
+(allow user-preference-read)
+(allow ipc-posix-shm-read-data (ipc-posix-name-prefix "apple.cfprefs."))
+(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.system.notification_center"))
 (allow mach-lookup (global-name "com.apple.SecurityServer"))
 (allow mach-lookup (global-name "com.apple.securityd"))
 (allow mach-lookup (global-name "com.apple.trustd"))
@@ -486,6 +622,9 @@ impl Drop for ProcessGroup {
 fn isolated_command(program: &Path, home: &PrivateHome) -> Command {
     let mut command = Command::new(program);
     command.env_clear().envs(scrub_environment(std::env::vars_os(), &home.path)).current_dir(&home.cwd);
+    // A private HOME keeps Codex from discovering the user's own skills, AGENTS.md and
+    // agent configuration (it scans ~ for user-scope skills even with CODEX_HOME set).
+    command.env("HOME", home.path.join("home"));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -513,13 +652,17 @@ impl Drop for KillOnDrop {
 async fn probe(binary: &Path, home: &PrivateHome, profile: &str, subcommand: &[&str]) -> Result<String> {
     let mut args = app_server_argv(profile, binary);
     args.pop();
+    if subcommand.first() == Some(&"features") {
+        // `codex features` rejects --strict-config; it only reads the flags we pass.
+        args.retain(|arg| arg != "--strict-config");
+    }
     args.extend(subcommand.iter().map(OsString::from));
     let mut command = isolated_command(Path::new("/usr/bin/sandbox-exec"), home);
     command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     let child = command.spawn()?;
     let group = Arc::new(ProcessGroup::new(child.id()));
     let _guard = KillOnDrop(group.clone());
@@ -553,7 +696,10 @@ async fn probe(binary: &Path, home: &PrivateHome, profile: &str, subcommand: &[&
     home_result?;
     let output = output?;
     if !output.status.success() {
-        bail!("Codex startup probe failed");
+        // A scrubbed, bounded excerpt so a fail-closed probe still says why.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let excerpt: String = crate::transcript::scrub_text(stderr.trim()).chars().take(400).collect();
+        bail!("Codex startup probe failed ({}): {excerpt}", output.status);
     }
     String::from_utf8(output.stdout).map_err(|_| anyhow::anyhow!("invalid startup probe output"))
 }
@@ -591,12 +737,21 @@ pub async fn spawn_session(
     // No caller can widen the pinned protocol version through VersionRange.
     VersionRange::default().check(&version).map_err(|_| WrongVersion)?;
     verify_features(&probe(&binary, home, &profile, &["features", "list"]).await?)?;
+    // Codex's own diagnostics go to a private 0600 log so failures stay explainable.
+    let log = {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let dir = home.path.join("log");
+        if !dir.exists() {
+            std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        }
+        std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("codex-app-server.log"))?
+    };
     let mut command = isolated_command(Path::new("/usr/bin/sandbox-exec"), home);
     command
         .args(app_server_argv(&profile, &binary))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(log);
     let mut child = command.spawn()?;
     let group = Arc::new(ProcessGroup::new(child.id()));
     let kill_group = group.clone();

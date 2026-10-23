@@ -211,8 +211,26 @@ impl CodexAppServer {
             )
             .await?;
         self.transport()?.notify("initialized")?;
+        self.verify_no_skills().await?;
         self.initialized.store(true, Ordering::SeqCst);
         self.read_account().await?;
+        Ok(())
+    }
+
+    /// Fail closed unless every skill Codex can see is disabled: skills inject
+    /// instructions and tool guidance the chart agent must not receive.
+    async fn verify_no_skills(&self) -> Result<()> {
+        let result = self.transport()?.request("skills/list", json!({"cwds": [], "forceReload": true})).await?;
+        let entries = result["data"].as_array().context("skills/list returned no data")?;
+        let enabled: Vec<_> = entries
+            .iter()
+            .flat_map(|entry| entry["skills"].as_array().into_iter().flatten())
+            .filter(|skill| skill["enabled"].as_bool() != Some(false))
+            .map(|skill| skill["name"].as_str().unwrap_or("<unnamed>").to_owned())
+            .collect();
+        if !enabled.is_empty() {
+            bail!("Codex skills are enabled: {}", enabled.join(", "));
+        }
         Ok(())
     }
 
@@ -529,6 +547,10 @@ mod tests {
             assert_eq!(init["params"]["capabilities"]["experimentalApi"], true);
             send(&mut write, json!({"id":init["id"],"result":{}})).await;
             assert_eq!(receive(&mut read).await["method"], "initialized");
+            let skills = receive(&mut read).await;
+            assert_eq!(skills["method"], "skills/list");
+            let disabled = json!({"data":[{"skills":[{"name":"imagegen","enabled":false}]}]});
+            send(&mut write, json!({"id":skills["id"],"result":disabled})).await;
             let account = receive(&mut read).await;
             assert_eq!(account["method"], "account/read");
             send(&mut write, json!({"id":account["id"],"result":{"account":{"type":"apiKey"}}})).await;
@@ -537,6 +559,28 @@ mod tests {
         result.unwrap();
         assert_eq!(client.account_state(), AccountState::Unsupported);
         assert!(client.list_models().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn any_enabled_skill_fails_initialization_closed() {
+        let (transport, mut read, mut write, _) = fake(no_tools());
+        let client = CodexAppServer::new(transport);
+        let server = async {
+            let init = receive(&mut read).await;
+            send(&mut write, json!({"id":init["id"],"result":{}})).await;
+            assert_eq!(receive(&mut read).await["method"], "initialized");
+            let skills = receive(&mut read).await;
+            let listed = json!({"data":[{"skills":[
+                {"name":"imagegen","enabled":false},
+                {"name":"gmail","enabled":true},
+                {"name":"unknown"}
+            ]}]});
+            send(&mut write, json!({"id":skills["id"],"result":listed})).await;
+        };
+        let (result, ()) = tokio::join!(client.initialize(), server);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("gmail") && error.contains("unknown") && !error.contains("imagegen"), "{error}");
+        assert!(!client.initialized.load(Ordering::SeqCst));
     }
 
     fn ready(transport: Transport) -> CodexAppServer {

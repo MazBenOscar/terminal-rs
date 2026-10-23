@@ -321,6 +321,8 @@ async fn thread_start_pins_approval_policy_and_user_reviewer() {
         let init = receive(&mut read).await;
         send(&mut write, json!({"id":init["id"],"result":{}})).await;
         receive(&mut read).await; // initialized
+        let skills = receive(&mut read).await;
+        send(&mut write, json!({"id":skills["id"],"result":{"data":[]}})).await;
         let account = receive(&mut read).await;
         send(&mut write, json!({"id":account["id"],"result":{"account":{"type":"chatgpt"}}})).await;
         let start = receive(&mut read).await;

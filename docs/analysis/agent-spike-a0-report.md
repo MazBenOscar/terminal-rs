@@ -404,3 +404,43 @@ text/image calls, failed/unexpected completion, or interrupt latency >= 1 second
 makes the spike exit nonzero. Canary PASS is printed only after its completed turn
 without an observed violation. A canary is not a tool-inventory API or a substitute
 for validating all three isolation layers.
+
+## Live preflight without login (2026-10-23, codex-cli 0.163.0, macOS arm64)
+
+Run by the manager against a fresh private home under
+`~/Library/Application Support/terminal-rs-agent-spike`; no account, no network turn.
+Result: sandboxed version and feature probes, initialize, skills check and account
+read all pass; the client stops at "ChatGPT login required" as designed. Changes
+made from what the live run showed:
+
+- **Sandbox profile.** Codex needs to read the root directory entry (`literal "/"`),
+  the metadata of each ancestor of the private home (to canonicalize `CODEX_HOME`),
+  `/etc/codex/requirements.toml` and `managed_config.toml` (admin policy; absent on
+  this machine), and managed preferences (`user-preference-read`, `cfprefsd`
+  mach services and `apple.cfprefs.*` shared memory), plus `opendirectoryd.libinfo`
+  (user lookup) and `notification_center`. The install-directory subpath grant was
+  removed: only the `codex` binary itself is readable (the directory also holds
+  `codex-code-mode-host`). `diagnosticd` and `logd` stay denied.
+- **Features.** Retired features (`removed` stage) always report enabled and are
+  ignored by the check. `unified_exec` cannot be disabled by `--disable` or
+  `-c features.unified_exec=false` in 0.163.0; it is the only named exception
+  (`UNDISABLEABLE_FEATURES`), mitigated by the disabled shell tool, the exec-only-codex
+  sandbox and the tripwire, and re-proved by the canary turn. `codex features` rejects
+  `--strict-config`, so that probe omits it.
+- **Remote control.** Codex sends `remoteControl/status/changed` at startup. It is
+  accepted only with status `disabled`; any other status trips.
+- **Skills.** Codex installs five bundled system skills into `skills/.system` on
+  every start and, with the real `HOME`, discovers every user-scope skill in the
+  user's home (about 90 on this machine, including mail and computer-use skills).
+  Fixes: the child gets a private, empty `HOME` (`<private home>/home`), the config
+  disables each bundled skill with `[[skills.config]]`, the home validator accepts
+  only a link-free `skills/.system` tree, and `initialize` calls `skills/list` and
+  fails closed if any skill is enabled. `skip_host_skill_discovery` had no effect.
+- **Home entries.** Codex also creates `installation_id`, `goals_1`, `memories_1`
+  and `queue_1` SQLite files (memories and goals stay disabled) and `tmp/arg0-macos`
+  links back to its own binary; these exact shapes are accepted.
+- **Diagnostics.** App-server stderr goes to `log/codex-app-server.log` (0600) and
+  failed probes report a scrubbed stderr excerpt.
+
+Still to verify at login: Keychain storage with the private `HOME`, the login
+callback port, DNS and TLS under the 443-only policy.

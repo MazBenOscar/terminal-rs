@@ -552,6 +552,15 @@ fn route(value: Value, shared: &Arc<Shared>, handler: &ToolHandler, slots: &Arc<
         });
         return true;
     }
+    // Codex announces remote control at startup; only the disabled state is acceptable,
+    // since an enabled or paired state lets a remote client drive this app-server.
+    if method == "remoteControl/status/changed" {
+        if params["status"].as_str() != Some("disabled") {
+            shared.violation(&params, "remote control is not disabled".to_owned());
+            return false;
+        }
+        return true;
+    }
     if !ALLOWED_NOTIFICATIONS.contains(&method) {
         if let Some(id) = value.get("id") {
             shared.security_reply(json!({"id":id,"error":{"code":-32601,"message":"Unsupported notification"}}));
