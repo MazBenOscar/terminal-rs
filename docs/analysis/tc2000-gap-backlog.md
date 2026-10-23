@@ -149,7 +149,7 @@ tests ignored.
 | T07 | External data/validation | Live Alpaca entitlements, broader stock streaming, earnings and full exchange calendars | Needs accounts and data |
 | T09 | External data | Actual volume at price from trade data | Needs a data source |
 | F01 | Follow-up | Details card and chart tab show raw crypto keys (`COINBASE:BTC-USD`) instead of `BTC/USD` | Small |
-| F02 | Follow-up | Scanner, portfolio and Congress menus add only to the active watchlist; chart and watchlist menus already offer every list | Small |
+| F02 | Follow-up | Done on `codex/f02-watchlist-menus`: scanner, portfolio (holdings, positions, orders and activity), Congress trade/profile, chart and watchlist row menus share named-list and section destinations; UI-independent named-list add is available for A5 | Done |
 | F03 | Follow-up | Watchlist Last/Change/% columns overlap in very narrow panes | Small |
 | F04 | Validation | Real LaunchAgent install for app-closed alerts was not exercised; needs the user's approval | Needs approval |
 | F05 | Cleanup | `#[path = "drawing_toolbar.rs"]` module path, merged local branches and worktrees | Housekeeping |

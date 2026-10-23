@@ -62,17 +62,8 @@ impl TerminalApp {
                 .filter(|a| a.symbol == c.symbol && a.simulated == self.price_alerts.simulated)
                 .cloned()
                 .collect();
-            let key = tr_data::security(&c.symbol).key();
-            c.watchlists = self
-                .watchlists
-                .iter()
-                .enumerate()
-                .map(|(index, list)| crate::chart_view::WatchlistTarget {
-                    name: list.name.clone(),
-                    active: index == self.active_watchlist,
-                    contains: list.symbols.contains(&key),
-                })
-                .collect();
+            c.watchlists =
+                crate::chart_view::WatchlistTarget::for_symbol(&self.watchlists, self.active_watchlist, &c.symbol);
             c.hover_enabled = !dragging;
             let clicked = c.show(ui, rect, focused, &self.worker);
             actions.append(&mut c.actions);
@@ -88,21 +79,24 @@ impl TerminalApp {
             return (actions, clicked);
         }
         let freshness = self.congress_freshness();
+        let watchlists = crate::chart_view::WatchlistMenus { lists: &self.watchlists, active: self.active_watchlist };
         let inner = rect.shrink2(vec2(dp(8.0), dp(4.0)));
         let mut child = ui.new_child(UiBuilder::new().max_rect(inner).id_salt(("pane", id)));
         child.set_clip_rect(inner.intersect(ui.clip_rect()));
         let ui = &mut child;
         match &mut self.panes[i].kind {
-            PaneKind::Feed { filter } => actions.extend(congress_view::feed(ui, &self.latest, filter, &freshness)),
+            PaneKind::Feed { filter } => {
+                actions.extend(congress_view::feed(ui, &self.latest, filter, &freshness, watchlists))
+            }
             PaneKind::Ticker { symbol, trades, loading } => {
                 if *loading {
                     ui.label(RichText::new("Loading…").color(muted()));
                 } else {
-                    actions.extend(congress_view::ticker_trades(ui, symbol, trades));
+                    actions.extend(congress_view::ticker_trades(ui, symbol, trades, watchlists));
                 }
             }
             PaneKind::Profile { query, data, loading } => {
-                actions.extend(congress_view::profile(ui, query, data.as_deref(), *loading))
+                actions.extend(congress_view::profile(ui, query, data.as_deref(), *loading, watchlists))
             }
             PaneKind::Politicians => {
                 actions.extend(congress_view::politicians(ui, &self.politicians, &mut self.pol_search))
@@ -178,13 +172,13 @@ impl TerminalApp {
                     &self.watchlist,
                     bulk_ready,
                     |request| self.worker.send(request),
-                    &self.watchlists[self.active_watchlist].name,
+                    watchlists,
                 ));
             }
             PaneKind::Portfolio(pp) => {
                 let demo =
                     (self.prefs.trading.account_mode == crate::prefs::AccountMode::Demo).then_some(&*self.demo.pf);
-                for a in super::portfolio_view::portfolio(ui, pp, &self.broker, demo, &self.quotes) {
+                for a in super::portfolio_view::portfolio(ui, pp, &self.broker, demo, &self.quotes, watchlists) {
                     use super::portfolio_view::PortAction as P;
                     match a {
                         P::Core(a) => actions.push(a),
@@ -843,21 +837,8 @@ impl TerminalApp {
     }
 
     fn watchlist_destination_menu(&self, ui: &mut Ui, symbol: &str) -> Vec<Action> {
-        let mut out = Vec::new();
-        for (i, list) in self.watchlists.iter().enumerate() {
-            let contains = list.symbols.iter().any(|s| s == symbol);
-            let label = format!(
-                "{}{}{}",
-                if contains { "✓ " } else { "" },
-                list.name,
-                if i == self.active_watchlist { " (active)" } else { "" }
-            );
-            if ui.add_enabled(!contains, egui::Button::new(label)).clicked() {
-                out.push(Action::AddToNamedWatchlist { list: list.name.clone(), symbol: symbol.into() });
-                ui.close();
-            }
-        }
-        out
+        let targets = crate::chart_view::WatchlistTarget::for_symbol(&self.watchlists, self.active_watchlist, symbol);
+        crate::chart_view::watchlist_destinations(ui, symbol, &targets)
     }
 
     fn watch_details_card(&self, ui: &mut Ui) {
