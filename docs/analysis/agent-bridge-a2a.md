@@ -741,3 +741,27 @@ directories, not required build inputs. Successful tests clean up their own new
 fixtures; the old directories were left untouched for manager cleanup. The build
 uses the workspace-root `target/`. No real Codex binary, real credential/home, or
 live service was used. Existing manager validator fixes and reviewer tests remain.
+
+## In-app acceptance (2026-10-23, release build of `feature/agentic-charts`, user-driven)
+
+Run by the user in the real app (live data, Coinbase BTC/USD) with `gpt-6.1-sol`:
+
+| Check | Result |
+|---|---|
+| Sign in with ChatGPT from the pane | pass |
+| Read-only "What's the trend?" on a weekly chart | pass: cites real weekly bars, flags the forming bar |
+| Edit mode: support line, trend line and RSI 14 | pass: objects drawn and badged |
+| Undo last agent turn | pass: all three removed |
+| Interrupt with Esc mid-reply | pass: stops at once, reply marked provisional |
+| Chat focus vs chart hotkeys; palette Esc | pass |
+| Edits on a 4h chart after a manual switch | pass: levels from 4h bars |
+
+Bugs found and fixed during the session: the queue was paused while signed out, so
+the first prompt after sign-in never sent; turns without a pin carried an empty
+chart, so `read_chart` returned "chart not found" (sending now pins the last
+focused chart).
+
+Gap found: `set_view` only allows the loaded symbol and an equal or coarser
+timeframe, so the agent asked the user to switch weekly to 4h manually. Follow-up:
+let `set_view` switch to finer timeframes (and load their data) under the same
+undo and provenance rules.
