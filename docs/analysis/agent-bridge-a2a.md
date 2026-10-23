@@ -276,7 +276,166 @@ prompts that cannot be answered without chart data (and the first-turn self-test
 Review scrubbed transcripts locally before sharing; never copy raw login/account
 files or enable tools/features to work around a failure.
 
-## Verification
+## A2b agent pane
+
+`NEW AGENT`, the + menu's Agent entry, and `AGENT` open the pane. There is one
+background-owned session and one in-memory conversation per app. The **first Agent
+pane** owns the UI; additional panes say "Agent already open" rather than starting
+another child. Closing that pane makes the next Agent pane the owner, without
+replaying anything. Closing every pane retains the conversation/session until app
+exit. App exit closes the control channel and joins the owner after bridge cleanup.
+
+### State machine and actions
+
+The first open shows the privacy disclosure with **Continue**. A small Privacy
+info button reopens it later; disclosure acknowledgement is not exported/persisted.
+After acknowledgement each onboarding state has one primary action:
+
+| State | Primary action | Transition |
+|---|---|---|
+| Dormant | Start agent | Checking, on explicit request only |
+| Checking | Checking… (disabled) | Missing / Unsupported / SignedOut / RateLimited / Ready / Stopped |
+| Missing | Check again | Checking; installation instructions are plain text, never an executed command |
+| Unsupported | Check again | Checking; found version and tested `codex-cli 0.163.0` are shown |
+| SignedOut (including non-ChatGPT account) | Sign in with ChatGPT | SigningIn |
+| SigningIn | Cancel | SignedOut; successful completion continues readiness checks |
+| Ready | Send | One active turn; later prompts join the FIFO queue |
+| RateLimited | Check limits | Read limits again; Ready if quota permits |
+| ToolsUnavailable | Retry | Explicitly retry the last prompt; no silent replay |
+| Stopped / unsafe | Close agent | Close the pane, retaining the failure/safety state |
+
+SigningIn also offers the secondary **Open sign-in page again** action. Only the
+URL returned by `account/login/start` goes through the existing app opener. It is
+never drawn, logged or serialized. Login start/wait/cancel, account reads, model
+listing, launches and bridge RPCs run on the owner thread. Login uses the existing
+login-only sandbox, then waits for the supervisor's cleanup before starting the
+normal bridge. Scrubbed login failures are inline notices. A stopped/unsafe bridge
+has no API to reset its sticky safety state: consequently this pane deliberately
+**does not offer Restart agent**. Restart the app after resolving the cause; the
+pane never constructs a replacement to evade a bridge refusal.
+
+Recovery and history loss are inline notices. The active prompt is not resent,
+and remaining queued prompts are paused. Resume queue or Retry last prompt is an
+explicit user decision. Interrupt also pauses the remaining queue. Queue capacity
+is 32 prompts; Clear queue drops waiting prompts, not the active turn. Ordinary
+input uses `requires_tools = false`, even if its natural language mentions tools.
+The three suggested data questions use `true`. There is no separate bridge
+self-test API and no extra hidden/subscription-consuming turn is invented.
+
+### Persistence, rendering and integration boundaries
+
+`PaneSettings::Agent` contains only **model id, effort, tools mode, and a valid
+pinned chart uid**. No conversation, queued prompts, login URL/id, account payload,
+token, auth file or transcript enters layouts. Invalid/closed pins clear, and
+layout replacement cannot attach an old uid to a replacement chart. Pin active
+chart uses the last focused chart (otherwise the existing chart-selection rule).
+Labels use `security_names::label`, including crypto's BASE/QUOTE and venue.
+
+Models come from `model/list`, with `isDefault` first and per-model supported
+efforts; `ultra` remains excluded and `max`/costly efforts carry a usage/latency
+warning. The backend picker currently contains Codex only. `Settings::tool_set`
+and `AgentPane::tool_set` are the A3 hooks. They are a TODO-free ReadOnly no-op
+while `EDIT_EXECUTION_AVAILABLE` is false. The persisted Can edit charts option is
+disabled with an explanatory tooltip, and the executor still starts a ReadOnly
+registry. A3 must integrate its execution/registry/thread-switch hook before
+setting availability true; simply changing the UI constant is not integration.
+No drawing, indicator, set_view, or undo-agent-turn internals are implemented here.
+Screenshots remain refused by the existing executor: this build has no capture
+consent flow, sends `screenshot_consent = false`, and never claims to send images.
+
+The tiny markdown parser renders paragraphs, star-delimited bold/italic, inline
+code, fenced blocks, headings, bullet/numbered lists, and pipe tables as monospace
+grids. Links are visible text only; they do not open automatically or execute HTML.
+Tool rows contain name, success/failure, duration and collapsible scrubbed arguments;
+image content is removed before UI marshalling and image arguments are omitted.
+The rate-limit projection contains only percent, window duration and reset time,
+never credit balances, plan names or account identifiers.
+
+`App::logic` drains the session inbox as well as the existing A1a live-tool queue.
+Only rendered events wake the pane; reasoning/advisory/unused wire events do not.
+Text deltas are merged in the inbox and markdown updates use a 33 ms dirty-only
+coalescer, with no idle timer. Hidden tabs/minimized windows do not request stream
+repaints. As a conservative macOS hide policy, streaming repaint requests also stop
+when **all native viewports are unfocused**; focusing the app shows accumulated
+text. This avoids a timer on macOS application hide, not just minimization. Tool
+queue wakeups/deadlines remain the unchanged A1a mechanism. No polling loop was
+added. Enter sends, Shift+Enter inserts a newline, and Esc interrupts; while the
+input owns focus, chart keys and even the global command-palette shortcut are
+blocked before dispatch.
+
+The only backend changes are additive metadata (`Model.is_default`, scrubbed found
+version on `WrongVersion`) and public access to the existing cleanup wait. Version,
+isolation, skill inventory, tripwire, readiness, budgets, scrubbers, and the sealed
+Connector have not been relaxed. The pane's offline fixture test uses the same
+in-memory duplex transport/Codex client path as the existing fake app-server tests;
+it replays the committed A0 first turn into a deterministic tool/reply block list.
+It does not add an unchecked Connector or launch a real binary.
+
+### Exact live checks for the manager (not run by A2b)
+
+Run the sample app from this worktree, with the tested Codex CLI on the app's PATH.
+Use a dedicated manager data root so existing layouts/sign-in are not changed:
+
+```sh
+TR_DATA_DIR="$PWD/target/a2b-manager" TR_PROVIDER=sample cargo run --offline -p terminal-rs
+```
+
+1. Run `NEW CHART`, then `NEW AGENT`. Read the disclosure, Continue, Start agent.
+   With Codex absent expect Missing / Check again; with an unsupported version
+   expect the actual found version versus `0.163.0`, with no normal agent turn.
+   Do not enable tools/features or bypass the sandbox to make this pass.
+2. On a fresh **app-owned** private home, verify SignedOut has one Sign in with
+   ChatGPT action. Sign in, Cancel once, then sign in again. Verify reopening uses
+   the same current login URL, login progress remains responsive, and a failed/
+   stale login supplies only a scrubbed inline reason. Do not inspect/copy auth
+   files or use the user's normal Codex home.
+3. Pin the active sample chart. Click What's the trend? Verify read_chart/read_data
+   trace rows cite loaded sample bars and prices. Expand arguments: no image bytes,
+   account data or secrets. Type `Hello` as ordinary chat: a no-tool reply must not
+   become ToolsUnavailable. Check the quota meter shows percentages/reset times,
+   no plan or credits balance. Not investment advice remains visible.
+4. Ask for a long answer. While text streams, queue two labelled prompts; verify
+   queue count, order, Clear queue, and interrupt using Esc after the first delta.
+   Verify the interrupted reply is provisional and queued prompts pause. Explicitly
+   Retry last prompt; never silently retry on failure/recovery.
+5. Switch model and effort. Verify that model's default/supported efforts, costly
+   warning, default-first model ordering and Codex-only backend picker. Can edit
+   charts must remain disabled; screenshots must refuse, not acquire consent from
+   prompt text. No edit or undo execution is expected from this branch.
+6. Focus the input and type chart hotkeys and the command-palette chord: chart,
+   command bar and palette must not act. Check Enter versus Shift+Enter. Open
+   another Agent pane: it must show the already-open explanation and no new child.
+7. Close the pinned chart: pin clears. Save/export/reload the layout: only the four
+   choices above survive; no conversation or sign-in information is exported.
+8. During a long reply, kill **only this app's** sandboxed app-server in Activity
+   Monitor. Verify Recovered or history-lost notice, no resend, and paused queue.
+   A subsequent explicitly requested data question must still satisfy tool proof.
+   For a safety failure, verify Close agent only, never an in-pane safety reset.
+9. Observe Activity Monitor / existing performance readout while streaming, idle,
+   on a hidden Agent tab, minimized, and with the app hidden. Expect roughly 30 Hz
+   text updates only while foreground-visible, no agent timer while idle/hidden,
+   and accumulated text on return. Close the app and verify its child is reaped.
+
+These are manager-only live acceptance checks; no login, real Codex execution,
+real agent home access, network test, or CPU/latency measurement was performed by
+this implementation worker.
+
+### A2b verification
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | PASS; test counts N/A |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS, zero warnings; test counts N/A |
+| `cargo test --workspace` | PASS: **1,239 passed, 0 failed, 7 pre-existing ignored**, including the sealed-Connector compile-fail doctest |
+
+The focused `cargo test -p terminal-rs agent_` run passed 33 tests, with 0 failed
+and 0 ignored. A2b adds 16 offline tests covering markdown, state transitions,
+settings, pickers, rate-limit/privacy projection, queue/recovery, dirty timers,
+keyboard/focus guards, login cancel/reopen/failure and committed A0 fixture replay.
+The seven existing ignored tests require public-provider network availability;
+none was enabled. No dependency was added and no live acceptance check was run.
+
+## A2a verification (historical)
 
 All commands use offline dependency resolution; no real Codex process, credentials
 or network turn is used in tests.

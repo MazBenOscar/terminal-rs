@@ -126,6 +126,7 @@ pub enum PaneSettings {
         group: f64,
     },
     Settings,
+    Agent(crate::agent_pane::Settings),
     /// Option chain monitor.
     Options {
         symbol: String,
@@ -345,6 +346,11 @@ impl LayoutDoc {
             }
             if let PaneSettings::Scanner(settings) = &mut pane.settings {
                 settings.crypto_filter.sanitize();
+            }
+        }
+        for pane in &mut self.panes {
+            if let PaneSettings::Agent(settings) = &mut pane.settings {
+                settings.pinned_chart = settings.pinned_chart.filter(|uid| chart_ids.contains(uid));
             }
         }
         if self.watchlists.is_none() {

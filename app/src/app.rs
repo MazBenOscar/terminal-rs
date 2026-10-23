@@ -6,6 +6,7 @@
 
 #[path = "agent_bridge.rs"]
 pub mod agent_bridge;
+mod agent_ui;
 mod broker;
 mod chrome;
 mod columns_view;
@@ -120,6 +121,7 @@ pub enum PaneKind {
     /// Brokerage accounts through SnapTrade (`PORT`, `ACCT`, `POS`, `ORD`, `ACTV`).
     Portfolio(Box<broker::PortfolioPane>),
     Settings,
+    Agent(crate::agent_pane::Settings),
 }
 
 pub struct OptionsPane {
@@ -236,6 +238,7 @@ impl PaneKind {
             PaneKind::Options(o) => format!("{} Options", short(&o.symbol)),
             PaneKind::Portfolio(p) => p.title(),
             PaneKind::Settings => "Settings".into(),
+            PaneKind::Agent(_) => "Agent".into(),
         }
     }
 
@@ -257,6 +260,7 @@ impl PaneKind {
             PaneKind::Options(_) => "OMON",
             PaneKind::Portfolio(p) => p.view.code(),
             PaneKind::Settings => "PDF",
+            PaneKind::Agent(_) => "AGENT",
         }
     }
 
@@ -329,6 +333,7 @@ impl PaneKind {
                 PaneSettings::OrderBook { symbol: b.symbol.clone(), depth: b.depth, group: b.group }
             }
             PaneKind::Settings => PaneSettings::Settings,
+            PaneKind::Agent(settings) => PaneSettings::Agent(settings.clone()),
             PaneKind::Options(o) => {
                 PaneSettings::Options { symbol: o.symbol.clone(), strikes: o.strikes, greeks: o.show_greeks }
             }
@@ -409,6 +414,7 @@ impl PaneKind {
             PaneSettings::Options { symbol, strikes, greeks } => {
                 PaneKind::Options(Box::new(OptionsPane::new(&symbol, strikes, greeks)))
             }
+            PaneSettings::Agent(settings) => PaneKind::Agent(settings),
             PaneSettings::Portfolio { view, account, symbol, sort, open_only } => {
                 PaneKind::Portfolio(Box::new(broker::PortfolioPane { view, account, symbol, sort, open_only }))
             }
@@ -720,6 +726,7 @@ pub struct TerminalApp {
     drawing_ids: crate::drawing_history::SharedDrawingIds,
     pub agent_queue: crate::agent_queue::AgentToolQueue,
     pub pinned_agent_chart: Option<u64>,
+    pub(crate) agent_pane: crate::agent_pane::AgentPane,
     pub edit_log: crate::edit_log::EditLog,
     agent_job_chart: Option<u64>,
     worker: Worker,
@@ -959,6 +966,7 @@ impl TerminalApp {
             drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(ctx.clone()),
             pinned_agent_chart: None,
+            agent_pane: crate::agent_pane::AgentPane::default(),
             edit_log: Default::default(),
             agent_job_chart: None,
             broker,
@@ -1685,6 +1693,7 @@ impl TerminalApp {
                 }
             }
             Function::Help => self.open_panel(PaneKind::Help),
+            Function::Agent => self.open_panel(PaneKind::Agent(crate::agent_pane::Settings::default())),
             Function::Wei => {
                 self.last_wei = None;
                 self.open_panel(PaneKind::Wei);
@@ -2208,6 +2217,9 @@ impl TerminalApp {
     /// Global and chart hotkeys. Runs before the command line so it can claim keys; when
     /// the command line holds text, keys belong to it.
     fn hotkeys(&mut self, ctx: &egui::Context) {
+        if self.agent_escape(ctx) || (!self.palette.open && self.agent_captures_focus(ctx)) {
+            return;
+        }
         let presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
             i.events
                 .iter()
@@ -2646,7 +2658,8 @@ fn native_chrome(_frame: &eframe::Frame) -> Option<tr_macos::Chrome> {
 }
 
 impl eframe::App for TerminalApp {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.agent_logic(ctx);
         self.process_logic();
     }
 
@@ -2823,6 +2836,9 @@ impl eframe::App for TerminalApp {
     }
 
     fn on_exit(&mut self) {
+        // Drop signals shutdown and waits at most 1.5 s; any remaining cleanup
+        // stays with the detached owner instead of blocking the UI's exit/save.
+        self.agent_pane.session = None;
         self.exit_save();
         self.price_alerts.save();
         if self.demo.save_error.is_some() {
@@ -2839,6 +2855,7 @@ impl TerminalApp {
             drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(egui::Context::default()),
             pinned_agent_chart: None,
+            agent_pane: crate::agent_pane::AgentPane::default(),
             edit_log: Default::default(),
             agent_job_chart: None,
             broker: broker::BrokerState::with_store(

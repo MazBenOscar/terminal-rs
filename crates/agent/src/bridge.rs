@@ -384,6 +384,16 @@ pub fn png_url(bytes: &[u8]) -> String {
     result
 }
 
+/// Typed safety finding for app owners; ordinary RPC/recovery failures are not taint.
+#[derive(Debug)]
+pub struct UnsafeBackend;
+impl std::fmt::Display for UnsafeBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("bridge reports unsafe backend")
+    }
+}
+impl std::error::Error for UnsafeBackend {}
+
 pub struct AgentBridge {
     connector: Arc<dyn Connector>,
     client: Arc<CodexAppServer>,
@@ -416,11 +426,32 @@ impl AgentBridge {
         let safety = Arc::new(AtomicBool::new(false));
         let client = Arc::new(connector.connect(dispatch.handler()).await?);
         client.bind_bridge_safety(safety.clone())?;
-        client.initialize().await?;
-        require_ready(&client).await?;
-        let events = client.wire_events()?;
-        let thread = client.start_thread(thread_options(&options, &dispatch.registry)).await?;
-        connector.remember_thread(&thread)?;
+        let startup = async {
+            client.initialize().await?;
+            require_ready(&client).await?;
+            let events = client.wire_events()?;
+            let thread = client.start_thread(thread_options(&options, &dispatch.registry)).await?;
+            connector.remember_thread(&thread)?;
+            Ok::<_, anyhow::Error>((events, thread))
+        }
+        .await;
+        let (events, thread) = match startup {
+            Ok(startup) => startup,
+            Err(error) => {
+                client.shutdown();
+                let cleanup = tokio::time::timeout(CLEANUP_TIMEOUT, client.wait_cleanup()).await;
+                let error = match cleanup {
+                    Ok(Err(cleanup)) => cleanup,
+                    Err(_) => anyhow::anyhow!("agent startup cleanup timed out"),
+                    Ok(Ok(())) => error,
+                };
+                return Err(if safety.load(Ordering::SeqCst) || client.is_unsafe() {
+                    error.context(UnsafeBackend)
+                } else {
+                    error
+                });
+            }
+        };
         *dispatch.thread.lock().unwrap() = Some(thread.clone());
         Ok(Self {
             connector,
@@ -443,8 +474,12 @@ impl AgentBridge {
         &self.thread
     }
 
+    pub fn is_unsafe(&self) -> bool {
+        self.safety.load(Ordering::SeqCst) || self.client.is_unsafe()
+    }
+
     fn check_safe(&self) -> Result<()> {
-        if self.safety.load(Ordering::SeqCst) || self.client.is_unsafe() {
+        if self.is_unsafe() {
             self.safety.store(true, Ordering::SeqCst);
             self.cancel_turn();
             bail!("bridge unsafe; restart the app/agent");
@@ -1389,6 +1424,25 @@ mod tests {
             })
         }
     }
+    #[tokio::test]
+    async fn startup_errors_expose_taint_without_marking_rpc_failures_unsafe() {
+        for (behaviour, unsafe_backend) in
+            [(Behaviour::RejectInitialize, false), (Behaviour::TripwireOnInitialize, true)]
+        {
+            let connector = Scripted::new(vec![behaviour]);
+            let error = AgentBridge::start(
+                connector,
+                executor(),
+                Registry::new(ToolSet::ReadOnly),
+                BridgeOptions::new("empty".into()),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.is::<UnsafeBackend>(), unsafe_backend, "{error:#}");
+        }
+    }
+
     async fn scripted_bridge(connector: Arc<Scripted>) -> AgentBridge {
         let mut options = BridgeOptions::new("empty".into());
         options.executor_timeout = Duration::from_millis(500);
