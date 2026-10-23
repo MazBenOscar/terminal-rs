@@ -547,6 +547,7 @@ pub enum Response {
     },
     Status(String),
     CongressRefreshed(String),
+    CongressPaused(String),
     Curves(Box<YieldCurves>),
     SymbolCatalog {
         venue: tr_core::crypto::CryptoVenue,
@@ -924,7 +925,7 @@ impl Worker {
             if let Ok(paused) = refresh::paused_sources(&*s.db.lock().await)
                 && !paused.is_empty()
             {
-                s.send(Response::CongressRefreshed(paused.join(" · ")));
+                s.send(Response::CongressPaused(paused.join(" · ")));
             }
             let minutes = congress_refresh_minutes();
             if minutes == 0 {
@@ -932,6 +933,7 @@ impl Worker {
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
             let mut tick = tokio::time::interval(Duration::from_secs(minutes * 60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 congress_refresh(&s).await;
@@ -950,7 +952,9 @@ async fn congress_refresh(s: &Shared) {
         return s.send(Response::Status("Congress refresh disabled".into()));
     }
     // A single reusable source serialises manual and scheduled runs and preserves pacing.
-    let Ok(mut guard) = s.congress_source.try_lock() else { return };
+    let Ok(mut guard) = s.congress_source.try_lock() else {
+        return s.send(Response::Status("Congress refresh already running".into()));
+    };
     if guard.is_none() {
         match HttpSource::new() {
             Ok(src) => *guard = Some(src),

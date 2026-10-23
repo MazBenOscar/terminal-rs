@@ -71,7 +71,9 @@ impl fmt::Display for SiteRefused {
 impl std::error::Error for SiteRefused {}
 
 fn pause_text(site: Site, until: i64) -> String {
-    let local = chrono::DateTime::from_timestamp(until, 0).unwrap_or_default().with_timezone(&chrono::Local);
+    let now = Utc::now();
+    let bounded = until.clamp(now.timestamp(), now.timestamp() + 7 * 86400);
+    let local = chrono::DateTime::from_timestamp(bounded, 0).unwrap_or(now).with_timezone(&chrono::Local);
     format!("{} source paused until {}: site refused requests", site.label(), local.format("%Y-%m-%d %H:%M %Z"))
 }
 
@@ -89,7 +91,8 @@ pub fn paused_sources(db: &Db) -> Result<Vec<String>> {
 
 /// Shared by the scheduler and the app's freshness display. An explicit zero disables.
 pub fn refresh_minutes(provider: Option<&str>, configured: Option<&str>) -> u64 {
-    configured.and_then(|v| v.parse().ok()).unwrap_or(if provider == Some("sample") { 0 } else { 30 })
+    let sample = provider.map(str::trim).filter(|v| !v.is_empty()).is_some_and(|v| v.eq_ignore_ascii_case("sample"));
+    configured.and_then(|v| v.parse().ok()).unwrap_or(if sample { 0 } else { 30 })
 }
 
 /// Where filings come from. [`HttpSource`] talks to the official sites; tests
@@ -170,21 +173,72 @@ pub struct RefreshReport {
     pub alerts: Vec<NewTradeAlert>,
     pub paused: Vec<String>,
     pub capped: bool,
+    pub parse_errors: Vec<String>,
+    pub notes: Vec<String>,
+    /// House and Senate filing/trade counts, including work before a refusal.
+    pub chamber_counts: [(usize, usize); 2],
 }
 
 impl RefreshReport {
     pub fn summary(&self) -> String {
         if !self.paused.is_empty() {
-            return self.paused.join(" · ");
+            let mut parts: Vec<String> = ["House", "Senate"]
+                .iter()
+                .enumerate()
+                .filter(|(i, label)| {
+                    self.chamber_counts[*i] != (0, 0)
+                        || !self.paused.iter().any(|p| p.starts_with(&format!("{label} source")))
+                })
+                .map(|(i, label)| {
+                    format!("{label}: {} new filings, {} trades", self.chamber_counts[i].0, self.chamber_counts[i].1)
+                })
+                .collect();
+            parts.extend(self.paused.clone());
+            if !self.parse_errors.is_empty() {
+                parts.push(format!("{} parse errors", self.parse_errors.len()));
+            }
+            parts.extend(self.notes.clone());
+            return parts.join(" · ");
         }
-        format!(
+        let counts = format!(
             "{} new filings, {} trades, {} scanned/paper, {} errors, {} alerts",
             self.new_filings,
             self.new_trades,
             self.scanned,
-            self.errors.len(),
+            self.errors.len() + self.parse_errors.len(),
             self.alerts.len()
-        )
+        );
+        std::iter::once(counts).chain(self.notes.clone()).collect::<Vec<_>>().join(" · ")
+    }
+}
+
+fn is_transport(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| {
+        e.downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_timeout() || e.is_connect() || e.is_request() || e.is_body())
+    }) || ["connection reset", "connection closed", "connection refused", "timeout", "timed out", "connect error"]
+        .iter()
+        .any(|s| format!("{error:#}").to_ascii_lowercase().contains(s))
+}
+
+#[derive(Default)]
+struct TransportFailures([u8; 3]);
+
+impl TransportFailures {
+    fn observe<T>(&mut self, site: Site, result: Result<T>, report: &mut RefreshReport) -> Result<T> {
+        let count = &mut self.0[site as usize];
+        if let Err(e) = &result
+            && is_transport(e)
+        {
+            *count += 1;
+            if *count >= 3 {
+                report.errors.push(format!("{}: {e:#}", site.label()));
+                return Err(SiteRefused { site, retry_after: None }.into());
+            }
+            return result;
+        }
+        *count = 0;
+        result
     }
 }
 
@@ -202,6 +256,7 @@ pub async fn refresh<S: Source>(src: &S, db: &Mutex<Db>, cfg: &RefreshConfig) ->
     db.lock().await.migrate_refresh_dates()?;
     let today = Utc::now().date_naive();
     let mut report = RefreshReport::default();
+    let mut failures = TransportFailures::default();
     let mut incomplete_rosters = Vec::new();
     let mut blocked = Vec::new();
     for site in Site::ALL {
@@ -219,7 +274,7 @@ pub async fn refresh<S: Source>(src: &S, db: &Mutex<Db>, cfg: &RefreshConfig) ->
             incomplete_rosters.push(site);
             continue;
         }
-        match src.roster_for(site).await {
+        match failures.observe(site, src.roster_for(site).await, &mut report) {
             Ok(r) => {
                 house.extend(r.house);
                 senate.extend(r.senate);
@@ -257,8 +312,8 @@ pub async fn refresh<S: Source>(src: &S, db: &Mutex<Db>, cfg: &RefreshConfig) ->
         }
         let errors_before = report.errors.len();
         let result = match site {
-            Site::House => refresh_house(src, db, cfg, &roster, &mut report).await,
-            Site::Senate => refresh_senate(src, db, cfg, &roster, &mut report).await,
+            Site::House => refresh_house(src, db, cfg, &roster, &mut report, &mut failures).await,
+            Site::Senate => refresh_senate(src, db, cfg, &roster, &mut report, &mut failures).await,
             Site::HouseRoster => unreachable!(),
         };
         match result {
@@ -327,9 +382,12 @@ async fn store(
     let n = db.insert_filing(&rec, &parsed.trades)?;
     report.new_filings += 1;
     report.new_trades += n;
+    let chamber = usize::from(rec.chamber == Chamber::Senate);
+    report.chamber_counts[chamber].0 += 1;
+    report.chamber_counts[chamber].1 += n;
     match parsed.status {
         FilingStatus::Scanned => report.scanned += 1,
-        FilingStatus::Error => report.errors.push(format!("{}: {}", rec.id, parsed.error.unwrap_or_default())),
+        FilingStatus::Error => report.parse_errors.push(format!("{}: {}", rec.id, parsed.error.unwrap_or_default())),
         FilingStatus::Parsed => {}
     }
     if db.is_tracked(pid)? && parsed.status != FilingStatus::Error {
@@ -374,17 +432,29 @@ async fn refresh_house<S: Source>(
     cfg: &RefreshConfig,
     roster: &Roster,
     report: &mut RefreshReport,
+    failures: &mut TransportFailures,
 ) -> Result<bool> {
     let known = db.lock().await.known_filing_ids(Chamber::House)?;
+    let retries = db.lock().await.retry_filing_ids(Chamber::House)?;
     let mut todo: Vec<IndexEntry> = Vec::new();
     for &year in &cfg.house_years {
-        let entries = src.house_index(year).await.with_context(|| format!("house index {year}"))?;
+        let entries = match failures.observe(Site::House, src.house_index(year).await, report) {
+            Ok(entries) => entries,
+            Err(e) if e.is::<IndexNotPublished>() => {
+                report.notes.push(format!("House {year} index not published yet; skipped"));
+                continue;
+            }
+            Err(e) => return Err(e).with_context(|| format!("house index {year}")),
+        };
         todo.extend(entries.into_iter().filter(|e| {
             e.is_ptr()
-                && !known.contains(&format!("house:{}", e.doc_id))
-                && cfg.house_since.is_none_or(|since| e.filing_date.is_some_and(|d| d >= since))
+                && (retries.contains(&format!("house:{}", e.doc_id))
+                    || (!known.contains(&format!("house:{}", e.doc_id))
+                        && cfg.house_since.is_none_or(|since| e.filing_date.is_some_and(|d| d >= since))))
         }));
     }
+    let mut seen = std::collections::HashSet::new();
+    todo.retain(|entry| seen.insert(entry.doc_id.clone()));
     // Newest first so a capped run still gets the freshest filings.
     todo.sort_by_key(|e| std::cmp::Reverse(e.filing_date));
     let capped = todo.len() > cfg.max_new_per_chamber.min(200);
@@ -393,8 +463,12 @@ async fn refresh_house<S: Source>(
     debug!("house: {} new PTRs to fetch", todo.len());
 
     for entry in todo {
-        let parsed = match src.house_pdf(&entry).await {
+        let parsed = match failures.observe(Site::House, src.house_pdf(&entry).await, report) {
             Err(e) => {
+                let id = format!("house:{}", entry.doc_id);
+                if retries.contains(&id) {
+                    db.lock().await.record_failed_retry(&id)?;
+                }
                 if e.is::<SiteRefused>() {
                     return Err(e);
                 }
@@ -473,17 +547,21 @@ async fn refresh_senate<S: Source>(
     cfg: &RefreshConfig,
     roster: &Roster,
     report: &mut RefreshReport,
+    failures: &mut TransportFailures,
 ) -> Result<bool> {
     let known = db.lock().await.known_filing_ids(Chamber::Senate)?;
-    let mut todo: Vec<ReportRef> = src
-        .senate_reports(cfg.senate_since)
-        .await?
+    let retries = db.lock().await.retry_filing_ids(Chamber::Senate)?;
+    let mut todo: Vec<ReportRef> = failures
+        .observe(Site::Senate, src.senate_reports(cfg.senate_since).await, report)?
         .into_iter()
         .filter(|r| {
-            !known.contains(&format!("senate:{}", r.id))
-                && cfg.senate_since.is_none_or(|since| r.date_received.is_some_and(|d| d >= since))
+            retries.contains(&format!("senate:{}", r.id))
+                || (!known.contains(&format!("senate:{}", r.id))
+                    && cfg.senate_since.is_none_or(|since| r.date_received.is_some_and(|d| d >= since)))
         })
         .collect();
+    let mut seen = std::collections::HashSet::new();
+    todo.retain(|report| seen.insert(report.id.clone()));
     todo.sort_by_key(|r| std::cmp::Reverse(r.date_received));
     let capped = todo.len() > cfg.max_new_per_chamber.min(200);
     report.capped |= capped;
@@ -495,8 +573,12 @@ async fn refresh_senate<S: Source>(
             ReportKind::Electronic => src.senate_ptr(&r).await.map(Some),
             ReportKind::Paper => Ok(None),
         };
-        let parsed = match html {
+        let parsed = match failures.observe(Site::Senate, html, report) {
             Err(e) => {
+                let id = format!("senate:{}", r.id);
+                if retries.contains(&id) {
+                    db.lock().await.record_failed_retry(&id)?;
+                }
                 if e.is::<SiteRefused>() {
                     return Err(e);
                 }
@@ -564,6 +646,7 @@ async fn refresh_senate<S: Source>(
 struct PaceState {
     next: Option<Instant>,
     refused: bool,
+    transport_failures: u8,
 }
 
 #[derive(Default)]
@@ -586,6 +669,36 @@ impl Pacer {
     }
 }
 
+#[derive(Debug)]
+struct IndexNotPublished;
+impl fmt::Display for IndexNotPublished {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("House index not published yet")
+    }
+}
+impl std::error::Error for IndexNotPublished {}
+
+/// Validate download signatures, not Content-Type (which can be misleading).
+fn check_download(site: Site, url: &str, status: u16, body: &[u8], retry: Option<&str>) -> Result<()> {
+    let path = reqwest::Url::parse(url)?.path().to_ascii_lowercase();
+    if site == Site::House
+        && status == 404
+        && [Utc::now().year(), Utc::now().year() + 1].iter().any(|year| path.ends_with(&format!("/{year}fd.zip")))
+    {
+        return Err(IndexNotPublished.into());
+    }
+    check_response(site, status, body, retry)?;
+    if site == Site::House
+        && (200..300).contains(&status)
+        && ((path.ends_with(".pdf") && !body.starts_with(b"%PDF-"))
+            || (path.ends_with(".zip")
+                && ![b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"].iter().any(|magic| body.starts_with(*magic))))
+    {
+        return Err(SiteRefused { site, retry_after: None }.into());
+    }
+    Ok(())
+}
+
 fn retry_after(value: &str, now: i64) -> Option<i64> {
     value
         .trim()
@@ -593,6 +706,7 @@ fn retry_after(value: &str, now: i64) -> Option<i64> {
         .ok()
         .map(|s| now.saturating_add(s.min(i64::MAX as u64) as i64))
         .or_else(|| chrono::DateTime::parse_from_rfc2822(value).ok().map(|d| d.timestamp()))
+        .map(|until| until.min(now.saturating_add(7 * 86400)))
 }
 
 fn check_response(site: Site, status: u16, body: &[u8], retry: Option<&str>) -> Result<()> {
@@ -619,12 +733,21 @@ fn home_csrf(home: &str) -> Result<String> {
     senate::csrf_from_form(home).ok_or_else(|| SiteRefused { site: Site::Senate, retry_after: None }.into())
 }
 
+#[cfg(test)]
+type FixtureResponse = fn(&reqwest::Request) -> Result<(u16, Vec<u8>)>;
+
 /// Live source backed by the official websites.
 pub struct HttpSource {
     client: reqwest::Client,
     /// CSRF token of an agreed eFD session, established lazily.
     senate_csrf: Mutex<Option<String>>,
     pacers: [Pacer; 3],
+    senate_rehandshake: std::sync::atomic::AtomicBool,
+    site_base: Option<(Site, reqwest::Url)>,
+    #[cfg(test)]
+    fixture: Option<FixtureResponse>,
+    #[cfg(test)]
+    fixture_hits: std::sync::atomic::AtomicUsize,
 }
 
 impl HttpSource {
@@ -634,9 +757,32 @@ impl HttpSource {
             .cookie_store(true)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(20))
             .build()?;
-        Ok(Self { client, senate_csrf: Mutex::new(None), pacers: Default::default() })
+        Ok(Self {
+            client,
+            senate_csrf: Mutex::new(None),
+            pacers: Default::default(),
+            senate_rehandshake: Default::default(),
+            site_base: None,
+            #[cfg(test)]
+            fixture: None,
+            #[cfg(test)]
+            fixture_hits: Default::default(),
+        })
+    }
+
+    /// Route every request for one logical site to an offline fixture server.
+    /// Redirects are still classified and paced using the logical site.
+    pub fn with_site_base(site: Site, base: &str) -> Result<Self> {
+        let mut source = Self::new()?;
+        source.site_base = Some((site, reqwest::Url::parse(base)?));
+        Ok(source)
+    }
+
+    async fn refuse(&self, site: Site) -> anyhow::Error {
+        self.pacer(site).state.lock().await.refused = true;
+        SiteRefused { site, retry_after: None }.into()
     }
 
     fn pacer(&self, site: Site) -> &Pacer {
@@ -651,34 +797,47 @@ impl HttpSource {
             let site = Site::for_url(url.as_str())?;
             let mut pace = self.pacer(site).enter(site).await?;
             let replay = request.try_clone();
-            let resp = self.client.execute(request).await?;
-            let status = resp.status();
-            let retry =
-                resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|h| h.to_str().ok()).map(str::to_owned);
-            let location =
-                resp.headers().get(reqwest::header::LOCATION).and_then(|h| h.to_str().ok()).map(str::to_owned);
-            if matches!(status.as_u16(), 403 | 429 | 503) {
-                pace.refused = true;
-                return Err(SiteRefused {
-                    site,
-                    retry_after: retry.as_deref().and_then(|v| retry_after(v, Utc::now().timestamp())),
-                }
-                .into());
+            if let Some((mapped_site, base)) = &self.site_base {
+                // A fake-base source must never fall through to a live host.
+                anyhow::ensure!(*mapped_site == site, "unmapped site in offline source");
+                let mut target = base.clone();
+                target.set_path(url.path());
+                target.set_query(url.query());
+                *request.url_mut() = target;
             }
-            let bytes = resp.bytes().await?;
-            let checked = check_response(site, status.as_u16(), &bytes, retry.as_deref()).and_then(|()| {
-                if site == Site::Senate && url.path().contains("/search/home") && !status.is_redirection() {
-                    home_csrf(&String::from_utf8_lossy(&bytes)).map(|_| ()).map_err(|_| {
-                        SiteRefused {
-                            site,
-                            retry_after: retry.as_deref().and_then(|v| retry_after(v, Utc::now().timestamp())),
-                        }
-                        .into()
-                    })
-                } else {
-                    Ok(())
+            let (status, retry, location, bytes) = match self.response(request, site).await {
+                Ok(response) => {
+                    pace.transport_failures = 0;
+                    response
                 }
-            });
+                Err(e) => {
+                    if is_transport(&e) {
+                        pace.transport_failures += 1;
+                        if pace.transport_failures >= 3 {
+                            pace.refused = true;
+                            return Err(SiteRefused { site, retry_after: None }.into());
+                        }
+                    } else {
+                        pace.transport_failures = 0;
+                    }
+                    pace.refused |= e.is::<SiteRefused>();
+                    return Err(e);
+                }
+            };
+            let checked =
+                check_download(site, url.as_str(), status.as_u16(), &bytes, retry.as_deref()).and_then(|()| {
+                    if site == Site::Senate && url.path().contains("/search/home") && !status.is_redirection() {
+                        home_csrf(&String::from_utf8_lossy(&bytes)).map(|_| ()).map_err(|_| {
+                            SiteRefused {
+                                site,
+                                retry_after: retry.as_deref().and_then(|v| retry_after(v, Utc::now().timestamp())),
+                            }
+                            .into()
+                        })
+                    } else {
+                        Ok(())
+                    }
+                });
             if let Err(e) = checked {
                 pace.refused |= e.is::<SiteRefused>();
                 return Err(e);
@@ -699,6 +858,34 @@ impl HttpSource {
         bail!("too many Congress source redirects")
     }
 
+    /// Raw transport seam: fixture tests exercise the real request gate and session
+    /// logic without opening a socket or contacting any host.
+    async fn response(
+        &self,
+        request: reqwest::Request,
+        site: Site,
+    ) -> Result<(reqwest::StatusCode, Option<String>, Option<String>, Vec<u8>)> {
+        #[cfg(test)]
+        if let Some(fixture) = self.fixture {
+            self.fixture_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (status, bytes) = fixture(&request)?;
+            return Ok((reqwest::StatusCode::from_u16(status)?, None, None, bytes));
+        }
+        let resp = self.client.execute(request).await?;
+        let status = resp.status();
+        let retry = resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|h| h.to_str().ok()).map(str::to_owned);
+        let location = resp.headers().get(reqwest::header::LOCATION).and_then(|h| h.to_str().ok()).map(str::to_owned);
+        // Do not wait for a challenge body when the status already refuses us.
+        if matches!(status.as_u16(), 403 | 429 | 503) {
+            return Err(SiteRefused {
+                site,
+                retry_after: retry.as_deref().and_then(|v| retry_after(v, Utc::now().timestamp())),
+            }
+            .into());
+        }
+        Ok((status, retry, location, resp.bytes().await?.to_vec()))
+    }
+
     async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
         Ok(self.request(self.client.get(url)).await?.0)
     }
@@ -708,6 +895,9 @@ impl HttpSource {
         let mut guard = self.senate_csrf.lock().await;
         if let (Some(tok), false) = (guard.as_ref(), force) {
             return Ok(tok.clone());
+        }
+        if force && self.senate_rehandshake.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(self.refuse(Site::Senate).await);
         }
         let home = self.get_bytes(senate::HOME_URL).await?;
         let form_tok = home_csrf(&String::from_utf8_lossy(&home))?;
@@ -743,9 +933,12 @@ impl HttpSource {
 impl Source for HttpSource {
     async fn begin_run(&self, blocked: &[Site]) {
         for site in Site::ALL {
-            self.pacer(site).state.lock().await.refused = blocked.contains(&site);
+            let mut state = self.pacer(site).state.lock().await;
+            state.refused = blocked.contains(&site);
+            state.transport_failures = 0;
         }
         *self.senate_csrf.lock().await = None;
+        self.senate_rehandshake.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn roster_for(&self, site: Site) -> Result<Roster> {
@@ -779,9 +972,13 @@ impl Source for HttpSource {
             let page = match self.senate_page(&csrf, start, since).await {
                 Ok(p) => p,
                 // Session expired: agree again once and retry.
-                Err(e) if !e.is::<SiteRefused>() && (start == 0 || out.is_empty()) => {
+                Err(e) if !e.is::<SiteRefused>() && !is_transport(&e) && (start == 0 || out.is_empty()) => {
                     csrf = self.senate_session(true).await?;
-                    self.senate_page(&csrf, start, since).await?
+                    match self.senate_page(&csrf, start, since).await {
+                        Ok(page) => page,
+                        Err(e) if is_transport(&e) || e.is::<SiteRefused>() => return Err(e),
+                        Err(_) => return Err(self.refuse(Site::Senate).await),
+                    }
                 }
                 Err(e) => return Err(e),
             };
@@ -799,14 +996,20 @@ impl Source for HttpSource {
         self.senate_session(false).await?;
         let (bytes, final_url) =
             self.request(self.client.get(&report.url).header("Referer", senate::SEARCH_URL)).await?;
-        let text = String::from_utf8(bytes)?;
-        // An expired session bounces to the agreement page.
-        if final_url.contains("/search/home") || !text.contains("Transaction Date") {
-            self.senate_session(true).await?;
-            let (bytes, _) = self.request(self.client.get(&report.url).header("Referer", senate::SEARCH_URL)).await?;
-            return Ok(String::from_utf8(bytes)?);
+        let valid_ptr = |bytes: Vec<u8>, url: &str| -> Option<String> {
+            let text = String::from_utf8(bytes).ok()?;
+            (!url.contains("/search/home") && senate::parse_ptr_html(&text).is_ok()).then_some(text)
+        };
+        if let Some(text) = valid_ptr(bytes, &final_url) {
+            return Ok(text);
         }
-        Ok(text)
+        // The budget is shared with search and every PTR for the entire run.
+        self.senate_session(true).await?;
+        let (bytes, url) = self.request(self.client.get(&report.url).header("Referer", senate::SEARCH_URL)).await?;
+        match valid_ptr(bytes, &url) {
+            Some(text) => Ok(text),
+            None => Err(self.refuse(Site::Senate).await),
+        }
     }
 }
 
@@ -815,18 +1018,267 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
 
+    struct PtrProbe(HttpSource);
+
+    impl Source for PtrProbe {
+        async fn begin_run(&self, blocked: &[Site]) {
+            self.0.begin_run(blocked).await;
+        }
+        async fn roster_for(&self, _: Site) -> Result<Roster> {
+            Ok(Roster::default())
+        }
+        async fn house_index(&self, _: i32) -> Result<Vec<IndexEntry>> {
+            Ok(vec![])
+        }
+        async fn house_pdf(&self, _: &IndexEntry) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+        async fn senate_reports(&self, since: Option<NaiveDate>) -> Result<Vec<ReportRef>> {
+            let mut fake = Fake::new(None);
+            fake.count = 200;
+            fake.senate_reports(since).await
+        }
+        async fn senate_ptr(&self, report: &ReportRef) -> Result<String> {
+            self.0.senate_ptr(report).await
+        }
+    }
+
+    fn agreement() -> Vec<u8> {
+        b"<html><form><input name=\"csrfmiddlewaretoken\" value=\"fixture-token\"></form></html>".to_vec()
+    }
+
+    fn challenge_response(request: &reqwest::Request) -> Result<(u16, Vec<u8>)> {
+        Ok((
+            200,
+            if request.url().path().contains("/search/home") {
+                agreement()
+            } else {
+                b"<html>Transaction Date: please enable cookies</html>".to_vec()
+            },
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_soft_block_costs_six_requests_for_two_hundred_ptrs_and_persists_pause() {
+        for fixture in
+            [challenge_response as FixtureResponse, (|_: &reqwest::Request| Ok((200, agreement()))) as FixtureResponse]
+        {
+            let mut http = HttpSource::new().unwrap();
+            http.fixture = Some(fixture);
+            let src = PtrProbe(http);
+            let db = Mutex::new(Db::open_in_memory().unwrap());
+            let r = refresh(&src, &db, &config()).await.unwrap();
+            assert_eq!(src.0.fixture_hits.load(std::sync::atomic::Ordering::SeqCst), 6);
+            assert!(r.paused[0].contains("Senate source paused"));
+            assert_eq!(db.lock().await.source_cooldown(Site::Senate.key()).unwrap().1, 1);
+            refresh(&src, &db, &config()).await.unwrap();
+            assert_eq!(src.0.fixture_hits.load(std::sync::atomic::Ordering::SeqCst), 6);
+            // Even a direct caller cannot continue the queue within the run.
+            assert!(src.0.get_bytes(senate::HOME_URL).await.unwrap_err().is::<SiteRefused>());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forced_handshake_budget_is_shared_by_search_and_ptrs_and_reset_per_run() {
+        let mut http = HttpSource::new().unwrap();
+        http.fixture = Some(challenge_response);
+        for expected in [2, 4] {
+            http.begin_run(&[]).await;
+            http.senate_session(true).await.unwrap();
+            assert!(http.senate_session(true).await.unwrap_err().is::<SiteRefused>());
+            assert_eq!(http.fixture_hits.load(std::sync::atomic::Ordering::SeqCst), expected);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn house_html_downloads_refuse_and_close_the_http_gate() {
+        for url in [
+            house::index_zip_url(Utc::now().year()),
+            "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/123.pdf".into(),
+        ] {
+            let mut http = HttpSource::new().unwrap();
+            http.fixture = Some(|_| Ok((200, b"<html>Sign in to continue</html>".to_vec())));
+            assert!(http.get_bytes(&url).await.unwrap_err().is::<SiteRefused>());
+            assert!(http.get_bytes(&url).await.unwrap_err().is::<SiteRefused>());
+            assert_eq!(http.fixture_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        for (suffix, body) in [("pdf", b"random bytes".as_slice()), ("zip", b"not a zip".as_slice())] {
+            assert!(
+                check_download(
+                    Site::House,
+                    &format!("https://disclosures-clerk.house.gov/test.{suffix}"),
+                    200,
+                    body,
+                    None
+                )
+                .unwrap_err()
+                .is::<SiteRefused>()
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unpublished_house_year_is_skipped_with_a_note_not_a_refusal() {
+        let mut src = HttpSource::new().unwrap();
+        src.fixture = Some(|_| Ok((404, b"Not Found".to_vec())));
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let mut cfg = config();
+        cfg.house_years = vec![Utc::now().year() + 1];
+        let mut report = RefreshReport::default();
+        refresh_house(&src, &db, &cfg, &Roster::default(), &mut report, &mut TransportFailures::default())
+            .await
+            .unwrap();
+        assert!(report.errors.is_empty());
+        assert!(report.summary().contains("not published yet; skipped"));
+        assert!(!src.pacer(Site::House).state.lock().await.refused);
+        assert!(
+            !check_download(Site::House, &house::index_zip_url(2020), 404, b"missing", None)
+                .unwrap_err()
+                .is::<IndexNotPublished>()
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_failures_retry_daily_at_most_three_times_and_expire_after_seven_days() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let mut src = Fake::new(None);
+        src.bad_pdf = true;
+        src.count = 1;
+        for attempt in 1..=3 {
+            let r = refresh(&src, &db, &config()).await.unwrap();
+            assert!(r.errors.is_empty());
+            assert_eq!(r.parse_errors.len(), 1);
+            assert_eq!(src.requests(Site::House, "pdf"), attempt);
+            let db = db.lock().await;
+            assert!(db.known_filing_ids(Chamber::House).unwrap().contains("house:0"));
+            assert!(db.retry_filing_ids(Chamber::House).unwrap().is_empty());
+            let count: i64 = db
+                .conn()
+                .query_row("SELECT attempt_count FROM filings WHERE id = 'house:0'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, attempt as i64);
+            db.conn().execute("UPDATE filings SET fetched_at = fetched_at - 86400 WHERE status = 'error'", []).unwrap();
+        }
+        refresh(&src, &db, &config()).await.unwrap();
+        assert_eq!(src.requests(Site::House, "pdf"), 3);
+        {
+            let db = db.lock().await;
+            db.conn().execute("UPDATE filings SET attempt_count = 1, first_attempt_at = first_attempt_at - 8 * 86400 WHERE status = 'error'", []).unwrap();
+            assert!(db.retry_filing_ids(Chamber::House).unwrap().is_empty());
+        }
+        refresh(&src, &db, &config()).await.unwrap();
+        assert_eq!(src.requests(Site::House, "pdf"), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_transport_streak_stops_after_three_and_clears_next_run() {
+        let mut http = HttpSource::new().unwrap();
+        http.fixture = Some(|_| Err(anyhow::anyhow!("error sending request: connection reset by peer")));
+        for run in 1..=2 {
+            http.begin_run(&[]).await;
+            for attempt in 1..=4 {
+                let error = http.get_bytes(senate::HOME_URL).await.unwrap_err();
+                assert_eq!(error.is::<SiteRefused>(), attempt >= 3);
+            }
+            assert_eq!(http.fixture_hits.load(std::sync::atomic::Ordering::SeqCst), 3 * run);
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_error_download_failures_also_consume_the_daily_and_total_retry_budget() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let mut src = Fake::new(None);
+        src.bad_pdf = true;
+        src.count = 1;
+        refresh(&src, &db, &config()).await.unwrap();
+        src.failure = Some((Site::House, "pdf"));
+        src.status = 500;
+        for expected in 2..=3 {
+            db.lock()
+                .await
+                .conn()
+                .execute("UPDATE filings SET fetched_at = fetched_at - 86400 WHERE status = 'error'", [])
+                .unwrap();
+            refresh(&src, &db, &config()).await.unwrap();
+            refresh(&src, &db, &config()).await.unwrap();
+            assert_eq!(src.requests(Site::House, "pdf"), expected);
+        }
+        db.lock()
+            .await
+            .conn()
+            .execute("UPDATE filings SET fetched_at = fetched_at - 86400 WHERE status = 'error'", [])
+            .unwrap();
+        refresh(&src, &db, &config()).await.unwrap();
+        assert_eq!(src.requests(Site::House, "pdf"), 3);
+    }
+
+    #[test]
+    fn paused_summary_keeps_other_chamber_counts_and_parse_errors() {
+        let report = RefreshReport {
+            chamber_counts: [(3, 12), (0, 0)],
+            paused: vec![pause_text(Site::Senate, Utc::now().timestamp() + 3600)],
+            parse_errors: vec!["malformed filing".into()],
+            ..Default::default()
+        };
+        let summary = report.summary();
+        assert!(summary.starts_with("House: 3 new filings, 12 trades · Senate source paused until"));
+        assert!(summary.ends_with("1 parse errors"));
+    }
+
+    #[test]
+    fn huge_retry_after_values_are_bounded_in_parser_storage_and_display() {
+        let now = Utc::now().timestamp();
+        assert_eq!(retry_after(&u64::MAX.to_string(), now), Some(now + 7 * 86400));
+        assert_eq!(retry_after("Fri, 31 Dec 9999 23:59:59 GMT", now), Some(now + 7 * 86400));
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.refuse_source(Site::Senate.key(), now, Some(i64::MAX)).unwrap(), now + 7 * 86400);
+        assert!(!pause_text(Site::Senate, i64::MAX).contains("1970"));
+    }
+
+    #[test]
+    fn transport_streak_is_per_site_and_success_breaks_it() {
+        let mut failures = TransportFailures::default();
+        let mut report = RefreshReport::default();
+        for message in ["connection reset by peer", "operation timed out", "connect error"] {
+            assert!(
+                !failures
+                    .observe::<()>(Site::Senate, Err(anyhow::anyhow!(message)), &mut report)
+                    .unwrap_err()
+                    .is::<SiteRefused>()
+            );
+            failures.observe(Site::Senate, Ok(()), &mut report).unwrap();
+        }
+        for site in [Site::Senate, Site::House] {
+            for attempt in 1..=3 {
+                let e = failures
+                    .observe::<()>(site, Err(anyhow::anyhow!("connection reset by peer")), &mut report)
+                    .unwrap_err();
+                assert_eq!(e.is::<SiteRefused>(), attempt == 3);
+            }
+        }
+    }
+
     struct Fake {
         failure: Option<(Site, &'static str)>,
         status: u16,
         retry: Option<&'static str>,
         count: usize,
+        bad_pdf: bool,
         seen: StdMutex<Vec<(Site, String)>>,
         since: StdMutex<Option<NaiveDate>>,
     }
 
     impl Fake {
         fn new(failure: Option<(Site, &'static str)>) -> Self {
-            Self { failure, status: 403, retry: None, count: 3, seen: Default::default(), since: Default::default() }
+            Self {
+                failure,
+                status: 403,
+                retry: None,
+                count: 3,
+                bad_pdf: false,
+                seen: Default::default(),
+                since: Default::default(),
+            }
         }
 
         fn fetch(&self, site: Site, stage: &str, id: &str) -> Result<()> {
@@ -874,6 +1326,9 @@ mod tests {
 
         async fn house_pdf(&self, entry: &IndexEntry) -> Result<Vec<u8>> {
             self.fetch(Site::House, "pdf", &entry.doc_id)?;
+            if self.bad_pdf {
+                return Ok(b"%PDF-1.4 truncated garbage".to_vec());
+            }
             Ok(include_bytes!("../tests/fixtures/house/8221321.pdf").to_vec())
         }
 
@@ -1360,6 +1815,9 @@ mod tests {
 
     #[test]
     fn sample_provider_disables_refresh_unless_explicitly_enabled() {
+        assert_eq!(refresh_minutes(Some(" sample \t"), None), 0);
+        assert_eq!(refresh_minutes(Some("  SaMpLe  "), None), 0);
+        assert_eq!(refresh_minutes(Some(" \t"), None), 30);
         assert_eq!(refresh_minutes(Some("sample"), None), 0);
         assert_eq!(refresh_minutes(Some("sample"), Some("15")), 15);
         assert_eq!(refresh_minutes(Some("sample"), Some("0")), 0);

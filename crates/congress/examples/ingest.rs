@@ -1,5 +1,6 @@
 //! Run one live refresh against the official sources into a SQLite file.
-//! `cargo run -p tr-congress --example ingest -- congress.sqlite3 [max_new_per_chamber]`
+//! `cargo run -p tr-congress --example ingest -- --i-know congress.sqlite3 [max_new_per_chamber]`
+//! Without --i-know this exits without opening a database or contacting any source.
 use tokio::sync::Mutex;
 use tr_congress::Db;
 use tr_congress::refresh::{HttpSource, RefreshConfig, refresh};
@@ -8,6 +9,14 @@ use tr_congress::refresh::{HttpSource, RefreshConfig, refresh};
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info,tr_congress=debug").init();
     let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("--i-know") {
+        eprintln!(
+            "WARNING: ingest contacts live Congress sites. Dry run: no requests or database changes.\n\
+            To opt in: ingest --i-know <app-congress-db> [max_new_per_chamber].\n\
+            Use the app's database to share its persisted source cooldowns."
+        );
+        return Ok(());
+    }
     let path = args.next().unwrap_or_else(|| "congress.sqlite3".into());
     let db = Db::open(&path)?;
     let mut cfg = RefreshConfig::incremental(&db);
