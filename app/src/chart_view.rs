@@ -707,6 +707,38 @@ impl ChartState {
             || self.agent_state_edits.iter().any(|edit| edit.turn == turn)
     }
 
+    /// Number of retained inverse operations, including targets that may now conflict.
+    /// Unlike successful tool-call counts, this excludes no-op comparison requests.
+    pub(crate) fn agent_turn_change_count(&self, turn: &str) -> usize {
+        let drawings: usize = self
+            .drawing_undo
+            .iter()
+            .filter(|edit| edit.author == tr_chart::drawings::Author::Agent && edit.turn.as_deref() == Some(turn))
+            .map(|edit| edit.inverse_operations().len())
+            .sum();
+        drawings
+            + self
+                .agent_state_edits
+                .iter()
+                .filter(|edit| edit.turn == turn)
+                .map(|edit| {
+                    let id = |spec: &IndicatorSpec| spec.chart.as_ref().map(|settings| settings.id);
+                    let studies =
+                        edit.before.iter().filter(|spec| !edit.after.iter().any(|other| id(spec) == id(other))).count()
+                            + edit
+                                .after
+                                .iter()
+                                .filter(|spec| !edit.before.iter().any(|other| id(spec) == id(other)))
+                                .count();
+                    let comparisons = edit.comparisons.as_ref().map_or(0, |(before, after)| {
+                        before.iter().filter(|object| !after.contains(object)).count()
+                            + after.iter().filter(|object| !before.contains(object)).count()
+                    });
+                    studies + comparisons + usize::from(edit.view.is_some())
+                })
+                .sum::<usize>()
+    }
+
     pub fn studies(&self) -> Vec<StudyRead> {
         self.study_reads(None, usize::MAX)
     }
@@ -10492,5 +10524,6 @@ mod tests {
         let owner = chart.comparison_objects().into_iter().find(|c| c.symbol == key).unwrap();
         assert_eq!(owner.created_by, tr_chart::drawings::Author::User);
         assert_eq!(owner.turn_id, None);
+        assert_eq!(chart.agent_turn_change_count("s:1"), 0, "successful no-op tools are not chart changes");
     }
 }

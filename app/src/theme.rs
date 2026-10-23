@@ -184,6 +184,11 @@ pub fn ui_font(size: f32) -> FontId {
     FontId::new(size * SCALE.with(Cell::get), family)
 }
 
+/// Running prose stays proportional even when chrome uses a terminal face.
+pub fn body_font(size: f32) -> FontId {
+    FontId::new(size * SCALE.with(Cell::get), FontFamily::Proportional)
+}
+
 /// Corner radii for cards and controls.
 pub const CARD_RADIUS: u8 = 10;
 pub const CONTROL_RADIUS: u8 = 6;

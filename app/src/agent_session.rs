@@ -622,13 +622,13 @@ mod tests {
                 "create_drawing",
                 json!({"kind":"horizontal","anchors":[{"time":123456789,"price":227.123456}]}),
                 json!({"id":42}),
-                "#42 · horizontal line at 227.12",
+                "#42 · Horizontal line at 227.12",
             ),
             (
                 "create_drawing",
                 json!({"kind":"trend_line","anchors":[{"time":123456789,"price":227.123456},{"time":987654321,"price":228.123456}]}),
                 json!({"id":43}),
-                "#43 · trend line (2 anchors)",
+                "#43 · Trend line",
             ),
             (
                 "update_drawing",
@@ -948,7 +948,7 @@ mod fix_tests {
             assert!(
                 matches!(&state, Onboarding::Stopped { unsafe_backend: false, reason } if !reason.contains("fixture-secret"))
             );
-            assert_eq!(state.primary(), "Restart agent");
+            assert_eq!(state.primary(), "Restart");
             let mut pane = crate::agent_pane::AgentPane::default();
             pane.transition(state);
             pane.transition(Onboarding::Checking);

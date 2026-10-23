@@ -7,6 +7,13 @@ use crate::dock::PaneId;
 use tr_agent::TurnInput;
 use tr_agent::bridge::{BridgeTurn, ChartPin};
 
+fn open_agent_help(url: &str, open: impl FnOnce(&str) -> std::io::Result<()>) -> std::io::Result<()> {
+    if !url.starts_with("https://") {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Agent help requires HTTPS"));
+    }
+    open(url)
+}
+
 fn pane_id(id: PaneId) -> egui::Id {
     egui::Id::new(("agent-pane", id))
 }
@@ -14,6 +21,17 @@ fn pane_id(id: PaneId) -> egui::Id {
 impl TerminalApp {
     fn first_agent(&self) -> Option<PaneId> {
         self.panes.iter().find(|p| matches!(p.kind, PaneKind::Agent(_))).map(|p| p.id)
+    }
+
+    pub(super) fn focus_agent_input(&mut self, ctx: &egui::Context) -> bool {
+        let Some(id) = self.first_agent() else {
+            return false;
+        };
+        self.focus = id;
+        self.dock.activate(id);
+        self.focus_cmd = false;
+        ctx.memory_mut(|memory| memory.request_focus(agent_pane::input_id(pane_id(id))));
+        true
     }
 
     pub(super) fn agent_captures_focus(&self, ctx: &egui::Context) -> bool {
@@ -101,7 +119,7 @@ impl TerminalApp {
                 }
                 Event::Limits(limits) => self.agent_pane.set_limits(&limits),
                 Event::Bridge(event) => self.agent_pane.event(event),
-                Event::Notice(reason) => self.agent_pane.notice(&reason),
+                Event::Notice(reason) => self.agent_pane.error_notice(&reason),
             }
         }
         if self
@@ -117,7 +135,11 @@ impl TerminalApp {
 
     pub(super) fn agent_panel(&mut self, ui: &mut egui::Ui, id: PaneId) {
         if self.first_agent() != Some(id) {
-            ui.label("Agent already open in another pane. There is one shared agent session per app; use the first Agent tab.");
+            crate::agent_markdown::wrapped(
+                ui,
+                "Agent is open in another pane. Use its Agent tab; this app shares one session.",
+                crate::theme::text(),
+            );
             return;
         }
         self.initialize_agent_choices();
@@ -126,12 +148,28 @@ impl TerminalApp {
             .and_then(|uid| {
                 self.panes.iter().find_map(|p| match &p.kind {
                     PaneKind::Chart(c) if c.uid == uid => {
-                        Some(format!("Pinned: {} · {}", crate::security_names::label(&c.symbol), c.tf))
+                        Some(format!("{} · {}", crate::security_names::label(&c.symbol), c.tf))
                     }
                     _ => None,
                 })
             })
             .unwrap_or_else(|| "No chart pinned".into());
+        self.agent_pane.data_basis = self
+            .pinned_agent_chart
+            .and_then(|uid| {
+                self.panes.iter().find_map(|pane| match &pane.kind {
+                    PaneKind::Chart(chart) if chart.uid == uid => {
+                        Some(agent_pane::DataBasis::from_chart(chart, self.provider.eq_ignore_ascii_case("sample")))
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or_default();
+        self.agent_pane.focus_shortcut = self
+            .prefs
+            .hotkeys
+            .chord(crate::prefs::Action::FocusAgentInput)
+            .map_or_else(|| "Shortcut unassigned".into(), |chord| chord.display());
         self.refresh_agent_undo();
         let actions = self.agent_pane.show(ui, &pin_label, pane_id(id));
         for action in actions {
@@ -141,6 +179,9 @@ impl TerminalApp {
     }
 
     fn start_agent_session(&mut self, ctx: &egui::Context) {
+        if self.agent_demo.is_some() {
+            return;
+        }
         let Some(tools) = self.agent_pane.prepare_session_start() else { return };
         self.agent_pane.session = None;
         self.agent_pane.session =
@@ -151,9 +192,28 @@ impl TerminalApp {
         let available: Vec<_> = self.undoable_agent_turns().into_iter().map(str::to_owned).collect();
         let last = self.last_agent_turn().map(str::to_owned);
         self.agent_pane.refresh_undo(&available, last.as_deref());
+        for turn in &mut self.agent_pane.turns {
+            if let Some(id) = &turn.id {
+                let changes = self
+                    .panes
+                    .iter()
+                    .filter_map(|pane| match &pane.kind {
+                        PaneKind::Chart(chart) => Some(chart.agent_turn_change_count(id)),
+                        _ => None,
+                    })
+                    .sum();
+                if turn.undo_available || turn.chart_changes.is_none() {
+                    turn.chart_changes = Some(changes);
+                }
+            }
+        }
     }
 
     fn agent_action(&mut self, ctx: &egui::Context, id: PaneId, action: Action) {
+        // Fixtures are for visual review only, including their enabled-looking controls.
+        if self.agent_demo.is_some() {
+            return;
+        }
         match action {
             Action::Check => self.start_agent_session(ctx),
             Action::SetTools(mode) => {
@@ -173,6 +233,13 @@ impl TerminalApp {
             Action::SignIn => self.agent_command(Command::SignIn),
             Action::CancelLogin => self.agent_command(Command::CancelLogin),
             Action::ReopenLogin => self.agent_command(Command::ReopenLogin),
+            Action::InstallationInstructions => {
+                if open_agent_help(agent_pane::INSTALLATION_URL, super::broker::open_external).is_err() {
+                    self.agent_pane.error_notice(
+                        "Could not open installation instructions. Visit https://developers.openai.com/codex.",
+                    );
+                }
+            }
             Action::RefreshLimits => self.agent_command(Command::RefreshLimits),
             Action::Interrupt => self.agent_command(Command::Interrupt),
             Action::Retry => {
@@ -204,6 +271,9 @@ impl TerminalApp {
     }
 
     fn agent_command(&mut self, command: Command) {
+        if self.agent_demo.is_some() {
+            return;
+        }
         if matches!(command, Command::Interrupt) {
             self.agent_pane.interrupt();
         }
@@ -260,6 +330,7 @@ impl TerminalApp {
                 model,
                 effort: self.agent_pane.settings.effort.clone(),
                 text: prompt.text,
+                response_style: Some(self.agent_pane.settings.response_style),
                 ..Default::default()
             },
             pin,
@@ -272,6 +343,90 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installation_help_uses_the_exact_https_url_and_rejects_other_schemes_before_opening() {
+        let mut opened = None;
+        open_agent_help(agent_pane::INSTALLATION_URL, |url| {
+            opened = Some(url.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(opened.as_deref(), Some("https://developers.openai.com/codex"));
+        for url in ["http://developers.openai.com/codex", "file:///tmp/help", "javascript:help()", "https-not-a-url"] {
+            assert!(open_agent_help(url, |_| panic!("non-HTTPS reached external opener")).is_err());
+        }
+        assert!(
+            open_agent_help(agent_pane::INSTALLATION_URL, |_| Err(std::io::Error::other("opener failed"))).is_err()
+        );
+    }
+
+    #[test]
+    fn agent_input_shortcut_focuses_existing_pane_without_starting_or_acknowledging() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/agent-input-shortcut");
+        let mut app = TerminalApp::test_workspace(&root);
+        let ctx = egui::Context::default();
+        assert!(!app.focus_agent_input(&ctx));
+        app.execute("NEW AGENT");
+        let agent = app.first_agent().unwrap();
+        app.execute("NEW CHART");
+        let binding = crate::prefs::Keymap::default().chord(crate::prefs::Action::FocusAgentInput).unwrap();
+        assert_eq!(
+            app.prefs.hotkeys.action_for(egui::Key::L, egui::Modifiers::COMMAND),
+            Some(crate::prefs::Action::FocusAgentInput)
+        );
+        assert!(binding.matches(egui::Key::L, egui::Modifiers::COMMAND));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::L,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            },
+            |_| {
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("command-line")));
+                app.hotkeys(&ctx);
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(agent_pane::input_id(pane_id(agent))));
+            },
+        );
+        output.textures_delta.clear();
+        assert_eq!(app.focus, agent);
+        assert!(app.dock.visible().contains(&agent));
+        assert!(!app.focus_cmd);
+        assert!(app.agent_pane.session.is_none());
+        assert!(!app.agent_pane.acknowledged, "focus never skips privacy consent");
+    }
+
+    #[test]
+    fn demo_cannot_start_a_session_even_when_start_signin_or_retry_is_requested() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/agent-demo-action-tests");
+        let scratch = crate::agent_demo::Scratch::create(&root).unwrap();
+        let mut app = TerminalApp::test_workspace(&scratch.0);
+        let config = crate::agent_demo::Config {
+            state: crate::agent_demo::State::parse("dormant").unwrap(),
+            shot: None,
+            size: [1100, 800],
+            pane_only: false,
+            agent_width: None,
+        };
+        app.agent_demo = Some(crate::agent_demo::Demo::new(config, Default::default()));
+        app.execute("NEW AGENT");
+        let id = app.first_agent().unwrap();
+        let ctx = egui::Context::default();
+        app.start_agent_session(&ctx);
+        for action in [Action::Check, Action::SignIn, Action::Retry, Action::RefreshLimits] {
+            app.agent_action(&ctx, id, action);
+        }
+        app.agent_command(Command::SignIn);
+        app.send_next_agent_prompt();
+        assert!(app.agent_pane.session.is_none());
+        assert_eq!(app.agent_pane.state, Onboarding::Dormant);
+        assert!(app.agent_pane.blocks.is_empty());
+    }
 
     #[test]
     fn escape_interrupts_only_agent_input_or_a_pane_without_another_focus() {
@@ -383,7 +538,7 @@ mod tests {
         assert!(!app.agent_pane.turns[0].undo_available);
         assert_eq!(
             app.agent_pane.turns[0].undo_summary.as_deref(),
-            Some("Undo: 1 reverted · 1 conflicts skipped · 1 charts")
+            Some("1 change reverted · 1 kept because you edited them")
         );
         app.agent_action(&ctx, id, Action::UndoTurn(turn));
         assert_eq!(app.agent_pane.turns[0].undo_summary.as_deref(), Some(agent_pane::UNDO_UNAVAILABLE));

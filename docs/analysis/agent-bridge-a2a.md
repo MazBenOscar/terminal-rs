@@ -505,6 +505,65 @@ check was used. The seven network-dependent ignores remain unchanged. A3 ownersh
 limits, isolation, tripwire, scrubbers, caps and readiness are unchanged. Git state
 was not changed; the work is uncommitted.
 
+## Agent pane demo states
+
+`TR_AGENT_DEMO=<state>` is an **opt-in development aid**, read once at startup.
+When unset, all demo/capture options are inert. Unknown state names fail startup.
+The demo opens only a weekly BTC sample chart and its docked Agent pane, using the
+normal renderer and pane event reducer. No session, Codex process, login, agent
+home or network provider is constructed. Agent controls are visual fixtures, not
+live backend actions. Edit fixtures use the existing chart edit validation,
+provenance and inverse-undo implementation, including actual object IDs and badges.
+
+States: `dormant`, `missing`, `unsupported`, `signed-out`, `signing-in`, `checking`,
+`empty-ready`, `streaming`, `answer`, `markdown`, `edits`, `undone`, `interrupted`,
+`queue`, `tools-unavailable`, `rate-limited`, `stopped-unsafe`, `stopped-recoverable`,
+`privacy`. Streaming freezes a partial reply and three tool rows (two finished,
+one running); queue freezes two waiting prompts with the queue paused.
+
+```sh
+# Interactive fixture review; no clicking needed to reach the state.
+TR_AGENT_DEMO=edits TR_THEME='Terminal Dark' cargo run --offline -p terminal-rs
+
+# Capture the app's own viewport, crop to the whole Agent dock card, then exit.
+# The output directory must already exist; relative paths resolve from the cwd.
+TR_AGENT_DEMO=markdown TR_THEME='Terminal Light' TR_DEMO_SIZE=1100x800 \
+  TR_DEMO_AGENT_WIDTH=360 TR_DEMO_PANE_ONLY=1 TR_DEMO_SHOT="$PWD/target/markdown.png" \
+  cargo run --offline -p terminal-rs
+
+# 19 states × 3 layouts × 3 themes = 171 PNGs; paths are printed as files finish.
+bash scripts/agent-pane-shots.sh "$PWD/target/agent-pane-shots"
+# To produce the same matrix as pane-only crops:
+TR_DEMO_PANE_ONLY=1 bash scripts/agent-pane-shots.sh "$PWD/target/agent-pane-crops"
+```
+
+- `TR_DEMO_SHOT=<path.png>` enables one capture and exit (0 only after a successful
+  PNG write; nonzero on invalid options, early window close, write/capture failure
+  or the 30-second deadline). Without it the fixture stays open for review.
+- `TR_DEMO_SIZE=<width>x<height>` sets the window's **inner logical size** (default
+  `1600x960`). PNG dimensions reflect native device pixels, e.g. 2× on Retina.
+- `TR_DEMO_AGENT_WIDTH=<logical pixels>` optionally fixes the Agent dock width;
+  otherwise it gets 42% of the workspace. The script uses `1600x960` / 660,
+  `1100x800` / 450, and `1100x800` / 360 (the `narrow360` filename suffix).
+- `TR_DEMO_PANE_ONLY=1` crops to the Agent dock card, including its tab strip,
+  using the captured frame's pixel scale. Otherwise the whole app frame is saved.
+- Existing `TR_THEME` supports `Terminal Dark`, `Terminal Light`, `Bloomberg`
+  (and the usual `dark` / `light` aliases).
+
+Capture waits for sample bars and study outputs, synchronous font setup, at least
+24 stable-layout frames and two seconds of settling before sending the existing
+`ViewportCommand::Screenshot`, then uses the existing PNG crop encoder. This is
+not agent screenshot consent and does not change the agent's screenshot tool.
+Demo layout/settings/preference writes are disabled. Before any lock or worker is
+created, startup redirects `TR_DATA_DIR` to a fresh disposable child of the supplied
+`TR_DATA_DIR` (default: this checkout's `target/`), forces `TR_PROVIDER=sample` and
+`TR_CONGRESS_REFRESH_MIN=0`, and removes that child after normal exit. The script
+also supplies a temporary `TR_DATA_DIR`. The fixed sample provider has no live
+ticks; the updater and normal periodic/background account work are skipped.
+A desktop/GPU session is required for real screenshots; offline tests cover the
+state matrix, two-pane assembly, edit/undo provenance, persistence guards, capture
+stabilization, PNG/crop scaling and failure paths without opening a native window.
+
 ## A3 agent edits
 
 The app executor and sample driver now execute the Edit preset through the same
