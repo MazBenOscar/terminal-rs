@@ -477,10 +477,386 @@ pub(super) fn evaluate_native(specs: &[Spec], input: &Input<'_>) -> Vec<Result<V
     (0..specs.len()).map(|i| node(i, specs, input, &mut visiting, &mut done)).collect()
 }
 
+/// Streaming kernels retain a checkpoint immediately before the mutable last bar.
+/// `from` must include every changed bar; callers must pass zero after a history
+/// replacement, prepend or an untracked rewrite. Earlier edits restart the kernel.
+pub struct StreamingStudy {
+    spec: Spec,
+    tf: crate::Timeframe,
+    session: crate::session::Session,
+    params: Vec<f64>,
+    checkpoint: StreamState,
+    checkpoint_at: usize,
+    pub outputs: Vec<Output>,
+}
+
+#[derive(Clone, Default)]
+struct SmoothState {
+    seen: usize,
+    acc: f64,
+}
+
+impl SmoothState {
+    fn push(&mut self, v: f64, n: usize, alpha: f64) -> f64 {
+        if n == 0 || !v.is_finite() {
+            return f64::NAN;
+        }
+        if self.seen < n {
+            self.acc += v;
+            self.seen += 1;
+            if self.seen < n {
+                return f64::NAN;
+            }
+            self.acc /= n as f64;
+        } else {
+            self.acc = alpha * v + (1.0 - alpha) * self.acc;
+        }
+        self.acc
+    }
+}
+
+#[derive(Clone, Default)]
+struct StreamState {
+    smooth: [SmoothState; 3],
+    reference: Option<f64>,
+    sum: f64,
+    squares: f64,
+    bad: usize,
+    session: Option<i64>,
+    volume: f64,
+}
+
+impl StreamingStudy {
+    pub fn new(spec: &Spec, tf: crate::Timeframe, session: crate::session::Session) -> Option<Self> {
+        if !matches!(spec.code.as_str(), "EMA" | "SMA" | "RSI" | "MACD" | "BB" | "ATR" | "VWAP")
+            || spec.chart.as_ref().is_some_and(|c| {
+                matches!(c.source, Source::Output { .. })
+                    || (c.source != Source::Bars && matches!(spec.code.as_str(), "ATR" | "VWAP"))
+                    || c.formula != super::formula::Formula::default()
+                    || c.displacement != 0
+                    || c.timeframe.is_some()
+                    || c.fill.is_some()
+                    || matches!(c.pane, Pane::With(_))
+                    || matches!(c.scale, Scale::Fixed { lo, hi } if !lo.is_finite() || !hi.is_finite() || lo >= hi)
+                    || c.outputs.values().any(|s| !s.width.is_finite() || !(0.5..=8.).contains(&s.width))
+            })
+        {
+            return None;
+        }
+        let params = spec.def()?.normalize(&spec.params);
+        let outputs = spec.compute(&Input::new(&[], tf).with_session(session));
+        Some(Self {
+            spec: spec.clone(),
+            tf,
+            session,
+            params,
+            checkpoint: StreamState::default(),
+            checkpoint_at: 0,
+            outputs,
+        })
+    }
+
+    /// Returns the first recomputed output index. No prefix values are copied.
+    pub fn update(&mut self, bars: &[Bar], from: usize) -> usize {
+        let from = if from < self.checkpoint_at || bars.len() < self.checkpoint_at {
+            self.checkpoint = StreamState::default();
+            self.checkpoint_at = 0;
+            0
+        } else {
+            self.checkpoint_at
+        };
+        let mut state = self.checkpoint.clone();
+        for o in &mut self.outputs {
+            o.values.truncate(from);
+        }
+        for i in from..bars.len() {
+            if i + 1 == bars.len() {
+                self.checkpoint = state.clone();
+                self.checkpoint_at = i;
+            }
+            let values = self.push(&mut state, bars, i);
+            for (o, v) in self.outputs.iter_mut().zip(values) {
+                o.values.push(v);
+            }
+        }
+        from
+    }
+
+    fn scalar(&self, b: &Bar) -> f64 {
+        match self.spec.chart.as_ref().map(|c| &c.source) {
+            Some(Source::Open) => b.open,
+            Some(Source::High) => b.high,
+            Some(Source::Low) => b.low,
+            Some(Source::Volume) => b.volume,
+            Some(Source::Hlc3) => (b.high + b.low + b.close) / 3.,
+            _ => b.close,
+        }
+    }
+
+    fn push(&self, s: &mut StreamState, bars: &[Bar], i: usize) -> Vec<f64> {
+        let b = bars[i];
+        let close = self.scalar(&b);
+        let n = self.params.first().copied().unwrap_or(1.) as usize;
+        let ema = |s: &mut SmoothState, v: f64, n: usize| s.push(v, n, 2. / (n as f64 + 1.));
+        match self.spec.code.as_str() {
+            "EMA" => vec![ema(&mut s.smooth[0], close, n)],
+            "ATR" => {
+                let p = i.checked_sub(1).map_or(f64::NAN, |j| bars[j].close);
+                let tr = if p.is_nan() { b.high - b.low } else { b.high.max(p) - b.low.min(p) };
+                vec![s.smooth[0].push(tr, n, 1. / n as f64)]
+            }
+            "RSI" => {
+                let d = i.checked_sub(1).map_or(f64::NAN, |j| close - self.scalar(&bars[j]));
+                let (g, l) = if d.is_finite() { (d.max(0.), (-d).max(0.)) } else { (f64::NAN, f64::NAN) };
+                let g = s.smooth[0].push(g, n, 1. / n as f64);
+                let l = s.smooth[1].push(l, n, 1. / n as f64);
+                vec![if !g.is_finite() || !l.is_finite() {
+                    f64::NAN
+                } else if l == 0. {
+                    if g == 0. { 50. } else { 100. }
+                } else {
+                    100. - 100. / (1. + g / l)
+                }]
+            }
+            "MACD" => {
+                let f = ema(&mut s.smooth[0], close, n);
+                let slow = ema(&mut s.smooth[1], close, self.params[1] as usize);
+                let m = f - slow;
+                let signal = ema(&mut s.smooth[2], m, self.params[2] as usize);
+                vec![m, signal, m - signal]
+            }
+            "VWAP" => {
+                let ts = if self.session != crate::session::Session::Provider && self.tf.is_intraday() {
+                    crate::session::Zone::NewYork.local(b.ts).and_utc().timestamp()
+                } else {
+                    b.ts
+                };
+                let key = super::levels::session_key(self.tf)(ts);
+                if s.session != Some(key) {
+                    s.session = Some(key);
+                    s.sum = 0.;
+                    s.volume = 0.;
+                }
+                s.sum += b.hlc3() * b.volume;
+                s.volume += b.volume;
+                vec![if s.volume > 0. { s.sum / s.volume } else { b.hlc3() }]
+            }
+            _ => {
+                // Same centred rolling sum and periodic re-sum order as stats::windows.
+                if s.reference.is_none() && close.is_finite() {
+                    s.reference = Some(close);
+                }
+                let r = s.reference.unwrap_or(0.);
+                let y = |j: usize| {
+                    let v = self.scalar(&bars[j]);
+                    if v.is_finite() { v - r } else { 0. }
+                };
+                if !close.is_finite() {
+                    s.bad += 1;
+                }
+                if i >= n {
+                    if !self.scalar(&bars[i - n]).is_finite() {
+                        s.bad -= 1;
+                    }
+                    let old = y(i - n);
+                    s.sum -= old;
+                    s.squares -= old * old;
+                }
+                let v = y(i);
+                s.sum += v;
+                s.squares += v * v;
+                if i + 1 >= n && (i + 1).is_multiple_of(n) {
+                    s.sum = 0.;
+                    s.squares = 0.;
+                    for j in i + 1 - n..=i {
+                        let v = y(j);
+                        s.sum += v;
+                        s.squares += v * v;
+                    }
+                }
+                let (middle, sd) = if i + 1 >= n && s.bad == 0 {
+                    let k = n as f64;
+                    let m = s.sum / k;
+                    ((s.sum + r * k) / k, (s.squares / k - m * m).max(0.).sqrt())
+                } else {
+                    (f64::NAN, f64::NAN)
+                };
+                if self.spec.code == "BB" {
+                    let width = self.params[1] * sd;
+                    vec![middle + width, middle, middle - width]
+                } else {
+                    vec![middle]
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Timeframe;
+
+    fn review_assert_stream(
+        spec: &Spec,
+        bars: &[Bar],
+        stream: &StreamingStudy,
+        tf: Timeframe,
+        session: crate::session::Session,
+    ) {
+        let full = evaluate_with_session(std::slice::from_ref(spec), &Input::new(bars, tf), session);
+        let full = full[0].as_ref().unwrap();
+        assert_eq!(stream.outputs.len(), full.len());
+        for (got, want) in stream.outputs.iter().zip(full) {
+            assert_eq!(got.name, want.name);
+            assert_eq!(got.values.len(), want.values.len());
+            for (i, (a, b)) in got.values.iter().zip(&want.values).enumerate() {
+                assert!(
+                    a.to_bits() == b.to_bits() || a.is_nan() && b.is_nan(),
+                    "{} {} index {i}: {a:?} != {b:?}",
+                    spec.code,
+                    got.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_stream_boundary_matrix_and_second_last_invalidation() {
+        use crate::session::Session;
+        for code in ["EMA", "SMA", "RSI", "MACD", "BB", "ATR", "VWAP"] {
+            for period in [1., 3., 14.] {
+                let params = match code {
+                    "MACD" => vec![period, period + 2., period],
+                    "BB" => vec![period, 2.],
+                    "VWAP" => vec![],
+                    _ => vec![period],
+                };
+                let spec = Spec::new(code, &params).unwrap();
+                for tf in [Timeframe::M1, Timeframe::D1] {
+                    for session in [Session::Provider, Session::UsRegular, Session::UsExtended] {
+                        let mut stream = StreamingStudy::new(&spec, tf, session).unwrap();
+                        let mut bars = Vec::new();
+                        for i in 0..40usize {
+                            let c = if i == 7 {
+                                f64::NAN
+                            } else if i < 20 {
+                                10.
+                            } else {
+                                10. + (i as f64).sin()
+                            };
+                            let volume = if i % 9 == 0 {
+                                f64::NAN
+                            } else if i % 3 == 0 {
+                                0.
+                            } else {
+                                2.
+                            };
+                            bars.push(Bar::new(1_767_657_600 + i as i64 * tf.seconds(), c, c + 1., c - 1., c, volume));
+                            stream.update(&bars, i.saturating_sub(1));
+                            review_assert_stream(&spec, &bars, &stream, tf, session);
+                            for _ in 0..3 {
+                                bars[i].close += 0.125;
+                                stream.update(&bars, i);
+                                review_assert_stream(&spec, &bars, &stream, tf, session);
+                            }
+                            if i > 1 {
+                                bars[i - 1].close += 0.25;
+                                assert_eq!(stream.update(&bars, i - 1), 0);
+                                review_assert_stream(&spec, &bars, &stream, tf, session);
+                            }
+                        }
+                        bars.drain(..5);
+                        stream.update(&bars, 0);
+                        review_assert_stream(&spec, &bars, &stream, tf, session);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_stream_vwap_calendar_boundaries_and_flat_warmups() {
+        use crate::session::Session;
+        let ts = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        let times = [
+            "2026-01-30T23:59:00Z",
+            "2026-01-31T00:00:00Z",
+            "2026-01-31T04:59:00Z",
+            "2026-01-31T05:00:00Z",
+            "2026-01-31T23:59:00Z",
+            "2026-02-01T00:00:00Z",
+            "2026-02-01T05:00:00Z",
+        ];
+        let spec = Spec::new("VWAP", &[]).unwrap();
+        for tf in [Timeframe::M1, Timeframe::D1] {
+            for session in [Session::Provider, Session::UsRegular, Session::UsExtended] {
+                let mut stream = StreamingStudy::new(&spec, tf, session).unwrap();
+                let mut bars = Vec::new();
+                for (i, time) in times.iter().enumerate() {
+                    let c = 10. + i as f64 * 2.;
+                    bars.push(Bar::new(ts(time), c, c, c, c, if i == 0 { 0. } else { 2. }));
+                    stream.update(&bars, i.saturating_sub(1));
+                    review_assert_stream(&spec, &bars, &stream, tf, session);
+                }
+            }
+        }
+        let bars: Vec<_> = (0..10).map(|i| Bar::new(i * 60, 10., 12., 8., 10., 0.)).collect();
+        for code in ["RSI", "BB", "ATR", "MACD"] {
+            let params: &[f64] = match code {
+                "BB" => &[3., 2.],
+                "MACD" => &[2., 3., 2.],
+                _ => &[3.],
+            };
+            let spec = Spec::new(code, params).unwrap();
+            let mut stream = StreamingStudy::new(&spec, Timeframe::M1, Session::Provider).unwrap();
+            stream.update(&bars, 0);
+            review_assert_stream(&spec, &bars, &stream, Timeframe::M1, Session::Provider);
+            match code {
+                "RSI" => {
+                    assert!(stream.outputs[0].values[..3].iter().all(|v| v.is_nan()));
+                    assert_eq!(stream.outputs[0].values[3], 50.);
+                }
+                "BB" => {
+                    for o in &stream.outputs {
+                        assert_eq!(o.values[2], 10.);
+                    }
+                }
+                "ATR" => {
+                    assert!(stream.outputs[0].values[0].is_nan());
+                    assert_eq!(stream.outputs[0].values[2], 4.);
+                }
+                "MACD" => {
+                    assert!(stream.outputs[1].values[2].is_nan());
+                    assert_eq!(stream.outputs[1].values[3], 0.);
+                }
+                _ => unreachable!(),
+            }
+        }
+        let spec = Spec::new("ATR", &[1.]).unwrap();
+        let mut stream = StreamingStudy::new(&spec, Timeframe::M1, Session::Provider).unwrap();
+        stream.update(&bars[..1], 0);
+        assert_eq!(stream.outputs[0].values, vec![4.]);
+    }
+
+    #[test]
+    fn review_stream_nondefault_formula_and_displacement_fall_back() {
+        use crate::session::Session;
+        for code in ["EMA", "SMA", "RSI", "MACD", "BB", "ATR", "VWAP"] {
+            let mut spec = Spec::new(code, &[]).unwrap();
+            spec.chart = Some(Settings::new(42, &spec));
+            for displacement in [-3, 2] {
+                spec.chart.as_mut().unwrap().displacement = displacement;
+                assert!(StreamingStudy::new(&spec, Timeframe::D1, Session::Provider).is_none());
+                let bars = crate::sample::generate("REVIEW", Timeframe::D1, 80, 1_790_000_000);
+                let full = evaluate(std::slice::from_ref(&spec), &Input::new(&bars, Timeframe::D1));
+                assert!(full[0].is_ok());
+            }
+            spec.chart.as_mut().unwrap().displacement = 0;
+            spec.chart.as_mut().unwrap().formula.bars_ago = 2;
+            assert!(StreamingStudy::new(&spec, Timeframe::D1, Session::Provider).is_none());
+        }
+    }
 
     #[test]
     fn legacy_band_fill_loads_and_cross_study_template_round_trips() {
@@ -705,5 +1081,96 @@ mod tests {
         specs[0].chart.as_mut().unwrap().formula.bars_ago = 1;
         let lag = evaluate(&specs, &Input::new(&bars, Timeframe::D1));
         assert_ne!(lag[1].as_ref().unwrap()[0].values[10], b[10]);
+    }
+
+    #[test]
+    fn streaming_edits_appends_and_checkpoint_invalidation_are_bit_exact() {
+        let mut seed = 42u64;
+        let mut random = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 32) as f64 / u32::MAX as f64
+        };
+        for size in [1, 2, 3, 13, 14, 15, 19, 20, 21, 49, 50, 51, 99, 100, 101, 199, 200, 201, 1000, 100_000] {
+            let original: Vec<_> = (0..size)
+                .map(|i| {
+                    let c = 100. + random() * 10.;
+                    Bar::new(1_790_000_000 + i as i64 * 60, c, c + 1., c - 1., c, random() * 100.)
+                })
+                .collect();
+            for code in ["EMA", "SMA", "RSI", "MACD", "BB", "ATR", "VWAP"] {
+                let params: &[f64] = match code {
+                    "EMA" => &[50.],
+                    "SMA" => &[200.],
+                    _ => &[],
+                };
+                let spec = Spec::new(code, params).unwrap();
+                for session in [crate::session::Session::Provider, crate::session::Session::UsRegular] {
+                    let mut bars = original.clone();
+                    let mut stream = StreamingStudy::new(&spec, Timeframe::M1, session).unwrap();
+                    stream.update(&bars, 0);
+                    for tick in 0..24 {
+                        let from = if tick == 23 { 0 } else { bars.len() - 1 };
+                        bars[from].close += random() - 0.5;
+                        bars[from].volume += random();
+                        if tick % 3 == 0 {
+                            let mut b = *bars.last().unwrap();
+                            b.ts += 60;
+                            bars.push(b);
+                        }
+                        let start = stream.update(&bars, from);
+                        if from == 0 {
+                            assert_eq!(start, 0);
+                        }
+                        let full = evaluate_with_session(
+                            std::slice::from_ref(&spec),
+                            &Input::new(&bars, Timeframe::M1),
+                            session,
+                        );
+                        for (got, want) in stream.outputs.iter().zip(full[0].as_ref().unwrap()) {
+                            assert_eq!(got.name, want.name);
+                            assert_eq!(got.values.len(), want.values.len());
+                            for (i, (a, b)) in got.values.iter().zip(&want.values).enumerate() {
+                                assert!(
+                                    a.to_bits() == b.to_bits() || a.is_nan() && b.is_nan(),
+                                    "{code} size {size} tick {tick} output {} index {i}: {a} != {b}",
+                                    got.name
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_scalar_sources_and_missing_values_match_full_evaluation() {
+        for source in [Source::Open, Source::High, Source::Low, Source::Close, Source::Hlc3, Source::Volume] {
+            for code in ["EMA", "SMA", "RSI", "MACD", "BB"] {
+                let mut spec = Spec::new(code, &[]).unwrap();
+                spec.chart = Some(Settings::new(1, &spec));
+                spec.chart.as_mut().unwrap().source = source.clone();
+                let mut stream = StreamingStudy::new(&spec, Timeframe::M1, crate::session::Session::Provider).unwrap();
+                let mut bars = Vec::new();
+                for i in 0..130 {
+                    let c = if i % 17 == 0 { f64::NAN } else { 100. + (i as f64).sin() };
+                    let from = bars.len().saturating_sub(1);
+                    bars.push(Bar::new(i * 60, c, c + 1., c - 1., c, c * 10.));
+                    stream.update(&bars, from);
+                    let full = evaluate(std::slice::from_ref(&spec), &Input::new(&bars, Timeframe::M1));
+                    for (got, want) in stream.outputs.iter().zip(full[0].as_ref().unwrap()) {
+                        assert!(
+                            got.values
+                                .iter()
+                                .zip(&want.values)
+                                .all(|(a, b)| a.to_bits() == b.to_bits() || a.is_nan() && b.is_nan()),
+                            "{code} {source:?} at {i}"
+                        );
+                    }
+                }
+                spec.chart.as_mut().unwrap().displacement = 1;
+                assert!(StreamingStudy::new(&spec, Timeframe::M1, crate::session::Session::Provider).is_none());
+            }
+        }
     }
 }

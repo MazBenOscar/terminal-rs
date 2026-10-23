@@ -3,6 +3,7 @@
 //!
 //! `cargo run --release -p tr-chart --example framebench [bars]`
 //! `cargo run --release -p tr-chart --example framebench -- --live` compares live updates.
+//! `cargo run --release -p tr-chart --example framebench -- --studies` compares study refreshes.
 
 use std::time::{Duration, Instant};
 
@@ -96,7 +97,79 @@ fn live_bench() {
     println!("LIVE equivalence: passed (100000 bars, 600 ticks, 10 appends)");
 }
 
+fn study_bench() {
+    use indicators::registry::{Input, Spec};
+    use indicators::study::{StreamingStudy, evaluate};
+    let specs: Vec<_> = ["EMA 50", "EMA 100", "SMA 200", "RSI 14", "MACD", "BB 20"]
+        .iter()
+        .map(|label| {
+            let mut words = label.split_whitespace();
+            Spec::parse(words.next().unwrap(), &words.collect::<Vec<_>>()).unwrap()
+        })
+        .collect();
+    let mut bars = sample::generate("STUDIES", Timeframe::M1, 100_000, 1_790_000_000);
+    let mut streams: Vec<_> =
+        specs.iter().map(|spec| StreamingStudy::new(spec, Timeframe::M1, Default::default()).unwrap()).collect();
+    let mut lines: Vec<Vec<_>> = streams
+        .iter_mut()
+        .map(|stream| {
+            stream.update(&bars, 0);
+            stream.outputs.iter().map(|o| line_ref(&o.values)).collect()
+        })
+        .collect();
+    let (mut old_times, mut new_times) = (Vec::new(), Vec::new());
+    for tick in 1..=100 {
+        let from = bars.len() - 1;
+        let b = bars.last_mut().unwrap();
+        b.close += if tick % 2 == 0 { 0.03 } else { -0.02 };
+        b.high = b.high.max(b.close);
+        b.low = b.low.min(b.close);
+        b.volume += 1.;
+        if tick % 10 == 0 {
+            let mut b = *bars.last().unwrap();
+            b.ts += 60;
+            bars.push(b);
+        }
+        let t = Instant::now();
+        let old = evaluate(&specs, &Input::new(&bars, Timeframe::M1));
+        let fresh: Vec<_> = old.iter().flat_map(|r| r.as_ref().unwrap().iter().map(|o| line_ref(&o.values))).collect();
+        std::hint::black_box(&fresh);
+        old_times.push(t.elapsed());
+        let t = Instant::now();
+        for (stream, lines) in streams.iter_mut().zip(&mut lines) {
+            let first = stream.update(&bars, from);
+            for (output, line) in stream.outputs.iter().zip(lines) {
+                if line.update_tail(&output.values, first).is_none() {
+                    *line = line_ref(&output.values);
+                }
+            }
+        }
+        new_times.push(t.elapsed());
+        for (stream, full) in streams.iter().zip(&old) {
+            for (a, b) in stream.outputs.iter().zip(full.as_ref().unwrap()) {
+                assert_eq!(a.values.len(), b.values.len());
+                assert!(
+                    a.values.iter().zip(&b.values).all(|(a, b)| a.to_bits() == b.to_bits() || a.is_nan() && b.is_nan())
+                );
+            }
+        }
+    }
+    for (name, times) in [("OLD", &mut old_times), ("NEW", &mut new_times)] {
+        println!(
+            "STUDIES {name}: p50 {:.3} ms, p95 {:.3} ms, p99 {:.3} ms",
+            pct(times, 0.5),
+            pct(times, 0.95),
+            pct(times, 0.99)
+        );
+    }
+    println!("STUDIES bit-equivalence: passed (100000 bars, 100 refreshes, 10 appends)");
+}
+
 fn main() {
+    if std::env::args().any(|arg| arg == "--studies") {
+        study_bench();
+        return;
+    }
     if std::env::args().any(|arg| arg == "--live") {
         live_bench();
         return;

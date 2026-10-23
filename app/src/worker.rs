@@ -154,6 +154,7 @@ pub enum Request {
         limit: usize,
     },
     Indicators {
+        from: usize,
         revision: u64,
         pane: PaneId,
         generation: u64,
@@ -167,6 +168,7 @@ pub enum Request {
         session: tr_core::session::Session,
     },
     Compare {
+        from: usize,
         revision: u64,
         pane: PaneId,
         generation: u64,
@@ -174,6 +176,9 @@ pub enum Request {
         tf: Timeframe,
         options: tr_data::HistoryOptions,
         base: Arc<Vec<Bar>>,
+    },
+    SessionHistory {
+        history: SessionHistory,
     },
     CompareSearch {
         pane: PaneId,
@@ -312,6 +317,29 @@ pub struct CapsError {
     pub retry_after: Option<Duration>,
 }
 
+pub struct SessionHistory {
+    pub pane: PaneId,
+    pub generation: u64,
+    pub revision: u64,
+    pub tf: Timeframe,
+    pub session: tr_core::session::Session,
+    pub source: Arc<Vec<Bar>>,
+    pub prepended: usize,
+    pub first_visible: Option<i64>,
+    pub from_cache: bool,
+    pub exhausted: bool,
+    pub live: bool,
+}
+
+pub(crate) fn filter_history(history: &mut SessionHistory) -> (Arc<Vec<Bar>>, SeriesGpu) {
+    let bars = Arc::new(history.session.filter(&history.source, history.tf));
+    if history.prepended > 0 {
+        history.prepended = history.first_visible.map_or(0, |ts| bars.partition_point(|b| b.ts < ts));
+    }
+    let gpu = SeriesGpu::build(&bars);
+    (bars, gpu)
+}
+
 pub struct BuiltIndicator {
     pub spec: IndicatorSpec,
     pub overlays: Vec<(String, Overlay)>,
@@ -334,6 +362,11 @@ pub struct Profile {
 }
 
 pub enum Response {
+    SessionHistory {
+        history: SessionHistory,
+        bars: Arc<Vec<Bar>>,
+        gpu: SeriesGpu,
+    },
     CryptoScanStats {
         pane: PaneId,
         generation: u64,
@@ -585,12 +618,207 @@ fn study_history_fresh(c: &StudyHistory, end: i64, start: i64, limit: usize, now
 
 type StudyFetches = HashMap<(String, Timeframe), Arc<Mutex<()>>>;
 
+type StudyLines = HashMap<(usize, String), tr_chart::gpu::LineRef>;
+
+#[derive(Default)]
+struct StudyPaneCache {
+    identity: Option<(u64, Timeframe, Vec<IndicatorSpec>, theme::Palette, tr_core::session::Session)>,
+    revision: u64,
+    streams: Vec<Option<tr_core::indicators::study::StreamingStudy>>,
+    templates: Vec<BuiltIndicator>,
+    lines: StudyLines,
+    children: Vec<Self>,
+}
+
+fn patch_study_line(line: &mut tr_chart::gpu::LineRef, values: &[f64], from: usize, markers: bool) {
+    let first = {
+        let p = line.pyramid.read().expect("pyramid lock");
+        if values.len() < p.len0 || from > p.len0 {
+            None
+        } else {
+            Some(
+                (from..p.len0)
+                    .find(|&i| {
+                        let (a, b) = (p.data[i][1], values[i] as f32);
+                        a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan())
+                    })
+                    .unwrap_or(p.len0),
+            )
+        }
+    };
+    if let Some(first) = first
+        && (first == values.len() || line.update_tail(values, first).is_some())
+    {
+        return;
+    }
+    *line = if markers { marker_ref(values) } else { line_ref(values) };
+}
+
+impl StudyPaneCache {
+    fn build(&mut self, request: StudyBuild<'_>) -> Vec<BuiltIndicator> {
+        let StudyBuild { generation, revision, from, bars, tf, specs, palette, session, histories } = request;
+        let identity = (generation, tf, specs.to_vec(), *palette, session);
+        if self.identity.as_ref() != Some(&identity) {
+            *self = Self::default();
+            self.identity = Some(identity);
+            self.streams =
+                specs.iter().map(|spec| tr_core::indicators::study::StreamingStudy::new(spec, tf, session)).collect();
+        }
+        let from = if revision == self.revision + 1 { from } else { 0 };
+        self.revision = revision;
+        if from == 0 {
+            self.lines.clear();
+            self.templates.clear();
+        }
+        let streaming = self.streams.iter().all(Option::is_some);
+        if !streaming && self.streams.iter().any(Option::is_some) && independent_specs(specs) {
+            self.children.resize_with(specs.len(), Self::default);
+            return self
+                .children
+                .iter_mut()
+                .zip(specs)
+                .enumerate()
+                .flat_map(|(index, (cache, spec))| {
+                    let mut palette = *palette;
+                    if spec.chart.is_none() {
+                        let colors = palette.series.len();
+                        palette.series.rotate_left(index % colors);
+                    }
+                    cache.build(StudyBuild {
+                        generation,
+                        revision,
+                        from,
+                        bars,
+                        tf,
+                        specs: std::slice::from_ref(spec),
+                        palette: &palette,
+                        session,
+                        histories,
+                    })
+                })
+                .collect();
+        }
+        if streaming {
+            let starts: Vec<_> = self.streams.iter_mut().flatten().map(|stream| stream.update(bars, from)).collect();
+            if !self.templates.is_empty() && from != 0 {
+                return self
+                    .templates
+                    .iter_mut()
+                    .zip(self.streams.iter().flatten())
+                    .zip(starts)
+                    .map(|((template, stream), start)| {
+                        for (name, overlay) in &mut template.overlays {
+                            if let Some(output) = stream.outputs.iter().find(|o| o.name == name) {
+                                patch_study_line(
+                                    &mut overlay.line,
+                                    &output.values,
+                                    start,
+                                    overlay.kind == LineKind::Dots,
+                                );
+                            }
+                        }
+                        BuiltIndicator {
+                            spec: template.spec.clone(),
+                            overlays: template.overlays.clone(),
+                            error: template.error.clone(),
+                            fill: None,
+                            ports: template.ports.clone(),
+                            bounds: Vec::new(),
+                            readouts: template.readouts.clone(),
+                        }
+                    })
+                    .collect();
+            }
+        }
+        let built = build_indicators_cached(bars, tf, specs, palette, session, histories, Some(&mut self.lines));
+        if streaming {
+            self.templates = built
+                .iter()
+                .map(|b| BuiltIndicator {
+                    spec: b.spec.clone(),
+                    overlays: b.overlays.clone(),
+                    error: b.error.clone(),
+                    fill: None,
+                    ports: b.ports.clone(),
+                    bounds: Vec::new(),
+                    readouts: b.readouts.clone(),
+                })
+                .collect();
+        }
+        built
+    }
+}
+
+struct StudyBuild<'a> {
+    generation: u64,
+    revision: u64,
+    from: usize,
+    bars: &'a [Bar],
+    tf: Timeframe,
+    specs: &'a [IndicatorSpec],
+    palette: &'a theme::Palette,
+    session: tr_core::session::Session,
+    histories: &'a StudyHistories,
+}
+
+struct CompareCache {
+    generation: u64,
+    revision: u64,
+    tf: Timeframe,
+    options: tr_data::HistoryOptions,
+    first: i64,
+    len: usize,
+    base_times: Vec<i64>,
+    bars: Vec<Bar>,
+    values: Vec<f64>,
+    finite: usize,
+    line: tr_chart::gpu::LineRef,
+}
+
+impl CompareCache {
+    fn can_merge(&self, other: &[Bar], limit: usize) -> bool {
+        let Some(first) = other.first() else { return false };
+        let start = self.bars.partition_point(|b| b.ts < first.ts);
+        let count = start + other.len();
+        // A different history count would move the full-fetch left edge. Refetch
+        // rather than silently changing the last-at-or-before alignment there.
+        count == limit && other.iter().any(|b| self.bars.binary_search_by_key(&b.ts, |old| old.ts).is_ok())
+    }
+
+    fn tail_limit(
+        &self,
+        identity: (u64, u64, Timeframe, tr_data::HistoryOptions),
+        base: &[Bar],
+        from: usize,
+    ) -> Option<usize> {
+        let (generation, revision, tf, options) = identity;
+        if self.generation != generation
+            || self.revision + 1 != revision
+            || self.tf != tf
+            || self.options != options
+            || base.first()?.ts != self.first
+            || base.len() < self.len
+            // A short provider history may roll its left edge independently of the
+            // chart. Only a full fetch can tell which cached bars have expired.
+            || self.bars.len() < self.len.max(100)
+            || from == 0
+            || from > self.len
+        {
+            return None;
+        }
+        let anchor = self.bars.last()?.ts.min(base.get(from.min(base.len() - 1))?.ts);
+        Some(((base.last()?.ts - anchor).max(0) / tf.seconds()) as usize + 3)
+    }
+}
+
 struct Shared {
     provider: Provider,
     /// Shared across scanner panes; opening more panes cannot multiply exchange load.
     scan_slots: tokio::sync::Semaphore,
     names: Mutex<Option<crate::security_names::Names>>,
     study_histories: std::sync::Mutex<HashMap<(String, Timeframe), StudyHistory>>,
+    study_outputs: std::sync::Mutex<HashMap<PaneId, Arc<std::sync::Mutex<StudyPaneCache>>>>,
+    compare_outputs: std::sync::Mutex<HashMap<(PaneId, String), CompareCache>>,
     study_fetches: std::sync::Mutex<StudyFetches>,
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
     /// tagged with the pane's load generation.
@@ -614,10 +842,15 @@ pub use tr_alerts::data_dir;
 impl Worker {
     #[cfg(test)]
     pub fn inert() -> Self {
-        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        Self::recording().0
+    }
+
+    #[cfg(test)]
+    pub fn recording() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Request>) {
+        let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
         let (_, rx) = mpsc::channel();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        Self { tx, rx, _rt: rt }
+        (Self { tx, rx, _rt: rt }, requests)
     }
 
     pub fn spawn(ctx: egui::Context, provider: Provider) -> anyhow::Result<Self> {
@@ -643,6 +876,8 @@ impl Worker {
             provider,
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
+            study_outputs: Default::default(),
+            compare_outputs: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
@@ -746,8 +981,21 @@ pub(crate) fn smooth_steps(values: &[f64]) -> Vec<f64> {
     out
 }
 
-fn overlay(values: &[f64], color: egui::Color32, kind: LineKind) -> Overlay {
-    let line = if kind == LineKind::Dots { marker_ref(values) } else { line_ref(values) };
+fn overlay(
+    values: &[f64],
+    color: egui::Color32,
+    kind: LineKind,
+    key: (usize, String),
+    cache: &mut Option<&mut StudyLines>,
+) -> Overlay {
+    let build = || if kind == LineKind::Dots { marker_ref(values) } else { line_ref(values) };
+    let line = if let Some(cache) = cache {
+        let line = cache.entry(key).or_insert_with(build);
+        patch_study_line(line, values, 0, kind == LineKind::Dots);
+        line.clone()
+    } else {
+        build()
+    };
     Overlay { line, color: theme::rgba(color), kind, scale: 1.0, width: 1.3, histogram_color: None }
 }
 
@@ -763,6 +1011,7 @@ pub fn build_indicators(
     build_indicators_session(bars, tf, specs, palette, tr_core::session::Session::Provider, &StudyHistories::new())
 }
 
+#[cfg(test)]
 pub(crate) fn build_indicators_session(
     bars: &[Bar],
     tf: Timeframe,
@@ -771,9 +1020,51 @@ pub(crate) fn build_indicators_session(
     session: tr_core::session::Session,
     histories: &StudyHistories,
 ) -> Vec<BuiltIndicator> {
+    build_indicators_cached(bars, tf, specs, palette, session, histories, None)
+}
+
+fn independent_specs(specs: &[IndicatorSpec]) -> bool {
+    use tr_core::indicators::study::{Pane, Source};
+    specs.iter().all(|spec| {
+        spec.chart.as_ref().is_none_or(|c| {
+            !matches!(c.source, Source::Output { .. }) && !matches!(c.pane, Pane::With(_)) && c.fill.is_none()
+        })
+    })
+}
+
+fn calculate_studies(
+    specs: &[IndicatorSpec],
+    input: &Input<'_>,
+    session: tr_core::session::Session,
+    histories: &StudyHistories,
+) -> Vec<Result<Vec<tr_core::indicators::registry::Output>, String>> {
+    use tr_core::indicators::study::evaluate_with_histories;
+    let independent = independent_specs(specs);
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
+    if !independent || specs.len() < 2 || input.bars.len() < 4096 || workers == 1 {
+        return evaluate_with_histories(specs, input, session, histories);
+    }
+    std::thread::scope(|scope| {
+        let tasks: Vec<_> = specs
+            .chunks(specs.len().div_ceil(workers))
+            .map(|chunk| scope.spawn(move || evaluate_with_histories(chunk, input, session, histories)))
+            .collect();
+        tasks.into_iter().flat_map(|task| task.join().expect("study calculation panicked")).collect()
+    })
+}
+
+fn build_indicators_cached(
+    bars: &[Bar],
+    tf: Timeframe,
+    specs: &[IndicatorSpec],
+    palette: &theme::Palette,
+    session: tr_core::session::Session,
+    histories: &StudyHistories,
+    mut cache: Option<&mut StudyLines>,
+) -> Vec<BuiltIndicator> {
     let input = Input::new(bars, tf);
     let colors = palette.series.len();
-    let calculated = tr_core::indicators::study::evaluate_with_histories(specs, &input, session, histories);
+    let calculated = calculate_studies(specs, &input, session, histories);
     let lookup = specs
         .iter()
         .zip(&calculated)
@@ -834,6 +1125,8 @@ pub(crate) fn build_indicators_session(
                         ),
                         egui::Color32::TRANSPARENT,
                         LineKind::Line,
+                        (index, format!("bound:{}", o.name)),
+                        &mut cache,
                     )
                 })
                 .collect();
@@ -887,7 +1180,7 @@ pub(crate) fn build_indicators_session(
                     } else {
                         (values, None)
                     };
-                    let mut overlay = overlay(&drawn, color, kind);
+                    let mut overlay = overlay(&drawn, color, kind, (index, o.name.to_string()), &mut cache);
                     overlay.width = custom.map_or(1.3, |c| c.width);
                     overlay.histogram_color = custom.and_then(|c| c.color).map(|_| theme::rgba(color));
                     Some(((o.name.to_string(), overlay), readout))
@@ -901,18 +1194,20 @@ pub(crate) fn build_indicators_session(
 
 /// Align `other`'s closes to `base` timestamps (last close at or before each bar). The
 /// chart rebases the result to the first visible bar every frame.
+#[cfg(test)]
 pub fn align_compare(base: &[Bar], other: &[Bar]) -> Vec<f64> {
-    let mut out = vec![f64::NAN; base.len()];
+    align_compare_times(base.iter().map(|b| b.ts), other)
+}
+
+fn align_compare_times(base: impl Iterator<Item = i64>, other: &[Bar]) -> Vec<f64> {
     let mut j = 0;
-    for (i, b) in base.iter().enumerate() {
-        while j + 1 < other.len() && other[j + 1].ts <= b.ts {
+    base.map(|ts| {
+        while j + 1 < other.len() && other[j + 1].ts <= ts {
             j += 1;
         }
-        if let Some(o) = other.get(j).filter(|o| o.ts <= b.ts) {
-            out[i] = o.close;
-        }
-    }
-    out
+        other.get(j).filter(|o| o.ts <= ts).map_or(f64::NAN, |o| o.close)
+    })
+    .collect()
 }
 
 fn default_limit(tf: Timeframe) -> usize {
@@ -1207,11 +1502,26 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
             }
         }
-        Request::Indicators { pane, generation, bars, symbol, options, tf, specs, palette, session, revision } => {
+        Request::Indicators {
+            from,
+            pane,
+            generation,
+            bars,
+            symbol,
+            options,
+            tf,
+            specs,
+            palette,
+            session,
+            revision,
+        } => {
             let mut histories = StudyHistories::new();
             let source = chart_options_key(s.provider.as_ref(), &symbol, options);
-            for study_tf in study_timeframes(&specs, tf) {
-                let Some((end, start, limit)) = study_request(&bars, tf, study_tf, &specs) else { continue };
+            let requests: Vec<_> = study_timeframes(&specs, tf)
+                .into_iter()
+                .filter_map(|study_tf| study_request(&bars, tf, study_tf, &specs).map(|request| (study_tf, request)))
+                .collect();
+            for (study_tf, (end, start, limit)) in requests {
                 let key = (source.clone(), study_tf);
                 let fetch = {
                     let mut fetches = s.study_fetches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1253,21 +1563,114 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 }
                 histories.insert(study_tf, history);
             }
+            let shared = s.clone();
             let built = tokio::task::spawn_blocking(move || {
-                build_indicators_session(&bars, tf, &specs, &palette, session, &histories)
+                let cache = shared
+                    .study_outputs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(pane)
+                    .or_default()
+                    .clone();
+                let built = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).build(StudyBuild {
+                    generation,
+                    revision,
+                    from,
+                    bars: &bars,
+                    tf,
+                    specs: &specs,
+                    palette: &palette,
+                    session,
+                    histories: &histories,
+                });
+                drop(bars);
+                built
             })
             .await
             .unwrap_or_default();
             s.send(Response::Indicators { pane, generation, built, revision });
         }
-        Request::Compare { pane, generation, symbol, tf, base, revision, options } => {
-            let limit = base.len().max(100);
+        Request::Compare { from, pane, generation, symbol, tf, base, revision, options } => {
+            let key = (pane, symbol.clone());
+            let mut cached = s.compare_outputs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
+            let tail_limit =
+                cached.as_ref().and_then(|c| c.tail_limit((generation, revision, tf, options), &base, from));
+            let limit = tail_limit.unwrap_or_else(|| base.len().max(100));
             let end = base.last().map(|b| tr_core::session::next_bucket(tf, b.ts));
-            match s.provider.chart_history(&symbol, tf, end, limit, options).await {
+            let full_limit = base.len().max(100);
+            let (base, mut base_times) = if tail_limit.is_some() {
+                // Keep cached timestamps for a possible full-fetch fallback; copy only
+                // the changed base tail, and release the chart snapshot before I/O.
+                let mut times = std::mem::take(&mut cached.as_mut().unwrap().base_times);
+                times.truncate(from);
+                times.extend(base[from..].iter().map(|b| b.ts));
+                drop(base);
+                (None, times)
+            } else {
+                (Some(base), Vec::new())
+            };
+            let fetched = s.provider.chart_history(&symbol, tf, end, limit, options).await;
+            let fetched = match fetched {
+                Ok(other) if tail_limit.is_some() && !cached.as_ref().unwrap().can_merge(&other, full_limit) => {
+                    cached = None;
+                    s.provider.chart_history(&symbol, tf, end, full_limit, options).await
+                }
+                other => other,
+            };
+            match fetched {
                 Ok(other) => {
+                    if tail_limit.is_none() {
+                        cached = None;
+                    }
+                    let shared = s.clone();
                     let line = tokio::task::spawn_blocking(move || {
-                        let values = align_compare(&base, &other);
-                        values.iter().any(|v| v.is_finite()).then(|| line_ref(&values))
+                        if let Some(base) = base {
+                            base_times.extend(base.iter().map(|b| b.ts));
+                        }
+                        let base = base_times;
+                        let (other, values, line, finite) = if let Some(mut c) = cached {
+                            let start =
+                                other.first().map_or(c.bars.len(), |b| c.bars.partition_point(|old| old.ts < b.ts));
+                            c.bars.truncate(start);
+                            c.bars.extend(other);
+                            // A revised comparison candle can affect base bars before `from`.
+                            let from =
+                                from.min(base.partition_point(|ts| *ts < c.bars[start.min(c.bars.len() - 1)].ts));
+                            c.finite -= c.values[from..].iter().filter(|v| v.is_finite()).count();
+                            c.values.truncate(from);
+                            let other_from = base
+                                .get(from)
+                                .map_or(c.bars.len(), |ts| c.bars.partition_point(|o| o.ts <= *ts).saturating_sub(1));
+                            c.values.extend(align_compare_times(base[from..].iter().copied(), &c.bars[other_from..]));
+                            c.finite += c.values[from..].iter().filter(|v| v.is_finite()).count();
+                            patch_study_line(&mut c.line, &c.values, from, false);
+                            (c.bars, c.values, c.line, c.finite)
+                        } else {
+                            let values = align_compare_times(base.iter().copied(), &other);
+                            let finite = values.iter().filter(|v| v.is_finite()).count();
+                            let line = line_ref(&values);
+                            (other, values, line, finite)
+                        };
+                        let result = (finite != 0).then(|| line.clone());
+                        if let Some(first) = base.first() {
+                            shared.compare_outputs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(
+                                key,
+                                CompareCache {
+                                    generation,
+                                    revision,
+                                    tf,
+                                    options,
+                                    first: *first,
+                                    len: base.len(),
+                                    base_times: base,
+                                    bars: other,
+                                    values,
+                                    finite,
+                                    line,
+                                },
+                            );
+                        }
+                        result
                     })
                     .await;
                     if let Ok(Some(line)) = line {
@@ -1285,6 +1688,18 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 Err(e) => {
                     s.send(Response::CompareError { pane, generation, revision, symbol, error: format!("{e:#}") })
                 }
+            }
+        }
+        Request::SessionHistory { mut history } => {
+            if let Ok((history, bars, gpu)) = tokio::task::spawn_blocking(move || {
+                let (bars, gpu) = filter_history(&mut history);
+                // The UI already retains the raw source for live tail filtering.
+                history.source = Arc::new(Vec::new());
+                (history, bars, gpu)
+            })
+            .await
+            {
+                s.send(Response::SessionHistory { history, bars, gpu });
             }
         }
         Request::CompareSearch { pane, query } => {
@@ -2234,6 +2649,8 @@ mod tests {
                 provider,
                 scan_slots: tokio::sync::Semaphore::new(4),
                 study_histories: Default::default(),
+                study_outputs: Default::default(),
+                compare_outputs: Default::default(),
                 study_fetches: Default::default(),
                 names: Mutex::new(None),
                 series: Default::default(),
@@ -3057,6 +3474,8 @@ mod tests {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)),
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
+            study_outputs: Default::default(),
+            compare_outputs: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
@@ -3198,6 +3617,8 @@ mod tests {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 20)),
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
+            study_outputs: Default::default(),
+            compare_outputs: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
@@ -3276,6 +3697,8 @@ mod tests {
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 400)),
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
+            study_outputs: Default::default(),
+            compare_outputs: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
@@ -3349,6 +3772,8 @@ mod tests {
             provider: fixture.clone(),
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
+            study_outputs: Default::default(),
+            compare_outputs: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
@@ -3429,6 +3854,8 @@ mod tests {
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
+            study_outputs: Default::default(),
+            compare_outputs: Default::default(),
             study_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
@@ -3944,5 +4371,590 @@ mod tests {
             assert_eq!(Arc::as_ptr(&map[&1].1) as usize, identity);
         }
         assert_eq!(clears, 1);
+    }
+
+    fn review_equal_built(got: &[BuiltIndicator], want: &[BuiltIndicator]) {
+        assert_eq!(got.len(), want.len());
+        for (got, want) in got.iter().zip(want) {
+            assert_eq!(got.spec, want.spec);
+            assert_eq!(got.error, want.error);
+            assert_eq!(got.ports, want.ports);
+            assert_eq!(got.overlays.len(), want.overlays.len());
+            assert_eq!(got.bounds.len(), want.bounds.len());
+            assert_eq!(got.fill.is_some(), want.fill.is_some());
+            for ((gn, g), (wn, w)) in got.overlays.iter().zip(&want.overlays) {
+                assert_eq!(gn, wn);
+                assert_eq!(g.color, w.color);
+                assert_eq!(g.kind, w.kind);
+                let g = g.line.pyramid.read().unwrap();
+                let w = w.line.pyramid.read().unwrap();
+                assert_eq!(g.len0, w.len0);
+                for k in 0..g.levels() {
+                    for (a, b) in g.data[g.offsets[k]..g.offsets[k] + g.level_len(k)]
+                        .iter()
+                        .zip(&w.data[w.offsets[k]..w.offsets[k] + w.level_len(k)])
+                    {
+                        assert!(
+                            a[0] == b[0] && (a[1].to_bits() == b[1].to_bits() || a[1].is_nan() && b[1].is_nan()),
+                            "{gn} level {k}: {a:?} != {b:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_cache_identity_paging_resync_and_stale_revisions_match_fresh() {
+        use tr_core::indicators::study::{Source, assign_ids};
+        let mut bars = tr_core::sample::generate("CACHE", Timeframe::M1, 5000, 1_790_000_000);
+        let mut specs = vec![IndicatorSpec::new("EMA", &[3.]).unwrap(); 2];
+        assign_ids(&mut specs);
+        let saved = specs[1].clone();
+        let mut cache = StudyPaneCache::default();
+        let mut palette = theme::palette();
+        let mut session = tr_core::session::Session::Provider;
+        let histories = StudyHistories::new();
+        let mut tf = Timeframe::M1;
+        let mut generation = 1;
+        for step in 1..=15 {
+            let mut from = bars.len() - 1;
+            bars.last_mut().unwrap().close += 0.5;
+            match step {
+                1 => from = 0,
+                2 => specs[0].params[0] = 7., // same instance ID
+                3 => {
+                    specs.pop();
+                }
+                4 => specs.push(saved.clone()),
+                5 => palette.series.rotate_left(1),
+                6 => session = tr_core::session::Session::UsRegular,
+                7 => {
+                    bars = tr_core::sample::generate("NEW SYMBOL", tf, 5000, 1_790_000_000);
+                    from = 0;
+                }
+                8 => tf = Timeframe::D1,
+                9 => {
+                    let mut first = bars[0];
+                    first.ts -= tf.seconds();
+                    bars.insert(0, first);
+                    from = 0;
+                }
+                10 => {
+                    bars[100].close += 30.;
+                    from = 100;
+                }
+                11 => {
+                    bars[200].close += 20.;
+                    from = 0;
+                }
+                12 => specs[0].chart.as_mut().unwrap().source = Source::Hlc3,
+                13 => generation += 1,
+                _ => {}
+            }
+            let revision = match step {
+                14 => 9,
+                15 => 20,
+                _ => step,
+            };
+            let got = cache.build(StudyBuild {
+                generation,
+                revision,
+                from,
+                bars: &bars,
+                tf,
+                specs: &specs,
+                palette: &palette,
+                session,
+                histories: &histories,
+            });
+            let want = build_indicators_session(&bars, tf, &specs, &palette, session, &histories);
+            review_equal_built(&got, &want);
+        }
+    }
+
+    #[test]
+    fn review_sparse_marker_histogram_tail_visibility_and_length_changes() {
+        for markers in [false, true] {
+            let mut values = vec![f64::NAN; 127];
+            let mut line = if markers { marker_ref(&values) } else { line_ref(&values) };
+            for step in 0..40 {
+                let from = values.len() - 1;
+                values[from] = if step % 2 == 0 { 42. } else { f64::NAN };
+                if step % 3 == 0 {
+                    values.push(if step % 2 == 0 { 4. } else { f64::NAN });
+                }
+                patch_study_line(&mut line, &values, from, markers);
+                let rebuilt = if markers { marker_ref(&values) } else { line_ref(&values) };
+                let got = line.pyramid.read().unwrap();
+                let want = rebuilt.pyramid.read().unwrap();
+                assert_eq!(got.len0, want.len0);
+                for k in 0..got.levels() {
+                    for (a, b) in got.data[got.offsets[k]..got.offsets[k] + got.level_len(k)]
+                        .iter()
+                        .zip(&want.data[want.offsets[k]..want.offsets[k] + want.level_len(k)])
+                    {
+                        assert!(a[0] == b[0] && (a[1] == b[1] || a[1].is_nan() && b[1].is_nan()));
+                    }
+                }
+            }
+            values.truncate(10);
+            patch_study_line(&mut line, &values, 0, markers);
+            assert_eq!(line.pyramid.read().unwrap().len0, 10);
+        }
+    }
+
+    #[test]
+    fn stable_study_lines_patch_exact_dirty_ranges_and_invalidate_identity() {
+        let mut bars = tr_core::sample::generate("CACHE", Timeframe::M1, 1000, 1_790_000_000);
+        let mut cache = StudyPaneCache::default();
+        let mut specs = vec![IndicatorSpec::new("EMA", &[50.]).unwrap()];
+        let mut palette = theme::palette();
+        let mut session = tr_core::session::Session::Provider;
+        let histories = StudyHistories::new();
+        let mut generation = 1;
+        let mut previous = None;
+        for revision in 1..=7 {
+            let from = if revision == 1 { 0 } else { 999 };
+            bars[999].close += 1.;
+            match revision {
+                3 => specs[0] = IndicatorSpec::new("EMA", &[100.]).unwrap(),
+                4 => palette.amber = egui::Color32::RED,
+                5 => session = tr_core::session::Session::UsRegular,
+                6 => generation += 1,
+                _ => {}
+            }
+            let built = cache.build(StudyBuild {
+                generation,
+                revision,
+                from,
+                bars: &bars,
+                tf: Timeframe::M1,
+                specs: &specs,
+                palette: &palette,
+                session,
+                histories: &histories,
+            });
+            let line = &built[0].overlays[0].1.line;
+            if let Some((key, version)) = previous {
+                if matches!(revision, 2 | 7) {
+                    assert_eq!(line.key, key);
+                    assert!(line.version > version);
+                    let p = line.pyramid.read().unwrap();
+                    let expected: Vec<_> = p
+                        .offsets
+                        .iter()
+                        .enumerate()
+                        .map(|(k, off)| (off + (999 >> k)) * 8..(off + p.level_len(k)) * 8)
+                        .collect();
+                    assert_eq!(p.dirty, expected);
+                } else {
+                    assert_ne!(line.key, key);
+                }
+            }
+            previous = Some((line.key, line.version));
+        }
+        for markers in [false, true] {
+            let mut values = vec![f64::NAN; 1000];
+            values[999] = 1.;
+            let mut line = if markers { marker_ref(&values) } else { line_ref(&values) };
+            let key = line.key;
+            values[999] = 2.;
+            patch_study_line(&mut line, &values, 0, markers);
+            assert_eq!(line.key, key);
+            assert_eq!(line.pyramid.read().unwrap().dirty[0], 999 * 8..1000 * 8);
+        }
+    }
+
+    struct ComparisonFixture {
+        bars: std::sync::Mutex<Vec<Bar>>,
+        limits: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for ComparisonFixture {
+        fn name(&self) -> &str {
+            "comparison fixture"
+        }
+        async fn history(&self, _: &str, _: Timeframe, end: Option<i64>, limit: usize) -> anyhow::Result<Vec<Bar>> {
+            self.limits.lock().unwrap().push(limit);
+            let bars = self.bars.lock().unwrap();
+            let end = bars.partition_point(|b| end.is_none_or(|end| b.ts < end));
+            Ok(bars[end.saturating_sub(limit)..end].to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn review_comparison_sparse_sessions_and_extra_bars() {
+        review_comparison_modes(0..3).await;
+    }
+
+    #[tokio::test]
+    async fn review_comparison_rolling_short_history_matches_full_fetch() {
+        review_comparison_modes(3..4).await;
+    }
+
+    async fn review_comparison_modes(modes: std::ops::Range<usize>) {
+        for mode in modes {
+            let mut base = tr_core::sample::generate("BASE", Timeframe::M1, 160, 1_790_000_000);
+            let provider = Arc::new(ComparisonFixture { bars: Default::default(), limits: Default::default() });
+            let (s, rx) = backfill_shared(provider.clone());
+            for revision in 1..=8 {
+                let mut from = if revision == 1 { 0 } else { base.len() - 1 };
+                if revision > 1 {
+                    let mut next = *base.last().unwrap();
+                    next.ts += 60;
+                    base.push(next);
+                }
+                if revision == 5 {
+                    let mut first = base[0];
+                    first.ts -= 60;
+                    base.insert(0, first);
+                    from = 0;
+                }
+                let mut other = Vec::new();
+                for (i, b) in base.iter().enumerate() {
+                    // Missing candles, different trading hours, twice as many candles,
+                    // and a genuinely short provider history (fewer than requested).
+                    if match mode {
+                        0 => i % 3 != 0,
+                        1 => !(30..110).contains(&i),
+                        3 => i < base.len() - 12,
+                        _ => false,
+                    } {
+                        continue;
+                    }
+                    let mut b = *b;
+                    b.close = i as f64 + revision as f64;
+                    other.push(b);
+                    if mode == 2 {
+                        b.ts += 30;
+                        b.close += 0.5;
+                        other.push(b);
+                    }
+                }
+                // Only the returned overlapping tail is mutable between requests.
+                // Keep all older values fixed, as the incremental contract requires.
+                for b in &mut other {
+                    b.close -= revision as f64;
+                }
+                *provider.bars.lock().unwrap() = other.clone();
+                handle(
+                    &s,
+                    Request::Compare {
+                        pane: 1,
+                        generation: if revision < 7 { 1 } else { 2 },
+                        revision,
+                        from,
+                        symbol: "OTHER".into(),
+                        tf: Timeframe::M1,
+                        base: Arc::new(base.clone()),
+                        options: Default::default(),
+                    },
+                )
+                .await;
+                let Response::Compare { line, .. } = rx.try_recv().unwrap() else {
+                    panic!("comparison mode {mode} revision {revision}")
+                };
+                let end = tr_core::session::next_bucket(Timeframe::M1, base.last().unwrap().ts);
+                other.retain(|b| b.ts < end);
+                let full = align_compare(&base, &other[other.len().saturating_sub(base.len().max(100))..]);
+                let p = line.pyramid.read().unwrap();
+                assert_eq!(p.len0, full.len());
+                for (i, (a, b)) in p.data[..p.len0].iter().zip(&full).enumerate() {
+                    assert!(
+                        a[1].to_bits() == (*b as f32).to_bits() || a[1].is_nan() && b.is_nan(),
+                        "mode {mode} revision {revision} index {i}: {} != {b}",
+                        a[1]
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn comparison_tail_fetch_matches_full_alignment_and_backfill_refetches() {
+        let mut base = tr_core::sample::generate("BASE", Timeframe::M1, 1000, 1_790_000_000);
+        let provider =
+            Arc::new(ComparisonFixture { bars: std::sync::Mutex::new(base.clone()), limits: Default::default() });
+        let (s, rx) = backfill_shared(provider.clone());
+        let mut key = None;
+        for revision in 1..=5 {
+            let from = if matches!(revision, 1 | 4 | 5) { 0 } else { base.len() - 1 };
+            if revision > 1 && revision < 5 {
+                base.last_mut().unwrap().close += 1.;
+                let mut next = *base.last().unwrap();
+                next.ts += 60;
+                base.push(next);
+            }
+            if revision == 4 {
+                let mut first = base[0];
+                first.ts -= 60;
+                base.insert(0, first);
+            }
+            if revision == 5 {
+                base[500].close += 2.;
+            }
+            *provider.bars.lock().unwrap() = base.clone();
+            handle(
+                &s,
+                Request::Compare {
+                    from,
+                    pane: 1,
+                    generation: 1,
+                    symbol: "OTHER".into(),
+                    tf: Timeframe::M1,
+                    base: Arc::new(base.clone()),
+                    revision,
+                    options: Default::default(),
+                },
+            )
+            .await;
+            let Response::Compare { line, .. } = rx.try_recv().unwrap() else { panic!("expected comparison") };
+            let full = align_compare(&base, &provider.bars.lock().unwrap());
+            let p = line.pyramid.read().unwrap();
+            assert!(
+                p.data[..p.len0]
+                    .iter()
+                    .zip(&full)
+                    .all(|(a, b)| a[1].to_bits() == (*b as f32).to_bits() || a[1].is_nan() && b.is_nan())
+            );
+            if matches!(revision, 2 | 3) {
+                assert_eq!(Some(line.key), key);
+            }
+            if revision >= 4 {
+                assert_ne!(Some(line.key), key);
+            }
+            key = Some(line.key);
+        }
+        let limits = provider.limits.lock().unwrap();
+        assert_eq!(limits.len(), 5);
+        assert_eq!(limits[0], 1000);
+        assert!(limits[1] <= 5 && limits[2] <= 5);
+        assert_eq!(limits[3], base.len());
+        assert_eq!(limits[4], base.len());
+    }
+
+    #[tokio::test]
+    async fn comparison_tail_releases_chart_snapshot_before_blocked_fetch() {
+        struct BlockedComparison {
+            bars: Vec<Bar>,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for BlockedComparison {
+            fn name(&self) -> &str {
+                "blocked comparison"
+            }
+            async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, limit: usize) -> anyhow::Result<Vec<Bar>> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(self.bars[self.bars.len().saturating_sub(limit)..].to_vec())
+            }
+        }
+        let mut bars = Arc::new(tr_core::sample::generate("BASE", Timeframe::M1, 1000, 1_790_000_000));
+        let provider = Arc::new(BlockedComparison {
+            bars: bars.as_ref().clone(),
+            entered: Default::default(),
+            release: Default::default(),
+        });
+        let (s, rx) = backfill_shared(provider.clone());
+        for revision in 1..=2 {
+            let request = Request::Compare {
+                from: if revision == 1 { 0 } else { 999 },
+                pane: 1,
+                generation: 1,
+                symbol: "OTHER".into(),
+                tf: Timeframe::M1,
+                base: bars.clone(),
+                revision,
+                options: Default::default(),
+            };
+            let shared = s.clone();
+            let task = tokio::spawn(async move { handle(&shared, request).await });
+            provider.entered.notified().await;
+            assert_eq!(Arc::strong_count(&bars), if revision == 1 { 2 } else { 1 });
+            let pointer = bars.as_ptr();
+            Arc::make_mut(&mut bars).last_mut().unwrap().close += 1.;
+            if revision == 2 {
+                assert_eq!(bars.as_ptr(), pointer);
+            }
+            provider.release.notify_one();
+            task.await.unwrap();
+            assert!(matches!(rx.try_recv().unwrap(), Response::Compare { revision: r, .. } if r == revision));
+        }
+    }
+
+    #[tokio::test]
+    async fn comparison_unaligned_tail_falls_back_to_one_full_fetch() {
+        let mut base = tr_core::sample::generate("BASE", Timeframe::M1, 1000, 1_790_000_000);
+        let provider =
+            Arc::new(ComparisonFixture { bars: std::sync::Mutex::new(base.clone()), limits: Default::default() });
+        let (s, rx) = backfill_shared(provider.clone());
+        for revision in 1..=2 {
+            if revision == 2 {
+                let mut bar = *base.last().unwrap();
+                bar.ts += 60;
+                base.push(bar);
+                *provider.bars.lock().unwrap() = base
+                    .iter()
+                    .map(|b| {
+                        let mut b = *b;
+                        b.ts += 30;
+                        b
+                    })
+                    .collect();
+            }
+            handle(
+                &s,
+                Request::Compare {
+                    from: if revision == 1 { 0 } else { 999 },
+                    pane: 1,
+                    generation: 1,
+                    symbol: "OTHER".into(),
+                    tf: Timeframe::M1,
+                    base: Arc::new(base.clone()),
+                    revision,
+                    options: Default::default(),
+                },
+            )
+            .await;
+            let Response::Compare { line, .. } = rx.try_recv().unwrap() else { panic!("expected comparison") };
+            let other: Vec<_> =
+                provider.bars.lock().unwrap().iter().filter(|b| b.ts < base.last().unwrap().ts + 60).copied().collect();
+            let full = align_compare(&base, &other);
+            let p = line.pyramid.read().unwrap();
+            assert!(
+                p.data[..p.len0]
+                    .iter()
+                    .zip(full)
+                    .all(|(a, b)| a[1].to_bits() == (b as f32).to_bits() || a[1].is_nan() && b.is_nan())
+            );
+        }
+        let limits = provider.limits.lock().unwrap();
+        assert_eq!(limits.len(), 3);
+        assert!(limits[1] <= 5);
+        assert_eq!(limits[2], base.len());
+    }
+
+    #[test]
+    fn parallel_full_studies_preserve_order_values_and_dependency_validation() {
+        let bars = tr_core::sample::generate("PARALLEL", Timeframe::M1, 5000, 1_790_000_000);
+        let input = Input::new(&bars, Timeframe::M1);
+        let mut specs: Vec<_> =
+            ["TEMA", "CCI", "RSI", "EMA"].iter().map(|code| IndicatorSpec::new(code, &[]).unwrap()).collect();
+        tr_core::indicators::study::assign_ids(&mut specs);
+        for dependent in [false, true] {
+            if dependent {
+                specs[2].chart.as_mut().unwrap().source =
+                    tr_core::indicators::study::Source::Output { study: 4, output: "EMA".into() };
+            }
+            let histories = StudyHistories::new();
+            let session = tr_core::session::Session::Provider;
+            let expected = tr_core::indicators::study::evaluate_with_histories(&specs, &input, session, &histories);
+            let actual = calculate_studies(&specs, &input, session, &histories);
+            for (a, b) in actual.iter().zip(&expected) {
+                match (a, b) {
+                    (Ok(a), Ok(b)) => {
+                        for (a, b) in a.iter().zip(b) {
+                            assert_eq!(a.name, b.name);
+                            assert_eq!(a.values.len(), b.values.len());
+                            assert!(
+                                a.values
+                                    .iter()
+                                    .zip(&b.values)
+                                    .all(|(a, b)| a.to_bits() == b.to_bits() || a.is_nan() && b.is_nan())
+                            );
+                        }
+                    }
+                    (Err(a), Err(b)) => assert_eq!(a, b),
+                    _ => panic!("parallel evaluation changed a result"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_path_reuses_markers_histograms_and_lines_without_fresh_pyramids() {
+        let mut bars = tr_core::sample::generate("FULL", Timeframe::M1, 5000, 1_790_000_000);
+        let mut specs: Vec<_> =
+            ["TEMA", "MACD", "EMA"].iter().map(|code| IndicatorSpec::new(code, &[]).unwrap()).collect();
+        tr_core::indicators::study::assign_ids(&mut specs);
+        specs[0].chart.as_mut().unwrap().outputs.insert(
+            "TEMA".into(),
+            tr_core::indicators::study::OutputStyle {
+                plot: Some(tr_core::indicators::study::PlotStyle::Dots),
+                ..Default::default()
+            },
+        );
+        let palette = theme::palette();
+        let histories = StudyHistories::new();
+        let mut cache = StudyPaneCache::default();
+        let mut previous: Vec<u64> = Vec::new();
+        for revision in 1..=3 {
+            bars.last_mut().unwrap().close += 1.;
+            let built = cache.build(StudyBuild {
+                generation: 1,
+                revision,
+                from: if revision == 1 { 0 } else { 4999 },
+                bars: &bars,
+                tf: Timeframe::M1,
+                specs: &specs,
+                palette: &palette,
+                session: tr_core::session::Session::Provider,
+                histories: &histories,
+            });
+            let fresh = build_indicators(&bars, Timeframe::M1, &specs, &palette);
+            let keys: Vec<_> = built.iter().flat_map(|b| b.overlays.iter().map(|(_, o)| o.line.key)).collect();
+            if !previous.is_empty() {
+                assert_eq!(keys, previous);
+            }
+            previous = keys;
+            for (a, b) in built.iter().flat_map(|b| &b.overlays).zip(fresh.iter().flat_map(|b| &b.overlays)) {
+                assert_eq!(a.0, b.0);
+                let a = a.1.line.pyramid.read().unwrap();
+                let b = b.1.line.pyramid.read().unwrap();
+                for k in 0..a.levels() {
+                    let a = &a.data[a.offsets[k]..a.offsets[k] + a.level_len(k)];
+                    let b = &b.data[b.offsets[k]..b.offsets[k] + b.level_len(k)];
+                    assert!(
+                        a.iter()
+                            .zip(b)
+                            .all(|(a, b)| a[1].to_bits() == b[1].to_bits() || a[1].is_nan() && b[1].is_nan())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn worker_session_history_matches_filter_and_preserves_prepend_metadata() {
+        let source = Arc::new(tr_core::sample::generate("SESSION", Timeframe::M1, 2000, 1_790_000_000));
+        let mut history = SessionHistory {
+            pane: 1,
+            generation: 2,
+            revision: 3,
+            tf: Timeframe::M1,
+            session: tr_core::session::Session::UsRegular,
+            source: source.clone(),
+            prepended: 500,
+            first_visible: Some(source[500].ts),
+            from_cache: false,
+            exhausted: true,
+            live: false,
+        };
+        let expected = history.session.filter(&source, history.tf);
+        let expected_gpu = SeriesGpu::build(&expected);
+        let (bars, gpu) = filter_history(&mut history);
+        assert_eq!(*bars, expected);
+        assert_eq!(history.prepended, expected.partition_point(|b| b.ts < source[500].ts));
+        let a = gpu.bars.pyramid.read().unwrap();
+        let b = expected_gpu.bars.pyramid.read().unwrap();
+        for k in 0..a.levels() {
+            assert_eq!(a.level(k), b.level(k));
+        }
+        assert_eq!((history.generation, history.revision, history.exhausted), (2, 3, true));
+        assert!(Arc::ptr_eq(&history.source, &source));
     }
 }

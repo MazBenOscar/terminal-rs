@@ -105,3 +105,62 @@ The in-app gain (about 8% CPU, about 20 MB) is smaller than the per-tick gain
 because a 6,000-bar chart is cheap to rebuild and the remaining cost is indicator
 recomputation and painting; it grows with history length. Indicator work (finding
 2) and session filtering (finding 3) are P1b.
+
+## P1b results (2026-10-22)
+
+`cargo run --release -p tr-chart --example framebench -- --studies` now compares
+full evaluation plus fresh line pyramids against checkpoint resumption plus tail
+patches. The deterministic workload has 100,000 bars, EMA 50, EMA 100, SMA 200,
+RSI 14, MACD and BB 20, and 100 last-bar edits including 10 appends.
+
+| Study refresh | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| OLD | 4.239 ms | 4.821 ms | 5.285 ms |
+| NEW | 0.007 ms | 0.011 ms | 0.019 ms |
+
+Every output is checked bit-for-bit (NaNs compare equal) after every refresh.
+These are CPU calculation/geometry numbers, not GPU frame times or an in-app A/B.
+
+- EMA, SMA, Wilder RSI, MACD, Bollinger Bands, ATR and session-anchored VWAP
+  retain the state before the mutable last bar. Earlier changes restart the
+  calculation; History replacements and revision gaps invalidate the cache.
+  Scalar OHLC/HLC3/volume inputs are supported for the close-based kernels,
+  including SMA/EMA volume averages (there is no separate VMA registry entry).
+- Study lines, markers, histogram lines and transparent bounds keep their keys
+  and patch changed f32 entries. Generation, specs, palette and session are part
+  of the cache identity. Native studies also resume in independent mixed batches.
+- Other study codes, non-default formula settings, multi-timeframe studies, PCF,
+  displacement, fills and pane links use full evaluation.
+  Dependency-bearing batches retain the original graph evaluator. Independent
+  full-evaluation batches use up to four scoped threads for histories of at least
+  4,096 bars. Fill point arrays and validity prefixes remain fresh builds; they
+  are not line pyramids.
+- Indicators and comparisons share the existing UI Arc instead of copying the
+  Vec on every request. Live patches apply immediately: `Arc::make_mut` copies
+  once if a worker still holds the snapshot, never waiting for provider I/O.
+  Indicator fetch parameters are computed before awaiting; the full series is
+  retained for calculation and dropped before response delivery. Without
+  multi-timeframe histories there are no network awaits. Comparison tail requests
+  copy only changed base timestamps into a retained timestamp cache and drop the
+  chart Arc before fetching; cached timestamps also support full-fetch fallback.
+  Full comparison requests may retain the Arc across I/O. Tests check request Arc
+  identity, immediate live edits/appends with blocked requests, revision acceptance
+  and supersession, and no Vec copy without an outstanding reader.
+- Comparison requests keep their existing cadence, fetch a small overlapping
+  tail, and resume alignment from the affected timestamp. Missing overlap,
+  changed history counts, prepends, backfills and identity changes use a full
+  fetch. A failed tail merge can require one additional full fetch at that same
+  cadence; no new polling was added.
+- Full custom-session History filtering, filtered prepend counting and filtered
+  SeriesGpu construction run on the blocking worker. Delivery retains raw
+  `live_source` data and preserves the viewport; live tail filtering is unchanged.
+  Only SessionHistory delivery queues live ticks: its blocking closure performs
+  session filtering and fresh pyramid construction, with no network, shared-lock
+  acquisition or other work to wait on. The pending revision gates delivery, so
+  no read lease is needed.
+
+Verification: formatting and strict workspace Clippy passed; workspace tests
+passed with 1,011 passed and 7 ignored. New tests cover checkpoint resumption and
+invalidation, missing values and scalar sources, cache identities and exact dirty
+ranges, shared-request ownership, comparison request limits and fallbacks,
+parallel calculation parity, and worker session filtering/viewport preservation.
