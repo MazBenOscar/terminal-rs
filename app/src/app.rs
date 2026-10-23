@@ -441,6 +441,13 @@ pub struct NamedWatchlist {
     pub sections: Vec<crate::watch_sections::WatchSection>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchlistAddOutcome {
+    pub added: bool,
+    pub truncated: bool,
+    pub message: String,
+}
+
 impl NamedWatchlist {
     pub fn new(name: String, symbols: Vec<String>) -> Self {
         Self { name, symbols, sections: Vec::new() }
@@ -500,7 +507,7 @@ pub(crate) fn sanitize_watchlists(lists: Vec<NamedWatchlist>) -> Vec<NamedWatchl
                     }
                     let tokens: Vec<_> = s.split_whitespace().collect();
                     tr_core::Security::resolve_tokens(&tokens)
-                        .and_then(|(security, used)| (used == tokens.len()).then(|| security.key()))
+                        .and_then(|(_, used)| (used == tokens.len()).then(|| watchlist_symbol_key(&s)))
                 })
                 .collect(),
         )
@@ -511,7 +518,7 @@ pub(crate) fn sanitize_watchlists(lists: Vec<NamedWatchlist>) -> Vec<NamedWatchl
                 crate::watch_sections::Item::Symbol(s) => {
                     let tokens: Vec<_> = s.split_whitespace().collect();
                     tr_core::Security::resolve_tokens(&tokens)
-                        .and_then(|(security, used)| (used == tokens.len()).then(|| security.key()))
+                        .and_then(|(_, used)| (used == tokens.len()).then(|| watchlist_symbol_key(&s)))
                         .map(crate::watch_sections::Item::Symbol)
                 }
                 section => Some(section),
@@ -857,13 +864,18 @@ fn keys_from_words(words: &[String]) -> Vec<String> {
     out
 }
 
+/// Qualified keys are already identities; legacy bare tickers still resolve as before.
+fn watchlist_symbol_key(symbol: &str) -> String {
+    if symbol.contains(':') { symbol.to_owned() } else { tr_data::security(symbol).key() }
+}
+
 /// Each watchlist is capped at 200 symbols; appending preserves existing order.
 fn watchlist_append(current: &[String], symbols: Vec<String>) -> (Vec<String>, usize, bool) {
     let mut next = current.to_vec();
     let mut truncated = false;
     for symbol in symbols {
-        let key = tr_data::security(&symbol).key();
-        if !next.contains(&key) {
+        let key = watchlist_symbol_key(&symbol);
+        if !next.iter().any(|existing| crate::symbol_search::same_key(existing, &key)) {
             if next.len() >= 200 {
                 truncated = true;
             } else {
@@ -1297,26 +1309,73 @@ impl TerminalApp {
         self.toasts.push((format!("Watchlist: {message}"), Instant::now()));
     }
 
-    /// Add to any saved watchlist. The active list goes through the usual path (undo,
-    /// quote refresh); another list is updated in place and saved with the settings.
-    fn add_to_named_watchlist(&mut self, name: &str, symbol: String) {
-        let Some(index) = self.watchlists.iter().position(|list| list.name == name) else {
-            self.status = format!("Watchlist {name} no longer exists");
-            return;
+    /// UI-independent single-symbol add for menus and agent tools. A missing section
+    /// appends to the list's end; a section target is its ordinal and captured name.
+    /// Duplicates and the cap are reported without moving an existing symbol.
+    pub fn add_to_named_watchlist(
+        &mut self,
+        name: &str,
+        symbol: String,
+        section: Option<&crate::chart_view::WatchlistSectionTarget>,
+    ) -> Result<WatchlistAddOutcome, String> {
+        let index = self
+            .watchlists
+            .iter()
+            .position(|list| list.name == name)
+            .ok_or_else(|| format!("Watchlist {name} no longer exists"))?;
+        let list = &self.watchlists[index];
+        let mut items = list.items();
+        let gap = if let Some(section) = section {
+            let header = items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.is_section())
+                .nth(section.index)
+                .filter(|(_, item)| {
+                    matches!(item,
+                    crate::watch_sections::Item::Section { name, .. } if name == &section.name)
+                })
+                .map(|(position, _)| position)
+                .ok_or_else(|| format!("Section {} in {name} no longer exists", section.name))?;
+            crate::watch_sections::block(&items, header).end
+        } else {
+            items.len()
         };
-        if index == self.active_watchlist {
-            return self.add_watchlist_symbols(vec![symbol]);
-        }
         let ticker = crate::security_names::ticker(&tr_data::security(&symbol), false);
-        let (next, added, truncated) = watchlist_append(&self.watchlists[index].symbols, vec![symbol]);
-        self.watchlists[index].symbols = next;
-        let message = match (added, truncated) {
-            (0, true) => format!("{name} is full (200 symbols); {ticker} was not added"),
-            (0, false) => format!("{ticker} is already in {name}"),
-            _ => format!("Added {ticker} to {name}"),
+        let (next, added, truncated) = watchlist_append(&list.symbols, vec![symbol]);
+        if added != 0 {
+            items.insert(gap, crate::watch_sections::Item::Symbol(next.last().unwrap().clone()));
+            if index == self.active_watchlist {
+                self.set_watchlist_items(&items);
+            } else {
+                self.watchlists[index].set_items(&items);
+            }
+        }
+        let message = if index == self.active_watchlist {
+            watchlist_add_message(added, truncated)
+        } else {
+            match (added, truncated) {
+                (0, true) => format!("{name} is full (200 symbols); {ticker} was not added"),
+                (0, false) => format!("{ticker} is already in {name}"),
+                _ => format!("Added {ticker} to {name}"),
+            }
         };
-        self.status = message.clone();
-        self.toasts.push((format!("Watchlist: {message}"), Instant::now()));
+        Ok(WatchlistAddOutcome { added: added != 0, truncated, message })
+    }
+
+    fn add_watchlist_symbol(
+        &mut self,
+        name: &str,
+        symbol: String,
+        section: Option<&crate::chart_view::WatchlistSectionTarget>,
+    ) {
+        match self.add_to_named_watchlist(name, symbol, section) {
+            Ok(outcome) => {
+                self.status = outcome.message.clone();
+                self.toasts.push((format!("Watchlist: {}", outcome.message), Instant::now()));
+            }
+            Err(error) => self.status = error,
+        }
     }
 
     fn undo_watchlist(&mut self) {
@@ -1344,8 +1403,14 @@ impl TerminalApp {
                     self.open_panel(PaneKind::Ticker { symbol: s, trades: Vec::new(), loading: true })
                 }
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
-                Action::AddToWatchlist(s) => self.add_watchlist_symbols(vec![s]),
-                Action::AddToNamedWatchlist { list, symbol } => self.add_to_named_watchlist(&list, symbol),
+                Action::AddToWatchlist(symbol) => {
+                    let name = self.watchlists[self.active_watchlist].name.clone();
+                    self.add_watchlist_symbol(&name, symbol, None);
+                }
+                Action::AddToNamedWatchlist { list, symbol } => self.add_watchlist_symbol(&list, symbol, None),
+                Action::AddToWatchlistSection { list, symbol, section } => {
+                    self.add_watchlist_symbol(&list, symbol, Some(&section));
+                }
                 Action::AddToCompare(symbol) => {
                     if self.panes.iter().any(|p| matches!(p.kind, PaneKind::Chart(_))) {
                         self.with_chart(|c, w| c.add_comparison(symbol, w));
@@ -4181,5 +4246,121 @@ mod tests {
         assert_eq!(app.edit_log.newest(1, false)[0].author, Author::Agent);
         assert_eq!(app.chart_mut(1).unwrap().drawings[1].created_by, Author::Agent);
         assert_eq!(app.chart_mut(1).unwrap().drawings[1].turn_id.as_deref(), Some("turn"));
+    }
+
+    #[test]
+    fn named_add_selects_section_preserves_keys_and_reports_duplicates_without_moving() {
+        use crate::chart_view::WatchlistSectionTarget;
+        use crate::watch_sections::Item;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/f02-section-add");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.create_watchlist("Crypto".into(), Vec::new()).unwrap();
+        app.set_watchlist_items(&[
+            Item::Section { name: "Spot".into(), collapsed: true },
+            Item::Section { name: "Spot".into(), collapsed: false },
+        ]);
+        let crypto = app.active_watchlist;
+        app.switch_watchlist(0);
+        let before = app.watchlist.clone();
+        let section = WatchlistSectionTarget { index: 0, name: "Spot".into() };
+        let key = "COINBASE:BTC-USD";
+        let outcome = app.add_to_named_watchlist("Crypto", key.into(), Some(&section)).unwrap();
+        assert!(outcome.added && !outcome.truncated);
+        assert_eq!(outcome.message, "Added BTC/USD to Crypto");
+        assert_eq!(app.watchlists[crypto].symbols, [key]);
+        assert_eq!(app.watchlists[crypto].items()[1], Item::Symbol(key.into()));
+        assert_eq!(app.watchlists[crypto].sections[1].at, 1);
+        assert!(app.watchlists[crypto].sections[0].collapsed);
+        assert_eq!(app.active_watchlist, 0);
+        assert_eq!(app.watchlist, before);
+        assert!(app.status.is_empty() && app.toasts.is_empty(), "headless adds do not emit UI notices");
+
+        let rows = app.watchlists[crypto].items();
+        let other_section = WatchlistSectionTarget { index: 1, name: "Spot".into() };
+        let duplicate = app.add_to_named_watchlist("Crypto", key.into(), Some(&other_section)).unwrap();
+        assert!(!duplicate.added && !duplicate.truncated);
+        assert_eq!(duplicate.message, "BTC/USD is already in Crypto");
+        let alias = app.add_to_named_watchlist("Crypto", format!("{key} Curncy"), None).unwrap();
+        assert!(!alias.added && !alias.truncated);
+        assert_eq!(alias.message, duplicate.message);
+        assert_eq!(app.watchlists[crypto].items(), rows);
+        let saved: Vec<NamedWatchlist> = serde_json::from_slice(&serde_json::to_vec(&app.watchlists).unwrap()).unwrap();
+        assert_eq!(sanitize_watchlists(saved), app.watchlists, "saving and loading preserves qualified keys");
+        app.run_actions(vec![Action::AddToWatchlistSection {
+            list: "Crypto".into(),
+            symbol: "BINANCE:BTCUSDT".into(),
+            section: other_section,
+        }]);
+        assert_eq!(app.watchlists[crypto].symbols, [key, "BINANCE:BTCUSDT"]);
+        assert_eq!(app.watchlists[crypto].items()[3], Item::Symbol("BINANCE:BTCUSDT".into()));
+        assert_eq!(app.status, "Added BTC/USDT to Crypto");
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts[0].0, "Watchlist: Added BTC/USDT to Crypto");
+    }
+
+    #[test]
+    fn named_add_rejects_missing_lists_and_stale_sections_without_mutation() {
+        use crate::chart_view::WatchlistSectionTarget;
+        use crate::watch_sections::Item;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/f02-stale-add");
+        let mut app = TerminalApp::test_workspace(&root);
+        let before = app.watchlists.clone();
+        assert_eq!(
+            app.add_to_named_watchlist("Gone", "COINBASE:BTC-USD".into(), None),
+            Err("Watchlist Gone no longer exists".into())
+        );
+        assert_eq!(app.watchlists, before);
+        app.create_watchlist("Other".into(), Vec::new()).unwrap();
+        let section = WatchlistSectionTarget { index: 0, name: "Deleted".into() };
+        app.set_watchlist_items(&[Item::Section { name: "Replacement".into(), collapsed: false }]);
+        let before = app.watchlists.clone();
+        assert_eq!(
+            app.add_to_named_watchlist("Other", "AAPL".into(), Some(&section)),
+            Err("Section Deleted in Other no longer exists".into())
+        );
+        assert_eq!(app.watchlists, before);
+        app.delete_watchlist(1).unwrap();
+        let before = app.watchlists.clone();
+        app.run_actions(vec![Action::AddToNamedWatchlist { list: "Other".into(), symbol: "AAPL".into() }]);
+        assert_eq!(app.status, "Watchlist Other no longer exists");
+        assert_eq!(app.watchlists, before);
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn named_add_active_path_refreshes_and_keeps_existing_duplicate_and_cap_messages() {
+        use crate::chart_view::WatchlistSectionTarget;
+        use crate::watch_sections::Item;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/f02-active-add");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.set_watchlist_items(&[
+            Item::Section { name: "First".into(), collapsed: false },
+            Item::Section { name: "Last".into(), collapsed: true },
+        ]);
+        let revision = app.columns_revision;
+        let section = WatchlistSectionTarget { index: 0, name: "First".into() };
+        app.run_actions(vec![Action::AddToWatchlistSection {
+            list: "Main".into(),
+            symbol: "COINBASE:BTC-USD".into(),
+            section,
+        }]);
+        assert_eq!(app.watchlist, ["COINBASE:BTC-USD"]);
+        assert_eq!(app.watchlists[0].symbols, app.watchlist);
+        assert!(app.columns_revision > revision);
+        assert_eq!(app.status, "Added 1 symbols to the watchlist");
+        assert_eq!(app.watchlists[0].sections[1].at, 1);
+        app.run_actions(vec![Action::AddToWatchlist("COINBASE:BTC-USD".into())]);
+        assert_eq!(app.status, "All matches are already in the watchlist");
+        assert_eq!(app.watchlist.len(), 1);
+        let full = (0..200).map(|i| tr_data::security(&format!("QA{i}")).key()).collect();
+        app.create_watchlist("Full".into(), full).unwrap();
+        let outcome = app.add_to_named_watchlist("Full", "COINBASE:BTC-USD".into(), None).unwrap();
+        assert!(!outcome.added && outcome.truncated);
+        assert_eq!(outcome.message, "Added 0 symbols to the watchlist (truncated to the 200-symbol watchlist cap)");
+        app.switch_watchlist(0);
+        let outcome = app.add_to_named_watchlist("Full", "COINBASE:BTC-USD".into(), None).unwrap();
+        assert!(!outcome.added && outcome.truncated);
+        assert_eq!(outcome.message, "Full is full (200 symbols); BTC/USD was not added");
+        assert_eq!(app.watchlists[1].symbols.len(), 200);
     }
 }

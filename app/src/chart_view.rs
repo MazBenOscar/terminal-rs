@@ -4620,29 +4620,13 @@ impl ChartState {
         }
     }
 
-    /// "Add to watchlist" lists every saved watchlist; lists that already hold the symbol
-    /// are shown checked and disabled. Without any (headless use) it adds to the active list.
     fn watchlist_menu(&mut self, ui: &mut Ui) {
         if self.watchlists.is_empty() {
-            if ui.button("Add to Watchlist").clicked() {
-                self.actions.push(Action::AddToWatchlist(self.symbol.clone()));
-                ui.close();
-            }
+            active_watchlist_entry(ui, &self.symbol, "Add to Watchlist", &mut self.actions);
             return;
         }
         ui.menu_button("Add to watchlist", |ui| {
-            ui.set_min_width(180.0);
-            for list in &self.watchlists {
-                let label = if list.active { format!("{} (active)", list.name) } else { list.name.clone() };
-                if list.contains {
-                    ui.add_enabled(false, egui::Button::new(format!("✓ {label}")))
-                        .on_disabled_hover_text("Already in this watchlist");
-                } else if ui.button(label).clicked() {
-                    self.actions
-                        .push(Action::AddToNamedWatchlist { list: list.name.clone(), symbol: self.symbol.clone() });
-                    ui.close();
-                }
-            }
+            self.actions.extend(watchlist_destinations(ui, &self.symbol, &self.watchlists));
         });
     }
 
@@ -5466,6 +5450,105 @@ pub struct WatchlistTarget {
     pub active: bool,
     /// The chart's symbol is already in this list.
     pub contains: bool,
+    pub sections: Vec<WatchlistSectionTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchlistSectionTarget {
+    pub index: usize,
+    pub name: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WATCHLIST_TARGET_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl WatchlistTarget {
+    pub(crate) fn for_symbol(lists: &[crate::app::NamedWatchlist], active: usize, symbol: &str) -> Vec<Self> {
+        #[cfg(test)]
+        WATCHLIST_TARGET_BUILDS.set(WATCHLIST_TARGET_BUILDS.get() + 1);
+        lists
+            .iter()
+            .enumerate()
+            .map(|(index, list)| Self {
+                name: list.name.clone(),
+                active: index == active,
+                contains: list.symbols.iter().any(|key| crate::symbol_search::same_key(key, symbol)),
+                sections: list
+                    .sections
+                    .iter()
+                    .enumerate()
+                    .map(|(index, section)| WatchlistSectionTarget { index, name: section.name.clone() })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn label(&self) -> String {
+        format!("{}{}{}", if self.contains { "✓ " } else { "" }, self.name, if self.active { " (active)" } else { "" })
+    }
+}
+
+/// Borrowed destinations for symbol-row menus; targets are built only in the open submenu.
+#[derive(Clone, Copy)]
+pub(crate) struct WatchlistMenus<'a> {
+    pub lists: &'a [crate::app::NamedWatchlist],
+    pub active: usize,
+}
+
+fn active_watchlist_entry(ui: &mut Ui, symbol: &str, label: &str, out: &mut Vec<Action>) {
+    if ui.button(label).clicked() {
+        out.push(Action::AddToWatchlist(symbol.into()));
+        ui.close();
+    }
+}
+
+pub(crate) fn symbol_watchlist_menu(
+    ui: &mut Ui,
+    symbol: &str,
+    active_label: &str,
+    watchlists: WatchlistMenus<'_>,
+) -> Vec<Action> {
+    let mut out = Vec::new();
+    active_watchlist_entry(ui, symbol, active_label, &mut out);
+    ui.menu_button("Add to named watchlist", |ui| {
+        let targets = WatchlistTarget::for_symbol(watchlists.lists, watchlists.active, symbol);
+        out.extend(watchlist_destinations(ui, symbol, &targets));
+    });
+    out
+}
+
+pub(crate) fn watchlist_destinations(ui: &mut Ui, symbol: &str, targets: &[WatchlistTarget]) -> Vec<Action> {
+    let mut out = Vec::new();
+    ui.set_min_width(180.0);
+    for list in targets {
+        if ui
+            .add_enabled(!list.contains, egui::Button::new(list.label()))
+            .on_disabled_hover_text("Already in this watchlist")
+            .clicked()
+        {
+            out.push(Action::AddToNamedWatchlist { list: list.name.clone(), symbol: symbol.into() });
+            ui.close();
+        }
+        if !list.sections.is_empty() {
+            ui.add_enabled_ui(!list.contains, |ui| {
+                ui.menu_button(format!("{} sections", list.name), |ui| {
+                    for section in &list.sections {
+                        if ui.button(&section.name).clicked() {
+                            out.push(Action::AddToWatchlistSection {
+                                list: list.name.clone(),
+                                symbol: symbol.into(),
+                                section: section.clone(),
+                            });
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        }
+    }
+    out
 }
 
 /// One candle's values for the press-and-hold popup.
@@ -7963,7 +8046,12 @@ mod tests {
     fn context_menu_adds_the_symbol_to_a_chosen_saved_watchlist() {
         let ctx = egui::Context::default();
         let mut chart = sample_chart();
-        let target = |name: &str, active, contains| WatchlistTarget { name: name.into(), active, contains };
+        let target = |name: &str, active, contains| WatchlistTarget {
+            name: name.into(),
+            active,
+            contains,
+            sections: Vec::new(),
+        };
         chart.watchlists =
             vec![target("Main", true, false), target("Crypto", false, false), target("Tech", false, true)];
         let worker = Worker::inert();
@@ -9763,5 +9851,129 @@ mod tests {
         chart.built = crate::worker::build_indicators(&bars, chart.tf, &chart.indicators, &theme::palette());
         chart.built[0].overlays.clear();
         assert_eq!(chart.studies()[0].outputs[0].values[0], Some(bars[0].close));
+    }
+
+    #[test]
+    fn watchlist_menu_model_keeps_saved_order_membership_and_section_ordinals() {
+        use crate::app::NamedWatchlist;
+        use crate::watch_sections::WatchSection;
+        let key = "COINBASE:BTC-USD";
+        let mut lists = vec![
+            NamedWatchlist::new("Main".into(), vec![key.into()]),
+            NamedWatchlist::new("Crypto".into(), Vec::new()),
+        ];
+        lists[1].sections = vec![
+            WatchSection { name: "Spot".into(), collapsed: true, at: 0 },
+            WatchSection { name: "Spot".into(), collapsed: false, at: 0 },
+        ];
+        let targets = WatchlistTarget::for_symbol(&lists, 1, key);
+        assert_eq!(targets.iter().map(WatchlistTarget::label).collect::<Vec<_>>(), ["✓ Main", "Crypto (active)"]);
+        assert!(targets[0].contains && !targets[1].contains);
+        assert!(WatchlistTarget::for_symbol(&lists, 1, &format!("{key} Curncy"))[0].contains);
+        assert_eq!(
+            targets[1].sections,
+            [
+                WatchlistSectionTarget { index: 0, name: "Spot".into() },
+                WatchlistSectionTarget { index: 1, name: "Spot".into() },
+            ]
+        );
+        let other_key = WatchlistTarget::for_symbol(&lists, 1, "BINANCE:BTCUSDT");
+        assert!(!other_key[0].contains, "display labels never replace market keys");
+        assert!(WatchlistTarget::for_symbol(&[], 0, key).is_empty());
+    }
+
+    fn click_watchlist_choice(
+        ctx: &egui::Context,
+        label: &str,
+        mut menu: impl FnMut(&mut Ui) -> Vec<Action>,
+    ) -> Vec<Action> {
+        let mut out = Vec::new();
+        let texts = ui_frame(ctx, vec![], |ui| out.extend(menu(ui)));
+        let at = texts.iter().find(|(text, _)| text == label).unwrap_or_else(|| panic!("{label}")).1.center();
+        ui_frame(ctx, vec![egui::Event::PointerMoved(at), pointer_button(at, true)], |ui| out.extend(menu(ui)));
+        ui_frame(ctx, vec![pointer_button(at, false)], |ui| out.extend(menu(ui)));
+        out
+    }
+
+    #[test]
+    fn shared_destinations_disable_duplicates_and_emit_exact_section_and_key() {
+        use crate::app::NamedWatchlist;
+        use crate::watch_sections::WatchSection;
+        let key = "COINBASE:BTC-USD";
+        let mut lists =
+            vec![NamedWatchlist::new("Main".into(), vec![key.into()]), NamedWatchlist::new("Other".into(), Vec::new())];
+        lists[0].sections = vec![WatchSection { name: "Existing".into(), collapsed: false, at: 0 }];
+        lists[1].sections = vec![WatchSection { name: "Spot".into(), collapsed: true, at: 0 }];
+        let targets = WatchlistTarget::for_symbol(&lists, 0, key);
+        let ctx = egui::Context::default();
+        let menu = |ui: &mut Ui| watchlist_destinations(ui, key, &targets);
+        assert!(click_watchlist_choice(&ctx, "✓ Main (active)", menu).is_empty());
+        assert!(click_watchlist_choice(&ctx, "Main sections", menu).is_empty());
+        let texts = ui_frame(&ctx, vec![], |ui| {
+            watchlist_destinations(ui, key, &targets);
+        });
+        assert!(!texts.iter().any(|(text, _)| text == "Existing"), "duplicate sections are disabled too");
+        assert!(click_watchlist_choice(&ctx, "Other sections", menu).is_empty());
+        assert_eq!(
+            click_watchlist_choice(&ctx, "Spot", menu),
+            [Action::AddToWatchlistSection {
+                list: "Other".into(),
+                symbol: key.into(),
+                section: WatchlistSectionTarget { index: 0, name: "Spot".into() },
+            }]
+        );
+    }
+
+    #[test]
+    fn closed_symbol_menus_do_not_build_targets() {
+        let ctx = egui::Context::default();
+        let key = "COINBASE:BTC-USD";
+        let lists = [crate::app::NamedWatchlist::new("Main".into(), Vec::new())];
+        let watchlists = WatchlistMenus { lists: &lists, active: 0 };
+        let builds = WATCHLIST_TARGET_BUILDS.get();
+        let texts = ui_frame(&ctx, vec![], |ui| {
+            ui.button(key).context_menu(|ui| {
+                symbol_watchlist_menu(ui, key, "Add to Watchlist", watchlists);
+            });
+            // Even an open row menu must not build destinations while its named submenu is closed.
+            symbol_watchlist_menu(ui, key, "Add to Watchlist", watchlists);
+        });
+        assert!(texts.iter().any(|(text, _)| text == "Add to named watchlist"));
+        assert_eq!(WATCHLIST_TARGET_BUILDS.get(), builds);
+        let menu = |ui: &mut Ui| symbol_watchlist_menu(ui, key, "Add to Watchlist", watchlists);
+        assert!(click_watchlist_choice(&ctx, "Add to named watchlist", menu).is_empty());
+        assert!(WATCHLIST_TARGET_BUILDS.get() > builds, "opening the submenu builds its destinations");
+    }
+
+    #[test]
+    fn symbol_row_menu_keeps_active_first_and_uses_fresh_named_destinations() {
+        use crate::app::NamedWatchlist;
+        let key = "COINBASE:BTC-USD";
+        let ctx = egui::Context::default();
+        let lists = [NamedWatchlist::new("Main".into(), Vec::new()), NamedWatchlist::new("Other".into(), Vec::new())];
+        let menu = |ui: &mut Ui| {
+            symbol_watchlist_menu(ui, key, "Add to Watchlist", WatchlistMenus { lists: &lists, active: 0 })
+        };
+        let texts = ui_frame(&ctx, vec![], |ui| {
+            menu(ui);
+        });
+        let labels: Vec<_> = texts.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(labels, ["Add to Watchlist", "Add to named watchlist"]);
+        assert_eq!(click_watchlist_choice(&ctx, "Add to Watchlist", menu), [Action::AddToWatchlist(key.into())]);
+        assert!(click_watchlist_choice(&ctx, "Add to named watchlist", menu).is_empty());
+        assert_eq!(
+            click_watchlist_choice(&ctx, "Other", menu),
+            [Action::AddToNamedWatchlist { list: "Other".into(), symbol: key.into() }]
+        );
+        let lists = [NamedWatchlist::new("Main".into(), vec![key.into()])];
+        let menu = |ui: &mut Ui| {
+            symbol_watchlist_menu(ui, key, "Add to Watchlist", WatchlistMenus { lists: &lists, active: 0 })
+        };
+        assert!(click_watchlist_choice(&ctx, "Add to named watchlist", menu).is_empty());
+        let texts = ui_frame(&ctx, vec![], |ui| {
+            menu(ui);
+        });
+        assert!(!texts.iter().any(|(text, _)| text == "Other"));
+        assert!(texts.iter().any(|(text, _)| text == "✓ Main (active)"));
     }
 }
