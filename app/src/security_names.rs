@@ -109,6 +109,25 @@ pub fn order(a: Option<&str>, b: Option<&str>, descending: bool) -> std::cmp::Or
     }
 }
 
+pub fn label(key: &str) -> String {
+    let sec = tr_data::security(key);
+    if sec.crypto_instrument().is_ok() { ticker(&sec, true) } else { key.to_owned() }
+}
+
+pub fn ticker(sec: &tr_core::Security, with_venue: bool) -> String {
+    let Ok(instrument) = sec.crypto_instrument() else { return sec.ticker.clone() };
+    let pair = format!("{}/{}", instrument.base, instrument.quote);
+    if with_venue {
+        let venue = match instrument.venue {
+            tr_core::crypto::CryptoVenue::Coinbase => "Coinbase",
+            tr_core::crypto::CryptoVenue::Binance => "Binance",
+        };
+        format!("{pair} · {venue}")
+    } else {
+        pair
+    }
+}
+
 pub fn hover(ticker: &str, name: Option<&str>) -> String {
     name.map_or_else(|| ticker.to_string(), |n| format!("{ticker} · {n}"))
 }
@@ -169,6 +188,36 @@ pub fn paint(ui: &egui::Ui, rect: egui::Rect, name: &str, id: impl std::hash::Ha
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instrument_tickers_show_crypto_pairs_and_optional_venue() {
+        for (key, pair, venue) in [
+            ("COINBASE:BTC-USD", "BTC/USD", "Coinbase"),
+            ("COINBASE:AAVE-USD", "AAVE/USD", "Coinbase"),
+            ("BINANCE:BTCUSDT", "BTC/USDT", "Binance"),
+            ("BTCUSD Curncy", "BTC/USD", "Coinbase"),
+        ] {
+            let sec = tr_data::security(key);
+            assert_eq!(ticker(&sec, false), pair);
+            assert_eq!(ticker(&sec, true), format!("{pair} · {venue}"));
+            assert_eq!(label(key), format!("{pair} · {venue}"));
+            assert_eq!(sec, tr_data::security(key));
+        }
+    }
+
+    #[test]
+    fn instrument_tickers_preserve_equities_futures_and_unknown_keys() {
+        for sec in [
+            tr_data::security("AAPL US Equity"),
+            tr_data::security("CL1 Comdty"),
+            tr_core::Security::new("OTHER:BTC-USD", tr_core::AssetClass::Crypto),
+            tr_core::Security::new("UNKNOWN", tr_core::AssetClass::Crypto),
+        ] {
+            assert_eq!(ticker(&sec, false), sec.ticker);
+            assert_eq!(ticker(&sec, true), sec.ticker);
+            assert_eq!(label(&sec.key()), sec.key());
+        }
+    }
 
     #[test]
     fn catalog_wins_and_missing_names_are_blank() {

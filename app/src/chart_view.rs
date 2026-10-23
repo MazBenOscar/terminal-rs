@@ -2133,7 +2133,7 @@ impl ChartState {
                     .id_salt((self.id, "header")),
             );
             hui.spacing_mut().item_spacing.x = 6.0;
-            hui.label(RichText::new(&self.sec.ticker).font(mono(12.0)).color(amber()));
+            hui.label(RichText::new(crate::security_names::ticker(&self.sec, false)).font(mono(12.0)).color(amber()));
             if hui.available_width() > Self::controls_width(&hui) {
                 clicked |= self.controls(&mut hui, w);
             } else {
@@ -2267,7 +2267,10 @@ impl ChartState {
             self.gpu.clone()
         };
         let Some(gpu) = display else {
-            let msg = self.error.clone().unwrap_or_else(|| format!("Loading {} {}…", self.symbol, self.tf));
+            let msg = self
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("Loading {} {}…", crate::security_names::label(&self.symbol), self.tf));
             painter.text(plot_all.center(), Align2::CENTER_CENTER, msg, mono(13.0), amber_dim());
             if self.error.is_some() && self.chart_type == ChartType::Renko {
                 ui.scope_builder(
@@ -3150,7 +3153,7 @@ impl ChartState {
             state.set_open(true);
             state.store(ctx);
         }
-        egui::Window::new(RichText::new(format!("Indicators · {}", self.sec.ticker)).font(ui_font(13.0)))
+        egui::Window::new(RichText::new(format!("Indicators · {}", crate::security_names::ticker(&self.sec, false))).font(ui_font(13.0)))
             .id(window_id)
             .open(&mut open)
             .default_width(theme::dp(380.0))
@@ -3688,7 +3691,8 @@ impl ChartState {
 
     fn template_save_controls(&mut self, ui: &mut Ui) -> egui::Response {
         if self.template_name.is_empty() {
-            self.template_name = format!("{} {} studies", self.sec.ticker, self.tf.label());
+            self.template_name =
+                format!("{} {} studies", crate::security_names::ticker(&self.sec, false), self.tf.label());
         }
         ui.horizontal(|ui| {
             let save_w = theme::dp(96.0);
@@ -3905,7 +3909,7 @@ impl ChartState {
                         symbol: self.symbol.clone(),
                         title: format!(
                             "{} {} · {}{}",
-                            self.symbol,
+                            crate::security_names::label(&self.symbol),
                             self.tf,
                             self.chart_type.label(),
                             if self.replay_cutoff.is_some() { " · REPLAY" } else { "" }
@@ -4470,7 +4474,7 @@ impl ChartState {
             p.galley(pos2(*x, y), g.clone(), color);
             *x += g.size().x + 8.0;
         };
-        put(format!("{} · {}", self.sec.ticker, self.tf), amber(), &mut x);
+        put(format!("{} · {}", crate::security_names::ticker(&self.sec, true), self.tf), amber(), &mut x);
         for (k, val) in [("O", b.open), ("H", b.high), ("L", b.low), ("C", b.close)] {
             put(format!("{k}{val:.dec$}"), col, &mut x);
         }
@@ -4487,7 +4491,7 @@ impl ChartState {
             ly += 14.0;
         }
         for key in self.compare.iter().chain(&self.data.comparisons) {
-            let ticker = key.split_whitespace().next().unwrap_or(key);
+            let ticker = crate::security_names::ticker(&tr_data::security(key), true);
             let extra = self.comparisons.get(key);
             let (line, factor, loading, error) = if self.compare.as_ref() == Some(key) {
                 (self.compare_line.as_ref(), self.compare_scale, self.compare_loading, self.compare_error.as_deref())

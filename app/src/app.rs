@@ -209,7 +209,7 @@ impl BookPane {
 impl PaneKind {
     /// Short tab title.
     fn tab_title(&self) -> String {
-        let short = |s: &str| tr_data::security(s).ticker;
+        let short = |s: &str| crate::security_names::ticker(&tr_data::security(s), false);
         match self {
             PaneKind::Chart(c) => short(&c.symbol),
             PaneKind::Feed { .. } => "Congress".into(),
@@ -1292,7 +1292,7 @@ impl TerminalApp {
         if index == self.active_watchlist {
             return self.add_watchlist_symbols(vec![symbol]);
         }
-        let ticker = tr_data::security(&symbol).ticker;
+        let ticker = crate::security_names::ticker(&tr_data::security(&symbol), false);
         let (next, added, truncated) = watchlist_append(&self.watchlists[index].symbols, vec![symbol]);
         self.watchlists[index].symbols = next;
         let message = match (added, truncated) {
@@ -2890,7 +2890,7 @@ mod tests {
         app.run_actions(vec![Action::AddToNamedWatchlist { list: "Crypto".into(), symbol: "SOLUSD Curncy".into() }]);
         assert_eq!(app.watchlists[crypto].symbols, vec![tr_data::security("SOLUSD Curncy").key()]);
         assert_eq!((app.active_watchlist, &app.watchlist), (active, &before));
-        assert!(app.status.contains("Added SOLUSD to Crypto"), "{}", app.status);
+        assert!(app.status.contains("Added SOL/USD to Crypto"), "{}", app.status);
         app.run_actions(vec![Action::AddToNamedWatchlist { list: "Crypto".into(), symbol: "SOLUSD Curncy".into() }]);
         assert_eq!(app.watchlists[crypto].symbols.len(), 1);
         assert!(app.status.contains("already in Crypto"), "{}", app.status);
