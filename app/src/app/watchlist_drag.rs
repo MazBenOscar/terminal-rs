@@ -169,7 +169,7 @@ impl<'a> DragFrame<'a> {
         painter.rect_filled(ghost, 3.0, theme::card().gamma_multiply(0.94));
         painter.rect_stroke(ghost, 3.0, Stroke::new(1.0, theme::accent()), egui::StrokeKind::Inside);
         let label = match &self.items[drag.from] {
-            Item::Symbol(key) => tr_data::security(key).ticker,
+            Item::Symbol(key) => crate::security_names::ticker(&tr_data::security(key), false),
             Item::Section { name, .. } => format!("{} ({})", name, block.len() - 1),
         };
         painter.text(

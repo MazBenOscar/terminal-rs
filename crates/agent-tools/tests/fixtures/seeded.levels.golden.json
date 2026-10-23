@@ -1,0 +1,82 @@
+{
+  "bar_range": {
+    "count": 96,
+    "from": "2024-01-01T00:00:00+00:00",
+    "to": "2024-04-05T00:00:00+00:00"
+  },
+  "mode": "levels",
+  "pivot_kind": "classic",
+  "pivot_session": "core timeframe session key",
+  "pivots": {
+    "P": 123.4300308,
+    "R1": 133.66021289,
+    "R2": 147.38020523,
+    "R3": 157.61038732,
+    "S1": 109.71003846,
+    "S2": 99.47985636,
+    "S3": 85.75986402
+  },
+  "price_basis": "adjusted",
+  "session": "Provider bars",
+  "support_resistance": [
+    {
+      "last_touch_time": 1708473600,
+      "price": 103.3623878,
+      "score": 5.18754904,
+      "touches": 4,
+      "zone_width": 2.79048545
+    },
+    {
+      "last_touch_time": 1709164800,
+      "price": 106.96921202,
+      "score": 4.51114221,
+      "touches": 3,
+      "zone_width": 2.79048545
+    },
+    {
+      "last_touch_time": 1707177600,
+      "price": 98.83407457,
+      "score": 3.92160073,
+      "touches": 3,
+      "zone_width": 2.79048545
+    },
+    {
+      "last_touch_time": 1710979200,
+      "price": 127.21709507,
+      "score": 3.76161109,
+      "touches": 2,
+      "zone_width": 2.79048545
+    },
+    {
+      "last_touch_time": 1710892800,
+      "price": 136.46268797,
+      "score": 3.57782437,
+      "touches": 2,
+      "zone_width": 2.79048545
+    },
+    {
+      "last_touch_time": 1707868800,
+      "price": 94.49827389,
+      "score": 3.26232418,
+      "touches": 2,
+      "zone_width": 2.79048545
+    },
+    {
+      "last_touch_time": 1708819200,
+      "price": 110.72844441,
+      "score": 3.24350938,
+      "touches": 2,
+      "zone_width": 2.79048545
+    },
+    {
+      "last_touch_time": 1709683200,
+      "price": 130.24263747,
+      "score": 2.59646144,
+      "touches": 1,
+      "zone_width": 2.79048545
+    }
+  ],
+  "symbol": "FIXTURE",
+  "timeframe": "1D",
+  "version": 1
+}

@@ -20,7 +20,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 15] = [
+pub const PANELS: [(&str, &str); 16] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("Scanner", "SCAN"),
@@ -35,6 +35,7 @@ pub const PANELS: [(&str, &str); 15] = [
     ("Alerts", "ALRT"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
+    ("Agent", "AGENT"),
     ("Help", "HELP"),
 ];
 
@@ -369,6 +370,14 @@ impl TerminalApp {
     fn init_kind(&mut self, id: PaneId, kind: PaneKind) -> PaneKind {
         match kind {
             PaneKind::Chart(mut c) => {
+                tr_chart::drawings::reserve_id(c.uid);
+                while c.uid == 0
+                    || self.panes.iter().any(|p| matches!(&p.kind, PaneKind::Chart(other) if other.uid == c.uid))
+                {
+                    c.uid = tr_chart::drawings::next_id();
+                }
+                c.drawing_ids.attach(self.drawing_ids.clone());
+                c.drawing_ids.repair(&mut c.drawings);
                 c.id = id;
                 c.load(&self.worker);
                 c.restore_price_scale();
@@ -406,6 +415,9 @@ impl TerminalApp {
         let kind = self.init_kind(new, kind);
         let Some(i) = self.idx(id) else { return new };
         let old = std::mem::replace(&mut self.panes[i], Pane { id: new, kind, link: None, title: None, window: None });
+        if matches!(&old.kind, PaneKind::Chart(c) if self.pinned_agent_chart == Some(c.uid)) {
+            self.pinned_agent_chart = None;
+        }
         self.panes[i].link = old.link;
         self.panes[i].window = old.window;
         self.dock.replace(id, new);
@@ -419,6 +431,9 @@ impl TerminalApp {
     pub(super) fn close_pane(&mut self, id: PaneId) {
         let Some(i) = self.idx(id) else { return };
         let p = self.panes.remove(i);
+        if matches!(&p.kind, PaneKind::Chart(c) if self.pinned_agent_chart == Some(c.uid)) {
+            self.pinned_agent_chart = None;
+        }
         self.dock.remove(id);
         self.worker.send(Request::Forget(id));
         self.preset = None;
@@ -739,6 +754,7 @@ impl TerminalApp {
             "ALRT" | "ALERTS" => PaneKind::Alerts,
             "SECF" | "SEARCH" => PaneKind::Search { query: words[1..].join(" ") },
             "PREFS" | "SETTINGS" | "PDF" => PaneKind::Settings,
+            "AGENT" => PaneKind::Agent(crate::agent_pane::Settings::default()),
             "HELP" => PaneKind::Help,
             _ => return None,
         })
@@ -801,7 +817,12 @@ impl TerminalApp {
                 .iter()
                 .map(|p| SavedPane {
                     id: ids[&p.id],
-                    settings: p.kind.settings(),
+                    settings: match &p.kind {
+                        PaneKind::Agent(settings) => {
+                            crate::layouts::PaneSettings::Agent(self.agent_saved_settings(settings))
+                        }
+                        _ => p.kind.settings(),
+                    },
                     link: p.link,
                     title: p.title.clone(),
                     window: p.window,
@@ -816,7 +837,33 @@ impl TerminalApp {
     /// Replace the workspace with `doc`. Pane ids are reassigned so responses for the old
     /// panes can never reach the new ones.
     pub(super) fn apply_doc(&mut self, mut doc: LayoutDoc) {
+        // Layout documents retain provenance, but never the in-memory inverse edits.
+        self.agent_turns.clear();
         doc.repair();
+        // Imported identities must not alias charts that are live at load time,
+        // even though those charts are about to be replaced.
+        let live: std::collections::HashSet<_> = self.charts().iter().map(|c| c.uid).collect();
+        let mut reserved = live.clone();
+        for pane in &doc.panes {
+            if let crate::layouts::PaneSettings::Chart { uid, .. } = &pane.settings {
+                reserved.insert(*uid);
+            }
+        }
+        for pane in &mut doc.panes {
+            if let crate::layouts::PaneSettings::Chart { uid, .. } = &mut pane.settings
+                && live.contains(uid)
+            {
+                loop {
+                    *uid = tr_chart::drawings::next_id();
+                    if reserved.insert(*uid) {
+                        break;
+                    }
+                }
+            }
+        }
+        self.pinned_agent_chart = None;
+        self.agent_pane.initialized = false;
+        self.edit_log.observed.clear();
         if doc.skipped_drawings > 0 {
             self.toasts.push((
                 format!("{} drawings in this layout were invalid and were skipped", doc.skipped_drawings),
@@ -874,6 +921,8 @@ impl TerminalApp {
         self.preset = None;
         self.drag = None;
         self.renaming_tab = None;
+        // Establish the loaded baseline now, before any subsequent user input.
+        self.observe_edits(false);
         let path = self.store.path(&self.layout_name);
         if let Ok(bytes) = std::fs::read(&path) {
             self.saves.written.insert(path, bytes);
@@ -1651,6 +1700,51 @@ mod tests {
     }
 
     #[test]
+    fn a1a_pin_and_drawing_ids_survive_split_popout_dockback_and_pane_copy() {
+        use crate::agent_queue::ChartTarget;
+        use tr_chart::drawings::{Anchor, Author, Drawing, Tool};
+        let (mut app, root) = fixture("a1a-pane-identity");
+        let first = app.new_pane(PaneKind::from_settings(crate::layouts::chart_settings("AAA", &Default::default())));
+        app.dock_pane(first, None, Zone::Right);
+        let PaneKind::Chart(chart) = &mut app.panes[0].kind else { panic!("chart") };
+        chart.edit_drawings(Author::User, None, |d| {
+            let a = Anchor { ts: 86400, price: 10. };
+            d.push(Drawing::new(Tool::Horizontal, a, a));
+        });
+        let uid = chart.uid;
+        let drawing_id = chart.drawings[0].id;
+        app.pinned_agent_chart = Some(uid);
+        app.apply(crate::command::Function::Split { down: false, panel: "CHART".into() });
+        let split = app.focus;
+        assert_ne!(split, first);
+        assert_eq!(app.agent_chart_uid(ChartTarget::Pinned), Some(uid));
+        app.pop_out(first);
+        assert!(app.pane_mut(first).unwrap().window.is_some());
+        app.dock_back(first);
+        assert!(app.pane_mut(first).unwrap().window.is_none());
+        assert!(app.dock.contains(first));
+        assert_eq!(app.agent_chart(ChartTarget::Pinned).unwrap().drawings[0].id, drawing_id);
+        let copied = app.panes.iter().find(|p| p.id == first).unwrap().kind.settings();
+        let copy = app.new_pane(PaneKind::from_settings(copied));
+        let PaneKind::Chart(copy_chart) = &app.panes.iter().find(|p| p.id == copy).unwrap().kind else {
+            panic!("chart")
+        };
+        assert_ne!(copy_chart.uid, uid);
+        assert_ne!(copy_chart.drawings[0].id, drawing_id, "pane initialization repairs cross-chart copies");
+        app.close_pane(split);
+        app.close_pane(copy);
+        assert_eq!(app.agent_chart_uid(ChartTarget::Pinned), Some(uid));
+        assert_eq!(app.agent_chart(ChartTarget::Pinned).unwrap().drawings[0].id, drawing_id);
+        let replacement =
+            app.new_pane(PaneKind::from_settings(crate::layouts::chart_settings("BBB", &Default::default())));
+        app.dock_pane(replacement, Some(first), Zone::Right);
+        app.close_pane(first);
+        assert_eq!(app.agent_chart_uid(ChartTarget::Pinned), app.peek_chart().map(|c| c.uid));
+        assert_ne!(app.agent_chart_uid(ChartTarget::Pinned), Some(uid));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn workspace_save_load_apply_save_is_canonical() {
         use crate::layouts::{PaneSettings, ScanSettings};
         use tr_core::{
@@ -1752,10 +1846,18 @@ mod tests {
         app.apply_doc(app.store.load("Audit").unwrap());
         assert!(app.panes.iter().all(|p| !old_ids.contains(&p.id)), "runtime ids remain fresh");
         app.save_layout();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
-            serde_json::from_slice::<serde_json::Value>(&std::fs::read(app.store.path("Audit")).unwrap()).unwrap()
-        );
+        let before: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.store.path("Audit")).unwrap()).unwrap();
+        for (old, new) in before["panes"].as_array().unwrap().iter().zip(after["panes"].as_array_mut().unwrap()) {
+            if let Some(chart) = new.get_mut("Chart") {
+                // Loading over live charts must replace colliding uids. All other
+                // saved settings, including drawing identities, remain canonical.
+                assert_ne!(old["Chart"]["uid"], chart["uid"]);
+                chart["uid"] = old["Chart"]["uid"].clone();
+            }
+        }
+        assert_eq!(before, after);
         assert_eq!(
             serde_json::to_value(&app.price_alerts.book).unwrap(),
             alerts_before,

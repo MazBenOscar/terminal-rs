@@ -40,6 +40,7 @@ impl TerminalApp {
         let mut actions = Vec::new();
         let id = self.panes[i].id;
         let dragging = self.drag.is_some_and(|d| d.active);
+        let chart_focused = focused && !self.agent_captures_focus(ui.ctx());
         let account_overlay = if let PaneKind::Chart(c) = &self.panes[i].kind {
             Some(crate::chart_account::Snapshot::build(
                 self.shown_portfolio(),
@@ -62,19 +63,10 @@ impl TerminalApp {
                 .filter(|a| a.symbol == c.symbol && a.simulated == self.price_alerts.simulated)
                 .cloned()
                 .collect();
-            let key = tr_data::security(&c.symbol).key();
-            c.watchlists = self
-                .watchlists
-                .iter()
-                .enumerate()
-                .map(|(index, list)| crate::chart_view::WatchlistTarget {
-                    name: list.name.clone(),
-                    active: index == self.active_watchlist,
-                    contains: list.symbols.contains(&key),
-                })
-                .collect();
+            c.watchlists =
+                crate::chart_view::WatchlistTarget::for_symbol(&self.watchlists, self.active_watchlist, &c.symbol);
             c.hover_enabled = !dragging;
-            let clicked = c.show(ui, rect, focused, &self.worker);
+            let clicked = c.show(ui, rect, chart_focused, &self.worker);
             actions.append(&mut c.actions);
             let alert_actions = std::mem::take(&mut c.price_alert_actions);
             for action in alert_actions {
@@ -88,21 +80,24 @@ impl TerminalApp {
             return (actions, clicked);
         }
         let freshness = self.congress_freshness();
+        let watchlists = crate::chart_view::WatchlistMenus { lists: &self.watchlists, active: self.active_watchlist };
         let inner = rect.shrink2(vec2(dp(8.0), dp(4.0)));
         let mut child = ui.new_child(UiBuilder::new().max_rect(inner).id_salt(("pane", id)));
         child.set_clip_rect(inner.intersect(ui.clip_rect()));
         let ui = &mut child;
         match &mut self.panes[i].kind {
-            PaneKind::Feed { filter } => actions.extend(congress_view::feed(ui, &self.latest, filter, &freshness)),
+            PaneKind::Feed { filter } => {
+                actions.extend(congress_view::feed(ui, &self.latest, filter, &freshness, watchlists))
+            }
             PaneKind::Ticker { symbol, trades, loading } => {
                 if *loading {
                     ui.label(RichText::new("Loading…").color(muted()));
                 } else {
-                    actions.extend(congress_view::ticker_trades(ui, symbol, trades));
+                    actions.extend(congress_view::ticker_trades(ui, symbol, trades, watchlists));
                 }
             }
             PaneKind::Profile { query, data, loading } => {
-                actions.extend(congress_view::profile(ui, query, data.as_deref(), *loading))
+                actions.extend(congress_view::profile(ui, query, data.as_deref(), *loading, watchlists))
             }
             PaneKind::Politicians => {
                 actions.extend(congress_view::politicians(ui, &self.politicians, &mut self.pol_search))
@@ -178,13 +173,13 @@ impl TerminalApp {
                     &self.watchlist,
                     bulk_ready,
                     |request| self.worker.send(request),
-                    &self.watchlists[self.active_watchlist].name,
+                    watchlists,
                 ));
             }
             PaneKind::Portfolio(pp) => {
                 let demo =
                     (self.prefs.trading.account_mode == crate::prefs::AccountMode::Demo).then_some(&*self.demo.pf);
-                for a in super::portfolio_view::portfolio(ui, pp, &self.broker, demo, &self.quotes) {
+                for a in super::portfolio_view::portfolio(ui, pp, &self.broker, demo, &self.quotes, watchlists) {
                     use super::portfolio_view::PortAction as P;
                     match a {
                         P::Core(a) => actions.push(a),
@@ -216,11 +211,12 @@ impl TerminalApp {
                     }
                 }
             }
-            PaneKind::Watchlist | PaneKind::Settings | PaneKind::Help | PaneKind::Chart(_) => {}
+            PaneKind::Watchlist | PaneKind::Settings | PaneKind::Help | PaneKind::Chart(_) | PaneKind::Agent(_) => {}
         }
         match self.panes[i].kind {
             PaneKind::Watchlist => actions.extend(self.watchlist(ui)),
             PaneKind::Help => self.help_panel(ui),
+            PaneKind::Agent(_) => self.agent_panel(ui, id),
             PaneKind::Settings => {
                 let cmds = self.settings_panel(ui);
                 self.run_settings_cmds(cmds);
@@ -607,8 +603,7 @@ impl TerminalApp {
         // asset visible (USD and USDT are different markets), and "Curncy" adds nothing.
         let crypto_pair = crypto.is_some();
         let ticker_width = if crypto_pair { 114.0 } else { 70.0 };
-        let ticker =
-            crypto.map_or_else(|| sec.ticker.clone(), |instrument| format!("{}/{}", instrument.base, instrument.quote));
+        let ticker = crate::security_names::ticker(&sec, false);
         let mut job = egui::text::LayoutJob::simple_singleline(ticker, mono(12.5), amber());
         job.wrap.max_width = ticker_width;
         job.wrap.max_rows = 1;
@@ -627,7 +622,7 @@ impl TerminalApp {
         }
         let name = self.security_names.name(s);
         let ticker_hit = Rect::from_min_max(r.min, pos2(name_left, r.bottom()));
-        let mut description = crate::security_names::hover(&sec.ticker, name);
+        let mut description = crate::security_names::hover(&crate::security_names::ticker(&sec, true), name);
         if let Some(quote) = self.quotes.get(s)
             && let Some(source) = &quote.crypto_source
         {
@@ -702,7 +697,8 @@ impl TerminalApp {
         }
         let tradable = matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf);
         let pills = if tradable { widgets::buy_sell_pills().to_vec() } else { Vec::new() };
-        let tips = [format!("Buy {} (⇧B)", sec.ticker), format!("Sell {} (⇧S)", sec.ticker)];
+        let ticker = crate::security_names::ticker(&sec, false);
+        let tips = [format!("Buy {ticker} (⇧B)"), format!("Sell {ticker} (⇧S)")];
         let tips: Vec<&str> = tips.iter().map(String::as_str).collect();
         match widgets::row_pills(ui, r, ("wl-pills", s), &pills, &tips) {
             Some(i) => out.push(Action::Command(format!("{} {s}", if i == 0 { "BUY" } else { "SELL" }))),
@@ -731,12 +727,12 @@ impl TerminalApp {
             out.push(Action::OpenChart(s.to_owned()));
             ui.close();
         }
-        ui.menu_button(format!("Add {} to watchlist", sec.ticker), |ui| {
+        ui.menu_button(format!("Add {} to watchlist", crate::security_names::ticker(&sec, false)), |ui| {
             for action in self.watchlist_destination_menu(ui, s) {
                 out.push(action);
             }
         });
-        if ui.button(format!("Add {} to compare", sec.ticker)).clicked() {
+        if ui.button(format!("Add {} to compare", crate::security_names::ticker(&sec, false))).clicked() {
             out.push(Action::AddToCompare(s.to_owned()));
             ui.close();
         }
@@ -843,21 +839,8 @@ impl TerminalApp {
     }
 
     fn watchlist_destination_menu(&self, ui: &mut Ui, symbol: &str) -> Vec<Action> {
-        let mut out = Vec::new();
-        for (i, list) in self.watchlists.iter().enumerate() {
-            let contains = list.symbols.iter().any(|s| s == symbol);
-            let label = format!(
-                "{}{}{}",
-                if contains { "✓ " } else { "" },
-                list.name,
-                if i == self.active_watchlist { " (active)" } else { "" }
-            );
-            if ui.add_enabled(!contains, egui::Button::new(label)).clicked() {
-                out.push(Action::AddToNamedWatchlist { list: list.name.clone(), symbol: symbol.into() });
-                ui.close();
-            }
-        }
-        out
+        let targets = crate::chart_view::WatchlistTarget::for_symbol(&self.watchlists, self.active_watchlist, symbol);
+        crate::chart_view::watchlist_destinations(ui, symbol, &targets)
     }
 
     fn watch_details_card(&self, ui: &mut Ui) {
@@ -872,7 +855,7 @@ impl TerminalApp {
         let p = ui.painter();
         p.line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, muted().gamma_multiply(0.3)));
         let at = |y| pos2(r.left() + dp(8.0), r.top() + dp(y));
-        p.text(at(17.0), Align2::LEFT_CENTER, &sec.ticker, mono(17.0), amber());
+        p.text(at(17.0), Align2::LEFT_CENTER, crate::security_names::ticker(&sec, true), mono(17.0), amber());
         p.text(at(38.0), Align2::LEFT_CENTER, self.security_names.name(symbol).unwrap_or(""), ui_font(11.0), text());
         let crypto = sec.crypto_instrument().ok();
         let venue = if let Some(instrument) = &crypto {
@@ -1018,7 +1001,9 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
     let key = tr_data::security(&b.symbol);
     let book: Option<OrderBook> = b.book.as_ref().map(|x| x.grouped(b.group));
     ui.horizontal_wrapped(|ui| {
-        let r = ui.label(RichText::new(&key.ticker).font(mono(13.0)).color(amber())).interact(Sense::click());
+        let r = ui
+            .label(RichText::new(crate::security_names::ticker(&key, true)).font(mono(13.0)).color(amber()))
+            .interact(Sense::click());
         if r.clicked() {
             action = Some(Action::OpenChart(b.symbol.clone()));
         }

@@ -6,6 +6,7 @@ use egui::{Color32, RichText, ScrollArea, Sense, Ui};
 use tr_congress::db::{Alert, PoliticianSummary};
 use tr_congress::{Chamber, Party, Trade, TxType};
 
+use crate::chart_view::WatchlistMenus;
 use crate::theme::{self, amber, mono, muted, text, ui_font};
 use crate::worker::Profile;
 
@@ -28,6 +29,11 @@ pub enum Action {
     AddToNamedWatchlist {
         list: String,
         symbol: String,
+    },
+    AddToWatchlistSection {
+        list: String,
+        symbol: String,
+        section: crate::chart_view::WatchlistSectionTarget,
     },
     SaveMatchesAsWatchlist(String, Vec<String>),
     AddMatchesToWatchlist(Vec<String>),
@@ -104,6 +110,7 @@ fn trade_row(
     show_ticker: bool,
     extra: Option<(String, Color32)>,
     out: &mut Vec<Action>,
+    watchlists: WatchlistMenus<'_>,
 ) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
@@ -143,7 +150,8 @@ fn trade_row(
         if show_ticker {
             match &t.ticker {
                 Some(tk) => {
-                    let r = clickable(ui, format!("{tk:<6}"), amber());
+                    let ticker = crate::security_names::ticker(&tr_data::security(tk), false);
+                    let r = clickable(ui, format!("{ticker:<6}"), amber());
                     if r.clicked() {
                         out.push(Action::OpenChart(tk.clone()));
                     }
@@ -153,14 +161,11 @@ fn trade_row(
                             out.push(Action::OpenChart(tk.clone()));
                             ui.close();
                         }
-                        if ui.button(format!("Who in Congress Traded {tk}")).clicked() {
+                        if ui.button(format!("Who in Congress Traded {ticker}")).clicked() {
                             out.push(Action::OpenTicker(tk.clone()));
                             ui.close();
                         }
-                        if ui.button("Add to Watchlist").clicked() {
-                            out.push(Action::AddToWatchlist(tk.clone()));
-                            ui.close();
-                        }
+                        out.extend(crate::chart_view::symbol_watchlist_menu(ui, tk, "Add to Watchlist", watchlists));
                     });
                 }
                 None => plain(ui, "-     ", muted()),
@@ -175,7 +180,13 @@ fn trade_row(
     });
 }
 
-pub fn feed(ui: &mut Ui, trades: &[Trade], filter: &mut FeedFilter, status: &str) -> Vec<Action> {
+pub fn feed(
+    ui: &mut Ui,
+    trades: &[Trade],
+    filter: &mut FeedFilter,
+    status: &str,
+    watchlists: WatchlistMenus<'_>,
+) -> Vec<Action> {
     let mut out = Vec::new();
     ui.horizontal(|ui| {
         let chip = |ui: &mut Ui, label: &str, on: bool| {
@@ -212,13 +223,13 @@ pub fn feed(ui: &mut Ui, trades: &[Trade], filter: &mut FeedFilter, status: &str
     let row_h = 16.0;
     ScrollArea::both().id_salt("feed").auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
         for t in &rows[range] {
-            trade_row(ui, t, true, true, None, &mut out);
+            trade_row(ui, t, true, true, None, &mut out, watchlists);
         }
     });
     out
 }
 
-pub fn ticker_trades(ui: &mut Ui, symbol: &str, trades: &[Trade]) -> Vec<Action> {
+pub fn ticker_trades(ui: &mut Ui, symbol: &str, trades: &[Trade], watchlists: WatchlistMenus<'_>) -> Vec<Action> {
     let mut out = Vec::new();
     let buys = trades.iter().filter(|t| t.tx_type.is_buy()).count();
     let sells = trades.iter().filter(|t| t.tx_type.is_sell()).count();
@@ -254,14 +265,20 @@ pub fn ticker_trades(ui: &mut Ui, symbol: &str, trades: &[Trade]) -> Vec<Action>
         trades.len(),
         |ui, range| {
             for t in &trades[range] {
-                trade_row(ui, t, true, false, None, &mut out);
+                trade_row(ui, t, true, false, None, &mut out, watchlists);
             }
         },
     );
     out
 }
 
-pub fn profile(ui: &mut Ui, query: &str, p: Option<&Profile>, loading: bool) -> Vec<Action> {
+pub fn profile(
+    ui: &mut Ui,
+    query: &str,
+    p: Option<&Profile>,
+    loading: bool,
+    watchlists: WatchlistMenus<'_>,
+) -> Vec<Action> {
     let mut out = Vec::new();
     let Some(p) = p else {
         plain(
@@ -342,7 +359,7 @@ pub fn profile(ui: &mut Ui, query: &str, p: Option<&Profile>, loading: bool) -> 
                     .get(&t.id)
                     .map(|r| (format!("{:>+6.1}%", r * 100.0), if *r >= 0.0 { theme::up() } else { theme::down() }))
                     .unwrap_or(("   n/a ".into(), muted()));
-                trade_row(ui, t, false, true, Some(extra), &mut out);
+                trade_row(ui, t, false, true, Some(extra), &mut out, watchlists);
             }
         },
     );
@@ -452,6 +469,68 @@ mod tests {
         assert!(!FeedFilter { buys: Some(true), ..Default::default() }.matches(&t));
         let bond = trade(Party::Republican, Chamber::House, TxType::Purchase, None);
         assert!(!FeedFilter { tickers_only: true, ..Default::default() }.matches(&bond));
+    }
+
+    #[test]
+    fn feed_symbol_menu_uses_borrowed_watchlists_and_builds_only_when_open() {
+        let ctx = egui::Context::default();
+        let key = "AAPL US Equity";
+        let trades = [trade(Party::Democrat, Chamber::Senate, TxType::Purchase, Some(key))];
+        let lists = [crate::app::NamedWatchlist::new("Other".into(), Vec::new())];
+        let mut filter = FeedFilter::default();
+        let mut actions = Vec::new();
+        let builds = crate::chart_view::WATCHLIST_TARGET_BUILDS.get();
+        let mut frame = |events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 600.0))),
+                    time: Some(ctx.input(|i| i.time) + 0.2),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    actions.extend(feed(ui, &trades, &mut filter, "", WatchlistMenus { lists: &lists, active: 0 }));
+                },
+            );
+            let texts: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        Some((text.galley.job.text.clone(), text.galley.rect.translate(text.pos.to_vec2())))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            output.textures_delta.clear();
+            texts
+        };
+        let point = |texts: &[(String, egui::Rect)], label: &str| {
+            texts.iter().find(|(text, _)| text.trim() == label).unwrap().1.center()
+        };
+        let pointer = |pos, button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let at = point(&frame(vec![]), "AAPL");
+        assert_eq!(crate::chart_view::WATCHLIST_TARGET_BUILDS.get(), builds);
+        frame(vec![egui::Event::PointerMoved(at)]);
+        frame(vec![pointer(at, egui::PointerButton::Secondary, true)]);
+        frame(vec![pointer(at, egui::PointerButton::Secondary, false)]);
+        let at = point(&frame(vec![]), "Add to named watchlist");
+        assert_eq!(crate::chart_view::WATCHLIST_TARGET_BUILDS.get(), builds);
+        frame(vec![egui::Event::PointerMoved(at)]);
+        frame(vec![pointer(at, egui::PointerButton::Primary, true)]);
+        frame(vec![pointer(at, egui::PointerButton::Primary, false)]);
+        let at = point(&frame(vec![]), "Other (active)");
+        frame(vec![egui::Event::PointerMoved(at)]);
+        frame(vec![pointer(at, egui::PointerButton::Primary, true)]);
+        frame(vec![pointer(at, egui::PointerButton::Primary, false)]);
+        assert_eq!(actions, [Action::AddToNamedWatchlist { list: "Other".into(), symbol: key.into() }]);
+        assert!(crate::chart_view::WATCHLIST_TARGET_BUILDS.get() > builds);
     }
 
     #[test]

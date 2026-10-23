@@ -59,6 +59,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("PREFS", "", "settings preferences config", Some(Action::Settings)),
     ("UPDATE", "", "check for updates new version upgrade", None),
     ("HELP", "", "help functions reference", Some(Action::Help)),
+    ("AGENT", "", "chat codex chart analysis chatgpt", None),
     ("CANDLE", "", "chart type candlesticks", None),
     ("BAR", "", "chart type ohlc", None),
     ("LINE", "", "chart type", None),

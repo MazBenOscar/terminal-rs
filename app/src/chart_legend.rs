@@ -11,6 +11,8 @@ pub struct Row {
     pub rect: Rect,
     pub text: String,
     pub visible: bool,
+    pub agent_highlight: bool,
+    pub turn_id: Option<String>,
     pub color: Color32,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -18,6 +20,7 @@ pub enum Action {
     Visibility(u32, bool),
     Edit(u32),
     Remove(u32),
+    Keep(u32),
 }
 
 pub fn rows(
@@ -62,7 +65,8 @@ pub fn rows(
         } else {
             "(hidden)".into()
         };
-        let label = format!("{}  {values}", spec.label());
+        let badge = if settings.agent_highlight() { " · Agent" } else { "" };
+        let label = format!("{}{badge}  {values}", spec.label());
         let color = if !settings.visible {
             theme::muted()
         } else {
@@ -76,7 +80,15 @@ pub fn rows(
         let at = pos2(rect.left() + 6., rect.top() + if price { 20. } else { 3. } + row as f32 * 14.);
         let hit = Rect::from_min_size(at, vec2(width, 14.)).intersect(rect);
         if hit.is_positive() {
-            rows.push(Row { id: settings.id, rect: hit, text: label, visible: settings.visible, color });
+            rows.push(Row {
+                id: settings.id,
+                rect: hit,
+                text: label,
+                visible: settings.visible,
+                agent_highlight: settings.agent_highlight(),
+                turn_id: settings.turn_id.clone(),
+                color,
+            });
         }
     };
     for (i, spec) in specs.iter().enumerate() {
@@ -101,9 +113,19 @@ pub fn rows(
 pub fn interact(ui: &Ui, pane: u64, rows: &[Row]) -> Option<Action> {
     let mut action = None;
     for row in rows {
-        let response = ui
-            .interact(row.rect, ui.id().with((pane, "study-legend", row.id)), Sense::click())
-            .on_hover_text(format!("{}\nClick or right-click to show, hide, edit or remove this study.", row.text));
+        let provenance = if row.agent_highlight {
+            format!(
+                "\nCreated by Agent, turn {}. Keep transfers ownership to you.",
+                row.turn_id.as_deref().unwrap_or("unknown")
+            )
+        } else {
+            String::new()
+        };
+        let response =
+            ui.interact(row.rect, ui.id().with((pane, "study-legend", row.id)), Sense::click()).on_hover_text(format!(
+                "{}{provenance}\nClick or right-click to show, hide, edit or remove this study.",
+                row.text
+            ));
         if response.secondary_clicked() {
             egui::Popup::toggle_id(ui.ctx(), egui::Popup::default_response_id(&response));
         }
@@ -112,6 +134,10 @@ pub fn interact(ui: &Ui, pane: u64, rows: &[Row]) -> Option<Action> {
             let mut visible = row.visible;
             if ui.checkbox(&mut visible, "Show on chart").changed() {
                 action = Some(Action::Visibility(row.id, visible));
+                ui.close();
+            }
+            if row.agent_highlight && ui.button("Keep (make user study)").clicked() {
+                action = Some(Action::Keep(row.id));
                 ui.close();
             }
             if ui.button("Edit indicator…").clicked() {

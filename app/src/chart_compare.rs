@@ -162,7 +162,7 @@ impl Picker {
         window.show(ctx, |ui| {
             if let Some(current) = current {
                 ui.horizontal(|ui| {
-                    ui.label(format!("Comparing {current}"));
+                    ui.label(format!("Comparing {}", crate::security_names::label(current)));
                     let mut visible = !hidden.iter().any(|s| s == current);
                     if ui.checkbox(&mut visible, "Show").changed() {
                         hidden.retain(|s| s != current);
@@ -180,7 +180,7 @@ impl Picker {
                 ui.push_id(key, |ui| {
                     ui.horizontal(|ui| {
                         let mut visible = !hidden.contains(key);
-                        if ui.checkbox(&mut visible, key).changed() {
+                        if ui.checkbox(&mut visible, crate::security_names::label(key)).changed() {
                             hidden.retain(|s| s != key);
                             if !visible {
                                 hidden.push(key.clone());

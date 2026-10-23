@@ -134,9 +134,20 @@ pub enum Scale {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Author {
+    #[default]
+    User,
+    Agent,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub id: u32,
+    #[serde(default)]
+    pub created_by: Author,
+    #[serde(default)]
+    pub turn_id: Option<String>,
     #[serde(default)]
     pub source: Source,
     pub pane: Pane,
@@ -173,6 +184,10 @@ fn height() -> f32 {
 }
 
 impl Settings {
+    pub fn agent_highlight(&self) -> bool {
+        self.created_by == Author::Agent
+    }
+
     /// Normalize display settings from untrusted saves. Unavailable external
     /// references stay intact so the editor can explain them instead of silently
     /// retargeting a fill to a different study.
@@ -208,6 +223,8 @@ impl Settings {
     pub fn new(id: u32, spec: &Spec) -> Self {
         Self {
             id,
+            created_by: Author::User,
+            turn_id: None,
             source: Source::Bars,
             pane: if spec.def().is_some_and(|d| d.pane) { Pane::Own } else { Pane::Price },
             scale: Scale::Shared,
@@ -228,7 +245,7 @@ impl Settings {
 /// Give legacy and newly added specs unique IDs without renumbering existing ports.
 pub fn assign_ids(specs: &mut [Spec]) {
     for spec in specs.iter_mut() {
-        spec.chart = spec.chart.take().map(Settings::sanitized);
+        spec.chart = spec.chart.take().map(|settings| Box::new(settings.sanitized()));
     }
     let mut reserved: std::collections::HashSet<_> =
         specs.iter().filter_map(|s| s.chart.as_ref().map(|c| c.id)).filter(|id| *id != 0).collect();
@@ -251,7 +268,7 @@ pub fn assign_ids(specs: &mut [Spec]) {
         if let Some(c) = &mut spec.chart {
             c.id = id;
         } else {
-            spec.chart = Some(Settings::new(id, spec));
+            spec.chart = Some(Box::new(Settings::new(id, spec)));
         }
     }
 }
@@ -394,7 +411,7 @@ pub(super) fn evaluate_native(specs: &[Spec], input: &Input<'_>) -> Vec<Result<V
         let source = spec.chart.as_ref().map(|c| &c.source).unwrap_or(&Source::Bars);
         let result = (|| {
             pane_key(specs, index)?;
-            if let Some(Settings { scale: Scale::Fixed { lo, hi }, .. }) = &spec.chart
+            if let Some(Settings { scale: Scale::Fixed { lo, hi }, .. }) = spec.chart.as_deref()
                 && (!lo.is_finite() || !hi.is_finite() || lo >= hi)
             {
                 return Err("Fixed scale minimum must be smaller than its maximum".into());
@@ -844,7 +861,7 @@ mod tests {
         use crate::session::Session;
         for code in ["EMA", "SMA", "RSI", "MACD", "BB", "ATR", "VWAP"] {
             let mut spec = Spec::new(code, &[]).unwrap();
-            spec.chart = Some(Settings::new(42, &spec));
+            spec.chart = Some(Box::new(Settings::new(42, &spec)));
             for displacement in [-3, 2] {
                 spec.chart.as_mut().unwrap().displacement = displacement;
                 assert!(StreamingStudy::new(&spec, Timeframe::D1, Session::Provider).is_none());
@@ -1026,7 +1043,7 @@ mod tests {
         specs.remove(0);
         assert!(evaluate(&specs, &input)[0].is_err());
         let mut atr = Spec::new("ATR", &[]).unwrap();
-        atr.chart = Some(Settings::new(3, &atr));
+        atr.chart = Some(Box::new(Settings::new(3, &atr)));
         atr.chart.as_mut().unwrap().source = Source::Volume;
         assert!(evaluate(&[atr], &input)[0].is_err());
     }
@@ -1148,7 +1165,7 @@ mod tests {
         for source in [Source::Open, Source::High, Source::Low, Source::Close, Source::Hlc3, Source::Volume] {
             for code in ["EMA", "SMA", "RSI", "MACD", "BB"] {
                 let mut spec = Spec::new(code, &[]).unwrap();
-                spec.chart = Some(Settings::new(1, &spec));
+                spec.chart = Some(Box::new(Settings::new(1, &spec)));
                 spec.chart.as_mut().unwrap().source = source.clone();
                 let mut stream = StreamingStudy::new(&spec, Timeframe::M1, crate::session::Session::Provider).unwrap();
                 let mut bars = Vec::new();

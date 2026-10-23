@@ -79,7 +79,42 @@ pub enum QuestradeAction {
     Test,
 }
 
+pub enum AgentRequest {
+    ToolHistory {
+        symbol: String,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        options: tr_data::HistoryOptions,
+        reply: tokio::sync::oneshot::Sender<Result<tr_agent_tools::History, String>>,
+    },
+    History {
+        symbol: String,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        options: tr_data::HistoryOptions,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<Bar>, String>>,
+    },
+    Quotes {
+        symbols: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<Quote>, String>>,
+    },
+    Search {
+        query: String,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<SearchHit>, String>>,
+    },
+    Indicators {
+        bars: Vec<Bar>,
+        tf: Timeframe,
+        specs: Vec<IndicatorSpec>,
+        session: tr_core::session::Session,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::chart_view::StudyRead>, String>>,
+    },
+}
+
 pub enum Request {
+    Agent(AgentRequest),
     SecurityNames(Vec<String>),
     WatchlistColumns {
         revision: u64,
@@ -345,8 +380,12 @@ pub(crate) fn filter_history(history: &mut SessionHistory) -> (Arc<Vec<Bar>>, Se
     (bars, gpu)
 }
 
+pub type StudyValues = Vec<(String, Arc<std::sync::RwLock<Vec<f64>>>)>;
+
 pub struct BuiltIndicator {
     pub spec: IndicatorSpec,
+    /// Exact evaluated values, including hidden outputs, shared across tail updates.
+    pub values: StudyValues,
     pub overlays: Vec<(String, Overlay)>,
     pub error: Option<String>,
     pub fill: Option<crate::chart_fill::Fill>,
@@ -713,6 +752,14 @@ impl StudyPaneCache {
                     .zip(self.streams.iter().flatten())
                     .zip(starts)
                     .map(|((template, stream), start)| {
+                        for (name, values) in &template.values {
+                            if let Some(output) = stream.outputs.iter().find(|o| o.name == name) {
+                                let mut values = values.write().expect("study values lock");
+                                let from = start.min(values.len()).min(output.values.len());
+                                values.truncate(from);
+                                values.extend_from_slice(&output.values[from..]);
+                            }
+                        }
                         for (name, overlay) in &mut template.overlays {
                             if let Some(output) = stream.outputs.iter().find(|o| o.name == name) {
                                 patch_study_line(
@@ -725,6 +772,7 @@ impl StudyPaneCache {
                         }
                         BuiltIndicator {
                             spec: template.spec.clone(),
+                            values: template.values.clone(),
                             overlays: template.overlays.clone(),
                             error: template.error.clone(),
                             fill: None,
@@ -742,6 +790,7 @@ impl StudyPaneCache {
                 .iter()
                 .map(|b| BuiltIndicator {
                     spec: b.spec.clone(),
+                    values: b.values.clone(),
                     overlays: b.overlays.clone(),
                     error: b.error.clone(),
                     fill: None,
@@ -847,6 +896,11 @@ impl Shared {
 pub use tr_alerts::data_dir;
 
 impl Worker {
+    /// Clone before starting background clients; replies to Agent requests use oneshots.
+    pub fn sender(&self) -> tokio::sync::mpsc::UnboundedSender<Request> {
+        self.tx.clone()
+    }
+
     #[cfg(test)]
     pub fn inert() -> Self {
         Self::recording().0
@@ -1108,6 +1162,10 @@ fn build_indicators_cached(
                 .map_or(palette.series[i % colors], |[r, g, b]| egui::Color32::from_rgb(r, g, b));
             let error = result.as_ref().err().cloned();
             let mut outputs = result.clone().unwrap_or_default();
+            let values = outputs
+                .iter()
+                .map(|o| (o.name.to_owned(), Arc::new(std::sync::RwLock::new(o.values.clone()))))
+                .collect();
             let ports = outputs.iter().map(|o| o.name.to_string()).collect();
             let fill = spec.chart.as_ref().and_then(|c| {
                 let band = c.fill.as_ref()?;
@@ -1208,7 +1266,7 @@ fn build_indicators_cached(
                 })
                 .collect::<Vec<_>>();
             let (overlays, readouts) = overlays.into_iter().unzip();
-            BuiltIndicator { spec: spec.clone(), overlays, error, fill, ports, bounds, readouts }
+            BuiltIndicator { spec: spec.clone(), values, overlays, error, fill, ports, bounds, readouts }
         })
         .collect()
 }
@@ -1246,8 +1304,113 @@ pub fn initial_limit(tf: Timeframe) -> usize {
     std::env::var("TR_HISTORY_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| default_limit(tf))
 }
 
+async fn agent_history(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    end: Option<i64>,
+    limit: usize,
+    options: tr_data::HistoryOptions,
+) -> Result<Vec<Bar>, String> {
+    let source = chart_options_key(s.provider.as_ref(), symbol, options);
+    let result = s.provider.chart_history(symbol, tf, end, limit, options).await.map_err(|e| format!("{e:#}"));
+    match result {
+        Ok(bars) => {
+            if chart_options_key(s.provider.as_ref(), symbol, options) != source {
+                Err("Data route changed; retry history".into())
+            } else {
+                if let Ok(mut cache) = s.cache.lock()
+                    && let Some(cache) = cache.as_mut()
+                {
+                    let _ = cache.store(&source, tf, &bars);
+                }
+                Ok(bars)
+            }
+        }
+        Err(error) => {
+            // The cache stores the latest tail, never an arbitrary historical page.
+            let cached = if end.is_none() {
+                s.cache
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.as_ref().and_then(|c| c.load(&source, tf, limit).ok()))
+                    .filter(|bars| !bars.is_empty())
+            } else {
+                None
+            };
+            cached.ok_or(error)
+        }
+    }
+}
+
+async fn handle_agent(s: &Shared, request: AgentRequest) {
+    match request {
+        AgentRequest::ToolHistory { symbol, tf, end, limit, options, reply } => {
+            let source = chart_options_key(s.provider.as_ref(), &symbol, options);
+            let result = agent_history(s, &symbol, tf, end, limit, options).await.and_then(|bars| {
+                if chart_options_key(s.provider.as_ref(), &symbol, options) != source {
+                    return Err("Data route changed; retry history".into());
+                }
+                Ok(tr_agent_tools::History {
+                    bars,
+                    session: options.session,
+                    instrument: s.provider.crypto_instrument(&symbol),
+                    ..Default::default()
+                })
+            });
+            let _ = reply.send(result);
+        }
+        AgentRequest::History { symbol, tf, end, limit, options, reply } => {
+            let _ = reply.send(agent_history(s, &symbol, tf, end, limit, options).await);
+        }
+        AgentRequest::Quotes { symbols, reply } => {
+            let _ = reply.send(s.provider.quotes(&symbols).await.map_err(|e| format!("{e:#}")));
+        }
+        AgentRequest::Search { query, reply } => {
+            let _ = reply.send(s.provider.search(&query).await.map_err(|e| format!("{e:#}")));
+        }
+        AgentRequest::Indicators { bars, tf, specs, session, reply } => {
+            let result = tokio::task::spawn_blocking(move || {
+                let input = Input::new(&bars, tf).with_session(session);
+                let outputs = calculate_studies(&specs, &input, session, &StudyHistories::new());
+                specs
+                    .into_iter()
+                    .zip(outputs)
+                    .map(|(spec, result)| {
+                        let (outputs, error) = match result {
+                            Ok(outputs) => (
+                                outputs
+                                    .into_iter()
+                                    .map(|output| crate::chart_view::StudyOutputRead {
+                                        name: output.name.into(),
+                                        values: output.values.into_iter().map(|v| v.is_finite().then_some(v)).collect(),
+                                    })
+                                    .collect(),
+                                None,
+                            ),
+                            Err(error) => (Vec::new(), Some(error)),
+                        };
+                        crate::chart_view::StudyRead {
+                            id: spec.chart.as_ref().map(|c| c.id),
+                            tool_id: None,
+                            agent_highlight: spec.chart.as_ref().is_some_and(|c| c.agent_highlight()),
+                            spec,
+                            outputs,
+                            error,
+                        }
+                    })
+                    .collect()
+            })
+            .await
+            .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+    }
+}
+
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
+        Request::Agent(request) => handle_agent(s, request).await,
         Request::SecurityNames(symbols) => {
             use futures::StreamExt;
             if s.provider.name().eq_ignore_ascii_case("sample") || s.provider.name().eq_ignore_ascii_case("offline") {
@@ -4983,5 +5146,236 @@ mod tests {
         }
         assert_eq!((history.generation, history.revision, history.exhausted), (2, 3, true));
         assert!(Arc::ptr_eq(&history.source, &source));
+    }
+
+    #[tokio::test]
+    async fn agent_requests_reply_directly_without_panes_or_ui_responses() {
+        let bars = vec![
+            Bar::new(60, 1., 3., 1., 2., 10.),
+            Bar::new(120, 2., 4., 2., 3., 20.),
+            Bar::new(180, 3., 5., 3., 4., 30.),
+        ];
+        let provider =
+            Arc::new(ComparisonFixture { bars: std::sync::Mutex::new(bars.clone()), limits: Default::default() });
+        let (s, ui) = backfill_shared(provider.clone());
+        *s.cache.lock().unwrap() = Some(BarCache::open_in_memory().unwrap());
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle(
+            &s,
+            Request::Agent(AgentRequest::History {
+                symbol: "AAA".into(),
+                tf: Timeframe::M1,
+                end: Some(180),
+                limit: 1,
+                options: Default::default(),
+                reply,
+            }),
+        )
+        .await;
+        assert_eq!(receive.await.unwrap().unwrap(), vec![bars[1]]);
+        assert_eq!(*provider.limits.lock().unwrap(), vec![1]);
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle(&s, Request::Agent(AgentRequest::Quotes { symbols: vec!["AAA".into()], reply })).await;
+        assert_eq!(receive.await.unwrap().unwrap()[0].last, 4.);
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle(&s, Request::Agent(AgentRequest::Search { query: "AAA".into(), reply })).await;
+        assert!(receive.await.unwrap().unwrap().is_empty());
+        let mut specs = vec![IndicatorSpec::new("SMA", &[2.]).unwrap()];
+        tr_core::indicators::study::assign_ids(&mut specs);
+        let id = specs[0].chart.as_ref().unwrap().id;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle(
+            &s,
+            Request::Agent(AgentRequest::Indicators {
+                bars,
+                tf: Timeframe::M1,
+                specs,
+                session: tr_core::session::Session::Provider,
+                reply,
+            }),
+        )
+        .await;
+        let studies = receive.await.unwrap().unwrap();
+        assert_eq!(studies[0].id, Some(id));
+        assert_eq!(studies[0].outputs[0].values, vec![None, Some(2.5), Some(3.5)]);
+        assert!(s.series.lock().unwrap().is_empty());
+        assert!(matches!(ui.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    struct AgentUnavailable;
+
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for AgentUnavailable {
+        fn name(&self) -> &str {
+            "agent unavailable fixture"
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            anyhow::bail!("offline fixture")
+        }
+        async fn search(&self, _: &str) -> anyhow::Result<Vec<SearchHit>> {
+            anyhow::bail!("search fixture error")
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_history_reuses_cache_but_never_substitutes_tail_for_a_page() {
+        let (s, ui) = backfill_shared(Arc::new(AgentUnavailable));
+        let options = tr_data::HistoryOptions::default();
+        let source = chart_options_key(s.provider.as_ref(), "AAA", options);
+        let bar = Bar::new(60, 1., 3., 1., 2., 10.);
+        let mut cache = BarCache::open_in_memory().unwrap();
+        cache.store(&source, Timeframe::M1, &[bar]).unwrap();
+        *s.cache.lock().unwrap() = Some(cache);
+        for end in [None, Some(60)] {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            handle(
+                &s,
+                Request::Agent(AgentRequest::History {
+                    symbol: "AAA".into(),
+                    tf: Timeframe::M1,
+                    end,
+                    limit: 10,
+                    options,
+                    reply,
+                }),
+            )
+            .await;
+            let result = receive.await.unwrap();
+            if end.is_none() {
+                assert_eq!(result.unwrap(), vec![bar]);
+            } else {
+                assert!(result.unwrap_err().contains("offline fixture"));
+            }
+        }
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle(&s, Request::Agent(AgentRequest::Search { query: "AAA".into(), reply })).await;
+        assert_eq!(receive.await.unwrap().unwrap_err(), "search fixture error");
+        assert!(ui.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a1a_agent_dropped_receivers_and_errors_leave_existing_pane_generation_untouched() {
+        let (s, ui) = backfill_shared(Arc::new(AgentUnavailable));
+        let bars = Arc::new(vec![Bar::new(60, 1., 2., 0.5, 1.5, 10.)]);
+        assert!(claim_series(&s, 41, 7, "existing-pane-route"));
+        assert!(store_series(&s, 41, 7, bars.clone()));
+        let existing = s.series.lock().unwrap()[&41].clone();
+        let (reply, mut receive) = tokio::sync::oneshot::channel();
+        handle(
+            &s,
+            Request::Agent(AgentRequest::History {
+                symbol: "AAA".into(),
+                tf: Timeframe::M1,
+                end: None,
+                limit: 10,
+                options: Default::default(),
+                reply,
+            }),
+        )
+        .await;
+        assert!(receive.try_recv().unwrap().unwrap_err().contains("offline fixture"));
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        drop(receive);
+        handle(
+            &s,
+            Request::Agent(AgentRequest::History {
+                symbol: "AAA".into(),
+                tf: Timeframe::M1,
+                end: Some(60),
+                limit: 10,
+                options: Default::default(),
+                reply,
+            }),
+        )
+        .await;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        drop(receive);
+        handle(&s, Request::Agent(AgentRequest::Search { query: "AAA".into(), reply })).await;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        drop(receive);
+        handle(&s, Request::Agent(AgentRequest::Quotes { symbols: vec!["AAA".into()], reply })).await;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        drop(receive);
+        handle(
+            &s,
+            Request::Agent(AgentRequest::Indicators {
+                bars: bars.as_ref().clone(),
+                tf: Timeframe::M1,
+                specs: vec![IndicatorSpec::new("SMA", &[1.]).unwrap()],
+                session: tr_core::session::Session::Provider,
+                reply,
+            }),
+        )
+        .await;
+        assert_eq!(s.series.lock().unwrap()[&41], existing);
+        assert!(Arc::ptr_eq(&s.series.lock().unwrap()[&41].1, &existing.1));
+        assert_eq!(current_series(&s, 41, 7).unwrap().as_ref(), bars.as_ref());
+        assert!(current_series(&s, 41, 6).is_none());
+        assert_eq!(s.series.lock().unwrap().len(), 1);
+        assert!(s.study_outputs.lock().unwrap().is_empty());
+        assert!(s.compare_outputs.lock().unwrap().is_empty());
+        assert!(matches!(ui.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn a1a_successful_agent_history_populates_the_shared_cache_without_pane_delivery() {
+        let bars = vec![Bar::new(60, 1., 2., 0., 1., 10.), Bar::new(120, 2., 3., 1., 2., 20.)];
+        let provider =
+            Arc::new(ComparisonFixture { bars: std::sync::Mutex::new(bars.clone()), limits: Default::default() });
+        let (s, ui) = backfill_shared(provider);
+        *s.cache.lock().unwrap() = Some(BarCache::open_in_memory().unwrap());
+        let source = chart_options_key(s.provider.as_ref(), "AAA", Default::default());
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle(
+            &s,
+            Request::Agent(AgentRequest::History {
+                symbol: "AAA".into(),
+                tf: Timeframe::M1,
+                end: None,
+                limit: 2,
+                options: Default::default(),
+                reply,
+            }),
+        )
+        .await;
+        assert_eq!(receive.await.unwrap().unwrap(), bars);
+        assert_eq!(s.cache.lock().unwrap().as_ref().unwrap().load(&source, Timeframe::M1, 10).unwrap(), bars);
+        assert!(s.series.lock().unwrap().is_empty());
+        assert!(matches!(ui.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn exact_study_values_patch_shared_tails_without_full_array_copies() {
+        let mut cache = StudyPaneCache::default();
+        let mut bars = tr_core::sample::generate("AAA", Timeframe::M1, 100, 1_790_000_000);
+        let mut specs = vec![IndicatorSpec::new("SMA", &[2.]).unwrap()];
+        tr_core::indicators::study::assign_ids(&mut specs);
+        let palette = theme::palette();
+        let histories = StudyHistories::new();
+        let mut previous = None;
+        for revision in 1..=3 {
+            let from = if revision == 1 { 0 } else { bars.len() - 1 };
+            bars.last_mut().unwrap().close += 0.123456789;
+            let built = cache.build(StudyBuild {
+                generation: 0,
+                revision,
+                from,
+                bars: &bars,
+                tf: Timeframe::M1,
+                specs: &specs,
+                palette: &palette,
+                session: tr_core::session::Session::Provider,
+                histories: &histories,
+            });
+            let exact = &built[0].values[0].1;
+            if let Some(previous) = previous {
+                assert!(Arc::ptr_eq(&previous, exact));
+            }
+            let expected = build_indicators(&bars, Timeframe::M1, &specs, &palette);
+            for (actual, expected) in exact.read().unwrap().iter().zip(expected[0].values[0].1.read().unwrap().iter()) {
+                assert!(actual.is_nan() && expected.is_nan() || (actual - expected).abs() < 1e-10);
+            }
+            previous = Some(exact.clone());
+        }
     }
 }

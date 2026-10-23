@@ -1,0 +1,18 @@
+{
+  "bar_range": {
+    "count": 80,
+    "from": "2024-01-01T00:00:00+00:00",
+    "to": "2024-03-20T00:00:00+00:00"
+  },
+  "direction": "up",
+  "higher_highs": 0,
+  "higher_lows": 0,
+  "mode": "trend",
+  "price_basis": "adjusted",
+  "r_squared": 0.24995968,
+  "session": "Provider bars",
+  "slope_per_bar": 0.18396624,
+  "symbol": "FIXTURE",
+  "timeframe": "1D",
+  "version": 1
+}

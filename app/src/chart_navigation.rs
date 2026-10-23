@@ -9,7 +9,7 @@ pub struct Navigation {
     pub cursor: bool,
     pub range: bool,
 }
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct DateRange {
     pub start: i64,
     pub end: i64,

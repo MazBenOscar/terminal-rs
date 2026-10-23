@@ -8,6 +8,7 @@ use tr_broker::{Account, Portfolio, Position};
 use tr_data::Quote;
 
 use super::broker::{BrokerMode, BrokerState, PortfolioPane, PosSort};
+use crate::chart_view::WatchlistMenus;
 use crate::command::PortView;
 use crate::congress_view::Action;
 use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
@@ -253,7 +254,7 @@ fn trade_items(ui: &mut Ui, key: &str, account: Option<&str>, held: Option<f64>,
 }
 
 /// Right-click menu for a security row.
-fn security_menu(ui: &mut Ui, key: &str, symbol: &str, out: &mut Vec<PortAction>) {
+fn security_menu(ui: &mut Ui, key: &str, symbol: &str, out: &mut Vec<PortAction>, watchlists: WatchlistMenus<'_>) {
     if ui.button("Open Chart").clicked() {
         out.push(PortAction::Core(Action::OpenChart(key.to_string())));
         ui.close();
@@ -273,10 +274,11 @@ fn security_menu(ui: &mut Ui, key: &str, symbol: &str, out: &mut Vec<PortAction>
         out.push(PortAction::Core(Action::OpenTicker(sec.ticker.clone())));
         ui.close();
     }
-    if ui.button("Add to Watchlist").clicked() {
-        out.push(PortAction::Core(Action::AddToWatchlist(key.to_string())));
-        ui.close();
-    }
+    out.extend(
+        crate::chart_view::symbol_watchlist_menu(ui, key, "Add to Watchlist", watchlists)
+            .into_iter()
+            .map(PortAction::Core),
+    );
     ui.separator();
     if ui.button(format!("Copy {symbol}")).clicked() {
         ui.ctx().copy_text(symbol.to_string());
@@ -294,6 +296,7 @@ pub fn portfolio(
     b: &BrokerState,
     demo: Option<&Portfolio>,
     quotes: &HashMap<String, Quote>,
+    watchlists: WatchlistMenus<'_>,
 ) -> Vec<PortAction> {
     let mut out = Vec::new();
     toolbar(ui, pane, b, demo, &mut out);
@@ -333,12 +336,12 @@ pub fn portfolio(
                     egui::ScrollArea::vertical()
                         .id_salt("port-summary")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| summary(ui, pane, pf, &price_of, &mut out));
+                        .show(ui, |ui| summary(ui, pane, pf, &price_of, &mut out, watchlists));
                 }
                 PortView::Accounts => accounts(ui, pane, pf, &price_of),
-                PortView::Positions => positions(ui, pane, pf, &price_of, &mut out),
-                PortView::Orders => orders(ui, pane, pf, &mut out),
-                PortView::Activity => activity(ui, pane, pf, &mut out),
+                PortView::Positions => positions(ui, pane, pf, &price_of, &mut out, watchlists),
+                PortView::Orders => orders(ui, pane, pf, &mut out, watchlists),
+                PortView::Activity => activity(ui, pane, pf, &mut out, watchlists),
             }
             if !pf.warnings.is_empty() {
                 ui.add_space(dp(6.0));
@@ -439,7 +442,7 @@ fn toolbar(
     // A security filter (`AAPL POS`) on its own line, so it never collides with the status.
     if let Some(s) = pane.symbol.clone() {
         ui.horizontal(|ui| {
-            let t = tr_data::security(&s).ticker;
+            let t = crate::security_names::ticker(&tr_data::security(&s), false);
             note(ui, format!("Showing {t} only"));
             if ui.small_button("Show all").on_hover_text("Remove the security filter").clicked() {
                 pane.symbol = None;
@@ -563,6 +566,7 @@ fn summary(
     pf: &Portfolio,
     price_of: &dyn Fn(&Position) -> Option<f64>,
     out: &mut Vec<PortAction>,
+    watchlists: WatchlistMenus<'_>,
 ) {
     let t = pf.totals(pane.account.as_deref(), price_of);
     let ccy = currency(pf, pane);
@@ -676,7 +680,7 @@ fn summary(
     );
     header(ui, &cols, None);
     for (p, _) in held.iter().take(8) {
-        position_row(ui, &cols, p, price_of(p), out, |ui, r, cols, p, live| {
+        position_row(ui, &cols, p, price_of(p), out, watchlists, |ui, r, cols, p, live| {
             let painter = ui.painter();
             cell(painter, r, cols, 0, p.short_label(), mono(12.0), amber());
             cell(painter, r, cols, 1, qty(p.units), mono(12.0), text());
@@ -718,6 +722,7 @@ fn position_row(
     p: &Position,
     live: Option<f64>,
     out: &mut Vec<PortAction>,
+    watchlists: WatchlistMenus<'_>,
     draw: impl FnOnce(&mut Ui, Rect, &[Col], &Position, Option<f64>),
 ) {
     let (r, resp) = row(ui);
@@ -768,7 +773,7 @@ fn position_row(
                     ui.separator();
                 }
             }
-            security_menu(ui, k, &p.symbol, out)
+            security_menu(ui, k, &p.symbol, out, watchlists)
         });
     }
 }
@@ -823,6 +828,7 @@ fn positions(
     pf: &Portfolio,
     price_of: &dyn Fn(&Position) -> Option<f64>,
     out: &mut Vec<PortAction>,
+    watchlists: WatchlistMenus<'_>,
 ) {
     let sel = selected(pane);
     let mut list: Vec<(&Position, Option<f64>)> = pf
@@ -875,7 +881,7 @@ fn positions(
             for (p, live) in &list {
                 let share = (gross > 0.0).then(|| value(&(p, *live)).abs() / gross * 100.0);
                 let account = pf.account(&p.account_id).map(Account::label).unwrap_or_default();
-                position_row(ui, &cols, p, *live, out, |ui, r, cols, p, live| {
+                position_row(ui, &cols, p, *live, out, watchlists, |ui, r, cols, p, live| {
                     let painter = ui.painter();
                     cell(painter, r, cols, 0, p.short_label(), mono(12.0), amber());
                     let desc =
@@ -938,7 +944,13 @@ fn positions(
     });
 }
 
-fn orders(ui: &mut Ui, pane: &mut PortfolioPane, pf: &Portfolio, out: &mut Vec<PortAction>) {
+fn orders(
+    ui: &mut Ui,
+    pane: &mut PortfolioPane,
+    pf: &Portfolio,
+    out: &mut Vec<PortAction>,
+    watchlists: WatchlistMenus<'_>,
+) {
     ui.horizontal(|ui| {
         let sel = Some(usize::from(!pane.open_only));
         if let Some(i) = widgets::segmented(ui, "port-orders", &["Open", "All"], sel, 20.0) {
@@ -1047,7 +1059,7 @@ fn orders(ui: &mut Ui, pane: &mut PortfolioPane, pf: &Portfolio, out: &mut Vec<P
                         ui.separator();
                     }
                     if let Some(k) = &key {
-                        security_menu(ui, k, &o.symbol, out);
+                        security_menu(ui, k, &o.symbol, out, watchlists);
                     }
                 });
             }
@@ -1055,7 +1067,13 @@ fn orders(ui: &mut Ui, pane: &mut PortfolioPane, pf: &Portfolio, out: &mut Vec<P
     });
 }
 
-fn activity(ui: &mut Ui, pane: &mut PortfolioPane, pf: &Portfolio, out: &mut Vec<PortAction>) {
+fn activity(
+    ui: &mut Ui,
+    pane: &mut PortfolioPane,
+    pf: &Portfolio,
+    out: &mut Vec<PortAction>,
+    watchlists: WatchlistMenus<'_>,
+) {
     note(
         ui,
         format!("Last {} days: trades, dividends, interest, transfers and fees", tr_broker::snaptrade::ACTIVITY_DAYS),
@@ -1127,7 +1145,7 @@ fn activity(ui: &mut Ui, pane: &mut PortfolioPane, pf: &Portfolio, out: &mut Vec
                     out.push(PortAction::Core(Action::OpenChart(k.clone())));
                 }
                 let sym = a.symbol.clone().unwrap_or_default();
-                resp.context_menu(|ui| security_menu(ui, &k, &sym, out));
+                resp.context_menu(|ui| security_menu(ui, &k, &sym, out, watchlists));
             }
         }
     });
@@ -1179,16 +1197,19 @@ mod tests {
         b.creds = tr_broker::Credentials::default();
         b.portfolio = Some(Box::new(tr_broker::sample::portfolio()));
         let quotes = HashMap::new();
+        let lists = [super::super::NamedWatchlist::new("Main".into(), Vec::new())];
+        let watchlists = WatchlistMenus { lists: &lists, active: 0 };
+        let builds = crate::chart_view::WATCHLIST_TARGET_BUILDS.get();
         for view in PortView::ALL {
             let mut pane = PortfolioPane::new(view);
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+                let _ = portfolio(ui, &mut pane, &b, None, &quotes, watchlists);
             });
             out.textures_delta.clear();
             pane.account = Some("sim-ira".into());
             pane.symbol = Some("SPY US Equity".into());
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+                let _ = portfolio(ui, &mut pane, &b, None, &quotes, watchlists);
             });
             out.textures_delta.clear();
         }
@@ -1197,7 +1218,7 @@ mod tests {
         for view in PortView::ALL {
             let mut pane = PortfolioPane::new(view);
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, Some(&demo), &quotes);
+                let _ = portfolio(ui, &mut pane, &b, Some(&demo), &quotes, watchlists);
             });
             out.textures_delta.clear();
         }
@@ -1205,8 +1226,9 @@ mod tests {
         b.simulate = false;
         let mut pane = PortfolioPane::new(PortView::Summary);
         let mut out = ctx.run_ui(Default::default(), |ui| {
-            let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+            let _ = portfolio(ui, &mut pane, &b, None, &quotes, watchlists);
         });
         out.textures_delta.clear();
+        assert_eq!(crate::chart_view::WATCHLIST_TARGET_BUILDS.get(), builds, "closed menus must not build targets");
     }
 }

@@ -13,6 +13,7 @@ use tr_core::scanner::{
     MatchMode, ScanCondition, ScanDefinition, ScanOperand, ScanOutcome, Source,
 };
 
+use crate::chart_view::WatchlistMenus;
 use crate::congress_view::Action;
 use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
 use crate::widgets::{self, Icon};
@@ -692,7 +693,8 @@ pub fn show(
     bulk_ready: bool,
     send: impl FnMut(Request),
 ) -> Vec<Action> {
-    show_named(ui, pane, id, symbols, bulk_ready, send, "Main")
+    let lists = [super::NamedWatchlist::new("Main".into(), Vec::new())];
+    show_named(ui, pane, id, symbols, bulk_ready, send, WatchlistMenus { lists: &lists, active: 0 })
 }
 
 pub fn show_named(
@@ -702,8 +704,9 @@ pub fn show_named(
     symbols: &[String],
     bulk_ready: bool,
     mut send: impl FnMut(Request),
-    watchlist_name: &str,
+    watchlists: WatchlistMenus<'_>,
 ) -> Vec<Action> {
+    let watchlist_name = &watchlists.lists[watchlists.active].name;
     let mut actions = Vec::new();
     let market = pane.universe != Universe::Watchlist;
     pane.restrict_refresh();
@@ -1043,9 +1046,9 @@ pub fn show_named(
                     }
                 });
             }
-            results_table(ui, pane, market, &mut actions);
+            results_table(ui, pane, market, &mut actions, watchlists);
         } else if pane.running && !pane.rows.is_empty() {
-            results_table(ui, pane, market, &mut actions);
+            results_table(ui, pane, market, &mut actions, watchlists);
         } else if !pane.running {
             ui.add_space(dp(6.0));
             ui.label(RichText::new("Choose conditions and run a scan. Definitions are saved with the workspace; Save scan also adds them to your library.").color(muted()));
@@ -1142,7 +1145,13 @@ fn stats_hint(pane: &ScannerPane, symbol: &str, now: i64) -> String {
 }
 
 /// Results drawn like the watchlist: a header band, hover-washed rows, click to chart.
-fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec<Action>) {
+fn results_table(
+    ui: &mut Ui,
+    pane: &ScannerPane,
+    market: bool,
+    actions: &mut Vec<Action>,
+    watchlists: WatchlistMenus<'_>,
+) {
     let matches = matching_symbols(&pane.rows);
     if !pane.running && !matches.is_empty() {
         ui.horizontal_wrapped(|ui| {
@@ -1180,14 +1189,20 @@ fn results_table(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Ve
     if pane.universe.crypto_venue().is_some() {
         egui::ScrollArea::horizontal().id_salt("crypto-results-scroll").show(ui, |ui| {
             ui.set_min_width(dp(1000.0));
-            results_rows(ui, pane, market, actions);
+            results_rows(ui, pane, market, actions, watchlists);
         });
     } else {
-        results_rows(ui, pane, market, actions);
+        results_rows(ui, pane, market, actions, watchlists);
     }
 }
 
-fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec<Action>) {
+fn results_rows(
+    ui: &mut Ui,
+    pane: &ScannerPane,
+    market: bool,
+    actions: &mut Vec<Action>,
+    watchlists: WatchlistMenus<'_>,
+) {
     let row_h = dp(22.0);
     let w = ui.available_width();
     // Left edges: security, result, last bar, bar age, details.
@@ -1284,11 +1299,7 @@ fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec
         let p = ui.painter_at(r);
         let y = r.center().y;
         let security = tr_data::security(&row.symbol);
-        let ticker = security.ticker.clone();
-        let shown_ticker = security
-            .crypto_instrument()
-            .ok()
-            .map_or_else(|| ticker.clone(), |instrument| format!("{}/{}", instrument.base, instrument.quote));
+        let shown_ticker = crate::security_names::ticker(&security, false);
         let mut job = egui::text::LayoutJob::simple_singleline(shown_ticker, mono(12.5), amber());
         job.wrap.max_width = security_width - dp(14.0);
         job.wrap.max_rows = 1;
@@ -1368,10 +1379,7 @@ fn results_rows(ui: &mut Ui, pane: &ScannerPane, market: bool, actions: &mut Vec
             row.symbol
         ));
         resp.context_menu(|ui| {
-            if ui.button("Add to watchlist").clicked() {
-                actions.push(Action::AddToWatchlist(row.symbol.clone()));
-                ui.close();
-            }
+            actions.extend(crate::chart_view::symbol_watchlist_menu(ui, &row.symbol, "Add to watchlist", watchlists));
         });
         if resp.clicked() {
             if outcome == ScanOutcome::Match {
@@ -1548,7 +1556,7 @@ mod tests {
                         ..Default::default()
                     },
                     |ui| {
-                        show_named(ui, &mut pane, 1, &[], false, |request| requests.push(request), "Main");
+                        show(ui, &mut pane, 1, &[], false, |request| requests.push(request));
                     },
                 );
                 output.textures_delta.clear();
@@ -1579,13 +1587,13 @@ mod tests {
                 }],
             );
             let mut output = ctx.run_ui(Default::default(), |ui| {
-                show_named(ui, &mut pane, 1, &[], false, |request| requests.push(request), "Main");
+                show(ui, &mut pane, 1, &[], false, |request| requests.push(request));
             });
             assert!(!output.shapes.is_empty());
             output.textures_delta.clear();
             pane.crypto_filter.quote = "USD/T".into();
             let mut output = ctx.run_ui(Default::default(), |ui| {
-                show_named(ui, &mut pane, 1, &[], false, |request| requests.push(request), "Main");
+                show(ui, &mut pane, 1, &[], false, |request| requests.push(request));
             });
             output.textures_delta.clear();
             assert!(requests.is_empty(), "An invalid filter must not schedule an unfiltered scan");
@@ -1732,6 +1740,11 @@ mod tests {
             simulated: false,
             error: None,
         }];
+        let lists = [
+            super::super::NamedWatchlist::new("Main".into(), Vec::new()),
+            super::super::NamedWatchlist::new("Other".into(), Vec::new()),
+        ];
+        let builds = crate::chart_view::WATCHLIST_TARGET_BUILDS.get();
         let mut actions = Vec::new();
         let mut frame = |pane: &ScannerPane, events: Vec<egui::Event>| {
             let mut output = ctx.run_ui(
@@ -1741,7 +1754,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| results_table(ui, pane, false, &mut actions),
+                |ui| results_table(ui, pane, false, &mut actions, WatchlistMenus { lists: &lists, active: 0 }),
             );
             let texts: Vec<_> = output
                 .shapes
@@ -1758,6 +1771,7 @@ mod tests {
             texts
         };
         let labels = frame(&pane, vec![]);
+        assert_eq!(crate::chart_view::WATCHLIST_TARGET_BUILDS.get(), builds, "closed menus must not build targets");
         let point = |labels: &[(String, egui::Rect)], label: &str| {
             labels.iter().find(|(text, _)| text == label).unwrap().1.center()
         };
@@ -1778,7 +1792,20 @@ mod tests {
         frame(&pane, vec![pointer(at, egui::PointerButton::Secondary, true)]);
         frame(&pane, vec![pointer(at, egui::PointerButton::Secondary, false)]);
         let menu = frame(&pane, vec![]);
+        assert_eq!(crate::chart_view::WATCHLIST_TARGET_BUILDS.get(), builds, "closed named submenu stays lazy");
         let at = point(&menu, "Add to watchlist");
+        frame(&pane, vec![egui::Event::PointerMoved(at)]);
+        frame(&pane, vec![pointer(at, egui::PointerButton::Primary, true)]);
+        frame(&pane, vec![pointer(at, egui::PointerButton::Primary, false)]);
+        let at = point(&labels, "NVDA");
+        frame(&pane, vec![egui::Event::PointerMoved(at)]);
+        frame(&pane, vec![pointer(at, egui::PointerButton::Secondary, true)]);
+        frame(&pane, vec![pointer(at, egui::PointerButton::Secondary, false)]);
+        let at = point(&frame(&pane, vec![]), "Add to named watchlist");
+        frame(&pane, vec![egui::Event::PointerMoved(at)]);
+        frame(&pane, vec![pointer(at, egui::PointerButton::Primary, true)]);
+        frame(&pane, vec![pointer(at, egui::PointerButton::Primary, false)]);
+        let at = point(&frame(&pane, vec![]), "Other");
         frame(&pane, vec![egui::Event::PointerMoved(at)]);
         frame(&pane, vec![pointer(at, egui::PointerButton::Primary, true)]);
         frame(&pane, vec![pointer(at, egui::PointerButton::Primary, false)]);
@@ -1793,6 +1820,7 @@ mod tests {
                 Action::AddMatchesToWatchlist(vec![tr_data::security("NVDA").key()]),
                 Action::ReplaceWatchlistWithMatches(vec![tr_data::security("NVDA").key()]),
                 Action::AddToWatchlist("NVDA".into()),
+                Action::AddToNamedWatchlist { list: "Other".into(), symbol: "NVDA".into() },
             ]
         );
     }
@@ -1802,7 +1830,16 @@ mod tests {
         let ctx = egui::Context::default();
         let mut pane = ScannerPane::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            show_named(ui, &mut pane, 1, &["NVDA US Equity".into()], false, |_| {}, "Technology");
+            let lists = [super::super::NamedWatchlist::new("Technology".into(), Vec::new())];
+            show_named(
+                ui,
+                &mut pane,
+                1,
+                &["NVDA US Equity".into()],
+                false,
+                |_| {},
+                WatchlistMenus { lists: &lists, active: 0 },
+            );
         });
         output.textures_delta.clear();
         assert!(output.shapes.iter().any(|shape| {
@@ -1852,7 +1889,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| results_table(ui, &pane, false, &mut actions),
+                |ui| results_table(ui, &pane, false, &mut actions, WatchlistMenus { lists: &[], active: 0 }),
             );
             output.textures_delta.clear();
             output

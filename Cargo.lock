@@ -4129,6 +4129,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "tr-agent",
+ "tr-agent-tools",
  "tr-alerts",
  "tr-broker",
  "tr-chart",
@@ -4443,6 +4445,35 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
+
+[[package]]
+name = "tr-agent"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tr-agent-tools",
+ "tr-chart",
+ "tr-core",
+ "tr-data",
+]
+
+[[package]]
+name = "tr-agent-tools"
+version = "0.1.1"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tr-chart",
+ "tr-core",
+ "tr-data",
+]
 
 [[package]]
 name = "tr-alerts"

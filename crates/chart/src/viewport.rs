@@ -4,7 +4,7 @@
 //! bar `i` occupies `[i, i+1)` in index space and gaps (nights, weekends) collapse.
 
 /// Horizontal view over a bar series.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct Viewport {
     /// Fractional bar index at the right edge of the plot.
     pub right: f64,

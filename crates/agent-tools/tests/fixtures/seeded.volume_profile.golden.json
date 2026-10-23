@@ -1,0 +1,25 @@
+{
+  "anchored_vwap": 112.21376429,
+  "bar_range": {
+    "count": 96,
+    "from": "2024-01-01T00:00:00+00:00",
+    "to": "2024-04-05T00:00:00+00:00"
+  },
+  "mode": "volume_profile",
+  "price_basis": "adjusted",
+  "profile": {
+    "bins": 48,
+    "estimated_from_ohlcv": true,
+    "poc": 100.30301211,
+    "value_area": {
+      "fraction": 0.7,
+      "high": 122.59317928,
+      "low": 93.47949155
+    }
+  },
+  "session": "Provider bars",
+  "symbol": "FIXTURE",
+  "timeframe": "1D",
+  "version": 1,
+  "vwap_anchor": 1704067200
+}
