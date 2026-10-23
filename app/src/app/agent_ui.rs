@@ -226,6 +226,19 @@ impl TerminalApp {
     }
 
     fn send_agent_prompt(&mut self, prompt: agent_pane::Prompt) {
+        // Without a valid pin, pin the chart the user last focused (else the visible chart) so
+        // the turn's chart and later Pinned lookups agree; the header shows the pin.
+        let pinned_valid = self
+            .pinned_agent_chart
+            .is_some_and(|uid| self.agent_chart(crate::agent_queue::ChartTarget::Uid(uid)).is_some());
+        if !pinned_valid {
+            self.pinned_agent_chart = self
+                .agent_pane
+                .active_chart
+                .filter(|uid| self.agent_chart(crate::agent_queue::ChartTarget::Uid(*uid)).is_some())
+                .or_else(|| self.peek_chart().map(|c| c.uid));
+            self.agent_pane.settings.pinned_chart = self.pinned_agent_chart;
+        }
         let pin = self
             .pinned_agent_chart
             .and_then(|uid| self.agent_chart(crate::agent_queue::ChartTarget::Uid(uid)))
@@ -433,6 +446,31 @@ mod tests {
         app.agent_action(&ctx, id, Action::Check);
         assert!(app.agent_pane.session.is_none());
         assert_eq!(app.agent_pane.tool_set(), tr_agent_tools::ToolSet::Edit);
+    }
+
+    #[test]
+    fn sending_without_a_pin_pins_the_last_focused_chart() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/agent-ui-autopin");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.execute("NEW CHART");
+        app.execute("NEW CHART");
+        app.execute("NEW AGENT");
+        let charts: Vec<u64> = app
+            .panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) => Some(c.uid),
+                _ => None,
+            })
+            .collect();
+        let last_used = *charts.last().unwrap();
+        app.agent_pane.active_chart = Some(last_used);
+        app.focus = app.first_agent().unwrap();
+        app.pinned_agent_chart = None;
+        app.send_agent_prompt(agent_pane::Prompt { text: "What's the trend?".into(), requires_tools: true });
+        assert_eq!(app.pinned_agent_chart, Some(last_used));
+        assert_eq!(app.agent_pane.settings.pinned_chart, Some(last_used));
+        assert_eq!(app.agent_chart_uid(crate::agent_queue::ChartTarget::Pinned), Some(last_used));
     }
 
     #[test]
