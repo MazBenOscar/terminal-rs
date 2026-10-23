@@ -2,7 +2,10 @@
 //! congressional (STOCK Act) trade tracking.
 
 pub use app::agent_bridge;
+mod agent_markdown;
+mod agent_pane;
 pub mod agent_queue;
+mod agent_session;
 mod alert_delivery;
 mod anim;
 pub mod app;

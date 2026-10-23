@@ -40,6 +40,7 @@ impl TerminalApp {
         let mut actions = Vec::new();
         let id = self.panes[i].id;
         let dragging = self.drag.is_some_and(|d| d.active);
+        let chart_focused = focused && !self.agent_captures_focus(ui.ctx());
         let account_overlay = if let PaneKind::Chart(c) = &self.panes[i].kind {
             Some(crate::chart_account::Snapshot::build(
                 self.shown_portfolio(),
@@ -65,7 +66,7 @@ impl TerminalApp {
             c.watchlists =
                 crate::chart_view::WatchlistTarget::for_symbol(&self.watchlists, self.active_watchlist, &c.symbol);
             c.hover_enabled = !dragging;
-            let clicked = c.show(ui, rect, focused, &self.worker);
+            let clicked = c.show(ui, rect, chart_focused, &self.worker);
             actions.append(&mut c.actions);
             let alert_actions = std::mem::take(&mut c.price_alert_actions);
             for action in alert_actions {
@@ -210,11 +211,12 @@ impl TerminalApp {
                     }
                 }
             }
-            PaneKind::Watchlist | PaneKind::Settings | PaneKind::Help | PaneKind::Chart(_) => {}
+            PaneKind::Watchlist | PaneKind::Settings | PaneKind::Help | PaneKind::Chart(_) | PaneKind::Agent(_) => {}
         }
         match self.panes[i].kind {
             PaneKind::Watchlist => actions.extend(self.watchlist(ui)),
             PaneKind::Help => self.help_panel(ui),
+            PaneKind::Agent(_) => self.agent_panel(ui, id),
             PaneKind::Settings => {
                 let cmds = self.settings_panel(ui);
                 self.run_settings_cmds(cmds);

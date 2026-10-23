@@ -269,6 +269,7 @@ pub enum Function {
     /// `SIDEBAR LEFT|RIGHT|TOGGLE|SHOW|HIDE|SWAP`.
     Sidebar(String),
     Settings,
+    Agent,
     /// Check for a newer release of the app.
     Update,
     /// `THEME LIGHT|DARK|SYSTEM|COMPACT|REGULAR|COMFORTABLE`.
@@ -466,6 +467,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "THEME" => Function::Theme(words().join(" ")),
         "TITLE" | "RENAME" => Function::Title(joined()),
         "CLOSE" => Function::ClosePane,
+        "AGENT" => Function::Agent,
         "HELP" | "?" | "H" => Function::Help,
         "WEI" | "MARKETS" | "WORLD" => Function::Wei,
         "GC" | "YCRV" | "CURVE" | "YC" => Function::Curve,
@@ -635,6 +637,7 @@ fn describe(f: &Function) -> String {
         Function::Theme(t) => format!("Theme {t}"),
         Function::Title(t) => format!("Rename tab to {t:?}"),
         Function::ClosePane => "Close focused pane".into(),
+        Function::Agent => "Chart agent (Codex / ChatGPT)".into(),
         Function::Help => "Help".into(),
         Function::Wei => "World markets overview".into(),
         Function::Curve => "US Treasury yield curve".into(),

@@ -29,6 +29,8 @@ pub struct Model {
     pub id: String,
     pub model: String,
     pub display_name: String,
+    #[serde(default)]
+    pub is_default: bool,
     pub default_reasoning_effort: String,
     pub supported_reasoning_efforts: Vec<ReasoningOption>,
 }
@@ -303,6 +305,16 @@ impl CodexAppServer {
     }
 
     pub async fn login_wait(&self, login: &mut Login) -> Result<()> {
+        self.login_wait_for_completion(login).await?;
+        if self.read_account().await? != AccountState::ChatGpt {
+            bail!("ChatGPT account required");
+        }
+        Ok(())
+    }
+
+    /// Observe browser completion separately from account verification so a UI can
+    /// dismiss Cancel immediately. Callers must still verify read_account before use.
+    pub async fn login_wait_for_completion(&self, login: &mut Login) -> Result<()> {
         while let Some(event) = login.events.recv().await {
             match event {
                 WireEvent::Notification { method, params }
@@ -313,9 +325,6 @@ impl CodexAppServer {
                         let reason = params["error"].as_str().map(crate::transcript::scrub_text);
                         let reason: String = reason.as_deref().unwrap_or("no reason given").chars().take(300).collect();
                         bail!("ChatGPT login failed: {reason}");
-                    }
-                    if self.read_account().await? != AccountState::ChatGpt {
-                        bail!("ChatGPT account required");
                     }
                     return Ok(());
                 }
@@ -356,7 +365,7 @@ impl CodexAppServer {
         Ok(())
     }
 
-    pub(crate) async fn wait_cleanup(&self) -> Result<()> {
+    pub async fn wait_cleanup(&self) -> Result<()> {
         self.transport()?.wait_cleanup().await
     }
 
@@ -420,11 +429,12 @@ impl AgentBackend for CodexAppServer {
             return Ok(BackendState::NotLoggedIn);
         }
         let limits = self.rate_limits().await?;
-        if let Some(allowed) = limits["ordinaryUsageAllowed"].as_bool() {
-            return Ok(if allowed { BackendState::Ready } else { BackendState::RateLimited });
+        if limits["ordinaryUsageAllowed"] == false {
+            return Ok(BackendState::RateLimited);
         }
-        let snapshots = std::iter::once(&limits["rateLimits"])
-            .chain(limits["rateLimitsByLimitId"].as_object().into_iter().flat_map(|map| map.values()));
+        // detect() has no selected model: only the ordinary snapshot governs it.
+        // Per-model/other limit ids are evaluated by the app for its selection.
+        let snapshots = std::iter::once(&limits["rateLimits"]);
         if snapshots.into_iter().any(|snapshot| {
             ["primary", "secondary"]
                 .iter()
@@ -569,6 +579,35 @@ mod tests {
                     assert_eq!(request["method"], "account/rateLimits/read");
                     send(&mut write, json!({"id":request["id"],"result":{"ordinaryUsageAllowed":allowed,"rateLimits":{"primary":{"usedPercent":0}}}})).await;
                 }
+            };
+            let (state, ()) = tokio::join!(client.detect(), server);
+            assert_eq!(state.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_only_blocks_the_ordinary_limit_snapshot() {
+        for (allowed, ordinary, expected) in [
+            (Value::Null, 3, BackendState::Ready),
+            (json!(true), 3, BackendState::Ready),
+            (json!(true), 100, BackendState::RateLimited),
+            (json!(false), 3, BackendState::RateLimited),
+        ] {
+            let (transport, mut read, mut write, _) = fake(no_tools());
+            let client = ready(transport);
+            let server = async {
+                let account = receive(&mut read).await;
+                send(&mut write, json!({"id":account["id"],"result":{"account":{"type":"chatgpt"}}})).await;
+                let limits = receive(&mut read).await;
+                send(
+                    &mut write,
+                    json!({"id":limits["id"],"result":{
+                        "ordinaryUsageAllowed":allowed,
+                        "rateLimits":{"primary":{"usedPercent":ordinary}},
+                        "rateLimitsByLimitId":{"other-model":{"primary":{"usedPercent":100}}}
+                    }}),
+                )
+                .await;
             };
             let (state, ()) = tokio::join!(client.detect(), server);
             assert_eq!(state.unwrap(), expected);

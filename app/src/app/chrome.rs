@@ -294,7 +294,7 @@ impl TerminalApp {
     fn command_field(&mut self, ui: &mut Ui, field: Rect) -> bool {
         let suggestions = self.suggestions();
         // Claim navigation keys for the dropdown before the text field sees them.
-        let (sel_down, sel_up, complete) = if suggestions.is_empty() {
+        let (sel_down, sel_up, complete) = if suggestions.is_empty() || self.agent_captures_focus(ui.ctx()) {
             (false, false, false)
         } else {
             ui.input_mut(|i| {
@@ -1171,5 +1171,36 @@ mod tests {
         frame(&mut app, vec![pointer(false)]);
         assert_eq!(app.cmd_history.last(), Some(&first));
         assert!(app.cmd.is_empty());
+    }
+
+    #[test]
+    fn agent_focus_blocks_palette_and_command_completion_keys() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/agent-focus-test");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.execute("NEW AGENT");
+        app.cmd = "BTC".into();
+        assert!(!app.suggestions().is_empty());
+        let input = crate::agent_pane::input_id(Id::new(("agent-pane", app.focus)));
+        let ctx = egui::Context::default();
+        for (key, modifiers) in [(Key::K, Modifiers::COMMAND), (Key::Tab, Modifiers::NONE)] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1000.0, 600.0))),
+                    events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }],
+                    ..Default::default()
+                },
+                |ui| {
+                    ctx.memory_mut(|m| m.request_focus(input));
+                    assert!(app.agent_captures_focus(&ctx));
+                    app.hotkeys(&ctx);
+                    app.command_field(ui, Rect::from_min_size(pos2(100.0, 10.0), vec2(600.0, 24.0)));
+                    assert!(ctx.input(|i| i.key_pressed(key)), "command chrome must leave the key for chat");
+                },
+            );
+            output.textures_delta.clear();
+            assert!(!app.palette.open);
+            assert!(!app.focus_cmd);
+            assert_eq!(app.cmd, "BTC");
+        }
     }
 }

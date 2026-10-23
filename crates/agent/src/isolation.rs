@@ -881,7 +881,9 @@ fn isolated_command(program: &Path, home: &PrivateHome) -> Command {
 }
 
 #[derive(Debug)]
-pub struct WrongVersion;
+pub struct WrongVersion {
+    pub found: String,
+}
 impl std::fmt::Display for WrongVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("unsupported Codex version")
@@ -980,9 +982,13 @@ pub async fn spawn_session(
     let user_home = user_home.canonicalize()?;
     let profile = sandbox_profile_for(&home.path, &binary, &user_home, mode)?;
     let version = probe(&binary, home, &profile, &["--version"]).await?;
-    range.check(&version).map_err(|_| WrongVersion)?;
+    range.check(&version).map_err(|_| WrongVersion {
+        found: crate::transcript::scrub_text(version.trim()).chars().take(80).collect(),
+    })?;
     // No caller can widen the pinned protocol version through VersionRange.
-    VersionRange::default().check(&version).map_err(|_| WrongVersion)?;
+    VersionRange::default().check(&version).map_err(|_| WrongVersion {
+        found: crate::transcript::scrub_text(version.trim()).chars().take(80).collect(),
+    })?;
     let features = probe(&binary, home, &profile, &["features", "list"]).await?;
     verify_features(&features)?;
     crate::bridge::verify_readiness(&version, &features, &std::fs::read_to_string(home.path.join("config.toml"))?)?;

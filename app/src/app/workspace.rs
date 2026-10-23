@@ -20,7 +20,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 15] = [
+pub const PANELS: [(&str, &str); 16] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("Scanner", "SCAN"),
@@ -35,6 +35,7 @@ pub const PANELS: [(&str, &str); 15] = [
     ("Alerts", "ALRT"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
+    ("Agent", "AGENT"),
     ("Help", "HELP"),
 ];
 
@@ -753,6 +754,7 @@ impl TerminalApp {
             "ALRT" | "ALERTS" => PaneKind::Alerts,
             "SECF" | "SEARCH" => PaneKind::Search { query: words[1..].join(" ") },
             "PREFS" | "SETTINGS" | "PDF" => PaneKind::Settings,
+            "AGENT" => PaneKind::Agent(crate::agent_pane::Settings::default()),
             "HELP" => PaneKind::Help,
             _ => return None,
         })
@@ -815,7 +817,12 @@ impl TerminalApp {
                 .iter()
                 .map(|p| SavedPane {
                     id: ids[&p.id],
-                    settings: p.kind.settings(),
+                    settings: match &p.kind {
+                        PaneKind::Agent(settings) => {
+                            crate::layouts::PaneSettings::Agent(self.agent_saved_settings(settings))
+                        }
+                        _ => p.kind.settings(),
+                    },
                     link: p.link,
                     title: p.title.clone(),
                     window: p.window,
@@ -853,6 +860,7 @@ impl TerminalApp {
             }
         }
         self.pinned_agent_chart = None;
+        self.agent_pane.initialized = false;
         self.edit_log.observed.clear();
         if doc.skipped_drawings > 0 {
             self.toasts.push((
