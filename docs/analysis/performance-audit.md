@@ -160,7 +160,24 @@ These are CPU calculation/geometry numbers, not GPU frame times or an in-app A/B
   no read lease is needed.
 
 Verification: formatting and strict workspace Clippy passed; workspace tests
-passed with 1,011 passed and 7 ignored. New tests cover checkpoint resumption and
+passed with 1,021 passed and 7 ignored after review fixes. New tests cover checkpoint resumption and
 invalidation, missing values and scalar sources, cache identities and exact dirty
 ranges, shared-request ownership, comparison request limits and fallbacks,
 parallel calculation parity, and worker session filtering/viewport preservation.
+
+Adversarial review found two bugs, both fixed: a study result built before a live
+append is now shown and followed by one throttle-bypassing catch-up request
+(dropping it would starve studies on busy charts, where ticks outrun the 1.5 s
+refresh); a comparison cache shorter than the requested window now refetches in
+full so its left edge matches a fresh fetch.
+
+In-app A/B (`TR_PROVIDER=sample`, AAVE 1D, 6,000 bars, 5 studies, foreground
+idle, 60 s windows): P1b 4.01 / 3.74 s CPU and 122–125 MB versus `personal/main`
+with P1a 3.71 / 3.79 s and 136–138 MB. CPU is unchanged within noise; memory is
+about 13 MB lower. A `sample` profile of that run shows almost all remaining
+on-CPU time in egui frame building (text and path tessellation, panel layout) on
+each tick repaint, not in data or study work. Further foreground savings on
+short charts therefore need fewer or cheaper repaints (repaint only when visible
+content changes, cached text layout), which belongs with P3/P5; P1b's gain
+appears on long histories, where study refresh drops from about 4.5 ms to under
+0.01 ms per tick.
