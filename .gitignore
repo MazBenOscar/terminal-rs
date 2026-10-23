@@ -6,3 +6,5 @@
 /.env*
 secrets/
 snaptrade*.json
+# Nested build/test output (e.g. crates/agent/target from isolation tests)
+**/target/

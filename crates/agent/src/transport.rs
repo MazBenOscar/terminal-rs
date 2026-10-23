@@ -142,6 +142,8 @@ struct Shared {
     events: Mutex<Vec<std::sync::Weak<EventQueue>>>,
     terminal: watch::Sender<Option<String>>,
     unsafe_backend: AtomicBool,
+    bridge_safety: Mutex<Option<Arc<AtomicBool>>>,
+    cleanup: watch::Sender<Option<std::result::Result<(), String>>>,
     stopped: AtomicBool,
     kill: Arc<dyn Fn() + Send + Sync>,
     transcript: Option<Transcript>,
@@ -151,6 +153,13 @@ struct Shared {
 }
 
 impl Shared {
+    fn taint(&self) {
+        self.unsafe_backend.store(true, Ordering::SeqCst);
+        if let Some(safety) = self.bridge_safety.lock().unwrap().as_ref() {
+            safety.store(true, Ordering::SeqCst);
+        }
+    }
+
     fn emit(&self, event: WireEvent) {
         self.events.lock().unwrap().retain(|subscriber| {
             if let Some(queue) = subscriber.upgrade() {
@@ -171,6 +180,7 @@ impl Shared {
         if let Some(check) = self.shutdown_check.lock().unwrap().as_ref()
             && let Err(error) = check()
         {
+            self.taint();
             message.push_str(&format!("; cleanup findings: {}", crate::transcript::scrub_text(&error.to_string())));
         }
         for (_, sender) in self.pending.lock().unwrap().drain() {
@@ -206,7 +216,7 @@ impl Shared {
 
     fn violation(&self, params: &Value, message: String) {
         let already_stopped = self.stopped.load(Ordering::SeqCst);
-        self.unsafe_backend.store(true, Ordering::SeqCst);
+        self.taint();
         self.tool_cancel.send_modify(|generation| *generation += 1);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let packet = Outbound {
@@ -292,6 +302,10 @@ impl Transport {
             events: Mutex::new(Vec::new()),
             terminal,
             unsafe_backend: AtomicBool::new(false),
+            bridge_safety: Mutex::new(None),
+            // Duplex transports have no child to reap. Isolated sessions arm this
+            // before returning the transport to their caller.
+            cleanup: watch::channel(Some(Ok(()))).0,
             stopped: AtomicBool::new(false),
             kill,
             transcript,
@@ -343,12 +357,41 @@ impl Transport {
         *self.shared.login_only.lock().unwrap() = Some(login);
     }
 
-    pub(crate) fn cleanup_reporter(&self) -> impl Fn(String) + Send + 'static {
+    pub(crate) fn bind_bridge_safety(&self, safety: Arc<AtomicBool>) {
+        let mut observer = self.shared.bridge_safety.lock().unwrap();
+        if self.is_unsafe() {
+            safety.store(true, Ordering::SeqCst);
+        }
+        *observer = Some(safety);
+    }
+
+    pub(crate) fn stop(&self, reason: &str) {
+        self.shared.fail(reason);
+    }
+
+    /// The supervisor reports even successful cleanup, after wait() and the final
+    /// process/home checks. A timer is not evidence that the old child is gone.
+    pub(crate) fn cleanup_reporter(&self) -> impl Fn(std::result::Result<(), String>) + Send + 'static {
+        self.shared.cleanup.send_replace(None);
         let shared = self.shared.clone();
-        move |message| {
-            let message = crate::transcript::scrub_text(&message);
-            shared.terminal.send_replace(Some(message.clone()));
-            shared.emit(WireEvent::Error(message));
+        move |result| {
+            if let Err(message) = &result {
+                shared.taint();
+                let message = crate::transcript::scrub_text(message);
+                shared.terminal.send_replace(Some(message.clone()));
+                shared.emit(WireEvent::Error(message));
+            }
+            shared.cleanup.send_replace(Some(result));
+        }
+    }
+
+    pub(crate) async fn wait_cleanup(&self) -> Result<()> {
+        let mut cleanup = self.shared.cleanup.subscribe();
+        loop {
+            if let Some(result) = cleanup.borrow().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            cleanup.changed().await?;
         }
     }
 

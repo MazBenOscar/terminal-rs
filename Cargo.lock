@@ -4129,6 +4129,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "tr-agent",
+ "tr-agent-tools",
  "tr-alerts",
  "tr-broker",
  "tr-chart",
@@ -4450,9 +4452,13 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
+ "tr-agent-tools",
+ "tr-core",
+ "tr-data",
 ]
 
 [[package]]

@@ -54,6 +54,14 @@ impl AgentToolQueue {
         self.ctx.request_repaint();
     }
 
+    pub fn cancel_job(&self, id: &str) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(index) = jobs.iter().position(|job| job.id == id) {
+            let job = jobs.remove(index).unwrap();
+            let _ = job.reply.send(AgentReply::error("cancelled"));
+        }
+    }
+
     pub fn cancel(&self, turn: &str) {
         let cancelled = {
             let mut jobs = self.jobs.lock().unwrap();

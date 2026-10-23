@@ -34,6 +34,7 @@ fn committed_schema_covers_every_wire_method_field_and_enum() {
         "account/login/cancel",
         "model/list",
         "thread/start",
+        "thread/resume",
         "turn/start",
         "turn/interrupt",
         "turn/steer",
@@ -80,6 +81,15 @@ fn committed_schema_covers_every_wire_method_field_and_enum() {
         ("ReasoningEffortOption", "reasoningEffort description"),
         ("ThreadStartParams", "dynamicTools environments cwd sandbox baseInstructions ephemeral serviceTier"),
         ("ThreadStartResponse", "thread"),
+        (
+            "ThreadResumeParams",
+            "threadId cwd sandbox approvalPolicy approvalsReviewer baseInstructions serviceTier runtimeWorkspaceRoots excludeTurns",
+        ),
+        ("ThreadResumeResponse", "thread"),
+        ("WarningNotification", "message threadId"),
+        ("ConfigWarningNotification", "summary details"),
+        ("ErrorNotification", "error threadId turnId willRetry"),
+        ("TurnError", "message"),
         ("Thread", "id"),
         ("TurnStartParams", "threadId input model effort sandboxPolicy additionalContext serviceTier environments"),
         ("TurnStartResponse", "turn"),
@@ -87,7 +97,7 @@ fn committed_schema_covers_every_wire_method_field_and_enum() {
         ("TurnInterruptParams", "threadId turnId"),
         ("TurnSteerParams", "threadId expectedTurnId input additionalContext"),
         ("AdditionalContextEntry", "kind value"),
-        ("DynamicToolCallParams", "arguments callId threadId tool turnId"),
+        ("DynamicToolCallParams", "arguments callId threadId tool turnId namespace"),
         ("DynamicToolCallResponse", "success contentItems"),
         ("CommandExecutionRequestApprovalResponse", "decision"),
         ("FileChangeRequestApprovalResponse", "decision"),
@@ -113,6 +123,7 @@ fn committed_schema_covers_every_wire_method_field_and_enum() {
         fields(variant(&schema, "ThreadItem", "type", kind), "type");
     }
     fields(variant(&schema, "DynamicToolSpec", "type", "function"), "type name description inputSchema deferLoading");
+    fields(variant(&schema, "DynamicToolSpec", "type", "namespace"), "type name description tools");
     fields(variant(&schema, "Account", "type", "chatgpt"), "type");
     fields(variant(&schema, "Account", "type", "apiKey"), "type");
     fields(variant(&schema, "LoginAccountParams", "type", "chatgpt"), "type");

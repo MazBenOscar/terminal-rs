@@ -75,6 +75,14 @@ pub enum QuestradeAction {
 }
 
 pub enum AgentRequest {
+    ToolHistory {
+        symbol: String,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        options: tr_data::HistoryOptions,
+        reply: tokio::sync::oneshot::Sender<Result<tr_agent_tools::History, String>>,
+    },
     History {
         symbol: String,
         tf: Timeframe,
@@ -1275,39 +1283,64 @@ pub fn initial_limit(tf: Timeframe) -> usize {
     std::env::var("TR_HISTORY_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| default_limit(tf))
 }
 
+async fn agent_history(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    end: Option<i64>,
+    limit: usize,
+    options: tr_data::HistoryOptions,
+) -> Result<Vec<Bar>, String> {
+    let source = chart_options_key(s.provider.as_ref(), symbol, options);
+    let result = s.provider.chart_history(symbol, tf, end, limit, options).await.map_err(|e| format!("{e:#}"));
+    match result {
+        Ok(bars) => {
+            if chart_options_key(s.provider.as_ref(), symbol, options) != source {
+                Err("Data route changed; retry history".into())
+            } else {
+                if let Ok(mut cache) = s.cache.lock()
+                    && let Some(cache) = cache.as_mut()
+                {
+                    let _ = cache.store(&source, tf, &bars);
+                }
+                Ok(bars)
+            }
+        }
+        Err(error) => {
+            // The cache stores the latest tail, never an arbitrary historical page.
+            let cached = if end.is_none() {
+                s.cache
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.as_ref().and_then(|c| c.load(&source, tf, limit).ok()))
+                    .filter(|bars| !bars.is_empty())
+            } else {
+                None
+            };
+            cached.ok_or(error)
+        }
+    }
+}
+
 async fn handle_agent(s: &Shared, request: AgentRequest) {
     match request {
-        AgentRequest::History { symbol, tf, end, limit, options, reply } => {
+        AgentRequest::ToolHistory { symbol, tf, end, limit, options, reply } => {
             let source = chart_options_key(s.provider.as_ref(), &symbol, options);
-            let result = s.provider.chart_history(&symbol, tf, end, limit, options).await.map_err(|e| format!("{e:#}"));
-            let result = match result {
-                Ok(bars) => {
-                    if chart_options_key(s.provider.as_ref(), &symbol, options) != source {
-                        Err("Data route changed; retry history".into())
-                    } else {
-                        if let Ok(mut cache) = s.cache.lock()
-                            && let Some(cache) = cache.as_mut()
-                        {
-                            let _ = cache.store(&source, tf, &bars);
-                        }
-                        Ok(bars)
-                    }
+            let result = agent_history(s, &symbol, tf, end, limit, options).await.and_then(|bars| {
+                if chart_options_key(s.provider.as_ref(), &symbol, options) != source {
+                    return Err("Data route changed; retry history".into());
                 }
-                Err(error) => {
-                    // The cache stores the latest tail, never an arbitrary historical page.
-                    let cached = if end.is_none() {
-                        s.cache
-                            .lock()
-                            .ok()
-                            .and_then(|c| c.as_ref().and_then(|c| c.load(&source, tf, limit).ok()))
-                            .filter(|bars| !bars.is_empty())
-                    } else {
-                        None
-                    };
-                    cached.ok_or(error)
-                }
-            };
+                Ok(tr_agent_tools::History {
+                    bars,
+                    session: options.session,
+                    instrument: s.provider.crypto_instrument(&symbol),
+                    ..Default::default()
+                })
+            });
             let _ = reply.send(result);
+        }
+        AgentRequest::History { symbol, tf, end, limit, options, reply } => {
+            let _ = reply.send(agent_history(s, &symbol, tf, end, limit, options).await);
         }
         AgentRequest::Quotes { symbols, reply } => {
             let _ = reply.send(s.provider.quotes(&symbols).await.map_err(|e| format!("{e:#}")));

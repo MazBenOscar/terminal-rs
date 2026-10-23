@@ -1,3 +1,4 @@
+pub mod bridge;
 pub mod codex;
 pub mod isolation;
 pub mod transcript;

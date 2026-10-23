@@ -45,6 +45,9 @@ Labels used in every note:
   Codex app-server that reads and edits charts: isolation, architecture, tool
   registry and phases A0–A5, with an integration review and ordering (priority).
 
+- [A2a headless agent bridge](agent-bridge-a2a.md) — registry/queue API for A2b,
+  direct-tool readiness, interrupt/recovery and manager-only live commands.
+
 - [Quick tools and Auto/Log follow-up](toolbar-scale-followup.md) — 2026-10-21
   REA website runtime tests of drawing favorites, reload, scale-state transitions
   and indicator access; includes explicit account/interaction limits.

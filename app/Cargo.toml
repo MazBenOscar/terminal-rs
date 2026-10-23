@@ -6,6 +6,8 @@ edition.workspace = true
 default-run = "terminal-rs"
 
 [dependencies]
+tr-agent.workspace = true
+tr-agent-tools = { path = "../crates/agent-tools" }
 tr-alerts.workspace = true
 tr-core.workspace = true
 tr-broker.workspace = true

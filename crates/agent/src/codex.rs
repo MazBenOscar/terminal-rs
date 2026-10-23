@@ -351,6 +351,47 @@ impl CodexAppServer {
         Ok(())
     }
 
+    pub(crate) fn bind_bridge_safety(&self, safety: std::sync::Arc<AtomicBool>) -> Result<()> {
+        self.transport()?.bind_bridge_safety(safety);
+        Ok(())
+    }
+
+    pub(crate) async fn wait_cleanup(&self) -> Result<()> {
+        self.transport()?.wait_cleanup().await
+    }
+
+    pub(crate) fn stop(&self, reason: &str) {
+        if let Ok(transport) = self.transport() {
+            transport.stop(reason);
+        }
+    }
+
+    pub(crate) fn terminal_reason(&self) -> Option<String> {
+        self.transport().ok()?.closed().borrow().clone()
+    }
+
+    pub(crate) fn wire_events(&self) -> Result<EventStream> {
+        Ok(self.transport()?.events())
+    }
+
+    pub async fn resume_thread(&self, thread: &str, cwd: &str, instructions: &str) -> Result<String> {
+        self.require_account()?;
+        let result = self
+            .transport()?
+            .request(
+                "thread/resume",
+                json!({
+                    "threadId": thread, "cwd": cwd, "baseInstructions": instructions,
+                    "sandbox": "read-only", "approvalPolicy": "untrusted", "approvalsReviewer": "user",
+                    "serviceTier": "default", "runtimeWorkspaceRoots": [], "excludeTurns": true
+                }),
+            )
+            .await?;
+        let thread = string(&result["thread"], "id")?;
+        *self.active.lock().unwrap() = (Some(thread.clone()), None);
+        Ok(thread)
+    }
+
     fn active_ids(&self) -> Result<(String, String)> {
         let active = self.active.lock().unwrap();
         Ok((active.0.clone().context("no active thread")?, active.1.clone().context("no active turn")?))
