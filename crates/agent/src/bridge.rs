@@ -332,6 +332,13 @@ impl Drop for AbortExecution {
 fn short(text: &str) -> String {
     scrub_text(text).chars().take(300).collect()
 }
+
+/// A provider failure is not an expired data wait. Scrub before shortening so a
+/// truncated credential cannot evade redaction, and share the wire shape across
+/// windowed and headless view-loading hosts.
+pub fn provider_error(reason: &str) -> ToolResult {
+    ToolResult::error("provider_error", &short(reason), None)
+}
 fn reason(result: &ToolResult) -> String {
     result
         .content
@@ -1786,13 +1793,23 @@ mod tests {
         })
         .await;
         let connector = recorded.lock().unwrap().take().unwrap();
+        use tr_data::MarketData;
+        let bars = tr_data::sample::SampleProvider::at(1_790_000_000, 1000)
+            .history("AAPL US Equity", tr_core::Timeframe::W1, None, 1000)
+            .await
+            .unwrap();
         let replies = connector.replies.lock().unwrap();
         assert!(replies.iter().all(|r| r["success"] == true), "{replies:?}");
         let chart: Value = serde_json::from_str(replies[5]["contentItems"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(chart["charts"][0]["timeframe"], json!(tr_core::Timeframe::W1));
         assert!(chart["charts"][0]["studies"][0]["tool_id"].as_str().unwrap().starts_with("1:"));
         let studies: Value = serde_json::from_str(replies[6]["contentItems"][0]["text"].as_str().unwrap()).unwrap();
-        assert!(studies["studies"][0]["values"][0]["last"].is_null());
+        // A3B loads actual weekly history instead of resampling the 40 daily
+        // seed bars into too few weekly bars for RSI. Check the real calculation.
+        let spec = tr_core::indicators::registry::Spec::new("RSI", &[]).unwrap();
+        let outputs = spec.compute(&tr_core::indicators::registry::Input::new(&bars, tr_core::Timeframe::W1));
+        assert_eq!(chart["charts"][0]["loaded_bars"], bars.len());
+        assert_eq!(studies["studies"][0]["values"][0]["last"], json!(outputs[0].values.last().unwrap()));
     }
 
     struct TurnRecorder(Arc<std::sync::Mutex<Vec<String>>>);

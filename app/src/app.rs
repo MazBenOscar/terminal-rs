@@ -1863,13 +1863,29 @@ impl TerminalApp {
         self.drain();
         // History/live changes are not user edits.
         self.observe_edits(false);
+        for pane in &mut self.panes {
+            if let PaneKind::Chart(chart) = &mut pane.kind
+                && chart.finish_agent_view().is_some()
+            {
+                self.agent_save_pending = true;
+            }
+        }
+        self.observe_edits(true);
+        for pane in &mut self.panes {
+            if let PaneKind::Chart(chart) = &mut pane.kind {
+                chart.edit_author = Author::User;
+                chart.edit_turn = None;
+            }
+        }
         self.agent_queue.expire();
         let started = Instant::now();
+        let mut executed = 0;
         for _ in 0..self.agent_queue.len().min(MAX_JOBS_PER_FRAME) {
             if started.elapsed() >= MAX_JOB_TIME_PER_FRAME {
                 break;
             }
             let Some(job) = self.agent_queue.pop() else { break };
+            executed += 1;
             let reply = if job.deadline <= Instant::now() {
                 AgentReply::error("timeout")
             } else if let Some(uid) = self.agent_chart_uid(job.chart) {
@@ -1897,6 +1913,8 @@ impl TerminalApp {
             };
             let _ = job.reply.send(reply);
         }
+        let queue = self.agent_queue.clone();
+        queue.check_waiting(self, started, MAX_JOBS_PER_FRAME - executed);
         self.agent_queue.expire();
         self.agent_queue.repaint_pending();
         if self.agent_save_pending {

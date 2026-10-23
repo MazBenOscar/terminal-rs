@@ -526,7 +526,7 @@
     "needs_confirmation": true
   },
   {
-    "description": "Set symbol, timeframe or range; report linked panes that also moved.",
+    "description": "Switch the pinned chart to any supported timeframe, including finer timeframes (e.g. weekly to 4H), and/or set its range. Symbol must stay unchanged. Waits for loaded bars; range is then clamped to them. Never moves linked panes. After switching, call read_data with the new timeframe before drawing support/resistance or other anchors.",
     "input_schema": {
       "additionalProperties": false,
       "properties": {

@@ -362,12 +362,21 @@ pub struct ChartRead<'a> {
     pub session: tr_core::session::Session,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct AgentView {
-    bars: Arc<Vec<Bar>>,
     symbol: String,
     timeframe: Timeframe,
     range: Option<crate::chart_navigation::DateRange>,
+    // Only user navigation advances this generation; data delivery and agent
+    // edits (including undo) must not revoke an earlier agent's ownership.
+    user_generation: u64,
+}
+
+struct PendingAgentView {
+    turn: String,
+    generation: u64,
+    from: Option<i64>,
+    to: Option<i64>,
 }
 
 struct AgentStateEdit {
@@ -406,6 +415,8 @@ pub struct ChartState {
     pub shared_cursor: Option<i64>,
     pub range_event: Option<crate::chart_navigation::DateRange>,
     pending_dates: Option<crate::chart_navigation::DateRange>,
+    pending_agent_view: Option<PendingAgentView>,
+    view_user_generation: u64,
 
     bars: Arc<Vec<Bar>>,
     source_bars: Arc<Vec<Bar>>,
@@ -546,6 +557,8 @@ impl ChartState {
             shared_cursor: None,
             range_event: None,
             pending_dates: None,
+            pending_agent_view: None,
+            view_user_generation: 0,
             bars: Arc::new(Vec::new()),
             source_bars: Arc::new(Vec::new()),
             live_source: None,
@@ -881,7 +894,19 @@ impl ChartState {
         }
     }
 
+    /// Record gestures at their entry points, never inferred from viewport/data
+    /// differences. Keep this monotonic even across undo: undoing a newer agent
+    /// edit cannot erase a user's intervening navigation from an older inverse.
+    fn touch_user_view(&mut self) {
+        if self.edit_author == tr_chart::drawings::Author::User {
+            self.view_user_generation += 1;
+            self.pending_agent_view = None;
+        }
+    }
+
     pub fn set_symbol(&mut self, symbol: &str, w: &Worker) {
+        self.touch_user_view();
+        self.pending_agent_view = None;
         self.pending_dates = None;
         self.adopt_legacy_drawings();
         let sec = tr_data::security(symbol);
@@ -903,17 +928,27 @@ impl ChartState {
 
     pub fn set_timeframe(&mut self, tf: Timeframe, w: &Worker) {
         if tf != self.tf {
-            self.pending_dates =
-                self.viewport.as_ref().and_then(|v| crate::chart_navigation::date_range(&self.bars, self.tf, v));
+            self.touch_user_view();
+            self.switch_timeframe(tf, w);
+        }
+    }
+
+    // Same loading path for agent switches/undo, without recording a user gesture.
+    fn switch_timeframe(&mut self, tf: Timeframe, w: &Worker) {
+        if tf != self.tf {
+            self.pending_agent_view = None;
+            self.pending_dates = self.agent_view().range;
             self.tf = tf;
             self.load(w);
         }
     }
 
     pub fn set_range(&mut self, r: Range, w: &Worker) {
+        self.touch_user_view();
         self.pending_dates = None;
         self.pending_range = Some(r);
         if r.timeframe() != self.tf {
+            self.pending_agent_view = None;
             self.tf = r.timeframe();
             self.load(w);
         } else {
@@ -1113,6 +1148,7 @@ impl ChartState {
     }
 
     fn toggle_auto_scale(&mut self) {
+        self.touch_user_view();
         if self.manual_scale.is_some() {
             self.manual_scale = None;
         } else {
@@ -1495,25 +1531,73 @@ impl ChartState {
 
     fn agent_view(&self) -> AgentView {
         AgentView {
-            bars: self.source_bars.clone(),
             symbol: self.symbol.clone(),
             timeframe: self.tf,
-            range: self.visible_date_range(),
+            // Undo may have started a reload whose bars are still empty. Its
+            // buffered date window is nevertheless the current logical range.
+            range: self.pending_dates.or_else(|| self.visible_date_range()),
+            user_generation: self.view_user_generation,
         }
     }
 
-    fn apply_loaded_timeframe(&mut self, timeframe: Timeframe, bars: Arc<Vec<Bar>>, w: &Worker) {
-        self.tf = timeframe;
-        self.generation += 1;
-        self.series_revision = 0;
-        self.history_resync = false;
-        self.indicator_snapshot = None;
-        self.session_history_revision = None;
-        self.pending_live.clear();
-        self.viewport = None;
-        self.glide = None;
-        let gpu = SeriesGpu::build(&bars);
-        self.on_history_revision(self.generation, 1, bars, gpu, 0, false, true, false, w);
+    pub(crate) fn agent_view_generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn agent_view_pending(&self) -> bool {
+        self.pending_agent_view.is_some()
+    }
+
+    pub(crate) fn agent_view_error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub(crate) fn agent_view_result(&self) -> serde_json::Value {
+        serde_json::json!({
+            "uid":self.uid,"symbol":self.symbol,"timeframe":self.tf.to_string(),
+            "from":self.visible_date_range().and_then(|r| self.source_bars.first().zip(self.source_bars.last()).map(|(a,b)| r.start.clamp(a.ts,b.ts))),
+            "to":self.visible_date_range().and_then(|r| self.source_bars.first().zip(self.source_bars.last()).map(|(a,b)| r.end.clamp(a.ts,b.ts))),
+            "loaded_bars":self.source_bars.len(),
+            "first_bar_time":self.source_bars.first().map(|b| b.ts),
+            "last_bar_time":self.source_bars.last().map(|b| b.ts),
+            "visible_range":self.visible_date_range(),
+            "from_cache":self.cached_history,
+            "data_source":if self.cached_history { "cache" } else { "fresh_load" },
+            "linked_panes":[]
+        })
+    }
+
+    /// Called by logic after worker delivery, even if the tool was cancelled or
+    /// timed out. Late data still completes the range and its retained inverse.
+    pub(crate) fn finish_agent_view(&mut self) -> Option<String> {
+        let pending = self.pending_agent_view.as_ref()?;
+        if pending.generation != self.generation {
+            self.pending_agent_view = None;
+            return None;
+        }
+        if self.source_bars.is_empty() || self.bars.is_empty() || self.session_history_revision.is_some() {
+            return None;
+        }
+        let pending = self.pending_agent_view.take().unwrap();
+        self.begin_agent_edit(&pending.turn);
+        let first = self.source_bars.first().unwrap().ts;
+        let last = self.source_bars.last().unwrap().ts;
+        // With no range arguments retain the user switch path's date window;
+        // explicit endpoints are resolved only against the new loaded history.
+        let inherited = if pending.from.is_none() && pending.to.is_none() { self.visible_date_range() } else { None };
+        let range = crate::chart_navigation::DateRange {
+            start: pending.from.or(inherited.map(|r| r.start)).unwrap_or(first).clamp(first, last),
+            end: pending.to.or(inherited.map(|r| r.end)).unwrap_or(last).clamp(first, last),
+        };
+        self.apply_view_range(range);
+        self.range_event = None;
+        let after = self.agent_view();
+        if let Some(edit) =
+            self.agent_state_edits.iter_mut().rev().find(|edit| edit.turn == pending.turn && edit.view.is_some())
+        {
+            edit.view.as_mut().unwrap().1 = after;
+        }
+        Some(pending.turn)
     }
 
     pub(crate) fn apply_agent_plan(
@@ -1556,15 +1640,15 @@ impl ChartState {
             Plan::View { symbol, timeframe, from, to } => {
                 let previous = self.agent_view();
                 debug_assert_eq!(symbol, self.symbol);
-                if timeframe != self.tf {
-                    let bars = timeframe.resample_session(&self.source_bars, self.read_chart().session);
-                    self.apply_loaded_timeframe(timeframe, Arc::new(bars), w);
-                }
-                self.apply_linked_range(crate::chart_navigation::DateRange { start: from, end: to });
-                // No linked panes are moved: agent range changes are local, unlike
-                // a user gesture which emits range_event.
+                // Exactly the user path: worker History, cache, session filtering,
+                // transformed bars and study recomputation. Never resample old bars.
+                self.pending_range = None;
+                self.switch_timeframe(timeframe, w);
+                self.range_event = None;
+                self.pending_agent_view =
+                    Some(PendingAgentView { turn: turn.into(), generation: self.generation, from, to });
                 view = Some((previous, self.agent_view()));
-                serde_json::json!({"uid":self.uid,"symbol":self.symbol,"timeframe":self.tf,"from":from,"to":to,"linked_panes":[]})
+                self.agent_view_result()
             }
             Plan::Compare(args) => {
                 let before = self.comparison_objects();
@@ -1607,6 +1691,9 @@ impl ChartState {
         let edits = std::mem::take(&mut self.agent_state_edits);
         let (target, kept): (Vec<_>, Vec<_>) = edits.into_iter().partition(|edit| edit.turn == turn);
         self.agent_state_edits = kept;
+        // Several switches in one turn are inverted synchronously, before any
+        // reload can answer. Compare the intermediate logical view, not empty bars.
+        let mut logical_view = self.agent_view();
         for edit in target.into_iter().rev() {
             let id = |s: &IndicatorSpec| s.chart.as_ref().map(|c| c.id);
             for after in edit.after.iter().rev().filter(|s| !edit.before.iter().any(|b| id(b) == id(s))) {
@@ -1667,13 +1754,21 @@ impl ChartState {
                 }
             }
             if let Some((before, after)) = edit.view {
-                if self.agent_view() == after {
-                    if before.timeframe != self.tf {
-                        self.apply_loaded_timeframe(before.timeframe, before.bars, w);
-                    }
+                // Live bars, cache refreshes and anchored paging can all change
+                // the exact date window. Only a user gesture revokes ownership.
+                if logical_view.user_generation == after.user_generation
+                    && logical_view.symbol == after.symbol
+                    && logical_view.timeframe == after.timeframe
+                {
+                    self.pending_agent_view = None;
+                    self.pending_range = None;
+                    self.switch_timeframe(before.timeframe, w);
+                    self.pending_dates = None;
                     if let Some(range) = before.range {
-                        self.apply_linked_range(range);
+                        self.apply_view_range(range);
                     }
+                    logical_view = before;
+                    self.range_event = None;
                     reverted += 1;
                 } else {
                     skipped.push(format!("view:{}", self.uid));
@@ -1701,6 +1796,8 @@ impl ChartState {
     }
 
     pub fn reset_view(&mut self) {
+        self.touch_user_view();
+        self.pending_dates = None;
         self.glide(|s| {
             if let Some(v) = s.viewport.as_mut() {
                 *v = Viewport::fit_last(s.bars.len(), DEFAULT_VISIBLE, v.width_px);
@@ -1710,6 +1807,8 @@ impl ChartState {
     }
 
     pub fn pan_bars(&mut self, n: f64) {
+        self.touch_user_view();
+        self.pending_dates = None;
         self.glide(|s| {
             if let Some(v) = s.viewport.as_mut() {
                 v.pan_bars(n);
@@ -1719,6 +1818,8 @@ impl ChartState {
     }
 
     pub fn zoom(&mut self, factor: f64) {
+        self.touch_user_view();
+        self.pending_dates = None;
         self.glide(|s| {
             if let Some(v) = s.viewport.as_mut() {
                 let anchor = v.width_px * 0.85;
@@ -2464,6 +2565,11 @@ impl ChartState {
     }
 
     pub fn apply_linked_range(&mut self, range: crate::chart_navigation::DateRange) {
+        self.touch_user_view();
+        self.apply_view_range(range);
+    }
+
+    fn apply_view_range(&mut self, range: crate::chart_navigation::DateRange) {
         // A newer event supersedes a buffered range even when it is already covered
         // by the currently loaded bars. Otherwise the next history response replays
         // the stale range over the newer navigation.
@@ -2968,6 +3074,8 @@ impl ChartState {
         if plot_resp.hovered() && !over_legend || axis_resp.hovered() || time_resp.hovered() {
             let (scroll, zoom_delta) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
             if scroll != egui::Vec2::ZERO || zoom_delta != 1.0 {
+                self.touch_user_view();
+                self.pending_dates = None;
                 self.glide = None;
             }
             let v = self.viewport.as_mut().expect("viewport");
@@ -2994,6 +3102,8 @@ impl ChartState {
             && self.draw.drag.is_none()
             && self.draw.hover.is_none()
         {
+            self.touch_user_view();
+            self.pending_dates = None;
             let d = plot_resp.drag_delta();
             self.viewport.as_mut().expect("viewport").pan_px(d.x as f64);
             if let Some(s) = self.manual_scale.as_mut() {
@@ -3002,6 +3112,8 @@ impl ChartState {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         }
         if time_resp.dragged() {
+            self.touch_user_view();
+            self.pending_dates = None;
             let v = self.viewport.as_mut().expect("viewport");
             let w_px = v.width_px;
             v.zoom((-time_resp.drag_delta().x as f64 * 0.005).exp(), w_px);
@@ -3178,12 +3290,14 @@ impl ChartState {
             return clicked;
         }
         if axis_resp.dragged() {
+            self.touch_user_view();
             let mut s = self.manual_scale.unwrap_or(scale);
             s.stretch((axis_resp.drag_delta().y as f64 * -0.01).exp());
             self.manual_scale = Some(s);
             ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
         }
         if axis_resp.double_clicked() {
+            self.touch_user_view();
             self.manual_scale = None;
         }
 

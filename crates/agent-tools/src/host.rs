@@ -68,6 +68,8 @@ pub mod edits {
         "pin_changed",
         "turn_object_limit",
         "chart_object_limit",
+        "data_loading_timeout",
+        "provider_error",
     ];
 
     pub fn error(code: &str, message: &str) -> ToolResult {
@@ -124,7 +126,7 @@ pub mod edits {
     pub enum Plan {
         Drawings(Vec<Drawing>, u64),
         Indicators(Vec<Spec>, String),
-        View { symbol: String, timeframe: Timeframe, from: i64, to: i64 },
+        View { symbol: String, timeframe: Timeframe, from: Option<i64>, to: Option<i64> },
         Compare(args::Compare),
     }
 
@@ -334,11 +336,6 @@ pub mod edits {
                     Ok(Plan::Indicators(next, a.id))
                 }
                 LiveArgs::SetView(a) => {
-                    let (first, last) = chart
-                        .bars
-                        .first()
-                        .zip(chart.bars.last())
-                        .ok_or_else(|| error("invalid_args", "Chart has no loaded data"))?;
                     let timeframe = a
                         .timeframe
                         .as_deref()
@@ -349,23 +346,22 @@ pub mod edits {
                     if a.symbol
                         .as_ref()
                         .is_some_and(|symbol| tr_data::security(symbol).key() != tr_data::security(chart.symbol).key())
-                        || timeframe.seconds() < chart.timeframe.seconds()
                     {
                         return Err(error(
                             "invalid_args",
-                            "set_view is limited to the loaded symbol and equal or coarser timeframes",
+                            "set_view is limited to the loaded symbol; symbol changes are not allowed",
                         ));
                     }
-                    let from = a.from.unwrap_or(first.ts).clamp(first.ts, last.ts);
-                    let to = a.to.unwrap_or(last.ts).clamp(first.ts, last.ts);
-                    if from > to {
+                    // Do not clamp against the old timeframe. Hosts apply the range
+                    // only after loading the requested timeframe's bars.
+                    if a.from.zip(a.to).is_some_and(|(from, to)| from > to) {
                         return Err(error("invalid_args", "from must not exceed to"));
                     }
                     Ok(Plan::View {
                         symbol: a.symbol.map_or_else(|| chart.symbol.into(), |s| tr_data::security(&s).key()),
                         timeframe,
-                        from,
-                        to,
+                        from: a.from,
+                        to: a.to,
                     })
                 }
                 LiveArgs::Compare(mut a) => {
