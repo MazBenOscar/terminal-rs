@@ -1,0 +1,22 @@
+{
+  "atr": 3.98640779,
+  "atr_period": 14,
+  "bar_range": {
+    "count": 96,
+    "from": "2024-01-01T00:00:00+00:00",
+    "to": "2024-04-05T00:00:00+00:00"
+  },
+  "log_return_count": 95,
+  "mode": "volatility",
+  "price_basis": "adjusted",
+  "range_percentiles": {
+    "p10": 1.80838748,
+    "p50": 3.21519337,
+    "p90": 6.20620668
+  },
+  "realized_volatility_per_bar": 0.02149342,
+  "session": "Provider bars",
+  "symbol": "FIXTURE",
+  "timeframe": "1D",
+  "version": 1
+}

@@ -1,0 +1,40 @@
+{
+  "bar_range": {
+    "count": 80,
+    "from": "2024-01-01T00:00:00+00:00",
+    "to": "2024-03-20T00:00:00+00:00"
+  },
+  "mode": "levels",
+  "pivot_kind": "classic",
+  "pivot_session": "core timeframe session key",
+  "pivots": {
+    "P": 101.33333333,
+    "R1": 112.66666667,
+    "R2": 121.33333333,
+    "R3": 132.66666667,
+    "S1": 92.66666667,
+    "S2": 81.33333333,
+    "S3": 72.66666667
+  },
+  "price_basis": "adjusted",
+  "session": "Provider bars",
+  "support_resistance": [
+    {
+      "last_touch_time": 1709424000,
+      "price": 90.0,
+      "score": 10.29482575,
+      "touches": 8,
+      "zone_width": 3.25988461
+    },
+    {
+      "last_touch_time": 1709078400,
+      "price": 110.0,
+      "score": 10.24482575,
+      "touches": 8,
+      "zone_width": 3.25988461
+    }
+  ],
+  "symbol": "FIXTURE",
+  "timeframe": "1D",
+  "version": 1
+}
