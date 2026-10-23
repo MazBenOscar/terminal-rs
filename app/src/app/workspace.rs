@@ -369,6 +369,31 @@ impl TerminalApp {
     fn init_kind(&mut self, id: PaneId, kind: PaneKind) -> PaneKind {
         match kind {
             PaneKind::Chart(mut c) => {
+                tr_chart::drawings::reserve_id(c.uid);
+                while c.uid == 0
+                    || self.panes.iter().any(|p| matches!(&p.kind, PaneKind::Chart(other) if other.uid == c.uid))
+                {
+                    c.uid = tr_chart::drawings::next_id();
+                }
+                let mut drawing_ids: std::collections::HashSet<_> = self
+                    .panes
+                    .iter()
+                    .flat_map(|p| match &p.kind {
+                        PaneKind::Chart(chart) => chart.drawings.iter().map(|d| d.id).collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                let reserved: std::collections::HashSet<_> = c.drawings.iter().map(|d| d.id).collect();
+                for drawing in &mut c.drawings {
+                    if drawing.id == 0 || !drawing_ids.insert(drawing.id) {
+                        loop {
+                            drawing.id = tr_chart::drawings::next_id();
+                            if !reserved.contains(&drawing.id) && drawing_ids.insert(drawing.id) {
+                                break;
+                            }
+                        }
+                    }
+                }
                 c.id = id;
                 c.load(&self.worker);
                 c.restore_price_scale();

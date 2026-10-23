@@ -71,6 +71,8 @@ where
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PaneSettings {
     Chart {
+        #[serde(default)]
+        uid: u64,
         symbol: String,
         tf: Timeframe,
         chart_type: ChartType,
@@ -150,7 +152,9 @@ pub enum PaneSettings {
 
 fn deserialize_drawings<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Drawing>, D::Error> {
     let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(values.into_iter().filter_map(parse_drawing).collect())
+    let mut drawings: Vec<_> = values.into_iter().filter_map(parse_drawing).collect();
+    tr_chart::drawings::assign_ids(&mut drawings);
+    Ok(drawings)
 }
 
 fn parse_drawing(value: serde_json::Value) -> Option<Drawing> {
@@ -298,7 +302,47 @@ impl LayoutDoc {
     /// Make a loaded document self-consistent: unique pane ids, a dock that references
     /// only known docked panes, every docked pane placed, and at least one pane.
     pub fn repair(&mut self) {
+        let mut chart_ids = HashSet::new();
+        let mut drawing_ids = HashSet::new();
+        let reserved_drawings: HashSet<_> = self
+            .panes
+            .iter()
+            .flat_map(|p| match &p.settings {
+                PaneSettings::Chart { drawings, .. } => drawings.iter().map(|d| d.id).collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let reserved: HashSet<_> = self
+            .panes
+            .iter()
+            .filter_map(|p| match &p.settings {
+                PaneSettings::Chart { uid, .. } => Some(*uid),
+                _ => None,
+            })
+            .collect();
         for pane in &mut self.panes {
+            if let PaneSettings::Chart { uid, drawings, .. } = &mut pane.settings {
+                tr_chart::drawings::reserve_id(*uid);
+                if *uid == 0 || !chart_ids.insert(*uid) {
+                    loop {
+                        *uid = tr_chart::drawings::next_id();
+                        if !reserved.contains(uid) && chart_ids.insert(*uid) {
+                            break;
+                        }
+                    }
+                }
+                tr_chart::drawings::assign_ids(drawings);
+                for drawing in drawings {
+                    if !drawing_ids.insert(drawing.id) {
+                        loop {
+                            drawing.id = tr_chart::drawings::next_id();
+                            if !reserved_drawings.contains(&drawing.id) && drawing_ids.insert(drawing.id) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             if let PaneSettings::Scanner(settings) = &mut pane.settings {
                 settings.crypto_filter.sanitize();
             }
@@ -392,6 +436,7 @@ impl LayoutDoc {
 
 pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSettings {
     PaneSettings::Chart {
+        uid: tr_chart::drawings::next_id(),
         symbol: symbol.into(),
         tf: d.timeframe,
         chart_type: d.chart_type,
@@ -869,8 +914,21 @@ mod tests {
         // Original shared-model entries plus annotation tools and sampled vertices.
         let fixture = include_str!("../tests/fixtures/drawings_fixture.json").trim();
         let loaded: Vec<Drawing> = serde_json::from_str(fixture).unwrap();
-        assert_eq!(drawings, loaded);
-        assert_eq!(serde_json::to_string(&loaded).unwrap(), fixture);
+        let mut expected = drawings;
+        for (drawing, saved) in expected.iter_mut().zip(&loaded) {
+            assert_ne!(saved.id, 0);
+            assert_eq!(saved.created_by, tr_chart::drawings::Author::User);
+            assert_eq!(saved.turn_id, None);
+            drawing.id = saved.id;
+        }
+        assert_eq!(expected, loaded);
+        let mut migrated: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&loaded).unwrap()).unwrap();
+        for drawing in migrated.as_array_mut().unwrap() {
+            for field in ["id", "created_by", "turn_id"] {
+                drawing.as_object_mut().unwrap().remove(field);
+            }
+        }
+        assert_eq!(migrated, serde_json::from_str::<serde_json::Value>(fixture).unwrap());
     }
 
     #[test]
@@ -1138,8 +1196,15 @@ mod tests {
             let end = start + raw[start..].find(r#""width": 1.0}"#).unwrap() + r#""width": 1.0}"#.len();
             let mut mixed = raw.to_string();
             mixed.replace_range(start..end, invalid);
-            let loaded = LayoutDoc::from_json(mixed.as_bytes()).unwrap();
+            let mut loaded = LayoutDoc::from_json(mixed.as_bytes()).unwrap();
             assert_eq!(loaded.skipped_drawings, 1, "{invalid}");
+            if let PaneSettings::Chart { uid, drawings: migrated, .. } = &mut loaded.panes[0].settings {
+                let PaneSettings::Chart { uid: expected_uid, .. } = &doc.panes[0].settings else { panic!("chart") };
+                *uid = *expected_uid;
+                for (drawing, expected) in migrated.iter_mut().zip(drawings) {
+                    drawing.id = expected.id;
+                }
+            }
             assert_eq!(loaded.panes, doc.panes);
         }
     }
@@ -1176,5 +1241,38 @@ mod tests {
         }
         let restored = LayoutDoc::from_json(&doc.to_json()).unwrap();
         assert_eq!(restored.panes[0].settings, doc.panes[0].settings);
+    }
+
+    #[test]
+    fn legacy_layout_assigns_chart_and_drawing_ids_and_repairs_duplicates() {
+        let chart = serde_json::json!({ "symbol": "AAA", "tf": "D1", "chart_type": "Candles", "log": false,
+            "indicators": [], "compare": null, "drawings": [
+                { "id": 7, "tool": "Horizontal", "a": { "ts": 1, "price": 2. }, "b": { "ts": 2, "price": 3. } },
+                { "id": 7, "tool": "Vertical", "a": { "ts": 1, "price": 2. }, "b": { "ts": 2, "price": 3. } },
+                { "tool": "Arrow", "a": { "ts": 1, "price": 2. }, "b": { "ts": 2, "price": 3. } }
+            ] });
+        let mut raw = serde_json::json!({ "name": "Legacy agent ids", "dock": { "type": "tabs", "panes": [1, 2, 3] },
+            "panes": [{ "id": 1, "Chart": chart.clone() }, { "id": 2, "Chart": chart.clone() }, { "id": 3, "Chart": chart }] });
+        raw["panes"][1]["Chart"]["uid"] = 42.into();
+        raw["panes"][2]["Chart"]["uid"] = 42.into();
+        let doc = LayoutDoc::from_json(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        let mut chart_ids = HashSet::new();
+        let mut drawing_ids = HashSet::new();
+        for pane in &doc.panes {
+            let PaneSettings::Chart { uid, drawings, .. } = &pane.settings else { panic!("chart") };
+            assert_ne!(*uid, 0);
+            assert!(chart_ids.insert(*uid));
+            for drawing in drawings {
+                assert_ne!(drawing.id, 0);
+                assert!(drawing_ids.insert(drawing.id));
+                assert_eq!(drawing.created_by, tr_chart::drawings::Author::User);
+                assert!(drawing.turn_id.is_none());
+                assert_eq!(drawing.a.price, 2.);
+                assert_eq!(drawing.b.price, 3.);
+            }
+        }
+        assert!(chart_ids.contains(&42));
+        assert!(drawing_ids.contains(&7));
+        assert_eq!(LayoutDoc::from_json(&doc.to_json()).unwrap(), doc);
     }
 }
