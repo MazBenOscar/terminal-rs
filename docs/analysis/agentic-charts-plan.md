@@ -403,6 +403,39 @@ Acceptance criteria:
   ready, rate-limited) shows one action.
 - Live: first full in-app agent test (sign-in, trend question, interrupt, model switch).
 
+#### A2c: agent pane design polish (impeccable)
+
+- Branch: `codex/agent-pane-polish`
+- Requested by the user after in-app acceptance (2026-10-23): the pane works but does
+  not look or feel finished.
+
+Work, following the impeccable skill's workflow (Operate mode: precision and
+restraint, patterns traders already know):
+
+1. **Context.** The repo has no `PRODUCT.md` or `DESIGN.md`. Run `impeccable init`
+   (the user supplies product intent) and `impeccable document` to derive the design
+   system from the shipped terminal (tokens, type scale, spacing, colours, density),
+   so the pane is polished in the terminal's own visual language, not a generic chat
+   style.
+2. **Critique.** Capture the pane in each state at the sizes it ships at (narrow
+   side pane, half width, full; light/dark if themed): onboarding states, sign-in,
+   empty with suggested prompts, streaming, tool rows, edit mode with undo, errors,
+   rate limit. Run `impeccable critique` against them and reference agent side panels.
+3. **Refine** with `polish`, `layout`, `typeset` and `clarify`: header (model,
+   effort, tools mode, pin) hierarchy; message layout (user versus agent, spacing,
+   markdown typography, tables, code); tool trace rows (compact, collapsible,
+   status); notices (one consistent style instead of raw sentences such as "Queue
+   stays paused; no prompt is resent"); input area (multiline, send/stop, queue);
+   undo affordances; empty state; copy throughout.
+4. **Constraints.** egui only, no new crates; keep every A2b/A3 behaviour, keyboard
+   rule, privacy rule and test; no idle repaints; verify by looking at the rendered
+   pane (screenshots before and after) rather than by code alone.
+
+Acceptance criteria:
+
+- Before/after screenshots of every state reviewed with the user.
+- The user signs off on the look in the real app.
+
 ### A3: agent edits the chart
 
 - Branch: `codex/agent-edits`
@@ -541,7 +574,8 @@ names are authoritative.
 drain, drawing ids and undo by id, chart getters, edit log; and A1b the
 `agent-tools` crate, data tools, level finder and golden tests; these can run as
 parallel workers once the tool schema types are agreed) → A2a (headless bridge)
-→ A2b (pane) ∥ A3 (edits) → A5 → A4, with F02 running in parallel before A5.
+→ A2b (pane) ∥ A3 (edits) → A3b (agent timeframe switching) → A2c (pane design
+polish with impeccable) → A5 → A4, with F02 running in parallel before A5.
 A5 (watchlist and alert tools inside the app) is placed before A4 (MCP shim and
 mimo backend) because the in-app agent is the priority; A4 can move earlier if
 external clients are wanted sooner.
