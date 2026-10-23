@@ -397,6 +397,10 @@ pub struct ChartState {
     last_live: Option<std::time::Instant>,
     last_indicator_req: Option<std::time::Instant>,
     indicator_revision: u64,
+    study_from: usize,
+    session_history_revision: Option<u64>,
+    compare_from: usize,
+    pending_live: Vec<(u64, u64, usize, Vec<Bar>, usize)>,
     /// App-level actions requested from this chart (context menu), drained by the app.
     pub actions: Vec<Action>,
     /// Saved watchlists for the "Add to watchlist" menu, refreshed by the app each frame.
@@ -516,6 +520,10 @@ impl ChartState {
             last_live: None,
             last_indicator_req: None,
             indicator_revision: 0,
+            study_from: 0,
+            session_history_revision: None,
+            compare_from: 0,
+            pending_live: Vec::new(),
             actions: Vec::new(),
             watchlists: Vec::new(),
             price_alerts: Vec::new(),
@@ -619,6 +627,10 @@ impl ChartState {
         study::assign_ids(&mut self.indicators);
         self.generation += 1;
         self.series_revision = 0;
+        self.session_history_revision = None;
+        self.pending_live.clear();
+        self.study_from = 0;
+        self.compare_from = 0;
         self.history_resync = false;
         self.resync_revision = 0;
         self.loading = true;
@@ -1159,10 +1171,11 @@ impl ChartState {
         if !self.bars.is_empty() {
             self.indicator_revision += 1;
             w.send(Request::Indicators {
+                from: std::mem::replace(&mut self.study_from, usize::MAX),
                 revision: self.indicator_revision,
                 pane: self.id,
                 generation: self.generation,
-                bars: Arc::new(self.bars.as_ref().clone()),
+                bars: self.bars.clone(),
                 symbol: self.symbol.clone(),
                 options: self.effective_history(),
                 tf: self.tf,
@@ -1188,6 +1201,7 @@ impl ChartState {
             {
                 self.compare_line = None;
             }
+            let from = std::mem::replace(&mut self.compare_from, usize::MAX);
             for sym in symbols {
                 if self.compare.as_ref() != Some(&sym) {
                     let extra = self.comparisons.entry(sym.clone()).or_default();
@@ -1202,13 +1216,14 @@ impl ChartState {
                     }
                 }
                 w.send(Request::Compare {
+                    from,
                     revision: self.compare_revision,
                     pane: self.id,
                     generation: self.generation,
                     symbol: sym,
                     tf: self.tf,
                     options: self.effective_history(),
-                    base: Arc::new(self.bars.as_ref().clone()),
+                    base: self.bars.clone(),
                 });
             }
         }
@@ -1232,6 +1247,14 @@ impl ChartState {
         }
     }
 
+    fn flush_pending_live(&mut self, w: &Worker) {
+        if self.session_history_revision.is_none() {
+            for (generation, revision, from, bars, len) in std::mem::take(&mut self.pending_live) {
+                self.on_live_bars_revision(generation, revision, from, bars, len, w);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn on_live_bars(&mut self, generation: u64, from: usize, tail: Vec<Bar>, len: usize, w: &Worker) {
         self.on_live_bars_revision(generation, self.series_revision + 1, from, tail, len, w);
@@ -1248,6 +1271,14 @@ impl ChartState {
         w: &Worker,
     ) {
         if generation != self.generation || self.history_resync || revision <= self.series_revision {
+            return;
+        }
+        self.flush_pending_live(w);
+        if revision <= self.series_revision || self.history_resync {
+            return;
+        }
+        if !self.pending_live.is_empty() || self.session_history_revision.is_some() {
+            self.pending_live.push((generation, revision, from, tail, len));
             return;
         }
         let aligned = |bars: &[Bar], from: usize, tail: &[Bar], len: usize| {
@@ -1283,6 +1314,8 @@ impl ChartState {
             return;
         }
         self.series_revision = revision;
+        self.study_from = self.study_from.min(from);
+        self.compare_from = self.compare_from.min(from);
         let plain = self.replay_cutoff.is_none() && self.chart_type != ChartType::Renko;
         let replay_unchanged = self.chart_type != ChartType::Renko
             && self.view_config == (self.replay_cutoff, None)
@@ -1390,6 +1423,8 @@ impl ChartState {
             prepended = self.source_bars.first().map_or(0, |first| merged.partition_point(|bar| bar.ts < first.ts));
             bars = Arc::new(merged);
         }
+        self.study_from = 0;
+        self.compare_from = 0;
         self.series_revision = self.series_revision.max(revision);
         self.history_resync = false;
         self.error = None;
@@ -1399,18 +1434,54 @@ impl ChartState {
         if reconciled && !filtered {
             gpu = SeriesGpu::build(&bars);
         }
-        let (bars, gpu, prepended) = if filtered {
-            let filtered = Arc::new(session.filter(&bars, self.tf));
-            let prepended = if prepended > 0 {
-                self.bars.first().map_or(0, |first| filtered.partition_point(|b| b.ts < first.ts))
-            } else {
-                0
-            };
-            let gpu = SeriesGpu::build(&filtered);
-            (filtered, gpu, prepended)
-        } else {
-            (bars, gpu, prepended)
+        let history = crate::worker::SessionHistory {
+            pane: self.id,
+            generation,
+            revision: self.series_revision,
+            tf: self.tf,
+            session,
+            source: bars.clone(),
+            prepended,
+            first_visible: self.bars.first().map(|b| b.ts),
+            from_cache,
+            exhausted,
+            live,
         };
+        self.session_history_revision = None;
+        if filtered {
+            self.session_history_revision = Some(self.series_revision);
+            w.send(Request::SessionHistory { history });
+            return;
+        }
+        self.finish_history(history, bars, gpu, w);
+    }
+
+    pub fn on_session_history(
+        &mut self,
+        history: crate::worker::SessionHistory,
+        bars: Arc<Vec<Bar>>,
+        gpu: SeriesGpu,
+        w: &Worker,
+    ) {
+        if history.generation != self.generation
+            || history.revision != self.series_revision
+            || history.tf != self.tf
+            || history.session != self.effective_session()
+        {
+            return;
+        }
+        self.session_history_revision = None;
+        self.finish_history(history, bars, gpu, w);
+    }
+
+    fn finish_history(
+        &mut self,
+        history: crate::worker::SessionHistory,
+        bars: Arc<Vec<Bar>>,
+        gpu: SeriesGpu,
+        w: &Worker,
+    ) {
+        let crate::worker::SessionHistory { prepended, from_cache, exhausted, live, .. } = history;
         if live {
             self.last_live = Some(std::time::Instant::now());
         }
@@ -1442,6 +1513,10 @@ impl ChartState {
         w: &Worker,
         old_len: usize,
     ) {
+        if !live {
+            self.study_from = 0;
+            self.compare_from = 0;
+        }
         let new_len = bars.len();
         if old_len == 0 && new_len > 0 {
             self.reveal_key = crate::anim::fresh_key();
@@ -1933,6 +2008,7 @@ impl ChartState {
     }
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
+        self.flush_pending_live(w);
         self.capture_export(ui.ctx(), w);
         self.set_export_pane_rect(rect);
         self.refresh_view(w);
@@ -8527,6 +8603,7 @@ mod tests {
             false,
             &worker,
         );
+        deliver_session_history(&mut chart, &worker);
         assert!(!chart.bars.is_empty());
         let mut saw_regular = false;
         let mut saw_excluded = false;
@@ -8555,6 +8632,7 @@ mod tests {
         let mut bars = tr_core::sample::generate("AAPL", Timeframe::M1, 2000, 1_790_000_000);
         let source = Arc::new(bars.clone());
         chart.on_history(chart.generation, source.clone(), SeriesGpu::build(&source), 0, false, false, false, &w);
+        deliver_session_history(&mut chart, &w);
         assert!(chart.bars.len() < bars.len());
         for _ in 0..3 {
             let from = bars.len() - 1;
@@ -8568,5 +8646,133 @@ mod tests {
             assert_eq!(chart.live_source.as_ref().unwrap().as_ref(), &bars);
             assert!(chart.last_live.is_some());
         }
+    }
+
+    fn deliver_session_history(chart: &mut ChartState, w: &Worker) {
+        let mut history = crate::worker::SessionHistory {
+            pane: chart.id,
+            generation: chart.generation,
+            revision: chart.series_revision,
+            tf: chart.tf,
+            session: chart.effective_session(),
+            source: chart.live_source.clone().unwrap(),
+            prepended: 0,
+            first_visible: None,
+            from_cache: false,
+            exhausted: false,
+            live: false,
+        };
+        let (bars, gpu) = crate::worker::filter_history(&mut history);
+        history.source = Arc::new(Vec::new());
+        chart.on_session_history(history, bars, gpu, w);
+    }
+
+    #[test]
+    fn live_patch_applies_while_indicator_and_compare_requests_are_blocked() {
+        let (w, mut requests) = Worker::recording();
+        let mut chart = ChartState::new(1, "AAPL US Equity", Timeframe::D1);
+        let bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 1000, 1_790_000_000));
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &w);
+        drop(bars);
+        while requests.try_recv().is_ok() {}
+        chart.request_indicators(&w);
+        chart.compare = Some("QQQ US Equity".into());
+        chart.request_compare(&w);
+        let indicator = requests.try_recv().unwrap();
+        let comparison = requests.try_recv().unwrap();
+        let Request::Indicators { bars, .. } = &indicator else { panic!("expected indicators") };
+        assert!(Arc::ptr_eq(bars, &chart.bars));
+        let Request::Compare { base, .. } = &comparison else { panic!("expected comparison") };
+        assert!(Arc::ptr_eq(base, &chart.bars));
+        let pointer = chart.source_bars.as_ptr();
+        let mut bar = *bars.last().unwrap();
+        bar.close += 1.;
+        let mut next = bar;
+        next.ts += chart.tf.seconds();
+        chart.on_live_bars(chart.generation, 999, vec![bar, next], 1001, &w);
+        assert!(chart.pending_live.is_empty());
+        assert_ne!(chart.source_bars.as_ptr(), pointer);
+        assert_eq!(chart.bars.len(), 1001);
+        assert_eq!(chart.bars[999].close, bar.close);
+        assert_eq!(bars.len(), 1000);
+        assert_ne!(bars[999].close, bar.close);
+
+        // Recorded requests remain blocked until now, just as during provider I/O.
+        let Request::Indicators { generation, revision: indicator_revision, bars, tf, specs, palette, .. } = indicator
+        else {
+            panic!("expected indicators")
+        };
+        let built = crate::worker::build_indicators(&bars, tf, &specs, &palette);
+        chart.on_indicators(generation, indicator_revision, built);
+        assert_eq!(chart.built.len(), specs.len());
+        let Request::Compare { generation, revision, symbol, base, .. } = comparison else {
+            panic!("expected comparison")
+        };
+        let line = tr_chart::scene::line_ref(&crate::worker::align_compare(&base, &base));
+        chart.on_compare(generation, revision, &symbol, line.clone());
+        assert!(revision < chart.compare_revision, "live append requested a newer comparison");
+        assert!(chart.compare_line.is_none());
+        chart.on_compare(generation, chart.compare_revision, &symbol, line.clone());
+        assert!(chart.compare_line.is_some());
+        chart.request_indicators(&w);
+        chart.request_compare(&w);
+        chart.built.clear();
+        chart.compare_line = None;
+        chart.on_indicators(
+            generation,
+            indicator_revision,
+            crate::worker::build_indicators(&bars, tf, &specs, &palette),
+        );
+        chart.on_compare(generation, revision, &symbol, line);
+        assert!(chart.built.is_empty());
+        assert!(chart.compare_line.is_none());
+    }
+
+    #[test]
+    fn session_history_waits_for_delivery_and_preserves_prepended_viewport() {
+        let w = Worker::inert();
+        let mut chart = ChartState::new(1, "AAPL US Equity", Timeframe::M1);
+        chart.data.session = tr_core::session::Session::UsRegular;
+        let raw = tr_core::sample::generate("AAPL", Timeframe::M1, 5000, 1_790_000_000);
+        let source = Arc::new(raw[2500..].to_vec());
+        chart.on_history(0, source.clone(), SeriesGpu::build(&source), 0, false, false, false, &w);
+        chart.flush_pending_live(&w);
+        assert!(chart.bars.is_empty(), "only delivery clears the pending session revision");
+        deliver_session_history(&mut chart, &w);
+        chart.viewport.as_mut().unwrap().right = 100.;
+        let old_first = chart.bars[0].ts;
+        let source = Arc::new(raw);
+        let revision = chart.series_revision + 1;
+        chart.on_history_revision(
+            0,
+            revision,
+            source.clone(),
+            SeriesGpu::build(&source),
+            2500,
+            false,
+            false,
+            false,
+            &w,
+        );
+        let mut history = crate::worker::SessionHistory {
+            pane: chart.id,
+            generation: 0,
+            revision,
+            tf: chart.tf,
+            session: chart.effective_session(),
+            source: source.clone(),
+            prepended: 2500,
+            first_visible: Some(old_first),
+            from_cache: false,
+            exhausted: false,
+            live: false,
+        };
+        let (bars, gpu) = crate::worker::filter_history(&mut history);
+        let prepended = history.prepended;
+        history.source = Arc::new(Vec::new());
+        chart.on_session_history(history, bars, gpu, &w);
+        assert_eq!(chart.viewport.as_ref().unwrap().right, 100. + prepended as f64);
+        assert_eq!(chart.live_source.as_ref().unwrap().as_ref(), source.as_ref());
+        assert!(chart.session_history_revision.is_none());
     }
 }

@@ -1713,6 +1713,14 @@ impl TerminalApp {
                         );
                     }
                 }
+                Response::SessionHistory { history, bars, gpu } => {
+                    let worker = &self.worker;
+                    if let Some(PaneKind::Chart(c)) =
+                        self.panes.iter_mut().find(|p| p.id == history.pane).map(|p| &mut p.kind)
+                    {
+                        c.on_session_history(history, bars, gpu, worker);
+                    }
+                }
                 Response::LiveBars { pane, generation, revision, from, bars, len } => {
                     let worker = &self.worker;
                     if let Some(PaneKind::Chart(c)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
