@@ -593,7 +593,13 @@ impl TerminalApp {
                 let resp = row_frame(ui, false);
                 let r = resp.rect;
                 let pt = ui.painter();
-                pt.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, &sec.ticker, mono(12.0), text());
+                pt.text(
+                    pos2(r.left() + 8.0, r.center().y),
+                    Align2::LEFT_CENTER,
+                    crate::security_names::ticker(&sec, false),
+                    mono(12.0),
+                    text(),
+                );
                 if let Some(q) = self.quotes.get(key) {
                     let up = q.change() >= 0.0;
                     let c = if up { theme::up() } else { theme::down() };
@@ -621,7 +627,11 @@ impl TerminalApp {
                 if resp.clicked() {
                     out.push(SidebarCmd::Action(Action::OpenChart(key.clone())));
                 }
-                let resp = resp.on_hover_text(format!("{} — {}", sec.key(), sec.name().unwrap_or(&sec.ticker)));
+                let resp = resp.on_hover_text(format!(
+                    "{} — {}",
+                    crate::security_names::label(&sec.key()),
+                    sec.name().unwrap_or(&crate::security_names::ticker(&sec, false))
+                ));
                 resp.context_menu(|ui| {
                     if ui.button("Open Chart").clicked() {
                         out.push(SidebarCmd::Action(Action::OpenChart(key.clone())));

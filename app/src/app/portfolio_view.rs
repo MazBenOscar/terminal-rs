@@ -439,7 +439,7 @@ fn toolbar(
     // A security filter (`AAPL POS`) on its own line, so it never collides with the status.
     if let Some(s) = pane.symbol.clone() {
         ui.horizontal(|ui| {
-            let t = tr_data::security(&s).ticker;
+            let t = crate::security_names::ticker(&tr_data::security(&s), false);
             note(ui, format!("Showing {t} only"));
             if ui.small_button("Show all").on_hover_text("Remove the security filter").clicked() {
                 pane.symbol = None;

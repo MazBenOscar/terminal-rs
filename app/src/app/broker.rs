@@ -48,7 +48,7 @@ impl PortfolioPane {
 
     pub fn title(&self) -> String {
         match &self.symbol {
-            Some(s) => format!("{} {}", tr_data::security(s).ticker, self.view.label()),
+            Some(s) => format!("{} {}", crate::security_names::ticker(&tr_data::security(s), false), self.view.label()),
             None if self.view == PortView::Summary => "Portfolio".into(),
             None => self.view.label().into(),
         }

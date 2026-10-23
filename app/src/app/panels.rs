@@ -607,8 +607,7 @@ impl TerminalApp {
         // asset visible (USD and USDT are different markets), and "Curncy" adds nothing.
         let crypto_pair = crypto.is_some();
         let ticker_width = if crypto_pair { 114.0 } else { 70.0 };
-        let ticker =
-            crypto.map_or_else(|| sec.ticker.clone(), |instrument| format!("{}/{}", instrument.base, instrument.quote));
+        let ticker = crate::security_names::ticker(&sec, false);
         let mut job = egui::text::LayoutJob::simple_singleline(ticker, mono(12.5), amber());
         job.wrap.max_width = ticker_width;
         job.wrap.max_rows = 1;
@@ -627,7 +626,7 @@ impl TerminalApp {
         }
         let name = self.security_names.name(s);
         let ticker_hit = Rect::from_min_max(r.min, pos2(name_left, r.bottom()));
-        let mut description = crate::security_names::hover(&sec.ticker, name);
+        let mut description = crate::security_names::hover(&crate::security_names::ticker(&sec, true), name);
         if let Some(quote) = self.quotes.get(s)
             && let Some(source) = &quote.crypto_source
         {
@@ -702,7 +701,8 @@ impl TerminalApp {
         }
         let tradable = matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf);
         let pills = if tradable { widgets::buy_sell_pills().to_vec() } else { Vec::new() };
-        let tips = [format!("Buy {} (⇧B)", sec.ticker), format!("Sell {} (⇧S)", sec.ticker)];
+        let ticker = crate::security_names::ticker(&sec, false);
+        let tips = [format!("Buy {ticker} (⇧B)"), format!("Sell {ticker} (⇧S)")];
         let tips: Vec<&str> = tips.iter().map(String::as_str).collect();
         match widgets::row_pills(ui, r, ("wl-pills", s), &pills, &tips) {
             Some(i) => out.push(Action::Command(format!("{} {s}", if i == 0 { "BUY" } else { "SELL" }))),
@@ -731,12 +731,12 @@ impl TerminalApp {
             out.push(Action::OpenChart(s.to_owned()));
             ui.close();
         }
-        ui.menu_button(format!("Add {} to watchlist", sec.ticker), |ui| {
+        ui.menu_button(format!("Add {} to watchlist", crate::security_names::ticker(&sec, false)), |ui| {
             for action in self.watchlist_destination_menu(ui, s) {
                 out.push(action);
             }
         });
-        if ui.button(format!("Add {} to compare", sec.ticker)).clicked() {
+        if ui.button(format!("Add {} to compare", crate::security_names::ticker(&sec, false))).clicked() {
             out.push(Action::AddToCompare(s.to_owned()));
             ui.close();
         }
@@ -872,7 +872,7 @@ impl TerminalApp {
         let p = ui.painter();
         p.line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, muted().gamma_multiply(0.3)));
         let at = |y| pos2(r.left() + dp(8.0), r.top() + dp(y));
-        p.text(at(17.0), Align2::LEFT_CENTER, &sec.ticker, mono(17.0), amber());
+        p.text(at(17.0), Align2::LEFT_CENTER, crate::security_names::ticker(&sec, true), mono(17.0), amber());
         p.text(at(38.0), Align2::LEFT_CENTER, self.security_names.name(symbol).unwrap_or(""), ui_font(11.0), text());
         let crypto = sec.crypto_instrument().ok();
         let venue = if let Some(instrument) = &crypto {
@@ -1018,7 +1018,9 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
     let key = tr_data::security(&b.symbol);
     let book: Option<OrderBook> = b.book.as_ref().map(|x| x.grouped(b.group));
     ui.horizontal_wrapped(|ui| {
-        let r = ui.label(RichText::new(&key.ticker).font(mono(13.0)).color(amber())).interact(Sense::click());
+        let r = ui
+            .label(RichText::new(crate::security_names::ticker(&key, true)).font(mono(13.0)).color(amber()))
+            .interact(Sense::click());
         if r.clicked() {
             action = Some(Action::OpenChart(b.symbol.clone()));
         }
