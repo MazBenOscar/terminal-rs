@@ -111,6 +111,7 @@ impl TerminalApp {
             self.pinned_agent_chart = None;
         }
         self.agent_pane.settings.pinned_chart = self.pinned_agent_chart;
+        self.refresh_agent_undo();
         self.send_next_agent_prompt();
     }
 
@@ -131,48 +132,75 @@ impl TerminalApp {
                 })
             })
             .unwrap_or_else(|| "No chart pinned".into());
+        self.refresh_agent_undo();
         let actions = self.agent_pane.show(ui, &pin_label, pane_id(id));
         for action in actions {
-            match action {
-                Action::Check => {
-                    self.agent_pane.session = None;
-                    self.agent_pane.transition(Onboarding::Checking);
-                    self.agent_pane.session =
-                        Some(Session::start(ui.ctx().clone(), AppExecutor::new(self), tr_alerts::data_dir()));
-                }
-                Action::SignIn => self.agent_command(Command::SignIn),
-                Action::CancelLogin => self.agent_command(Command::CancelLogin),
-                Action::ReopenLogin => self.agent_command(Command::ReopenLogin),
-                Action::RefreshLimits => self.agent_command(Command::RefreshLimits),
-                Action::Interrupt => self.agent_command(Command::Interrupt),
-                Action::Retry => {
-                    self.agent_pane.transition(Onboarding::Ready);
-                    if let Some(prompt) = self.agent_pane.last_prompt.clone()
-                        && let Some(prompt) = self.agent_pane.start_prompt(prompt)
-                    {
-                        self.send_agent_prompt(prompt);
-                    }
-                }
-                Action::Send(prompt) => {
-                    if matches!(self.agent_pane.state, Onboarding::ToolsUnavailable { .. }) {
-                        self.agent_pane.transition(Onboarding::Ready);
-                    }
-                    self.agent_pane.enqueue(prompt);
-                }
-                Action::Pin => {
-                    self.pinned_agent_chart = self
-                        .agent_pane
-                        .active_chart
-                        .filter(|uid| self.agent_chart(crate::agent_queue::ChartTarget::Uid(*uid)).is_some())
-                        .or_else(|| self.peek_chart().map(|c| c.uid));
-                    self.agent_pane.settings.pinned_chart = self.pinned_agent_chart;
-                }
-                Action::Close => {
-                    self.close_pane(id);
-                }
-            }
+            self.agent_action(ui.ctx(), id, action);
         }
         self.send_next_agent_prompt();
+    }
+
+    fn start_agent_session(&mut self, ctx: &egui::Context) {
+        let Some(tools) = self.agent_pane.prepare_session_start() else { return };
+        self.agent_pane.session = None;
+        self.agent_pane.session =
+            Some(Session::start(ctx.clone(), AppExecutor::new(self), tr_alerts::data_dir(), tools));
+    }
+
+    fn refresh_agent_undo(&mut self) {
+        let available: Vec<_> = self.undoable_agent_turns().into_iter().map(str::to_owned).collect();
+        let last = self.last_agent_turn().map(str::to_owned);
+        self.agent_pane.refresh_undo(&available, last.as_deref());
+    }
+
+    fn agent_action(&mut self, ctx: &egui::Context, id: PaneId, action: Action) {
+        match action {
+            Action::Check => self.start_agent_session(ctx),
+            Action::SetTools(mode) => {
+                if self.agent_pane.select_tools(mode, crate::agent_bridge::agent_edit_tools_available())
+                    && self.agent_pane.session.is_some()
+                {
+                    self.start_agent_session(ctx);
+                }
+            }
+            Action::UndoTurn(turn) => {
+                if !self.agent_pane.running {
+                    let result = self.undo_agent_turn(&turn);
+                    self.agent_pane.undo_result(&turn, result);
+                    self.refresh_agent_undo();
+                }
+            }
+            Action::SignIn => self.agent_command(Command::SignIn),
+            Action::CancelLogin => self.agent_command(Command::CancelLogin),
+            Action::ReopenLogin => self.agent_command(Command::ReopenLogin),
+            Action::RefreshLimits => self.agent_command(Command::RefreshLimits),
+            Action::Interrupt => self.agent_command(Command::Interrupt),
+            Action::Retry => {
+                self.agent_pane.transition(Onboarding::Ready);
+                if let Some(prompt) = self.agent_pane.last_prompt.clone()
+                    && let Some(prompt) = self.agent_pane.start_prompt(prompt)
+                {
+                    self.send_agent_prompt(prompt);
+                }
+            }
+            Action::Send(prompt) => {
+                if matches!(self.agent_pane.state, Onboarding::ToolsUnavailable { .. }) {
+                    self.agent_pane.transition(Onboarding::Ready);
+                }
+                self.agent_pane.enqueue(prompt);
+            }
+            Action::Pin => {
+                self.pinned_agent_chart = self
+                    .agent_pane
+                    .active_chart
+                    .filter(|uid| self.agent_chart(crate::agent_queue::ChartTarget::Uid(*uid)).is_some())
+                    .or_else(|| self.peek_chart().map(|c| c.uid));
+                self.agent_pane.settings.pinned_chart = self.pinned_agent_chart;
+            }
+            Action::Close => {
+                self.close_pane(id);
+            }
+        }
     }
 
     fn agent_command(&mut self, command: Command) {
@@ -208,8 +236,6 @@ impl TerminalApp {
                 visible_range: chart.visible_date_range().map(|range| (range.start, range.end)),
             })
             .unwrap_or(ChartPin { uid: 0, symbol: String::new(), timeframe: String::new(), visible_range: None });
-        // A3 can replace the no-op tool-set hook when edit execution is integrated.
-        debug_assert_eq!(self.agent_pane.tool_set(), tr_agent_tools::ToolSet::ReadOnly);
         let model = self
             .agent_pane
             .models
@@ -279,6 +305,134 @@ mod tests {
             // No real session: attempting the interrupt gives a recoverable stop.
             assert_eq!(!app.agent_pane.running, interrupted, "focus={focus:?}, palette={palette}");
         }
+    }
+
+    #[test]
+    fn pane_undo_action_runs_on_app_and_reports_conflicts_and_layout_unavailability() {
+        use std::sync::Arc;
+        use tr_agent::bridge::{BridgeEvent, ToolCall, ToolExecutor};
+        use tr_agent_tools::{Content, Registry, ToolSet};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/agent-wire-undo");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.execute("NEW CHART");
+        app.execute("NEW AGENT");
+        let id = app.first_agent().unwrap();
+        app.initialize_agent_choices();
+        app.pinned_agent_chart = app.peek_chart().map(|c| c.uid);
+        app.agent_pane.state = Onboarding::Ready;
+        let pin = AppExecutor::pin(&app).unwrap();
+        let executor = AppExecutor::new(&app);
+        let turn = tr_agent::bridge::TurnIds::new().unwrap().allocate().unwrap();
+        app.agent_pane
+            .start_prompt(agent_pane::Prompt { text: "add two RSI studies".into(), requires_tools: false })
+            .unwrap();
+        app.agent_pane.event(BridgeEvent::Started { turn: turn.clone() });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            for keep in [true, false] {
+                let mut future = executor.execute(
+                    Arc::new(Registry::new(ToolSet::Edit)),
+                    ToolCall {
+                        turn: turn.clone(),
+                        pin: pin.clone(),
+                        name: "add_indicator".into(),
+                        arguments: "{\"code\":\"RSI\",\"params\":[14]}".into(),
+                        confirmed: false,
+                    },
+                );
+                assert!(futures::poll!(future.as_mut()).is_pending());
+                app.process_logic();
+                let result = future.await;
+                assert!(result.success);
+                if keep {
+                    let Content::Text(text) = &result.content[0] else { panic!("text result") };
+                    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+                    let study = value["id"].as_str().unwrap().split_once(':').unwrap().1.parse().unwrap();
+                    app.agent_chart_mut(crate::agent_queue::ChartTarget::Pinned).unwrap().keep_agent_study(study);
+                }
+            }
+        });
+        app.agent_pane.event(BridgeEvent::Completed {
+            turn: turn.clone(),
+            status: "completed".into(),
+            calls: 2,
+            interrupt_elapsed: None,
+        });
+        app.refresh_agent_undo();
+        assert!(app.agent_pane.turns[0].undo_available);
+        let ctx = egui::Context::default();
+        app.agent_pane.running = true;
+        app.agent_action(&ctx, id, Action::UndoTurn(turn.clone()));
+        assert!(app.agent_turn_undo_available(&turn), "undo must wait for the active turn");
+        app.agent_pane.running = false;
+        app.agent_action(&ctx, id, Action::UndoTurn(turn.clone()));
+        assert!(!app.agent_turn_undo_available(&turn));
+        assert!(!app.agent_pane.turns[0].undo_available);
+        assert_eq!(
+            app.agent_pane.turns[0].undo_summary.as_deref(),
+            Some("Undo: 1 reverted · 1 conflicts skipped · 1 charts")
+        );
+        app.agent_action(&ctx, id, Action::UndoTurn(turn));
+        assert_eq!(app.agent_pane.turns[0].undo_summary.as_deref(), Some(agent_pane::UNDO_UNAVAILABLE));
+
+        // The conversation survives layout changes, but inverse edits do not.
+        let second = tr_agent::bridge::TurnIds::new().unwrap().allocate().unwrap();
+        app.agent_pane.start_prompt(agent_pane::Prompt { text: "RSI".into(), requires_tools: false }).unwrap();
+        app.agent_pane.event(BridgeEvent::Started { turn: second.clone() });
+        runtime.block_on(async {
+            let mut future = executor.execute(
+                Arc::new(Registry::new(ToolSet::Edit)),
+                ToolCall {
+                    turn: second.clone(),
+                    pin,
+                    name: "add_indicator".into(),
+                    arguments: "{\"code\":\"RSI\"}".into(),
+                    confirmed: false,
+                },
+            );
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            app.process_logic();
+            assert!(future.await.success);
+        });
+        app.agent_pane.event(BridgeEvent::Completed {
+            turn: second,
+            status: "completed".into(),
+            calls: 1,
+            interrupt_elapsed: None,
+        });
+        app.refresh_agent_undo();
+        assert!(app.agent_pane.turns[1].undo_available);
+        let doc = app.current_doc();
+        app.apply_doc(doc);
+        app.refresh_agent_undo();
+        assert!(app.agent_pane.turns[1].made_edits);
+        assert!(!app.agent_pane.turns[1].undo_available);
+    }
+
+    #[test]
+    fn tools_mode_action_persists_only_choices_and_cannot_bypass_unsafe_or_active_turn() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/agent-wire-mode");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.execute("NEW AGENT");
+        let id = app.first_agent().unwrap();
+        app.initialize_agent_choices();
+        app.agent_pane.state = Onboarding::Ready;
+        let ctx = egui::Context::default();
+        app.agent_action(&ctx, id, Action::SetTools(agent_pane::ToolsMode::Edit));
+        assert_eq!(app.agent_pane.tool_set(), tr_agent_tools::ToolSet::Edit);
+        assert!(app.agent_pane.session.is_none(), "choosing before Start must not launch a child");
+        let json = serde_json::to_string(&app.current_doc()).unwrap();
+        assert!(json.contains("\"tools\":\"Edit\""));
+        assert!(!json.contains("Queue stays paused"));
+        app.agent_pane.running = true;
+        app.agent_action(&ctx, id, Action::SetTools(agent_pane::ToolsMode::ReadOnly));
+        assert_eq!(app.agent_pane.tool_set(), tr_agent_tools::ToolSet::Edit);
+        app.agent_pane.running = false;
+        app.agent_pane.transition(Onboarding::Stopped { reason: "tripwire".into(), unsafe_backend: true });
+        app.agent_action(&ctx, id, Action::SetTools(agent_pane::ToolsMode::ReadOnly));
+        app.agent_action(&ctx, id, Action::Check);
+        assert!(app.agent_pane.session.is_none());
+        assert_eq!(app.agent_pane.tool_set(), tr_agent_tools::ToolSet::Edit);
     }
 
     #[test]

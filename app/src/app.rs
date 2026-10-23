@@ -2883,7 +2883,7 @@ impl eframe::App for TerminalApp {
 #[cfg(test)]
 impl TerminalApp {
     /// Inert workspace with all disk-backed dependencies confined to the fixture.
-    fn test_workspace(root: &std::path::Path) -> Self {
+    pub(crate) fn test_workspace(root: &std::path::Path) -> Self {
         Self {
             drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(egui::Context::default()),
