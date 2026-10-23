@@ -1739,8 +1739,10 @@ impl TerminalApp {
                     }
                 }
                 Response::Indicators { pane, generation, built, revision } => {
-                    if let Some(c) = self.chart_mut(pane) {
-                        c.on_indicators(generation, revision, built);
+                    let worker = &self.worker;
+                    if let Some(PaneKind::Chart(c)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        c.on_indicators(generation, revision, built, worker);
                     }
                 }
                 Response::LiveStatus { pane, generation, message } => {

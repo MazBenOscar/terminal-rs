@@ -397,6 +397,8 @@ pub struct ChartState {
     last_live: Option<std::time::Instant>,
     last_indicator_req: Option<std::time::Instant>,
     indicator_revision: u64,
+    indicator_snapshot: Option<(u64, u64, usize, Option<Bar>)>,
+    indicator_catch_up: bool,
     study_from: usize,
     session_history_revision: Option<u64>,
     compare_from: usize,
@@ -520,6 +522,8 @@ impl ChartState {
             last_live: None,
             last_indicator_req: None,
             indicator_revision: 0,
+            indicator_snapshot: None,
+            indicator_catch_up: false,
             study_from: 0,
             session_history_revision: None,
             compare_from: 0,
@@ -627,6 +631,8 @@ impl ChartState {
         study::assign_ids(&mut self.indicators);
         self.generation += 1;
         self.series_revision = 0;
+        self.indicator_snapshot = None;
+        self.indicator_catch_up = false;
         self.session_history_revision = None;
         self.pending_live.clear();
         self.study_from = 0;
@@ -1167,9 +1173,17 @@ impl ChartState {
         PriceScale { lo: inv(lo), hi: inv(hi), ..target }
     }
 
+    fn indicator_series(&self) -> (u64, u64, usize, Option<Bar>) {
+        (self.series_revision, self.view_revision, self.bars.len(), self.bars.last().copied())
+    }
+
     fn request_indicators(&mut self, w: &Worker) {
         if !self.bars.is_empty() {
             self.indicator_revision += 1;
+            // The request owns the bars, including their count and last timestamp.
+            // Keep only a revision key here so UI aliases cannot force a live copy.
+            self.indicator_snapshot = Some(self.indicator_series());
+            self.indicator_catch_up = false;
             w.send(Request::Indicators {
                 from: std::mem::replace(&mut self.study_from, usize::MAX),
                 revision: self.indicator_revision,
@@ -1554,7 +1568,7 @@ impl ChartState {
         // Live ticks only move the last bar: refresh indicators at most every 1.5 s and
         // leave the compare series alone.
         let due = self.last_indicator_req.is_none_or(|t| t.elapsed().as_millis() >= 1500);
-        if !live || due {
+        if !live || due && !self.indicator_catch_up {
             self.request_indicators(w);
             self.last_indicator_req = Some(std::time::Instant::now());
         }
@@ -1784,12 +1798,21 @@ impl ChartState {
         }
     }
 
-    pub fn on_indicators(&mut self, generation: u64, revision: u64, built: Vec<BuiltIndicator>) {
+    pub fn on_indicators(&mut self, generation: u64, revision: u64, built: Vec<BuiltIndicator>, w: &Worker) {
         if generation == self.generation
             && revision == self.indicator_revision
             && built.iter().map(|b| &b.spec).eq(self.indicators.iter())
         {
             self.built = built;
+            let behind = self.indicator_snapshot.take().is_some_and(|snapshot| snapshot != self.indicator_series());
+            let catching_up = std::mem::take(&mut self.indicator_catch_up);
+            // Accept lagging studies, then bypass the live throttle once. A catch-up
+            // response cannot chain more requests if ticks keep outrunning the worker.
+            if behind && !catching_up {
+                self.request_indicators(w);
+                self.indicator_catch_up = true;
+                self.last_indicator_req = Some(std::time::Instant::now());
+            }
         }
     }
 
@@ -7938,7 +7961,7 @@ mod tests {
             chart.effective_session(),
             &histories,
         );
-        chart.on_indicators(chart.generation, chart.indicator_revision, built);
+        chart.on_indicators(chart.generation, chart.indicator_revision, built, &Worker::inert());
         assert_eq!(chart.built.len(), 1);
         assert!(chart.built[0].error.is_none());
         let extent = chart.built[0].overlays[0]
@@ -7962,7 +7985,7 @@ mod tests {
         chart.request_indicators(&worker);
         let revision = chart.indicator_revision;
         chart.request_indicators(&worker);
-        chart.on_indicators(chart.generation, revision, old);
+        chart.on_indicators(chart.generation, revision, old, &worker);
         assert!(chart.built.is_empty());
     }
 
@@ -8117,7 +8140,7 @@ mod tests {
         let built = crate::worker::build_indicators(&bars, Timeframe::D1, &chart.indicators, &theme::palette());
         assert_eq!(study_groups(&built), vec![(Some(1), vec![0, 1]), (None, vec![3])]);
         chart.indicators[0].params[0] = 2.;
-        chart.on_indicators(chart.generation, chart.indicator_revision, built);
+        chart.on_indicators(chart.generation, chart.indicator_revision, built, &Worker::inert());
         assert!(chart.built.is_empty(), "a superseded parameter response cannot replace current studies");
     }
 
@@ -8648,6 +8671,128 @@ mod tests {
         }
     }
 
+    #[test]
+    fn review_old_indicator_snapshot_must_not_replace_live_revision() {
+        let (w, mut requests) = Worker::recording();
+        let mut chart = ChartState::new(1, "AAPL US Equity", Timeframe::D1);
+        let bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 80, 1_790_000_000));
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &w);
+        while requests.try_recv().is_ok() {}
+        chart.request_indicators(&w);
+        let Request::Indicators { generation, revision, bars: snapshot, tf, specs, palette, .. } =
+            requests.try_recv().unwrap()
+        else {
+            panic!("indicators")
+        };
+        // The request owns the previous Arc. A live append is inside the throttle window,
+        // so no new indicator request supersedes this one.
+        let mut next = *bars.last().unwrap();
+        next.ts += tf.seconds();
+        next.close += 20.;
+        chart.on_live_bars(chart.generation, bars.len(), vec![next], bars.len() + 1, &w);
+        assert_eq!(chart.bars.len(), 81);
+        assert_eq!(snapshot.len(), 80);
+        let built = crate::worker::build_indicators(&snapshot, tf, &specs, &palette);
+        chart.on_indicators(generation, revision, built, &w);
+        assert!(!chart.built.is_empty());
+        assert!(chart.built.iter().flat_map(|b| &b.overlays).all(|(_, o)| o.line.pyramid.read().unwrap().len0 == 80));
+        // Rendering an accepted snapshot shorter than the live bars must be safe.
+        chart_frame(&egui::Context::default(), &mut chart, vec![]);
+        let Request::Indicators { generation, revision: catch_up, bars, tf, specs, palette, .. } =
+            requests.try_recv().unwrap()
+        else {
+            panic!("catch-up indicators")
+        };
+        assert!(requests.try_recv().is_err());
+        assert_eq!(bars.len(), chart.bars.len());
+        // Duplicate/older request responses cannot enqueue another catch-up.
+        chart.on_indicators(generation, revision, crate::worker::build_indicators(&snapshot, tf, &specs, &palette), &w);
+        assert!(requests.try_recv().is_err());
+        chart.on_indicators(generation, catch_up, crate::worker::build_indicators(&bars, tf, &specs, &palette), &w);
+        assert!(requests.try_recv().is_err());
+        assert!(
+            chart
+                .built
+                .iter()
+                .flat_map(|b| &b.overlays)
+                .all(|(_, o)| o.line.pyramid.read().unwrap().len0 == chart.bars.len())
+        );
+    }
+
+    #[test]
+    fn indicator_catch_up_is_bounded_while_ticks_continue() {
+        let (w, mut requests) = Worker::recording();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        let bars = Arc::new(tr_core::sample::generate("AAPL", chart.tf, 80, 1_790_000_000));
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &w);
+        while requests.try_recv().is_ok() {}
+        chart.request_indicators(&w);
+        let first = requests.try_recv().unwrap();
+        let mut bar = *bars.last().unwrap();
+        bar.close += 1.;
+        chart.on_live_bars(chart.generation, 79, vec![bar], 80, &w);
+        let Request::Indicators { generation, revision, bars, tf, specs, palette, .. } = first else {
+            panic!("indicators")
+        };
+        chart.on_indicators(generation, revision, crate::worker::build_indicators(&bars, tf, &specs, &palette), &w);
+        let Request::Indicators { generation, revision, bars, tf, specs, palette, .. } = requests.try_recv().unwrap()
+        else {
+            panic!("catch-up indicators")
+        };
+        for _ in 0..3 {
+            // Even an expired throttle must not supersede the outstanding catch-up.
+            chart.last_indicator_req = None;
+            bar.close += 1.;
+            chart.on_live_bars(chart.generation, 79, vec![bar], 80, &w);
+            assert!(requests.try_recv().is_err());
+        }
+        chart.on_indicators(generation, revision, crate::worker::build_indicators(&bars, tf, &specs, &palette), &w);
+        assert!(!chart.built.is_empty());
+        assert!(requests.try_recv().is_err(), "catch-up responses must not chain requests");
+        assert!(!chart.indicator_catch_up);
+    }
+
+    #[test]
+    fn review_session_history_supersession_queue_order_and_generation_drop() {
+        let (w, mut requests) = Worker::recording();
+        let mut chart = ChartState::new(1, "AAPL US Equity", Timeframe::M1);
+        chart.data.session = tr_core::session::Session::UsRegular;
+        let raw = Arc::new(tr_core::sample::generate("AAPL", Timeframe::M1, 5000, 1_790_000_000));
+        chart.on_history_revision(0, 1, raw.clone(), SeriesGpu::build(&raw), 0, false, false, false, &w);
+        let mut old = loop {
+            if let Request::SessionHistory { history } = requests.try_recv().unwrap() {
+                break history;
+            }
+        };
+        let mut changed = *raw.last().unwrap();
+        changed.close += 1.;
+        chart.on_live_bars_revision(0, 2, raw.len() - 1, vec![changed], raw.len(), &w);
+        changed.close += 1.;
+        chart.on_live_bars_revision(0, 3, raw.len() - 1, vec![changed], raw.len(), &w);
+        assert_eq!(chart.pending_live.len(), 2);
+        // A newer authoritative history already includes revision 2.
+        let mut newer = raw.as_ref().clone();
+        newer.last_mut().unwrap().close += 1.;
+        let newer = Arc::new(newer);
+        chart.on_history_revision(0, 2, newer.clone(), SeriesGpu::build(&newer), 0, false, false, false, &w);
+        let (bars, gpu) = crate::worker::filter_history(&mut old);
+        chart.on_session_history(old, bars, gpu, &w);
+        assert_eq!(chart.session_history_revision, Some(2));
+        deliver_session_history(&mut chart, &w);
+        chart.flush_pending_live(&w);
+        assert_eq!(chart.series_revision, 3);
+        assert_eq!(chart.live_source.as_ref().unwrap().last().unwrap().close, changed.close);
+        assert!(chart.pending_live.is_empty());
+        // An in-flight old-symbol result cannot apply after a generation change.
+        chart.session_history_revision = Some(3);
+        chart.on_live_bars_revision(0, 4, raw.len() - 1, vec![changed], raw.len(), &w);
+        chart.generation += 1;
+        chart.session_history_revision = None;
+        chart.flush_pending_live(&w);
+        assert_eq!(chart.series_revision, 3);
+        assert!(chart.pending_live.is_empty());
+    }
+
     fn deliver_session_history(chart: &mut ChartState, w: &Worker) {
         let mut history = crate::worker::SessionHistory {
             pane: chart.id,
@@ -8703,7 +8848,7 @@ mod tests {
             panic!("expected indicators")
         };
         let built = crate::worker::build_indicators(&bars, tf, &specs, &palette);
-        chart.on_indicators(generation, indicator_revision, built);
+        chart.on_indicators(generation, indicator_revision, built, &w);
         assert_eq!(chart.built.len(), specs.len());
         let Request::Compare { generation, revision, symbol, base, .. } = comparison else {
             panic!("expected comparison")
@@ -8722,6 +8867,7 @@ mod tests {
             generation,
             indicator_revision,
             crate::worker::build_indicators(&bars, tf, &specs, &palette),
+            &w,
         );
         chart.on_compare(generation, revision, &symbol, line);
         assert!(chart.built.is_empty());

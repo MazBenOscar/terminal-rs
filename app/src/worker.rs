@@ -782,9 +782,7 @@ impl CompareCache {
         let count = start + other.len();
         // A different history count would move the full-fetch left edge. Refetch
         // rather than silently changing the last-at-or-before alignment there.
-        count <= limit
-            && (self.bars.len() < self.len.max(100) || count == limit)
-            && other.iter().any(|b| self.bars.binary_search_by_key(&b.ts, |old| old.ts).is_ok())
+        count == limit && other.iter().any(|b| self.bars.binary_search_by_key(&b.ts, |old| old.ts).is_ok())
     }
 
     fn tail_limit(
@@ -800,6 +798,9 @@ impl CompareCache {
             || self.options != options
             || base.first()?.ts != self.first
             || base.len() < self.len
+            // A short provider history may roll its left edge independently of the
+            // chart. Only a full fetch can tell which cached bars have expired.
+            || self.bars.len() < self.len.max(100)
             || from == 0
             || from > self.len
         {
@@ -4372,6 +4373,137 @@ mod tests {
         assert_eq!(clears, 1);
     }
 
+    fn review_equal_built(got: &[BuiltIndicator], want: &[BuiltIndicator]) {
+        assert_eq!(got.len(), want.len());
+        for (got, want) in got.iter().zip(want) {
+            assert_eq!(got.spec, want.spec);
+            assert_eq!(got.error, want.error);
+            assert_eq!(got.ports, want.ports);
+            assert_eq!(got.overlays.len(), want.overlays.len());
+            assert_eq!(got.bounds.len(), want.bounds.len());
+            assert_eq!(got.fill.is_some(), want.fill.is_some());
+            for ((gn, g), (wn, w)) in got.overlays.iter().zip(&want.overlays) {
+                assert_eq!(gn, wn);
+                assert_eq!(g.color, w.color);
+                assert_eq!(g.kind, w.kind);
+                let g = g.line.pyramid.read().unwrap();
+                let w = w.line.pyramid.read().unwrap();
+                assert_eq!(g.len0, w.len0);
+                for k in 0..g.levels() {
+                    for (a, b) in g.data[g.offsets[k]..g.offsets[k] + g.level_len(k)]
+                        .iter()
+                        .zip(&w.data[w.offsets[k]..w.offsets[k] + w.level_len(k)])
+                    {
+                        assert!(
+                            a[0] == b[0] && (a[1].to_bits() == b[1].to_bits() || a[1].is_nan() && b[1].is_nan()),
+                            "{gn} level {k}: {a:?} != {b:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_cache_identity_paging_resync_and_stale_revisions_match_fresh() {
+        use tr_core::indicators::study::{Source, assign_ids};
+        let mut bars = tr_core::sample::generate("CACHE", Timeframe::M1, 5000, 1_790_000_000);
+        let mut specs = vec![IndicatorSpec::new("EMA", &[3.]).unwrap(); 2];
+        assign_ids(&mut specs);
+        let saved = specs[1].clone();
+        let mut cache = StudyPaneCache::default();
+        let mut palette = theme::palette();
+        let mut session = tr_core::session::Session::Provider;
+        let histories = StudyHistories::new();
+        let mut tf = Timeframe::M1;
+        let mut generation = 1;
+        for step in 1..=15 {
+            let mut from = bars.len() - 1;
+            bars.last_mut().unwrap().close += 0.5;
+            match step {
+                1 => from = 0,
+                2 => specs[0].params[0] = 7., // same instance ID
+                3 => {
+                    specs.pop();
+                }
+                4 => specs.push(saved.clone()),
+                5 => palette.series.rotate_left(1),
+                6 => session = tr_core::session::Session::UsRegular,
+                7 => {
+                    bars = tr_core::sample::generate("NEW SYMBOL", tf, 5000, 1_790_000_000);
+                    from = 0;
+                }
+                8 => tf = Timeframe::D1,
+                9 => {
+                    let mut first = bars[0];
+                    first.ts -= tf.seconds();
+                    bars.insert(0, first);
+                    from = 0;
+                }
+                10 => {
+                    bars[100].close += 30.;
+                    from = 100;
+                }
+                11 => {
+                    bars[200].close += 20.;
+                    from = 0;
+                }
+                12 => specs[0].chart.as_mut().unwrap().source = Source::Hlc3,
+                13 => generation += 1,
+                _ => {}
+            }
+            let revision = match step {
+                14 => 9,
+                15 => 20,
+                _ => step,
+            };
+            let got = cache.build(StudyBuild {
+                generation,
+                revision,
+                from,
+                bars: &bars,
+                tf,
+                specs: &specs,
+                palette: &palette,
+                session,
+                histories: &histories,
+            });
+            let want = build_indicators_session(&bars, tf, &specs, &palette, session, &histories);
+            review_equal_built(&got, &want);
+        }
+    }
+
+    #[test]
+    fn review_sparse_marker_histogram_tail_visibility_and_length_changes() {
+        for markers in [false, true] {
+            let mut values = vec![f64::NAN; 127];
+            let mut line = if markers { marker_ref(&values) } else { line_ref(&values) };
+            for step in 0..40 {
+                let from = values.len() - 1;
+                values[from] = if step % 2 == 0 { 42. } else { f64::NAN };
+                if step % 3 == 0 {
+                    values.push(if step % 2 == 0 { 4. } else { f64::NAN });
+                }
+                patch_study_line(&mut line, &values, from, markers);
+                let rebuilt = if markers { marker_ref(&values) } else { line_ref(&values) };
+                let got = line.pyramid.read().unwrap();
+                let want = rebuilt.pyramid.read().unwrap();
+                assert_eq!(got.len0, want.len0);
+                for k in 0..got.levels() {
+                    for (a, b) in got.data[got.offsets[k]..got.offsets[k] + got.level_len(k)]
+                        .iter()
+                        .zip(&want.data[want.offsets[k]..want.offsets[k] + want.level_len(k)])
+                    {
+                        assert!(a[0] == b[0] && (a[1] == b[1] || a[1].is_nan() && b[1].is_nan()));
+                    }
+                }
+            }
+            values.truncate(10);
+            patch_study_line(&mut line, &values, 0, markers);
+            assert_eq!(line.pyramid.read().unwrap().len0, 10);
+        }
+    }
+
     #[test]
     fn stable_study_lines_patch_exact_dirty_ranges_and_invalidate_identity() {
         let mut bars = tr_core::sample::generate("CACHE", Timeframe::M1, 1000, 1_790_000_000);
@@ -4449,6 +4581,94 @@ mod tests {
             let bars = self.bars.lock().unwrap();
             let end = bars.partition_point(|b| end.is_none_or(|end| b.ts < end));
             Ok(bars[end.saturating_sub(limit)..end].to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn review_comparison_sparse_sessions_and_extra_bars() {
+        review_comparison_modes(0..3).await;
+    }
+
+    #[tokio::test]
+    async fn review_comparison_rolling_short_history_matches_full_fetch() {
+        review_comparison_modes(3..4).await;
+    }
+
+    async fn review_comparison_modes(modes: std::ops::Range<usize>) {
+        for mode in modes {
+            let mut base = tr_core::sample::generate("BASE", Timeframe::M1, 160, 1_790_000_000);
+            let provider = Arc::new(ComparisonFixture { bars: Default::default(), limits: Default::default() });
+            let (s, rx) = backfill_shared(provider.clone());
+            for revision in 1..=8 {
+                let mut from = if revision == 1 { 0 } else { base.len() - 1 };
+                if revision > 1 {
+                    let mut next = *base.last().unwrap();
+                    next.ts += 60;
+                    base.push(next);
+                }
+                if revision == 5 {
+                    let mut first = base[0];
+                    first.ts -= 60;
+                    base.insert(0, first);
+                    from = 0;
+                }
+                let mut other = Vec::new();
+                for (i, b) in base.iter().enumerate() {
+                    // Missing candles, different trading hours, twice as many candles,
+                    // and a genuinely short provider history (fewer than requested).
+                    if match mode {
+                        0 => i % 3 != 0,
+                        1 => !(30..110).contains(&i),
+                        3 => i < base.len() - 12,
+                        _ => false,
+                    } {
+                        continue;
+                    }
+                    let mut b = *b;
+                    b.close = i as f64 + revision as f64;
+                    other.push(b);
+                    if mode == 2 {
+                        b.ts += 30;
+                        b.close += 0.5;
+                        other.push(b);
+                    }
+                }
+                // Only the returned overlapping tail is mutable between requests.
+                // Keep all older values fixed, as the incremental contract requires.
+                for b in &mut other {
+                    b.close -= revision as f64;
+                }
+                *provider.bars.lock().unwrap() = other.clone();
+                handle(
+                    &s,
+                    Request::Compare {
+                        pane: 1,
+                        generation: if revision < 7 { 1 } else { 2 },
+                        revision,
+                        from,
+                        symbol: "OTHER".into(),
+                        tf: Timeframe::M1,
+                        base: Arc::new(base.clone()),
+                        options: Default::default(),
+                    },
+                )
+                .await;
+                let Response::Compare { line, .. } = rx.try_recv().unwrap() else {
+                    panic!("comparison mode {mode} revision {revision}")
+                };
+                let end = tr_core::session::next_bucket(Timeframe::M1, base.last().unwrap().ts);
+                other.retain(|b| b.ts < end);
+                let full = align_compare(&base, &other[other.len().saturating_sub(base.len().max(100))..]);
+                let p = line.pyramid.read().unwrap();
+                assert_eq!(p.len0, full.len());
+                for (i, (a, b)) in p.data[..p.len0].iter().zip(&full).enumerate() {
+                    assert!(
+                        a[1].to_bits() == (*b as f32).to_bits() || a[1].is_nan() && b.is_nan(),
+                        "mode {mode} revision {revision} index {i}: {} != {b}",
+                        a[1]
+                    );
+                }
+            }
         }
     }
 
