@@ -425,7 +425,12 @@ impl AgentPane {
         if matches!(self.state, Onboarding::Stopped { unsafe_backend: true, .. }) {
             return;
         }
-        if !matches!(state, Onboarding::Ready | Onboarding::SigningIn | Onboarding::Checking) {
+        // Pause only when work is cut off; onboarding states before Ready have nothing to protect.
+        if matches!(
+            state,
+            Onboarding::RateLimited { .. } | Onboarding::ToolsUnavailable { .. } | Onboarding::Stopped { .. }
+        ) && (self.running || !self.queue.is_empty())
+        {
             self.queue_paused = true;
         }
         if matches!(state, Onboarding::Stopped { .. }) {
@@ -454,6 +459,10 @@ impl AgentPane {
 
     pub fn enqueue(&mut self, prompt: Prompt) {
         if !prompt.text.trim().is_empty() && self.queue.len() < 32 {
+            // An empty, idle queue holds no stale prompts, so a pause has nothing left to guard.
+            if self.queue.is_empty() && !self.running {
+                self.queue_paused = false;
+            }
             // Conversation text is not a log: preserve whitespace and ordinary words.
             // While paused, new prompts append without releasing the existing queue.
             self.queue.push_back(prompt);
@@ -1223,7 +1232,8 @@ mod fix_tests {
         pane.settings.model = "unlimited-model".into();
         pane.set_limits(&value);
         assert_eq!(pane.state, Onboarding::Ready);
-        assert!(pane.queue_paused);
+        // Nothing was queued or running, so the rate limit had nothing to pause.
+        assert!(!pane.queue_paused);
         pane.set_limits(&json!({"ordinaryUsageAllowed":false}));
         assert!(matches!(pane.state, Onboarding::RateLimited { .. }));
     }
@@ -1591,5 +1601,30 @@ mod review_tests {
             }
         }));
         assert_eq!(pane.state, Onboarding::Ready);
+    }
+
+    #[test]
+    fn prompt_after_signing_in_from_signed_out_is_sent() {
+        let mut pane = AgentPane::default();
+        for state in [
+            Onboarding::Checking,
+            Onboarding::SignedOut,
+            Onboarding::SigningIn,
+            Onboarding::Checking,
+            Onboarding::Ready,
+        ] {
+            pane.transition(state);
+        }
+        pane.enqueue(Prompt { text: "What's the trend?".into(), requires_tools: true });
+        assert_eq!(pane.next_prompt().map(|p| p.text).as_deref(), Some("What's the trend?"));
+    }
+
+    #[test]
+    fn stale_paused_prompts_still_wait_for_explicit_resume() {
+        let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
+        pane.enqueue(Prompt { text: "stale".into(), requires_tools: false });
+        pane.interrupt();
+        pane.enqueue(Prompt { text: "new".into(), requires_tools: false });
+        assert!(pane.next_prompt().is_none(), "a non-empty paused queue must not resume implicitly");
     }
 }
