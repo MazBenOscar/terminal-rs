@@ -144,8 +144,54 @@ impl Tool {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Author {
+    #[default]
+    User,
+    Agent,
+}
+
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn next_id() -> u64 {
+    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn reserve_id(id: u64) {
+    // Keep imported ids out of the allocator's path without allowing hostile
+    // near-u64::MAX values to wrap it. High ids cannot be reached in practice.
+    if id < u64::MAX / 2 {
+        NEXT_ID.fetch_max(id + 1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Preserve saved identities, repairing legacy and duplicated ids.
+pub fn assign_ids(drawings: &mut [Drawing]) {
+    let mut seen = std::collections::HashSet::new();
+    let reserved: std::collections::HashSet<_> = drawings.iter().map(|d| d.id).collect();
+    for id in &reserved {
+        reserve_id(*id);
+    }
+    for drawing in drawings {
+        if drawing.id == 0 || !seen.insert(drawing.id) {
+            loop {
+                drawing.id = next_id();
+                if !reserved.contains(&drawing.id) && seen.insert(drawing.id) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Drawing {
+    #[serde(default = "next_id")]
+    pub id: u64,
+    #[serde(default)]
+    pub created_by: Author,
+    #[serde(default)]
+    pub turn_id: Option<String>,
     pub tool: Tool,
     pub a: Anchor,
     pub b: Anchor,
@@ -195,6 +241,9 @@ fn line_width() -> f32 {
 impl Drawing {
     pub fn new(tool: Tool, a: Anchor, b: Anchor) -> Self {
         Self {
+            id: next_id(),
+            created_by: Author::User,
+            turn_id: None,
             tool,
             a,
             b,
@@ -214,6 +263,10 @@ impl Drawing {
     }
     /// Normalise untrusted saved geometry; false means the drawing is incomplete.
     pub fn sanitize(&mut self) -> bool {
+        if self.id == 0 {
+            self.id = next_id();
+        }
+        reserve_id(self.id);
         self.text = text::sanitize(&self.text);
         if self.tool != Tool::Path {
             self.arrow_end = false;

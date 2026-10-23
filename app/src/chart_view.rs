@@ -319,8 +319,46 @@ fn screenshot_request(pending: Option<&PendingExport>, token: u64, image: Arc<eg
     })
 }
 
+#[derive(serde::Serialize)]
+pub struct BarsRead<'a> {
+    pub bars: &'a [Bar],
+    pub last_in_progress: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct StudyRead {
+    pub id: Option<u32>,
+    pub spec: IndicatorSpec,
+    pub outputs: Vec<StudyOutputRead>,
+    pub error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct StudyOutputRead {
+    pub name: String,
+    pub values: Vec<Option<f64>>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ChartRead<'a> {
+    pub uid: u64,
+    pub symbol: &'a str,
+    pub display_name: &'a str,
+    pub timeframe: Timeframe,
+    pub source: BarsRead<'a>,
+    pub displayed: BarsRead<'a>,
+    pub viewport: Option<Viewport>,
+    pub visible_range: Option<crate::chart_navigation::DateRange>,
+    pub studies: Vec<StudyRead>,
+    pub comparisons: Vec<String>,
+    pub drawings: &'a [Drawing],
+    pub chart_type: ChartType,
+    pub session: tr_core::session::Session,
+}
+
 pub struct ChartState {
     pub id: PaneId,
+    pub uid: u64,
     pub symbol: String,
     pub tf: Timeframe,
     pub chart_type: ChartType,
@@ -438,8 +476,16 @@ pub struct ChartState {
     template_names: Option<Vec<String>>,
     template_selected: String,
     template_status: Option<Result<String, String>>,
-    drawing_undo: Vec<Vec<Drawing>>,
-    drawing_redo: Vec<Vec<Drawing>>,
+    pub(crate) drawing_ids: crate::drawing_history::DrawingIds,
+    drawing_undo: Vec<crate::drawing_history::Edit>,
+    drawing_redo: Vec<crate::drawing_history::Edit>,
+    drawing_revision: u64,
+    drawing_user_revisions: std::collections::HashMap<u64, u64>,
+    pending_drawing_edit: Option<Vec<Drawing>>,
+    pending_drawing_origin: (tr_chart::drawings::Author, Option<String>),
+    pub(crate) edit_author: tr_chart::drawings::Author,
+    pub(crate) edit_turn: Option<String>,
+    pub(crate) drawing_events: Vec<crate::drawing_history::Edit>,
 }
 
 impl ChartState {
@@ -448,6 +494,7 @@ impl ChartState {
         study::assign_ids(&mut indicators);
         Self {
             id,
+            uid: tr_chart::drawings::next_id(),
             symbol: tr_data::security(symbol).key(),
             tf,
             chart_type: if tr_data::security(symbol).class == AssetClass::Govt {
@@ -556,8 +603,87 @@ impl ChartState {
             template_names: None,
             template_selected: String::new(),
             template_status: None,
+            drawing_ids: Default::default(),
             drawing_undo: Vec::new(),
             drawing_redo: Vec::new(),
+            drawing_revision: 0,
+            drawing_user_revisions: Default::default(),
+            pending_drawing_edit: None,
+            pending_drawing_origin: Default::default(),
+            edit_author: Default::default(),
+            edit_turn: None,
+            drawing_events: Vec::new(),
+        }
+    }
+
+    pub fn source_bars(&self) -> BarsRead<'_> {
+        self.read_bars(&self.source_bars)
+    }
+
+    pub fn displayed_bars(&self) -> BarsRead<'_> {
+        self.read_bars(&self.bars)
+    }
+
+    fn read_bars<'a>(&self, bars: &'a [Bar]) -> BarsRead<'a> {
+        let now = chrono::Utc::now().timestamp();
+        let last_in_progress = self.replay_cutoff.is_none()
+            && bars.last().is_some_and(|bar| bar.ts <= now && now < tr_core::session::next_bucket(self.tf, bar.ts));
+        BarsRead { bars, last_in_progress }
+    }
+
+    pub fn viewport(&self) -> Option<Viewport> {
+        self.viewport
+    }
+
+    pub fn visible_date_range(&self) -> Option<crate::chart_navigation::DateRange> {
+        self.viewport.as_ref().and_then(|v| crate::chart_navigation::date_range(&self.bars, self.tf, v))
+    }
+
+    pub fn comparison_symbols(&self) -> Vec<String> {
+        self.compare.iter().chain(&self.data.comparisons).cloned().collect()
+    }
+
+    pub fn studies(&self) -> Vec<StudyRead> {
+        self.indicators
+            .iter()
+            .map(|spec| {
+                let id = spec.chart.as_ref().map(|c| c.id);
+                let built = self.built.iter().find(|b| b.spec == *spec);
+                let outputs = built.map_or_else(Vec::new, |built| {
+                    built
+                        .values
+                        .iter()
+                        .map(|(name, values)| {
+                            let values = values
+                                .read()
+                                .expect("study values lock")
+                                .iter()
+                                .map(|value| value.is_finite().then_some(*value))
+                                .collect();
+                            StudyOutputRead { name: name.clone(), values }
+                        })
+                        .collect()
+                });
+                StudyRead { id, spec: spec.clone(), outputs, error: built.and_then(|b| b.error.clone()) }
+            })
+            .collect()
+    }
+
+    pub fn read_chart(&self) -> ChartRead<'_> {
+        ChartRead {
+            uid: self.uid,
+            symbol: &self.symbol,
+            display_name: &self.sec.ticker,
+            timeframe: self.tf,
+            source: self.source_bars(),
+            displayed: self.displayed_bars(),
+            viewport: self.viewport(),
+            visible_range: self.visible_date_range(),
+            studies: self.studies(),
+            comparisons: self.comparison_symbols(),
+            drawings: &self.drawings,
+            chart_type: self.chart_type,
+            session: self.effective_session(),
         }
     }
 
@@ -1057,7 +1183,7 @@ impl ChartState {
             if let Some(drawing) = self.drawings.get_mut(drag.index) {
                 *drawing = drag.original;
             }
-            self.drawing_undo.pop();
+            self.pending_drawing_edit = None;
         }
         if self.draw.tool.is_some() || self.draw.selected.is_some() || self.draw.note.is_some() {
             self.draw = DrawState::default();
@@ -1079,6 +1205,8 @@ impl ChartState {
     pub fn delete_selected(&mut self) -> bool {
         match self.draw.selected.take() {
             Some(i) if i < self.drawings.len() => {
+                // End the gesture before recording deletion as a separate undo step.
+                self.draw.drag = None;
                 self.remember_drawings();
                 self.drawings.remove(i);
                 true
@@ -1088,38 +1216,180 @@ impl ChartState {
     }
 
     fn adopt_legacy_drawings(&mut self) {
-        for drawing in self
-            .drawings
-            .iter_mut()
-            .chain(self.drawing_undo.iter_mut().flatten())
-            .chain(self.drawing_redo.iter_mut().flatten())
-        {
+        self.drawing_ids.repair(&mut self.drawings);
+        for drawing in self.drawings.iter_mut().chain(self.pending_drawing_edit.iter_mut().flatten()) {
             if drawing.symbol.is_none() {
                 drawing.symbol = Some(self.symbol.clone());
+            }
+        }
+        for edit in self.drawing_undo.iter_mut().chain(&mut self.drawing_redo) {
+            for operation in &mut edit.operations {
+                operation.adopt(&self.symbol);
             }
         }
     }
 
     fn remember_drawings(&mut self) {
-        if self.drawing_undo.len() >= 64 {
-            self.drawing_undo.remove(0);
+        self.finish_drawing_edit();
+        self.drawing_ids.repair(&mut self.drawings);
+        self.pending_drawing_edit = Some(self.drawings.clone());
+        self.pending_drawing_origin = (self.edit_author, self.edit_turn.clone());
+        if self.edit_author == tr_chart::drawings::Author::User {
+            self.drawing_redo.clear();
         }
-        self.drawing_undo.push(self.drawings.clone());
-        self.drawing_redo.clear();
+    }
+
+    pub(crate) fn begin_agent_edit(&mut self, turn: &str) {
+        self.finish_drawing_edit();
+        self.edit_author = tr_chart::drawings::Author::Agent;
+        self.edit_turn = Some(turn.to_owned());
+        // Read jobs must neither cancel a user's gesture nor discard redo.
+        // Mutations use edit_drawings to close an in-progress user edit first.
+        if self.draw.drag.is_none() {
+            self.remember_drawings();
+        }
+    }
+
+    pub(crate) fn edit_observation(&self) -> serde_json::Value {
+        serde_json::json!({
+            "symbol": self.symbol,
+            "timeframe": self.tf,
+            "range": self.visible_date_range(),
+            "indicators": self.indicators,
+            "comparisons": self.comparison_symbols(),
+        })
+    }
+
+    /// Close an edit boundary after a menu action or a completed pointer gesture.
+    pub(crate) fn finish_drawing_edit(&mut self) {
+        if self.draw.drag.is_some() {
+            return;
+        }
+        let Some(before) = self.pending_drawing_edit.take() else { return };
+        let (author, turn) = self.pending_drawing_origin.clone();
+        self.drawing_ids.repair(&mut self.drawings);
+        for drawing in &mut self.drawings {
+            if !before.iter().any(|old| old.id == drawing.id) {
+                drawing.created_by = author;
+                drawing.turn_id = turn.clone();
+            }
+        }
+        let edit = crate::drawing_history::Edit::between(&before, &self.drawings, author, turn);
+        if !edit.operations.is_empty() {
+            self.drawing_redo.clear();
+            if self.drawing_undo.len() >= 64 {
+                self.drawing_undo.remove(0);
+            }
+            let edit = self.record_drawing_edit(edit);
+            self.drawing_undo.push(edit);
+        }
+    }
+
+    fn record_drawing_edit(&mut self, mut edit: crate::drawing_history::Edit) -> crate::drawing_history::Edit {
+        self.drawing_revision += 1;
+        edit.revision = self.drawing_revision;
+        if edit.author == tr_chart::drawings::Author::User {
+            for id in edit.operations.iter().flat_map(|op| op.ids()) {
+                self.drawing_user_revisions.insert(id, edit.revision);
+            }
+        }
+        self.drawing_events.push(edit.clone());
+        edit
+    }
+
+    /// Apply a batch as one undo step. New drawings receive fresh identities.
+    pub fn edit_drawings(
+        &mut self,
+        author: tr_chart::drawings::Author,
+        turn: Option<String>,
+        edit: impl FnOnce(&mut Vec<Drawing>),
+    ) {
+        self.draw.drag = None;
+        self.finish_drawing_edit();
+        self.draw = DrawState::default();
+        let previous = (self.edit_author, self.edit_turn.clone());
+        self.edit_author = author;
+        self.edit_turn = turn;
+        self.remember_drawings();
+        edit(&mut self.drawings);
+        self.finish_drawing_edit();
+        (self.edit_author, self.edit_turn) = previous;
+    }
+
+    pub fn clear_drawings(&mut self) {
+        self.edit_drawings(self.edit_author, self.edit_turn.clone(), Vec::clear);
     }
 
     pub fn undo_drawings(&mut self) {
+        self.draw.drag = None;
+        self.finish_drawing_edit();
         if let Some(previous) = self.drawing_undo.pop() {
-            self.drawing_redo.push(std::mem::replace(&mut self.drawings, previous));
+            let before = self.drawings.clone();
+            for operation in previous.inverse_operations() {
+                operation.apply(&mut self.drawings);
+            }
+            self.record_drawing_edit(crate::drawing_history::Edit::between(
+                &before,
+                &self.drawings,
+                self.edit_author,
+                self.edit_turn.clone(),
+            ));
+            self.drawing_redo.push(previous);
             self.draw = DrawState::default();
         }
     }
 
     pub fn redo_drawings(&mut self) {
+        self.finish_drawing_edit();
         if let Some(next) = self.drawing_redo.pop() {
-            self.drawing_undo.push(std::mem::replace(&mut self.drawings, next));
+            let before = self.drawings.clone();
+            for operation in &next.operations {
+                operation.apply(&mut self.drawings);
+            }
+            self.record_drawing_edit(crate::drawing_history::Edit::between(
+                &before,
+                &self.drawings,
+                self.edit_author,
+                self.edit_turn.clone(),
+            ));
+            self.drawing_undo.push(next);
             self.draw = DrawState::default();
         }
+    }
+
+    pub fn undo_turn(&mut self, turn: &str) -> crate::drawing_history::UndoTurn {
+        use tr_chart::drawings::Author;
+        self.draw.drag = None;
+        self.finish_drawing_edit();
+        let mut report = crate::drawing_history::UndoTurn::default();
+        let before = self.drawings.clone();
+        for edit in self.drawing_undo.iter().rev() {
+            if edit.author == Author::Agent && edit.turn.as_deref() == Some(turn) {
+                for operation in edit.inverse_operations() {
+                    let ids = operation.ids();
+                    let user_changed = ids.iter().any(|id| {
+                        self.drawing_user_revisions.get(id).is_some_and(|revision| *revision > edit.revision)
+                    });
+                    if user_changed || !operation.apply(&mut self.drawings) {
+                        report.skipped.extend(ids);
+                    } else {
+                        report.reverted += 1;
+                    }
+                }
+            }
+        }
+        self.drawing_undo.retain(|edit| edit.author != Author::Agent || edit.turn.as_deref() != Some(turn));
+        self.drawing_redo.clear();
+        self.record_drawing_edit(crate::drawing_history::Edit::between(
+            &before,
+            &self.drawings,
+            Author::Agent,
+            Some(turn.to_owned()),
+        ));
+        self.draw = DrawState::default();
+        report.skipped.sort_unstable();
+        report.skipped.dedup();
+        report
     }
 
     pub fn reset_view(&mut self) {
@@ -4270,7 +4540,13 @@ impl ChartState {
             ui.close();
         }
         self.drawing_tools_menu(ui);
-        if ui.add_enabled(!self.drawing_undo.is_empty(), egui::Button::new("Undo drawing edit")).clicked() {
+        if ui
+            .add_enabled(
+                !self.drawing_undo.is_empty() || self.pending_drawing_edit.is_some(),
+                egui::Button::new("Undo drawing edit"),
+            )
+            .clicked()
+        {
             self.undo_drawings();
             ui.close();
         }
@@ -8924,5 +9200,568 @@ mod tests {
         assert_eq!(chart.viewport.as_ref().unwrap().right, 100. + prepended as f64);
         assert_eq!(chart.live_source.as_ref().unwrap().as_ref(), source.as_ref());
         assert!(chart.session_history_revision.is_none());
+    }
+
+    #[test]
+    fn undo_turn_keeps_interleaved_user_edits_and_reports_conflicts() {
+        use tr_chart::drawings::Author;
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        let anchor = Anchor { ts: 86400, price: 1. };
+        chart.edit_drawings(Author::Agent, Some("turn".into()), |drawings| {
+            drawings.push(Drawing::new(Tool::Horizontal, anchor, anchor));
+            drawings.push(Drawing::new(Tool::Vertical, anchor, anchor));
+        });
+        let protected = chart.drawings[0].id;
+        chart.edit_drawings(Author::User, None, |drawings| drawings[0].text = "user edit".into());
+        let user_edit = chart.drawings[0].clone();
+        chart.edit_drawings(Author::Agent, Some("turn".into()), |drawings| drawings[1].width = 3.);
+        chart.edit_drawings(Author::User, None, |drawings| drawings.push(Drawing::new(Tool::Arrow, anchor, anchor)));
+        let user_added = chart.drawings[2].clone();
+        let report = chart.undo_turn("turn");
+        assert_eq!(report.reverted, 2);
+        assert_eq!(report.skipped, vec![protected]);
+        assert_eq!(chart.drawings, vec![user_edit, user_added]);
+        assert_eq!(chart.undo_turn("turn").reverted, 0);
+    }
+
+    #[test]
+    fn undo_turn_inverts_remove_and_clear_without_erasing_user_additions() {
+        use tr_chart::drawings::Author;
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        let anchor = Anchor { ts: 86400, price: 1. };
+        chart.edit_drawings(Author::User, None, |drawings| {
+            for tool in [Tool::Horizontal, Tool::Vertical, Tool::Arrow] {
+                drawings.push(Drawing::new(tool, anchor, anchor));
+            }
+        });
+        let removed = chart.drawings[0].clone();
+        chart.edit_drawings(Author::Agent, Some("turn".into()), |drawings| {
+            drawings.remove(0);
+        });
+        chart.edit_drawings(Author::User, None, |drawings| drawings[0].text = "during turn".into());
+        let restored = chart.drawings.clone();
+        chart.edit_drawings(Author::Agent, Some("turn".into()), Vec::clear);
+        chart.edit_drawings(Author::User, None, |drawings| {
+            drawings.push(Drawing::new(Tool::ArrowMarkUp, anchor, anchor))
+        });
+        let user_added = chart.drawings[0].clone();
+        let report = chart.undo_turn("turn");
+        assert_eq!(report.reverted, 3);
+        assert!(report.skipped.is_empty());
+        // Clear left neither neighbour alive, so restoration starts at the end.
+        assert_eq!(chart.drawings, [vec![user_added, removed], restored].concat());
+    }
+
+    #[test]
+    fn undo_turn_does_not_resurrect_user_removed_or_overwrite_later_turn_targets() {
+        use tr_chart::drawings::Author;
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        let anchor = Anchor { ts: 86400, price: 1. };
+        chart.edit_drawings(Author::Agent, Some("first".into()), |drawings| {
+            drawings.push(Drawing::new(Tool::Horizontal, anchor, anchor));
+            drawings.push(Drawing::new(Tool::Vertical, anchor, anchor));
+        });
+        let ids: Vec<_> = chart.drawings.iter().map(|d| d.id).collect();
+        chart.edit_drawings(Author::User, None, |drawings| {
+            drawings.remove(0);
+        });
+        chart.edit_drawings(Author::Agent, Some("second".into()), |drawings| drawings[0].text = "later turn".into());
+        let remaining = chart.drawings.clone();
+        let report = chart.undo_turn("first");
+        assert_eq!(report.reverted, 0);
+        assert_eq!(report.skipped, ids);
+        assert_eq!(chart.drawings, remaining);
+    }
+
+    #[test]
+    fn drawing_identity_survives_updates_undo_and_duplicate_insertion() {
+        use tr_chart::drawings::Author;
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        let anchor = Anchor { ts: 86400, price: 1. };
+        chart.edit_drawings(Author::User, None, |drawings| {
+            drawings.push(Drawing::new(Tool::Horizontal, anchor, anchor))
+        });
+        let first = chart.drawings[0].id;
+        chart.edit_drawings(Author::User, None, |drawings| drawings.push(drawings[0].clone()));
+        let second = chart.drawings[1].id;
+        assert_ne!(first, second);
+        chart.undo_drawings();
+        assert_eq!(chart.drawings[0].id, first);
+        chart.redo_drawings();
+        assert_eq!(chart.drawings[1].id, second);
+        chart.edit_drawings(Author::User, None, |drawings| drawings[0].width = 4.);
+        chart.undo_drawings();
+        assert_eq!(chart.drawings[0].id, first);
+        chart.redo_drawings();
+        assert_eq!(chart.drawings[0].width, 4.);
+    }
+
+    #[test]
+    fn agent_read_accessors_serialize_bars_viewport_and_built_study_values() {
+        let w = Worker::inert();
+        let mut chart = ChartState::new(1, "BTCUSD Curncy", Timeframe::M1);
+        let ts = chrono::Utc::now().timestamp() / 60 * 60;
+        let bars = Arc::new(vec![Bar::new(ts - 60, 1., 3., 1., 2., 10.), Bar::new(ts, 2., 4., 2., 3., 20.)]);
+        chart.indicators = vec![IndicatorSpec::new("SMA", &[2.]).unwrap()];
+        study::assign_ids(&mut chart.indicators);
+        chart.on_history(0, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &w);
+        chart.built = crate::worker::build_indicators(&bars, chart.tf, &chart.indicators, &theme::palette());
+        let read = chart.read_chart();
+        assert_eq!(read.source.bars, bars.as_slice());
+        assert_eq!(read.displayed.bars, bars.as_slice());
+        assert!(read.source.last_in_progress && read.displayed.last_in_progress);
+        assert_eq!(read.visible_range, crate::chart_navigation::date_range(&bars, chart.tf, &read.viewport.unwrap()));
+        assert_eq!(read.studies[0].id, chart.indicators[0].chart.as_ref().map(|c| c.id));
+        assert_eq!(read.studies[0].outputs[0].values, vec![None, Some(2.5)]);
+        let json = serde_json::to_value(read).unwrap();
+        assert_eq!(json["symbol"], chart.symbol);
+        assert_eq!(json["studies"][0]["outputs"][0]["values"][0], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn operation_batches_restore_order_after_noncontiguous_removals() {
+        use tr_chart::drawings::Author;
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        let anchor = Anchor { ts: 86400, price: 1. };
+        chart.edit_drawings(Author::User, None, |drawings| {
+            for tool in [Tool::Horizontal, Tool::Vertical, Tool::Arrow, Tool::ArrowMarkUp] {
+                drawings.push(Drawing::new(tool, anchor, anchor));
+            }
+        });
+        let before = chart.drawings.clone();
+        chart.edit_drawings(Author::User, None, |drawings| {
+            drawings.retain(|d| matches!(d.tool, Tool::Vertical | Tool::ArrowMarkUp));
+            drawings[0].width = 5.;
+            drawings.insert(1, Drawing::new(Tool::ArrowMarkDown, anchor, anchor));
+        });
+        let after = chart.drawings.clone();
+        chart.undo_drawings();
+        assert_eq!(chart.drawings, before);
+        chart.redo_drawings();
+        assert_eq!(chart.drawings, after);
+    }
+
+    #[test]
+    fn read_jobs_preserve_redo_and_do_not_cancel_user_drag() {
+        use tr_chart::drawings::Author;
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        let anchor = Anchor { ts: 86400, price: 1. };
+        chart.edit_drawings(Author::User, None, |drawings| {
+            drawings.push(Drawing::new(Tool::Horizontal, anchor, anchor))
+        });
+        chart.undo_drawings();
+        chart.begin_agent_edit("read");
+        chart.finish_drawing_edit();
+        chart.edit_author = Author::User;
+        chart.edit_turn = None;
+        chart.redo_drawings();
+        assert_eq!(chart.drawings.len(), 1);
+        let original = chart.drawings[0].clone();
+        chart.remember_drawings();
+        chart.draw.drag =
+            Some(DrawingDrag { index: 0, handle: DrawHandle::Body, start: anchor, original: original.clone() });
+        chart.drawings[0].width = 3.;
+        chart.begin_agent_edit("read");
+        chart.finish_drawing_edit();
+        chart.edit_author = Author::User;
+        chart.edit_turn = None;
+        assert!(chart.draw.drag.is_some());
+        assert_eq!(chart.drawings[0].width, 3.);
+        chart.undo_drawings();
+        assert_eq!(chart.drawings, vec![original]);
+        chart.redo_drawings();
+        assert_eq!(chart.drawings[0].width, 3.);
+    }
+
+    #[test]
+    fn undo_turn_respects_user_undo_redo_even_when_content_matches() {
+        use tr_chart::drawings::Author;
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        let anchor = Anchor { ts: 86400, price: 1. };
+        chart.edit_drawings(Author::Agent, Some("turn".into()), |drawings| {
+            drawings.push(Drawing::new(Tool::Horizontal, anchor, anchor))
+        });
+        let drawing = chart.drawings[0].clone();
+        chart.undo_drawings();
+        chart.redo_drawings();
+        let result = chart.undo_turn("turn");
+        assert_eq!(result.skipped, vec![drawing.id]);
+        assert_eq!(chart.drawings, vec![drawing]);
+    }
+
+    // A snapshot oracle, deliberately independent of Edit/Operation. Exercise the
+    // same remember/finish boundaries as the pointer and property-menu paths.
+    fn a1a_drawing(tool: Tool, n: usize) -> Drawing {
+        let a = Anchor { ts: n as i64 * 86400, price: 100. + n as f64 };
+        let b = Anchor { ts: a.ts + 86400, price: a.price + 10. };
+        let mut d = Drawing::new(tool, a, b);
+        d.symbol = Some("AAA".into());
+        if tool.points() == 3 {
+            d.c = Some(Anchor { ts: b.ts + 86400, price: b.price - 5. });
+        }
+        if drawings::patterns::point_count(tool) > 0 {
+            d.pattern_points =
+                (0..tool.points()).map(|i| Anchor { ts: a.ts + i as i64 * 86400, price: a.price + i as f64 }).collect();
+        }
+        if matches!(tool, Tool::Brush | Tool::Path) {
+            d.vertices = vec![a, b];
+        }
+        if drawings::text::editable(tool) {
+            d.text = "original note".into();
+        }
+        d
+    }
+
+    #[test]
+    fn a1a_every_tool_pointer_creation_and_magnet_anchor_drag_are_undoable() {
+        for tool in Tool::ALL {
+            let ctx = egui::Context::default();
+            let mut chart = drawing_chart();
+            chart.magnet = true;
+            chart.start_tool(tool);
+            let from = pos2(320., 300.);
+            if tool == Tool::Brush {
+                drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(from)], false);
+                drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], false);
+                drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(pos2(400., 200.))], false);
+                drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(pos2(480., 100.))], false);
+                drawing_frame(&ctx, &mut chart, vec![pointer_button(pos2(480., 100.), false)], false);
+            } else {
+                let count = if tool == Tool::Path { 3 } else { tool.points() };
+                for i in 0..count {
+                    click_drawing(&ctx, &mut chart, pos2(320. + i as f32 * 60., 300. - i as f32 * 25.), false);
+                    chart.finish_drawing_edit();
+                }
+                if tool == Tool::Path {
+                    drawing_frame(
+                        &ctx,
+                        &mut chart,
+                        vec![egui::Event::Key {
+                            key: egui::Key::Enter,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        false,
+                    );
+                }
+                if tool == Tool::Text {
+                    chart.draw.note.as_mut().unwrap().text = "pointer-created note".into();
+                    drawing_frame(&ctx, &mut chart, vec![], false);
+                    let labels = drawing_frame(&ctx, &mut chart, vec![], false);
+                    let save = labels.iter().find(|(label, _)| label == "Save note").unwrap().1.center();
+                    click_drawing(&ctx, &mut chart, save, false);
+                }
+            }
+            chart.finish_drawing_edit();
+            assert_eq!(chart.drawings.len(), 1, "create {tool:?}");
+            let original = chart.drawings.clone();
+            assert_eq!(original[0].created_by, tr_chart::drawings::Author::User);
+            assert_eq!(original[0].a.price, 140., "magnet {tool:?}");
+            chart.undo_drawings();
+            assert!(chart.drawings.is_empty(), "undo create {tool:?}");
+            chart.redo_drawings();
+            assert_eq!(chart.drawings, original, "redo create {tool:?}");
+            chart.draw.note = None; // Callout's optional nonmodal note editor.
+            // Drag the first handle under the magnet; this goes through hit testing,
+            // not a direct assignment to the Drawing model.
+            let handle = drawings::handles(&chart.drawings[0])[0];
+            let from = pos2((chart.index_of_ts(handle.ts) * 8.) as f32, (200. - handle.price) as f32 * 4.);
+            let to = from + vec2(24., -60.);
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(from)], false);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], false);
+            drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], false);
+            drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], false);
+            chart.finish_drawing_edit();
+            let moved = chart.drawings.clone();
+            assert_ne!(moved, original, "drag {tool:?}");
+            chart.undo_drawings();
+            assert_eq!(chart.drawings, original, "undo drag {tool:?}");
+            chart.redo_drawings();
+            assert_eq!(chart.drawings, moved, "redo drag {tool:?}");
+        }
+    }
+
+    #[test]
+    fn a1a_every_tool_geometry_properties_delete_and_clear_match_snapshots() {
+        for tool in Tool::ALL {
+            let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+            let original = a1a_drawing(tool, 1);
+            let mut states = vec![Vec::new()];
+            chart.remember_drawings();
+            chart.drawings.push(original);
+            chart.finish_drawing_edit();
+            states.push(chart.drawings.clone());
+            // Body, endpoint, third/pattern/vertex anchors, then menu properties.
+            for property in 0..9 {
+                chart.remember_drawings();
+                let d = &mut chart.drawings[0];
+                match property {
+                    0 => {
+                        d.a.ts += 86400;
+                        d.b.ts += 86400;
+                        for p in d.c.iter_mut().chain(&mut d.pattern_points).chain(&mut d.vertices) {
+                            p.ts += 86400;
+                            p.price += 2.;
+                        }
+                    }
+                    1 => d.a.price = 145., // also represents a magnet-snapped endpoint
+                    2 => d.b.price = 155.,
+                    3 => d.color = Some([1, 99, 201]),
+                    4 => d.width = 4.5,
+                    5 => d.text = "edited note / levels label".into(),
+                    6 => {
+                        d.extend_left = true;
+                        d.extend_right = true;
+                    }
+                    7 => d.profile_rows = 60,
+                    _ => d.all_symbols = true,
+                }
+                chart.finish_drawing_edit();
+                states.push(chart.drawings.clone());
+            }
+            // Duplicate insertion must allocate once; redo must reuse that id.
+            chart.remember_drawings();
+            chart.drawings.push(chart.drawings[0].clone());
+            chart.finish_drawing_edit();
+            assert_ne!(chart.drawings[0].id, chart.drawings[1].id);
+            states.push(chart.drawings.clone());
+            chart.draw.selected = Some(0);
+            assert!(chart.delete_selected());
+            chart.finish_drawing_edit();
+            states.push(chart.drawings.clone());
+            chart.clear_drawings();
+            states.push(chart.drawings.clone());
+            for expected in states[..states.len() - 1].iter().rev() {
+                chart.undo_drawings();
+                assert_eq!(&chart.drawings, expected, "undo {tool:?}");
+            }
+            for expected in &states[1..] {
+                chart.redo_drawings();
+                assert_eq!(&chart.drawings, expected, "redo {tool:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a1a_long_random_history_matches_snapshot_model_and_invalidates_redo() {
+        use tr_chart::drawings::Author;
+        for seed in 1..=16u64 {
+            let mut rng = seed;
+            let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+            let mut model = Vec::<Drawing>::new();
+            let mut undo = Vec::<Vec<Drawing>>::new();
+            let mut redo = Vec::<Vec<Drawing>>::new();
+            for step in 0..1000 {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let choice = (rng >> 32) as usize;
+                match choice % 10 {
+                    0 | 1 => {
+                        if let Some(previous) = undo.pop() {
+                            redo.push(model.clone());
+                            model = previous;
+                        }
+                        chart.undo_drawings();
+                    }
+                    2 => {
+                        if let Some(next) = redo.pop() {
+                            undo.push(model.clone());
+                            model = next;
+                        }
+                        chart.redo_drawings();
+                    }
+                    _ => {
+                        let mut next = model.clone();
+                        if next.is_empty() || choice % 10 == 3 {
+                            let index = choice % (next.len() + 1);
+                            next.insert(index, a1a_drawing(Tool::ALL[choice % Tool::ALL.len()], step));
+                        } else {
+                            let index = choice % next.len();
+                            match choice % 10 {
+                                4 => {
+                                    next.remove(index);
+                                }
+                                5 => next.clear(),
+                                6 => {
+                                    // Noncontiguous bulk delete plus an insertion.
+                                    next = next
+                                        .into_iter()
+                                        .enumerate()
+                                        .filter(|(i, _)| i % 2 == 0)
+                                        .map(|(_, d)| d)
+                                        .collect();
+                                    next.insert(0, a1a_drawing(Tool::Horizontal, step));
+                                }
+                                7 => {
+                                    for d in &mut next {
+                                        d.width += 0.5;
+                                        d.a.price += 1.;
+                                    }
+                                }
+                                8 => next[index].text.push('x'),
+                                _ => next[index].all_symbols = !next[index].all_symbols,
+                            }
+                        }
+                        assert_ne!(model, next);
+                        if undo.len() == 64 {
+                            undo.remove(0);
+                        }
+                        undo.push(model.clone());
+                        redo.clear();
+                        model = next;
+                        chart.edit_drawings(Author::User, None, |d| *d = model.clone());
+                        assert!(chart.drawing_redo.is_empty());
+                    }
+                }
+                assert_eq!(chart.drawings, model, "seed {seed}, step {step}");
+            }
+            while let Some(previous) = undo.pop() {
+                redo.push(model);
+                model = previous;
+                chart.undo_drawings();
+                assert_eq!(chart.drawings, model, "final unwind, seed {seed}");
+            }
+            while let Some(next) = redo.pop() {
+                model = next;
+                chart.redo_drawings();
+                assert_eq!(chart.drawings, model, "final replay, seed {seed}");
+            }
+        }
+    }
+
+    #[test]
+    fn a1a_all_symbols_history_survives_symbol_switches() {
+        use tr_chart::drawings::Author;
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        chart.edit_drawings(Author::User, None, |d| {
+            d.push(a1a_drawing(Tool::Horizontal, 1));
+            let mut shared = a1a_drawing(Tool::Fib, 2);
+            shared.all_symbols = true;
+            d.push(shared);
+        });
+        let before = chart.drawings.clone();
+        chart.set_symbol("MSFT", &Worker::inert());
+        assert!(!chart.drawings[0].visible_on(&chart.symbol));
+        assert!(chart.drawings[1].visible_on(&chart.symbol));
+        chart.edit_drawings(Author::User, None, |d| d[1].width = 7.);
+        let after = chart.drawings.clone();
+        chart.set_symbol("NVDA", &Worker::inert());
+        chart.undo_drawings();
+        assert_eq!(chart.drawings, before);
+        chart.redo_drawings();
+        assert_eq!(chart.drawings, after);
+    }
+
+    #[test]
+    fn a1a_undo_turn_reused_id_twice_and_user_deleted_update() {
+        use tr_chart::drawings::Author;
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        chart.edit_drawings(Author::User, None, |d| d.push(a1a_drawing(Tool::Rectangle, 0)));
+        chart.edit_drawings(Author::Agent, Some("t".into()), |d| d[0].width = 5.);
+        let removed_id = chart.drawings[0].id;
+        chart.edit_drawings(Author::User, None, |d| {
+            d.remove(0);
+        });
+        chart.edit_drawings(Author::Agent, Some("t".into()), |d| d.push(a1a_drawing(Tool::Arrow, 1)));
+        let result = chart.undo_turn("t");
+        assert_eq!(result.skipped, vec![removed_id]);
+        assert_eq!(result.reverted, 1);
+        assert!(chart.drawings.is_empty());
+        assert_eq!(chart.undo_turn("t").reverted, 0);
+        chart.edit_drawings(Author::Agent, Some("t".into()), |d| d.push(a1a_drawing(Tool::Fib, 2)));
+        assert_eq!(chart.undo_turn("t").reverted, 1);
+        assert!(chart.drawings.is_empty());
+    }
+
+    #[test]
+    fn a1a_bug_delete_during_drag_loses_drag_undo() {
+        use tr_chart::drawings::Author;
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        chart.edit_drawings(Author::User, None, |d| d.push(a1a_drawing(Tool::Rectangle, 0)));
+        let original = chart.drawings.clone();
+        chart.remember_drawings();
+        chart.draw.drag =
+            Some(DrawingDrag { index: 0, handle: DrawHandle::A, start: original[0].a, original: original[0].clone() });
+        chart.drawings[0].a.price += 5.;
+        let moved = chart.drawings.clone();
+        chart.draw.selected = Some(0);
+        assert!(chart.delete_selected()); // Delete hotkey while the pointer is still down.
+        chart.draw.drag = None;
+        chart.finish_drawing_edit();
+        chart.undo_drawings();
+        assert_eq!(chart.drawings, moved, "undo deletion");
+        chart.undo_drawings();
+        assert_eq!(chart.drawings, original, "undo the preceding drag, not creation");
+    }
+
+    #[test]
+    fn a1a_bug_undo_turn_restores_wrong_z_order() {
+        use tr_chart::drawings::Author;
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        chart.edit_drawings(Author::User, None, |d| {
+            for n in 0..3 {
+                d.push(a1a_drawing(Tool::Rectangle, n));
+            }
+        });
+        let expected = chart.drawings[1..].to_vec();
+        chart.edit_drawings(Author::Agent, Some("t".into()), |d| {
+            d.remove(1);
+        });
+        chart.edit_drawings(Author::User, None, |d| {
+            d.remove(0);
+        });
+        let report = chart.undo_turn("t");
+        assert_eq!(report.reverted, 1);
+        assert!(report.skipped.is_empty());
+        assert_eq!(chart.drawings, expected, "restored B must remain below surviving C");
+    }
+
+    #[test]
+    fn ordinary_remove_and_clear_undo_use_neighbours_not_shifted_indices() {
+        use tr_chart::drawings::Author;
+        for (surviving, restored_index) in [(vec![2, 3], 0), (vec![0, 3], 1), (Vec::new(), 1)] {
+            let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+            chart.edit_drawings(Author::User, None, |d| {
+                for n in 0..4 {
+                    d.push(a1a_drawing(Tool::Rectangle, n));
+                }
+            });
+            let original = chart.drawings.clone();
+            chart.edit_drawings(Author::User, None, |d| {
+                d.remove(1);
+            });
+            // Later programmatic changes shift indices without another undo step.
+            chart.drawings = surviving.iter().map(|&i| original[i].clone()).collect();
+            let added = a1a_drawing(Tool::Arrow, 5);
+            chart.drawings.push(added.clone());
+            chart.undo_drawings();
+            let mut expected: Vec<_> = surviving.iter().map(|&i| original[i].clone()).collect();
+            expected.push(added);
+            expected.insert(restored_index, original[1].clone());
+            assert_eq!(chart.drawings, expected);
+        }
+
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        chart.edit_drawings(Author::User, None, |d| {
+            d.extend((0..3).map(|n| a1a_drawing(Tool::Rectangle, n)));
+        });
+        let original = chart.drawings.clone();
+        chart.clear_drawings();
+        let added = a1a_drawing(Tool::Arrow, 5);
+        chart.drawings.push(added.clone());
+        chart.undo_drawings();
+        assert_eq!(chart.drawings, [vec![added], original].concat());
+    }
+
+    #[test]
+    fn agent_study_values_include_hidden_outputs_at_full_precision() {
+        let mut chart = ChartState::new(1, "AAA", Timeframe::D1);
+        let bars = vec![Bar::new(86400, 1., 3., 1., 1.123456789012, 10.)];
+        chart.indicators = vec![IndicatorSpec::new("SMA", &[1.]).unwrap()];
+        study::assign_ids(&mut chart.indicators);
+        chart.built = crate::worker::build_indicators(&bars, chart.tf, &chart.indicators, &theme::palette());
+        chart.built[0].overlays.clear();
+        assert_eq!(chart.studies()[0].outputs[0].values[0], Some(bars[0].close));
     }
 }
