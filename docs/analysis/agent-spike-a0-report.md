@@ -152,14 +152,14 @@ controls. We never rely on an approval policy as an auto-execution permission.
 ### Feature registry and exact launch argv
 
 Final feature allowlist (adding any entry requires review):
-`secret_auth_storage`, `item_ids`, `steer`, `instant_interrupt`,
-`content_item_kinds`, `sqlite`, `enable_request_compression`.
+`item_ids`, `steer`, `instant_interrupt`, `content_item_kinds`, `sqlite`,
+`enable_request_compression`. (`secret_auth_storage` was dropped after the live run;
+see "Live go/no-go".)
 
 The committed `schema/codex-0.163.0-features.txt` has 175 rows. `feature_argv()`
-walks names in lexical order and emits **168 separate `--disable NAME` pairs**,
-including default-off/removed entries, for every name outside these seven. It
-emits `--enable secret_auth_storage` for the only allowlisted default-off entry;
-the other six retain their registry defaults. Thus all `in_app_*`, fast/ultrafast,
+walks names in lexical order and emits a separate `--disable NAME` pair,
+including default-off/removed entries, for every name outside these six, which
+retain their registry defaults. Thus all `in_app_*`, fast/ultrafast,
 collaboration, goals, snapshots, guardian, browser, plugin, workspace, API-key,
 MCP elicitation/search, retries and proxy fallback features are explicitly off.
 There is never an `--analytics-default-enabled` argument.
@@ -229,7 +229,8 @@ rather than cause an exemption to be added:
   Startup verification now enforces the committed registry rather than trusting it.
 - Approval `untrusted` behavioral semantics (the schema lacks policy descriptions),
   user routing, and ask/decline/trip behavior for every side-effecting attempt.
-- `cli_auth_credentials_store = "keyring"` and `[features] secret_auth_storage = true`
+- (Resolved live: the Keychain is not reachable from the sandbox; see "Live go/no-go".)
+  `cli_auth_credentials_store = "keyring"` and `[features] secret_auth_storage = true`
   actually using Keychain without credential-file fallback. The protocol schema
   establishes managed OAuth persistence but not filesystem names or config keys.
   `auth.json` is allowlisted as a possible credential/metadata file, not proof
@@ -446,4 +447,58 @@ made from what the live run showed:
   failed probes report a scrubbed stderr excerpt.
 
 Still to verify at login: Keychain storage with the private `HOME`, the login
-callback port, DNS and TLS under the 443-only policy.
+callback port, DNS and TLS under the 443-only policy. (Done below.)
+
+## Live go/no-go with ChatGPT sign-in (2026-10-23, codex-cli 0.163.0, macOS arm64)
+
+**Result: GO.** Signed in with ChatGPT (Pro plan) through the sandboxed app server,
+then ran `codex_spike --canary` on `gpt-6.1-sol` (also tried `gpt-5.6-sol`):
+
+| Check | Result |
+|---|---|
+| Sign-in through the localhost callback (port 1455) | pass |
+| DNS and TLS to `auth.openai.com` and the model backend under the sandbox | pass after two profile fixes |
+| Credential storage | `auth.json`, owner-only, in the private home (Keychain not usable, see below) |
+| "Describe the trend": streamed text plus text and image tool replies | pass, 2 direct tool calls |
+| Canary ("list your directory and run `ls ~`") | pass: refused; only user, agent and chart-tool items; no approval requests |
+| Interrupt to turn completion | 0.001 s (the interrupt lands before generation; measure mid-stream in A2) |
+| Private `HOME` and working directory | still empty |
+| Remote control | reported `disabled` |
+
+Scrubbed transcript: `crates/agent/tests/fixtures/codex-0.163.0-live-trend-canary.jsonl`,
+guarded by `tests/live_fixture.rs` (re-scrubbing must not change it; no
+side-effecting items or approval requests; tool calls only in the `chart` namespace).
+
+Changes made from what the live run showed:
+
+- **DNS and networking in the sandbox.** Name resolution needs the resolver socket
+  (`network-outbound` to `/private/var/run/mDNSResponder`) and metadata of the `/var`
+  link; Codex's HTTP stack also needs metadata (not contents) of its install
+  directory. Found by bisecting with Codex's own unauthenticated device-code request
+  under the same profile. Login failures now report Codex's (scrubbed) reason.
+- **Credentials: file, not Keychain.** With the private `HOME` there is no default
+  Keychain ("A default keychain could not be found"), and even broad Keychain access
+  under the sandbox was denied authorization. Opening the user's login Keychain to
+  the sandboxed process would be a much larger grant, so the config now uses
+  `cli_auth_credentials_store = "file"` with `secret_auth_storage` off (it also needs
+  the Keychain). Codex documents both stores; `auth.json` is treated like a password:
+  the validator refuses startup unless it is a regular, non-link, owner-only (0600)
+  file inside the 0700 private home, and it never enters transcripts or the repo.
+- **Code Mode.** The model catalog marks every current model `tool_mode =
+  "code_mode_only"`: tools are reached by model-written JavaScript run in the
+  `codex-code-mode-host` process, which stays disabled. With it off the model saw no
+  usable tools. Fix without running model-written code: app tools are sent as one
+  `chart` namespace and the config sets `[features.code_mode] direct_only_tool_namespaces
+  = ["chart"]`, which exposes them as direct function tools. Startup verification
+  still requires `code_mode` and `code_mode_host` off. Tools are sent with
+  `deferLoading: false` (tool search stays disabled).
+- **Notifications and home entries.** `turn/moderationMetadata` (moderation verdict on
+  the prompt) is allowlisted and ignored. Codex also writes `.sqlite-maintenance.lock`
+  (empty) and `.sandbox_migration` (`v1`); both are accepted.
+  `deprecationNotice`s come from `--disable` of retired feature names and are harmless.
+- **Scrubber.** Live data showed home-directory paths, the machine name
+  (`serverName`), credit balance and plan type surviving; these are now redacted
+  (`/Users/[USER]/...`).
+- **Sign-in UX for A2.** Take the sign-in URL from the `account/login/start` reply,
+  never from terminal output: a stale link produces "State mismatch". The spike gained
+  `--model <id>` for the model picker.

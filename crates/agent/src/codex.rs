@@ -49,6 +49,9 @@ pub enum AccountState {
     Unsupported,
 }
 
+/// Namespace for every app tool; must match `direct_only_tool_namespaces` in the config.
+pub const TOOL_NAMESPACE: &str = "chart";
+
 #[derive(Clone, Debug)]
 pub struct DynamicTool {
     pub name: String,
@@ -307,7 +310,9 @@ impl CodexAppServer {
                         && (params["loginId"].is_null() || params["loginId"] == login.id) =>
                 {
                     if params["success"] != true {
-                        bail!("ChatGPT login failed; callback port may be in use");
+                        let reason = params["error"].as_str().map(crate::transcript::scrub_text);
+                        let reason: String = reason.as_deref().unwrap_or("no reason given").chars().take(300).collect();
+                        bail!("ChatGPT login failed: {reason}");
                     }
                     if self.read_account().await? != AccountState::ChatGpt {
                         bail!("ChatGPT account required");
@@ -420,15 +425,22 @@ impl AgentBackend for CodexAppServer {
 
     async fn start_thread(&self, opts: ThreadOptions) -> Result<String> {
         self.require_account()?;
-        let tools: Vec<_> = opts
+        // Current models are code_mode_only; the app's tools go in one namespace that the
+        // config routes directly (`[code_mode] direct_only_tool_namespaces`), so no
+        // model-written code runs. Never deferred: tool search stays disabled.
+        let functions: Vec<_> = opts
             .dynamic_tools
             .into_iter()
             .map(|tool| {
                 json!({
-                    "type":"function", "name":tool.name, "description":tool.description, "inputSchema":tool.input_schema
+                    "type":"function", "name":tool.name, "description":tool.description,
+                    "inputSchema":tool.input_schema, "deferLoading":false
                 })
             })
             .collect();
+        let tools = vec![json!({
+            "type":"namespace", "name":TOOL_NAMESPACE, "description":"Terminal chart tools", "tools":functions
+        })];
         let result = self
             .transport()?
             .request(

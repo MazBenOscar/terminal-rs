@@ -98,6 +98,10 @@ fn scrub_nested(value: &mut Value, identifying: bool) {
                     || key.contains("password")
                     || key.contains("secret")
                     || key == "limitname"
+                    || key == "servername"
+                    || key == "hostname"
+                    || key == "balance"
+                    || key == "plantype"
                     || key.contains("email")
                     || key.contains("authurl")
                     || key.contains("apikey")
@@ -152,7 +156,11 @@ pub fn scrub_text(text: &str) -> String {
         .map(|pattern| Regex::new(pattern).unwrap())
         .collect()
     });
-    patterns.iter().fold(text.to_owned(), |text, pattern| pattern.replace_all(&text, "[REDACTED]").into_owned())
+    static HOME: OnceLock<Regex> = OnceLock::new();
+    // Home-directory paths name the local user; keep the rest of the path for debugging.
+    let home = HOME.get_or_init(|| Regex::new(r#"/(Users|home)/[^/\s"']+"#).unwrap());
+    let text = home.replace_all(text, "/$1/[USER]");
+    patterns.iter().fold(text.into_owned(), |text, pattern| pattern.replace_all(&text, "[REDACTED]").into_owned())
 }
 
 #[derive(Default)]
@@ -221,7 +229,8 @@ mod tests {
             "orgId":"opaque-org", "accessToken":"abc", "limitId":"quota-name",
             "authUrl":"https://login.example/?state=secret", "text":"trader@example.com user-123 org-456 sk-abcdef eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturelong",
             "rateLimitsByLimitId":{"private-quota":{"limitId":"private-quota","usedPercent":5}},
-            "account":{"id":"nested-account"}, "tokenUsage":{"totalTokens":123}
+            "account":{"id":"nested-account"}, "tokenUsage":{"totalTokens":123},
+            "serverName":"traders-macbook.local", "credits":{"balance":"62500.0"}, "planType":"pro", "cwd":"/Users/trader/Library/agent/empty", "path":"/home/trader/x"
         });
         scrub_value(&mut value);
         let text = value.to_string();
@@ -235,11 +244,17 @@ mod tests {
             "sk-abcdef",
             "eyJ",
             "private-quota",
+            "traders-macbook",
+            "/Users/trader",
+            "/home/trader",
+            "62500",
+            "\"pro\"",
         ] {
             assert!(!text.contains(secret), "{secret}");
         }
         assert!(text.contains("usedPercent"));
         assert!(!text.contains("nested-account"));
+        assert_eq!(value["cwd"], "/Users/[USER]/Library/agent/empty");
         assert_eq!(value["tokenUsage"]["totalTokens"], 123);
         let mut output = Vec::new();
         scrub_jsonl(std::io::Cursor::new(format!("{value}\n")), &mut output).unwrap();

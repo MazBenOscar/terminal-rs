@@ -12,15 +12,8 @@ use crate::transcript::Transcript;
 use crate::transport::{ToolHandler, Transport};
 
 pub const FEATURE_REGISTRY: &str = include_str!("../schema/codex-0.163.0-features.txt");
-pub const ALLOWED_FEATURES: &[&str] = &[
-    "secret_auth_storage",
-    "item_ids",
-    "steer",
-    "instant_interrupt",
-    "content_item_kinds",
-    "sqlite",
-    "enable_request_compression",
-];
+pub const ALLOWED_FEATURES: &[&str] =
+    &["item_ids", "steer", "instant_interrupt", "content_item_kinds", "sqlite", "enable_request_compression"];
 
 /// The stage column can contain spaces. Reject unknown stages, duplicates and
 /// missing rows rather than accepting a partial listing as startup verification.
@@ -104,7 +97,7 @@ pub fn feature_argv() -> Vec<OsString> {
 }
 
 // Config and CLI feature names are not described by the app-server schema. Live verification required.
-pub const CONFIG: &str = "sandbox_mode = \"read-only\"\nweb_search = \"disabled\"\nforced_login_method = \"chatgpt\"\ncli_auth_credentials_store = \"keyring\"\n\n[features]\nsecret_auth_storage = true\n\n[[skills.config]]\nname = \"imagegen\"\nenabled = false\n\n[[skills.config]]\nname = \"openai-docs\"\nenabled = false\n\n[[skills.config]]\nname = \"review-agent\"\nenabled = false\n\n[[skills.config]]\nname = \"skill-creator\"\nenabled = false\n\n[[skills.config]]\nname = \"skill-installer\"\nenabled = false\n";
+pub const CONFIG: &str = "sandbox_mode = \"read-only\"\nweb_search = \"disabled\"\nforced_login_method = \"chatgpt\"\ncli_auth_credentials_store = \"file\"\n\n[[skills.config]]\nname = \"imagegen\"\nenabled = false\n\n[[skills.config]]\nname = \"openai-docs\"\nenabled = false\n\n[[skills.config]]\nname = \"review-agent\"\nenabled = false\n\n[[skills.config]]\nname = \"skill-creator\"\nenabled = false\n\n[[skills.config]]\nname = \"skill-installer\"\nenabled = false\n\n[features.code_mode]\ndirect_only_tool_namespaces = [\"chart\"]\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(pub u32, pub u32, pub u32);
@@ -293,6 +286,8 @@ fn validate_home_entries(path: &Path, root: bool) -> Result<()> {
                         | "logs_2.sqlite-shm"
                         | "logs_2.sqlite-wal"
                         | ".codex-global-state.json"
+                        | ".sqlite-maintenance.lock"
+                        | ".sandbox_migration"
                 )
             }
         } else if directory {
@@ -306,6 +301,14 @@ fn validate_home_entries(path: &Path, root: bool) -> Result<()> {
             bail!(
                 "private home contains an unknown or instruction/extension entry; refusing startup (entry names omitted)"
             );
+        }
+        // The ChatGPT token lives here (file store; the sandbox cannot reach the Keychain),
+        // so it must stay owner-only like a password.
+        if root && name == "auth.json" {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                bail!("credential file must be owner-only (0600); refusing startup");
+            }
         }
         if directory {
             validate_home_entries(&entry.path(), false)?;
@@ -441,6 +444,7 @@ pub fn sandbox_profile_for(private_home: &Path, binary: &Path, user_home: &Path,
         .collect::<Result<Vec<_>>>()?
         .join(" ");
     let executable = quote(binary)?;
+    let install = quote(install_path)?;
     let ssh = quote(&user_home.join(".ssh"))?;
     let codex = quote(&user_home.join(".codex"))?;
     let documents = quote(&user_home.join("Documents"))?;
@@ -466,6 +470,9 @@ pub fn sandbox_profile_for(private_home: &Path, binary: &Path, user_home: &Path,
 (allow mach-lookup (global-name "com.apple.trustd"))
 (allow mach-lookup (global-name "com.apple.trustd.agent"))
 (allow network-outbound (remote tcp "*:443"))
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
+(allow file-read-metadata (literal "/var"))
+(allow file-read-metadata (literal {install}))
 {callback}(deny file-read* file-write* (subpath {ssh}) (subpath {codex}) (subpath {documents}))
 "#
     ))
@@ -946,11 +953,22 @@ mod tests {
         std::fs::create_dir_all(&parent).unwrap();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
         let home = PrivateHome::create(&parent).unwrap();
-        for file in
-            ["auth.json", "version.json", "models_cache.json", "state_5.sqlite", "state_5.sqlite-wal", "logs_2.sqlite"]
-        {
+        for file in [
+            "auth.json",
+            "version.json",
+            "models_cache.json",
+            "state_5.sqlite",
+            "state_5.sqlite-wal",
+            "logs_2.sqlite",
+            ".sqlite-maintenance.lock",
+            ".sandbox_migration",
+        ] {
             std::fs::write(home.path.join(file), "{}").unwrap();
         }
+        let auth = home.path.join("auth.json");
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(home.recheck().is_err(), "readable credential file");
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::create_dir(home.path.join("sessions")).unwrap();
         std::fs::write(home.path.join("sessions/rollout-test.jsonl"), "{}").unwrap();
         home.recheck().unwrap();
@@ -1012,8 +1030,13 @@ mod tests {
         assert!(CONFIG.contains("sandbox_mode = \"read-only\""));
         assert!(CONFIG.contains("web_search = \"disabled\""));
         assert!(CONFIG.contains("forced_login_method = \"chatgpt\""));
-        assert!(CONFIG.contains("secret_auth_storage = true"));
-        assert!(CONFIG.contains("cli_auth_credentials_store = \"keyring\""));
+        assert!(!CONFIG.contains("secret_auth_storage"));
+        assert!(CONFIG.contains("cli_auth_credentials_store = \"file\""));
+        // App tools bypass Code Mode only through this namespace; it must match the client.
+        assert!(CONFIG.contains(&format!(
+            "[features.code_mode]\ndirect_only_tool_namespaces = [\"{}\"]",
+            crate::codex::TOOL_NAMESPACE
+        )));
         assert!(!CONFIG.contains("mcp_servers"));
         assert!(!CONFIG.contains("notify"));
         let args = app_server_argv("profile", Path::new("/opt/codex"));
@@ -1053,6 +1076,10 @@ mod tests {
         }
         assert!(profile.contains("(allow process-exec (literal \"/opt/codex/bin/codex\"))"));
         assert!(profile.contains("*:443"));
+        // DNS goes through the resolver socket; only that one local socket is reachable.
+        assert!(profile.contains("(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))"));
+        // Networking needs metadata (only) of the install directory; its contents stay unreadable.
+        assert!(profile.contains("(allow file-read-metadata (literal \"/opt/codex/bin\"))"));
         assert!(!profile.contains("network-inbound"));
         assert!(!profile.contains("network-bind"));
         let login = sandbox_profile_for(

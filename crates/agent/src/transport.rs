@@ -43,6 +43,8 @@ pub const ALLOWED_NOTIFICATIONS: &[&str] = &[
     "turn/started",
     "turn/completed",
     "turn/plan/updated",
+    // Moderation verdict on the prompt; informational, never surfaced or acted on.
+    "turn/moderationMetadata",
     "item/started",
     "item/completed",
     "item/agentMessage/delta",

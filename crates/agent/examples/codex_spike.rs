@@ -18,11 +18,13 @@ struct Args {
     transcript: Option<PathBuf>,
     canary: bool,
     callback_port: u16,
+    model: Option<String>,
 }
 
 fn args() -> Result<Args> {
     let mut args = std::env::args().skip(1);
-    let mut result = Args { home: PathBuf::new(), login: false, transcript: None, canary: false, callback_port: 1455 };
+    let mut result =
+        Args { home: PathBuf::new(), login: false, transcript: None, canary: false, callback_port: 1455, model: None };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--home" => result.home = args.next().context("--home requires a directory")?.into(),
@@ -32,7 +34,8 @@ fn args() -> Result<Args> {
             }
             "--transcript" => result.transcript = Some(args.next().context("--transcript requires a new file")?.into()),
             "--canary" => result.canary = true,
-            _ => bail!("usage: codex_spike --home <dir> [--login] [--transcript <file>] [--canary]"),
+            "--model" => result.model = Some(args.next().context("--model requires a model id")?),
+            _ => bail!("usage: codex_spike --home <dir> [--login] [--transcript <file>] [--canary] [--model <id>]"),
         }
     }
     if result.home.as_os_str().is_empty() {
@@ -248,7 +251,10 @@ async fn run() -> Result<()> {
                 .join(", ")
         );
     }
-    let model = models.first().context("no models available")?;
+    let model = match &args.model {
+        Some(id) => models.iter().find(|model| &model.model == id).context("unknown --model")?,
+        None => models.first().context("no models available")?,
+    };
     let mut limits: Value = client.rate_limits().await?;
     scrub_value(&mut limits);
     eprintln!("rate limits: {limits}");

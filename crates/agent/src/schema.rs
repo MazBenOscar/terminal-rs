@@ -112,7 +112,7 @@ fn committed_schema_covers_every_wire_method_field_and_enum() {
     ]) {
         fields(variant(&schema, "ThreadItem", "type", kind), "type");
     }
-    fields(variant(&schema, "DynamicToolSpec", "type", "function"), "type name description inputSchema");
+    fields(variant(&schema, "DynamicToolSpec", "type", "function"), "type name description inputSchema deferLoading");
     fields(variant(&schema, "Account", "type", "chatgpt"), "type");
     fields(variant(&schema, "Account", "type", "apiKey"), "type");
     fields(variant(&schema, "LoginAccountParams", "type", "chatgpt"), "type");
