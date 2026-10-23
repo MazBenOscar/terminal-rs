@@ -38,7 +38,12 @@ Labels used in every note:
   (delivery record at `dc27b49`).
 
 - [Performance audit](performance-audit.md) — 2026-10-22 measured and
-  code-review findings with the P1–P6 optimisation programme (pending).
+  code-review findings with the P1–P6 optimisation programme (P1 and P2 autosave
+  delivered; P3–P6 pending).
+
+- [Agentic charts plan](agentic-charts-plan.md) — agent chat pane on the local
+  Codex app-server that reads and edits charts: isolation, architecture, tool
+  registry and phases A0–A5, with an integration review and ordering (priority).
 
 - [Quick tools and Auto/Log follow-up](toolbar-scale-followup.md) — 2026-10-21
   REA website runtime tests of drawing favorites, reload, scale-state transitions

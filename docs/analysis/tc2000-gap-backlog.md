@@ -142,9 +142,10 @@ tests ignored.
 
 | ID | Classification | Work | Owner / note |
 |---|---|---|---|
+| A0–A5 | Feature (priority) | Agentic charts: agent chat pane on local Codex that reads and edits charts, then MCP shim and mimo backend (see [agentic charts plan](agentic-charts-plan.md)); A0 spike is a go/no-go gate | Here; needs F01 before A2 and F02 before A5 |
 | T02 | Unverified parity | Formula and indicator parity against attributed TC2000 exports | Remote agent (holds the TC2000 export files) |
 | C03b | Implementation gap | Crypto current-bar seeding and Coinbase volume accounting after connect/reconnect (see crypto delivery, C03b) | **Done** (`dabcc6a`): matches feed, REST seeding, trade-id dedupe, reviewer fixes |
-| P1–P6 | Performance | Incremental live updates, idle throttling, virtualized tables, batched alerts, overlay caching, distribution build profile (see [performance audit](performance-audit.md)) | P2 measured: autosave part shipped (`4a9c275`), throttling shelved (no gain on macOS); P1 next; P4 offered to the remote agent |
+| P1–P6 | Performance | Incremental live updates, idle throttling, virtualized tables, batched alerts, overlay caching, distribution build profile (see [performance audit](performance-audit.md)) | P1a and P1b delivered (`3956ebe`, `03e3fa9`); P2 autosave shipped, throttling shelved; P3–P6 deferred behind agentic charts A0–A3; P4 offered to the remote agent |
 | T07 | External data/validation | Live Alpaca entitlements, broader stock streaming, earnings and full exchange calendars | Needs accounts and data |
 | T09 | External data | Actual volume at price from trade data | Needs a data source |
 | F01 | Follow-up | Details card and chart tab show raw crypto keys (`COINBASE:BTC-USD`) instead of `BTC/USD` | Small |
