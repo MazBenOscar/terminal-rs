@@ -1923,7 +1923,11 @@ impl TerminalApp {
                 Response::CongressRefreshed(summary) => {
                     self.congress_status = summary.to_string();
                     self.congress_checked = Some(chrono::Local::now());
-                    self.status = format!("Congress disclosures updated: {summary}");
+                    self.status = if summary.contains("source paused until") {
+                        summary
+                    } else {
+                        format!("Congress disclosures updated: {summary}")
+                    };
                     self.refresh_congress_views();
                 }
             }
@@ -1933,10 +1937,7 @@ impl TerminalApp {
     /// Freshness line for the Congress feed: last check, newest filing, next check.
     fn congress_freshness(&self) -> String {
         let newest = self.latest.iter().map(|t| t.filed_date).max();
-        let minutes = std::env::var("TR_CONGRESS_REFRESH_MIN")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(crate::worker::CONGRESS_REFRESH_MIN as i64);
+        let minutes = crate::worker::congress_refresh_minutes() as i64;
         let mut parts = Vec::new();
         match self.congress_checked {
             Some(t) => {
@@ -1945,6 +1946,7 @@ impl TerminalApp {
                     parts.push(format!("next {}", (t + chrono::Duration::minutes(minutes)).format("%H:%M")));
                 }
             }
+            None if minutes == 0 => parts.push("Congress refresh disabled".into()),
             None => parts.push("checking Senate eFD + House Clerk…".into()),
         }
         if let Some(d) = newest {

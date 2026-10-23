@@ -134,7 +134,16 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
     `MemberData.xml`, senate.gov `senators_cfm.xml`); politicians are keyed by bioguide ID, which
     also repairs typos in the source index.
   - Refreshed on a schedule (every 30 minutes by default, `TR_CONGRESS_REFRESH_MIN`, `0` disables;
-    `REFRESH`/F6 forces one), incrementally — only unseen filings are fetched.
+    `REFRESH`/F6 requests an enabled refresh), incrementally — only unseen filings are fetched.
+    Sample-provider runs disable refresh unless the interval is explicitly set. First-run discovery
+    covers the last 90 days independently for each chamber with no stored filings, capped at 200
+    new filings per chamber per run, newest first. Otherwise each chamber starts seven days before
+    its own last complete refresh (`last_refresh_date_house` / `last_refresh_date_senate`); a pause,
+    error or cap keeps only that chamber's date unchanged. A one-time migration seeds each key from
+    the legacy `last_refresh_date` only if that chamber already has filings; the legacy key is left
+    unchanged and no longer written. Requests are sequential per site and spaced by at least one second. Refusals/challenges pause that site
+    for 6/12/24 hours (or longer via `Retry-After`), persisted across restarts; the Congress freshness
+    line shows the local resume time. Manual refresh also respects pauses.
   - Panels: latest trades feed with party/chamber/side filters (`CONG`); per-ticker "who in
     Congress traded it" (`NVDA CONG`, or right-click any ticker); politician profile with trade
     history and **estimated performance** (amount-weighted directional return, hit rate, average
