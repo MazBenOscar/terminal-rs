@@ -336,17 +336,53 @@ Acceptance criteria:
 
 ### A2: Agent pane on Codex (read-only)
 
+Split after A0 (2026-10-23). The A0 spike already delivered the backend crate
+(`crates/agent`: `AgentBackend`, `CodexAppServer`, isolation, tripwire, scrubber), and
+the live run changed what A2 has to carry (see "Status after A0" below). A2a proves
+the agent loop headless before any UI is built on it; A3 depends on A2a, not on the
+pane, so A2b and A3 run in parallel.
+
+#### A2a: headless bridge
+
+- Branch: `codex/agent-bridge`
+
+Work:
+
+1. **Bridge.** Connect `tr-agent` to the A1b registry (`tr-agent-tools`, every tool in
+   the single `chart` namespace that the config routes directly past Code Mode) and to
+   the A1a queue (`Request::Agent`, budgets, chart uids and pin). No UI.
+2. **Version and tool self-test.** Refuse any Codex version outside the tested range,
+   and before reporting ready, verify that the tools are offered as direct function
+   tools (the `code_mode_only` + `direct_only_tool_namespaces` behaviour is
+   undocumented and could change on upgrade).
+3. **Interrupt and recovery.** Interrupt mid-stream (after the first delta), and
+   recover a killed app-server through `thread/resume`.
+4. **Headless driver.** An example or test harness that runs the bridge against the
+   sample provider, so live checks need no window.
+
+Acceptance criteria:
+
+- Live, read-only preset on sample data: "what's the trend" cites real loaded bars;
+  all read tools reachable; text and image budgets enforced.
+- Interrupt after streaming starts completes in under 1 s.
+- Codex version outside the range, or tools not offered directly: refuses to start
+  with a clear reason.
+- CI replays the committed A0 transcript through a fake app-server.
+
+#### A2b: agent pane
+
 - Branch: `codex/agent-pane`
 
 Work:
 
-1. **Backend crate.** Create `crates/agent` with the `AgentBackend` trait and the
-   `CodexAppServer` client: process supervision, JSON Lines routing by thread, turn,
-   item and request id, `detect()` states and login.
-2. **Agent pane.** Add a `PaneKind::Agent` variant in `app.rs`, a `PaneSettings::Agent`
+1. **Agent pane.** Add a `PaneKind::Agent` variant in `app.rs`, a `PaneSettings::Agent`
    variant in `layouts.rs`, pane rendering in `app/panels.rs`, and a `NEW AGENT` panel
    in `app/workspace.rs`. The pane provides:
-   - backend, model and effort pickers;
+   - backend, model and effort pickers (from `model/list`: per-model efforts, default,
+     and "costly" tiers);
+   - sign-in: open the URL from the `account/login/start` reply (never from terminal
+     output; a stale link gives "State mismatch"), show login progress and the scrubbed
+     failure reason;
    - the streamed reply, coalesced to about 30 Hz;
    - markdown rendering (egui_commonmark or a minimal renderer);
    - tool trace rows;
@@ -354,18 +390,18 @@ Work:
    - a message queue;
    - suggested prompts;
    - a chart pin;
-   - a rate-limit meter;
+   - a rate-limit meter (`account/rateLimits/read` and updates);
    - a privacy disclosure of what leaves the machine;
    - "not investment advice".
-3. **Keyboard focus.** The chat input captures keyboard focus so chart hotkeys don't fire.
-4. **Tools.** Read tools, `additionalContext`, and screenshots with consent.
+2. **Keyboard focus.** The chat input captures keyboard focus so chart hotkeys don't fire.
+3. **Context.** `additionalContext`, and screenshots with consent.
 
 Acceptance criteria:
 
-- CI replays the A0 transcript through a fake app-server, and the pane renders deterministically.
-- Live, "what's the trend" cites real loaded bars.
-- Each onboarding state shows one action.
-- A killed app-server recovers through `thread/resume`.
+- The pane renders the A0 transcript deterministically through the fake app-server.
+- Each onboarding state (not installed, unsupported version, signed out, signing in,
+  ready, rate-limited) shows one action.
+- Live: first full in-app agent test (sign-in, trend question, interrupt, model switch).
 
 ### A3: agent edits the chart
 
@@ -504,7 +540,29 @@ names are authoritative.
 **Order.** A0 (go/no-go) → A1 (split into A1a app prerequisites: `logic()`
 drain, drawing ids and undo by id, chart getters, edit log; and A1b the
 `agent-tools` crate, data tools, level finder and golden tests; these can run as
-parallel workers once the tool schema types are agreed) → A2 → A3 → A5 → A4.
+parallel workers once the tool schema types are agreed) → A2a (headless bridge)
+→ A2b (pane) ∥ A3 (edits) → A5 → A4, with F02 running in parallel before A5.
 A5 (watchlist and alert tools inside the app) is placed before A4 (MCP shim and
 mimo backend) because the in-app agent is the priority; A4 can move earlier if
 external clients are wanted sooner.
+
+## Status after A0 (2026-10-23)
+
+A0 passed the live go/no-go (report: [agent-spike-a0-report.md](agent-spike-a0-report.md))
+and is merged into `feature/agentic-charts` with A1a, A1b and F01. Findings that change
+later phases:
+
+- **Code Mode.** Every current model is `code_mode_only`. App tools must stay in the one
+  `chart` namespace routed by `[features.code_mode] direct_only_tool_namespaces`; Code
+  Mode and its host stay disabled, so no model-written code runs. Only two canned tools
+  have been proven this way; A2a proves the full registry.
+- **Credentials.** The token is an owner-only `auth.json` in the private home, not the
+  Keychain (unreachable from the sandbox). Startup refuses a readable or linked file.
+- **Sandbox.** DNS needs the mDNSResponder socket and `/var` metadata; networking needs
+  metadata of the Codex install directory.
+- **Version drift** is now an A2a acceptance criterion (pinned range plus a tool
+  self-test), not only a risk.
+- **Interrupt** must be measured mid-stream; the A0 figure (0.001 s) landed before
+  generation started.
+- **Sign-in** must use the URL from the `account/login/start` reply.
+
