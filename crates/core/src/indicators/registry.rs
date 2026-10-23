@@ -258,7 +258,7 @@ pub struct Spec {
     pub params: Vec<f64>,
     /// Chart-instance settings are separate from calculation parameters. Commands
     /// and legacy saved labels omit them until attached to a chart.
-    pub chart: Option<super::study::Settings>,
+    pub chart: Option<Box<super::study::Settings>>,
 }
 
 impl Spec {
@@ -365,7 +365,7 @@ impl<'de> Deserialize<'de> for Spec {
             Repr::Label(s) => Spec::from_label(&s),
             Repr::Instance { indicator, chart } => {
                 let mut spec = Spec::from_label(&indicator);
-                spec.chart = Some(*chart);
+                spec.chart = Some(chart);
                 spec
             }
             Repr::Legacy(Legacy::Sma(n)) => spec("SMA", &[n as f64]),

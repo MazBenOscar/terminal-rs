@@ -1,6 +1,7 @@
 //! Transport-independent agent tools. Live calls are validated here and applied by the host.
 pub mod analytics;
 pub mod args;
+pub use host::edits;
 mod data;
 mod host;
 mod registry;

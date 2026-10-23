@@ -727,6 +727,8 @@ pub struct TerminalApp {
     pub agent_queue: crate::agent_queue::AgentToolQueue,
     pub pinned_agent_chart: Option<u64>,
     pub(crate) agent_pane: crate::agent_pane::AgentPane,
+    agent_turns: Vec<String>,
+    agent_save_pending: bool,
     pub edit_log: crate::edit_log::EditLog,
     agent_job_chart: Option<u64>,
     worker: Worker,
@@ -967,6 +969,8 @@ impl TerminalApp {
             agent_queue: crate::agent_queue::AgentToolQueue::new(ctx.clone()),
             pinned_agent_chart: None,
             agent_pane: crate::agent_pane::AgentPane::default(),
+            agent_turns: Vec::new(),
+            agent_save_pending: false,
             edit_log: Default::default(),
             agent_job_chart: None,
             broker,
@@ -1469,6 +1473,26 @@ impl TerminalApp {
     }
 
     fn execute(&mut self, input: &str) {
+        let undo = input.trim().to_ascii_uppercase();
+        if undo == "UNDO AGENT" || undo.starts_with("UNDO AGENT CHART ") {
+            let turn = if let Some(uid) = undo.strip_prefix("UNDO AGENT CHART ") {
+                uid.parse().ok().and_then(|uid| self.last_agent_turn_for_chart(uid)).map(str::to_owned)
+            } else {
+                self.last_agent_turn().map(str::to_owned)
+            };
+            self.status = match turn {
+                Some(turn) => match self.undo_agent_turn(&turn) {
+                    Ok(summary) => format!(
+                        "Undid agent turn: {} operations, {} conflicts",
+                        summary.reverted,
+                        summary.skipped.len()
+                    ),
+                    Err(error) => error,
+                },
+                None => "No agent turn to undo".into(),
+            };
+            return;
+        }
         let Some(cmd) = command::parse(input) else {
             self.status = command::parse_error(input);
             return;
@@ -1875,6 +1899,9 @@ impl TerminalApp {
         }
         self.agent_queue.expire();
         self.agent_queue.repaint_pending();
+        if self.agent_save_pending {
+            self.autosave();
+        }
     }
 
     fn drain(&mut self) {
@@ -2568,6 +2595,7 @@ impl TerminalApp {
         writes.push((self.store.path(&self.layout_name), self.current_doc().to_json()));
         writes.push((self.settings_file.clone(), self.settings_json()));
         self.saves.start(writes);
+        self.agent_save_pending = false;
     }
 
     fn complete_save(&mut self, results: Vec<SaveResult>) {
@@ -2661,6 +2689,11 @@ impl eframe::App for TerminalApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.agent_logic(ctx);
         self.process_logic();
+        // An edit arriving during an in-flight save still needs a fresh snapshot
+        // while hidden. Poll only until that snapshot can start; never tick idle.
+        if self.agent_save_pending {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -2856,6 +2889,8 @@ impl TerminalApp {
             agent_queue: crate::agent_queue::AgentToolQueue::new(egui::Context::default()),
             pinned_agent_chart: None,
             agent_pane: crate::agent_pane::AgentPane::default(),
+            agent_turns: Vec::new(),
+            agent_save_pending: false,
             edit_log: Default::default(),
             agent_job_chart: None,
             broker: broker::BrokerState::with_store(

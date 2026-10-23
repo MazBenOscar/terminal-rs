@@ -393,6 +393,8 @@ impl AgentPane {
         match event {
             BridgeEvent::Wire(WireEvent::Notification { method, params }) => self.wire(&method, &params),
             BridgeEvent::Wire(WireEvent::Error(reason)) => self.notice(&reason),
+            // Canonical turn id (provenance and undo); the pane does not use it yet.
+            BridgeEvent::Started { .. } => {}
             BridgeEvent::Completed { status, .. } => {
                 self.flush(Instant::now());
                 self.running = false;

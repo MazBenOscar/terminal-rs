@@ -16,4 +16,5 @@ tokio = { workspace = true, features = ["io-util"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tr-core.workspace = true
+tr-chart.workspace = true
 tr-data.workspace = true

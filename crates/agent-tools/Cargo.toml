@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 tr-core.workspace = true
+tr-chart.workspace = true
 tr-data.workspace = true
 chrono.workspace = true
 serde.workspace = true

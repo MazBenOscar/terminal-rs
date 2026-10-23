@@ -91,6 +91,9 @@ mod study_presets {
             if let Some(chart) = &mut spec.chart {
                 chart.reset_fill_targets(local_output.as_deref());
                 chart.id = 0;
+                // A user-applied preset is a new user object, not saved agent work.
+                chart.created_by = tr_chart::drawings::Author::User;
+                chart.turn_id = None;
                 if matches!(chart.source, study::Source::Output { .. }) {
                     chart.source = study::Source::default();
                     reset_source = true;
@@ -329,6 +332,8 @@ pub struct BarsRead<'a> {
 pub struct StudyRead {
     pub id: Option<u32>,
     pub spec: IndicatorSpec,
+    pub tool_id: Option<String>,
+    pub agent_highlight: bool,
     pub outputs: Vec<StudyOutputRead>,
     pub error: Option<String>,
 }
@@ -351,9 +356,26 @@ pub struct ChartRead<'a> {
     pub visible_range: Option<crate::chart_navigation::DateRange>,
     pub studies: Vec<StudyRead>,
     pub comparisons: Vec<String>,
+    pub comparison_provenance: Vec<tr_agent_tools::edits::Comparison>,
     pub drawings: &'a [Drawing],
     pub chart_type: ChartType,
     pub session: tr_core::session::Session,
+}
+
+#[derive(Clone, PartialEq)]
+struct AgentView {
+    bars: Arc<Vec<Bar>>,
+    symbol: String,
+    timeframe: Timeframe,
+    range: Option<crate::chart_navigation::DateRange>,
+}
+
+struct AgentStateEdit {
+    turn: String,
+    before: Vec<IndicatorSpec>,
+    after: Vec<IndicatorSpec>,
+    view: Option<(AgentView, AgentView)>,
+    comparisons: Option<(Vec<tr_agent_tools::edits::Comparison>, Vec<tr_agent_tools::edits::Comparison>)>,
 }
 
 pub struct ChartState {
@@ -477,6 +499,7 @@ pub struct ChartState {
     template_selected: String,
     template_status: Option<Result<String, String>>,
     pub(crate) drawing_ids: crate::drawing_history::DrawingIds,
+    agent_state_edits: Vec<AgentStateEdit>,
     drawing_undo: Vec<crate::drawing_history::Edit>,
     drawing_redo: Vec<crate::drawing_history::Edit>,
     drawing_revision: u64,
@@ -604,6 +627,7 @@ impl ChartState {
             template_selected: String::new(),
             template_status: None,
             drawing_ids: Default::default(),
+            agent_state_edits: Vec::new(),
             drawing_undo: Vec::new(),
             drawing_redo: Vec::new(),
             drawing_revision: 0,
@@ -647,6 +671,29 @@ impl ChartState {
         self.compare.iter().chain(&self.data.comparisons).cloned().collect()
     }
 
+    pub fn comparison_objects(&self) -> Vec<tr_agent_tools::edits::Comparison> {
+        self.comparison_symbols()
+            .into_iter()
+            .map(|symbol| {
+                self.data
+                    .comparison_provenance
+                    .iter()
+                    .find(|c| c.symbol == symbol)
+                    .cloned()
+                    .unwrap_or_else(|| symbol.into())
+            })
+            .collect()
+    }
+
+    /// Undo availability is chart-local and derives only from retained undo state,
+    /// never from persisted provenance (which cannot reconstruct an inverse edit).
+    pub fn has_agent_turn(&self, turn: &str) -> bool {
+        self.drawing_undo
+            .iter()
+            .any(|edit| edit.author == tr_chart::drawings::Author::Agent && edit.turn.as_deref() == Some(turn))
+            || self.agent_state_edits.iter().any(|edit| edit.turn == turn)
+    }
+
     pub fn studies(&self) -> Vec<StudyRead> {
         self.study_reads(None, usize::MAX)
     }
@@ -659,7 +706,13 @@ impl ChartState {
     fn study_reads(&self, id: Option<&str>, tail: usize) -> Vec<StudyRead> {
         self.indicators
             .iter()
-            .filter(|spec| id.is_none_or(|id| spec.chart.as_ref().is_some_and(|c| c.id.to_string() == id)))
+            .filter(|spec| {
+                id.is_none_or(|id| {
+                    spec.chart
+                        .as_ref()
+                        .is_some_and(|c| c.id.to_string() == id || format!("{}:{}", self.uid, c.id) == id)
+                })
+            })
             .map(|spec| {
                 let id = spec.chart.as_ref().map(|c| c.id);
                 let built = self.built.iter().find(|b| b.spec == *spec);
@@ -677,7 +730,14 @@ impl ChartState {
                         })
                         .collect()
                 });
-                StudyRead { id, spec: spec.clone(), outputs, error: built.and_then(|b| b.error.clone()) }
+                StudyRead {
+                    id,
+                    tool_id: id.map(|id| format!("{}:{id}", self.uid)),
+                    agent_highlight: spec.chart.as_ref().is_some_and(|s| s.agent_highlight()),
+                    spec: spec.clone(),
+                    outputs,
+                    error: built.and_then(|b| b.error.clone()),
+                }
             })
             .collect()
     }
@@ -694,6 +754,7 @@ impl ChartState {
             visible_range: self.visible_date_range(),
             studies: self.studies(),
             comparisons: self.comparison_symbols(),
+            comparison_provenance: self.comparison_objects(),
             drawings: &self.drawings,
             chart_type: self.chart_type,
             session: self.effective_session(),
@@ -993,6 +1054,8 @@ impl ChartState {
         let Some(symbol) = crate::chart_compare::parse_key(&symbol).filter(|s| *s != self.symbol) else {
             return;
         };
+        let existed = self.comparison_symbols().contains(&symbol);
+        let added = symbol.clone();
         self.data.hidden_comparisons.retain(|s| s != &symbol);
         if self.compare.is_none() {
             self.set_compare(Some(symbol), w);
@@ -1003,9 +1066,34 @@ impl ChartState {
             self.data.comparisons.push(symbol);
             self.request_compare(w);
         }
+        if !existed && self.comparison_symbols().contains(&added) {
+            self.data.comparison_provenance.retain(|c| c.symbol != added);
+            self.data.comparison_provenance.push(added.into());
+        }
+    }
+
+    pub(crate) fn remove_comparison(&mut self, symbol: &str, w: &Worker) {
+        self.data.comparison_provenance.retain(|c| c.symbol != symbol);
+        if self.compare.as_deref() == Some(symbol) {
+            if self.data.comparisons.is_empty() {
+                self.set_compare(None, w);
+            } else {
+                let next = self.data.comparisons.remove(0);
+                self.compare_line = self.comparisons.remove(&next).and_then(|s| s.line);
+                self.compare = Some(next);
+                self.request_compare(w);
+            }
+        } else {
+            self.data.comparisons.retain(|s| s != symbol);
+            self.data.hidden_comparisons.retain(|s| s != symbol);
+            self.comparisons.remove(symbol);
+            self.request_compare(w);
+        }
     }
 
     pub fn set_compare(&mut self, symbol: Option<String>, w: &Worker) {
+        // This is the user replacement path, not an ownership-preserving reload.
+        self.data.comparison_provenance.clear();
         self.data.comparisons.clear();
         self.data.hidden_comparisons.clear();
         self.comparisons.clear();
@@ -1175,7 +1263,7 @@ impl ChartState {
             return;
         }
         let mut spec = IndicatorSpec::new("PCF", &[]).unwrap();
-        spec.chart = Some(study::Settings::new(0, &spec));
+        spec.chart = Some(Box::new(study::Settings::new(0, &spec)));
         let settings = spec.chart.as_mut().unwrap();
         settings.expression = Some(expression);
         settings.scan_plot = true;
@@ -1403,6 +1491,213 @@ impl ChartState {
         report.skipped.sort_unstable();
         report.skipped.dedup();
         report
+    }
+
+    fn agent_view(&self) -> AgentView {
+        AgentView {
+            bars: self.source_bars.clone(),
+            symbol: self.symbol.clone(),
+            timeframe: self.tf,
+            range: self.visible_date_range(),
+        }
+    }
+
+    fn apply_loaded_timeframe(&mut self, timeframe: Timeframe, bars: Arc<Vec<Bar>>, w: &Worker) {
+        self.tf = timeframe;
+        self.generation += 1;
+        self.series_revision = 0;
+        self.history_resync = false;
+        self.indicator_snapshot = None;
+        self.session_history_revision = None;
+        self.pending_live.clear();
+        self.viewport = None;
+        self.glide = None;
+        let gpu = SeriesGpu::build(&bars);
+        self.on_history_revision(self.generation, 1, bars, gpu, 0, false, true, false, w);
+    }
+
+    pub(crate) fn apply_agent_plan(
+        &mut self,
+        plan: tr_agent_tools::edits::Plan,
+        turn: &str,
+        w: &Worker,
+    ) -> serde_json::Value {
+        use tr_agent_tools::edits::Plan;
+        use tr_chart::drawings::Author;
+        let before = self.indicators.clone();
+        let mut view = None;
+        let mut comparisons = None;
+        let result = match plan {
+            Plan::Drawings(next, id) => {
+                self.edit_drawings(Author::Agent, Some(turn.into()), |drawings| *drawings = next);
+                serde_json::json!({"id":id})
+            }
+            Plan::Indicators(next, id) => {
+                // Use the user removal path (dependency cleanup and built cache),
+                // never toggle an existing instance off when adding another one.
+                let removed: Vec<_> = self
+                    .indicators
+                    .iter()
+                    .filter_map(|s| s.chart.as_ref())
+                    .filter(|c| !next.iter().any(|s| s.chart.as_ref().is_some_and(|n| n.id == c.id)))
+                    .map(|c| c.id)
+                    .collect();
+                for id in removed {
+                    if let Some(index) =
+                        self.indicators.iter().position(|s| s.chart.as_ref().is_some_and(|c| c.id == id))
+                    {
+                        self.remove_study(index);
+                    }
+                }
+                self.indicators = next;
+                self.request_indicators(w);
+                serde_json::json!({"id":id})
+            }
+            Plan::View { symbol, timeframe, from, to } => {
+                let previous = self.agent_view();
+                debug_assert_eq!(symbol, self.symbol);
+                if timeframe != self.tf {
+                    let bars = timeframe.resample_session(&self.source_bars, self.read_chart().session);
+                    self.apply_loaded_timeframe(timeframe, Arc::new(bars), w);
+                }
+                self.apply_linked_range(crate::chart_navigation::DateRange { start: from, end: to });
+                // No linked panes are moved: agent range changes are local, unlike
+                // a user gesture which emits range_event.
+                view = Some((previous, self.agent_view()));
+                serde_json::json!({"uid":self.uid,"symbol":self.symbol,"timeframe":self.tf,"from":from,"to":to,"linked_panes":[]})
+            }
+            Plan::Compare(args) => {
+                let before = self.comparison_objects();
+                match args.action {
+                    tr_agent_tools::args::CompareAction::Add => {
+                        // The chart may have changed since planning: only a comparison this call
+                        // actually added becomes the agent's, never one the user already had.
+                        let existed = self.comparison_symbols().contains(&args.symbol);
+                        self.add_comparison(args.symbol.clone(), w);
+                        if !existed && self.comparison_symbols().contains(&args.symbol) {
+                            self.data.comparison_provenance.retain(|c| c.symbol != args.symbol);
+                            self.data.comparison_provenance.push(tr_agent_tools::edits::Comparison {
+                                symbol: args.symbol.clone(),
+                                created_by: Author::Agent,
+                                turn_id: Some(turn.into()),
+                            });
+                        }
+                    }
+                    tr_agent_tools::args::CompareAction::Remove => self.remove_comparison(&args.symbol, w),
+                }
+                comparisons = Some((before, self.comparison_objects()));
+                serde_json::json!({"symbol":args.symbol,"comparisons":self.comparison_symbols()})
+            }
+        };
+        if before != self.indicators || view.is_some() || comparisons.is_some() {
+            self.agent_state_edits.push(AgentStateEdit {
+                turn: turn.into(),
+                before,
+                after: self.indicators.clone(),
+                view,
+                comparisons,
+            });
+        }
+        result
+    }
+
+    pub(crate) fn undo_agent_state(&mut self, turn: &str, w: &Worker) -> (usize, Vec<String>) {
+        let mut reverted = 0;
+        let mut skipped = Vec::new();
+        let edits = std::mem::take(&mut self.agent_state_edits);
+        let (target, kept): (Vec<_>, Vec<_>) = edits.into_iter().partition(|edit| edit.turn == turn);
+        self.agent_state_edits = kept;
+        for edit in target.into_iter().rev() {
+            let id = |s: &IndicatorSpec| s.chart.as_ref().map(|c| c.id);
+            for after in edit.after.iter().rev().filter(|s| !edit.before.iter().any(|b| id(b) == id(s))) {
+                let key = format!("{}:{}", self.uid, id(after).unwrap_or_default());
+                let dependent = self.indicators.iter().any(|s| {
+                    s.chart.as_ref().is_some_and(|c| {
+                        matches!(c.source, StudySource::Output { study, .. } if Some(study) == id(after))
+                            || matches!(c.pane, StudyPane::With(parent) if Some(parent) == id(after))
+                            || c.fill.as_ref().is_some_and(|f| {
+                                [f.upper.study, f.lower.study].iter().any(|p| p.is_some() && *p == id(after))
+                            })
+                    })
+                });
+                if let Some(index) = self.indicators.iter().position(|s| s == after).filter(|_| !dependent) {
+                    self.remove_study(index);
+                    reverted += 1;
+                } else {
+                    skipped.push(key);
+                }
+            }
+            for (index, before) in
+                edit.before.iter().enumerate().filter(|(_, s)| !edit.after.iter().any(|a| id(a) == id(s)))
+            {
+                if self.indicators.iter().any(|s| id(s) == id(before)) {
+                    skipped.push(format!("{}:{}", self.uid, id(before).unwrap_or_default()));
+                    continue;
+                }
+                let following =
+                    edit.before[index + 1..].iter().find_map(|s| self.indicators.iter().position(|n| id(n) == id(s)));
+                let preceding = edit.before[..index]
+                    .iter()
+                    .rev()
+                    .find_map(|s| self.indicators.iter().position(|n| id(n) == id(s)).map(|i| i + 1));
+                self.indicators.insert(following.or(preceding).unwrap_or(self.indicators.len()), before.clone());
+                reverted += 1;
+            }
+            if let Some((before, after)) = edit.comparisons {
+                for object in after.iter().filter(|s| !before.contains(s)) {
+                    if object.created_by == tr_chart::drawings::Author::Agent
+                        && object.turn_id.as_deref() == Some(turn)
+                        && self.comparison_objects().contains(object)
+                    {
+                        self.remove_comparison(&object.symbol, w);
+                        reverted += 1;
+                    } else {
+                        skipped.push(format!("comparison:{}:{}", self.uid, object.symbol));
+                    }
+                }
+                for object in before.iter().filter(|s| !after.contains(s)) {
+                    if !self.comparison_symbols().contains(&object.symbol) && self.comparison_symbols().len() < 8 {
+                        self.add_comparison(object.symbol.clone(), w);
+                        self.data.comparison_provenance.retain(|c| c.symbol != object.symbol);
+                        self.data.comparison_provenance.push(object.clone());
+                        reverted += 1;
+                    } else {
+                        skipped.push(format!("comparison:{}:{}", self.uid, object.symbol));
+                    }
+                }
+            }
+            if let Some((before, after)) = edit.view {
+                if self.agent_view() == after {
+                    if before.timeframe != self.tf {
+                        self.apply_loaded_timeframe(before.timeframe, before.bars, w);
+                    }
+                    if let Some(range) = before.range {
+                        self.apply_linked_range(range);
+                    }
+                    reverted += 1;
+                } else {
+                    skipped.push(format!("view:{}", self.uid));
+                }
+            }
+        }
+        self.request_indicators(w);
+        (reverted, skipped)
+    }
+
+    pub fn keep_agent_drawing(&mut self, id: u64) {
+        self.edit_drawings(tr_chart::drawings::Author::User, None, |drawings| {
+            if let Some(drawing) = drawings.iter_mut().find(|d| d.id == id) {
+                drawing.created_by = tr_chart::drawings::Author::User;
+                drawing.turn_id = None;
+            }
+        });
+    }
+
+    pub fn keep_agent_study(&mut self, id: u32) {
+        if let Some(settings) = self.indicators.iter_mut().filter_map(|s| s.chart.as_mut()).find(|s| s.id == id) {
+            settings.created_by = tr_chart::drawings::Author::User;
+            settings.turn_id = None;
+        }
     }
 
     pub fn reset_view(&mut self) {
@@ -3324,12 +3619,13 @@ impl ChartState {
     fn apply_legend_action(&mut self, action: crate::chart_legend::Action, w: &Worker) {
         use crate::chart_legend::Action;
         let id = match action {
-            Action::Visibility(id, _) | Action::Edit(id) | Action::Remove(id) => id,
+            Action::Visibility(id, _) | Action::Edit(id) | Action::Remove(id) | Action::Keep(id) => id,
         };
         let Some(index) = self.indicators.iter().position(|s| s.chart.as_ref().is_some_and(|c| c.id == id)) else {
             return;
         };
         match action {
+            Action::Keep(_) => self.keep_agent_study(id),
             Action::Edit(_) => {
                 self.indicator_editor = true;
                 self.reveal_indicator_editor = true;
@@ -4055,6 +4351,15 @@ impl ChartState {
         ui.set_min_width(theme::dp(190.));
         menu_section(ui, "View");
         self.view_menu(ui, w);
+        let has_agent_turn = self
+            .drawing_undo
+            .iter()
+            .any(|edit| edit.author == tr_chart::drawings::Author::Agent && edit.turn.is_some())
+            || !self.agent_state_edits.is_empty();
+        if has_agent_turn && ui.button("Undo latest agent turn touching this chart (all charts)").clicked() {
+            self.actions.push(Action::Command(format!("UNDO AGENT CHART {}", self.uid)));
+            ui.close();
+        }
         ui.separator();
         menu_section(ui, "Analysis");
         self.analysis_menu(ui);
@@ -4552,6 +4857,36 @@ impl ChartState {
             self.delete_selected();
             ui.close();
         }
+        if !self.drawings.is_empty() {
+            ui.menu_button("Drawing list", |ui| {
+                let mut keep = None;
+                let mut delete = None;
+                for drawing in self.drawings.iter().filter(|d| d.visible_on(&self.symbol)) {
+                    ui.horizontal(|ui| {
+                        let badge = if drawing.agent_highlight() { " · Agent" } else { "" };
+                        ui.label(format!("{} #{}{badge}", drawing.tool.label(), drawing.id)).on_hover_text(format!(
+                            "{}\n{}",
+                            drawing.text,
+                            drawing.turn_id.as_deref().unwrap_or("User drawing")
+                        ));
+                        if drawing.agent_highlight() && ui.small_button("Keep").clicked() {
+                            keep = Some(drawing.id);
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            delete = Some(drawing.id);
+                        }
+                    });
+                }
+                if let Some(id) = keep {
+                    self.keep_agent_drawing(id);
+                }
+                if let Some(id) = delete {
+                    self.edit_drawings(tr_chart::drawings::Author::User, None, |drawings| {
+                        drawings.retain(|d| d.id != id)
+                    });
+                }
+            });
+        }
         self.drawing_tools_menu(ui);
         if ui
             .add_enabled(
@@ -4570,7 +4905,17 @@ impl ChartState {
         if let Some(index) = self.draw.selected.filter(|&i| i < self.drawings.len()) {
             ui.separator();
             let mut edited = self.drawings[index].clone();
-            ui.label(format!("Selected {}", edited.tool.label()));
+            let badge = if edited.agent_highlight() { " · Agent" } else { "" };
+            ui.label(format!("Selected {}{badge}", edited.tool.label())).on_hover_text(
+                edited.turn_id.as_ref().map_or_else(
+                    || "User drawing".into(),
+                    |turn| format!("Agent turn {turn}. Keep transfers ownership to you."),
+                ),
+            );
+            if edited.agent_highlight() && ui.button("Keep (make user drawing)").clicked() {
+                edited.created_by = tr_chart::drawings::Author::User;
+                edited.turn_id = None;
+            }
             if matches!(edited.tool, Tool::Trendline | Tool::Ray | Tool::Horizontal)
                 && ui.button("Alert on saved line…").clicked()
             {
@@ -5265,6 +5610,19 @@ impl ChartState {
             all.push((preview, true));
         }
         for (d, selected) in all {
+            if d.agent_highlight() {
+                let at =
+                    pos2(rect.left() + v.x_of(self.index_of_ts(d.a.ts)) as f32, rect.top() + s.y_of(d.a.price) as f32);
+                if at.is_finite() {
+                    p.text(
+                        at + vec2(5., -8.),
+                        Align2::LEFT_BOTTOM,
+                        "Agent",
+                        mono(9.),
+                        theme::cyan().gamma_multiply(0.65),
+                    );
+                }
+            }
             let color =
                 if selected { amber() } else { d.color.map_or(theme::cyan(), |[r, g, b]| Color32::from_rgb(r, g, b)) };
             let stroke = Stroke::new(if selected { d.width.clamp(2.0, 6.0) } else { d.width.clamp(0.5, 6.0) }, color);
@@ -5728,7 +6086,7 @@ mod tests {
         assert_eq!(added.code, expected.code);
         assert_eq!(added.params, expected.params);
         let id = added.chart.as_ref().unwrap().id;
-        assert_eq!(added.chart, Some(study::Settings::new(id, &expected)));
+        assert_eq!(added.chart, Some(Box::new(study::Settings::new(id, &expected))));
         assert!(!before.iter().any(|spec| spec.chart.as_ref().unwrap().id == id));
     }
 
@@ -5764,7 +6122,7 @@ mod tests {
         let added = chart.indicators.last().unwrap();
         assert_eq!(added.code, def.code);
         assert_eq!(added.params, def.defaults());
-        assert_eq!(added.chart, Some(study::Settings::new(added.chart.as_ref().unwrap().id, added)));
+        assert_eq!(added.chart, Some(Box::new(study::Settings::new(added.chart.as_ref().unwrap().id, added))));
     }
 
     #[test]
@@ -10004,5 +10362,21 @@ mod tests {
         });
         assert!(!texts.iter().any(|(text, _)| text == "Other"));
         assert!(texts.iter().any(|(text, _)| text == "✓ Main (active)"));
+    }
+
+    #[test]
+    fn agent_add_of_an_existing_user_comparison_does_not_take_ownership() {
+        use tr_agent_tools::args::{Compare, CompareAction};
+        use tr_agent_tools::edits::Plan;
+        let mut chart = sample_chart();
+        let worker = Worker::inert();
+        let key = tr_data::security("MSFT").key();
+        // The user adds MSFT after the agent planned its own add (plan saw no MSFT).
+        chart.add_comparison(key.clone(), &worker);
+        let plan = Plan::Compare(Compare { symbol: key.clone(), action: CompareAction::Add, chart_id: None });
+        chart.apply_agent_plan(plan, "s:1", &worker);
+        let owner = chart.comparison_objects().into_iter().find(|c| c.symbol == key).unwrap();
+        assert_eq!(owner.created_by, tr_chart::drawings::Author::User);
+        assert_eq!(owner.turn_id, None);
     }
 }

@@ -837,6 +837,8 @@ impl TerminalApp {
     /// Replace the workspace with `doc`. Pane ids are reassigned so responses for the old
     /// panes can never reach the new ones.
     pub(super) fn apply_doc(&mut self, mut doc: LayoutDoc) {
+        // Layout documents retain provenance, but never the in-memory inverse edits.
+        self.agent_turns.clear();
         doc.repair();
         // Imported identities must not alias charts that are live at load time,
         // even though those charts are about to be replaced.

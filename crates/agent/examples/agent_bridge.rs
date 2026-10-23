@@ -1,12 +1,13 @@
 //! Manager-run sample-data bridge. Never launched by offline tests.
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use tr_agent::bridge::{
-    AgentBridge, BridgeEvent, BridgeFuture, BridgeOptions, BridgeTurn, ChartPin, HostExecutor, IsolatedConnector,
+    AgentBridge, BridgeEvent, BridgeFuture, BridgeOptions, BridgeTurn, ChartPin, IsolatedConnector, ToolCall,
+    ToolExecutor,
 };
 use tr_agent::isolation::{PrivateHome, SessionMode, VersionRange};
 use tr_agent::transcript::{StreamScrubber, Transcript, scrub_text, scrub_value};
@@ -26,6 +27,8 @@ struct Args {
     interrupt: bool,
     verify_recovery: bool,
     optional_tools: bool,
+    tools: ToolSet,
+    undo_agent_turn: bool,
 }
 fn args() -> Result<Args> {
     let mut args = std::env::args().skip(1);
@@ -33,6 +36,8 @@ fn args() -> Result<Args> {
     let mut interrupt = false;
     let mut verify_recovery = false;
     let mut optional_tools = false;
+    let mut tools = ToolSet::ReadOnly;
+    let mut undo_agent_turn = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--home" => home = Some(PathBuf::from(args.next().context("--home requires a directory")?)),
@@ -44,8 +49,16 @@ fn args() -> Result<Args> {
             "--interrupt-after-first-delta" => interrupt = true,
             "--verify-recovery" => verify_recovery = true,
             "--optional-tools" => optional_tools = true,
+            "--tools" => {
+                tools = match args.next().as_deref() {
+                    Some("edit") => ToolSet::Edit,
+                    Some("read-only") => ToolSet::ReadOnly,
+                    _ => bail!("--tools requires read-only or edit"),
+                }
+            }
+            "--undo-agent-turn" => undo_agent_turn = true,
             _ => bail!(
-                "usage: agent_bridge --home <dir> --model <id> --prompt <text> --transcript <new file> [--optional-tools] [--interrupt-after-first-delta | --verify-recovery]"
+                "usage: agent_bridge --home <dir> --model <id> --prompt <text> --transcript <new file> [--tools read-only|edit] [--undo-agent-turn] [--optional-tools] [--interrupt-after-first-delta | --verify-recovery]"
             ),
         }
     }
@@ -60,6 +73,8 @@ fn args() -> Result<Args> {
         interrupt,
         verify_recovery,
         optional_tools,
+        tools,
+        undo_agent_turn,
     })
 }
 fn find_codex() -> Result<PathBuf> {
@@ -77,7 +92,232 @@ struct SampleHost {
     data: Arc<MarketDataHost<SampleProvider>>,
     loaded: History,
     pin: ChartPin,
+    state: Arc<Mutex<SampleState>>,
 }
+
+#[derive(Default)]
+struct SampleState {
+    session: tr_agent_tools::edits::Session,
+    drawings: Vec<tr_chart::drawings::Drawing>,
+    indicators: Vec<tr_core::indicators::registry::Spec>,
+    comparisons: Vec<tr_agent_tools::edits::Comparison>,
+    timeframe: Option<Timeframe>,
+    range: Option<(i64, i64)>,
+    events: Vec<serde_json::Value>,
+    history: Vec<SampleEdit>,
+}
+struct SampleEdit {
+    turn: String,
+    before: Vec<tr_chart::drawings::Drawing>,
+    after: Vec<tr_chart::drawings::Drawing>,
+    studies_before: Vec<tr_core::indicators::registry::Spec>,
+    studies_after: Vec<tr_core::indicators::registry::Spec>,
+    comparisons_before: Vec<tr_agent_tools::edits::Comparison>,
+    comparisons_after: Vec<tr_agent_tools::edits::Comparison>,
+    timeframe_before: Option<Timeframe>,
+    timeframe_after: Option<Timeframe>,
+    range_before: Option<(i64, i64)>,
+    range_after: Option<(i64, i64)>,
+}
+
+impl SampleState {
+    fn undo(&mut self, turn: &str) -> Result<usize> {
+        let mut reverted = 0;
+        let (target, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.history).into_iter().partition(|edit| edit.turn == turn);
+        self.history = kept;
+        for edit in target.into_iter().rev() {
+            // The headless driver has no concurrent user input. Still invert by id
+            // and expected value rather than replacing the whole chart.
+            for after in &edit.after {
+                let before = edit.before.iter().find(|d| d.id == after.id);
+                if before == Some(after) {
+                    continue;
+                }
+                if let Some(index) = self.drawings.iter().position(|d| d == after) {
+                    reverted += 1;
+                    match before {
+                        Some(before) => self.drawings[index] = before.clone(),
+                        None => {
+                            self.drawings.remove(index);
+                        }
+                    }
+                }
+            }
+            for (index, before) in
+                edit.before.iter().enumerate().filter(|(_, d)| !edit.after.iter().any(|a| a.id == d.id))
+            {
+                if !self.drawings.iter().any(|d| d.id == before.id) {
+                    let at = edit.before[index + 1..]
+                        .iter()
+                        .find_map(|d| self.drawings.iter().position(|n| n.id == d.id))
+                        .or_else(|| {
+                            edit.before[..index]
+                                .iter()
+                                .rev()
+                                .find_map(|d| self.drawings.iter().position(|n| n.id == d.id).map(|i| i + 1))
+                        })
+                        .unwrap_or(self.drawings.len());
+                    self.drawings.insert(at, before.clone());
+                    reverted += 1;
+                }
+            }
+            for after in &edit.studies_after {
+                if !edit.studies_before.contains(after)
+                    && let Some(index) = self.indicators.iter().position(|s| s == after)
+                {
+                    self.indicators.remove(index);
+                    reverted += 1;
+                }
+            }
+            for (index, before) in edit.studies_before.iter().enumerate() {
+                if !edit.studies_after.contains(before)
+                    && !self
+                        .indicators
+                        .iter()
+                        .any(|s| s.chart.as_ref().map(|c| c.id) == before.chart.as_ref().map(|c| c.id))
+                {
+                    self.indicators.insert(index.min(self.indicators.len()), before.clone());
+                    reverted += 1;
+                }
+            }
+            for object in edit.comparisons_after.iter().filter(|s| !edit.comparisons_before.contains(s)) {
+                if object.created_by == tr_chart::drawings::Author::Agent
+                    && object.turn_id.as_deref() == Some(turn)
+                    && let Some(index) = self.comparisons.iter().position(|c| c == object)
+                {
+                    self.comparisons.remove(index);
+                    reverted += 1;
+                }
+            }
+            for object in edit.comparisons_before.iter().filter(|s| !edit.comparisons_after.contains(s)) {
+                if !self.comparisons.iter().any(|c| c.symbol == object.symbol) {
+                    self.comparisons.push(object.clone());
+                    reverted += 1;
+                }
+            }
+            if self.timeframe == edit.timeframe_after {
+                self.timeframe = edit.timeframe_before;
+            }
+            if self.range == edit.range_after {
+                self.range = edit.range_before;
+            }
+        }
+        if reverted == 0 {
+            bail!("undo did not revert any objects for agent turn {turn}");
+        }
+        Ok(reverted)
+    }
+}
+
+struct SampleExecutor(SampleHost);
+impl ToolExecutor for SampleExecutor {
+    fn execute(&self, registry: Arc<Registry>, call: ToolCall) -> BridgeFuture<'_, ToolResult> {
+        Box::pin(async move {
+            let live = TurnHost { host: &self.0, turn: &call.turn };
+            let mut budget = tr_agent_tools::CallBudget::new(1);
+            let mut ctx = tr_agent_tools::CallContext::new(&self.0, &live, &mut budget);
+            ctx.confirmed = call.confirmed;
+            registry.call(&call.name, &call.arguments, &mut ctx).await
+        })
+    }
+}
+struct TurnHost<'a> {
+    host: &'a SampleHost,
+    turn: &'a str,
+}
+impl LiveHost for TurnHost<'_> {
+    fn call_live<'a>(&'a self, name: &'a str, args: LiveArgs) -> BridgeFuture<'a, ToolResult> {
+        Box::pin(async move {
+            use tr_agent_tools::edits::{Chart, Plan};
+            if matches!(
+                args,
+                LiveArgs::ReadChart(_)
+                    | LiveArgs::ReadUserActions(_)
+                    | LiveArgs::IndicatorValues(_)
+                    | LiveArgs::Screenshot(_)
+            ) {
+                return self.host.call_live(name, args).await;
+            }
+            if tr_agent_tools::edits::chart_id(&args).is_some_and(|id| id != self.host.pin.uid.to_string()) {
+                return ToolResult::error("chart_not_found", "Unknown chart uid", None);
+            }
+            let mut state = self.host.state.lock().unwrap();
+            let before = state.drawings.clone();
+            let studies_before = state.indicators.clone();
+            let range_before = state.range;
+            let comparisons_before = state.comparisons.clone();
+            let timeframe_before = state.timeframe;
+            let timeframe = state.timeframe.unwrap_or(Timeframe::D1);
+            let bars = timeframe.resample_session(&self.host.loaded.bars, self.host.loaded.session);
+            let chart = Chart {
+                uid: self.host.pin.uid,
+                symbol: &self.host.pin.symbol,
+                timeframe,
+                bars: &bars,
+                drawings: &before,
+                indicators: &studies_before,
+                comparisons: &comparisons_before,
+            };
+            let plan = match state.session.plan(&chart, self.turn, args) {
+                Ok(plan) => plan,
+                Err(error) => return error,
+            };
+            let value = match plan {
+                Plan::Drawings(next, id) => {
+                    state.drawings = next;
+                    json!({"id":id})
+                }
+                Plan::Indicators(next, id) => {
+                    state.indicators = next;
+                    json!({"id":id})
+                }
+                Plan::View { symbol, timeframe, from, to } => {
+                    debug_assert_eq!(symbol, self.host.pin.symbol);
+                    state.timeframe = Some(timeframe);
+                    state.range = Some((from, to));
+                    json!({"uid":self.host.pin.uid,"symbol":symbol,"timeframe":timeframe,"from":from,"to":to,"linked_panes":[]})
+                }
+                Plan::Compare(args) => {
+                    match args.action {
+                        tr_agent_tools::args::CompareAction::Add => {
+                            state.comparisons.push(tr_agent_tools::edits::Comparison {
+                                symbol: args.symbol.clone(),
+                                created_by: tr_chart::drawings::Author::Agent,
+                                turn_id: Some(self.turn.into()),
+                            })
+                        }
+                        tr_agent_tools::args::CompareAction::Remove => {
+                            state.comparisons.retain(|s| s.symbol != args.symbol)
+                        }
+                    }
+                    json!({"symbol":args.symbol,"comparisons":state.comparisons})
+                }
+            };
+            let after = state.drawings.clone();
+            let studies_after = state.indicators.clone();
+            let range_after = state.range;
+            let comparisons_after = state.comparisons.clone();
+            let timeframe_after = state.timeframe;
+            state.history.push(SampleEdit {
+                turn: self.turn.into(),
+                before,
+                after,
+                studies_before,
+                studies_after,
+                comparisons_before,
+                comparisons_after,
+                timeframe_before,
+                timeframe_after,
+                range_before,
+                range_after,
+            });
+            state.events.push(json!({"author":"Agent","turn_id":self.turn,"kind":name,"value":value}));
+            ToolResult::json(value)
+        })
+    }
+}
+
 impl DataHost for SampleHost {
     fn history<'a>(
         &'a self,
@@ -144,16 +384,32 @@ impl LiveHost for SampleHost {
             if chart.as_ref().is_some_and(|id| id != &self.pin.uid.to_string()) {
                 return ToolResult::error("chart_not_found", "Unknown chart uid", Some("chart_id"));
             }
+            let state = self.state.lock().unwrap();
+            let timeframe = state.timeframe.unwrap_or(Timeframe::D1);
+            let bars = timeframe.resample_session(&self.loaded.bars, self.loaded.session);
             match args {
                 LiveArgs::ReadChart(_) => {
+                    let studies: Vec<_> = state
+                        .indicators
+                        .iter()
+                        .map(|spec| {
+                            json!({
+                                "tool_id":format!("{}:{}",self.pin.uid,spec.chart.as_ref().unwrap().id),
+                                "spec":spec,
+                                "agent_highlight":spec.chart.as_ref().unwrap().agent_highlight()
+                            })
+                        })
+                        .collect();
                     ToolResult::json(json!({"charts":[{"uid":self.pin.uid,"symbol":self.pin.symbol,
-                    "timeframe":self.pin.timeframe,"source":"sample","loaded_bars":self.loaded.bars.len(),
-                    "first_bar":self.loaded.bars.first(),"last_bar":self.loaded.bars.last(),"drawings":[],"comparisons":[]}]}))
+                    "timeframe":timeframe,"source":"sample","loaded_bars":bars.len(),
+                    "first_bar":bars.first(),"last_bar":bars.last(),"drawings":state.drawings,"studies":studies,"comparisons":state.comparisons,"visible_range":state.range}]}))
                 }
                 LiveArgs::IndicatorValues(_) => ToolResult::json(
-                    json!({"uid":self.pin.uid,"studies":[],"reason":"No studies attached to the headless chart"}),
+                    json!({"uid":self.pin.uid,"studies":state.indicators.iter().map(|spec| json!({"tool_id":format!("{}:{}",self.pin.uid,spec.chart.as_ref().unwrap().id),"spec":spec,"agent_highlight":spec.chart.as_ref().unwrap().agent_highlight(),"values":spec.compute(&tr_core::indicators::registry::Input::new(&bars, timeframe)).iter().map(|output| json!({"name":output.name,"last":output.values.last().filter(|v| v.is_finite())})).collect::<Vec<_>>()})).collect::<Vec<_>>()}),
                 ),
-                LiveArgs::ReadUserActions(_) => ToolResult::json(json!({"events":[]})),
+                LiveArgs::ReadUserActions(_) => ToolResult::json(
+                    json!({"events":state.events.iter().filter(|event| event["author"] == "User").collect::<Vec<_>>()}),
+                ),
                 _ => unreachable!("read-only live tool"),
             }
         })
@@ -168,7 +424,8 @@ async fn run() -> Result<()> {
     let parent = args.home.canonicalize().context("--home must already exist and be app-owned")?;
     let home =
         if parent.join("codex-agent").exists() { PrivateHome::open(&parent)? } else { PrivateHome::create(&parent)? };
-    let options = BridgeOptions::new(home.cwd.to_string_lossy().into_owned());
+    let mut options = BridgeOptions::new(home.cwd.to_string_lossy().into_owned());
+    options.tools = args.tools;
     let transcript = Transcript::create(&args.transcript)?;
     let connector = Arc::new(IsolatedConnector {
         launch: LaunchOptions {
@@ -192,14 +449,10 @@ async fn run() -> Result<()> {
         timeframe: "1D".into(),
         visible_range: loaded.bars.first().zip(loaded.bars.last()).map(|(a, b)| (a.ts, b.ts)),
     };
-    let host = SampleHost { data: Arc::new(data), loaded, pin: pin.clone() };
-    let mut bridge = AgentBridge::start(
-        connector,
-        Arc::new(HostExecutor { data: host.clone(), live: host }),
-        Registry::new(ToolSet::ReadOnly),
-        options,
-    )
-    .await?;
+    let state = Arc::new(Mutex::new(SampleState::default()));
+    let host = SampleHost { data: Arc::new(data), loaded, pin: pin.clone(), state: state.clone() };
+    let mut bridge =
+        AgentBridge::start(connector, Arc::new(SampleExecutor(host)), Registry::new(options.tools), options).await?;
     let result = async {
         let models = bridge.client().list_models().await?;
         let model = models.iter().find(|model| model.model == args.model).context("unknown --model")?;
@@ -239,7 +492,20 @@ async fn run() -> Result<()> {
                     }
                     _ => {}
                 },
-                BridgeEvent::Completed { status, calls, interrupt_elapsed, .. } => {
+                BridgeEvent::Completed { turn, status, calls, interrupt_elapsed } => {
+                    let mut state = state.lock().unwrap();
+                    println!(
+                        "{}",
+                        json!({"drawings":state.drawings,"indicators":state.indicators,"comparisons":state.comparisons,"timeframe":state.timeframe.unwrap_or(Timeframe::D1),"range":state.range,"events":state.events})
+                    );
+                    if args.undo_agent_turn {
+                        let reverted = state.undo(&turn)?;
+                        eprintln!("undid {turn}: {reverted} object operations");
+                        println!(
+                            "{}",
+                            json!({"undo_agent_turn":turn,"drawings":state.drawings,"indicators":state.indicators,"comparisons":state.comparisons,"timeframe":state.timeframe.unwrap_or(Timeframe::D1),"range":state.range})
+                        );
+                    }
                     println!("{}", scrubber.finish());
                     eprintln!("status={status} calls={calls}");
                     if args.verify_recovery && !recovered {
@@ -287,6 +553,7 @@ async fn run() -> Result<()> {
                         .await?;
                 }
                 // Transport errors are consumed by next_event (recover or Err), never forwarded.
+                BridgeEvent::Started { turn } => eprintln!("started agent turn {turn}"),
                 BridgeEvent::Wire(_) => {}
             }
         }
@@ -305,7 +572,7 @@ async fn main() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tr_agent_tools::{CallBudget, CallContext, Content};
 
@@ -323,6 +590,7 @@ mod tests {
             data: Arc::new(data),
             loaded,
             pin: ChartPin { uid: 1, symbol: "AAPL US Equity".into(), timeframe: "1D".into(), visible_range: None },
+            state: Default::default(),
         };
         let registry = Registry::new(ToolSet::ReadOnly);
         let mut budget = CallBudget::default();
@@ -352,5 +620,106 @@ mod tests {
         }
         ctx.confirmed = true;
         assert!(!registry.call("screenshot", "{}", &mut ctx).await.success);
+    }
+
+    /// Invoked from the library's sealed-connector bridge harness, not with
+    /// hand-built ToolCalls. Also compiled in the standalone example test target.
+    #[allow(dead_code)]
+    pub(crate) async fn sample_edit_bridge_roundtrip(
+        make_connector: impl FnOnce(Vec<serde_json::Value>) -> Arc<dyn tr_agent::bridge::Connector>,
+    ) {
+        let data = MarketDataHost {
+            market: SampleProvider::at(1_790_000_000, 1000),
+            price_basis: PriceBasis::Unknown,
+            session: Default::default(),
+        };
+        let loaded = data.history("AAPL US Equity", Timeframe::D1, None, 40).await.unwrap();
+        let first = loaded.bars.first().unwrap();
+        let last = loaded.bars.last().unwrap();
+        let anchors = json!([{"time":first.ts,"price":first.close},{"time":last.ts,"price":last.close}]);
+        let horizontal =
+            json!({"symbol":"AAPL US Equity","kind":"horizontal","anchors":[{"time":first.ts,"price":first.close}]});
+        let state = Arc::new(Mutex::new(SampleState::default()));
+        let pin = ChartPin { uid: 1, symbol: "AAPL US Equity".into(), timeframe: "1D".into(), visible_range: None };
+        let executor =
+            SampleExecutor(SampleHost { data: Arc::new(data), loaded, pin: pin.clone(), state: state.clone() });
+        let calls = [
+            ("create_drawing", horizontal),
+            ("create_drawing", json!({"symbol":"AAPL US Equity","kind":"trend_line","anchors":anchors})),
+            ("add_indicator", json!({"code":"RSI"})),
+            ("set_view", json!({"timeframe":"1W","from":0,"to":2000000000})),
+            ("compare", json!({"symbol":"MSFT","action":"add"})),
+            ("read_chart", json!({})),
+            ("indicator_values", json!({})),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(id, (name, arguments))| {
+            json!({
+                "id":900 + id,"method":"item/tool/call","params":{
+                    "threadId":"thread","turnId":"turn","callId":format!("call-{id}"),
+                    "namespace":"chart","tool":name,"arguments":arguments
+                }
+            })
+        })
+        .collect();
+        let mut options = BridgeOptions::new("empty".into());
+        options.tools = ToolSet::Edit;
+        let mut bridge =
+            AgentBridge::start(make_connector(calls), Arc::new(executor), Registry::new(ToolSet::Edit), options)
+                .await
+                .unwrap();
+        let sent = bridge
+            .send(BridgeTurn {
+                input: TurnInput {
+                    model: "fake".into(),
+                    effort: "low".into(),
+                    text: "edit".into(),
+                    ..Default::default()
+                },
+                pin,
+                requires_tools: true,
+                screenshot_consent: false,
+            })
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match bridge.next_event().await.unwrap() {
+                    BridgeEvent::Completed { turn, calls, .. } => {
+                        assert_eq!(calls, 7);
+                        break turn;
+                    }
+                    BridgeEvent::Wire(_) | BridgeEvent::Started { .. } => {}
+                    other => panic!("unexpected bridge event: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(sent, completed);
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.drawings.len(), 2);
+            assert_eq!(state.indicators.len(), 1);
+            assert!(state.drawings.iter().all(|d| d.created_by == tr_chart::drawings::Author::Agent
+                && d.turn_id.as_deref() == Some(completed.as_str())));
+            assert!(state.events.iter().all(|event| event["author"] == "Agent" && event["turn_id"] == completed));
+            let settings = state.indicators[0].chart.as_ref().unwrap();
+            assert_eq!(settings.created_by, tr_chart::drawings::Author::Agent);
+            assert_eq!(settings.turn_id.as_deref(), Some(completed.as_str()));
+        }
+        {
+            let mut state = state.lock().unwrap();
+            assert_eq!(state.comparisons[0].turn_id.as_deref(), Some(completed.as_str()));
+            assert!(state.undo("unknown-turn").is_err());
+            assert_eq!(state.undo(&completed).unwrap(), 4);
+            assert!(state.undo(&completed).is_err(), "a no-op must fail the driver");
+        }
+        let state = state.lock().unwrap();
+        assert!(state.drawings.is_empty());
+        assert!(state.indicators.is_empty());
+        assert_eq!(state.range, None);
+        assert_eq!(state.timeframe, None);
     }
 }

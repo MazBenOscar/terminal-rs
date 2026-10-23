@@ -421,11 +421,199 @@ real agent home access, network test, or CPU/latency measurement was performed b
 this implementation worker.
 
 ### A2b verification
+## A3 agent edits
+
+The app executor and sample driver now execute the Edit preset through the same
+registry and shared edit validation. App mutations use the existing 8-job / 4-ms
+logic drain. Isolation, readiness, tripwire, scrubbing, result caps and the
+eight-attempt bridge turn budget are unchanged. No agent pane is included here;
+A2b owns that UI.
+
+### Ownership, identity and bounds
+
+- **Session ownership is mandatory.** An agent may update/delete only drawings,
+  studies and comparisons created by its current executor/bridge session. Saved
+  `created_by: Agent` metadata is provenance, not permission. The object must also
+  carry one of this session's creation turns and match its own kind/id/chart record.
+  Reused IDs from layouts or templates do not transfer ownership. Applying a chart
+  template or study preset makes imported studies/comparisons User-owned and clears
+  their turn provenance (templates exclude drawings). Starting a new bridge
+  creates a fresh ownership session; reconnect/resume inside it retains ownership.
+  Enabling Edit is not consent to edit a user's existing objects. This version
+  exposes no grant for user-owned objects and therefore always refuses them.
+- Drawings retain A1a's globally issued numeric IDs. Study tool IDs are opaque
+  strings `chart_uid:study_id`; read_chart/indicator_values expose these as
+  `tool_id` in the app. Study allocation uses each chart's free u32 space, independent
+  of drawing IDs; IDs observed/issued in the ownership session are not recycled.
+  Even a loaded u32::MAX study ID or huge drawing ID does not exhaust that space.
+  Unknown/removed IDs fail; an ID known on another chart fails as `wrong_chart`.
+- A canonical turn ID is `<32 lowercase random hex session nonce>:<decimal sequence>`.
+  Each bridge allocates a fresh 128-bit namespace (SQLite's OS-seeded PRNG, in memory)
+  across bridges, sessions and restarts; reconnects keep it. `send()`, Started/Completed,
+  ToolCall, provenance, edit log and undo APIs all use this ID. The separately held
+  Codex wire ID is only for protocol validation/interrupts, never a host undo key.
+- Agent drawings support every registered kind: horizontal (support/resistance
+  level), vertical, trend_line, ray, rectangle and text. The explicit symbol must
+  match the target chart. `all_symbols` remains the schema's explicit opt-in.
+  Anchors must be finite, have the tool's required point count, lie inside loaded
+  timestamps and not in the future. Absolute prices must not exceed 100 times
+  the loaded absolute price magnitude (minimum magnitude 1), capped at 1e15.
+- At most **20 creations per turn**, cumulatively (deleting/undoing does not refund
+  this allowance), and **100 live agent objects per chart**. The chart count includes
+  Agent drawings/studies/comparisons loaded from disk or created by another session.
+  All three share the allowances. The existing
+  bridge call budget remains stricter for a normal single turn; comparisons also
+  retain the chart's existing eight-comparison maximum.
+- Indicators use the existing core catalogue, parameter normalization, built-cache
+  refresh and study-removal path. Removing a study with any calculation, pane or
+  fill dependents fails rather than cascading into a user's studies.
+- `set_view` clamps both endpoints to loaded data. It operates on the loaded
+  symbol only, with equal or coarser timeframes, using session-aware resampling
+  of loaded bars; it does not fetch/fabricate finer bars or change symbols even
+  though the generic registry schema can express a symbol. Range changes are
+  local; results explicitly report `linked_panes: []`. A changed/closed pin or
+  a user symbol/timeframe change during a turn fails instead of retargeting edits.
+- Drawings, studies and comparisons persist `created_by` / `turn_id`. Missing legacy
+  comparison metadata means User. User remove/re-add creates a new User comparison,
+  even with the same symbol; the agent cannot remove it. Drawing/study Agent badges are
+  derived from `created_by`, not from labels or edit-log text. Drawing-list and
+  selected-drawing menus and study legends/tooltips expose provenance, **Keep**
+  and Delete/Remove. Keep converts the object to User ownership and prevents
+  subsequent agent mutation and turn undo from removing it.
+
+Structured failures have `success: false` and JSON
+`{"error":{"code":"...","message":"...","field":"..."}}` (field is optional).
+Existing registry codes `invalid_args`, `tool_disabled`, `budget_exhausted`,
+`confirmation_required` and host timeout/cancellation behavior are retained. A3
+adds the live-host codes listed in `tr_agent_tools::edits::ERROR_CODES`:
+
+| Code | Meaning |
+|---|---|
+| `stale_id` | Unknown or removed object |
+| `wrong_chart` | Another chart/symbol owns the requested ID |
+| `not_owned` | User-owned, kept, previous-session object, or study with dependents |
+| `chart_not_found` | Target or original pin was closed |
+| `pin_changed` | Pin, pinned symbol or timeframe changed during the turn |
+| `turn_object_limit` | Twenty creations already admitted for this turn |
+| `chart_object_limit` | One hundred live agent objects already exist |
+
+### A2b APIs and undo
+
+```rust
+// Default remains ReadOnly. Opt in before starting a NEW bridge/thread:
+let mut options = BridgeOptions::new(private_cwd);
+options.tools = tr_agent_tools::ToolSet::Edit;
+let bridge = AppExecutor::new(&app).start(connector, options).await?;
+
+// UI-thread APIs; no pane dependency:
+agent_bridge::agent_edit_tools_available() -> bool // true
+app.last_agent_turn() -> Option<&str>
+app.last_agent_turn_for_chart(uid: u64) -> Option<&str>
+app.undoable_agent_turns() -> Vec<&str>
+app.agent_turn_undo_available(turn_id: &str) -> bool
+app.undo_agent_turn(turn_id: &str) -> Result<agent_bridge::UndoSummary, String>
+// UndoSummary { charts: usize, reverted: usize, skipped: Vec<String> }
+```
+
+Do not call start on the UI thread; as in A2a, obtain the executor/pin there and
+move only the executor and options to the background owner task. ReadOnly still
+rejects every mutation before queueing it. The normal layout autosave serializes
+these same chart drawing/study/view fields; no separate agent save format exists.
+Successful edits and turn undo request autosave even without `ui()`. If a writer
+is already running, logic coalesces a fresh snapshot after it finishes. Only that
+pending-save interval requests timed wakeups; an idle agent adds no polling.
+
+The command bar accepts **`UNDO AGENT`** for the global latest undoable turn. The
+chart context menu offers **Undo latest agent turn touching this chart (all charts)**:
+it selects the latest turn with retained undo state on THAT chart, independent of
+focus or pin, then undoes the **whole turn on all affected charts**. Its internal
+command is `UNDO AGENT CHART <uid>`. The all-chart scope is explicit in the label.
+Undo uses A1a's inverse drawing operations by ID and neighbouring z-order, not a
+whole-chart rollback. Studies are inverted by instance ID and neighbours; view
+rollback compares the expected post-edit state first. Comparison undo checks the
+expected author/creation turn, preserves user re-adds, and reports missing or
+conflicting objects in `skipped`; no-op removals are never counted as reverted.
+Interleaved user edits, Keep, user-created studies and changed view state survive.
+Undo history is session-local (drawing history retains A1a's existing 64-step
+bound); layouts save provenance, not undo stacks. Layout replacement clears the
+undoable list. Availability APIs (also exposed per-chart by read_chart) exclude
+turns with no retained inverse state. An unavailable turn returns
+`undo for this agent turn is no longer available (layout changed/app restarted)`
+instead of a successful zero-operation report.
+
+### Exact A3 live commands (manager only; not run during implementation)
+
+Run from the repository root with the manager's already signed-in **app-owned**
+private home, never the user's Codex home. Transcript filenames must be new.
+The driver defaults to `--tools read-only`; `--tools edit` is explicit opt-in.
+It prints resulting drawings, indicators, comparisons, timeframe, range and edit
+events as JSON at turn completion. `--undo-agent-turn` then performs host-side undo of that completed
+turn using its canonical ID and prints the resulting chart as a second JSON record.
+It exits nonzero unless at least one object was actually reverted (a view-only or
+no-op undo is not proof of object undo). The offline driver regression runs the
+actual sample adapter through the sealed fake-connector bridge, not hand-built
+ToolCalls with an invented wire ID.
+
+```sh
+TR_PROVIDER=sample cargo run --offline -p tr-agent --example agent_bridge -- \
+  --home "$HOME/Library/Application Support/terminal-rs-agent-spike" \
+  --model gpt-6.1-sol --tools edit \
+  --prompt "Read the pinned chart and read_data with limit 20. Using only loaded bar timestamps and prices, create one horizontal support level at a recent low, one trend_line with two loaded anchors, and add_indicator RSI 14. Use at most five tool calls. Report each returned object id and explain that these are sample bars." \
+  --transcript "$HOME/Library/Application Support/terminal-rs-agent-spike/raw-a3-edits-1.jsonl"
+
+TR_PROVIDER=sample cargo run --offline -p tr-agent --example agent_bridge -- \
+  --home "$HOME/Library/Application Support/terminal-rs-agent-spike" \
+  --model gpt-6.1-sol --tools edit --undo-agent-turn \
+  --prompt "Read the pinned chart and read_data with limit 20. Create a horizontal support level and a two-anchor trend_line using loaded timestamps/prices, then add_indicator RSI with params [14]. Use at most five tool calls; return the ids. The host will undo this turn after completion." \
+  --transcript "$HOME/Library/Application Support/terminal-rs-agent-spike/raw-a3-undo-1.jsonl"
+```
+
+In the app, after A2b wires the Edit toggle: send that first prompt, add/move a user
+drawing during the agent turn, then enter **`UNDO AGENT`**. Check that Agent objects
+from that turn disappear/revert while the user drawing and its z-order survive.
+Use Keep on an Agent drawing/study before undo to check conflict preservation.
+The offline tests cover these behaviors without a real child or network.
+
+### A3 verification (2026-10-23; original implementation, historical)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | PASS; test counts N/A |
+| `cargo clippy --workspace --all-targets --offline -- -D warnings` | PASS, zero warnings; test counts N/A |
+| `cargo test --workspace --offline -- --quiet` | PASS: 1,234 passed, 0 failed, 7 pre-existing ignored; includes the sealed-connector compile-fail doctest |
+| `cargo test -p tr-agent --examples --offline -- --quiet` | PASS: 3 passed, 0 failed, 0 ignored; includes both headless bridge tests |
+
+A3 adds seven app-executor integration tests and four shared-validation tests,
+plus the headless edit/undo example test. Coverage includes all drawing kinds,
+CRUD, session ownership, structured failures, combined limits, Keep/highlights,
+interleaved undo/z-order, loaded-data view clamping/resampling, changed pins and
+closed charts, and logic-only autosave coalescing with an in-flight writer.
+No real Codex process or manager home was accessed; live commands above remain
+manager-run checks, not an A3 live verification claim.
+
+### A3-FIX verification (2026-10-23)
+
+All five reviewer `BUG` ignores are removed. The app's reused-turn regression now
+uses the same canonical allocator as the bridge: injecting the identical
+`bridge-1` ToolCall ID for two sessions contradicts the new identity contract
+(the same ID denotes the same turn). Bridge tests independently verify matching
+send/Started/tool/completion IDs and uniqueness across bridges. Comparison fixtures
+now supply real author/turn metadata; the ordinary-study reservation fixture uses
+a chart-local ID rather than depending on the unrelated drawing counter.
+
+Additional regressions cover drawing/study ownership after ID reuse, comparison
+remove/re-add and undo conflicts (including missing/no-op removals), persisted
+comparison provenance, layout/restart unavailability, chart-specific turn
+selection with whole-turn undo, template ownership transfer, and huge drawing /
+maximum-u32 study IDs. The driver regression exercises the actual example adapter
+through the in-module sealed fake connector; production Connector sealing is intact.
 
 | Command | Result |
 |---|---|
 | `cargo fmt --all` | PASS; test counts N/A |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS, zero warnings; test counts N/A |
+A2b verification:
+
 | `cargo test --workspace` | PASS: **1,239 passed, 0 failed, 7 pre-existing ignored**, including the sealed-Connector compile-fail doctest |
 
 The focused `cargo test -p terminal-rs agent_` run passed 33 tests, with 0 failed
@@ -434,6 +622,16 @@ settings, pickers, rate-limit/privacy projection, queue/recovery, dirty timers,
 keyboard/focus guards, login cancel/reopen/failure and committed A0 fixture replay.
 The seven existing ignored tests require public-provider network availability;
 none was enabled. No dependency was added and no live acceptance check was run.
+
+
+A3 verification:
+
+| `cargo test --workspace` | PASS: 1,249 passed, 0 failed, 7 pre-existing network tests ignored; includes compile-fail doctest |
+| `cargo test -p tr-agent --examples` | PASS: 2 passed, 0 failed, 0 ignored; bridge driver regression now runs in the library suite |
+
+No new crates or network tests; no real Codex execution, manager-home access, or
+changes to isolation/tripwire/scrubber/caps/readiness.
+
 
 ## A2a verification (historical)
 
