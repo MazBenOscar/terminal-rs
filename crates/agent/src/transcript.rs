@@ -230,7 +230,7 @@ mod tests {
             "authUrl":"https://login.example/?state=secret", "text":"trader@example.com user-123 org-456 sk-abcdef eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturelong",
             "rateLimitsByLimitId":{"private-quota":{"limitId":"private-quota","usedPercent":5}},
             "account":{"id":"nested-account"}, "tokenUsage":{"totalTokens":123},
-            "serverName":"traders-macbook.local", "credits":{"balance":"62500.0"}, "planType":"pro", "cwd":"/Users/trader/Library/agent/empty", "path":"/home/trader/x"
+            "serverName":"traders-macbook.local", "credits":{"balance":"1234.5"}, "planType":"pro", "cwd":"/Users/trader/Library/agent/empty", "path":"/home/trader/x"
         });
         scrub_value(&mut value);
         let text = value.to_string();
@@ -247,7 +247,7 @@ mod tests {
             "traders-macbook",
             "/Users/trader",
             "/home/trader",
-            "62500",
+            "1234.5",
             "\"pro\"",
         ] {
             assert!(!text.contains(secret), "{secret}");
