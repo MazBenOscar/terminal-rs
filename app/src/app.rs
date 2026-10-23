@@ -1920,23 +1920,31 @@ impl TerminalApp {
                     self.net_hits = (query, hits);
                 }
                 Response::Trade(r) => self.on_trade(*r),
+                Response::CongressPaused(summary) => self.show_congress_pause(summary),
                 Response::CongressRefreshed(summary) => {
                     self.congress_status = summary.to_string();
                     self.congress_checked = Some(chrono::Local::now());
-                    self.status = format!("Congress disclosures updated: {summary}");
+                    self.status = if summary.contains("source paused until") {
+                        summary
+                    } else {
+                        format!("Congress disclosures updated: {summary}")
+                    };
                     self.refresh_congress_views();
                 }
             }
         }
     }
 
+    /// A persisted pause is display state, not evidence of a completed check.
+    fn show_congress_pause(&mut self, summary: String) {
+        self.congress_status = summary.clone();
+        self.status = summary;
+    }
+
     /// Freshness line for the Congress feed: last check, newest filing, next check.
     fn congress_freshness(&self) -> String {
         let newest = self.latest.iter().map(|t| t.filed_date).max();
-        let minutes = std::env::var("TR_CONGRESS_REFRESH_MIN")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(crate::worker::CONGRESS_REFRESH_MIN as i64);
+        let minutes = crate::worker::congress_refresh_minutes() as i64;
         let mut parts = Vec::new();
         match self.congress_checked {
             Some(t) => {
@@ -1945,6 +1953,8 @@ impl TerminalApp {
                     parts.push(format!("next {}", (t + chrono::Duration::minutes(minutes)).format("%H:%M")));
                 }
             }
+            None if self.congress_status.contains("source paused until") => {}
+            None if minutes == 0 => parts.push("Congress refresh disabled".into()),
             None => parts.push("checking Senate eFD + House Clerk…".into()),
         }
         if let Some(d) = newest {
@@ -2722,6 +2732,23 @@ mod tests {
         app.finish_save();
         log.lock().unwrap().clear();
         (app, log)
+    }
+
+    #[test]
+    fn startup_congress_pause_does_not_claim_a_check() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/congress-pause-display");
+        let mut app = TerminalApp::test_workspace(&root);
+        let pause = "Senate source paused until 2026-10-24: site refused requests";
+        app.show_congress_pause(pause.into());
+        assert!(app.congress_checked.is_none());
+        assert_eq!(app.status, pause);
+        let freshness = app.congress_freshness();
+        assert!(freshness.contains(pause));
+        assert!(!freshness.contains("checked") && !freshness.contains("checking"));
+        let previous = chrono::Local::now() - chrono::Duration::hours(1);
+        app.congress_checked = Some(previous);
+        app.show_congress_pause(pause.into());
+        assert_eq!(app.congress_checked, Some(previous));
     }
 
     #[test]

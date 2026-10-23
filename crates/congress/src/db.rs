@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS alerts (
     seen          INTEGER NOT NULL DEFAULT 0,
     UNIQUE (filing_id)
 );
+CREATE TABLE IF NOT EXISTS source_cooldowns (
+    site          TEXT PRIMARY KEY,
+    blocked_until INTEGER NOT NULL,
+    strikes       INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -203,7 +208,48 @@ impl Db {
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        // Migrate existing databases without resetting their error retry budgets.
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(filings)")?
+            .query_map([], |r| r.get(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !columns.iter().any(|c| c == "attempt_count") {
+            conn.execute_batch(
+                "ALTER TABLE filings ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE filings ADD COLUMN first_attempt_at INTEGER NOT NULL DEFAULT 0;
+                UPDATE filings SET first_attempt_at = fetched_at;",
+            )?;
+        }
         Ok(Self { conn })
+    }
+
+    /// Persisted refusal state; expired pauses retain their strikes until success.
+    pub fn source_cooldown(&self, site: &str) -> Result<(i64, u32)> {
+        Ok(self
+            .conn
+            .query_row("SELECT blocked_until, strikes FROM source_cooldowns WHERE site = ?1", [site], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub fn refuse_source(&self, site: &str, now: i64, retry_after: Option<i64>) -> Result<i64> {
+        let (_, strikes) = self.source_cooldown(site)?;
+        let strikes = strikes.saturating_add(1);
+        let hours = 6_i64 << (strikes - 1).min(2);
+        let until = now.saturating_add(hours * 3600).max(retry_after.unwrap_or(0).min(now.saturating_add(7 * 86400)));
+        self.conn.execute(
+            "INSERT INTO source_cooldowns (site, blocked_until, strikes) VALUES (?1, ?2, ?3)
+             ON CONFLICT(site) DO UPDATE SET blocked_until = excluded.blocked_until, strikes = excluded.strikes",
+            params![site, until, strikes],
+        )?;
+        Ok(until)
+    }
+
+    pub fn reset_source(&self, site: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM source_cooldowns WHERE site = ?1", [site])?;
+        Ok(())
     }
 
     pub fn conn(&self) -> &Connection {
@@ -281,20 +327,46 @@ impl Db {
         Ok(merged)
     }
 
+    /// Stored errors are known for discovery too. Retry eligibility is separate so
+    /// exhausted errors never turn back into unlimited new discoveries.
     pub fn known_filing_ids(&self, chamber: Chamber) -> Result<HashSet<String>> {
-        let mut st = self.conn.prepare_cached("SELECT id FROM filings WHERE chamber = ?1 AND status <> 'error'")?;
+        let mut st = self.conn.prepare_cached("SELECT id FROM filings WHERE chamber = ?1")?;
         let ids = st.query_map([chamber.as_str()], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         Ok(ids)
+    }
+
+    /// At most three total attempts, spaced by a full day, within seven days.
+    /// fetched_at is the persisted last-attempt timestamp (including parse failures).
+    pub fn retry_filing_ids(&self, chamber: Chamber) -> Result<HashSet<String>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT id FROM filings WHERE chamber = ?1
+            AND status = 'error' AND attempt_count < 3 AND fetched_at <= ?2 - 86400
+            AND first_attempt_at >= ?2 - 604800",
+        )?;
+        Ok(st
+            .query_map(params![chamber.as_str(), Utc::now().timestamp()], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A retry that failed before parsing still consumes its daily/total budget.
+    pub fn record_failed_retry(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE filings SET attempt_count = attempt_count + 1, fetched_at = ?2
+            WHERE id = ?1 AND status = 'error'",
+            params![id, Utc::now().timestamp()],
+        )?;
+        Ok(())
     }
 
     /// Store a filing and replace its trades atomically. Returns trades written.
     pub fn insert_filing(&mut self, f: &FilingRecord, trades: &[ParsedTrade]) -> Result<usize> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO filings (id, chamber, politician_id, filed_date, url, kind, status, error, is_amendment, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO filings (id, chamber, politician_id, filed_date, url, kind, status, error, is_amendment, fetched_at, first_attempt_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
              ON CONFLICT (id) DO UPDATE SET status = excluded.status, error = excluded.error,
-               filed_date = excluded.filed_date, fetched_at = excluded.fetched_at",
+               filed_date = excluded.filed_date, fetched_at = excluded.fetched_at,
+               attempt_count = filings.attempt_count + 1",
             params![
                 f.id,
                 f.chamber.as_str(),
@@ -464,6 +536,34 @@ impl Db {
             "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    pub fn has_filings(&self, chamber: Chamber) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM filings WHERE chamber = ?1)", [chamber.as_str()], |r| r.get(0))?)
+    }
+
+    /// Import the legacy discovery date once, and only for chambers already populated.
+    /// The marker also prevents a later, partially backfilled chamber from inheriting it.
+    /// The legacy key is left untouched and is no longer written by refreshes.
+    pub fn migrate_refresh_dates(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "INSERT OR IGNORE INTO meta (key, value)
+             SELECT 'last_refresh_date_house', value FROM meta
+             WHERE key = 'last_refresh_date'
+               AND EXISTS(SELECT 1 FROM filings WHERE chamber = 'House')
+               AND NOT EXISTS(SELECT 1 FROM meta WHERE key = 'chamber_refresh_dates_migrated');
+             INSERT OR IGNORE INTO meta (key, value)
+             SELECT 'last_refresh_date_senate', value FROM meta
+             WHERE key = 'last_refresh_date'
+               AND EXISTS(SELECT 1 FROM filings WHERE chamber = 'Senate')
+               AND NOT EXISTS(SELECT 1 FROM meta WHERE key = 'chamber_refresh_dates_migrated');
+             INSERT OR IGNORE INTO meta (key, value) VALUES ('chamber_refresh_dates_migrated', '1');",
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

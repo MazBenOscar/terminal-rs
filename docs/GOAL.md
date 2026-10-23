@@ -15,6 +15,7 @@ Pure Rust, fully native, no web frontend: wgpu for GPU chart rendering plus a fa
 4. Congress trades (key feature): ingest STOCK Act disclosures directly from official sources: Senate eFD (efdsearch.senate.gov) and House Clerk PTR filings (disclosures-clerk.house.gov), including PDF/XML parsing. Normalise politician, party, chamber, ticker, buy/sell, amount range, transaction date and filed date into SQLite, refreshed on a schedule.
    - Panels: latest trades feed; politician profile (history, estimated performance); per-ticker list of who in Congress traded it.
    - Chart overlay: B/S markers at transaction dates coloured by party, with a hover card and the disclosure lag.
+   - Official-source etiquette: one request in flight per site, at least one second between requests, and at most 200 new filings per chamber per run (newest first). First-run discovery covers only the last 90 days; capped backlogs drain on later runs. Refusals/challenges pause the site in SQLite for 6, then 12, then 24 hours (or longer when `Retry-After` asks); successful refreshes reset strikes. Senate roster/eFD share a pause, while House roster/disclosure hosts are independent. Pauses survive app restarts and appear in Congress freshness with a local resume time. `TR_PROVIDER=sample` disables Congress refresh unless `TR_CONGRESS_REFRESH_MIN` is explicitly set; `0` disables it.
 5. Alerts when a tracked politician files a new trade.
 
 ## Quality

@@ -48,8 +48,13 @@ use tr_alerts::history_is_stale;
 
 pub type PaneId = u64;
 
-/// Minutes between Congress disclosure checks (`TR_CONGRESS_REFRESH_MIN`; 0 disables).
-pub const CONGRESS_REFRESH_MIN: u64 = 30;
+/// Shared scheduler/freshness setting; sample data never opts into live disclosures by default.
+pub fn congress_refresh_minutes() -> u64 {
+    refresh::refresh_minutes(
+        std::env::var("TR_PROVIDER").ok().as_deref(),
+        std::env::var("TR_CONGRESS_REFRESH_MIN").ok().as_deref(),
+    )
+}
 
 /// Bounded, on-demand scanner universe. Larger universes need a bulk data provider.
 pub const MAX_SCAN_SYMBOLS: usize = 200;
@@ -542,6 +547,7 @@ pub enum Response {
     },
     Status(String),
     CongressRefreshed(String),
+    CongressPaused(String),
     Curves(Box<YieldCurves>),
     SymbolCatalog {
         venue: tr_core::crypto::CryptoVenue,
@@ -826,6 +832,7 @@ struct Shared {
     cache: std::sync::Mutex<Option<BarCache>>,
     scan_store: std::sync::Mutex<Option<ScanStore>>,
     db: Mutex<Db>,
+    congress_source: Mutex<Option<HttpSource>>,
     out: mpsc::Sender<Response>,
     ctx: egui::Context,
 }
@@ -884,6 +891,7 @@ impl Worker {
             cache: std::sync::Mutex::new(cache),
             scan_store: std::sync::Mutex::new(scan_store),
             db: Mutex::new(db),
+            congress_source: Mutex::new(None),
             out,
             ctx,
         });
@@ -914,15 +922,18 @@ impl Worker {
         // Scheduled congressional disclosure refresh.
         let s = shared.clone();
         rt.spawn(async move {
-            let minutes: u64 = std::env::var("TR_CONGRESS_REFRESH_MIN")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(CONGRESS_REFRESH_MIN);
+            if let Ok(paused) = refresh::paused_sources(&*s.db.lock().await)
+                && !paused.is_empty()
+            {
+                s.send(Response::CongressPaused(paused.join(" · ")));
+            }
+            let minutes = congress_refresh_minutes();
             if minutes == 0 {
                 return;
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
             let mut tick = tokio::time::interval(Duration::from_secs(minutes * 60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 congress_refresh(&s).await;
@@ -937,13 +948,23 @@ impl Worker {
 }
 
 async fn congress_refresh(s: &Shared) {
-    s.send(Response::Status("Refreshing congressional disclosures (Senate eFD + House Clerk)…".into()));
-    let source = match HttpSource::new() {
-        Ok(src) => src,
-        Err(e) => return s.send(Response::Status(format!("congress refresh failed: {e:#}"))),
+    if congress_refresh_minutes() == 0 {
+        return s.send(Response::Status("Congress refresh disabled".into()));
+    }
+    // A single reusable source serialises manual and scheduled runs and preserves pacing.
+    let Ok(mut guard) = s.congress_source.try_lock() else {
+        return s.send(Response::Status("Congress refresh already running".into()));
     };
+    if guard.is_none() {
+        match HttpSource::new() {
+            Ok(src) => *guard = Some(src),
+            Err(e) => return s.send(Response::Status(format!("congress refresh failed: {e:#}"))),
+        }
+    }
+    let source = guard.as_ref().expect("source initialised");
+    s.send(Response::Status("Refreshing congressional disclosures (Senate eFD + House Clerk)…".into()));
     let cfg = RefreshConfig::incremental(&*s.db.lock().await);
-    match refresh::refresh(&source, &s.db, &cfg).await {
+    match refresh::refresh(source, &s.db, &cfg).await {
         Ok(report) => {
             if !report.alerts.is_empty() {
                 s.send(Response::NewAlerts(report.alerts.clone()));
@@ -2657,6 +2678,7 @@ mod tests {
                 cache: std::sync::Mutex::new(None),
                 scan_store: std::sync::Mutex::new(None),
                 db: Mutex::new(Db::open_in_memory().unwrap()),
+                congress_source: Mutex::new(None),
                 out,
                 ctx: egui::Context::default(),
             }),
@@ -3482,6 +3504,7 @@ mod tests {
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
+            congress_source: Mutex::new(None),
             out,
             ctx: egui::Context::default(),
         });
@@ -3625,6 +3648,7 @@ mod tests {
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
+            congress_source: Mutex::new(None),
             out,
             ctx: egui::Context::default(),
         });
@@ -3705,6 +3729,7 @@ mod tests {
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
             db: Mutex::new(Db::open_in_memory().unwrap()),
+            congress_source: Mutex::new(None),
             out,
             ctx: egui::Context::default(),
         };
@@ -3780,6 +3805,7 @@ mod tests {
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
             db: Mutex::new(Db::open_in_memory().unwrap()),
+            congress_source: Mutex::new(None),
             out,
             ctx: egui::Context::default(),
         };
@@ -3862,6 +3888,7 @@ mod tests {
             cache: std::sync::Mutex::new(None),
             scan_store: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
+            congress_source: Mutex::new(None),
             out,
             ctx: egui::Context::default(),
         };

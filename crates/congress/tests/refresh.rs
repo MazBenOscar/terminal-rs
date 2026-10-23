@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use chrono::NaiveDate;
 use tokio::sync::Mutex;
 use tr_congress::house::{self, IndexEntry};
-use tr_congress::refresh::{RefreshConfig, Source, refresh};
+use tr_congress::refresh::{RefreshConfig, Site, Source, refresh};
 use tr_congress::roster::{self, Roster};
 use tr_congress::senate::{self, ReportRef};
 use tr_congress::{Chamber, Db, Party};
@@ -21,10 +21,18 @@ struct Fixtures {
 }
 
 impl Source for Fixtures {
-    async fn rosters(&self) -> Result<Roster> {
-        let h = String::from_utf8(read("roster/house_members.xml"))?;
-        let s = String::from_utf8(read("roster/senators.xml"))?;
-        Ok(Roster::new(roster::parse_house_roster(&h)?, roster::parse_senate_roster(&s)?))
+    async fn roster_for(&self, site: Site) -> Result<Roster> {
+        match site {
+            Site::HouseRoster => {
+                let h = String::from_utf8(read("roster/house_members.xml"))?;
+                Ok(Roster::new(roster::parse_house_roster(&h)?, vec![]))
+            }
+            Site::Senate => {
+                let s = String::from_utf8(read("roster/senators.xml"))?;
+                Ok(Roster::new(vec![], roster::parse_senate_roster(&s)?))
+            }
+            Site::House => Ok(Roster::default()),
+        }
     }
     async fn house_index(&self, _year: i32) -> Result<Vec<IndexEntry>> {
         house::parse_index_xml(&String::from_utf8(read("house/2026FD.xml"))?)
@@ -49,7 +57,13 @@ impl Source for Fixtures {
 }
 
 fn cfg() -> RefreshConfig {
-    RefreshConfig { house_years: vec![2026], senate_since: None, max_new_per_chamber: 100, concurrency: 2 }
+    RefreshConfig {
+        house_years: vec![2026],
+        house_since: None,
+        senate_since: None,
+        max_new_per_chamber: 100,
+        concurrency: 2,
+    }
 }
 
 #[tokio::test]
