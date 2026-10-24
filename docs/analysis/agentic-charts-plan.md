@@ -476,12 +476,33 @@ Acceptance criteria:
 
 ### A5: more tools
 
-- Branch: `codex/agent-workflows`
+A hands-on comparison with CoinMarketCap Agentic Charts (2026-10-23) showed that its
+agent cannot create alerts or change a watchlist: it states the rule and stops. A5
+therefore leads with confirmed workflow tools, and a small A3c carries the
+answer-shape lessons from the same comparison.
 
-Work:
+**A5a: watchlist and alert tools** (`codex/agent-workflows`)
 
-- Watchlist and alert tools, with confirmation.
-- Scanner and multi-chart tools.
+- Seven workflow tools plus `list_alerts` and `list_watchlists`. They are enabled in
+  Chart edits mode; Read only gets the two list tools only.
+- Every mutating call becomes a proposal. An inline card offers Approve or Decline.
+  Nothing is applied without a click, and proposals expire after 10 minutes.
+- Close alerts fire only on a finished bar of the chosen timeframe, never on the
+  forming bar.
+- Turn undo also reverts approved workflow changes when it is safe, and reports
+  anything it had to keep.
+- Agent-created alerts carry an "Agent" provenance marker.
+
+**A3c: answer shape** (`codex/agent-answers`)
+
+- Answers open with a verdict, then evidence with the finished bar kept separate from
+  the forming bar, then the invalidation level.
+- Support and resistance are drawn as zones. Agent labels carry a timeframe prefix
+  (W1, H4).
+- The agent asks a clarifying question when the request is ambiguous.
+- The turn footer shows how long the turn took. Suggested prompts are grouped.
+
+**A5b (later): scanner and multi-chart tools.**
 - mmx stays deferred. If it is added later, call the MiniMax Messages API directly
   (this needs the reqwest `stream` feature) rather than a CLI per step.
 
