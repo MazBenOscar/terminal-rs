@@ -84,7 +84,8 @@ impl TerminalApp {
                 if self.agent_demo.is_none()
                     && let Some(approve) = action
                 {
-                    self.confirm_workflows(&turn, approve);
+                    let ids = self.agent_pane.proposal_shown.get(&turn).cloned().unwrap_or_default();
+                    self.confirm_shown_workflows(&turn, approve, Some(&ids));
                 }
                 return true;
             }
@@ -400,6 +401,12 @@ impl TerminalApp {
     }
 
     pub(crate) fn confirm_workflows(&mut self, turn: &str, approve: bool) {
+        self.confirm_shown_workflows(turn, approve, None);
+    }
+
+    /// `shown` limits the decision to proposals the user saw on the card (UI paths
+    /// always pass it); `None` decides every pending proposal of the turn.
+    pub(crate) fn confirm_shown_workflows(&mut self, turn: &str, approve: bool, shown: Option<&[u64]>) {
         use crate::agent_bridge::ProposalStatus;
         use tr_agent::codex::{WorkflowResult, WorkflowStatus};
         self.agent_pane.workflows.expire(std::time::Instant::now(), None);
@@ -410,7 +417,12 @@ impl TerminalApp {
             .proposals
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.turn == turn && p.status == ProposalStatus::Pending && (!approve || p.selected))
+            .filter(|(_, p)| {
+                p.turn == turn
+                    && p.status == ProposalStatus::Pending
+                    && (!approve || p.selected)
+                    && shown.is_none_or(|ids| ids.contains(&p.id))
+            })
             .map(|(i, _)| i)
             .collect();
         for index in proposals {
@@ -779,8 +791,8 @@ impl TerminalApp {
             return;
         }
         match action {
-            Action::Confirm { turn, approve } => {
-                self.confirm_workflows(&turn, approve);
+            Action::Confirm { turn, approve, ids } => {
+                self.confirm_shown_workflows(&turn, approve, Some(&ids));
                 self.refresh_agent_undo();
             }
             Action::Check => self.start_agent_session(ctx),
@@ -1904,6 +1916,7 @@ mod review_tests {
             });
             let ctx = egui::Context::default();
             frame(&ctx, vec![], |ui| app.agent_panel(ui, id));
+            frame(&ctx, vec![], |ui| app.agent_panel(ui, id));
             let mut ids: Vec<_> = app.agent_pane.proposal_focus.keys().copied().collect();
             ids.sort_by_key(|id| id.value());
             (app, ctx, ids)
@@ -1923,6 +1936,30 @@ mod review_tests {
         // One of the two focused buttons is Decline: Enter there must not approve.
         assert_eq!(outcomes.iter().filter(|s| **s == ProposalStatus::Approved).count(), 1, "{outcomes:?}");
         assert_eq!(outcomes.iter().filter(|s| **s == ProposalStatus::Declined).count(), 1, "{outcomes:?}");
+    }
+
+    #[test]
+    fn approve_applies_only_proposals_shown_on_the_card() {
+        use crate::agent_bridge::ProposalStatus;
+        let (mut app, id) = agent_app("workflow-shown-only");
+        for name in ["Seen", "Late"] {
+            app.agent_workflow(
+                "shown:1",
+                tr_agent_tools::args::LiveArgs::CreateWatchlist(tr_agent_tools::args::CreateWatchlist {
+                    name: name.into(),
+                }),
+            );
+        }
+        let seen = app.agent_pane.workflows.proposals[0].id;
+        app.agent_action(
+            &egui::Context::default(),
+            id,
+            agent_pane::Action::Confirm { turn: "shown:1".into(), approve: true, ids: vec![seen] },
+        );
+        assert_eq!(app.agent_pane.workflows.proposals[0].status, ProposalStatus::Approved);
+        assert_eq!(app.agent_pane.workflows.proposals[1].status, ProposalStatus::Pending, "unseen stays pending");
+        assert!(app.watchlists.iter().any(|w| w.name == "Seen"));
+        assert!(!app.watchlists.iter().any(|w| w.name == "Late"));
     }
 
     #[test]
@@ -1954,6 +1991,7 @@ mod review_tests {
             interrupt_elapsed: None,
         });
         let ctx = egui::Context::default();
+        frame(&ctx, vec![], |ui| app.agent_panel(ui, id));
         frame(&ctx, vec![], |ui| app.agent_panel(ui, id));
         let checkbox =
             *app.agent_pane.proposal_focus.keys().find(|id| !app.agent_pane.proposal_buttons.contains_key(id)).unwrap();

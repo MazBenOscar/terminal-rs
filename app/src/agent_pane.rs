@@ -393,6 +393,12 @@ pub struct AgentPane {
     pub proposal_focus: HashMap<egui::Id, String>,
     /// Only buttons have an Enter action; other card controls only own Escape.
     pub proposal_buttons: HashMap<egui::Id, bool>,
+    /// Pending proposal ids drawn last frame, per turn; persists across frames.
+    proposal_seen: HashMap<String, Vec<u64>>,
+    /// Pending ids drawn in both the previous and the current frame. Approve and
+    /// Decline act only on these, so a proposal that arrives as the user clicks is
+    /// never decided without having been on screen.
+    pub proposal_shown: HashMap<String, Vec<u64>>,
     pub state: Onboarding,
     pub models: Vec<Model>,
     pub limits: Vec<Limit>,
@@ -430,6 +436,8 @@ impl Default for AgentPane {
             workflows: Default::default(),
             proposal_focus: Default::default(),
             proposal_buttons: Default::default(),
+            proposal_seen: Default::default(),
+            proposal_shown: Default::default(),
             state: Onboarding::Dormant,
             models: Vec::new(),
             limits: Vec::new(),
@@ -475,7 +483,12 @@ pub enum Action {
     Send(Prompt),
     SetTools(ToolsMode),
     UndoTurn(String),
-    Confirm { turn: String, approve: bool },
+    /// `ids` are the pending proposals the user saw; others in the turn stay pending.
+    Confirm {
+        turn: String,
+        approve: bool,
+        ids: Vec<u64>,
+    },
     Pin,
     Close,
 }
@@ -1159,14 +1172,25 @@ impl AgentPane {
         let rows: Vec<_> =
             self.workflows.proposals.iter().enumerate().filter(|(_, p)| p.turn == turn).map(|(i, _)| i).collect();
         if rows.is_empty() {
+            self.proposal_seen.remove(turn);
+            self.proposal_shown.remove(turn);
             return;
         }
+        let pending: Vec<u64> = rows
+            .iter()
+            .map(|&i| &self.workflows.proposals[i])
+            .filter(|p| p.status == ProposalStatus::Pending)
+            .map(|p| p.id)
+            .collect();
+        let seen = self.proposal_seen.insert(turn.into(), pending.clone()).unwrap_or_default();
+        let shown: Vec<u64> = pending.into_iter().filter(|id| seen.contains(id)).collect();
+        self.proposal_shown.insert(turn.into(), shown.clone());
         let multi = rows.len() > 1;
         let focused = ui.memory(|m| m.focused());
         let card_focused = focused.is_some_and(|id| self.proposal_focus.get(&id).is_some_and(|owner| owner == turn));
         if card_focused {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-                actions.push(Action::Confirm { turn: turn.into(), approve: false });
+                actions.push(Action::Confirm { turn: turn.into(), approve: false, ids: shown.clone() });
             }
             if focused.is_some_and(|id| !self.proposal_buttons.contains_key(&id)) {
                 ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
@@ -1222,8 +1246,8 @@ impl AgentPane {
                 if rows.iter().any(|&i| self.workflows.proposals[i].status == ProposalStatus::Pending) {
                     ui.horizontal(|ui| {
                         let selected = rows.iter().any(|&i| {
-                            self.workflows.proposals[i].status == ProposalStatus::Pending
-                                && self.workflows.proposals[i].selected
+                            let p = &self.workflows.proposals[i];
+                            p.status == ProposalStatus::Pending && p.selected && shown.contains(&p.id)
                         });
                         let approve = ui
                             .add_enabled(selected, primary_button(if multi { "Approve selected" } else { "Approve" }));
@@ -1239,10 +1263,10 @@ impl AgentPane {
                         let escape =
                             focused && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
                         if (approve.clicked() || (enter && approve.has_focus())) && selected {
-                            actions.push(Action::Confirm { turn: turn.into(), approve: true });
+                            actions.push(Action::Confirm { turn: turn.into(), approve: true, ids: shown.clone() });
                         }
                         if decline.clicked() || (enter && decline.has_focus()) || escape {
-                            actions.push(Action::Confirm { turn: turn.into(), approve: false });
+                            actions.push(Action::Confirm { turn: turn.into(), approve: false, ids: shown.clone() });
                         }
                     });
                 }
@@ -2311,6 +2335,27 @@ mod polish_tests {
     }
 
     #[test]
+    fn confirmation_card_never_decides_a_proposal_that_arrived_as_the_user_clicked() {
+        use crate::agent_bridge::ProposalStatus;
+        let mut pane = card_pane();
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+        assert_eq!(pane.proposal_shown["card:1"], vec![1]);
+        // A second proposal lands in the same frame as the click: it is drawn, but the
+        // user cannot have seen it, so it must not be part of the decision.
+        let mut late = pane.workflows.proposals[0].clone();
+        late.id = 2;
+        late.status = ProposalStatus::Pending;
+        pane.workflows.proposals.push(late);
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+        assert_eq!(pane.proposal_shown["card:1"], vec![1]);
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+        assert_eq!(pane.proposal_shown["card:1"], vec![1, 2]);
+    }
+
+    #[test]
     fn confirmation_card_enter_only_acts_on_focused_button_without_app_hotkeys() {
         for target in ["approve", "decline", "checkbox"] {
             let mut pane = card_pane();
@@ -2319,6 +2364,8 @@ mod polish_tests {
             pane.workflows.proposals.push(second);
             let ctx = egui::Context::default();
             let mut actions = Vec::new();
+            // Two frames: a proposal is decidable only once it has been on screen.
+            render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
             render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
             let id = *pane
                 .proposal_focus
