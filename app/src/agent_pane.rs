@@ -227,6 +227,8 @@ pub struct ConversationTurn {
     pub undo_summary: Option<String>,
     pub reverted_changes: Option<usize>,
     pub local_time: String,
+    pub(crate) started_at: Instant,
+    pub(crate) duration: Option<Duration>,
 }
 
 impl ConversationTurn {
@@ -562,7 +564,9 @@ impl AgentPane {
 
     fn finish_turn(&mut self) {
         if let Some(index) = self.active_turn.take() {
-            self.turns[index].finished = true;
+            let turn = &mut self.turns[index];
+            turn.duration = Some(turn.started_at.elapsed());
+            turn.finished = true;
         }
     }
 
@@ -653,6 +657,8 @@ impl AgentPane {
             undo_summary: None,
             reverted_changes: None,
             local_time: local_time(chrono::Local::now().timestamp()),
+            started_at: Instant::now(),
+            duration: None,
         });
         self.retryable = false;
         self.blocks.push(RenderedBlock::Prompt(prompt.text.clone()));
@@ -889,11 +895,7 @@ impl AgentPane {
                         "Read trends, levels and momentum on the pinned chart; Chart edits also lets you mark it up.",
                         readable(theme::muted()),
                     );
-                    for prompt in ["What's the trend?", "Find support and resistance", "Summarise the last 20 bars"] {
-                        if control(ui, prompt).clicked() {
-                            actions.push(Action::Send(Prompt { text: prompt.into(), requires_tools: true }));
-                        }
-                    }
+                    suggested_prompts(ui, self.settings.tools, &mut actions);
                 }
                 self.conversation(ui, &mut actions);
                 if self.state != Onboarding::Ready {
@@ -1072,6 +1074,7 @@ impl AgentPane {
             turn.and_then(ConversationTurn::reverted_summary)
                 .map_or_else(|| tool_group_label(&traces, reverted), str::to_owned)
         };
+        let label = tool_group_duration(label, turn);
         let expanded = self.expanded_tools.contains(&key);
         let wash = ui.painter().add(egui::Shape::Noop);
         let response = ui
@@ -1849,6 +1852,38 @@ fn tool_label(name: &str) -> &str {
         "delete_alert" => "Propose deleting alert",
         _ => "Chart tool",
     }
+}
+
+fn suggested_prompts(ui: &mut Ui, mode: ToolsMode, actions: &mut Vec<Action>) {
+    for (heading, prompts, edits) in [
+        ("Analyze", &["What's the trend?", "Find support and resistance", "Summarise the last 20 bars"][..], false),
+        ("Find a setup", &["Where could a breakout confirm?", "What would invalidate a pullback setup?"][..], false),
+        ("Add to chart", &["Mark support and resistance zones", "Add RSI 14"][..], true),
+    ] {
+        ui.add_space(dp(6.0));
+        ui.label(RichText::new(heading).font(theme::ui_font(10.5)).color(readable(theme::muted())));
+        for prompt in prompts {
+            let enabled = !edits || mode == ToolsMode::Edit;
+            let response = if enabled {
+                control(ui, prompt)
+            } else {
+                ui.add_enabled(false, egui::Button::new(*prompt).wrap()).on_disabled_hover_text("Switch to Chart edits")
+            };
+            if response.clicked() {
+                actions.push(Action::Send(Prompt { text: (*prompt).into(), requires_tools: true }));
+            }
+        }
+    }
+}
+
+fn tool_group_duration(label: String, turn: Option<&ConversationTurn>) -> String {
+    let Some(duration) = turn.filter(|turn| turn.finished).and_then(|turn| turn.duration) else { return label };
+    let seconds = if duration < Duration::from_secs(1) {
+        "<1s".into()
+    } else {
+        format!("{:.0}s", duration.as_secs_f64().round())
+    };
+    format!("{label} · {seconds}")
 }
 
 fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
@@ -2681,7 +2716,7 @@ mod polish_tests {
         let mut output = ctx.run_ui(Default::default(), |ui| pane.conversation(ui, &mut Vec::new()));
         output.textures_delta.clear();
         let text = texts(&output);
-        for label in ["1 change reverted", "Reverted"] {
+        for label in ["1 change reverted · 7s", "Reverted"] {
             assert_eq!(text.iter().filter(|(s, _)| s == label).count(), 1, "{text:?}");
         }
         assert!(!text.iter().any(|(s, _)| s.starts_with("Undid")));
@@ -2690,6 +2725,84 @@ mod polish_tests {
         assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Path(path) if path.stroke.color == egui::epaint::ColorMode::Solid(readable(theme::up())))));
         pane.undo_result(crate::agent_demo::TURN, Err("unavailable".into()));
         assert_eq!(pane.turns[0].reverted_changes, Some(1));
+    }
+
+    #[test]
+    fn grouped_suggestions_gate_only_chart_edits_with_disabled_tooltip() {
+        for mode in [ToolsMode::ReadOnly, ToolsMode::Edit] {
+            let ctx = egui::Context::default();
+            immediate_tooltips(&ctx);
+            let mut actions = Vec::new();
+            let mut draw = |events| render(&ctx, 450.0, events, |ui| suggested_prompts(ui, mode, &mut actions));
+            draw(vec![]);
+            let output = draw(vec![]);
+            let text = texts(&output);
+            let mut previous = 0.0;
+            for heading in ["Analyze", "Find a setup", "Add to chart"] {
+                let rect = text.iter().find(|(s, _)| s == heading).unwrap().1;
+                assert!(rect.top() >= previous);
+                previous = rect.bottom();
+            }
+            for prompt in [
+                "What's the trend?",
+                "Where could a breakout confirm?",
+                "Mark support and resistance zones",
+                "Add RSI 14",
+            ] {
+                let rect = text.iter().find(|(s, _)| s == prompt).unwrap().1;
+                let mut tooltip_seen = false;
+                // Egui suppresses tooltips briefly after a click; advance input frames, not wall time.
+                for _ in 0..90 {
+                    let output = draw(vec![egui::Event::PointerMoved(rect.center())]);
+                    tooltip_seen |= texts(&output).iter().any(|(s, _)| s == "Switch to Chart edits");
+                }
+                let enabled =
+                    mode == ToolsMode::Edit || !["Mark support and resistance zones", "Add RSI 14"].contains(&prompt);
+                if !enabled {
+                    assert!(tooltip_seen, "{prompt}: {rect:?}");
+                }
+                for pressed in [true, false] {
+                    draw(pointer(rect.center(), pressed));
+                }
+            }
+            let sent: Vec<_> = actions
+                .iter()
+                .filter_map(|a| if let Action::Send(p) = a { Some(p.text.as_str()) } else { None })
+                .collect();
+            assert_eq!(sent.len(), if mode == ToolsMode::Edit { 4 } else { 2 }, "{mode:?}: {sent:?}");
+            assert!(sent.contains(&"What's the trend?") && sent.contains(&"Where could a breakout confirm?"));
+        }
+    }
+
+    #[test]
+    fn finished_tool_group_uses_frozen_total_turn_time_not_tool_sum() {
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("answer").unwrap(), 1);
+        let turn = &mut pane.turns[0];
+        let label = "Analyzed chart · 3 steps".to_owned();
+        assert_eq!(tool_group_duration(label.clone(), Some(turn)), "Analyzed chart · 3 steps · 7s");
+        for (millis, expected) in
+            [(0, "<1s"), (999, "<1s"), (1000, "1s"), (1499, "1s"), (1500, "2s"), (7499, "7s"), (7500, "8s")]
+        {
+            turn.duration = Some(Duration::from_millis(millis));
+            assert_eq!(tool_group_duration(label.clone(), Some(turn)), format!("{label} · {expected}"));
+        }
+        turn.finished = false;
+        assert_eq!(tool_group_duration(label.clone(), Some(turn)), label);
+        assert_eq!(pane.coalescer.due_in(Instant::now(), true), None);
+
+        let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
+        pane.start_prompt(Prompt { text: "Read chart".into(), requires_tools: true });
+        pane.turns[0].started_at = Instant::now() - Duration::from_secs(7);
+        pane.event(BridgeEvent::Completed {
+            turn: "duration".into(),
+            status: "completed".into(),
+            calls: 0,
+            interrupt_elapsed: None,
+        });
+        let measured = pane.turns[0].duration.unwrap();
+        assert!(measured >= Duration::from_secs(7));
+        pane.finish_turn();
+        assert_eq!(pane.turns[0].duration, Some(measured), "completion freezes the duration");
     }
 
     #[test]
@@ -3192,7 +3305,7 @@ mod polish_tests {
         let output = frame(&mut pane, &ctx, vec![]);
         let text = texts(&output);
         assert!(!text.iter().any(|(s, _)| s.contains("Horizontal line")));
-        let pos = text.iter().find(|(s, _)| s == "Drew 1 line · 4 steps").unwrap().1.center();
+        let pos = text.iter().find(|(s, _)| s == "Drew 1 line · 4 steps · 7s").unwrap().1.center();
         let click = |pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -3207,7 +3320,7 @@ mod polish_tests {
         assert!(text.iter().any(|(s, _)| s == "Draw · Horizontal line at 27,534.92"));
         assert!(text.iter().any(|(s, _)| s == "42 ms"));
         assert!(!text.iter().any(|(s, _)| s.contains("#1:3") || s == "Details" || s.contains("chart_id")));
-        assert!(text.iter().any(|(s, _)| s == "Drew 1 line · 4 steps"));
+        assert!(text.iter().any(|(s, _)| s == "Drew 1 line · 4 steps · 7s"));
         assert_eq!(price_label(27534.92), "27,534.92");
         assert_eq!(main_tool_label("#1:3 · RSI 14"), "RSI 14");
     }
@@ -3444,7 +3557,7 @@ mod polish_tests {
             let undo = text.iter().find(|(s, _)| s == "Undo 3 chart changes").unwrap().1;
             let prompt = text.iter().find(|(s, _)| s.starts_with("Mark support")).unwrap().1;
             let time = text.iter().find(|(s, _)| s == &pane.turns[0].local_time).unwrap().1;
-            let tools = text.iter().find(|(s, _)| s == "Drew 2 lines and added RSI 14 · 3 steps").unwrap().1;
+            let tools = text.iter().find(|(s, _)| s == "Drew 2 lines and added RSI 14 · 3 steps · 7s").unwrap().1;
             assert!(undo.top() >= prompt.bottom());
             assert!(time.bottom() <= prompt.top());
             assert!(tools.right() <= undo.left());
@@ -4002,7 +4115,13 @@ mod wire_tests {
             );
             pane.refresh_undo(&[], None);
             let (_, output) = frame(&mut pane, &ctx, vec![]);
-            text_position(&output, "2 changes reverted · 1 kept because you edited them");
+            text_position(
+                &output,
+                &tool_group_duration(
+                    "2 changes reverted · 1 kept because you edited them".into(),
+                    Some(&pane.turns[0]),
+                ),
+            );
             frame(&mut pane, &ctx, vec![click(true)]);
             let (actions, _) = frame(&mut pane, &ctx, vec![click(false)]);
             assert!(!actions.iter().any(|a| matches!(a, Action::UndoTurn(_))));

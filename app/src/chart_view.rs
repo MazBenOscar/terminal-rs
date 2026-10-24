@@ -5096,7 +5096,8 @@ impl ChartState {
             ui.add(egui::DragValue::new(&mut edited.width).range(0.5..=6.0).speed(0.1).prefix("Width "));
             let mut custom = edited.color.is_some();
             if ui.checkbox(&mut custom, "Custom drawing color").changed() {
-                edited.color = custom.then_some(theme::cyan().to_array()[..3].try_into().unwrap());
+                edited.color =
+                    custom.then(|| crate::drawing_paint::drawing_color(&edited).to_array()[..3].try_into().unwrap());
             }
             if let Some(color) = &mut edited.color {
                 ui.color_edit_button_srgb(color);
@@ -5769,8 +5770,7 @@ impl ChartState {
                     );
                 }
             }
-            let color =
-                if selected { amber() } else { d.color.map_or(theme::cyan(), |[r, g, b]| Color32::from_rgb(r, g, b)) };
+            let color = if selected { amber() } else { crate::drawing_paint::drawing_color(&d) };
             let stroke = Stroke::new(if selected { d.width.clamp(2.0, 6.0) } else { d.width.clamp(0.5, 6.0) }, color);
             if selected {
                 for anchor in drawings::handles(&d) {
@@ -8594,6 +8594,30 @@ mod tests {
             chart.actions,
             vec![Action::AddToNamedWatchlist { list: "Crypto".into(), symbol: chart.symbol.clone() }]
         );
+    }
+
+    #[test]
+    fn zone_custom_color_checkbox_seeds_current_theme_role() {
+        use tr_chart::drawings::ZoneRole;
+        for role in [ZoneRole::Support, ZoneRole::Resistance] {
+            let ctx = egui::Context::default();
+            let mut chart = sample_chart();
+            let mut drawing =
+                Drawing::new(Tool::Rectangle, Anchor { ts: 0, price: 10. }, Anchor { ts: 86400, price: 12. });
+            drawing.zone_role = Some(role);
+            let expected: [u8; 3] = crate::drawing_paint::drawing_color(&drawing).to_array()[..3].try_into().unwrap();
+            chart.drawings = vec![drawing];
+            chart.draw.selected = Some(0);
+            ui_frame(&ctx, vec![], |ui| chart.draw_menu(ui));
+            for custom in [true, false, true] {
+                let texts = ui_frame(&ctx, vec![], |ui| chart.draw_menu(ui));
+                let at = texts.iter().find(|(text, _)| text == "Custom drawing color").unwrap().1.center();
+                ui_frame(&ctx, vec![egui::Event::PointerMoved(at), pointer_button(at, true)], |ui| chart.draw_menu(ui));
+                ui_frame(&ctx, vec![pointer_button(at, false)], |ui| chart.draw_menu(ui));
+                assert_eq!(chart.drawings[0].color, custom.then_some(expected));
+                assert_eq!(chart.drawings[0].zone_role, Some(role));
+            }
+        }
     }
 
     #[test]

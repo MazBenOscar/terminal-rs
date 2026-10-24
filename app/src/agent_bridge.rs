@@ -1293,6 +1293,49 @@ mod tests {
     }
 
     #[test]
+    fn agent_objects_and_timeframe_labels_persist_across_set_view() {
+        let mut f = ViewFixture::new("a3c-persistent-zones");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let result = edit_call(
+                &mut f.app,
+                &f.executor,
+                &f.pin,
+                "zones",
+                "create_drawing",
+                json!({
+                    "symbol":"AAA", "kind":"rectangle", "label":"Support", "zone_role":"support",
+                    "anchors":[{"time":f.weekly[200].ts,"price":10.},{"time":f.weekly[600].ts,"price":12.}]
+                }),
+            )
+            .await;
+            assert!(result.success, "{result:?}");
+            let result = edit_call(
+                &mut f.app,
+                &f.executor,
+                &f.pin,
+                "zones",
+                "add_indicator",
+                json!({"code":"RSI","params":[14.]}),
+            )
+            .await;
+            assert!(result.success, "{result:?}");
+            let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+            let drawings = chart.drawings.clone();
+            let indicators = chart.indicators.clone();
+            assert_eq!(drawings[0].text, "W1 Support");
+            assert!(f.switch("zones", "4H", false).await.success);
+            let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+            assert_eq!(chart.drawings, drawings);
+            assert_eq!(chart.indicators, indicators);
+            assert!(chart.drawings.iter().all(|d| d.visible_on(&chart.symbol)), "no timeframe visibility filter");
+            assert!(f.switch("zones", "1W", true).await.success);
+            let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+            assert_eq!(chart.drawings, drawings);
+            assert_eq!(chart.indicators, indicators);
+        });
+    }
+
+    #[test]
     fn switched_view_uses_cache_and_never_moves_a_linked_pane() {
         let mut f = ViewFixture::new("a3b-linked-cache");
         let mut other = crate::chart_view::ChartState::new(2, "AAA", Timeframe::W1);

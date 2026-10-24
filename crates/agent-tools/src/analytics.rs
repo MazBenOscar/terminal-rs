@@ -31,6 +31,8 @@ fn computed_last(values: &[f64], ready: bool, field: &str) -> Result<Option<f64>
 pub struct SupportResistance {
     pub price: f64,
     pub zone_width: f64,
+    pub low: f64,
+    pub high: f64,
     pub touches: usize,
     pub last_touch_time: i64,
     pub score: f64,
@@ -70,9 +72,17 @@ pub fn support_resistance(bars: &[Bar], top: usize) -> Vec<SupportResistance> {
         let last = *indices.last().unwrap();
         let volume = indices.iter().map(|&i| bars[i].volume).sum::<f64>() / indices.len() as f64;
         let touches = indices.len();
+        let price = cluster.iter().map(|c| c.0).sum::<f64>() / cluster.len() as f64;
+        // A skewed cluster need not be centered on its mean: retain every touch
+        // while padding each side to at least the tolerance around price.
+        let low = cluster[0].0.min(price - tolerance);
+        let high = cluster.last().unwrap().0.max(price + tolerance);
+        let zone_width = high - low;
         out.push(SupportResistance {
-            price: cluster.iter().map(|c| c.0).sum::<f64>() / cluster.len() as f64,
-            zone_width: (cluster.last().unwrap().0 - cluster[0].0).max(2. * tolerance),
+            price,
+            zone_width,
+            low,
+            high,
             touches,
             last_touch_time: bars[last].ts,
             score: touches as f64 + last as f64 / bars.len() as f64 + (1. + volume / mean_volume).ln(),
@@ -174,8 +184,13 @@ pub(crate) fn analyze(
             }
             let levels = support_resistance(bars, top);
             for (i, level) in levels.iter().enumerate() {
-                for (name, value) in [("price", level.price), ("zone_width", level.zone_width), ("score", level.score)]
-                {
+                for (name, value) in [
+                    ("price", level.price),
+                    ("zone_width", level.zone_width),
+                    ("low", level.low),
+                    ("high", level.high),
+                    ("score", level.score),
+                ] {
                     finite(value, &format!("support_resistance[{i}].{name}"))?;
                 }
             }
@@ -283,6 +298,52 @@ fn trend(bars: &[Bar], o: &Ohlcv) -> Result<Value, ToolResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn level_output_exposes_zone_bounds_and_keeps_existing_fields() {
+        let bars = tr_core::sample::generate("ZONES", Timeframe::D1, 400, 1_700_000_000);
+        let value = analyze(&bars, Timeframe::D1, Session::Provider, Mode::Levels, 10).unwrap();
+        let levels = value["support_resistance"].as_array().unwrap();
+        assert!(!levels.is_empty());
+        for level in levels {
+            let price = level["price"].as_f64().unwrap();
+            let width = level["zone_width"].as_f64().unwrap();
+            assert!(width > 0.);
+            let low = level["low"].as_f64().unwrap();
+            let high = level["high"].as_f64().unwrap();
+            assert!(low < price && price < high);
+            assert_eq!(width, high - low);
+            for field in ["touches", "last_touch_time", "score"] {
+                assert!(level[field].is_number(), "{field}");
+            }
+        }
+        assert!(support_resistance(&[], 10).is_empty());
+    }
+
+    #[test]
+    fn lopsided_zone_contains_every_touch_and_tolerance_padding() {
+        let bars: Vec<_> = (0..25)
+            .map(|i| {
+                let high = match i {
+                    2 | 7 | 12 => 10.,
+                    17 => 12.,
+                    _ => 9.,
+                };
+                Bar::new(i * 86400, 8., high, 6., 8., 1.)
+            })
+            .collect();
+        let levels = support_resistance(&bars, 10);
+        let level = levels.iter().find(|level| level.price == 10.5).expect("10,10,10,12 cluster");
+        assert_eq!(level.touches, 4);
+        for touch in [10., 10., 10., 12.] {
+            assert!((level.low..=level.high).contains(&touch));
+        }
+        let tolerance = last_finite(&indicators::atr(&Ohlcv::new(&bars), 14)).unwrap() * 0.35;
+        assert!(level.low <= level.price - tolerance);
+        assert!(level.high >= level.price + tolerance);
+        assert_eq!(level.zone_width, level.high - level.low);
+        assert!(level.score.is_finite());
+    }
 
     #[test]
     fn lttb_keeps_endpoints_and_point_count() {

@@ -179,6 +179,14 @@ pub fn assign_ids(drawings: &mut [Drawing]) {
     }
 }
 
+/// Semantic zone ink resolved by the UI's active theme, never stored as RGB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoneRole {
+    Support,
+    Resistance,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Drawing {
     #[serde(default = "next_id")]
@@ -197,6 +205,8 @@ pub struct Drawing {
     pub all_symbols: bool,
     #[serde(default)]
     pub color: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_role: Option<ZoneRole>,
     #[serde(default = "line_width")]
     pub width: f32,
     #[serde(default)]
@@ -249,6 +259,7 @@ impl Drawing {
             symbol: None,
             all_symbols: false,
             color: None,
+            zone_role: None,
             width: line_width(),
             extend_left: false,
             extend_right: false,
