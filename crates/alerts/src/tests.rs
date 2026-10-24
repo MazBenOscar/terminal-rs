@@ -2,6 +2,210 @@ use super::*;
 use std::sync::{Arc, Mutex};
 use tr_core::price_alerts::{Direction, Repeat};
 
+#[test]
+fn finished_close_ignores_forming_bar_fires_on_finished_close_and_deduplicates() {
+    use tr_core::price_alerts::Rule;
+    let start = 1_792_713_600; // UTC bucket boundary, fixed sample data.
+    for (direction, finished, forming) in [(Direction::Above, 99., 101.), (Direction::Below, 101., 99.)] {
+        let mut book = Book::default();
+        let id = book.add("BTCUSD Curncy".into(), 100., direction, true).unwrap();
+        book.set_rule(id, Some(Rule::Formula { expression: "C".into(), timeframe: Timeframe::H4 })).unwrap();
+        book.set_repeat(id, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
+        book.alerts[0].completed_only = true;
+        book.alerts[0].created_at = start;
+        let bars = vec![
+            Bar::new(start, finished, finished, finished, finished, 1.),
+            Bar::new(start + 14_400, forming, forming, forming, forming, 1.),
+        ];
+        let mut q = Observation {
+            symbol: "BTCUSD Curncy".into(),
+            price: forming,
+            ts: start + 14_400 + 100,
+            simulated: true,
+            source: "test".into(),
+        };
+        let observation = finished_observation(&book.alerts[0], &bars, &q).unwrap();
+        assert_eq!(observation.price, finished, "forming bar must not be used");
+        assert!(merge_rule(&mut book, id, Ok(observation), true, q.ts).is_empty());
+        q.ts = start + 28_800;
+        let observation = finished_observation(&book.alerts[0], &bars, &q).unwrap();
+        assert_eq!(observation.price, forming);
+        assert_eq!(merge_rule(&mut book, id, Ok(observation.clone()), true, q.ts).len(), 1);
+        assert!(merge_rule(&mut book, id, Ok(observation.clone()), true, q.ts + 100).is_empty());
+        let mut restored: Book = serde_json::from_str(&serde_json::to_string(&book).unwrap()).unwrap();
+        assert!(
+            merge_rule(&mut restored, id, Ok(observation), true, q.ts + 200).is_empty(),
+            "same bar stays consumed across restart"
+        );
+        q.ts = start + 100;
+        assert!(finished_observation(&book.alerts[0], &bars[..1], &q).is_err());
+        // Existing Formula alerts still evaluate the forming bar, unchanged.
+        assert_eq!(book.alerts[0].rule.as_ref().unwrap().value(&bars).unwrap(), forming);
+    }
+}
+
+#[test]
+fn finished_close_uses_equity_session_grid_and_calendar_month_end() {
+    use tr_core::price_alerts::Rule;
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+    let mut book = Book::default();
+    let id = book.add("AAPL US Equity".into(), 100., Direction::Above, true).unwrap();
+    book.set_rule(id, Some(Rule::Formula { expression: "C".into(), timeframe: Timeframe::H4 })).unwrap();
+    let bar = Bar::new(parse("2026-10-23T13:30:00Z"), 101., 101., 101., 101., 1.);
+    let mut q = Observation {
+        symbol: "AAPL US Equity".into(),
+        price: 101.,
+        ts: parse("2026-10-23T16:30:00Z"),
+        simulated: true,
+        source: "test".into(),
+    };
+    assert!(finished_observation(&book.alerts[0], &[bar], &q).is_err(), "16:00 UTC is not this session bar's close");
+    q.ts = parse("2026-10-23T17:30:00Z");
+    assert_eq!(finished_observation(&book.alerts[0], &[bar], &q).unwrap().price, 101.);
+    book.set_rule(id, Some(Rule::Formula { expression: "C".into(), timeframe: Timeframe::MN1 })).unwrap();
+    let bar = Bar::new(parse("2026-02-01T00:00:00Z"), 101., 101., 101., 101., 1.);
+    q.ts = parse("2026-02-28T23:58:00Z");
+    assert!(finished_observation(&book.alerts[0], &[bar], &q).is_err());
+    q.ts = parse("2026-02-28T23:59:00Z");
+    assert!(finished_observation(&book.alerts[0], &[bar], &q).is_ok());
+}
+
+#[test]
+fn review_equity_hourly_close_ignores_forming_half_past_bar() {
+    use tr_core::price_alerts::Rule;
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+    let mut book = Book::default();
+    let id = book.add("AAPL US Equity".into(), 100., Direction::Above, true).unwrap();
+    book.set_rule(id, Some(Rule::Formula { expression: "C".into(), timeframe: Timeframe::H1 })).unwrap();
+    book.alerts[0].completed_only = true;
+    // Yahoo 60m US-equity bars (the default equity path, H1 is not resampled) are labelled
+    // at the session open grid: 09:30 ET = 13:30 UTC covers 13:30-14:30 UTC.
+    let bars = [
+        Bar::new(parse("2026-10-22T19:30:00Z"), 99., 99., 99., 99., 1.),
+        Bar::new(parse("2026-10-23T13:30:00Z"), 101., 101., 101., 101., 1.),
+    ];
+    let q = Observation {
+        symbol: "AAPL US Equity".into(),
+        price: 101.,
+        ts: parse("2026-10-23T14:05:00Z"),
+        simulated: true,
+        source: "test".into(),
+    };
+    let observation = finished_observation(&book.alerts[0], &bars, &q).unwrap();
+    assert_eq!(observation.price, 99., "the 13:30 bar is still forming at 14:05");
+}
+
+#[test]
+fn review_close_alert_does_not_fire_on_bar_closed_before_creation() {
+    use tr_core::price_alerts::Rule;
+    let now = 1_792_742_400 + 3_600; // one hour after a 4H bucket end
+    let mut book = Book::default();
+    let id = book.add("BTCUSD Curncy".into(), 100., Direction::Below, true).unwrap();
+    book.set_rule(id, Some(Rule::Formula { expression: "C".into(), timeframe: Timeframe::H4 })).unwrap();
+    book.alerts[0].completed_only = true;
+    book.alerts[0].created_at = now;
+    // Alert created at `now`; the latest finished 4H bar closed an hour earlier below the level.
+    let q = Observation {
+        symbol: "BTCUSD Curncy".into(),
+        price: 95.,
+        ts: 1_792_742_400,
+        simulated: true,
+        source: "test".into(),
+    };
+    assert!(merge_rule(&mut book, id, Ok(q.clone()), true, now).is_empty(), "no new finished close since creation");
+    let mut book: Book = serde_json::from_value(serde_json::to_value(book).unwrap()).unwrap();
+    let mut q = q;
+    q.ts = now;
+    assert!(merge_rule(&mut book, id, Ok(q.clone()), true, now).is_empty(), "creation boundary is not new");
+    q.ts = now + 10_800;
+    assert_eq!(merge_rule(&mut book, id, Ok(q.clone()), true, q.ts).len(), 1, "the next finished bar can fire");
+    let mut legacy = serde_json::to_value(&book).unwrap();
+    legacy["alerts"][0].as_object_mut().unwrap().remove("created_at");
+    let legacy: Book = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.alerts[0].created_at, 0);
+}
+
+#[test]
+fn review_equity_daily_close_is_finished_at_session_close() {
+    use tr_core::price_alerts::Rule;
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+    let mut book = Book::default();
+    let id = book.add("AAPL US Equity".into(), 100., Direction::Above, true).unwrap();
+    book.set_rule(id, Some(Rule::Formula { expression: "C".into(), timeframe: Timeframe::D1 })).unwrap();
+    book.alerts[0].completed_only = true;
+    // Yahoo daily bar for the regular session 13:30-20:00 UTC.
+    let bars = [Bar::new(parse("2026-10-22T13:30:00Z"), 101., 101., 101., 101., 1.)];
+    // alert_observation() is the last regular-hours M1 bar; it is the freshest quote until tomorrow's open.
+    let q = Observation {
+        symbol: "AAPL US Equity".into(),
+        price: 101.,
+        ts: parse("2026-10-22T19:59:00Z"),
+        simulated: true,
+        source: "test".into(),
+    };
+    // The bucket end used is 00:00 UTC, which a regular-session quote never reaches; the next
+    // fresh quote is tomorrow 13:30 UTC, so the daily close fires at the next open instead.
+    assert!(finished_observation(&book.alerts[0], &bars, &q).is_ok(), "session closed at 20:00 UTC");
+}
+
+#[test]
+fn equity_finished_ends_follow_provider_labels_dst_and_short_sessions() {
+    use tr_core::price_alerts::Rule;
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+    for (tf, start, end) in [
+        (Timeframe::H1, "2026-10-23T13:30:00Z", "2026-10-23T14:30:00Z"),
+        (Timeframe::H1, "2026-10-23T19:30:00Z", "2026-10-23T20:00:00Z"),
+        (Timeframe::H4, "2026-10-23T17:30:00Z", "2026-10-23T20:00:00Z"),
+        (Timeframe::D1, "2026-03-06T14:30:00Z", "2026-03-06T21:00:00Z"),
+        (Timeframe::D1, "2026-03-09T13:30:00Z", "2026-03-09T20:00:00Z"),
+        (Timeframe::D1, "2026-11-27T14:30:00Z", "2026-11-27T18:00:00Z"),
+        (Timeframe::H1, "2026-11-27T17:30:00Z", "2026-11-27T18:00:00Z"),
+    ] {
+        let mut book = Book::default();
+        let id = book.add("AAPL US Equity".into(), 100., Direction::Above, true).unwrap();
+        book.set_rule(id, Some(Rule::Formula { expression: "C".into(), timeframe: tf })).unwrap();
+        let bar = Bar::new(parse(start), 101., 101., 101., 101., 1.);
+        let mut q = Observation {
+            symbol: "AAPL US Equity".into(),
+            price: 101.,
+            ts: parse(end) - 120,
+            simulated: true,
+            source: "test".into(),
+        };
+        assert!(finished_observation(&book.alerts[0], &[bar], &q).is_err(), "{tf:?} {start} still forming");
+        q.ts += 60;
+        assert_eq!(
+            finished_observation(&book.alerts[0], &[bar], &q).unwrap().ts,
+            parse(end),
+            "{tf:?} {start} finished"
+        );
+    }
+}
+
+#[test]
+fn next_provider_bar_proves_completion_and_crypto_keeps_exact_end() {
+    use tr_core::price_alerts::Rule;
+    let start = 1_792_713_600;
+    let mut book = Book::default();
+    let id = book.add("BTCUSD Curncy".into(), 100., Direction::Above, true).unwrap();
+    book.set_rule(id, Some(Rule::Formula { expression: "C".into(), timeframe: Timeframe::H1 })).unwrap();
+    let bars = [Bar::new(start, 99., 99., 99., 99., 1.), Bar::new(start + 3600, 101., 101., 101., 101., 1.)];
+    let mut q = Observation {
+        symbol: "BTCUSD Curncy".into(),
+        price: 101.,
+        ts: start + 7199,
+        simulated: true,
+        source: "test".into(),
+    };
+    assert_eq!(finished_observation(&book.alerts[0], &bars, &q).unwrap().price, 99.);
+    q.ts += 1;
+    assert_eq!(finished_observation(&book.alerts[0], &bars, &q).unwrap().price, 101.);
+    // A provider's shorter bar ends at the next label, not at a guessed UTC bucket.
+    let bars = [bars[0], Bar { ts: start + 1800, ..bars[1] }];
+    q.ts = start + 1800;
+    assert_eq!(finished_observation(&book.alerts[0], &bars, &q).unwrap().ts, q.ts);
+}
+
 struct Fake {
     quote: Mutex<(f64, i64)>,
     calls: std::sync::atomic::AtomicUsize,

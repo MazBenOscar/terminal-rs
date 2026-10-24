@@ -41,21 +41,6 @@
     "input_schema": {
       "additionalProperties": false,
       "properties": {
-        "chart_id": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "id": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
-          "type": "string"
-        },
         "symbols": {
           "items": {
             "maxLength": 2048,
@@ -63,13 +48,19 @@
             "pattern": "\\S",
             "type": "string"
           },
-          "maxItems": 200,
+          "maxItems": 20,
           "minItems": 1,
           "type": "array"
+        },
+        "watchlist": {
+          "maxLength": 40,
+          "minLength": 1,
+          "pattern": "\\S",
+          "type": "string"
         }
       },
       "required": [
-        "id",
+        "watchlist",
         "symbols"
       ],
       "type": "object"
@@ -215,46 +206,81 @@
     "input_schema": {
       "additionalProperties": false,
       "properties": {
-        "chart_id": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "label": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "price": {
-          "type": "number"
-        },
-        "rule": {
+        "direction": {
           "enum": [
             "above",
-            "below",
-            "crossing"
+            "below"
           ],
           "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "price",
+            "close"
+          ],
+          "type": "string"
+        },
+        "level": {
+          "maximum": 1000000000000000.0,
+          "minimum": 0,
+          "type": "number"
+        },
+        "note": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "pattern": "\\S",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repeat": {
+          "description": "rearm uses a 60 second cooldown",
+          "enum": [
+            "once",
+            "rearm",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "symbol": {
           "maxLength": 2048,
           "minLength": 1,
           "pattern": "\\S",
           "type": "string"
+        },
+        "timeframe": {
+          "default": "1D",
+          "enum": [
+            "1m",
+            "2m",
+            "3m",
+            "5m",
+            "15m",
+            "30m",
+            "1H",
+            "2H",
+            "4H",
+            "1D",
+            "1W",
+            "1M",
+            "3M",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
         "symbol",
-        "rule",
-        "price"
+        "kind",
+        "direction",
+        "level"
       ],
       "type": "object"
     },
@@ -345,21 +371,12 @@
     "needs_confirmation": false
   },
   {
-    "description": "Create a named watchlist after confirmation.",
+    "description": "Propose a named watchlist; no change until user approval.",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
-        "chart_id": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "name": {
-          "maxLength": 2048,
+          "maxLength": 40,
           "minLength": 1,
           "pattern": "\\S",
           "type": "string"
@@ -380,20 +397,11 @@
     "input_schema": {
       "additionalProperties": false,
       "properties": {
-        "chart_id": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "id": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
-          "type": "string"
+          "description": "Drawing ids are issued below 2^53 for exact JSON client representation",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -453,24 +461,15 @@
     "input_schema": {
       "additionalProperties": false,
       "properties": {
-        "chart_id": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "id": {
-          "maxLength": 2048,
+        "watchlist": {
+          "maxLength": 40,
           "minLength": 1,
           "pattern": "\\S",
           "type": "string"
         }
       },
       "required": [
-        "id"
+        "watchlist"
       ],
       "type": "object"
     },
@@ -531,6 +530,42 @@
     "kind": "live",
     "mutating": false,
     "name": "indicator_values",
+    "needs_confirmation": false
+  },
+  {
+    "description": "List at most 50 alerts, optionally filtered by symbol.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "symbol": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "pattern": "\\S",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "kind": "live",
+    "mutating": false,
+    "name": "list_alerts",
+    "needs_confirmation": false
+  },
+  {
+    "description": "List at most 50 watchlists and their bounded symbol rows.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "kind": "live",
+    "mutating": false,
+    "name": "list_watchlists",
     "needs_confirmation": false
   },
   {
@@ -696,21 +731,6 @@
     "input_schema": {
       "additionalProperties": false,
       "properties": {
-        "chart_id": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "id": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
-          "type": "string"
-        },
         "symbols": {
           "items": {
             "maxLength": 2048,
@@ -718,13 +738,19 @@
             "pattern": "\\S",
             "type": "string"
           },
-          "maxItems": 200,
+          "maxItems": 20,
           "minItems": 1,
           "type": "array"
+        },
+        "watchlist": {
+          "maxLength": 40,
+          "minLength": 1,
+          "pattern": "\\S",
+          "type": "string"
         }
       },
       "required": [
-        "id",
+        "watchlist",
         "symbols"
       ],
       "type": "object"
@@ -835,46 +861,46 @@
     "input_schema": {
       "additionalProperties": false,
       "properties": {
-        "chart_id": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
+        "direction": {
+          "enum": [
+            "above",
+            "below",
+            null
+          ],
           "type": [
             "string",
             "null"
           ]
         },
         "id": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
-          "type": "string"
+          "description": "Drawing ids are issued below 2^53 for exact JSON client representation",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         },
-        "label": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "pattern": "\\S",
+        "level": {
+          "maximum": 1000000000000000.0,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "repeat": {
+          "description": "rearm uses a 60 second cooldown",
+          "enum": [
+            "once",
+            "rearm",
+            null
+          ],
           "type": [
             "string",
             "null"
           ]
-        },
-        "price": {
-          "type": "number"
-        },
-        "rule": {
-          "enum": [
-            "above",
-            "below",
-            "crossing"
-          ],
-          "type": "string"
         }
       },
       "required": [
-        "id",
-        "rule",
-        "price"
+        "id"
       ],
       "type": "object"
     },

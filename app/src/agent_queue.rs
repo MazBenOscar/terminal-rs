@@ -13,6 +13,8 @@ use crate::app::TerminalApp;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ChartTarget {
+    /// Global state tools do not require an open or pinned chart.
+    Application,
     Pinned,
     Uid(u64),
 }

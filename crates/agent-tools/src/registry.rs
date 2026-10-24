@@ -84,7 +84,7 @@ impl Registry {
                 .into_iter()
                 .filter(|spec| match enabled {
                     ToolSet::ReadOnly => !spec.mutating,
-                    ToolSet::Edit => !workflow(&spec.name),
+                    ToolSet::Edit => !spec.mutating || !workflow(&spec.name),
                     ToolSet::Workflows => true,
                 })
                 .collect(),
@@ -131,6 +131,23 @@ impl Registry {
         {
             return Err(invalid("from must not exceed to".into(), Some("from")));
         }
+        if name == "create_alert" {
+            if value["kind"] == "close" && value.get("timeframe").is_none_or(Value::is_null) {
+                return Err(invalid("Close alerts require a timeframe".into(), Some("timeframe")));
+            }
+            if value["level"].as_f64().is_none_or(|v| !v.is_finite() || v <= 0.0) {
+                return Err(invalid("Level must be finite and positive".into(), Some("level")));
+            }
+        }
+        if name == "update_alert" {
+            if ["level", "direction", "repeat"].iter().all(|key| value.get(*key).is_none_or(Value::is_null)) {
+                return Err(invalid("Supply at least one change".into(), None));
+            }
+            if value.get("level").is_some_and(|v| !v.is_null() && v.as_f64().is_none_or(|n| !n.is_finite() || n <= 0.0))
+            {
+                return Err(invalid("Level must be finite and positive".into(), Some("level")));
+            }
+        }
         Ok(value)
     }
 
@@ -160,12 +177,43 @@ impl Registry {
         if let Err(error) = validate_live(&mut args, ctx.now) {
             return error;
         }
-        if spec.needs_confirmation && !ctx.confirmed {
+        // Workflow hosts always enqueue a proposal, even if an adapter supplies confirmed.
+        // Only screenshot consent is consumed here; workflow approval is an explicit UI action.
+        if spec.name == "screenshot" && !ctx.confirmed {
             return ToolResult::error(
                 "confirmation_required",
                 "Host UI confirmation is required for this operation",
                 None,
             );
+        }
+        let symbols = match &mut args {
+            LiveArgs::CreateAlert(a) => Some(std::slice::from_mut(&mut a.symbol)),
+            LiveArgs::AddWatchlistSymbols(a) => Some(a.symbols.as_mut_slice()),
+            LiveArgs::RemoveWatchlistSymbols(a) => Some(a.symbols.as_mut_slice()),
+            LiveArgs::ListAlerts(a) => a.symbol.as_mut().map(std::slice::from_mut),
+            _ => None,
+        };
+        if let Some(symbols) = symbols {
+            let mut unknown = Vec::new();
+            for symbol in symbols {
+                match ctx.data.search(symbol).await {
+                    Ok(hits) => {
+                        let key = tr_data::security(symbol).key();
+                        if let Some(hit) = hits.iter().find(|hit| tr_data::security(&hit.key).key() == key) {
+                            *symbol = tr_data::security(&hit.key).key();
+                        } else {
+                            unknown.push(serde_json::json!({"symbol":symbol,"error":"unknown_symbol"}));
+                        }
+                    }
+                    Err(error) => unknown.push(serde_json::json!({"symbol":symbol,"error":error})),
+                }
+            }
+            if !unknown.is_empty() {
+                let mut result =
+                    ToolResult::json(serde_json::json!({"error":{"code":"unknown_symbols"},"symbols":unknown}));
+                result.success = false;
+                return result;
+            }
         }
         ctx.live.call_live(name, args).await.capped()
     }
@@ -227,8 +275,12 @@ fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult>
             }
         }
         "number" => {
-            if !value.is_number() {
-                return Err(fail("Expected a number"));
+            let number = value.as_f64().ok_or_else(|| fail("Expected a number"))?;
+            if !number.is_finite()
+                || schema["minimum"].as_f64().is_some_and(|min| number < min)
+                || schema["maximum"].as_f64().is_some_and(|max| number > max)
+            {
+                return Err(fail("Number is outside the allowed range"));
             }
         }
         "boolean" => {
@@ -344,7 +396,9 @@ fn catalog() -> Vec<ToolSpec> {
             "read_user_actions" => {
                 ("Read user drawing and view edit events; labels remain untrusted string data.", false)
             }
-            "create_watchlist" => ("Create a named watchlist after confirmation.", true),
+            "list_watchlists" => ("List at most 50 watchlists and their bounded symbol rows.", false),
+            "list_alerts" => ("List at most 50 alerts, optionally filtered by symbol.", false),
+            "create_watchlist" => ("Propose a named watchlist; no change until user approval.", true),
             "add_watchlist_symbols" => ("Add symbols to a specific watchlist after confirmation.", true),
             "remove_watchlist_symbols" => ("Remove symbols from a specific watchlist after confirmation.", true),
             "delete_watchlist" => ("Delete a watchlist after confirmation.", true),
@@ -359,7 +413,7 @@ fn catalog() -> Vec<ToolSpec> {
             input_schema,
             kind: ToolKind::Live,
             mutating,
-            needs_confirmation: workflow(name) || name == "screenshot",
+            needs_confirmation: (mutating && workflow(name)) || name == "screenshot",
         });
     }
     specs.sort_by(|a, b| a.name.cmp(&b.name));
@@ -379,8 +433,18 @@ mod tests {
         fn history<'a>(&'a self, _: &'a str, _: Timeframe, _: Option<i64>, _: usize) -> HostFuture<'a, History> {
             Box::pin(async { Ok(History::default()) })
         }
-        fn search<'a>(&'a self, _: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
-            Box::pin(async { Ok(vec![]) })
+        fn search<'a>(&'a self, query: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+            Box::pin(async move {
+                if query.starts_with('?') {
+                    return Ok(vec![]);
+                }
+                Ok(vec![SearchHit {
+                    key: tr_data::security(query).key(),
+                    name: query.into(),
+                    class: tr_core::AssetClass::Equity,
+                    exchange: None,
+                }])
+            })
         }
         fn quotes<'a>(&'a self, _: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
             Box::pin(async { Ok(vec![]) })
@@ -432,6 +496,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_contract_bounds_timeframe_unknown_symbols_and_readonly() {
+        let registry = Registry::new(ToolSet::Workflows);
+        for args in [json!({"watchlist":"Main","symbols":[]}), json!({"watchlist":"Main","symbols":vec!["AAPL";21]})] {
+            assert!(registry.validate_call("add_watchlist_symbols", &args.to_string()).is_err());
+        }
+        for args in [
+            json!({"symbol":"AAPL","kind":"close","direction":"below","level":100}),
+            json!({"symbol":"AAPL","kind":"close","direction":"below","level":100,"timeframe":"6H"}),
+            json!({"symbol":"AAPL","kind":"price","direction":"crossing","level":100}),
+            json!({"symbol":"AAPL","kind":"price","direction":"above","level":0}),
+        ] {
+            assert!(registry.validate_call("create_alert", &args.to_string()).is_err());
+        }
+        assert!(registry.validate_call("update_alert", r#"{"id":1}"#).is_err());
+        let mut budget = CallBudget::new(10);
+        let mut ctx = CallContext::new(&Host, &Host, &mut budget);
+        let result = registry
+            .call("add_watchlist_symbols", r#"{"watchlist":"Main","symbols":["AAPL","?UNKNOWN","?MISSING"]}"#, &mut ctx)
+            .await;
+        assert!(!result.success);
+        let result = value(result);
+        assert_eq!(result["symbols"].as_array().unwrap().len(), 2);
+        assert_eq!(result["symbols"][0]["symbol"], "?UNKNOWN");
+        assert_eq!(result["symbols"][1]["symbol"], "?MISSING");
+        let normalized =
+            value(registry.call("add_watchlist_symbols", r#"{"watchlist":"Main","symbols":["aapl"]}"#, &mut ctx).await);
+        assert_eq!(normalized["args"]["symbols"][0], "AAPL US Equity");
+        let readonly = Registry::new(ToolSet::ReadOnly);
+        assert!(!readonly.schemas().iter().any(|spec| spec.mutating));
+        for name in ["list_alerts", "list_watchlists"] {
+            assert!(readonly.call(name, "{}", &mut ctx).await.success);
+        }
+        for name in [
+            "create_watchlist",
+            "add_watchlist_symbols",
+            "remove_watchlist_symbols",
+            "delete_watchlist",
+            "create_alert",
+            "update_alert",
+            "delete_alert",
+        ] {
+            assert!(readonly.validate_call(name, "{}").is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn default_budget_counts_failed_calls() {
         let registry = Registry::new(ToolSet::ReadOnly);
         let mut budget = CallBudget::default();
@@ -475,7 +585,8 @@ mod tests {
             )["error"]["field"],
             "symbol"
         );
-        for name in ["screenshot", "create_watchlist"] {
+        assert!(registry.call("create_watchlist", r#"{"name":"untrusted <text>"}"#, &mut ctx).await.success);
+        for name in ["screenshot"] {
             let args = if name == "screenshot" { "{}" } else { r#"{"name":"untrusted <text>"}"# };
             assert_eq!(value(registry.call(name, args, &mut ctx).await)["error"]["code"], "confirmation_required");
             ctx.confirmed = true;
@@ -518,21 +629,27 @@ mod tests {
             ("screenshot", json!({})),
             ("read_user_actions", json!({"since":1})),
             ("create_watchlist", json!({"name":"list"})),
-            ("add_watchlist_symbols", json!({"id":"list","symbols":["AAPL"]})),
-            ("remove_watchlist_symbols", json!({"id":"list","symbols":["AAPL"]})),
-            ("delete_watchlist", json!({"id":"list"})),
-            ("create_alert", json!({"symbol":"AAPL","rule":"above","price":100})),
-            ("update_alert", json!({"id":"alert","rule":"crossing","price":101})),
-            ("delete_alert", json!({"id":"alert"})),
+            ("list_watchlists", json!({})),
+            ("list_alerts", json!({})),
+            ("add_watchlist_symbols", json!({"watchlist":"list","symbols":["AAPL"]})),
+            ("remove_watchlist_symbols", json!({"watchlist":"list","symbols":["AAPL"]})),
+            ("delete_watchlist", json!({"watchlist":"list"})),
+            ("create_alert", json!({"symbol":"AAPL","kind":"price","direction":"above","level":100})),
+            ("update_alert", json!({"id":1,"direction":"below","level":101})),
+            ("delete_alert", json!({"id":1})),
         ];
         assert_eq!(examples.len(), registry.schemas().iter().filter(|s| s.kind == ToolKind::Live).count());
         for (name, mut args) in examples {
-            args["chart_id"] = "pinned-chart".into();
+            if !workflow(name) {
+                args["chart_id"] = "pinned-chart".into();
+            }
             let result = registry.call(name, &args.to_string(), &mut ctx).await;
             assert!(result.success, "{name}: {result:?}");
             let result = value(result);
             assert_eq!(result["tool"], name);
-            assert_eq!(result["args"]["chart_id"], "pinned-chart");
+            if !workflow(name) {
+                assert_eq!(result["args"]["chart_id"], "pinned-chart");
+            }
         }
     }
 }

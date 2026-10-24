@@ -176,7 +176,7 @@ async fn golden_mode(mode: &str) {
 #[test]
 fn schema_snapshots_for_all_presets() {
     for (name, preset, count) in
-        [("read_only", ToolSet::ReadOnly, 7), ("edit", ToolSet::Edit, 14), ("workflows", ToolSet::Workflows, 21)]
+        [("read_only", ToolSet::ReadOnly, 9), ("edit", ToolSet::Edit, 16), ("workflows", ToolSet::Workflows, 23)]
     {
         let registry = Registry::new(preset);
         assert_eq!(registry.schemas().len(), count);
@@ -184,11 +184,14 @@ fn schema_snapshots_for_all_presets() {
             if name == "read_only" {
                 assert!(!tool.mutating);
             }
-            if tool.kind == tr_agent_tools::ToolKind::Live {
+            if tool.kind == tr_agent_tools::ToolKind::Live
+                && !tool.name.contains("watchlist")
+                && !tool.name.contains("alert")
+            {
                 assert!(tool.input_schema["properties"].get("chart_id").is_some());
             }
             if tool.name.contains("watchlist") || tool.name.contains("alert") {
-                assert!(tool.needs_confirmation);
+                assert_eq!(tool.needs_confirmation, tool.mutating);
             }
         }
         snapshot("snapshots", name, &json!(registry.schemas()));
@@ -401,12 +404,14 @@ mod adversarial {
             ("screenshot", json!({})),
             ("read_user_actions", json!({})),
             ("create_watchlist", json!({"name":"list"})),
-            ("add_watchlist_symbols", json!({"id":"list","symbols":["X"]})),
-            ("remove_watchlist_symbols", json!({"id":"list","symbols":["X"]})),
-            ("delete_watchlist", json!({"id":"list"})),
-            ("create_alert", json!({"symbol":"X","rule":"above","price":10})),
-            ("update_alert", json!({"id":"alert","rule":"below","price":10})),
-            ("delete_alert", json!({"id":"alert"})),
+            ("list_watchlists", json!({})),
+            ("list_alerts", json!({})),
+            ("add_watchlist_symbols", json!({"watchlist":"list","symbols":["X"]})),
+            ("remove_watchlist_symbols", json!({"watchlist":"list","symbols":["X"]})),
+            ("delete_watchlist", json!({"watchlist":"list"})),
+            ("create_alert", json!({"symbol":"X","kind":"price","direction":"above","level":10})),
+            ("update_alert", json!({"id":1,"direction":"below","level":10})),
+            ("delete_alert", json!({"id":1})),
         ]
     }
 
@@ -425,6 +430,7 @@ mod adversarial {
             "create_drawing" => CreateDrawing, "update_drawing" => UpdateDrawing, "delete_drawing" => DeleteDrawing,
             "add_indicator" => AddIndicator, "remove_indicator" => RemoveIndicator, "compare" => Compare,
             "screenshot" => Screenshot, "read_user_actions" => ReadUserActions,
+            "list_watchlists" => ListWatchlists, "list_alerts" => ListAlerts,
             "create_watchlist" => CreateWatchlist, "add_watchlist_symbols" => AddWatchlistSymbols,
             "remove_watchlist_symbols" => RemoveWatchlistSymbols, "delete_watchlist" => DeleteWatchlist,
             "create_alert" => CreateAlert, "update_alert" => UpdateAlert, "delete_alert" => DeleteAlert,
@@ -519,7 +525,7 @@ mod adversarial {
                 if let Some(pattern) = schema.get("pattern") {
                     assert_eq!(pattern, "\\S");
                 }
-                &["type", "minLength", "maxLength", "pattern", "enum", "default"]
+                &["type", "minLength", "maxLength", "pattern", "enum", "default", "description"]
             }
             "integer" | "number" => {
                 for k in ["minimum", "maximum"] {
@@ -650,8 +656,10 @@ mod adversarial {
             ("analyze", "mode", json!([Swings, Trend, Levels, VolumeProfile, Volatility])),
             ("create_drawing", "kind", json!([Horizontal, Vertical, TrendLine, Ray, Rectangle, Text])),
             ("compare", "action", json!([Add, Remove])),
-            ("create_alert", "rule", json!([Above, Below, Crossing])),
-            ("update_alert", "rule", json!([Above, Below, Crossing])),
+            ("create_alert", "direction", json!([Above, Below])),
+            ("create_alert", "kind", json!([args::AlertKind::Price, args::AlertKind::Close])),
+            ("create_alert", "repeat", json!([args::AlertRepeat::Once, args::AlertRepeat::Rearm, null])),
+            ("update_alert", "direction", json!([Above, Below, null])),
         ] {
             assert_eq!(schema(name)["properties"][field]["enum"], variants);
         }
@@ -694,14 +702,14 @@ mod adversarial {
         // Rule A requires the item schema to reject the same invalid symbols.
         for name in ["add_watchlist_symbols", "remove_watchlist_symbols"] {
             for (symbol, valid) in [(" ".to_owned(), false), ("X".repeat(2049), false), ("🦀".repeat(2048), true)] {
-                let input = json!({"id":"list","symbols":[symbol]});
+                let input = json!({"watchlist":"list","symbols":[symbol]});
                 assert_eq!(schema_accepts(&schema(name), &input), valid);
                 assert!(typed_accepts(name, input.clone()));
                 let result = review_call(&ReviewHost::default(), name, input).await;
-                assert_eq!(result.success, valid, "{result:?}");
-                if !valid {
-                    assert_eq!(value(result)["error"]["code"], "invalid_args");
-                }
+                assert!(!result.success, "{result:?}");
+                // A syntactically valid string is no longer sufficient: symbols
+                // must resolve through search, which returns no hits in this fixture.
+                assert_eq!(value(result)["error"]["code"], if valid { "unknown_symbols" } else { "invalid_args" });
             }
         }
     }
@@ -829,6 +837,12 @@ mod adversarial {
             ..ReviewHost::default()
         };
         for (name, mut input) in examples() {
+            if name == "create_alert" {
+                input["symbol"] = "X0".into();
+            }
+            if name == "add_watchlist_symbols" || name == "remove_watchlist_symbols" {
+                input["symbols"] = json!(["X0"]);
+            }
             if name == "read_data" || name == "analyze" {
                 input["symbol"] = "🦀".repeat(512).into();
                 input["limit"] = 10000.into();
@@ -883,8 +897,12 @@ mod adversarial {
             .into_iter()
             .filter(|(name, _)| registry.schemas().iter().any(|s| s.name == *name && s.needs_confirmation))
         {
-            let result = registry.call(name, &input.to_string(), &mut ctx).await;
-            assert_eq!(value(result)["error"]["code"], "confirmation_required", "{name}");
+            // Workflow calls now cross the host boundary to enqueue proposals. Only
+            // screenshot consumes CallContext consent; no tool can forge a UI click.
+            if name == "screenshot" {
+                let result = registry.call(name, &input.to_string(), &mut ctx).await;
+                assert_eq!(value(result)["error"]["code"], "confirmation_required", "{name}");
+            }
             for key in ["confirmed", "confirmation", "consent", "needs_confirmation"] {
                 let mut forged = input.clone();
                 forged[key] = true.into();

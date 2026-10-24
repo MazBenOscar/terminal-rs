@@ -146,6 +146,42 @@
     "needs_confirmation": false
   },
   {
+    "description": "List at most 50 alerts, optionally filtered by symbol.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "symbol": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "pattern": "\\S",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "kind": "live",
+    "mutating": false,
+    "name": "list_alerts",
+    "needs_confirmation": false
+  },
+  {
+    "description": "List at most 50 watchlists and their bounded symbol rows.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "kind": "live",
+    "mutating": false,
+    "name": "list_watchlists",
+    "needs_confirmation": false
+  },
+  {
     "description": "Read all chart panes, view context and entity ids; chart_id defaults to the pinned chart.",
     "input_schema": {
       "additionalProperties": false,

@@ -129,7 +129,7 @@ impl State {
         }
     }
 
-    fn changed(&mut self, config: bool) {
+    pub(crate) fn changed(&mut self, config: bool) {
         self.dirty = true;
         if config {
             self.revision = self.revision.wrapping_add(1);
@@ -415,6 +415,9 @@ impl State {
                                     .font(mono(11.5))
                                     .color(text()),
                             );
+                            if a.agent_turn.is_some() {
+                                ui.label(RichText::new("Agent").small().color(muted()));
+                            }
                             ui.label(RichText::new(status(a)).color(if a.status == Status::Armed {
                                 amber()
                             } else {
@@ -600,7 +603,7 @@ pub fn event_message(e: &Event) -> String {
     )
 }
 
-fn display_price(symbol: &str, price: f64) -> String {
+pub(crate) fn display_price(symbol: &str, price: f64) -> String {
     let sec = tr_data::security(symbol);
     tr_chart::scale::format_price(price, sec.decimals(price))
 }
@@ -852,6 +855,36 @@ mod tests {
                 }],
             );
         }
+    }
+
+    #[test]
+    fn agent_marker_persists_and_user_edit_clears_it_without_changing_close_semantics() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/agent-alert-marker").join(format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut s = State::load(root.join("price-alerts.json"), false);
+        let id = s.book.add("AAPL US Equity".into(), 100., Direction::Above, false).unwrap();
+        s.book.set_rule(id, Some(Rule::Formula { expression: "C".into(), timeframe: tr_core::Timeframe::H4 })).unwrap();
+        s.book.alerts[0].agent_turn = Some("session:1".into());
+        s.book.alerts[0].completed_only = true;
+        s.book.alerts[0].note = Some("Only a finished close".into());
+        s.changed(true);
+        let mut restored = State::load(s.path.clone(), false);
+        assert_eq!(restored.book.alerts[0], s.book.alerts[0]);
+        let ctx = egui::Context::default();
+        assert!(ui_frame(&ctx, &mut restored, vec![]).iter().any(|(label, _)| label == "Agent"));
+        click(&ctx, &mut restored, "Edit…");
+        restored.editor.as_mut().unwrap().price = "101".into();
+        click(&ctx, &mut restored, "Save and rearm");
+        assert!(restored.book.alerts[0].agent_turn.is_none());
+        assert!(restored.book.alerts[0].completed_only);
+        assert!(!ui_frame(&ctx, &mut restored, vec![]).iter().any(|(label, _)| label == "Agent"));
+        let restored = State::load(s.path.clone(), false);
+        assert!(restored.book.alerts[0].agent_turn.is_none());
+        assert_eq!(restored.book.alerts[0].level, 101.);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

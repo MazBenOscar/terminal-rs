@@ -448,6 +448,13 @@ pub struct NamedWatchlist {
     /// Section headers over `symbols`; older files have none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<crate::watch_sections::WatchSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_turn: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub agent_entries: std::collections::BTreeMap<String, String>,
+    /// Stable target identity once a workflow touches this list, not ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,7 +466,14 @@ pub struct WatchlistAddOutcome {
 
 impl NamedWatchlist {
     pub fn new(name: String, symbols: Vec<String>) -> Self {
-        Self { name, symbols, sections: Vec::new() }
+        Self {
+            name,
+            symbols,
+            sections: Vec::new(),
+            agent_turn: None,
+            agent_entries: Default::default(),
+            workflow_id: None,
+        }
     }
 
     /// Rows in display order (section headers and symbols).
@@ -468,7 +482,12 @@ impl NamedWatchlist {
     }
 
     pub fn set_items(&mut self, items: &[crate::watch_sections::Item]) {
-        (self.symbols, self.sections) = crate::watch_sections::split(items);
+        let (symbols, sections) = crate::watch_sections::split(items);
+        if symbols.iter().any(|s| !self.symbols.contains(s)) {
+            self.agent_turn = None;
+        }
+        self.agent_entries.retain(|s, _| symbols.contains(s));
+        (self.symbols, self.sections) = (symbols, sections);
     }
 }
 
@@ -536,7 +555,15 @@ pub(crate) fn sanitize_watchlists(lists: Vec<NamedWatchlist>) -> Vec<NamedWatchl
         let clean = crate::watch_sections::resync(&clean, &symbols);
         let (symbols, sections) = crate::watch_sections::split(&clean);
         let sections = crate::watch_sections::sanitize(&symbols, sections);
-        out.push(NamedWatchlist { name, symbols, sections });
+        let agent_entries = list.agent_entries.into_iter().filter(|(s, _)| symbols.contains(s)).collect();
+        out.push(NamedWatchlist {
+            name,
+            symbols,
+            sections,
+            agent_turn: list.agent_turn,
+            agent_entries,
+            workflow_id: list.workflow_id,
+        });
         if out.len() == 50 {
             break;
         }
@@ -1220,6 +1247,9 @@ impl TerminalApp {
 
     fn duplicate_watchlist(&mut self) -> Result<(), String> {
         let mut copy = self.watchlists[self.active_watchlist].clone();
+        copy.agent_turn = None;
+        copy.agent_entries.clear();
+        copy.workflow_id = None;
         copy.name = unique_watchlist_name(&copy.name, &self.watchlists);
         self.check_watchlist_name(&copy.name, None)?;
         if self.watchlists.len() >= 50 {
@@ -1277,6 +1307,7 @@ impl TerminalApp {
         }
         self.check_watchlist_name(&name, Some(index))?;
         let name = name.trim().to_owned();
+        self.watchlists[index].agent_turn = None;
         self.watchlists[index].name = name;
         Ok(())
     }
@@ -1321,7 +1352,29 @@ impl TerminalApp {
         }
     }
 
+    /// A user drag claims the moved entries, not the rows displaced by them.
+    fn move_watchlist_item(&mut self, from: usize, gap: usize) {
+        let mut items = self.watchlists[self.active_watchlist].items();
+        if from >= items.len() {
+            return;
+        }
+        let moved = items[crate::watch_sections::block(&items, from)].to_vec();
+        if crate::watch_sections::move_item(&mut items, from, gap) {
+            let list = &mut self.watchlists[self.active_watchlist];
+            list.agent_turn = None;
+            for item in moved {
+                if let crate::watch_sections::Item::Symbol(symbol) = item {
+                    list.agent_entries.remove(&symbol);
+                }
+            }
+            self.set_watchlist_items(&items);
+        }
+    }
+
     fn add_watchlist_symbols(&mut self, symbols: Vec<String>) {
+        for symbol in &symbols {
+            self.watchlists[self.active_watchlist].agent_entries.remove(&watchlist_symbol_key(symbol));
+        }
         let (next, added, truncated) = watchlist_append(&self.watchlist, symbols);
         self.set_watchlist(next);
         let message = watchlist_add_message(added, truncated);
@@ -1343,6 +1396,7 @@ impl TerminalApp {
             .iter()
             .position(|list| list.name == name)
             .ok_or_else(|| format!("Watchlist {name} no longer exists"))?;
+        self.watchlists[index].agent_entries.remove(&watchlist_symbol_key(&symbol));
         let list = &self.watchlists[index];
         let mut items = list.items();
         let gap = if let Some(section) = section {
@@ -1766,6 +1820,7 @@ impl TerminalApp {
         use crate::agent_queue::ChartTarget;
         let exists = |uid| self.panes.iter().any(|p| matches!(&p.kind, PaneKind::Chart(c) if c.uid == uid));
         match target {
+            ChartTarget::Application => None,
             ChartTarget::Uid(uid) => exists(uid).then_some(uid),
             ChartTarget::Pinned => {
                 self.pinned_agent_chart.filter(|uid| exists(*uid)).or_else(|| self.peek_chart().map(|c| c.uid))
@@ -1894,6 +1949,9 @@ impl TerminalApp {
             executed += 1;
             let reply = if job.deadline <= Instant::now() {
                 AgentReply::error("timeout")
+            } else if matches!(job.chart, crate::agent_queue::ChartTarget::Application) {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.run)(self)))
+                    .unwrap_or_else(|_| AgentReply::error("job panicked; edits may be partial"))
             } else if let Some(uid) = self.agent_chart_uid(job.chart) {
                 self.agent_job_chart = Some(uid);
                 for pane in &mut self.panes {
@@ -2941,6 +2999,7 @@ impl eframe::App for TerminalApp {
         }
         // Drop signals shutdown and waits at most 1.5 s; any remaining cleanup
         // stays with the detached owner instead of blocking the UI's exit/save.
+        self.agent_pane.workflows.reset();
         self.agent_pane.session = None;
         self.exit_save();
         self.price_alerts.save();

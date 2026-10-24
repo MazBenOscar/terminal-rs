@@ -69,6 +69,10 @@ impl TerminalApp {
         }
         let state = demo.config.state;
         self.agent_demo.as_mut().unwrap().populated = true;
+        if state.approved() {
+            // Construct the already-approved offline fixture; interactive demo controls stay inert.
+            self.confirm_workflows(TURN, true);
+        }
         if state.edits()
             && let Err(reason) = self.populate_demo_edits(state.undone())
         {
@@ -246,6 +250,31 @@ mod tests {
             output.textures_delta.clear();
             assert!(app.agent_pane.session.is_none());
             assert!(!app.agent_pane.running || matches!(*name, "streaming"));
+        }
+    }
+
+    #[test]
+    fn workflow_fixtures_show_two_pending_rows_or_applied_undoable_changes() {
+        use crate::agent_bridge::ProposalStatus;
+        for name in ["proposal", "approved"] {
+            let scratch = agent_demo::Scratch::create(&root()).unwrap();
+            let mut app = fixture(&scratch.0, name);
+            assert_eq!(app.agent_pane.workflows.proposals.len(), 2);
+            let approved = name == "approved";
+            assert!(
+                app.agent_pane
+                    .workflows
+                    .proposals
+                    .iter()
+                    .all(|p| p.status == if approved { ProposalStatus::Approved } else { ProposalStatus::Pending })
+            );
+            assert_eq!(app.watchlists.len(), if approved { 3 } else { 1 });
+            if approved {
+                assert!(app.agent_pane.turns[0].undo_available);
+                assert_eq!(app.agent_pane.turns[0].chart_changes, Some(2));
+                assert_eq!(app.undo_agent_turn(TURN).unwrap().reverted, 2);
+                assert_eq!(app.watchlists.len(), 1);
+            }
         }
     }
 

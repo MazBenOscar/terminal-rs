@@ -483,10 +483,7 @@ impl TerminalApp {
         });
         self.watch_drag = drag_state;
         if let Some((from, gap)) = drop {
-            let mut items = items;
-            if watch_sections::move_item(&mut items, from, gap) {
-                self.set_watchlist_items(&items);
-            }
+            self.move_watchlist_item(from, gap);
         }
         if details {
             self.watch_details_card(ui);

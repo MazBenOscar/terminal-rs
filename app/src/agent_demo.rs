@@ -29,6 +29,8 @@ pub const STATES: &[&str] = &[
     "stopped-unsafe",
     "stopped-recoverable",
     "privacy",
+    "proposal",
+    "approved",
 ];
 pub const TURN: &str = "000000000000000000000000000000a2c0:1";
 pub const SAMPLE_NOW: i64 = 1_792_713_600; // 2026-10-23 UTC, fixed across captures.
@@ -44,6 +46,9 @@ impl State {
             .copied()
             .map(Self)
             .ok_or_else(|| format!("Unknown TR_AGENT_DEMO state {name:?}; expected one of: {}", STATES.join(", ")))
+    }
+    pub fn approved(self) -> bool {
+        self.0 == "approved"
     }
     pub fn edits(self) -> bool {
         matches!(self.0, "edits" | "undone")
@@ -212,6 +217,42 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
             // Chart object IDs and the completed answer are filled after sample history arrives.
         }
     }
+    if matches!(state.0, "proposal" | "approved") {
+        use crate::agent_bridge::{Proposal, ProposalStatus};
+        pane.settings.tools = ToolsMode::Edit;
+        pane.session_tools = Some(tr_agent_tools::ToolSet::Workflows);
+        pane.start_prompt(Prompt {
+            text: "Create Crypto and Research watchlists for me.".into(),
+            requires_tools: false,
+        });
+        pane.event(BridgeEvent::Started { turn: TURN.into() });
+        pane.turns[0].local_time = crate::agent_pane::local_time(SAMPLE_NOW);
+        for (id, name) in [(1, "Crypto"), (2, "Research")] {
+            tool(
+                &mut pane,
+                &format!("proposal-{id}"),
+                "create_watchlist",
+                Some(true),
+                Some("Awaiting user confirmation"),
+            );
+            pane.workflows.proposals.push(Proposal {
+                id,
+                turn: TURN.into(),
+                args: tr_agent_tools::args::LiveArgs::CreateWatchlist(tr_agent_tools::args::CreateWatchlist {
+                    name: name.into(),
+                }),
+                summary: format!("Create watchlist · {name}"),
+                user_owned: false,
+                selected: true,
+                deadline: Instant::now() + Duration::from_secs(600),
+                status: ProposalStatus::Pending,
+                before: serde_json::Value::Null,
+            });
+        }
+        pane.workflows.next_id = 2;
+        pane.wire("item/completed", &json!({"item":{"type":"agentMessage","id":"workflow-reply","text":"These changes are proposals only. Approve the lists you want to create."}}));
+        complete(&mut pane, "completed");
+    }
     if state.0 == "queue" {
         pane.queue_review = true;
         pane.input = "Check momentum after those prompts.".into();
@@ -371,7 +412,7 @@ mod tests {
 
     #[test]
     fn all_exact_state_names_populate_a_session_free_pane() {
-        assert_eq!(STATES.len(), 19);
+        assert_eq!(STATES.len(), 21);
         for name in STATES {
             let state = State::parse(name).unwrap();
             let mut pane = pane(state, 7);

@@ -270,6 +270,7 @@ async fn run() -> Result<()> {
         images: vec![],
         context: BTreeMap::from([("chart".into(), "BTC/USD; 1h; canned bars".into())]),
         response_style: None,
+        workflow_results: vec![],
     };
     let turn = client.send_turn(input("describe the trend")).await?;
     let characters = finish(&mut events, &turn, "completed").await?;

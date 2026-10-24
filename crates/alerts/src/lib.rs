@@ -47,6 +47,45 @@ pub fn history_is_stale(tf: Timeframe, last: i64, quote: i64) -> bool {
     last > quote.saturating_add(30) || quote > boundary.saturating_add(120)
 }
 
+/// Narrow finished-bar path used only by alerts explicitly created with completed_only.
+/// Existing Formula/Condition/Line alerts continue to see the full, possibly forming history.
+pub fn finished_observation(alert: &Alert, bars: &[Bar], quote: &Observation) -> Result<Observation, String> {
+    let rule = alert.rule.as_ref().ok_or("Missing close rule")?;
+    let tf = rule.timeframes()[0];
+    let equity =
+        matches!(tr_data::security(&alert.symbol).class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf);
+    // Equity observations are regular-hours M1 bars labelled by their START.
+    // Crypto observations keep their existing timestamp semantics.
+    let observed_end = quote.ts.saturating_add(if equity { 60 } else { 0 });
+    let mut completed = Vec::new();
+    let mut last_end = None;
+    for (index, bar) in bars.iter().enumerate() {
+        // Use the provider label, never a UTC-hour bucket for session-aligned
+        // Yahoo :30 bars. Clip the final intraday bar (and D1) to session close,
+        // including DST and short sessions from the existing exchange calendar.
+        let calendar_end = if equity && (tf.is_intraday() || tf == Timeframe::D1) {
+            let session_close = tr_core::session::Session::UsRegular.interval(Timeframe::D1, bar.ts).1;
+            if tf == Timeframe::D1 { session_close } else { bar.ts.saturating_add(tf.seconds()).min(session_close) }
+        } else if matches!(tf, Timeframe::MN1 | Timeframe::MN3) {
+            tr_core::session::next_bucket(tf, bar.ts)
+        } else {
+            bar.ts.saturating_add(tf.seconds())
+        };
+        // A next bar is authoritative evidence of completion; do not extend a
+        // bar across an overnight/weekend gap when the session already closed.
+        let end =
+            bars.get(index + 1).filter(|next| next.ts > bar.ts).map_or(calendar_end, |next| next.ts.min(calendar_end));
+        if end <= observed_end {
+            completed.push(*bar);
+            last_end = Some(end);
+        }
+    }
+    let mut result = quote.clone();
+    result.price = rule.value(&completed)?;
+    result.ts = last_end.ok_or("No finished bar yet")?;
+    Ok(result)
+}
+
 pub async fn condition_observations(provider: Provider, alerts: Vec<Alert>) -> Vec<(u64, Result<Observation, String>)> {
     let mut groups = BTreeMap::<(String, Timeframe), Vec<Alert>>::new();
     for alert in alerts {
@@ -119,6 +158,9 @@ pub async fn condition_observations(provider: Provider, alerts: Vec<Alert>) -> V
                                 .map(|a| {
                                     let result = (|| {
                                         let rule = a.rule.as_ref().ok_or("Missing condition")?;
+                                        if a.completed_only {
+                                            return finished_observation(&a, &set[&tf].bars, &q);
+                                        }
                                         let mut observation = q.clone();
                                         for required in rule.timeframes() {
                                             if let Some(error) = errors.get(&required) {
@@ -198,7 +240,16 @@ pub fn merge_rule(
     now: i64,
 ) -> Vec<Event> {
     match result {
-        Ok(q) if q.simulated == simulated && q.valid_at(now) => book.observe_rule(id, q, now),
+        Ok(q)
+            if q.simulated == simulated
+                && (q.valid_at(now)
+                    || book
+                        .alerts
+                        .iter()
+                        .any(|a| a.id == id && a.completed_only && q.ts > 0 && q.ts <= now && q.price.is_finite())) =>
+        {
+            book.observe_rule(id, q, now)
+        }
         _ => {
             book.reset_rule(id);
             vec![]

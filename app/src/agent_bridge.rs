@@ -60,6 +60,78 @@ pub struct UndoSummary {
     pub skipped: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalStatus {
+    Pending,
+    Approved,
+    Declined,
+    Expired,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct Proposal {
+    pub id: u64,
+    pub turn: String,
+    pub args: LiveArgs,
+    pub summary: String,
+    pub user_owned: bool,
+    pub selected: bool,
+    pub deadline: Instant,
+    pub status: ProposalStatus,
+    pub before: Value,
+}
+
+impl Proposal {
+    pub fn ownership_label(&self) -> Option<&'static str> {
+        self.user_owned.then(|| {
+            if self.before["agent_created"].as_bool() == Some(true) || self.before["agent_turn"].as_str().is_some() {
+                "Created by the agent in an earlier conversation"
+            } else {
+                "This alert was created by you"
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum WorkflowUndo {
+    Alert { before: Option<tr_core::price_alerts::Alert>, after: Option<tr_core::price_alerts::Alert>, position: usize },
+    Watchlist { before: Option<crate::app::NamedWatchlist>, after: Option<crate::app::NamedWatchlist> },
+}
+
+#[derive(Default)]
+pub struct Workflows {
+    pub proposals: Vec<Proposal>,
+    pub undo: Vec<(String, WorkflowUndo)>,
+    pub context: Vec<tr_agent::codex::WorkflowResult>,
+    pub next_id: u64,
+}
+impl Workflows {
+    pub fn expire(&mut self, now: Instant, turn: Option<&str>) {
+        for proposal in &mut self.proposals {
+            if proposal.status == ProposalStatus::Pending
+                && (now >= proposal.deadline || turn.is_some_and(|t| t == proposal.turn))
+            {
+                proposal.status = ProposalStatus::Expired;
+                self.context.push(tr_agent::codex::WorkflowResult::Confirmation {
+                    proposal_id: proposal.id,
+                    status: tr_agent::codex::WorkflowStatus::Expired,
+                    summary: proposal.summary.clone(),
+                });
+            }
+        }
+    }
+    pub fn reset(&mut self) {
+        for proposal in &mut self.proposals {
+            if proposal.status == ProposalStatus::Pending {
+                proposal.status = ProposalStatus::Expired;
+            }
+        }
+        self.context.clear();
+    }
+}
+
 impl TerminalApp {
     fn execute_agent_edit(
         &mut self,
@@ -139,7 +211,8 @@ impl TerminalApp {
 
     /// Pane-facing availability: provenance survives saves, inverse edits do not.
     pub fn agent_turn_undo_available(&self, turn: &str) -> bool {
-        self.panes.iter().any(|pane| matches!(&pane.kind, PaneKind::Chart(chart) if chart.has_agent_turn(turn)))
+        self.agent_pane.workflows.undo.iter().any(|(owner, _)| owner == turn)
+            || self.panes.iter().any(|pane| matches!(&pane.kind, PaneKind::Chart(chart) if chart.has_agent_turn(turn)))
     }
 
     pub fn undoable_agent_turns(&self) -> Vec<&str> {
@@ -165,6 +238,7 @@ impl TerminalApp {
     /// Revert by identity, not by restoring a chart snapshot. Conflicting user
     /// changes (including Keep) are reported rather than overwritten.
     pub fn undo_agent_turn(&mut self, turn_id: &str) -> Result<UndoSummary, String> {
+        self.agent_pane.workflows.expire(Instant::now(), Some(turn_id));
         self.prune_agent_turns();
         if !self.agent_turns.iter().any(|turn| turn == turn_id) {
             return Err("undo for this agent turn is no longer available (layout changed/app restarted)".into());
@@ -183,6 +257,7 @@ impl TerminalApp {
                 summary.skipped.extend(skipped);
             }
         }
+        self.undo_workflows(turn_id, &mut summary);
         self.agent_turns.retain(|turn| turn != turn_id);
         self.observe_edits(true);
         self.edit_log.record(
@@ -431,6 +506,20 @@ impl DataHost for ScopedHost {
 impl LiveHost for ScopedHost {
     fn call_live<'a>(&'a self, _: &'a str, args: LiveArgs) -> BridgeFuture<'a, ToolResult> {
         Box::pin(async move {
+            if args.name().contains("watchlist") || args.name().contains("alert") {
+                let turn = self.call.turn.clone();
+                return match self
+                    .job(ChartTarget::Application, move |app| {
+                        let result = app.agent_workflow(&turn, args);
+                        AgentReply { success: true, value: serde_json::to_value(result).unwrap() }
+                    })
+                    .await
+                {
+                    Ok(value) => serde_json::from_value(value)
+                        .unwrap_or_else(|_| ToolResult::error("host_error", "Invalid workflow reply", None)),
+                    Err(error) => ToolResult::error("host_error", &error, None),
+                };
+            }
             let chart = match &args {
                 LiveArgs::ReadChart(a) => &a.chart_id,
                 LiveArgs::IndicatorValues(a) => &a.chart_id,
@@ -544,6 +633,43 @@ mod tests {
                 confirmed: false,
             },
         }
+    }
+
+    #[test]
+    fn workflow_reads_and_confirmed_calls_work_without_a_chart_but_never_auto_apply() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/workflow-global-host");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.panes.clear();
+        let executor = AppExecutor::new(&app);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (name, arguments, tools) in [
+                ("list_watchlists", "{}", tr_agent_tools::ToolSet::ReadOnly),
+                ("list_alerts", "{}", tr_agent_tools::ToolSet::ReadOnly),
+                ("create_watchlist", r#"{"name":"Proposed"}"#, tr_agent_tools::ToolSet::Workflows),
+            ] {
+                let registry = Arc::new(Registry::new(tools));
+                let call = ToolCall {
+                    turn: "global:1".into(),
+                    pin: ChartPin { uid: 0, symbol: String::new(), timeframe: String::new(), visible_range: None },
+                    name: name.into(),
+                    arguments: arguments.into(),
+                    confirmed: true,
+                };
+                let mut result = executor.execute(registry, call);
+                assert!(futures::poll!(result.as_mut()).is_pending());
+                app.process_logic();
+                let result = result.await;
+                assert!(result.success, "{name}: {result:?}");
+                if name == "create_watchlist" {
+                    assert!(
+                        matches!(&result.content[0], Content::Text(text) if text.contains("awaiting_user_confirmation"))
+                    );
+                }
+            }
+        });
+        assert_eq!(app.watchlists.len(), 1, "confirmed=true must not bypass the card");
+        app.confirm_workflows("global:1", true);
+        assert_eq!(app.watchlists.len(), 2);
     }
 
     #[tokio::test]

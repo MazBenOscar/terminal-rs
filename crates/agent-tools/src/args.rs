@@ -35,6 +35,7 @@ fn optional_schema<T: OptionalArgument>(mut schema: Value) -> Value {
 macro_rules! field_schema {
     (String) => { json!({"type":"string", "minLength":1, "maxLength":2048, "pattern":"\\S"}) };
     (f64) => { json!({"type":"number"}) };
+    (AlertLevel) => { json!({"type":"number", "minimum":0, "maximum":1e15}) };
     (u64) => { json!({"type":"integer", "minimum":0, "maximum":9007199254740991_u64,
         "description":"Drawing ids are issued below 2^53 for exact JSON client representation"}) };
     (bool) => { json!({"type":"boolean", "default":false}) };
@@ -42,9 +43,12 @@ macro_rules! field_schema {
     (Mode) => { json!({"type":"string", "enum":["swings","trend","levels","volume_profile","volatility"]}) };
     (DrawingKind) => { json!({"type":"string", "enum":["horizontal","vertical","trend_line","ray","rectangle","text"]}) };
     (CompareAction) => { json!({"type":"string", "enum":["add","remove"]}) };
-    (AlertRule) => { json!({"type":"string", "enum":["above","below","crossing"]}) };
+    (AlertRule) => { json!({"type":"string", "enum":["above","below"]}) };
+    (AlertKind) => { json!({"type":"string", "enum":["price","close"]}) };
+    (Repeat) => { json!({"type":"string", "enum":["once","rearm"], "description":"rearm uses a 60 second cooldown"}) };
+    (Name) => { json!({"type":"string", "minLength":1, "maxLength":40, "pattern":"\\S"}) };
     (Anchors) => { json!({"type":"array", "items":Anchor::schema(), "minItems":1, "maxItems":8}) };
-    (Symbols) => { json!({"type":"array", "items":field_schema!(String), "minItems":1, "maxItems":200}) };
+    (Symbols) => { json!({"type":"array", "items":field_schema!(String), "minItems":1, "maxItems":20}) };
     (Params) => { json!({"type":"array", "items":{"type":"number"}}) };
     (Timestamp) => { json!({"type":"integer", "description":"Unix seconds UTC",
         "minimum":MIN_TIMESTAMP, "maximum":MAX_TIMESTAMP}) };
@@ -62,6 +66,7 @@ macro_rules! args {
         }
         impl Arguments for $name {
             fn schema() -> Value {
+                #[allow(unused_mut)] // Empty argument objects deliberately have no properties.
                 let mut properties = serde_json::Map::new();
                 $(properties.insert(stringify!($field).into(), field_schema!($schema));)*
                 $(properties.insert(stringify!($optional).into(), optional_schema::<$opt_ty>(field_schema!($opt_schema)));)*
@@ -102,7 +107,18 @@ pub enum CompareAction {
 pub enum AlertRule {
     Above,
     Below,
-    Crossing,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertKind {
+    Price,
+    Close,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertRepeat {
+    Once,
+    Rearm,
 }
 
 args!(Anchor { time: i64 => Timestamp, price: f64 => f64 } {});
@@ -138,17 +154,19 @@ args!(RemoveIndicator { id: String => String } { chart_id: Option<String> => Str
 args!(Compare { symbol: String => String, action: CompareAction => CompareAction } { chart_id: Option<String> => String });
 args!(Screenshot {} { chart_id: Option<String> => String });
 args!(ReadUserActions {} { chart_id: Option<String> => String, since: Option<i64> => Timestamp });
-args!(CreateWatchlist { name: String => String } { chart_id: Option<String> => String });
-args!(AddWatchlistSymbols { id: String => String, symbols: Vec<String> => Symbols } { chart_id: Option<String> => String });
-args!(RemoveWatchlistSymbols { id: String => String, symbols: Vec<String> => Symbols } { chart_id: Option<String> => String });
-args!(DeleteWatchlist { id: String => String } { chart_id: Option<String> => String });
-args!(CreateAlert { symbol: String => String, rule: AlertRule => AlertRule, price: f64 => f64 } {
-    chart_id: Option<String> => String, label: Option<String> => String
+args!(ListWatchlists {} {});
+args!(ListAlerts {} { symbol: Option<String> => String });
+args!(CreateWatchlist { name: String => Name } {});
+args!(AddWatchlistSymbols { watchlist: String => Name, symbols: Vec<String> => Symbols } {});
+args!(RemoveWatchlistSymbols { watchlist: String => Name, symbols: Vec<String> => Symbols } {});
+args!(DeleteWatchlist { watchlist: String => Name } {});
+args!(CreateAlert { symbol: String => String, kind: AlertKind => AlertKind, direction: AlertRule => AlertRule, level: f64 => AlertLevel } {
+    timeframe: Option<String> => Timeframe, repeat: Option<AlertRepeat> => Repeat, note: Option<String> => String
 });
-args!(UpdateAlert { id: String => String, rule: AlertRule => AlertRule, price: f64 => f64 } {
-    chart_id: Option<String> => String, label: Option<String> => String
+args!(UpdateAlert { id: u64 => u64 } {
+    level: Option<f64> => AlertLevel, direction: Option<AlertRule> => AlertRule, repeat: Option<AlertRepeat> => Repeat
 });
-args!(DeleteAlert { id: String => String } { chart_id: Option<String> => String });
+args!(DeleteAlert { id: u64 => u64 } {});
 
 macro_rules! live_args {
     ($($variant:ident($ty:ident) => $name:literal),* $(,)?) => {
@@ -173,6 +191,7 @@ live_args!(
     UpdateDrawing(UpdateDrawing) => "update_drawing", DeleteDrawing(DeleteDrawing) => "delete_drawing",
     AddIndicator(AddIndicator) => "add_indicator", RemoveIndicator(RemoveIndicator) => "remove_indicator",
     Compare(Compare) => "compare", Screenshot(Screenshot) => "screenshot", ReadUserActions(ReadUserActions) => "read_user_actions",
+    ListWatchlists(ListWatchlists) => "list_watchlists", ListAlerts(ListAlerts) => "list_alerts",
     CreateWatchlist(CreateWatchlist) => "create_watchlist", AddWatchlistSymbols(AddWatchlistSymbols) => "add_watchlist_symbols",
     RemoveWatchlistSymbols(RemoveWatchlistSymbols) => "remove_watchlist_symbols", DeleteWatchlist(DeleteWatchlist) => "delete_watchlist",
     CreateAlert(CreateAlert) => "create_alert", UpdateAlert(UpdateAlert) => "update_alert", DeleteAlert(DeleteAlert) => "delete_alert",
