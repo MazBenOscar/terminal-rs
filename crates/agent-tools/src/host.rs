@@ -56,6 +56,38 @@ pub mod edits {
         args::{self, LiveArgs},
     };
 
+    pub(super) fn timeframe_label(label: &str, timeframe: Timeframe) -> String {
+        let sanitized = tr_chart::drawings::text::sanitize(label);
+        let label = sanitized.trim();
+        if label.is_empty() {
+            return String::new();
+        }
+        let mut tokens = label.split(|c: char| !c.is_alphanumeric()).filter(|token| !token.is_empty()).peekable();
+        let includes_timeframe = std::iter::from_fn(|| {
+            let token = tokens.next()?;
+            // Numeric M labels before "share(s)" mean a quantity, not minutes/months.
+            let shares = token.ends_with(['m', 'M'])
+                && tokens
+                    .peek()
+                    .is_some_and(|next| next.eq_ignore_ascii_case("shares") || next.eq_ignore_ascii_case("share"));
+            Some(
+                !shares
+                    && Timeframe::ALL.iter().any(|tf| {
+                        token.eq_ignore_ascii_case(&format!("{tf:?}")) || token.eq_ignore_ascii_case(tf.label())
+                    }),
+            )
+        })
+        .any(|matches| matches);
+        if includes_timeframe {
+            label.into()
+        } else {
+            let prefix = format!("{timeframe:?} ");
+            // Reserve the prefix's characters; truncate only the agent's text.
+            let text: String = label.chars().take(500 - prefix.chars().count()).collect();
+            format!("{prefix}{text}")
+        }
+    }
+
     pub const MAX_CREATED_PER_TURN: usize = 20;
     pub const MAX_AGENT_OBJECTS: usize = 100;
     /// Live-host edit failures supplement the registry's existing invalid_args,
@@ -217,13 +249,17 @@ pub mod edits {
                         args::DrawingKind::Rectangle => Tool::Rectangle,
                         args::DrawingKind::Text => Tool::Text,
                     };
+                    if a.zone_role.is_some() && tool != Tool::Rectangle {
+                        return Err(error("invalid_args", "zone_role is only supported for rectangles"));
+                    }
                     let points = anchors(chart, &a.anchors, tool.points())?;
                     let mut drawing = Drawing::new(tool, points[0], *points.last().unwrap());
                     drawing.symbol = Some(chart.symbol.into());
                     drawing.all_symbols = a.all_symbols;
                     drawing.created_by = Author::Agent;
                     drawing.turn_id = Some(turn.into());
-                    drawing.text = a.label.unwrap_or_default();
+                    drawing.text = timeframe_label(a.label.as_deref().unwrap_or_default(), chart.timeframe);
+                    drawing.zone_role = a.zone_role;
                     drawing.sanitize();
                     let id = drawing.id;
                     let mut next = chart.drawings.to_vec();
@@ -251,7 +287,7 @@ pub mod edits {
                         drawing.b = *points.last().unwrap();
                     }
                     if let Some(label) = a.label {
-                        drawing.text = label;
+                        drawing.text = timeframe_label(&label, chart.timeframe);
                     }
                     drawing.all_symbols = a.all_symbols;
                     drawing.sanitize();
@@ -474,6 +510,182 @@ mod tests {
     use tr_core::{Bar, Timeframe};
 
     #[test]
+    fn agent_labels_get_compact_timeframes_and_zone_roles_roundtrip() {
+        let bars = [Bar::new(86400, 10., 12., 8., 11., 1.), Bar::new(172800, 10., 12., 8., 11., 1.)];
+        let mut session = Session::default();
+        for timeframe in Timeframe::ALL {
+            let chart = Chart {
+                uid: 1,
+                symbol: "AAA US Equity",
+                timeframe,
+                bars: &bars,
+                drawings: &[],
+                indicators: &[],
+                comparisons: &[],
+            };
+            for (label, expected) in [
+                (Some("Support"), format!("{timeframe:?} Support")),
+                (Some("W1 Support"), "W1 Support".into()),
+                (Some("[H4] Resistance"), "[H4] Resistance".into()),
+                (Some("1W Support"), "1W Support".into()),
+                (Some("Support W1"), "Support W1".into()),
+                (None, String::new()),
+            ] {
+                for role in ["support", "resistance"] {
+                    let args = serde_json::from_value(serde_json::json!({
+                        "symbol":"AAA", "kind":"rectangle", "label":label, "zone_role":role,
+                        "anchors":[{"time":86400,"price":8.},{"time":172800,"price":12.}]
+                    }))
+                    .unwrap();
+                    let Plan::Drawings(drawings, _) = session
+                        .plan(&chart, &format!("{timeframe:?}-{label:?}-{role}"), LiveArgs::CreateDrawing(args))
+                        .unwrap()
+                    else {
+                        panic!("drawing")
+                    };
+                    let drawing = &drawings[0];
+                    assert_eq!(drawing.text, expected);
+                    assert_eq!(drawing.created_by, tr_chart::drawings::Author::Agent);
+                    assert!(drawing.color.is_none());
+                    assert_eq!(serde_json::to_value(drawing.zone_role).unwrap(), role);
+                    let saved = serde_json::to_value(drawing).unwrap();
+                    assert_eq!(serde_json::from_value::<tr_chart::drawings::Drawing>(saved).unwrap(), *drawing);
+                }
+            }
+        }
+        let mut user = tr_chart::drawings::Drawing::new(
+            tr_chart::drawings::Tool::Text,
+            tr_chart::drawings::Anchor { ts: 86400, price: 10. },
+            tr_chart::drawings::Anchor { ts: 86400, price: 10. },
+        );
+        user.text = "My label".into();
+        user.sanitize();
+        assert_eq!(user.text, "My label", "user drawings never enter the agent label path");
+        assert!(user.zone_role.is_none());
+    }
+
+    fn zone_args(label: &str) -> args::CreateDrawing {
+        serde_json::from_value(serde_json::json!({
+            "symbol":"AAA", "kind":"rectangle", "label":label, "zone_role":"support",
+            "anchors":[{"time":86400,"price":8.},{"time":172800,"price":12.}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn update_drawing_label_keeps_timeframe_prefix() {
+        let bars = [Bar::new(86400, 10., 12., 8., 11., 1.), Bar::new(172800, 10., 12., 8., 11., 1.)];
+        let chart = Chart {
+            uid: 1,
+            symbol: "AAA US Equity",
+            timeframe: Timeframe::W1,
+            bars: &bars,
+            drawings: &[],
+            indicators: &[],
+            comparisons: &[],
+        };
+        let mut session = Session::default();
+        let Plan::Drawings(drawings, id) =
+            session.plan(&chart, "turn", LiveArgs::CreateDrawing(zone_args("Support"))).unwrap()
+        else {
+            panic!("drawing")
+        };
+        assert_eq!(drawings[0].text, "W1 Support");
+        let chart = Chart { drawings: &drawings, ..chart };
+        let Plan::Drawings(updated, _) = session
+            .plan(
+                &chart,
+                "turn",
+                LiveArgs::UpdateDrawing(args::UpdateDrawing {
+                    symbol: "AAA".into(),
+                    id,
+                    chart_id: None,
+                    all_symbols: false,
+                    anchors: None,
+                    label: Some("Support retest".into()),
+                }),
+            )
+            .unwrap()
+        else {
+            panic!("drawing")
+        };
+        assert_eq!(updated[0].text, "W1 Support retest");
+        let chart = Chart { drawings: &updated, ..chart };
+        let Plan::Drawings(repeated, _) = session
+            .plan(
+                &chart,
+                "turn",
+                LiveArgs::UpdateDrawing(args::UpdateDrawing {
+                    symbol: "AAA".into(),
+                    id,
+                    chart_id: None,
+                    all_symbols: false,
+                    anchors: None,
+                    label: Some(updated[0].text.clone()),
+                }),
+            )
+            .unwrap()
+        else {
+            panic!("drawing")
+        };
+        assert_eq!(repeated[0].text, "W1 Support retest");
+    }
+
+    #[test]
+    fn lowercase_timeframe_in_agent_label_is_not_double_prefixed() {
+        let bars = [Bar::new(86400, 10., 12., 8., 11., 1.), Bar::new(172800, 10., 12., 8., 11., 1.)];
+        let chart = Chart {
+            uid: 1,
+            symbol: "AAA US Equity",
+            timeframe: Timeframe::H4,
+            bars: &bars,
+            drawings: &[],
+            indicators: &[],
+            comparisons: &[],
+        };
+        let mut session = Session::default();
+        for label in ["4h support", "h4 support", "1w support"] {
+            let Plan::Drawings(drawings, _) =
+                session.plan(&chart, label, LiveArgs::CreateDrawing(zone_args(label))).unwrap()
+            else {
+                panic!("drawing")
+            };
+            assert_eq!(drawings[0].text, label);
+        }
+    }
+
+    #[test]
+    fn timeframe_tokens_are_case_insensitive_standalone_and_not_share_quantities() {
+        for tf in Timeframe::ALL {
+            for token in [format!("{tf:?}"), tf.label().into()] {
+                for token in [token.to_ascii_lowercase(), token.to_ascii_uppercase()] {
+                    let label = format!("Support [{token}], retest");
+                    assert_eq!(timeframe_label(&label, Timeframe::W1), label);
+                    let embedded = format!("Support x{token}x");
+                    assert_eq!(timeframe_label(&embedded, Timeframe::W1), format!("W1 {embedded}"));
+                }
+            }
+        }
+        for label in ["1M shares", "1m SHARES", "3M shares sold", "1M, shares", "1Mshare", "xH4", "H4x"] {
+            assert_eq!(timeframe_label(label, Timeframe::W1), format!("W1 {label}"));
+        }
+        assert_eq!(timeframe_label("1M shares at [h4] support", Timeframe::W1), "1M shares at [h4] support");
+    }
+
+    #[test]
+    fn long_agent_labels_reserve_prefix_within_sanitize_cap() {
+        for timeframe in Timeframe::ALL {
+            let prefix = format!("{timeframe:?} ");
+            let label = timeframe_label(&format!("\u{0}{}", "界".repeat(600)), timeframe);
+            assert_eq!(label.chars().count(), 500);
+            assert_eq!(label, format!("{prefix}{}", "界".repeat(500 - prefix.chars().count())));
+            assert_eq!(tr_chart::drawings::text::sanitize(&label), label);
+            assert_eq!(timeframe_label(&label, timeframe), label);
+        }
+        assert_eq!(timeframe_label(" \u{0} ", Timeframe::W1), "");
+    }
+
+    #[test]
     fn direct_hosts_reject_nonfinite_coordinates_and_wrong_update_anchor_count() {
         let bars = [Bar::new(86400, 10., 12., 8., 11., 1.), Bar::new(172800, 10., 12., 8., 11., 1.)];
         let chart = Chart {
@@ -497,6 +709,7 @@ mod tests {
                     chart_id: None,
                     all_symbols: false,
                     label: None,
+                    zone_role: None,
                 }),
             );
             let Err(result) = result else { panic!("invalid coordinates succeeded") };
@@ -514,6 +727,7 @@ mod tests {
                     chart_id: None,
                     all_symbols: false,
                     label: None,
+                    zone_role: None,
                 }),
             )
             .unwrap();
@@ -717,6 +931,7 @@ mod tests {
                     chart_id: None,
                     all_symbols: false,
                     label: None,
+                    zone_role: None,
                 }),
             )
             .unwrap()

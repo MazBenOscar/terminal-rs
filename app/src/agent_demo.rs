@@ -250,7 +250,13 @@ pub fn tool(pane: &mut AgentPane, id: &str, name: &str, success: Option<bool>, s
     );
 }
 pub fn complete(pane: &mut AgentPane, status: &str) {
+    if let Some(turn) = pane.turns.last_mut() {
+        turn.started_at = Instant::now() - Duration::from_secs(7);
+    }
     pane.event(BridgeEvent::Completed { turn: TURN.into(), status: status.into(), calls: 3, interrupt_elapsed: None });
+    if let Some(turn) = pane.turns.last_mut() {
+        turn.duration = Some(Duration::from_secs(7));
+    }
 }
 
 const ANSWER: &str = "BTC's weekly trend is recovering, but it is not yet a confirmed breakout.\n\n- **Momentum:** 3 consecutive higher closes; RSI 14 at **56.8**.\n- **Levels:** support near **$62,400**; resistance near **$68,200**.\n- **Risk:** a weekly close below support would weaken the recovery.\n\nThese are synthetic sample bars, not live quotes. The current weekly bar is provisional.";

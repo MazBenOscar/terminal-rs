@@ -20,14 +20,18 @@
   "session": "Provider bars",
   "support_resistance": [
     {
+      "high": 91.6299423,
       "last_touch_time": 1709424000,
+      "low": 88.3700577,
       "price": 90.0,
       "score": 10.29482575,
       "touches": 8,
       "zone_width": 3.25988461
     },
     {
+      "high": 111.6299423,
       "last_touch_time": 1709078400,
+      "low": 108.3700577,
       "price": 110.0,
       "score": 10.24482575,
       "touches": 8,

@@ -234,6 +234,17 @@
           "minLength": 1,
           "pattern": "\\S",
           "type": "string"
+        },
+        "zone_role": {
+          "enum": [
+            "support",
+            "resistance",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

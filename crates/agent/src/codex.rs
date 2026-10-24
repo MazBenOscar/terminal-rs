@@ -90,11 +90,20 @@ impl ResponseStyle {
 
     pub fn instruction(self) -> &'static str {
         match self {
-            Self::Terse => "Response style: Brief. Lead with numbers; use minimal prose, key levels and timestamps.",
-            Self::Analyst => "Response style: Standard. Use brief plain English with key numbers and a bottom line.",
-            Self::Detailed => {
-                "Response style: Detailed. Explain the reasoning and concepts, with supporting numbers and a bottom line."
-            }
+            Self::Terse => concat!(
+                "Response style: Brief. For chart reads use only a one-line verdict, numbers (levels and timestamps), and one 'what would change this read' line with a concrete invalidation level and timeframe. ",
+                "Explicitly separate the last FINISHED bar from the still-forming bar. Lead with numbers; use minimal prose, key levels and timestamps, and no extra reasoning."
+            ),
+            Self::Analyst => concat!(
+                "Response style: Standard. Use brief plain English with key numbers and a bottom line. ",
+                "For chart reads open with a one-line verdict, then evidence citing levels and timestamps, explicitly separating the last FINISHED bar from the still-forming bar. ",
+                "End with one 'what would change this read' line with a concrete invalidation level and timeframe."
+            ),
+            Self::Detailed => concat!(
+                "Response style: Detailed. Explain the reasoning and concepts, with supporting numbers and a bottom line. ",
+                "For chart reads open with a one-line verdict, then evidence citing levels and timestamps, explicitly separating the last FINISHED bar from the still-forming bar, plus reasoning. ",
+                "End with one 'what would change this read' line with a concrete invalidation level and timeframe."
+            ),
         }
     }
 }
@@ -770,6 +779,26 @@ mod tests {
             let wire = additional_context(context.clone(), Some(style));
             assert_eq!(wire["response_style"], json!({"kind":"application", "value":style.instruction()}));
             assert_eq!(wire["chart"]["kind"], "untrusted");
+            let instruction = wire["response_style"]["value"].as_str().unwrap();
+            for required in [
+                "one-line verdict",
+                "levels and timestamps",
+                "last FINISHED bar",
+                "still-forming bar",
+                "one 'what would change this read' line",
+                "concrete invalidation level and timeframe",
+            ] {
+                assert!(instruction.contains(required), "{}: missing {required}", style.label());
+            }
+            match style {
+                ResponseStyle::Terse => {
+                    assert!(instruction.contains("use only") && instruction.contains("no extra reasoning"))
+                }
+                ResponseStyle::Analyst => assert!(instruction.contains("then evidence")),
+                ResponseStyle::Detailed => {
+                    assert!(instruction.contains("then evidence") && instruction.contains("plus reasoning"))
+                }
+            }
         }
         assert!(additional_context(context, None).get("response_style").is_none());
         let untrusted = additional_context(BTreeMap::from([("response_style".into(), "tool data".into())]), None);

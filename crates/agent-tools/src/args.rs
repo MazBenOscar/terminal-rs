@@ -1,6 +1,7 @@
 //! Typed arguments and their wire schemas. Unknown fields fail closed at every level.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+pub use tr_chart::drawings::ZoneRole;
 
 pub trait Arguments {
     fn schema() -> Value;
@@ -40,6 +41,7 @@ macro_rules! field_schema {
     (bool) => { json!({"type":"boolean", "default":false}) };
     (Timeframe) => { json!({"type":"string", "enum":["1m","2m","3m","5m","15m","30m","1H","2H","4H","1D","1W","1M","3M"], "default":"1D"}) };
     (Mode) => { json!({"type":"string", "enum":["swings","trend","levels","volume_profile","volatility"]}) };
+    (ZoneRole) => { json!({"type":"string", "enum":["support","resistance"]}) };
     (DrawingKind) => { json!({"type":"string", "enum":["horizontal","vertical","trend_line","ray","rectangle","text"]}) };
     (CompareAction) => { json!({"type":"string", "enum":["add","remove"]}) };
     (AlertRule) => { json!({"type":"string", "enum":["above","below","crossing"]}) };
@@ -122,7 +124,8 @@ args!(SetView {} {
     timeframe: Option<String> => Timeframe, from: Option<i64> => Timestamp, to: Option<i64> => Timestamp
 });
 args!(CreateDrawing { symbol: String => String, kind: DrawingKind => DrawingKind, anchors: Vec<Anchor> => Anchors } {
-    chart_id: Option<String> => String, all_symbols: bool => bool, label: Option<String> => String
+    chart_id: Option<String> => String, all_symbols: bool => bool, label: Option<String> => String,
+    zone_role: Option<ZoneRole> => ZoneRole
 });
 args!(UpdateDrawing { symbol: String => String, id: u64 => u64 } {
     chart_id: Option<String> => String, all_symbols: bool => bool, anchors: Option<Vec<Anchor>> => Anchors,

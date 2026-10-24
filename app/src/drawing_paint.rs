@@ -9,6 +9,18 @@ use crate::{
 use egui::{Align2, pos2, vec2};
 use tr_chart::drawings::{Drawing, Shape as DrawingShape, Tool};
 
+/// Resolve semantic zone ink at paint time so saved agent zones follow theme changes.
+pub(crate) fn drawing_color(drawing: &Drawing) -> Color32 {
+    drawing.color.map_or_else(
+        || match drawing.zone_role {
+            Some(tr_chart::drawings::ZoneRole::Support) => theme::up(),
+            Some(tr_chart::drawings::ZoneRole::Resistance) => theme::down(),
+            None => theme::cyan(),
+        },
+        |[r, g, b]| Color32::from_rgb(r, g, b),
+    )
+}
+
 type LabeledShape = (DrawingShape, Option<String>);
 pub struct Paint<'a> {
     pub painter: &'a Painter,
@@ -222,6 +234,39 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
                 }
             }
             DrawingShape::DashedSegment(..) | DrawingShape::Polygon(_) => {}
+        }
+    }
+}
+
+#[test]
+fn support_and_resistance_zones_resolve_theme_ink_and_existing_translucent_fill() {
+    use tr_chart::drawings::{Anchor, ZoneRole};
+    let ctx = egui::Context::default();
+    for name in ["Terminal Dark", "Terminal Light", "Bloomberg"] {
+        let themes = crate::themes::builtins();
+        theme::configure(&ctx, themes.iter().find(|t| t.name == name).unwrap(), theme::DEFAULT_ACCENT);
+        for (role, ink) in [(ZoneRole::Support, theme::up()), (ZoneRole::Resistance, theme::down())] {
+            let anchor = Anchor { ts: 86400, price: 10. };
+            let mut drawing = Drawing::new(Tool::Rectangle, anchor, anchor);
+            drawing.zone_role = Some(role);
+            assert_eq!(drawing_color(&drawing), ink);
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                paint(
+                    &drawing,
+                    &Paint {
+                        painter: ui.painter(),
+                        rect: ui.max_rect(),
+                        stroke: Stroke::new(theme::dp(1.0), drawing_color(&drawing)),
+                        selected: false,
+                    },
+                    vec![(DrawingShape::Rect([20., 20.], [200., 80.]), Some("W1 Support / resistance".into()))],
+                );
+            });
+            output.textures_delta.clear();
+            assert!(
+                output.shapes.iter().any(|s| matches!(&s.shape, Shape::Rect(r) if r.fill == ink.gamma_multiply(0.12))),
+                "{name} {role:?}"
+            );
         }
     }
 }
