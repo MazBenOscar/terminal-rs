@@ -143,7 +143,10 @@ impl TerminalApp {
     ) -> ToolResult {
         use tr_agent_tools::edits::{Chart, error};
         let Some(pinned) = self.agent_chart(ChartTarget::Uid(call.pin.uid)) else {
-            return error("chart_not_found", "Pinned chart was closed");
+            return error(
+                "chart_not_found",
+                "Pinned chart was closed; stop edits and ask the user to pin an open chart for a new turn",
+            );
         };
         if self.agent_chart_uid(ChartTarget::Pinned) != Some(call.pin.uid) {
             return error("pin_changed", "Chart pin changed during the turn; start a new turn");
@@ -151,7 +154,10 @@ impl TerminalApp {
         let (symbol, timeframe) =
             expected.get(&call.turn).cloned().unwrap_or_else(|| (call.pin.symbol.clone(), call.pin.timeframe.clone()));
         if pinned.symbol != symbol || pinned.tf.to_string() != timeframe {
-            return error("pin_changed", "Pinned chart symbol or timeframe changed during the turn");
+            return error(
+                "pin_changed",
+                "Pinned chart symbol or timeframe changed during the turn; stop edits and start a new turn with read_chart",
+            );
         }
         for pane in &self.panes {
             if let PaneKind::Chart(chart) = &pane.kind {
@@ -159,6 +165,7 @@ impl TerminalApp {
                     uid: chart.uid,
                     symbol: &chart.symbol,
                     timeframe: chart.tf,
+                    price_decimals: chart.agent_price_decimals,
                     bars: chart.source_bars().bars,
                     drawings: &chart.drawings,
                     indicators: &chart.indicators,
@@ -166,7 +173,12 @@ impl TerminalApp {
                 });
             }
         }
-        let Some(selected) = self.agent_chart(target) else { return error("chart_not_found", "Chart was closed") };
+        let Some(selected) = self.agent_chart(target) else {
+            return error(
+                "chart_not_found",
+                "chart_id no longer identifies an open chart; call read_chart for valid ids or omit chart_id for the pinned chart",
+            );
+        };
         let uid = selected.uid;
         if matches!(args, LiveArgs::SetView(_)) && uid != call.pin.uid {
             return error("wrong_chart", "set_view only changes the pinned chart");
@@ -176,6 +188,7 @@ impl TerminalApp {
             uid,
             symbol: &selected.symbol,
             timeframe: selected.tf,
+            price_decimals: selected.agent_price_decimals,
             bars: selected.source_bars().bars,
             drawings: &selected.drawings,
             indicators: &selected.indicators,
@@ -407,7 +420,9 @@ impl ScopedHost {
 
     fn target(&self, chart: &Option<String>) -> Result<ChartTarget, String> {
         chart.as_ref().map_or(Ok(ChartTarget::Uid(self.call.pin.uid)), |id| {
-            id.parse().map(ChartTarget::Uid).map_err(|_| "chart_id must be a chart uid".into())
+            id.parse().map(ChartTarget::Uid).map_err(|_| {
+                "chart_id must be a numeric chart uid from read_chart; omit chart_id for the pinned chart".into()
+            })
         })
     }
     async fn worker<T>(&self, request: Request, receive: oneshot::Receiver<Result<T, String>>) -> Result<T, String> {
@@ -569,12 +584,15 @@ impl LiveHost for ScopedHost {
                                 self.wait_view(load, deadline).await
                             } else {
                                 serde_json::from_value(value["result"].clone())
-                                    .unwrap_or_else(|_| ToolResult::error("host_error", "Invalid UI reply", None))
+                                    .unwrap_or_else(|_| ToolResult::error("host_error", "Invalid UI edit reply; outcome unconfirmed, inspect read_chart before any retry", None))
                             }
                         }
                         Err(error) => ToolResult::error(
                             if error.contains("chart not found") { "chart_not_found" } else { "host_error" },
-                            &error,
+                            &format!(
+                                "{}: {error}; edit outcome unconfirmed. Inspect read_chart before a retry; if cancelled, stop until a new user turn",
+                                self.call.name
+                            ),
                             None,
                         ),
                     };

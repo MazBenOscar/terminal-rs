@@ -32,10 +32,11 @@ Headless registry and deterministic data tools. No app or egui dependency.
 Live execution remains the host's responsibility: stable pinned-pane resolution,
 loaded-range checks and sanitization for drawings, stale entity ids, UI queue
 cancellation/deadlines, linked-pane reporting, hidden-window screenshot failures,
-and consent state. The registry rejects future drawing anchors early and checks
-indicator codes/normalizes parameters against the core catalog before forwarding.
-Confirmation-sensitive calls (including screenshots) fail unless `confirmed` is
-set by trusted UI consent; hosts should recheck consent at execution time.
+and consent state. The registry rejects future non-rectangle create anchors early;
+rectangle and update anchors are validated/normalized against loaded data by the host.
+It checks indicator codes/normalizes parameters against the core catalog before forwarding.
+Screenshots require trusted UI consent. Workflow calls enqueue proposals; they do not
+consume the screenshot consent flag or bypass user approval.
 
 ## Data semantics
 
@@ -69,6 +70,49 @@ The support/resistance finder lives in **this crate**, preserving the requested
 new-crate-only scope. It clusters confirmed swing highs/lows with ATR-scaled,
 bounded-diameter zones, then scores distinct swing-bar touches, recency and volume.
 It is public for later reuse or relocation into core without app dependencies.
+Zones are ordered by distance from the latest close, with at most three on each
+side. The nearest support, resistance and in-play clusters are reserved even if
+`top` is small (`top: 0` returns none). A containing zone has `in_play: true`;
+`side` distinguishes support, resistance and in-play. Scores remain available but
+no longer determine selection. Height is capped at max(1.5 ATR(14), 2 tolerance),
+trimming padding toward the dense center first, retaining all touches if possible;
+`trimmed: true` reports clipping. No zone is fabricated if no confirmed cluster exists.
+
+## Agent rectangle validation and normalization
+
+This is the rejection-path inventory for `create_drawing` rectangles:
+
+- Registry/transport: disabled/unknown tool, exhausted shared call budget (failed
+  attempts count), malformed JSON or >64 KiB payload; missing/unknown fields,
+  wrong types, invalid enums (`kind`, `zone_role`, `source_timeframe`), timestamps
+  outside the schema's calendar range, anchors outside the 1–8 schema item range,
+  and optional label strings that are blank or longer than 2048 characters.
+  Field paths and permitted values/ranges are returned. Omit `label` to use the
+  host default. Label sanitization itself does **not** reject: control characters
+  are removed and drawing text is truncated to 500 characters, reserving the TF prefix.
+- Live adapter/queue: invalid or missing chart id, closed pinned/target chart,
+  changed pin/symbol/timeframe, cancelled/disconnected job or UI deadline, or an
+  invalid internal UI reply. These are execution/transport failures, not geometry
+  failures. They do not prove an edit succeeded; read the chart before a new attempt.
+- Session limits: 20 creations per turn or 100 agent objects on a chart. Reuse
+  `update_drawing`, remove session-owned objects, or stop until a new turn as applicable.
+- Session arguments: explicit symbol must match the loaded chart; `zone_role`
+  requires `kind: rectangle`; direct hosts also validate `source_timeframe`.
+- Geometry: exactly two anchors and loaded bars are required. Prices must be
+  finite within ±min(100 × maximum loaded price magnitude, 1e15). Equal prices
+  are rejected with a non-zero-zone correction. Inverted prices and time order
+  are normalized, not rejected. End extensions are clamped to the last loaded bar.
+  The resulting start/end must be within loaded bars and not in the future;
+  errors include the anchor field and ISO/Unix loaded range. Times between bars
+  snap to the nearest bar (ties choose earlier). Times snapping to the same bar
+  are rejected; choose two distinct loaded bars. Non-rectangle geometry retains
+  its prior timestamp semantics.
+
+There is no extra rectangle rejection in `Drawing::sanitize`: this two-anchor
+geometry is complete. The host creates `W1 support 72883–76892`-style labels for
+unlabelled zones, using the chart-supplied axis precision and `source_timeframe`
+from analysis (chart timeframe only when absent). The source is persisted for
+idempotent label updates and survives chart timeframe changes.
 
 ## Errors
 

@@ -207,6 +207,12 @@ pub struct Drawing {
     pub color: Option<[u8; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_role: Option<ZoneRole>,
+    /// Timeframe used for agent analysis, independent of the displayed chart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_timeframe: Option<tr_core::Timeframe>,
+    /// Host-generated zone text follows anchors and axis precision until explicitly replaced.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_label: bool,
     #[serde(default = "line_width")]
     pub width: f32,
     #[serde(default)]
@@ -260,6 +266,8 @@ impl Drawing {
             all_symbols: false,
             color: None,
             zone_role: None,
+            source_timeframe: None,
+            auto_label: false,
             width: line_width(),
             extend_left: false,
             extend_right: false,

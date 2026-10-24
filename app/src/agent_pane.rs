@@ -211,8 +211,11 @@ pub struct Trace {
     pub success: Option<bool>,
     pub duration_ms: Option<u64>,
     pub arguments: String,
+    // In-memory identity only; never rendered in the tool row or persisted to layouts.
+    target_args: Value,
     pub summary: Option<String>,
     pub interrupted: bool,
+    pub error: Option<String>,
 }
 
 /// Local conversation metadata, never part of Settings or a layout.
@@ -221,6 +224,7 @@ pub struct ConversationTurn {
     pub id: Option<String>,
     pub prompt_index: usize,
     pub finished: bool,
+    pub final_answer_succeeded: bool,
     pub made_edits: bool,
     pub chart_changes: Option<usize>,
     pub undo_available: bool,
@@ -295,8 +299,15 @@ pub(crate) fn reset_time_at(timestamp: Option<i64>, now: i64) -> String {
     let today = chrono::DateTime::from_timestamp(now, 0).map(|t| t.with_timezone(&chrono::Local).date_naive());
     let day = if Some(date) == today { String::new() } else { format!("{} ", date.format("%b %d")) };
     let minutes = ((time.timestamp() - now).max(0) + 59) / 60;
-    let relative =
-        if minutes == 0 { "now".into() } else { format!("in {minutes} minute{}", if minutes == 1 { "" } else { "s" }) };
+    let relative = if minutes == 0 {
+        "now".into()
+    } else if minutes < 90 {
+        format!("in {minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    } else if minutes < 48 * 60 {
+        format!("in {}h {}m", minutes / 60, minutes % 60)
+    } else {
+        format!("in {}d {}h", minutes / (24 * 60), minutes / 60 % 24)
+    };
     format!("{relative} · {day}{}", local_time(time.timestamp()))
 }
 
@@ -366,6 +377,7 @@ struct ReplyMessage {
 pub struct DataBasis {
     pub sample: bool,
     pub last_bar: Option<i64>,
+    pub latest_price_update: Option<i64>,
     pub incomplete: Option<String>,
 }
 impl DataBasis {
@@ -374,6 +386,7 @@ impl DataBasis {
         Self {
             sample,
             last_bar: bars.bars.last().map(|bar| bar.ts),
+            latest_price_update: chart.price_update_time(),
             incomplete: bars.last_in_progress.then(|| match chart.tf.to_string().as_str() {
                 "1W" => "Weekly".into(),
                 "1D" => "Daily".into(),
@@ -383,7 +396,9 @@ impl DataBasis {
     }
 
     fn freshness(&self) -> Option<String> {
-        self.last_bar.map(|ts| format!("as of {}", local_time(ts)))
+        self.latest_price_update
+            .map(|ts| format!("as of {}", local_time(ts)))
+            .or_else(|| self.last_bar.map(|ts| format!("bar opened {}", local_time(ts))))
     }
 }
 
@@ -664,6 +679,7 @@ impl AgentPane {
             id: None,
             prompt_index: self.blocks.len(),
             finished: false,
+            final_answer_succeeded: false,
             made_edits: false,
             chart_changes: None,
             undo_available: false,
@@ -711,6 +727,16 @@ impl AgentPane {
                 // Completion also supplies the canonical id if Started was absent.
                 if let Some(index) = self.active_turn {
                     self.turns[index].id.get_or_insert(turn);
+                    let start = self.turns[index].prompt_index;
+                    let last_failure = self.blocks[start..]
+                        .iter()
+                        .rposition(|block| matches!(block, RenderedBlock::Tool(t) if t.success == Some(false)))
+                        .map(|i| start + i);
+                    self.turns[index].final_answer_succeeded = status == "completed"
+                        && self
+                            .replies
+                            .values()
+                            .any(|reply| !reply.text.trim().is_empty() && last_failure.is_none_or(|i| reply.index > i));
                 }
                 self.finish_turn();
                 self.flush(Instant::now());
@@ -802,8 +828,10 @@ impl AgentPane {
                     } else {
                         safe_arguments(&item["arguments"])
                     },
+                    target_args: normalized_args(&item["arguments"]),
                     summary,
                     interrupted: false,
+                    error: tool_error(item),
                 };
                 let start = self.active_turn.map_or(0, |index| self.turns[index].prompt_index + 1);
                 if let Some(RenderedBlock::Tool(old)) = self.blocks[start..]
@@ -924,7 +952,7 @@ impl AgentPane {
                         n => format!("{n}-minute"),
                     };
                     let source = if limit.id == "ordinary" { String::new() } else { format!("{} · ", limit.id) };
-                    let usage = format!("{source}{window} limit · {:.0}% used", limit.used);
+                    let usage = format!("{source}{window} limit {:.0}% used", limit.used);
                     let label = if matches!(self.state, Onboarding::RateLimited { .. }) {
                         usage
                     } else {
@@ -1084,10 +1112,16 @@ impl AgentPane {
         let label = if traces.is_empty() && reverted.is_none() {
             "Chart changes".into()
         } else {
-            turn.and_then(ConversationTurn::reverted_summary)
-                .map_or_else(|| tool_group_label(&traces, reverted), str::to_owned)
+            turn.and_then(ConversationTurn::reverted_summary).map_or_else(
+                || tool_group_label_outcome(&traces, reverted, turn.is_some_and(|t| t.final_answer_succeeded)),
+                str::to_owned,
+            )
         };
         let label = tool_group_duration(label, turn);
+        let recovered = recovered_failures(&traces);
+        let retries =
+            if traces.iter().filter(|trace| trace.success == Some(false)).count() == recovered { recovered } else { 0 };
+        let label = retry_suffix(label, retries);
         let expanded = self.expanded_tools.contains(&key);
         let wash = ui.painter().add(egui::Shape::Noop);
         let response = ui
@@ -1910,7 +1944,79 @@ fn tool_group_duration(label: String, turn: Option<&ConversationTurn>) -> String
     format!("{label} · {seconds}")
 }
 
+fn normalized_args(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(fields.iter().map(|(k, v)| (k.clone(), normalized_args(v))).collect()),
+        Value::Array(values) => Value::Array(values.iter().map(normalized_args).collect()),
+        Value::String(text) => Value::String(text.trim().into()),
+        _ => value.clone(),
+    }
+}
+
+fn same_tool_target(failed: &Trace, later: &Trace) -> bool {
+    if failed.name != later.name {
+        return false;
+    }
+    let (a, b) = (&failed.target_args, &later.target_args);
+    if !a.is_object() || !b.is_object() {
+        return false;
+    }
+    for scope in ["symbol", "chart_id"] {
+        if !a[scope].is_null() && !b[scope].is_null() && a[scope] != b[scope] {
+            return false;
+        }
+    }
+    match failed.name.as_str() {
+        "create_drawing" => {
+            // An explicit label can identify the intended drawing even when its geometry changes.
+            if a["label"].as_str().is_some_and(|label| !label.is_empty() && a["label"] == b["label"]) {
+                return true;
+            }
+            if a["kind"].is_null()
+                || a["kind"] != b["kind"]
+                || a["zone_role"] != b["zone_role"]
+                || a["side"] != b["side"]
+            {
+                return false;
+            }
+            let range = |args: &Value| -> Option<(f64, f64)> {
+                let prices: Option<Vec<_>> = args["anchors"].as_array()?.iter().map(|p| p["price"].as_f64()).collect();
+                let prices = prices?;
+                if prices.is_empty() || prices.iter().any(|p| !p.is_finite()) {
+                    return None;
+                }
+                Some((
+                    prices.iter().copied().fold(f64::INFINITY, f64::min),
+                    prices.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                ))
+            };
+            range(a).zip(range(b)).is_some_and(|((al, ah), (bl, bh))| al <= bh && bl <= ah)
+        }
+        "update_drawing" | "delete_drawing" => !a["id"].is_null() && a["id"] == b["id"],
+        _ => a == b,
+    }
+}
+
+fn recovered_failures(traces: &[&Trace]) -> usize {
+    traces
+        .iter()
+        .enumerate()
+        .filter(|(i, trace)| {
+            trace.success == Some(false)
+                && traces[i + 1..].iter().any(|later| later.success == Some(true) && same_tool_target(trace, later))
+        })
+        .count()
+}
+
+fn retry_suffix(label: String, retries: usize) -> String {
+    if retries == 0 { label } else { format!("{label} · {retries} retr{}", if retries == 1 { "y" } else { "ies" }) }
+}
+
 fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
+    tool_group_label_outcome(traces, reverted, false)
+}
+
+fn tool_group_label_outcome(traces: &[&Trace], reverted: Option<usize>, final_answer: bool) -> String {
     if let Some(n) = reverted {
         return format!("{n} change{} reverted", if n == 1 { "" } else { "s" });
     }
@@ -1925,12 +2031,14 @@ fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
     }
     let summary = if traces.iter().any(|trace| trace.interrupted) {
         "Stopped before finishing".into()
-    } else if traces.iter().any(|trace| trace.success == Some(false)) {
+    } else if traces.iter().any(|trace| trace.success == Some(false))
+        && !traces.iter().any(|trace| trace.success == Some(true))
+    {
         "Chart tools failed".into()
     } else {
         let edits: Vec<_> =
             traces.iter().filter(|trace| is_edit_tool(&trace.name) && trace.success == Some(true)).collect();
-        if traces.iter().any(|trace| {
+        if traces.iter().filter(|trace| trace.success == Some(true)).any(|trace| {
             matches!(
                 trace.name.as_str(),
                 "create_watchlist"
@@ -1944,9 +2052,13 @@ fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
         }) {
             "Proposed workflow changes".into()
         } else if edits.is_empty() {
-            if traces.iter().any(|trace| matches!(trace.name.as_str(), "list_watchlists" | "list_alerts")) {
+            if final_answer && !traces.iter().any(|trace| trace.success == Some(true)) {
+                "Answered".into()
+            } else if traces.iter().any(|trace| {
+                trace.success == Some(true) && matches!(trace.name.as_str(), "list_watchlists" | "list_alerts")
+            }) {
                 "Read watchlists and alerts".into()
-            } else if traces.iter().any(|trace| trace.name == "analyze") {
+            } else if traces.iter().any(|trace| trace.success == Some(true) && trace.name == "analyze") {
                 "Analyzed chart".into()
             } else {
                 "Read chart data".into()
@@ -1959,11 +2071,41 @@ fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
                         && trace.summary.as_deref().is_some_and(|s| s.to_ascii_lowercase().contains("line"))
                 })
                 .count();
+            let zones = edits
+                .iter()
+                .filter(|trace| {
+                    trace.name == "create_drawing"
+                        && trace.target_args["kind"] == "rectangle"
+                        && !trace.target_args["zone_role"].is_null()
+                })
+                .count();
+            let rectangles = edits
+                .iter()
+                .filter(|trace| {
+                    trace.name == "create_drawing"
+                        && trace.target_args["kind"] == "rectangle"
+                        && trace.target_args["zone_role"].is_null()
+                })
+                .count();
             let indicators: Vec<_> = edits.iter().filter(|trace| trace.name == "add_indicator").collect();
-            if lines + indicators.len() == edits.len() && indicators.len() <= 1 {
+            if lines + zones + rectangles + indicators.len() == edits.len() && indicators.len() <= 1 {
                 let mut parts = Vec::new();
+                if zones > 0 {
+                    parts.push(format!("Drew {zones} zone{}", if zones == 1 { "" } else { "s" }));
+                }
+                if rectangles > 0 {
+                    parts.push(format!(
+                        "{}{rectangles} rectangle{}",
+                        if parts.is_empty() { "Drew " } else { "" },
+                        if rectangles == 1 { "" } else { "s" }
+                    ));
+                }
                 if lines > 0 {
-                    parts.push(format!("Drew {lines} line{}", if lines == 1 { "" } else { "s" }));
+                    parts.push(format!(
+                        "{}{lines} line{}",
+                        if parts.is_empty() { "Drew " } else { "" },
+                        if lines == 1 { "" } else { "s" }
+                    ));
                 }
                 if let Some(trace) = indicators.first() {
                     let object = main_tool_label(trace.summary.as_deref().unwrap_or("indicator"));
@@ -1975,7 +2117,9 @@ fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
             }
         }
     };
-    format!("{summary} · {} step{}", traces.len(), if traces.len() == 1 { "" } else { "s" })
+    let label = format!("{summary} · {} step{}", traces.len(), if traces.len() == 1 { "" } else { "s" });
+    let failures = traces.iter().filter(|trace| trace.success == Some(false)).count() - recovered_failures(traces);
+    if failures > 0 { format!("{label} · {failures} failed") } else { label }
 }
 
 fn tool_status(trace: &Trace) -> &'static str {
@@ -2046,6 +2190,11 @@ fn tool_row_with_history(ui: &mut Ui, trace: &Trace, reverted: bool) {
         duration,
         theme::text(),
     );
+    if trace.success == Some(false)
+        && let Some(error) = &trace.error
+    {
+        ui.indent(("tool-error", &trace.id), |ui| agent_markdown::wrapped(ui, error, readable(theme::muted())));
+    }
     response.on_hover_text(format!(
         "{} · {status}\n{}\nCall: {}\n{}",
         trace.name,
@@ -2053,6 +2202,29 @@ fn tool_row_with_history(ui: &mut Ui, trace: &Trace, reverted: bool) {
         trace.id,
         trace.arguments,
     ));
+}
+
+pub(crate) fn tool_error(item: &Value) -> Option<String> {
+    if item["success"] != false {
+        return None;
+    }
+    let mut messages = Vec::new();
+    if let Some(message) = item["error"]["message"].as_str().or_else(|| item["error"].as_str()) {
+        messages.push(short_label(message));
+    }
+    for content in item["contentItems"].as_array().into_iter().flatten() {
+        if let Some(text) = content["text"].as_str() {
+            let value = serde_json::from_str::<Value>(text).ok();
+            let message = value.as_ref().and_then(|v| v["error"]["message"].as_str());
+            if let Some(message) = message {
+                messages.push(short_label(message));
+            } else if value.is_none() {
+                messages.push(short_label(text));
+            }
+        }
+    }
+    messages.dedup();
+    (!messages.is_empty()).then(|| messages.join(" · "))
 }
 
 fn main_tool_label(summary: &str) -> String {
@@ -2138,6 +2310,9 @@ pub(crate) fn edit_tool_summary(item: &Value) -> Option<String> {
             "trend_line" => "Trend line".into(),
             "vertical" => "vertical line".into(),
             "ray" => "ray (2 anchors)".into(),
+            "rectangle" if args["zone_role"].as_str().is_some() => {
+                format!("{} zone", args["zone_role"].as_str().unwrap())
+            }
             "rectangle" => "rectangle (2 anchors)".into(),
             "text" => "text annotation".into(),
             _ => "drawing update".into(),
@@ -2733,7 +2908,18 @@ mod polish_tests {
             assert!(basis.sample);
             assert_eq!(basis.last_bar, Some(ts));
             assert_eq!(basis.incomplete.as_deref(), Some(word));
-            assert_eq!(basis.freshness(), Some(format!("as of {}", local_time(ts))));
+            assert_eq!(basis.freshness(), Some(format!("bar opened {}", local_time(ts))));
+            let worker = crate::worker::Worker::inert();
+            let mut updated = bars.as_ref().clone();
+            updated[0].close = 1.5;
+            chart.on_live_bars(0, 0, updated, 1, &worker);
+            let live_basis = DataBasis::from_chart(&chart, false);
+            let received = chart.price_update_time().expect("accepted live update");
+            assert!(received >= now);
+            assert_eq!(live_basis.latest_price_update, Some(received));
+            assert_eq!(live_basis.freshness(), Some(format!("as of {}", local_time(received))));
+            chart.on_live_bars(1, 0, vec![], 0, &worker);
+            assert_eq!(chart.price_update_time(), Some(received), "stale generation cannot refresh freshness");
             assert!(!DataBasis::from_chart(&chart, false).sample);
             let old = Arc::new(vec![Bar::new(ts - 2 * tf.seconds(), 1., 2., 1., 2., 3.)]);
             chart.on_history(
@@ -2876,6 +3062,213 @@ mod polish_tests {
             assert_eq!(label(&running), expected);
             assert_eq!(running.coalescer.due_in(Instant::now(), true), None, "static running icons add no timer");
         }
+    }
+
+    #[test]
+    fn recovered_zone_headers_keep_failed_rows_and_muted_actionable_errors() {
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("edits").unwrap(), 1);
+        pane.wire("item/completed", &serde_json::json!({"item": {
+            "type":"dynamicToolCall", "id":"failed", "tool":"create_drawing", "success":false,
+            "arguments":{"symbol":crate::agent_demo::SYMBOL,"kind":"rectangle","zone_role":"support",
+                "anchors":[{"time":86400,"price":8.},{"time":172800,"price":12.}]},
+            "contentItems":[{"type":"inputText","text":"{\"error\":{\"message\":\"anchors[1].price must differ from anchors[0].price\"}}"}]
+        }}));
+        crate::agent_demo::tool(&mut pane, "retry", "create_drawing", Some(true), Some("Support zone"));
+        crate::agent_demo::tool(&mut pane, "second", "create_drawing", Some(true), Some("Resistance zone"));
+        crate::agent_demo::complete(&mut pane, "completed");
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| pane.conversation(ui, &mut Vec::new()));
+        output.textures_delta.clear();
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s == "Drew 2 zones · 3 steps · 7s · 1 retry"));
+        assert!(text.iter().any(|(s, _)| s == "anchors[1].price must differ from anchors[0].price"));
+        let traces: Vec<_> =
+            pane.blocks.iter().filter_map(|b| if let RenderedBlock::Tool(t) = b { Some(t) } else { None }).collect();
+        assert_eq!(traces[0].success, Some(false));
+        assert_eq!(recovered_failures(&traces), 1);
+        let mut line = (*traces[2]).clone();
+        line.summary = Some("Horizontal line".into());
+        line.target_args["kind"] = "horizontal".into();
+        line.target_args["zone_role"] = Value::Null;
+        assert_eq!(tool_group_label(&[traces[1], &line], None), "Drew 1 zone and 1 line · 2 steps");
+        assert_eq!(
+            tool_group_label(&[traces[1], traces[0]], None),
+            "Drew 1 zone · 2 steps · 1 failed",
+            "an earlier success cannot recover a later failure"
+        );
+        assert_eq!(tool_group_label_outcome(&[traces[0]], None, true), "Chart tools failed · 1 step · 1 failed");
+        assert_eq!(retry_suffix("Finished".into(), 2), "Finished · 2 retries");
+        assert_eq!(recovered_failures(&[traces[0], traces[0], traces[1]]), 2);
+        let mut other = (*traces[1]).clone();
+        other.name = "analyze".into();
+        assert_eq!(recovered_failures(&[traces[0], &other]), 0);
+    }
+
+    #[test]
+    fn final_answer_completion_does_not_recover_a_tool_failure() {
+        for (status, answer, recovered) in
+            [("completed", true, true), ("failed", true, false), ("completed", false, false)]
+        {
+            let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("edits").unwrap(), 1);
+            crate::agent_demo::tool(&mut pane, "failed", "analyze", Some(false), None);
+            if answer {
+                pane.wire("item/completed", &serde_json::json!({"item":{"type":"agentMessage", "id":"answer", "text":"Confirmed results only."}}));
+            }
+            crate::agent_demo::complete(&mut pane, status);
+            assert_eq!(pane.turns[0].final_answer_succeeded, recovered);
+            let traces: Vec<_> = pane
+                .blocks
+                .iter()
+                .filter_map(|b| if let RenderedBlock::Tool(t) = b { Some(t) } else { None })
+                .collect();
+            assert_eq!(recovered_failures(&traces), 0);
+            assert_eq!(tool_group_label_outcome(&traces, None, recovered), "Chart tools failed · 1 step · 1 failed");
+        }
+    }
+
+    fn review_trace(id: &str, success: bool, summary: &str) -> Trace {
+        Trace {
+            id: id.into(),
+            name: "create_drawing".into(),
+            success: Some(success),
+            duration_ms: Some(10),
+            arguments: String::new(),
+            target_args: serde_json::json!({"kind":"rectangle", "zone_role":if summary.contains("support") { Some("support") } else if summary.contains("resistance") { Some("resistance") } else { None },
+                "anchors":[{"time":86400,"price":8.},{"time":172800,"price":12.}]}),
+            summary: Some(summary.into()),
+            interrupted: false,
+            error: (!success).then(|| "anchors[1].time must be within the loaded range".into()),
+        }
+    }
+
+    #[test]
+    fn review_different_drawing_success_is_not_a_retry() {
+        let failed = review_trace("r", false, "resistance zone");
+        let other = review_trace("s", true, "#7 · support zone");
+        assert_eq!(recovered_failures(&[&failed, &other]), 0);
+        assert_eq!(tool_group_label(&[&failed, &other], None), "Drew 1 zone · 2 steps · 1 failed");
+    }
+
+    #[test]
+    fn retries_require_the_same_drawing_identity_or_normalized_tool_arguments() {
+        let failed = review_trace("failed", false, "support zone");
+        let mut later = review_trace("later", true, "support zone");
+        assert_eq!(recovered_failures(&[&failed, &later]), 1);
+        later.target_args["anchors"] = serde_json::json!([{"price":11.},{"price":15.}]);
+        assert_eq!(recovered_failures(&[&failed, &later]), 1, "overlapping ranges");
+        later.target_args["anchors"] = serde_json::json!([{"price":20.},{"price":25.}]);
+        assert_eq!(recovered_failures(&[&failed, &later]), 0, "different price target");
+        let mut labeled = failed.clone();
+        labeled.target_args["label"] = "weekly demand".into();
+        later.target_args["label"] = "weekly demand".into();
+        assert_eq!(recovered_failures(&[&labeled, &later]), 1, "same explicit label");
+        for (field, value) in [("kind", "horizontal"), ("zone_role", "resistance"), ("side", "sell")] {
+            let mut other = later.clone();
+            other.target_args["anchors"] = failed.target_args["anchors"].clone();
+            other.target_args[field] = value.into();
+            assert_eq!(recovered_failures(&[&failed, &other]), 0, "{field}");
+        }
+        assert_eq!(recovered_failures(&[&later, &labeled]), 0, "success must be later");
+        for tool in ["update_drawing", "delete_drawing"] {
+            let mut failed = failed.clone();
+            failed.name = tool.into();
+            failed.target_args = serde_json::json!({"id":7,"label":"before"});
+            let mut later = failed.clone();
+            later.success = Some(true);
+            later.target_args["label"] = "after".into();
+            assert_eq!(recovered_failures(&[&failed, &later]), 1);
+            later.target_args["id"] = 8.into();
+            assert_eq!(recovered_failures(&[&failed, &later]), 0);
+        }
+        let mut failed = failed;
+        failed.name = "analyze".into();
+        failed.target_args = normalized_args(
+            &serde_json::from_str::<Value>(r#"{ "mode": "trend", "symbol": " AAA ", "options": {"limit":20} }"#)
+                .unwrap(),
+        );
+        let mut later = failed.clone();
+        later.success = Some(true);
+        later.target_args = normalized_args(&serde_json::json!({"options":{"limit":20},"symbol":"AAA","mode":"trend"}));
+        assert_eq!(recovered_failures(&[&failed, &later]), 1);
+        later.target_args["options"]["limit"] = 30.into();
+        assert_eq!(recovered_failures(&[&failed, &later]), 0);
+    }
+
+    #[test]
+    fn partially_retried_failures_keep_success_summary_and_only_failed_suffix() {
+        let failed = review_trace("support-failed", false, "support zone");
+        let unresolved = review_trace("resistance-failed", false, "resistance zone");
+        let success = review_trace("support-success", true, "support zone");
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("edits").unwrap(), 1);
+        pane.blocks.extend([failed, unresolved.clone(), success].map(RenderedBlock::Tool));
+        crate::agent_demo::complete(&mut pane, "completed");
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| pane.conversation(ui, &mut Vec::new()));
+        output.textures_delta.clear();
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s.starts_with("Drew 1 zone · 3 steps · 1 failed")));
+        assert!(!text.iter().any(|(s, _)| s.contains("1 retry")));
+        let recovered = Trace { id: "resistance-success".into(), success: Some(true), error: None, ..unresolved };
+        pane.blocks.push(RenderedBlock::Tool(recovered));
+        let mut output = ctx.run_ui(Default::default(), |ui| pane.conversation(ui, &mut Vec::new()));
+        output.textures_delta.clear();
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s == "Drew 2 zones · 4 steps · 7s · 2 retries"));
+        assert!(!text.iter().any(|(s, _)| s.contains("1 failed")));
+    }
+
+    #[test]
+    fn review_plain_rectangle_is_not_a_zone() {
+        let rectangle = review_trace("p", true, "#9 · rectangle (2 anchors)");
+        assert_eq!(tool_group_label(&[&rectangle], None), "Drew 1 rectangle · 1 step");
+        assert_eq!(tool_group_label(&[&rectangle, &rectangle], None), "Drew 2 rectangles · 2 steps");
+        let zone = review_trace("zone", true, "support zone");
+        assert_eq!(tool_group_label(&[&zone, &rectangle], None), "Drew 1 zone and 1 rectangle · 2 steps");
+    }
+
+    #[test]
+    fn compact_reset_thresholds_include_local_date_only_when_needed() {
+        let now = crate::agent_demo::SAMPLE_NOW;
+        for (minutes, expected) in [
+            (1, "in 1 minute"),
+            (42, "in 42 minutes"),
+            (89, "in 89 minutes"),
+            (90, "in 1h 30m"),
+            (320, "in 5h 20m"),
+            (2879, "in 47h 59m"),
+            (2880, "in 2d 0h"),
+            (9420, "in 6d 13h"),
+        ] {
+            let reset = reset_time_at(Some(now + minutes * 60), now);
+            assert!(reset.starts_with(&format!("{expected} · ")), "{reset}");
+            assert!(reset.ends_with(&local_time(now + minutes * 60)));
+            if minutes >= 2880 {
+                let date = chrono::DateTime::from_timestamp(now + minutes * 60, 0)
+                    .unwrap()
+                    .with_timezone(&chrono::Local)
+                    .format("%b %d")
+                    .to_string();
+                assert!(reset.contains(&date), "{reset}");
+            }
+        }
+        assert!(reset_time_at(Some(now - 1), now).starts_with("now · "));
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("rate-limited").unwrap(), 1);
+        pane.limits[0] =
+            Limit { id: "weekly".into(), used: 25., reset: reset_time_at(Some(now + 9420 * 60), now), minutes: 10080 };
+        pane.limits_value = Value::Null;
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            pane.show(ui, "BTC/USD · 4H", egui::Id::new("long-reset"));
+        });
+        output.textures_delta.clear();
+        assert!(texts(&output).iter().any(|(s, _)| s == "weekly · Weekly limit 25% used"));
+        // When not blocked, meters may still expose their own reset windows.
+        pane.state = Onboarding::Ready;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            pane.show(ui, "BTC/USD · 4H", egui::Id::new("long-reset-ready"));
+        });
+        output.textures_delta.clear();
+        assert!(texts(&output).iter().any(|(s, _)| s.contains("Weekly limit 25% used · resets in 6d 13h")));
     }
 
     #[test]
@@ -3406,8 +3799,10 @@ mod polish_tests {
                 success: Some(true),
                 duration_ms: Some(42),
                 arguments: "safe projected arguments".into(),
+                target_args: Value::Null,
                 summary: Some("#1:3 · Horizontal line at 27,534.92".into()),
                 interrupted: false,
+                error: None,
             };
             for (success, interrupted, expected) in [
                 (Some(true), false, "ok"),
@@ -3653,7 +4048,7 @@ mod polish_tests {
         });
         output.textures_delta.clear();
         let text = texts(&output);
-        assert!(text.iter().any(|(s, _)| s == "5-hour limit · 100% used"));
+        assert!(text.iter().any(|(s, _)| s == "5-hour limit 100% used"));
         assert_eq!(text.iter().filter(|(s, _)| s.contains("20:42 EDT")).count(), 1);
         assert_eq!(text.iter().filter(|(s, _)| s.contains("in 42 minutes")).count(), 1);
     }

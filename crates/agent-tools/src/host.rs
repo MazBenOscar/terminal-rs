@@ -149,6 +149,8 @@ pub mod edits {
         pub uid: u64,
         pub symbol: &'a str,
         pub timeframe: Timeframe,
+        /// Current axis precision supplied by the chart renderer.
+        pub price_decimals: usize,
         pub bars: &'a [Bar],
         pub drawings: &'a [Drawing],
         pub indicators: &'a [Spec],
@@ -196,7 +198,10 @@ pub mod edits {
 
         fn can_create(&self, chart: &Chart<'_>, turn: &str) -> Result<(), ToolResult> {
             if self.created.get(turn).copied().unwrap_or_default() >= MAX_CREATED_PER_TURN {
-                return Err(error("turn_object_limit", "At most 20 objects may be created per turn"));
+                return Err(error(
+                    "turn_object_limit",
+                    "create_drawing/add_indicator/compare reached 20 new objects this turn; reuse update_drawing or stop creating until a new turn",
+                ));
             }
             let count = chart.drawings.iter().filter(|d| d.created_by == Author::Agent).count()
                 + chart
@@ -207,7 +212,10 @@ pub mod edits {
                     .count()
                 + chart.comparisons.iter().filter(|comparison| comparison.created_by == Author::Agent).count();
             if count >= MAX_AGENT_OBJECTS {
-                return Err(error("chart_object_limit", "At most 100 agent objects may exist per chart"));
+                return Err(error(
+                    "chart_object_limit",
+                    "chart reached 100 agent objects; update existing drawings or delete session-owned objects before creating more",
+                ));
             }
             Ok(())
         }
@@ -250,16 +258,33 @@ pub mod edits {
                         args::DrawingKind::Text => Tool::Text,
                     };
                     if a.zone_role.is_some() && tool != Tool::Rectangle {
-                        return Err(error("invalid_args", "zone_role is only supported for rectangles"));
+                        return Err(error(
+                            "invalid_args",
+                            "zone_role requires kind=rectangle; omit zone_role for lines or text",
+                        ));
                     }
-                    let points = anchors(chart, &a.anchors, tool.points())?;
+                    let points = drawing_anchors(chart, &a.anchors, tool)?;
+                    let source_timeframe = a
+                        .source_timeframe
+                        .as_deref()
+                        .map(str::parse::<Timeframe>)
+                        .transpose()
+                        .map_err(|_| {
+                            error("invalid_args", "source_timeframe must be a supported Timeframe (e.g. 1W, 4H)")
+                        })?
+                        .unwrap_or(chart.timeframe);
                     let mut drawing = Drawing::new(tool, points[0], *points.last().unwrap());
                     drawing.symbol = Some(chart.symbol.into());
                     drawing.all_symbols = a.all_symbols;
                     drawing.created_by = Author::Agent;
                     drawing.turn_id = Some(turn.into());
-                    drawing.text = timeframe_label(a.label.as_deref().unwrap_or_default(), chart.timeframe);
+                    drawing.source_timeframe = Some(source_timeframe);
                     drawing.zone_role = a.zone_role;
+                    drawing.text = timeframe_label(a.label.as_deref().unwrap_or_default(), source_timeframe);
+                    drawing.auto_label = drawing.zone_role.is_some() && drawing.text.is_empty();
+                    if drawing.auto_label {
+                        drawing.text = zone_label(&drawing, source_timeframe, chart.price_decimals);
+                    }
                     drawing.sanitize();
                     let id = drawing.id;
                     let mut next = chart.drawings.to_vec();
@@ -281,13 +306,18 @@ pub mod edits {
                     if drawing.symbol.as_deref() != Some(chart.symbol) {
                         return Err(error("wrong_chart", "Drawing belongs to another symbol"));
                     }
+                    let timeframe = drawing.source_timeframe.unwrap_or(chart.timeframe);
+                    let anchors_changed = a.anchors.is_some();
                     if let Some(points) = a.anchors {
-                        let points = anchors(chart, &points, drawing.tool.points())?;
+                        let points = drawing_anchors(chart, &points, drawing.tool)?;
                         drawing.a = points[0];
                         drawing.b = *points.last().unwrap();
                     }
                     if let Some(label) = a.label {
-                        drawing.text = timeframe_label(&label, chart.timeframe);
+                        drawing.text = timeframe_label(&label, timeframe);
+                        drawing.auto_label = false;
+                    } else if drawing.auto_label && anchors_changed {
+                        drawing.text = zone_label(drawing, timeframe, chart.price_decimals);
                     }
                     drawing.all_symbols = a.all_symbols;
                     drawing.sanitize();
@@ -435,32 +465,106 @@ pub mod edits {
 
     fn check_symbol(chart: &Chart<'_>, symbol: &str) -> Result<(), ToolResult> {
         if tr_data::security(symbol).key() != tr_data::security(chart.symbol).key() {
-            return Err(error("wrong_chart", "Explicit symbol does not match chart"));
+            return Err(error(
+                "wrong_chart",
+                &format!("symbol must match the loaded chart {}; call read_chart before retrying", chart.symbol),
+            ));
         }
         Ok(())
     }
 
-    fn anchors(chart: &Chart<'_>, points: &[args::Anchor], count: usize) -> Result<Vec<Anchor>, ToolResult> {
-        let (first, last) = chart
-            .bars
-            .first()
-            .zip(chart.bars.last())
-            .ok_or_else(|| error("invalid_args", "Chart has no loaded data"))?;
+    fn zone_label(drawing: &Drawing, timeframe: Timeframe, decimals: usize) -> String {
+        let Some(role) = drawing.zone_role else { return String::new() };
+        let role = match role {
+            args::ZoneRole::Support => "support",
+            args::ZoneRole::Resistance => "resistance",
+        };
+        let low = tr_chart::scale::format_price(drawing.a.price.min(drawing.b.price), decimals);
+        let high = tr_chart::scale::format_price(drawing.a.price.max(drawing.b.price), decimals);
+        format!("{timeframe:?} {role} {low}–{high}")
+    }
+
+    fn drawing_anchors(chart: &Chart<'_>, points: &[args::Anchor], tool: Tool) -> Result<Vec<Anchor>, ToolResult> {
+        let count = tool.points();
+        if points.len() != count {
+            return Err(error("invalid_args", &format!("anchors must contain exactly {count} points for {tool:?}")));
+        }
+        let (first, last) =
+            chart.bars.first().zip(chart.bars.last()).ok_or_else(|| {
+                error("invalid_args", "anchors require loaded bars; call read_chart after data loads")
+            })?;
         let magnitude =
             chart.bars.iter().flat_map(|b| [b.low.abs(), b.high.abs()]).filter(|p| p.is_finite()).fold(1., f64::max);
         let bound = (magnitude * 100.).min(1e15);
-        if points.len() != count
-            || points.iter().any(|p| {
-                !p.price.is_finite()
-                    || p.price.abs() > bound
-                    || p.time < first.ts
-                    || p.time > last.ts
-                    || p.time > chrono::Utc::now().timestamp()
-            })
-        {
-            return Err(error("invalid_args", "Invalid anchor count, price or timestamp outside loaded data"));
+        // Keep caller indices attached while normalizing chronological order.
+        let mut points: Vec<_> = points.iter().enumerate().collect();
+        if tool == Tool::Rectangle && points[0].1.time > points[1].1.time {
+            points.swap(0, 1);
         }
-        Ok(points.iter().map(|p| Anchor { ts: p.time, price: p.price }).collect())
+        let mut out = Vec::new();
+        for (position, &(i, p)) in points.iter().enumerate() {
+            if !p.price.is_finite() || p.price.abs() > bound {
+                return Err(error(
+                    "invalid_args",
+                    &format!("anchors[{i}].price must be finite and within -{bound}–{bound}; use analyze bounds"),
+                ));
+            }
+            // Rectangle end extensions are harmless; clip them to the loaded last bar.
+            let time = if tool == Tool::Rectangle && position == 1 { p.time.min(last.ts) } else { p.time };
+            if time < first.ts || time > last.ts || time > chrono::Utc::now().timestamp() {
+                let date = |ts| {
+                    chrono::DateTime::from_timestamp(ts, 0).map(|t| t.to_rfc3339()).unwrap_or_else(|| ts.to_string())
+                };
+                return Err(error(
+                    "invalid_args",
+                    &format!(
+                        "anchors[{i}].time must be within the loaded range {}–{} (Unix {}–{}); read_chart for valid anchors",
+                        date(first.ts),
+                        date(last.ts),
+                        first.ts,
+                        last.ts
+                    ),
+                ));
+            }
+            let ts = if tool == Tool::Rectangle {
+                let index = chart.bars.partition_point(|bar| bar.ts < time);
+                match (index.checked_sub(1).and_then(|i| chart.bars.get(i)), chart.bars.get(index)) {
+                    (Some(a), Some(b)) => {
+                        if time - a.ts <= b.ts - time {
+                            a.ts
+                        } else {
+                            b.ts
+                        }
+                    }
+                    (Some(a), None) => a.ts,
+                    (_, Some(b)) => b.ts,
+                    _ => unreachable!(),
+                }
+            } else {
+                time
+            };
+            out.push(Anchor { ts, price: p.price });
+        }
+        if tool == Tool::Rectangle {
+            if out[0].price == out[1].price {
+                return Err(error(
+                    "invalid_args",
+                    "anchors[1].price must differ from anchors[0].price; use analyze low and high for a non-zero zone",
+                ));
+            }
+            if out[0].price > out[1].price {
+                let price = out[0].price;
+                out[0].price = out[1].price;
+                out[1].price = price;
+            }
+            if out[0].ts == out[1].ts {
+                return Err(error(
+                    "invalid_args",
+                    "anchors times snap to the same bar; choose two distinct loaded bars from read_chart",
+                ));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -517,6 +621,7 @@ mod tests {
             let chart = Chart {
                 uid: 1,
                 symbol: "AAA US Equity",
+                price_decimals: 2,
                 timeframe,
                 bars: &bars,
                 drawings: &[],
@@ -544,6 +649,8 @@ mod tests {
                         panic!("drawing")
                     };
                     let drawing = &drawings[0];
+                    let expected =
+                        if label.is_none() { format!("{timeframe:?} {role} 8.00–12.00") } else { expected.clone() };
                     assert_eq!(drawing.text, expected);
                     assert_eq!(drawing.created_by, tr_chart::drawings::Author::Agent);
                     assert!(drawing.color.is_none());
@@ -573,11 +680,113 @@ mod tests {
     }
 
     #[test]
+    fn review_auto_zone_label_follows_anchor_update_after_precision_change() {
+        let bars = [Bar::new(86400, 10., 12., 8., 11., 1.), Bar::new(172800, 10., 12., 8., 11., 1.)];
+        let chart = Chart {
+            uid: 1,
+            symbol: "AAA US Equity",
+            price_decimals: 4,
+            timeframe: Timeframe::H4,
+            bars: &bars,
+            drawings: &[],
+            indicators: &[],
+            comparisons: &[],
+        };
+        let mut session = Session::default();
+        let Plan::Drawings(created, id) = session.plan(&chart, "turn", LiveArgs::CreateDrawing(zone_args(""))).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(created[0].text, "H4 support 8.0000–12.0000");
+        assert!(created[0].auto_label);
+        let mut saved = serde_json::to_value(&created[0]).unwrap();
+        assert_eq!(saved["auto_label"], true);
+        let restored: tr_chart::drawings::Drawing = serde_json::from_value(saved.clone()).unwrap();
+        assert!(restored.auto_label);
+        saved.as_object_mut().unwrap().remove("auto_label");
+        let legacy: tr_chart::drawings::Drawing = serde_json::from_value(saved).unwrap();
+        assert!(!legacy.auto_label);
+        assert!(serde_json::to_value(legacy).unwrap().get("auto_label").is_none());
+        // User zooms in: the axis now shows five decimals.
+        let chart = Chart { drawings: &created, price_decimals: 5, ..chart };
+        let update = args::UpdateDrawing {
+            symbol: "AAA".into(),
+            id,
+            chart_id: None,
+            all_symbols: false,
+            anchors: Some(vec![args::Anchor { time: 86400, price: 9. }, args::Anchor { time: 172800, price: 11. }]),
+            label: None,
+        };
+        let Plan::Drawings(updated, _) = session.plan(&chart, "turn", LiveArgs::UpdateDrawing(update.clone())).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(updated[0].text, "H4 support 9.00000–11.00000");
+        assert!(updated[0].auto_label);
+        // Even text that looks exactly like generated text becomes explicitly agent-owned.
+        let Plan::Drawings(custom, _) = session
+            .plan(
+                &chart,
+                "turn",
+                LiveArgs::UpdateDrawing(args::UpdateDrawing {
+                    label: Some(created[0].text.clone()),
+                    anchors: None,
+                    ..update.clone()
+                }),
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(!custom[0].auto_label);
+        let chart = Chart { drawings: &custom, ..chart };
+        let Plan::Drawings(moved, _) = session.plan(&chart, "turn", LiveArgs::UpdateDrawing(update)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(moved[0].text, custom[0].text);
+        let Plan::Drawings(custom_created, _) =
+            session.plan(&chart, "turn", LiveArgs::CreateDrawing(zone_args("My support"))).unwrap()
+        else {
+            panic!()
+        };
+        assert!(!custom_created.last().unwrap().auto_label);
+    }
+
+    #[test]
+    fn review_rectangle_rejection_names_the_agents_own_anchor_after_swap() {
+        let bars = [Bar::new(86400, 10., 12., 8., 11., 1.), Bar::new(172800, 10., 12., 8., 11., 1.)];
+        let chart = Chart {
+            uid: 1,
+            symbol: "AAA US Equity",
+            price_decimals: 2,
+            timeframe: Timeframe::H4,
+            bars: &bars,
+            drawings: &[],
+            indicators: &[],
+            comparisons: &[],
+        };
+        let mut args = zone_args("");
+        // anchors[1] is the bad one (before the loaded range).
+        args.anchors = vec![args::Anchor { time: 172800, price: 8. }, args::Anchor { time: 10, price: 12. }];
+        let result = Session::default().plan(&chart, "turn", LiveArgs::CreateDrawing(args.clone())).err().unwrap();
+        assert!(
+            matches!(&result.content[0], Content::Text(text) if text.contains("anchors[1].time")),
+            "{:?}",
+            result.content
+        );
+        args.anchors[1].time = 86400;
+        args.anchors[0].price = 1e16;
+        let result = Session::default().plan(&chart, "turn", LiveArgs::CreateDrawing(args)).err().unwrap();
+        assert!(matches!(&result.content[0], Content::Text(text) if text.contains("anchors[0].price")));
+    }
+
+    #[test]
     fn update_drawing_label_keeps_timeframe_prefix() {
         let bars = [Bar::new(86400, 10., 12., 8., 11., 1.), Bar::new(172800, 10., 12., 8., 11., 1.)];
         let chart = Chart {
             uid: 1,
             symbol: "AAA US Equity",
+            price_decimals: 2,
             timeframe: Timeframe::W1,
             bars: &bars,
             drawings: &[],
@@ -632,11 +841,180 @@ mod tests {
     }
 
     #[test]
+    fn source_timeframe_defaults_precise_zone_labels_and_idempotent_updates() {
+        let bars = [Bar::new(86400, 10., 12., 8., 11., 1.), Bar::new(172800, 10., 12., 8., 11., 1.)];
+        for decimals in [0, 2, 5] {
+            for label in [None, Some("\u{0}  "), Some("Demand")] {
+                let mut session = Session::default();
+                let chart = Chart {
+                    uid: 1,
+                    symbol: "AAA US Equity",
+                    timeframe: Timeframe::H4,
+                    price_decimals: decimals,
+                    bars: &bars,
+                    drawings: &[],
+                    indicators: &[],
+                    comparisons: &[],
+                };
+                let mut args = zone_args("");
+                args.label = label.map(str::to_owned);
+                args.source_timeframe = Some("1W".into());
+                let Plan::Drawings(drawings, id) = session.plan(&chart, "turn", LiveArgs::CreateDrawing(args)).unwrap()
+                else {
+                    panic!()
+                };
+                let expected = if label == Some("Demand") {
+                    "W1 Demand".into()
+                } else {
+                    format!("W1 support {:.*}–{:.*}", decimals, 8., decimals, 12.)
+                };
+                assert_eq!(drawings[0].text, expected);
+                assert_eq!(drawings[0].source_timeframe, Some(Timeframe::W1));
+                let mut current = drawings;
+                for _ in 0..2 {
+                    let chart = Chart { drawings: &current, timeframe: Timeframe::D1, ..chart };
+                    let args = args::UpdateDrawing {
+                        symbol: "AAA".into(),
+                        id,
+                        chart_id: None,
+                        all_symbols: false,
+                        anchors: None,
+                        label: Some(current[0].text.clone()),
+                    };
+                    let Plan::Drawings(updated, _) =
+                        session.plan(&chart, "turn", LiveArgs::UpdateDrawing(args)).unwrap()
+                    else {
+                        panic!()
+                    };
+                    assert_eq!(updated[0].text, expected);
+                    assert!(!updated[0].auto_label, "agent-supplied text clears automatic labeling");
+                    current = updated;
+                }
+                if label != Some("Demand") {
+                    let chart = Chart { drawings: &current, ..chart };
+                    let args = args::UpdateDrawing {
+                        symbol: "AAA".into(),
+                        id,
+                        chart_id: None,
+                        all_symbols: false,
+                        anchors: Some(vec![
+                            args::Anchor { time: 86400, price: 9. },
+                            args::Anchor { time: 172800, price: 13. },
+                        ]),
+                        label: None,
+                    };
+                    let Plan::Drawings(updated, _) =
+                        session.plan(&chart, "turn", LiveArgs::UpdateDrawing(args)).unwrap()
+                    else {
+                        panic!()
+                    };
+                    assert_eq!(updated[0].text, expected, "explicit text stays unchanged on anchor-only updates");
+                    current = updated;
+                }
+                let chart = Chart { drawings: &current, ..chart };
+                let args = args::UpdateDrawing {
+                    symbol: "AAA".into(),
+                    id,
+                    chart_id: None,
+                    all_symbols: false,
+                    anchors: None,
+                    label: Some("Retest".into()),
+                };
+                let Plan::Drawings(updated, _) = session.plan(&chart, "turn", LiveArgs::UpdateDrawing(args)).unwrap()
+                else {
+                    panic!()
+                };
+                assert_eq!(updated[0].text, "W1 Retest");
+            }
+        }
+    }
+
+    #[test]
+    fn rectangles_normalize_harmless_anchors_and_report_each_geometry_rejection() {
+        let bars = [
+            Bar::new(86400, 10., 12., 8., 11., 1.),
+            Bar::new(172800, 10., 12., 8., 11., 1.),
+            Bar::new(259200, 10., 12., 8., 11., 1.),
+        ];
+        let chart = Chart {
+            uid: 1,
+            symbol: "AAA US Equity",
+            timeframe: Timeframe::H4,
+            price_decimals: 2,
+            bars: &bars,
+            drawings: &[],
+            indicators: &[],
+            comparisons: &[],
+        };
+        let mut session = Session::default();
+        for (times, prices, expected) in [
+            ([172800, 86400], [12., 8.], [86400, 172800]),
+            ([90000, 170000], [12., 8.], [86400, 172800]),
+            ([86400, i64::MAX], [8., 12.], [86400, 259200]),
+        ] {
+            let mut args = zone_args("");
+            args.anchors = (0..2).map(|i| args::Anchor { time: times[i], price: prices[i] }).collect();
+            let Plan::Drawings(drawings, _) =
+                session.plan(&chart, "normalized", LiveArgs::CreateDrawing(args)).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!([drawings[0].a.ts, drawings[0].b.ts], expected);
+            assert_eq!([drawings[0].a.price, drawings[0].b.price], [8., 12.]);
+            assert_eq!(drawings[0].text, "H4 support 8.00–12.00");
+        }
+        for (times, prices, field) in [
+            ([0, 172800], [8., 12.], "anchors[0].time must be within the loaded range"),
+            ([0, 1], [8., 12.], "loaded range"),
+            ([86400, 172800], [8., 8.], "anchors[1].price must differ"),
+            ([86400, 86401], [8., 12.], "same bar"),
+            ([86400, 172800], [f64::NAN, 12.], "anchors[0].price must be finite"),
+            ([86400, 172800], [8., f64::INFINITY], "anchors[1].price must be finite"),
+            ([86400, 172800], [8., 1201.], "within -1200–1200"),
+        ] {
+            let mut args = zone_args("");
+            args.anchors = (0..2).map(|i| args::Anchor { time: times[i], price: prices[i] }).collect();
+            let result = session.plan(&chart, "invalid", LiveArgs::CreateDrawing(args)).err().expect("reject");
+            assert!(
+                matches!(&result.content[0], Content::Text(text) if text.contains(field)),
+                "{field}: {:?}",
+                result.content
+            );
+        }
+        let mut args = zone_args("");
+        args.anchors.pop();
+        let result = session.plan(&chart, "invalid", LiveArgs::CreateDrawing(args)).err().unwrap();
+        assert!(matches!(&result.content[0], Content::Text(text) if text.contains("exactly 2")));
+        let result = session
+            .plan(&Chart { bars: &[], ..chart }, "invalid", LiveArgs::CreateDrawing(zone_args("")))
+            .err()
+            .unwrap();
+        assert!(matches!(&result.content[0], Content::Text(text) if text.contains("require loaded bars")));
+        let mut args = zone_args("");
+        args.kind = args::DrawingKind::TrendLine;
+        let result = session.plan(&chart, "invalid", LiveArgs::CreateDrawing(args)).err().unwrap();
+        assert!(
+            matches!(&result.content[0], Content::Text(text) if text.contains("zone_role requires kind=rectangle"))
+        );
+        let mut args = zone_args("");
+        args.source_timeframe = Some("invalid".into());
+        let result = session.plan(&chart, "invalid", LiveArgs::CreateDrawing(args)).err().unwrap();
+        assert!(matches!(&result.content[0], Content::Text(text) if text.contains("source_timeframe")));
+        let mut args = zone_args("");
+        args.symbol = "BBB".into();
+        let result = session.plan(&chart, "invalid", LiveArgs::CreateDrawing(args)).err().unwrap();
+        assert!(
+            matches!(&result.content[0], Content::Text(text) if text.contains("symbol must match the loaded chart AAA"))
+        );
+    }
+
+    #[test]
     fn lowercase_timeframe_in_agent_label_is_not_double_prefixed() {
         let bars = [Bar::new(86400, 10., 12., 8., 11., 1.), Bar::new(172800, 10., 12., 8., 11., 1.)];
         let chart = Chart {
             uid: 1,
             symbol: "AAA US Equity",
+            price_decimals: 2,
             timeframe: Timeframe::H4,
             bars: &bars,
             drawings: &[],
@@ -691,6 +1069,7 @@ mod tests {
         let chart = Chart {
             uid: 1,
             symbol: "AAA US Equity",
+            price_decimals: 2,
             timeframe: Timeframe::D1,
             bars: &bars,
             drawings: &[],
@@ -710,6 +1089,7 @@ mod tests {
                     all_symbols: false,
                     label: None,
                     zone_role: None,
+                    source_timeframe: None,
                 }),
             );
             let Err(result) = result else { panic!("invalid coordinates succeeded") };
@@ -728,6 +1108,7 @@ mod tests {
                     all_symbols: false,
                     label: None,
                     zone_role: None,
+                    source_timeframe: None,
                 }),
             )
             .unwrap();
@@ -758,6 +1139,7 @@ mod tests {
         let chart = Chart {
             uid: 8,
             symbol: "AAA US Equity",
+            price_decimals: 2,
             timeframe: Timeframe::D1,
             bars: &[],
             drawings: &[],
@@ -808,6 +1190,7 @@ mod tests {
         let chart = Chart {
             uid: 1,
             symbol: "AAA US Equity",
+            price_decimals: 2,
             timeframe: Timeframe::D1,
             bars: &[],
             drawings: &[],
@@ -857,6 +1240,7 @@ mod tests {
         let chart = Chart {
             uid: 1,
             symbol: "AAA US Equity",
+            price_decimals: 2,
             timeframe: Timeframe::D1,
             bars: &[],
             drawings: &[],
@@ -887,6 +1271,7 @@ mod tests {
         let chart = Chart {
             uid: 42,
             symbol: "AAA US Equity",
+            price_decimals: 2,
             timeframe: Timeframe::D1,
             bars: &[],
             drawings: &[],
@@ -913,6 +1298,7 @@ mod tests {
         let chart = Chart {
             uid: 1,
             symbol: "AAA US Equity",
+            price_decimals: 2,
             timeframe: Timeframe::D1,
             bars: &bars,
             drawings: &[],
@@ -932,6 +1318,7 @@ mod tests {
                     all_symbols: false,
                     label: None,
                     zone_role: None,
+                    source_timeframe: None,
                 }),
             )
             .unwrap()
@@ -981,6 +1368,7 @@ mod tests {
         let chart = Chart {
             uid: 1,
             symbol: "AAA US Equity",
+            price_decimals: 2,
             timeframe: Timeframe::D1,
             bars: &[],
             drawings: &[],
@@ -1004,6 +1392,7 @@ mod tests {
         let chart = Chart {
             uid: 1,
             symbol: "AAA US Equity",
+            price_decimals: 2,
             timeframe: Timeframe::D1,
             bars: &bars,
             drawings: &[],

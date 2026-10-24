@@ -471,6 +471,7 @@ fn project(event: BridgeEvent) -> Option<BridgeEvent> {
             match method.as_str() {
                 "item/started" | "item/completed" if params["item"]["type"] == "dynamicToolCall" => {
                     let summary = crate::agent_pane::edit_tool_summary(&params["item"]);
+                    let error = crate::agent_pane::tool_error(&params["item"]);
                     if let Some(map) = params["item"].as_object_mut() {
                         map.retain(|key, _| {
                             matches!(key.as_str(), "id" | "type" | "tool" | "arguments" | "success" | "durationMs")
@@ -478,6 +479,9 @@ fn project(event: BridgeEvent) -> Option<BridgeEvent> {
                         if let Some(summary) = summary {
                             map.remove("arguments");
                             map.insert("editSummary".into(), summary.into());
+                        }
+                        if let Some(error) = error {
+                            map.insert("error".into(), error.into());
                         }
                     }
                 }
@@ -836,6 +840,26 @@ mod tests {
             {
                 assert!(!rendered.contains(private), "{name} leaked {private}");
             }
+        }
+    }
+
+    #[test]
+    fn failed_rectangle_projection_keeps_only_short_actionable_error_not_raw_content() {
+        let event = project(BridgeEvent::Wire(WireEvent::Notification { method: "item/completed".into(), params: json!({"item": {
+            "type":"dynamicToolCall", "id":"failed", "tool":"create_drawing", "success":false,
+            "arguments":{"kind":"rectangle","zone_role":"support","anchors":[{"time":123456789,"price":987654321}]},
+            "contentItems":[{"type":"inputText","text":json!({"error":{"code":"invalid_args","message":"anchors[1].time must be within the loaded range 2025-01-01–2026-01-01"}, "private":"never-forward"}).to_string()}]
+        }}) })).unwrap();
+        let mut pane = crate::agent_pane::AgentPane::default();
+        pane.event(event);
+        let crate::agent_pane::RenderedBlock::Tool(trace) = &pane.blocks[0] else { panic!() };
+        assert_eq!(
+            trace.error.as_deref(),
+            Some("anchors[1].time must be within the loaded range 2025-01-01–2026-01-01")
+        );
+        assert_eq!(trace.summary.as_deref(), Some("support zone"));
+        for private in ["never-forward", "123456789", "987654321", "contentItems"] {
+            assert!(!format!("{trace:?}").contains(private));
         }
     }
 

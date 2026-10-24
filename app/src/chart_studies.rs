@@ -89,9 +89,9 @@ impl Settings {
         bars: &[Bar],
         scope: (Timeframe, bool),
         scale: &PriceScale,
-    ) {
+    ) -> Option<Rect> {
         if self.profile == ProfileMode::Off {
-            return;
+            return None;
         }
         let (tf, us) = scope;
         let (lo, hi) = v.visible_range(bars.len());
@@ -101,9 +101,7 @@ impl Settings {
             let date = |b: &Bar| {
                 if us && tf.is_intraday() { Zone::NewYork.local(b.ts).date() } else { Zone::Utc.local(b.ts).date() }
             };
-            let Some(last) = bars.last() else {
-                return;
-            };
+            let last = bars.last()?;
             let start = bars.partition_point(|b| date(b) < date(last));
             &bars[start..]
         };
@@ -139,15 +137,21 @@ impl Settings {
             } else {
                 "OHLCV profile estimate · POC / 70% value area"
             };
-            p.text(plot.right_bottom() + vec2(-6., -18.), Align2::RIGHT_BOTTOM, label, mono(9.), muted());
+            Some(p.text(
+                plot.right_bottom() + vec2(-theme::dp(6.), -theme::dp(18.)),
+                Align2::RIGHT_BOTTOM,
+                label,
+                mono(9.),
+                muted(),
+            ))
         } else {
-            p.text(
+            Some(p.text(
                 plot.right_bottom() + vec2(-6., -18.),
                 Align2::RIGHT_BOTTOM,
                 "Volume profile unavailable",
                 mono(9.),
                 muted(),
-            );
+            ))
         }
     }
 }

@@ -129,6 +129,7 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
     pane.data_basis = crate::agent_pane::DataBasis {
         sample: true,
         last_bar: Some(tr_core::Timeframe::W1.bucket_start(SAMPLE_NOW)),
+        latest_price_update: None,
         incomplete: Some("Weekly".into()),
     };
     // Same model projection as a model/list reply, with no account or backend access.
@@ -172,7 +173,7 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
         "streaming" | "answer" | "markdown" | "edits" | "undone" | "interrupted" | "queue" | "tools-unavailable"
     ) {
         let prompt = if state.edits() {
-            "Mark support and the rising trend; add RSI 14. Use sample bars only."
+            "Mark support and resistance zones; add RSI 14. Use sample bars only."
         } else if state.0 == "markdown" {
             "Give me a structured weekly review with a comparison table."
         } else {
@@ -280,6 +281,18 @@ pub fn tool(pane: &mut AgentPane, id: &str, name: &str, success: Option<bool>, s
     let arguments = match name {
         "read_data" => json!({"symbol":SYMBOL, "timeframe":"1W", "limit":20}),
         "analyze" => json!({"symbol":SYMBOL, "mode":"trend", "timeframe":"1W", "limit":20}),
+        "create_drawing" => {
+            let summary = summary.unwrap_or_default().to_ascii_lowercase();
+            let role = if summary.contains("support") {
+                Some("support")
+            } else if summary.contains("resistance") {
+                Some("resistance")
+            } else {
+                None
+            };
+            json!({"symbol":SYMBOL, "kind":if role.is_some() || summary.contains("rectangle") { "rectangle" } else { "horizontal" },
+                "zone_role":role, "anchors":[{"time":86400,"price":8.},{"time":172800,"price":12.}]})
+        }
         _ => json!({"chart_id":"pinned"}),
     };
     pane.wire(

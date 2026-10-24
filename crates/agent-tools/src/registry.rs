@@ -97,7 +97,11 @@ impl Registry {
 
     pub async fn call(&self, name: &str, args_json: &str, ctx: &mut CallContext<'_>) -> ToolResult {
         if !ctx.budget.take() {
-            return ToolResult::error("budget_exhausted", "Per-turn tool call budget exhausted", None);
+            return ToolResult::error(
+                "budget_exhausted",
+                "Per-turn tool call budget exhausted; stop calling tools and summarize confirmed results (failed attempts also consume the budget)",
+                None,
+            );
         }
         let value = match self.validate_call(name, args_json) {
             Ok(value) => value,
@@ -224,11 +228,11 @@ fn invalid(message: String, field: Option<&str>) -> ToolResult {
 }
 
 fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult> {
-    let fail = |message: &str| invalid(message.into(), (!path.is_empty()).then_some(path));
+    let fail = |message: &str| invalid(format!("{path}: {message}"), (!path.is_empty()).then_some(path));
     if let Some(choices) = schema["enum"].as_array()
         && !choices.contains(value)
     {
-        return Err(fail("Value is not in the allowed enum"));
+        return Err(fail(&format!("use one of {}", serde_json::to_string(choices).unwrap())));
     }
     let types = &schema["type"];
     if value.is_null() && types.as_array().is_some_and(|types| types.iter().any(|t| t == "null")) {
@@ -241,13 +245,18 @@ fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult>
             let properties = schema["properties"].as_object().unwrap();
             for (key, value) in object {
                 let field = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
-                let property = properties.get(key).ok_or_else(|| invalid("Unknown field".into(), Some(&field)))?;
+                let property = properties.get(key).ok_or_else(|| {
+                    invalid(format!("{field}: unknown field; omit it and use the tool schema"), Some(&field))
+                })?;
                 validate(value, property, &field)?;
             }
             for required in schema["required"].as_array().unwrap() {
                 let key = required.as_str().unwrap();
                 if !object.contains_key(key) {
-                    return Err(invalid("Missing required field".into(), Some(key)));
+                    return Err(invalid(
+                        format!("{key}: missing required field; supply it using the tool schema"),
+                        Some(key),
+                    ));
                 }
             }
         }
@@ -258,7 +267,12 @@ fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult>
                 || schema["maxLength"].as_u64().is_some_and(|max| length > max)
                 || schema["pattern"] == "\\S" && text.chars().all(char::is_whitespace)
             {
-                return Err(fail("String is outside the allowed length or pattern"));
+                return Err(fail(&format!(
+                    "supply non-whitespace text of {}–{} characters{}",
+                    schema["minLength"],
+                    schema["maxLength"],
+                    if path == "label" { ", or omit the optional label" } else { "" }
+                )));
             }
         }
         "integer" => {
@@ -271,7 +285,7 @@ fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult>
                     || schema["maximum"].as_i64().is_some_and(|max| number > max)
             };
             if outside {
-                return Err(fail("Integer is outside the allowed range"));
+                return Err(fail(&format!("integer must be within {}–{}", schema["minimum"], schema["maximum"])));
             }
         }
         "number" => {
@@ -293,7 +307,12 @@ fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult>
             if schema["minItems"].as_u64().is_some_and(|min| array.len() < (min as usize))
                 || schema["maxItems"].as_u64().is_some_and(|max| array.len() > (max as usize))
             {
-                return Err(fail("Array length is outside the allowed range"));
+                return Err(fail(&format!(
+                    "supply {}–{} items{}",
+                    schema["minItems"],
+                    schema["maxItems"],
+                    if path == "anchors" { "; rectangle anchors require exactly 2" } else { "" }
+                )));
             }
             for (i, item) in array.iter().enumerate() {
                 validate(item, &schema["items"], &format!("{path}[{i}]"))?;
@@ -314,9 +333,16 @@ fn validate_live(args: &mut LiveArgs, now: i64) -> Result<(), ToolResult> {
             if a.anchors.len() != count {
                 return Err(invalid(format!("Drawing requires {count} anchors"), Some("anchors")));
             }
-            Some(&a.anchors)
+            if let Some(tf) = &a.source_timeframe {
+                tf.parse::<tr_core::Timeframe>().map_err(|_| {
+                    invalid("Use a supported timeframe such as 1W or 4H".into(), Some("source_timeframe"))
+                })?;
+            }
+            // Rectangles are normalized against loaded bars in Session::plan, including future end clipping.
+            if matches!(a.kind, args::DrawingKind::Rectangle) { None } else { Some(&a.anchors) }
         }
-        LiveArgs::UpdateDrawing(a) => a.anchors.as_ref(),
+        // Updates need the stored tool kind; validate in the host.
+        LiveArgs::UpdateDrawing(_) => None,
         _ => None,
     };
     if anchors.is_some_and(|anchors| anchors.iter().any(|a| a.time > now)) {
@@ -378,7 +404,7 @@ fn catalog() -> Vec<ToolSpec> {
                 true,
             ),
             "create_drawing" => (
-                "Create a drawing for an explicit symbol; host rejects anchors outside loaded bars. all_symbols defaults false.",
+                "Create a drawing for an explicit symbol. Rectangles normalize inverted anchors, snap times to loaded bars and clamp the end to the last bar; start must be loaded and both dimensions non-zero. Pass source_timeframe from analyze/read_data for zone labels. all_symbols defaults false.",
                 true,
             ),
             "update_drawing" => {
@@ -493,6 +519,52 @@ mod tests {
         }
         assert!(serde_json::from_str::<args::ReadData>(r#"{"symbol":"X","extra":true}"#).is_err());
         assert!(serde_json::from_str::<args::Anchor>(r#"{"time":1,"price":1,"extra":true}"#).is_err());
+    }
+
+    #[test]
+    fn review_source_timeframe_schema_does_not_advertise_a_false_default() {
+        let spec = catalog().into_iter().find(|spec| spec.name == "create_drawing").unwrap();
+        let property = &spec.input_schema["properties"]["source_timeframe"];
+        assert!(property.get("default").is_none(), "{property}");
+    }
+
+    #[tokio::test]
+    async fn rectangle_schema_rejections_identify_fields_and_future_end_reaches_normalizing_host() {
+        let registry = Registry::new(ToolSet::Edit);
+        let base = json!({"symbol":"AAA", "kind":"rectangle", "zone_role":"support", "source_timeframe":"1W",
+            "anchors":[{"time":86400,"price":8.},{"time":172800,"price":12.}]});
+        for (field, replacement) in [
+            ("source_timeframe", json!("W99")),
+            ("zone_role", json!("floor")),
+            ("kind", json!("box")),
+            ("label", json!("")),
+            ("label", json!("   ")),
+            ("label", json!("x".repeat(2049))),
+            ("anchors", json!([])),
+        ] {
+            let mut args = base.clone();
+            args[field] = replacement;
+            let error = value(registry.validate_call("create_drawing", &args.to_string()).unwrap_err());
+            assert_eq!(error["error"]["field"], field);
+        }
+        for (field, replacement) in [("time", json!(253370764800_i64)), ("time", json!(1.5)), ("price", json!("low"))] {
+            let mut args = base.clone();
+            args["anchors"][1][field] = replacement;
+            let error = value(registry.validate_call("create_drawing", &args.to_string()).unwrap_err());
+            assert_eq!(error["error"]["field"], format!("anchors[1].{field}"));
+        }
+        let mut future = base.clone();
+        future["anchors"][1]["time"] = json!(200000);
+        let mut budget = CallBudget::new(2);
+        let mut ctx = CallContext { now: 100000, ..CallContext::new(&Host, &Host, &mut budget) };
+        assert!(registry.call("create_drawing", &future.to_string(), &mut ctx).await.success);
+        future["anchors"] = json!([{"time":86400,"price":8.}]);
+        let result = value(registry.call("create_drawing", &future.to_string(), &mut ctx).await);
+        assert!(result["error"]["message"].as_str().unwrap().contains("2 anchors"));
+        assert_eq!(
+            value(registry.call("create_drawing", &base.to_string(), &mut ctx).await)["error"]["code"],
+            "budget_exhausted"
+        );
     }
 
     #[tokio::test]

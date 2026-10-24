@@ -40,6 +40,7 @@ pub fn geometry(g: &Geometry<'_>) -> Vec<LabeledShape> {
             }
             shapes
         }
+        Tool::Rectangle => vec![(Shape::Rect(a, b), (!g.drawing.text.is_empty()).then(|| g.drawing.text.clone()))],
         _ => vec![(Shape::Rect(a, b), None)],
     }
 }
@@ -95,6 +96,25 @@ pub fn simplify(points: &[Anchor], project: &dyn Fn(Anchor) -> Point) -> Vec<Anc
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rectangle_text_is_forwarded_to_label_painter() {
+        let a = Anchor { ts: 1, price: 10. };
+        let mut drawing = super::super::Drawing::new(Tool::Rectangle, a, a);
+        drawing.text = "W1 support 8.00–12.00".into();
+        let context = Geometry {
+            drawing: &drawing,
+            points: [[20., 30.], [120., 80.], [0., 0.]],
+            bounds: [0., 0., 200., 200.],
+            price_y: &|p| p,
+            measure_label: String::new(),
+            text_size: [0., 0.],
+            project: &|a| [a.ts as f64, a.price],
+            pattern_points: Vec::new(),
+            closes: &[],
+        };
+        assert_eq!(geometry(&context), vec![(Shape::Rect([20., 30.], [120., 80.]), Some(drawing.text.clone()))]);
+    }
+
     #[test]
     fn circle_radius_uses_both_screen_coordinates() {
         let a = Anchor { ts: 0, price: 100. };

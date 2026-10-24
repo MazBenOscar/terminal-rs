@@ -170,7 +170,8 @@ impl Snapshot {
         }
         crate::chart_view::menu_note(ui, "Read-only · P/L at the chart's latest loaded price; may be delayed.");
     }
-    pub fn paint(&self, ui: &Ui, plot: Rect, scale: &PriceScale, mark: Option<f64>) {
+    pub fn paint(&self, ui: &Ui, plot: Rect, scale: &PriceScale, mark: Option<f64>) -> Vec<Rect> {
+        let mut bounds = Vec::new();
         let p = ui.painter_at(plot);
         let mut last_label = f32::NEG_INFINITY;
         let mut levels: Vec<_> = self
@@ -205,15 +206,17 @@ impl Snapshot {
             p.rect_filled(r, 1., theme::card());
             p.galley(r.min + vec2(3., 0.), galley, color);
             last_label = r.bottom() + 2.;
+            bounds.push(r);
         }
-        crate::chart_view::label_text(
+        bounds.push(crate::chart_view::label_text(
             &p,
             plot.left_bottom() + vec2(6., -3.),
             Align2::LEFT_BOTTOM,
             &self.status,
             mono(9.5),
             muted(),
-        );
+        ));
+        bounds
     }
 }
 

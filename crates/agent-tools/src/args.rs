@@ -40,6 +40,7 @@ macro_rules! field_schema {
     (u64) => { json!({"type":"integer", "minimum":0, "maximum":9007199254740991_u64,
         "description":"Drawing ids are issued below 2^53 for exact JSON client representation"}) };
     (bool) => { json!({"type":"boolean", "default":false}) };
+    (SourceTimeframe) => { json!({"type":"string", "enum":["1m","2m","3m","5m","15m","30m","1H","2H","4H","1D","1W","1M","3M"], "description":"Analysis timeframe; falls back to the chart timeframe when omitted."}) };
     (Timeframe) => { json!({"type":"string", "enum":["1m","2m","3m","5m","15m","30m","1H","2H","4H","1D","1W","1M","3M"], "default":"1D"}) };
     (Mode) => { json!({"type":"string", "enum":["swings","trend","levels","volume_profile","volatility"]}) };
     (ZoneRole) => { json!({"type":"string", "enum":["support","resistance"]}) };
@@ -141,7 +142,7 @@ args!(SetView {} {
 });
 args!(CreateDrawing { symbol: String => String, kind: DrawingKind => DrawingKind, anchors: Vec<Anchor> => Anchors } {
     chart_id: Option<String> => String, all_symbols: bool => bool, label: Option<String> => String,
-    zone_role: Option<ZoneRole> => ZoneRole
+    zone_role: Option<ZoneRole> => ZoneRole, source_timeframe: Option<String> => SourceTimeframe
 });
 args!(UpdateDrawing { symbol: String => String, id: u64 => u64 } {
     chart_id: Option<String> => String, all_symbols: bool => bool, anchors: Option<Vec<Anchor>> => Anchors,

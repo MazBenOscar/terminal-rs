@@ -68,7 +68,16 @@ impl Settings {
             }
         }
     }
-    pub fn paint(&self, ui: &Ui, plot: Rect, s: &PriceScale, bars: &[Bar], scope: (Timeframe, bool, Session, bool)) {
+    /// Return the bounds from the actual label painter for chart-wide occupancy.
+    pub fn paint(
+        &self,
+        ui: &Ui,
+        plot: Rect,
+        s: &PriceScale,
+        bars: &[Bar],
+        scope: (Timeframe, bool, Session, bool),
+    ) -> Vec<Rect> {
+        let mut bounds = Vec::new();
         let (tf, us, session, live_time_bars) = scope;
         let p = ui.painter_at(plot);
         if let Some((previous, high, low)) = session_levels(bars, tf, us) {
@@ -95,14 +104,14 @@ impl Settings {
             let mut occupied = Vec::new();
             for (y, name, price) in labels {
                 let y = label_y(y - 2., &mut occupied);
-                crate::chart_view::label_text(
+                bounds.push(crate::chart_view::label_text(
                     &p,
-                    pos2(plot.right() - 6., y),
+                    pos2(plot.right() - theme::dp(6.), y),
                     Align2::RIGHT_BOTTOM,
                     format!("{name} {}", scale::format_price(price, 2)),
                     mono(9.5),
                     muted(),
-                );
+                ));
             }
         }
         if self.countdown
@@ -119,16 +128,17 @@ impl Settings {
                 let n = end - now;
                 format!("Closes in {:02}:{:02}:{:02}", n / 3600, n % 3600 / 60, n % 60)
             };
-            crate::chart_view::label_text(
+            bounds.push(crate::chart_view::label_text(
                 &p,
-                plot.right_bottom() + vec2(-6., -4.),
+                plot.right_bottom() + vec2(-theme::dp(6.), -theme::dp(4.)),
                 Align2::RIGHT_BOTTOM,
                 label,
                 mono(10.),
                 muted(),
-            );
+            ));
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         }
+        bounds
     }
 }
 fn label_y(mut y: f32, occupied: &mut Vec<f32>) -> f32 {

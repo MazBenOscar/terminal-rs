@@ -174,6 +174,9 @@ mod answer_instruction_tests {
             "recent visible range",
             "zone_role to support (theme up role) or resistance (theme down role)",
             "low-alpha fill",
+            "source_timeframe as the analyze/read_data timeframe (not the chart timeframe)",
+            "in_play zone(s) plus the nearest zone on each side at minimum",
+            "Say in text which zone price is in",
             "one short clarifying question with 3-5 concrete options",
             "make no chart edits in that turn",
             "symbols or scope",
@@ -851,7 +854,7 @@ fn session_instructions(options: &BridgeOptions, registry: &Registry) -> String 
     let mode_instructions = if edits_enabled {
         concat!(
             "When marking support/resistance, use analyze mode levels and draw labeled rectangles, not single lines: anchors at the returned low and high bounds, across the recent visible range from read_chart (within loaded bars). ",
-            "Set zone_role to support (theme up role) or resistance (theme down role); rectangles use the existing low-alpha fill. Include the chart timeframe in compact form (W1, D1, H4, H1, M15) in labels. ",
+            "Set zone_role to support (theme up role) or resistance (theme down role); rectangles use the existing low-alpha fill. Pass source_timeframe as the analyze/read_data timeframe (not the chart timeframe); labels use that source timeframe in compact form (W1, D1, H4, H1, M15). Draw the in_play zone(s) plus the nearest zone on each side at minimum when available. Say in text which zone price is in, or that it is between zones.",
             "If the request is ambiguous about symbols or scope, make no chart edits in that turn."
         )
     } else {

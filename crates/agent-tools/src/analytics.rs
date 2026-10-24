@@ -36,15 +36,19 @@ pub struct SupportResistance {
     pub touches: usize,
     pub last_touch_time: i64,
     pub score: f64,
+    pub in_play: bool,
+    pub trimmed: bool,
+    pub side: &'static str,
 }
 
 /// Cluster confirmed two-sided fractal highs/lows within 0.35 ATR(14). Clusters have
 /// bounded diameter (no single-link chaining). Touches count distinct swing bars;
 /// ranking combines touch count, normalized recency and relative touched-bar volume.
 pub fn support_resistance(bars: &[Bar], top: usize) -> Vec<SupportResistance> {
-    if bars.is_empty() {
+    if bars.is_empty() || top == 0 {
         return Vec::new();
     }
+    let close = bars.last().unwrap().close;
     let o = Ohlcv::new(bars);
     let atr = last_finite(&indicators::atr(&o, 14))
         .unwrap_or_else(|| indicators::true_range(&o).iter().sum::<f64>() / bars.len() as f64);
@@ -75,8 +79,9 @@ pub fn support_resistance(bars: &[Bar], top: usize) -> Vec<SupportResistance> {
         let price = cluster.iter().map(|c| c.0).sum::<f64>() / cluster.len() as f64;
         // A skewed cluster need not be centered on its mean: retain every touch
         // while padding each side to at least the tolerance around price.
-        let low = cluster[0].0.min(price - tolerance);
-        let high = cluster.last().unwrap().0.max(price + tolerance);
+        let touch_prices: Vec<_> = cluster.iter().map(|c| c.0).collect();
+        let cap = (1.5 * atr).max(2. * tolerance);
+        let (low, high, trimmed) = capped_zone_bounds(&touch_prices, price, tolerance, cap);
         let zone_width = high - low;
         out.push(SupportResistance {
             price,
@@ -86,12 +91,80 @@ pub fn support_resistance(bars: &[Bar], top: usize) -> Vec<SupportResistance> {
             touches,
             last_touch_time: bars[last].ts,
             score: touches as f64 + last as f64 / bars.len() as f64 + (1. + volume / mean_volume).ln(),
+            in_play: low <= close && close <= high,
+            trimmed,
+            side: if high < close {
+                "support"
+            } else if low > close {
+                "resistance"
+            } else {
+                "in_play"
+            },
         });
         start = end;
     }
-    out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.price.total_cmp(&b.price)));
-    out.truncate(top);
-    out
+    let distance = |zone: &SupportResistance| (zone.low - close).max(close - zone.high).max(0.);
+    out.sort_by(|a, b| {
+        distance(a).total_cmp(&distance(b)).then(b.score.total_cmp(&a.score)).then(a.price.total_cmp(&b.price))
+    });
+    // Reserve the nearest zone on each side before filling the remaining slots.
+    let support = out.iter().position(|z| z.high < close);
+    let resistance = out.iter().position(|z| z.low > close);
+    let mut selected: Vec<_> = out.iter().enumerate().filter_map(|(i, z)| z.in_play.then_some(i)).take(3).collect();
+    for i in [support, resistance].into_iter().flatten() {
+        let on_side = |z: &SupportResistance| if out[i].high < close { z.low <= close } else { z.high >= close };
+        if !selected.contains(&i) && selected.iter().filter(|&&j| on_side(&out[j])).count() < 3 {
+            selected.push(i);
+        }
+    }
+    let mut below = selected.iter().filter(|&&i| out[i].low <= close).count();
+    let mut above = selected.iter().filter(|&&i| out[i].high >= close).count();
+    for (i, zone) in out.iter().enumerate() {
+        if selected.len() >= top.max(2) {
+            break;
+        }
+        if selected.contains(&i) {
+            continue;
+        }
+        if (zone.low <= close && below >= 3) || (zone.high >= close && above >= 3) {
+            continue;
+        }
+        selected.push(i);
+        below += usize::from(zone.low <= close);
+        above += usize::from(zone.high >= close);
+    }
+    selected.sort_unstable();
+    selected.into_iter().map(|i| out[i].clone()).collect()
+}
+
+/// Trim padding first. If touches themselves exceed the cap, center the cap on
+/// the densest window of touches (ties favor the median), rather than on outliers.
+fn capped_zone_bounds(prices: &[f64], price: f64, tolerance: f64, cap: f64) -> (f64, f64, bool) {
+    let low = prices[0].min(price - tolerance);
+    let high = prices[prices.len() - 1].max(price + tolerance);
+    if high - low <= cap {
+        return (low, high, false);
+    }
+    let span = prices[prices.len() - 1] - prices[0];
+    let center = if span <= cap {
+        prices[prices.len() / 2]
+    } else {
+        let (start, end) = (0..prices.len())
+            .map(|i| {
+                let end = prices.partition_point(|p| *p <= prices[i] + cap);
+                (i, end)
+            })
+            .max_by_key(|&(i, end)| (end - i, std::cmp::Reverse(i.abs_diff(prices.len() / 2))))
+            .unwrap();
+        prices[(start + end - 1) / 2]
+    };
+    let mut low = (center - cap / 2.).clamp(low, high - cap);
+    if span <= cap {
+        low = low.clamp(prices[prices.len() - 1] - cap, prices[0]);
+    }
+    let high = low + cap;
+    let trimmed = prices.iter().any(|p| *p < low || *p > high);
+    (low, high, trimmed)
 }
 
 /// Largest-triangle-three-buckets on time/close. Thresholds below two still retain
@@ -343,6 +416,56 @@ mod tests {
         assert!(level.high >= level.price + tolerance);
         assert_eq!(level.zone_width, level.high - level.low);
         assert!(level.score.is_finite());
+    }
+
+    #[test]
+    fn zones_include_in_play_and_nearest_sides_in_distance_order_with_height_cap() {
+        let mut bars = tr_core::sample::generate("ZONE-ORDER", Timeframe::W1, 500, 1_700_000_000);
+        let original = support_resistance(&bars, 100);
+        assert!(!original.is_empty());
+        bars.last_mut().unwrap().close = original[0].price;
+        let close = bars.last().unwrap().close;
+        let zones = support_resistance(&bars, 100);
+        assert!(zones.iter().any(|z| z.in_play && z.low <= close && close <= z.high));
+        let distance = |z: &SupportResistance| (z.low - close).max(close - z.high).max(0.);
+        assert!(zones.windows(2).all(|w| distance(&w[0]) <= distance(&w[1])));
+        assert!(zones.iter().filter(|z| z.low <= close).count() <= 3);
+        assert!(zones.iter().filter(|z| z.high >= close).count() <= 3);
+        let atr = last_finite(&indicators::atr(&Ohlcv::new(&bars), 14)).unwrap();
+        let tolerance = (atr * 0.35).max(close.abs() * 1e-8).max(1e-8);
+        for z in &zones {
+            assert!(z.high - z.low <= (1.5 * atr).max(2. * tolerance) + 1e-9);
+        }
+        let limited = support_resistance(&bars, 1);
+        for side in ["support", "resistance"] {
+            if let Some(nearest) = zones.iter().find(|z| z.side == side) {
+                assert!(
+                    limited.iter().any(|z| z.price == nearest.price),
+                    "nearest {side} cannot be displaced by touch score or top"
+                );
+            }
+        }
+        assert!(limited.iter().any(|z| z.in_play));
+    }
+
+    #[test]
+    fn capped_zones_trim_padding_first_then_prefer_dense_touches_over_outliers() {
+        let (low, high, trimmed) = capped_zone_bounds(&[10., 10., 14.], 11.333333, 2., 4.);
+        assert!(!trimmed);
+        assert_eq!(high - low, 4.);
+        assert!(low <= 10. && high >= 14.);
+        let (low, high, trimmed) = capped_zone_bounds(&[0., 10., 10.1, 10.2, 100.], 26.06, 1., 3.);
+        assert!(trimmed);
+        assert_eq!(high - low, 3.);
+        assert!(low <= 10. && high >= 10.2);
+        assert!(low > 0. && high < 100.);
+    }
+
+    #[test]
+    fn review_trimmed_only_when_touches_are_excluded() {
+        let (low, high, trimmed) = capped_zone_bounds(&[10., 10., 14.], 11.333333, 2., 4.);
+        assert!(low <= 10. && high >= 14., "all touches inside");
+        assert!(!trimmed, "trimmed must report excluded touches, not removed padding");
     }
 
     #[test]

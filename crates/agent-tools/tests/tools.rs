@@ -263,7 +263,9 @@ fn support_resistance_finds_planted_levels_and_scores_touches() {
     assert!(levels.iter().any(|l| (l.price - 90.).abs() < 0.001));
     assert!(levels.iter().any(|l| (l.price - 110.).abs() < 0.001));
     assert!(levels.iter().all(|l| l.touches >= 8 && l.zone_width > 0. && l.score > 8.));
-    assert!(levels[0].score >= levels[1].score);
+    let close = fixture("levels").last().unwrap().close;
+    let distance = |l: &tr_agent_tools::analytics::SupportResistance| (l.low - close).max(close - l.high).max(0.);
+    assert!(distance(&levels[0]) <= distance(&levels[1]));
     assert!(support_resistance(&[], 10).is_empty());
     assert!(support_resistance(&fixture("levels"), 0).is_empty());
 }
@@ -882,7 +884,10 @@ mod adversarial {
             }
             if mode == "levels" {
                 let levels = output[0]["support_resistance"].as_array().unwrap();
-                assert!(levels.len() >= 50 && levels.len() <= 100, "exercise many output levels");
+                assert!(
+                    !levels.is_empty() && levels.len() <= 6,
+                    "at most three nearest zones per side, even on huge history"
+                );
             }
         }
     }
@@ -1189,9 +1194,13 @@ mod adversarial {
             assert!(l.score.is_finite() && l.touches > 0);
             assert!((bars[0].ts..=bars.last().unwrap().ts).contains(&l.last_touch_time));
         }
+        let close = bars.last().unwrap().close;
+        let distance = |l: &tr_agent_tools::analytics::SupportResistance| (l.low - close).max(close - l.high).max(0.);
         for pair in levels.windows(2) {
-            assert!(pair[0].score >= pair[1].score);
+            assert!(distance(&pair[0]) <= distance(&pair[1]));
         }
+        assert!(levels.iter().filter(|z| z.low <= close).count() <= 3);
+        assert!(levels.iter().filter(|z| z.high >= close).count() <= 3);
         for (i, a) in levels.iter().enumerate() {
             for b in &levels[i + 1..] {
                 assert_ne!(a.price, b.price);
