@@ -47,6 +47,11 @@ impl TerminalApp {
         let uid = app.peek_chart().expect("demo chart").uid;
         app.pinned_agent_chart = Some(uid);
         app.agent_pane = agent_demo::pane(state, uid);
+        if state.workflows() {
+            app.create_watchlist("Agent Test".into(), Vec::new()).expect("offline fixture watchlist");
+            let before = serde_json::json!(app.watchlists.last().unwrap());
+            app.agent_pane.workflows.proposals[1].before = before;
+        }
         let agent = app.new_pane(PaneKind::Agent(app.agent_pane.settings.clone()));
         app.dock = Node::split_with(Dir::Row, vec![Node::leaf(chart), Node::leaf(agent)], vec![0.58, 0.42]);
         app.focus = agent;
@@ -288,12 +293,28 @@ mod tests {
                     .iter()
                     .all(|p| p.status == if approved { ProposalStatus::Approved } else { ProposalStatus::Pending })
             );
-            assert_eq!(app.watchlists.len(), if approved { 3 } else { 1 });
+            assert_eq!(app.watchlists.len(), if approved { 3 } else { 2 });
+            let symbols = &app.agent_pane.workflows.proposals[1].symbols;
+            assert_eq!(symbols.len(), 3);
+            assert!(!symbols[1].selected);
             if approved {
+                assert_eq!(symbols[0].outcome.as_deref(), Some("Added"));
+                assert_eq!(symbols[1].outcome.as_deref(), Some("Declined"));
+                assert!(
+                    app.agent_pane.workflows.turn_summary(TURN).unwrap().contains("added 2 of 3 symbols to Agent Test")
+                );
+                assert!(app.agent_pane.workflows.decision_line(TURN).unwrap().starts_with("You approved 3 of 4 · "));
                 assert!(app.agent_pane.turns[0].undo_available);
                 assert_eq!(app.agent_pane.turns[0].chart_changes, Some(2));
                 assert_eq!(app.undo_agent_turn(TURN).unwrap().reverted, 2);
-                assert_eq!(app.watchlists.len(), 1);
+                assert_eq!(app.watchlists.len(), 2);
+                assert!(app.watchlists[1].symbols.is_empty());
+            } else {
+                assert_eq!(
+                    app.agent_pane.workflows.turn_summary(TURN).as_deref(),
+                    Some("Awaiting approval · 4 changes")
+                );
+                assert!(app.agent_pane.workflows.decision_line(TURN).is_none());
             }
         }
     }

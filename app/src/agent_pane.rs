@@ -414,6 +414,8 @@ pub struct AgentPane {
     /// Decline act only on these, so a proposal that arrives as the user clicks is
     /// never decided without having been on screen.
     pub proposal_shown: HashMap<String, Vec<u64>>,
+    symbol_seen: HashMap<String, Vec<(u64, usize, String)>>,
+    pub symbol_shown: HashMap<String, Vec<(u64, usize, String)>>,
     pub state: Onboarding,
     pub models: Vec<Model>,
     pub limits: Vec<Limit>,
@@ -453,6 +455,8 @@ impl Default for AgentPane {
             proposal_buttons: Default::default(),
             proposal_seen: Default::default(),
             proposal_shown: Default::default(),
+            symbol_seen: Default::default(),
+            symbol_shown: Default::default(),
             state: Onboarding::Dormant,
             models: Vec::new(),
             limits: Vec::new(),
@@ -811,13 +815,14 @@ impl AgentPane {
             "item/completed" | "item/started" if params["item"]["type"] == "dynamicToolCall" => {
                 let item = &params["item"];
                 let name = item["tool"].as_str().unwrap_or("chart tool");
-                let summary =
+                let summary = workflow_tool_target(name, &item["arguments"], &self.workflows.proposals).or_else(|| {
                     item["editSummary"].as_str().map(short_label).or_else(|| edit_tool_summary(item)).or_else(|| {
                         let args = &item["arguments"];
                         Some(short_label(
                             args["symbol"].as_str().or_else(|| args["query"].as_str()).unwrap_or("Pinned chart"),
                         ))
-                    });
+                    })
+                });
                 let trace = Trace {
                     id: scrub_text(item["id"].as_str().unwrap_or_default()),
                     name: scrub_text(name),
@@ -868,6 +873,13 @@ impl AgentPane {
     }
 
     pub fn show(&mut self, ui: &mut Ui, pin_label: &str, pane_id: egui::Id) -> Vec<Action> {
+        if ui
+            .memory(|m| m.focused())
+            .is_some_and(|id| self.proposal_focus.contains_key(&id) && !self.proposal_buttons.contains_key(&id))
+        {
+            // egui checkboxes also accept Enter by default; cards reserve it for buttons.
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        }
         self.proposal_focus.clear();
         self.proposal_buttons.clear();
         egui::Frame::new().inner_margin(dp(12.0)).show(ui, |ui| self.show_content(ui, pin_label, pane_id)).inner
@@ -1022,6 +1034,8 @@ impl AgentPane {
     }
 
     fn conversation(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        // Expire before deriving headers as well as cards on the single deadline wake.
+        self.workflows.expire(Instant::now(), None);
         for i in 0..self.blocks.len() {
             match &self.blocks[i] {
                 RenderedBlock::Prompt(text) => {
@@ -1063,6 +1077,23 @@ impl AgentPane {
                             agent_markdown::show(ui, &agent_markdown::prepare(blocks));
                         }
                     });
+                    // Host-authored feedback follows the last answer block of this turn;
+                    // the model's (possibly now stale) answer remains untouched.
+                    let end = self.blocks[i + 1..]
+                        .iter()
+                        .position(|b| matches!(b, RenderedBlock::Prompt(_)))
+                        .map_or(self.blocks.len(), |n| i + 1 + n);
+                    if !self.blocks[i + 1..end].iter().any(|b| matches!(b, RenderedBlock::Reply(_)))
+                        && let Some(line) = self
+                            .turns
+                            .iter()
+                            .rev()
+                            .find(|t| t.prompt_index < i)
+                            .and_then(|t| t.id.as_deref())
+                            .and_then(|id| self.workflows.decision_line(id))
+                    {
+                        ui.label(RichText::new(line).font(theme::mono(10.5)).color(readable(theme::muted())));
+                    }
                 }
                 RenderedBlock::Notice(text) => {
                     // A stop has one block and one adjacent action; its diagnostic stays in the tooltip.
@@ -1117,6 +1148,19 @@ impl AgentPane {
                 str::to_owned,
             )
         };
+        let label = if reverted.is_none() {
+            turn_id.as_deref().and_then(|id| self.workflows.turn_summary(id)).map_or(label.clone(), |summary| {
+                let chart_edits: Vec<_> = traces.iter().copied().filter(|trace| is_edit_tool(&trace.name)).collect();
+                let summary = if chart_edits.is_empty() {
+                    summary
+                } else {
+                    format!("{} · {summary}", tool_group_summary_outcome(&chart_edits, None, false))
+                };
+                tool_step_suffix(summary, &traces)
+            })
+        } else {
+            label
+        };
         let label = tool_group_duration(label, turn);
         let recovered = recovered_failures(&traces);
         let retries =
@@ -1170,7 +1214,13 @@ impl AgentPane {
                                 readable(theme::muted()),
                             );
                         }
-                        agent_markdown::wrapped(ui, &label, readable(theme::muted()));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&label).font(theme::ui_font(12.0)).color(readable(theme::muted())),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&label);
                     },
                 )
                 .response
@@ -1208,6 +1258,8 @@ impl AgentPane {
         if rows.is_empty() {
             self.proposal_seen.remove(turn);
             self.proposal_shown.remove(turn);
+            self.symbol_seen.remove(turn);
+            self.symbol_shown.remove(turn);
             return;
         }
         let pending: Vec<u64> = rows
@@ -1217,9 +1269,34 @@ impl AgentPane {
             .map(|p| p.id)
             .collect();
         let seen = self.proposal_seen.insert(turn.into(), pending.clone()).unwrap_or_default();
-        let shown: Vec<u64> = pending.into_iter().filter(|id| seen.contains(id)).collect();
+        let symbols: Vec<_> = rows
+            .iter()
+            .flat_map(|&i| {
+                let p = &self.workflows.proposals[i];
+                p.symbols.iter().enumerate().map(move |(index, s)| (p.id, index, s.symbol.clone()))
+            })
+            .collect();
+        let seen_symbols = self.symbol_seen.insert(turn.into(), symbols.clone()).unwrap_or_default();
+        let shown_symbols: Vec<_> = symbols.into_iter().filter(|s| seen_symbols.contains(s)).collect();
+        // Fail closed for the whole proposal if any sub-row is new. This also prevents
+        // unticked, newly arrived symbols being implicitly declined by Approve selected.
+        let shown: Vec<u64> = pending
+            .into_iter()
+            .filter(|id| {
+                seen.contains(id)
+                    && rows.iter().all(|&i| {
+                        let p = &self.workflows.proposals[i];
+                        p.id != *id
+                            || p.symbols
+                                .iter()
+                                .enumerate()
+                                .all(|(n, s)| shown_symbols.contains(&(p.id, n, s.symbol.clone())))
+                    })
+            })
+            .collect();
+        self.symbol_shown.insert(turn.into(), shown_symbols);
         self.proposal_shown.insert(turn.into(), shown.clone());
-        let multi = rows.len() > 1;
+        let multi = rows.len() > 1 || rows.iter().any(|&i| !self.workflows.proposals[i].symbols.is_empty());
         let focused = ui.memory(|m| m.focused());
         let card_focused = focused.is_some_and(|id| self.proposal_focus.get(&id).is_some_and(|owner| owner == turn));
         if card_focused {
@@ -1235,13 +1312,13 @@ impl AgentPane {
                 for &index in &rows {
                     let proposal = &mut self.workflows.proposals[index];
                     ui.horizontal_wrapped(|ui| {
-                        if multi && proposal.status == ProposalStatus::Pending {
+                        if multi && proposal.symbols.is_empty() && proposal.status == ProposalStatus::Pending {
                             let response = ui.checkbox(&mut proposal.selected, "");
                             self.proposal_focus.insert(response.id, turn.into());
                         }
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&proposal.summary).font(theme::ui_font(12.0)).color(theme::text()),
+                                RichText::new(proposal.card_summary()).font(theme::ui_font(12.0)).color(theme::text()),
                             )
                             .wrap(),
                         );
@@ -1254,6 +1331,26 @@ impl AgentPane {
                         };
                         ui.label(RichText::new(status).font(theme::ui_font(10.5)).color(theme::muted()));
                     });
+                    for (n, symbol) in proposal.symbols.iter_mut().enumerate() {
+                        ui.push_id((proposal.id, n), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_space(dp(12.0));
+                                let label = crate::security_names::label(&symbol.symbol);
+                                if proposal.status == ProposalStatus::Pending {
+                                    let response = ui.checkbox(&mut symbol.selected, label);
+                                    focus_ring(ui, &response);
+                                    self.proposal_focus.insert(response.id, turn.into());
+                                } else {
+                                    ui.label(RichText::new(label).font(theme::ui_font(12.0)).color(theme::text()));
+                                    if let Some(outcome) = &symbol.outcome {
+                                        ui.label(
+                                            RichText::new(outcome).font(theme::ui_font(10.5)).color(theme::muted()),
+                                        );
+                                    }
+                                }
+                            });
+                        });
+                    }
                     let note = match &proposal.args {
                         tr_agent_tools::args::LiveArgs::CreateAlert(args) => args.note.as_deref(),
                         _ => proposal.before["note"].as_str(),
@@ -1281,7 +1378,7 @@ impl AgentPane {
                     ui.horizontal(|ui| {
                         let selected = rows.iter().any(|&i| {
                             let p = &self.workflows.proposals[i];
-                            p.status == ProposalStatus::Pending && p.selected && shown.contains(&p.id)
+                            p.status == ProposalStatus::Pending && p.is_selected() && shown.contains(&p.id)
                         });
                         let approve = ui
                             .add_enabled(selected, primary_button(if multi { "Approve selected" } else { "Approve" }));
@@ -1953,6 +2050,44 @@ fn normalized_args(value: &Value) -> Value {
     }
 }
 
+fn workflow_tool_target(name: &str, args: &Value, proposals: &[crate::agent_bridge::Proposal]) -> Option<String> {
+    let text = match name {
+        "list_watchlists" => "All watchlists".into(),
+        "list_alerts" => "All alerts".into(),
+        "create_watchlist" => args["name"].as_str().unwrap_or("Watchlist").trim().to_owned(),
+        "add_watchlist_symbols" | "remove_watchlist_symbols" | "delete_watchlist" => {
+            args["watchlist"].as_str().unwrap_or("Watchlist").trim().to_owned()
+        }
+        "create_alert" | "update_alert" | "delete_alert" => {
+            let before = proposals.iter().rev().find_map(|p| {
+                use tr_agent_tools::args::LiveArgs;
+                let id = match &p.args {
+                    LiveArgs::UpdateAlert(a) => a.id,
+                    LiveArgs::DeleteAlert(a) => a.id,
+                    _ => return None,
+                };
+                (args["id"].as_u64() == Some(id)).then_some(&p.before)
+            });
+            let key = args["symbol"].as_str().or_else(|| before.and_then(|b| b["symbol"].as_str()));
+            let symbol = key
+                .map(crate::security_names::label)
+                .unwrap_or_else(|| args["id"].as_u64().map_or_else(|| "Alert".into(), |id| format!("Alert #{id}")));
+            if let Some(level) = args["level"].as_f64().or_else(|| before.and_then(|b| b["level"].as_f64())) {
+                let level = crate::price_alerts::display_price(key.unwrap_or(""), level);
+                if symbol.chars().count() + level.chars().count() < 45 {
+                    format!("{symbol} · {level}")
+                } else {
+                    symbol
+                }
+            } else {
+                symbol
+            }
+        }
+        _ => return None,
+    };
+    Some(short_label(&text))
+}
+
 fn same_tool_target(failed: &Trace, later: &Trace) -> bool {
     if failed.name != later.name {
         return false;
@@ -1960,6 +2095,25 @@ fn same_tool_target(failed: &Trace, later: &Trace) -> bool {
     let (a, b) = (&failed.target_args, &later.target_args);
     if !a.is_object() || !b.is_object() {
         return false;
+    }
+    match failed.name.as_str() {
+        "create_watchlist" | "add_watchlist_symbols" | "remove_watchlist_symbols" | "delete_watchlist" => {
+            let key = if failed.name == "create_watchlist" { "name" } else { "watchlist" };
+            return a[key].as_str().zip(b[key].as_str()).is_some_and(|(a, b)| {
+                a.trim().to_uppercase().to_lowercase() == b.trim().to_uppercase().to_lowercase()
+            });
+        }
+        "update_alert" | "delete_alert" => return !a["id"].is_null() && a["id"] == b["id"],
+        "create_alert" => {
+            return a["symbol"]
+                .as_str()
+                .zip(b["symbol"].as_str())
+                .is_some_and(|(a, b)| crate::symbol_search::same_key(a, b))
+                && a["level"].as_f64().is_some()
+                && a["level"].as_f64() == b["level"].as_f64()
+                && a["direction"] == b["direction"];
+        }
+        _ => {}
     }
     for scope in ["symbol", "chart_id"] {
         if !a[scope].is_null() && !b[scope].is_null() && a[scope] != b[scope] {
@@ -2017,6 +2171,15 @@ fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
 }
 
 fn tool_group_label_outcome(traces: &[&Trace], reverted: Option<usize>, final_answer: bool) -> String {
+    let summary = tool_group_summary_outcome(traces, reverted, final_answer);
+    if reverted.is_some() || traces.iter().any(|trace| trace.success.is_none() && !trace.interrupted) {
+        summary
+    } else {
+        tool_step_suffix(summary, traces)
+    }
+}
+
+fn tool_group_summary_outcome(traces: &[&Trace], reverted: Option<usize>, final_answer: bool) -> String {
     if let Some(n) = reverted {
         return format!("{n} change{} reverted", if n == 1 { "" } else { "s" });
     }
@@ -2029,7 +2192,7 @@ fn tool_group_label_outcome(traces: &[&Trace], reverted: Option<usize>, final_an
             _ => format!("{}…", tool_label(&trace.name)),
         };
     }
-    let summary = if traces.iter().any(|trace| trace.interrupted) {
+    if traces.iter().any(|trace| trace.interrupted) {
         "Stopped before finishing".into()
     } else if traces.iter().any(|trace| trace.success == Some(false))
         && !traces.iter().any(|trace| trace.success == Some(true))
@@ -2038,19 +2201,24 @@ fn tool_group_label_outcome(traces: &[&Trace], reverted: Option<usize>, final_an
     } else {
         let edits: Vec<_> =
             traces.iter().filter(|trace| is_edit_tool(&trace.name) && trace.success == Some(true)).collect();
-        if traces.iter().filter(|trace| trace.success == Some(true)).any(|trace| {
-            matches!(
-                trace.name.as_str(),
-                "create_watchlist"
-                    | "add_watchlist_symbols"
-                    | "remove_watchlist_symbols"
-                    | "delete_watchlist"
-                    | "create_alert"
-                    | "update_alert"
-                    | "delete_alert"
-            )
-        }) {
-            "Proposed workflow changes".into()
+        let workflow_changes = traces
+            .iter()
+            .filter(|trace| {
+                trace.success == Some(true)
+                    && matches!(
+                        trace.name.as_str(),
+                        "create_watchlist"
+                            | "add_watchlist_symbols"
+                            | "remove_watchlist_symbols"
+                            | "delete_watchlist"
+                            | "create_alert"
+                            | "update_alert"
+                            | "delete_alert"
+                    )
+            })
+            .count();
+        if workflow_changes > 0 {
+            format!("Awaiting approval · {workflow_changes} change{}", if workflow_changes == 1 { "" } else { "s" })
         } else if edits.is_empty() {
             if final_answer && !traces.iter().any(|trace| trace.success == Some(true)) {
                 "Answered".into()
@@ -2116,7 +2284,10 @@ fn tool_group_label_outcome(traces: &[&Trace], reverted: Option<usize>, final_an
                 "Chart edit tools finished".into()
             }
         }
-    };
+    }
+}
+
+fn tool_step_suffix(summary: String, traces: &[&Trace]) -> String {
     let label = format!("{summary} · {} step{}", traces.len(), if traces.len() == 1 { "" } else { "s" });
     let failures = traces.iter().filter(|trace| trace.success == Some(false)).count() - recovered_failures(traces);
     if failures > 0 { format!("{label} · {failures} failed") } else { label }
@@ -2441,6 +2612,269 @@ mod polish_tests {
         });
     }
 
+    fn workflow_trace(name: &str, args: Value, success: bool) -> Trace {
+        let mut pane = AgentPane::default();
+        pane.wire("item/completed", &serde_json::json!({"item":{"id":"workflow","type":"dynamicToolCall","tool":name,"arguments":args,"success":success}}));
+        let RenderedBlock::Tool(trace) = pane.blocks.remove(0) else { panic!("trace") };
+        trace
+    }
+
+    #[test]
+    fn workflow_retry_identity_recovers_the_reported_create_add_find_add_sequence() {
+        use serde_json::json;
+        let calls = [
+            workflow_trace("create_watchlist", json!({"name":"Agent Test"}), true),
+            workflow_trace(
+                "add_watchlist_symbols",
+                json!({"watchlist":"Agent Test","symbols":["AAPL","MSFT","BTC-USD"]}),
+                false,
+            ),
+            workflow_trace("find_symbol", json!({"query":"BTC-USD"}), true),
+            workflow_trace(
+                "add_watchlist_symbols",
+                json!({"watchlist":"aGENT tEST","symbols":["AAPL US Equity","MSFT US Equity","COINBASE:BTC-USD"]}),
+                true,
+            ),
+        ];
+        let traces: Vec<_> = calls.iter().collect();
+        assert_eq!(recovered_failures(&traces), 1);
+        let label = retry_suffix(tool_group_label(&traces, None), recovered_failures(&traces));
+        assert!(label.ends_with(" · 4 steps · 1 retry"), "{label}");
+        assert!(!label.contains("failed"));
+        assert_eq!(calls[1].summary.as_deref(), Some("Agent Test"));
+        assert_eq!(calls[1].success, Some(false), "failed detail row is retained");
+        assert_eq!(recovered_failures(&[&calls[3], &calls[1]]), 0, "only later success recovers");
+        let other = workflow_trace("add_watchlist_symbols", json!({"watchlist":"Other","symbols":["AAPL"]}), true);
+        assert_eq!(recovered_failures(&[&calls[1], &other]), 0);
+        let remove =
+            workflow_trace("remove_watchlist_symbols", json!({"watchlist":"Agent Test","symbols":["AAPL"]}), true);
+        assert_eq!(recovered_failures(&[&calls[1], &remove]), 0, "same target but different tool is not a retry");
+    }
+
+    #[test]
+    fn workflow_retry_identity_matches_each_workflow_target_not_changed_payloads() {
+        use serde_json::json;
+        for tool in ["create_watchlist", "add_watchlist_symbols", "remove_watchlist_symbols", "delete_watchlist"] {
+            let key = if tool == "create_watchlist" { "name" } else { "watchlist" };
+            let a = workflow_trace(tool, json!({key:" Agent Test ","symbols":["BTC-USD"]}), false);
+            let b = workflow_trace(tool, json!({key:"agent test","symbols":["COINBASE:BTC-USD"]}), true);
+            assert!(same_tool_target(&a, &b), "{tool}");
+        }
+        for tool in ["update_alert", "delete_alert"] {
+            let a = workflow_trace(tool, json!({"id":7,"level":10}), false);
+            let b = workflow_trace(tool, json!({"id":7,"level":20}), true);
+            let other = workflow_trace(tool, json!({"id":8,"level":20}), true);
+            assert!(same_tool_target(&a, &b));
+            assert!(!same_tool_target(&a, &other));
+        }
+    }
+
+    #[test]
+    fn create_alert_retry_requires_same_symbol_level_and_direction() {
+        use serde_json::json;
+        let a =
+            workflow_trace("create_alert", json!({"symbol":"BINANCE:XRPUSDT","level":10,"direction":"above"}), false);
+        let canonical = tr_data::security("BINANCE:XRPUSDT").key();
+        let b = workflow_trace("create_alert", json!({"symbol":canonical,"level":10.0,"direction":"above"}), true);
+        assert!(same_tool_target(&a, &b));
+        assert_eq!(recovered_failures(&[&a, &b]), 1);
+        for args in [
+            json!({"symbol":canonical,"level":20,"direction":"above"}),
+            json!({"symbol":canonical,"level":10,"direction":"below"}),
+            json!({"symbol":"AAPL US Equity","level":10,"direction":"above"}),
+        ] {
+            let other = workflow_trace("create_alert", args, true);
+            assert!(!same_tool_target(&a, &other));
+            assert_eq!(recovered_failures(&[&a, &other]), 0);
+            assert!(tool_group_label(&[&a, &other], None).ends_with(" · 1 failed"));
+        }
+    }
+
+    #[test]
+    fn review_workflow_tool_target_is_scrubbed_and_capped_like_other_tool_summaries() {
+        use serde_json::json;
+        let name = format!("me@example.com\nsecond line {}", "x".repeat(400));
+        for (tool, key) in [("create_watchlist", "name"), ("add_watchlist_symbols", "watchlist")] {
+            let trace = workflow_trace(tool, json!({key: name}), false);
+            let summary = trace.summary.unwrap();
+            assert!(!summary.contains("me@example.com"), "{tool}: model-supplied text must be scrubbed");
+            assert!(!summary.contains('\n'), "{tool}: control characters must be stripped");
+            assert!(summary.chars().count() <= 180, "{tool}: summary must be capped");
+        }
+    }
+
+    #[test]
+    fn workflow_tool_rows_show_targets_and_leave_chart_tool_labels_unchanged() {
+        use serde_json::json;
+        for (tool, args, expected) in [
+            ("create_watchlist", json!({"name":"Agent Test"}), "Agent Test"),
+            ("add_watchlist_symbols", json!({"watchlist":"Agent Test"}), "Agent Test"),
+            ("remove_watchlist_symbols", json!({"watchlist":"Agent Test"}), "Agent Test"),
+            ("delete_watchlist", json!({"watchlist":"Agent Test"}), "Agent Test"),
+            ("list_watchlists", json!({}), "All watchlists"),
+            ("list_alerts", json!({"symbol":"AAPL US Equity"}), "All alerts"),
+            ("create_alert", json!({"symbol":"COINBASE:BTC-USD"}), "BTC/USD · Coinbase"),
+            ("read_chart", json!({}), "Pinned chart"),
+        ] {
+            let trace = workflow_trace(tool, args, true);
+            assert_eq!(trace.summary.as_deref(), Some(expected), "{tool}");
+            let ctx = egui::Context::default();
+            let output = render(&ctx, dp(600.0), vec![], |ui| tool_row(ui, &trace));
+            assert!(texts(&output).iter().any(|(s, _)| s == &format!("{} · {expected}", tool_label(tool))), "{tool}");
+        }
+        let mut p = card_pane().workflows.proposals.remove(0);
+        p.before = json!({"symbol":"AAPL US Equity"});
+        for tool in ["update_alert", "delete_alert"] {
+            p.args = if tool == "update_alert" {
+                tr_agent_tools::args::LiveArgs::UpdateAlert(
+                    serde_json::from_value(json!({"id":7,"level":123})).unwrap(),
+                )
+            } else {
+                tr_agent_tools::args::LiveArgs::DeleteAlert(serde_json::from_value(json!({"id":7})).unwrap())
+            };
+            assert_eq!(workflow_tool_target(tool, &json!({"id":7}), &[p.clone()]).as_deref(), Some("AAPL US Equity"));
+        }
+        let label = workflow_tool_target("create_alert", &json!({"symbol":"AAPL US Equity","level":100}), &[]).unwrap();
+        assert!(label.starts_with("AAPL US Equity · 100"), "{label}");
+    }
+
+    #[test]
+    fn symbol_subrows_are_plain_text_focusable_space_only_and_all_unticked_disables_approve() {
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("proposal").unwrap(), 1);
+        pane.workflows.proposals.remove(0);
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        for _ in 0..2 {
+            render(&ctx, dp(600.0), vec![], |ui| {
+                actions = pane.show(ui, "Pinned", egui::Id::new("symbols"));
+            });
+        }
+        assert!(actions.is_empty());
+        let output = render(&ctx, dp(600.0), vec![], |ui| {
+            actions = pane.show(ui, "Pinned", egui::Id::new("symbols"));
+        });
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s == "Add to Agent Test"));
+        assert!(text.iter().any(|(s, _)| s == "AAPL US Equity"));
+        assert!(text.iter().any(|(s, _)| s == "BTC/USD · Coinbase"));
+        assert!(text.iter().any(|(s, _)| s == "Approve selected"));
+        let boxes: Vec<_> =
+            pane.proposal_focus.keys().filter(|id| !pane.proposal_buttons.contains_key(id)).copied().collect();
+        assert_eq!(boxes.len(), 3);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let before: Vec<_> = pane.workflows.proposals[0].symbols.iter().map(|s| s.selected).collect();
+        ctx.memory_mut(|m| m.request_focus(boxes[0]));
+        render(&ctx, dp(600.0), vec![key(egui::Key::Enter)], |ui| {
+            actions = pane.show(ui, "Pinned", egui::Id::new("symbols"));
+        });
+        assert!(actions.is_empty(), "Enter on sub-row cannot approve");
+        assert_eq!(
+            pane.workflows.proposals[0].symbols.iter().map(|s| s.selected).collect::<Vec<_>>(),
+            before,
+            "Enter does not toggle"
+        );
+        ctx.memory_mut(|m| m.request_focus(boxes[0]));
+        render(&ctx, dp(600.0), vec![key(egui::Key::Space)], |ui| {
+            actions = pane.show(ui, "Pinned", egui::Id::new("symbols"));
+        });
+        assert_eq!(
+            pane.workflows.proposals[0].symbols.iter().map(|s| s.selected).zip(before).filter(|(a, b)| a != b).count(),
+            1
+        );
+        assert!(actions.is_empty());
+        for s in &mut pane.workflows.proposals[0].symbols {
+            s.selected = false;
+        }
+        render(&ctx, dp(600.0), vec![], |ui| {
+            actions = pane.show(ui, "Pinned", egui::Id::new("symbols"));
+        });
+        assert!(!pane.proposal_buttons.values().any(|approve| *approve), "no enabled approval button");
+    }
+
+    #[test]
+    fn symbol_subrow_guard_requires_previous_frame_even_for_new_unticked_rows() {
+        use crate::agent_bridge::SymbolChoice;
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("proposal").unwrap(), 1);
+        let turn = crate::agent_demo::TURN;
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, turn, &mut actions));
+        assert!(pane.proposal_shown[turn].is_empty());
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, turn, &mut actions));
+        assert_eq!(pane.proposal_shown[turn], [1, 2]);
+        pane.workflows.proposals[1].symbols.push(SymbolChoice {
+            symbol: "NVDA US Equity".into(),
+            selected: false,
+            outcome: None,
+        });
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, turn, &mut actions));
+        assert_eq!(pane.proposal_shown[turn], [1], "new sub-row blocks approval AND implicit decline of its proposal");
+        assert!(!pane.symbol_shown[turn].iter().any(|(_, _, s)| s == "NVDA US Equity"));
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, turn, &mut actions));
+        assert_eq!(pane.proposal_shown[turn], [1, 2]);
+        assert!(pane.symbol_shown[turn].iter().any(|(_, _, s)| s == "NVDA US Equity"));
+    }
+
+    #[test]
+    fn workflow_outcome_header_truncates_with_tooltip_and_host_line_does_not_rewrite_answer() {
+        check_workflow_outcome_header(false);
+    }
+
+    #[test]
+    fn mixed_chart_and_workflow_header_keeps_both_summaries_and_full_tooltip() {
+        check_workflow_outcome_header(true);
+    }
+
+    fn check_workflow_outcome_header(with_chart_edit: bool) {
+        use crate::agent_bridge::ProposalStatus;
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("proposal").unwrap(), 1);
+        let turn = crate::agent_demo::TURN;
+        pane.turns[0].duration = Some(Duration::from_secs(57));
+        for p in &mut pane.workflows.proposals {
+            p.status = ProposalStatus::Approved;
+            p.decided_at = Some(crate::agent_demo::SAMPLE_NOW);
+            for s in &mut p.symbols {
+                s.outcome = Some(if s.selected { "Added" } else { "Declined" }.into());
+            }
+        }
+        if with_chart_edit {
+            crate::agent_demo::tool(&mut pane, "chart-line", "create_drawing", Some(true), Some("Horizontal line"));
+        }
+        let summary = pane.workflows.turn_summary(turn).unwrap();
+        let line = pane.workflows.decision_line(turn).unwrap();
+        let ctx = egui::Context::default();
+        immediate_tooltips(&ctx);
+        let mut actions = Vec::new();
+        let output = render(&ctx, dp(360.0), vec![], |ui| pane.conversation(ui, &mut actions));
+        let text = texts(&output);
+        let expected = if with_chart_edit {
+            format!("Drew 1 line · {summary} · 3 steps · 57s")
+        } else {
+            format!("{summary} · 2 steps · 57s")
+        };
+        let (_, rect) = text.iter().find(|(s, _)| s == &expected).expect("outcome header");
+        assert!(rect.height() < dp(24.0));
+        assert_eq!(text.iter().filter(|(s, _)| s == &line).count(), 1, "one host decision line under the answer");
+        assert!(text.iter().any(|(s, _)| s.contains("awaiting your confirmation")), "model text stays unchanged");
+        let hover = rect.center();
+        for _ in 0..2 {
+            render(&ctx, dp(360.0), vec![egui::Event::PointerMoved(hover)], |ui| pane.conversation(ui, &mut actions));
+        }
+        let output =
+            render(&ctx, dp(360.0), vec![egui::Event::PointerMoved(hover)], |ui| pane.conversation(ui, &mut actions));
+        assert!(
+            texts(&output).iter().filter(|(s, _)| s == &expected).count() >= 2,
+            "full outcome text is also in tooltip"
+        );
+        assert!(actions.is_empty());
+    }
+
     fn card_pane() -> AgentPane {
         use crate::agent_bridge::{Proposal, ProposalStatus};
         let mut pane = AgentPane::default();
@@ -2459,6 +2893,8 @@ mod polish_tests {
                         .repeat(8),
                 ),
             }),
+            symbols: Vec::new(),
+            decided_at: None,
             summary: "Create [Actual **Name**](https://example.invalid)".into(),
             user_owned: false,
             selected: true,

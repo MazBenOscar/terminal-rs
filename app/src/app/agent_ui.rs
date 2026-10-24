@@ -221,6 +221,8 @@ impl TerminalApp {
         self.agent_pane.workflows.proposals.push(Proposal {
             id,
             turn: turn.into(),
+            symbols: Proposal::symbol_choices(&args),
+            decided_at: None,
             args,
             summary: summary.clone(),
             user_owned,
@@ -420,15 +422,31 @@ impl TerminalApp {
             .filter(|(_, p)| {
                 p.turn == turn
                     && p.status == ProposalStatus::Pending
-                    && (!approve || p.selected)
+                    && (!approve || p.is_selected())
                     && shown.is_none_or(|ids| ids.contains(&p.id))
+                    && (shown.is_none()
+                        || p.symbols.iter().enumerate().all(|(n, s)| {
+                            self.agent_pane
+                                .symbol_shown
+                                .get(turn)
+                                .is_some_and(|rows| rows.contains(&(p.id, n, s.symbol.clone())))
+                        }))
             })
             .map(|(i, _)| i)
             .collect();
         for index in proposals {
             let proposal = self.agent_pane.workflows.proposals[index].clone();
-            let (status, result) = if approve {
-                match self.apply_workflow(&proposal) {
+            let mut selected = proposal.clone();
+            if !proposal.symbols.is_empty() {
+                let symbols = proposal.symbols.iter().filter(|s| s.selected).map(|s| s.symbol.clone()).collect();
+                match &mut selected.args {
+                    tr_agent_tools::args::LiveArgs::AddWatchlistSymbols(a) => a.symbols = symbols,
+                    tr_agent_tools::args::LiveArgs::RemoveWatchlistSymbols(a) => a.symbols = symbols,
+                    _ => unreachable!("only symbol proposals have sub-rows"),
+                }
+            }
+            let (status, result) = if approve && proposal.is_selected() {
+                match self.apply_workflow(&selected) {
                     Ok(undo) => {
                         // Earlier approvals in this card are not user conflicts. Rebase
                         // proposals that captured the same target/configuration, but never
@@ -456,11 +474,33 @@ impl TerminalApp {
             } else {
                 (ProposalStatus::Declined, WorkflowStatus::Declined)
             };
-            self.agent_pane.workflows.proposals[index].status = status;
+            let decided = &mut self.agent_pane.workflows.proposals[index];
+            decided.status = status;
+            decided.decided_at = Some(chrono::Local::now().timestamp());
+            let add = matches!(proposal.args, tr_agent_tools::args::LiveArgs::AddWatchlistSymbols(_));
+            for symbol in &mut decided.symbols {
+                let existed = proposal.before["symbols"].as_array().is_some_and(|items| {
+                    items.iter().any(|s| s.as_str().is_some_and(|s| crate::symbol_search::same_key(s, &symbol.symbol)))
+                });
+                symbol.outcome = Some(
+                    if !approve || !symbol.selected {
+                        if add { "Declined" } else { "Kept" }
+                    } else if decided.status != ProposalStatus::Approved {
+                        "Failed"
+                    } else if add {
+                        if existed { "Already in list" } else { "Added" }
+                    } else if existed {
+                        "Removed"
+                    } else {
+                        "Not in list"
+                    }
+                    .into(),
+                );
+            }
             self.agent_pane.workflows.context.push(WorkflowResult::Confirmation {
                 proposal_id: proposal.id,
                 status: result,
-                summary: proposal.summary,
+                summary: decided.decision_summary(),
             });
         }
         if self.agent_pane.running
@@ -622,6 +662,10 @@ impl TerminalApp {
         }
         retained.reverse();
         self.agent_pane.workflows.undo = retained;
+        self.agent_pane
+            .workflows
+            .undone
+            .insert(turn.into(), (chrono::Local::now().timestamp(), !summary.skipped.is_empty()));
         self.agent_pane.workflows.context.push(tr_agent::codex::WorkflowResult::Undo {
             turn: turn.into(),
             reverted: summary.reverted,
@@ -948,6 +992,398 @@ mod tests {
     }
     fn price() -> serde_json::Value {
         serde_json::json!({"symbol":"AAPL US Equity","kind":"price","direction":"above","level":100})
+    }
+
+    #[test]
+    fn symbol_selection_partial_add_preserves_order_reports_decisions_once_and_undoes_only_additions() {
+        use serde_json::json;
+        let mut app = workflow_app("symbol-partial-add");
+        app.create_watchlist("Agent Test".into(), vec![]).unwrap();
+        workflow(
+            &mut app,
+            "pick:1",
+            "add_watchlist_symbols",
+            json!({"watchlist":"Agent Test","symbols":["NVDA US Equity","MSFT US Equity","AAPL US Equity"]}),
+        );
+        let p = &mut app.agent_pane.workflows.proposals[0];
+        assert!(p.symbols.iter().all(|s| s.selected));
+        p.symbols[1].selected = false;
+        assert!(app.watchlists[1].symbols.is_empty());
+        assert!(app.agent_pane.workflows.decision_line("pick:1").is_none());
+        app.confirm_workflows("pick:1", true);
+        assert_eq!(app.watchlists[1].symbols, ["NVDA US Equity", "AAPL US Equity"]);
+        let p = &app.agent_pane.workflows.proposals[0];
+        assert_eq!(
+            p.symbols.iter().map(|s| s.outcome.as_deref().unwrap()).collect::<Vec<_>>(),
+            ["Added", "Declined", "Added"]
+        );
+        assert_eq!(p.outcome_summary(), "Added 2 of 3 symbols to Agent Test");
+        let tr_agent::codex::WorkflowResult::Confirmation { summary, .. } = &app.agent_pane.workflows.context[0] else {
+            panic!("confirmation")
+        };
+        assert!(summary.contains("approved symbols: [NVDA US Equity, AAPL US Equity]"), "{summary}");
+        assert!(summary.contains("declined symbols: [MSFT US Equity]"), "{summary}");
+        assert!(app.agent_pane.workflows.decision_line("pick:1").unwrap().starts_with("You approved 2 of 3 · "));
+        app.confirm_workflows("pick:1", true);
+        app.confirm_workflows("pick:1", false);
+        assert_eq!(app.agent_pane.workflows.context.len(), 1, "delivery-once decision");
+        app.add_to_named_watchlist("Agent Test", "MSFT US Equity".into(), None).unwrap();
+        assert_eq!(app.undo_agent_turn("pick:1").unwrap().reverted, 1);
+        assert_eq!(app.watchlists[1].symbols, ["MSFT US Equity"], "undo leaves the unapproved symbol alone");
+    }
+
+    #[test]
+    fn symbol_selection_partial_remove_reports_kept_and_undoes_only_removals() {
+        use serde_json::json;
+        let mut app = workflow_app("symbol-partial-remove");
+        app.create_watchlist(
+            "Agent Test".into(),
+            vec!["AAPL US Equity".into(), "MSFT US Equity".into(), "NVDA US Equity".into()],
+        )
+        .unwrap();
+        workflow(
+            &mut app,
+            "pick:2",
+            "remove_watchlist_symbols",
+            json!({"watchlist":"Agent Test","symbols":["AAPL US Equity","MSFT US Equity","NVDA US Equity"]}),
+        );
+        app.agent_pane.workflows.proposals[0].symbols[1].selected = false;
+        app.confirm_workflows("pick:2", true);
+        assert_eq!(app.watchlists[1].symbols, ["MSFT US Equity"]);
+        let p = &app.agent_pane.workflows.proposals[0];
+        assert_eq!(
+            p.symbols.iter().map(|s| s.outcome.as_deref().unwrap()).collect::<Vec<_>>(),
+            ["Removed", "Kept", "Removed"]
+        );
+        assert_eq!(p.outcome_summary(), "Removed 2 of 3 symbols from Agent Test");
+        assert!(p.decision_summary().contains("declined symbols: [MSFT US Equity]"));
+        app.add_to_named_watchlist("Agent Test", "TSLA US Equity".into(), None).unwrap();
+        assert_eq!(app.undo_agent_turn("pick:2").unwrap().reverted, 1);
+        assert_eq!(app.watchlists[1].symbols, ["MSFT US Equity", "TSLA US Equity", "AAPL US Equity", "NVDA US Equity"]);
+    }
+
+    #[test]
+    fn symbol_selection_all_unticked_stays_pending_until_explicitly_declined_without_undo() {
+        use crate::agent_bridge::ProposalStatus;
+        use serde_json::json;
+        let mut app = workflow_app("symbol-none");
+        app.create_watchlist("Agent Test".into(), vec![]).unwrap();
+        workflow(
+            &mut app,
+            "none:1",
+            "add_watchlist_symbols",
+            json!({"watchlist":"Agent Test","symbols":["AAPL US Equity","MSFT US Equity"]}),
+        );
+        for symbol in &mut app.agent_pane.workflows.proposals[0].symbols {
+            symbol.selected = false;
+        }
+        assert!(!app.agent_pane.workflows.proposals[0].is_selected());
+        workflow(&mut app, "none:1", "create_watchlist", json!({"name":"Selected"}));
+        app.confirm_workflows("none:1", true);
+        assert_eq!(app.agent_pane.workflows.proposals[0].status, ProposalStatus::Pending);
+        assert!(app.agent_pane.workflows.proposals[0].decided_at.is_none());
+        assert!(app.agent_pane.workflows.proposals[0].symbols.iter().all(|s| s.outcome.is_none()));
+        assert_eq!(app.agent_pane.workflows.context.len(), 1, "only the selected row is reported");
+        assert!(app.agent_pane.workflows.decision_line("none:1").is_none());
+        app.confirm_workflows("none:1", false);
+        assert_eq!(app.agent_pane.workflows.proposals[0].status, ProposalStatus::Declined);
+        assert_eq!(app.agent_pane.workflows.context.len(), 2);
+        assert_eq!(app.agent_pane.workflows.proposals[0].outcome_summary(), "Declined adding 2 symbols to Agent Test");
+        assert!(app.watchlists[1].symbols.is_empty());
+        assert_eq!(app.agent_pane.workflows.undo.len(), 1, "only the selected list creation has undo");
+        assert!(
+            app.agent_pane.workflows.proposals[0]
+                .decision_summary()
+                .contains("approved symbols: []; declined symbols: [AAPL US Equity, MSFT US Equity]")
+        );
+    }
+
+    #[test]
+    fn symbol_selection_subitem_host_guard_applies_to_both_approve_and_decline() {
+        use crate::agent_bridge::ProposalStatus;
+        use serde_json::json;
+        for approve in [true, false] {
+            let mut app = workflow_app(&format!("symbol-host-guard-{approve}"));
+            app.create_watchlist("Agent Test".into(), vec![]).unwrap();
+            workflow(
+                &mut app,
+                "guard:1",
+                "add_watchlist_symbols",
+                json!({"watchlist":"Agent Test","symbols":["AAPL US Equity","MSFT US Equity"]}),
+            );
+            let id = app.agent_pane.workflows.proposals[0].id;
+            app.agent_pane.symbol_shown.insert("guard:1".into(), vec![(id, 0, "AAPL US Equity".into())]);
+            app.confirm_shown_workflows("guard:1", approve, Some(&[id]));
+            assert_eq!(app.agent_pane.workflows.proposals[0].status, ProposalStatus::Pending);
+            assert!(app.watchlists[1].symbols.is_empty());
+            assert!(app.agent_pane.workflows.context.is_empty());
+            app.agent_pane.symbol_shown.get_mut("guard:1").unwrap().push((id, 1, "MSFT US Equity".into()));
+            app.confirm_shown_workflows("guard:1", approve, Some(&[id]));
+            assert_eq!(
+                app.agent_pane.workflows.proposals[0].status,
+                if approve { ProposalStatus::Approved } else { ProposalStatus::Declined }
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_selection_already_present_missing_and_expired_rows_have_truthful_status() {
+        use serde_json::json;
+        let mut app = workflow_app("symbol-noops");
+        app.create_watchlist("Agent Test".into(), vec!["AAPL US Equity".into()]).unwrap();
+        workflow(
+            &mut app,
+            "noop:1",
+            "add_watchlist_symbols",
+            json!({"watchlist":"Agent Test","symbols":["AAPL US Equity","MSFT US Equity"]}),
+        );
+        app.confirm_workflows("noop:1", true);
+        assert_eq!(app.agent_pane.workflows.proposals[0].symbols[0].outcome.as_deref(), Some("Already in list"));
+        let tr_agent::codex::WorkflowResult::Confirmation { summary, .. } = &app.agent_pane.workflows.context[0] else {
+            panic!("confirmation")
+        };
+        assert!(summary.contains("approved symbols: [MSFT US Equity]"), "{summary}");
+        assert!(summary.contains("approved, no change (already in list) symbols: [AAPL US Equity]"), "{summary}");
+        assert_eq!(
+            app.agent_pane.workflows.turn_summary("noop:1").as_deref(),
+            Some("Added 1 of 2 symbols to Agent Test · 1 already in list")
+        );
+        assert_eq!(app.undo_agent_turn("noop:1").unwrap().reverted, 1);
+        assert_eq!(app.watchlists[1].symbols, ["AAPL US Equity"]);
+        workflow(
+            &mut app,
+            "noop:2",
+            "remove_watchlist_symbols",
+            json!({"watchlist":"Agent Test","symbols":["AAPL US Equity","MSFT US Equity"]}),
+        );
+        app.confirm_workflows("noop:2", true);
+        assert_eq!(app.agent_pane.workflows.proposals[1].symbols[1].outcome.as_deref(), Some("Not in list"));
+        let tr_agent::codex::WorkflowResult::Confirmation { summary, .. } =
+            app.agent_pane.workflows.context.last().unwrap()
+        else {
+            panic!("confirmation")
+        };
+        assert!(summary.contains("approved symbols: [AAPL US Equity]"), "{summary}");
+        assert!(summary.contains("approved, no change (not in list) symbols: [MSFT US Equity]"), "{summary}");
+        assert_eq!(
+            app.agent_pane.workflows.turn_summary("noop:2").as_deref(),
+            Some("Removed 1 of 2 symbols from Agent Test · 1 not in list")
+        );
+        workflow(
+            &mut app,
+            "noop:3",
+            "add_watchlist_symbols",
+            json!({"watchlist":"Agent Test","symbols":["AAPL US Equity","MSFT US Equity"]}),
+        );
+        let deadline = app.agent_pane.workflows.proposals[2].deadline;
+        app.agent_pane.workflows.expire(deadline, None);
+        assert!(app.agent_pane.workflows.proposals[2].symbols.iter().all(|s| s.outcome.as_deref() == Some("Expired")));
+        assert_eq!(app.agent_pane.workflows.turn_summary("noop:3").as_deref(), Some("Proposal expired"));
+        let first = app.agent_pane.workflows.decision_line("noop:3").unwrap();
+        assert!(first.starts_with("Expired · "));
+        app.agent_pane.workflows.expire(deadline, None);
+        assert_eq!(app.agent_pane.workflows.decision_line("noop:3").as_deref(), Some(first.as_str()));
+    }
+
+    #[test]
+    fn workflow_feedback_headers_cover_create_decline_alert_and_mixed_decisions() {
+        use serde_json::json;
+        let mut app = workflow_app("workflow-feedback-headers");
+        workflow(&mut app, "feedback:1", "create_watchlist", json!({"name":"Agent Test"}));
+        assert_eq!(
+            app.agent_pane.workflows.turn_summary("feedback:1").as_deref(),
+            Some("Awaiting approval · 1 change")
+        );
+        app.confirm_workflows("feedback:1", true);
+        assert_eq!(app.agent_pane.workflows.turn_summary("feedback:1").as_deref(), Some("Created Agent Test"));
+        app.agent_pane.workflows.proposals[0].decided_at = Some(crate::agent_demo::SAMPLE_NOW);
+        let time = chrono::DateTime::from_timestamp(crate::agent_demo::SAMPLE_NOW, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(
+            app.agent_pane.workflows.decision_line("feedback:1").unwrap(),
+            format!("You approved this · {time}")
+        );
+        workflow(
+            &mut app,
+            "feedback:2",
+            "add_watchlist_symbols",
+            json!({"watchlist":"Agent Test","symbols":["NVDA US Equity","TSLA US Equity","COINBASE:ETH-USD"]}),
+        );
+        app.confirm_workflows("feedback:2", false);
+        assert_eq!(
+            app.agent_pane.workflows.turn_summary("feedback:2").as_deref(),
+            Some("Declined adding 3 symbols to Agent Test")
+        );
+        assert!(app.agent_pane.workflows.decision_line("feedback:2").unwrap().starts_with("You declined this · "));
+        workflow(
+            &mut app,
+            "feedback:3",
+            "create_alert",
+            json!({"symbol":"COINBASE:BTC-USD Curncy","kind":"close","direction":"above","level":85000,"timeframe":"4H"}),
+        );
+        app.confirm_workflows("feedback:3", true);
+        let summary = app.agent_pane.workflows.turn_summary("feedback:3").unwrap();
+        assert!(summary.starts_with("Created alert BTC/USD · Coinbase close above "), "{summary}");
+        assert!(summary.ends_with(" · 4H"), "{summary}");
+        workflow(&mut app, "feedback:4", "create_watchlist", json!({"name":"One"}));
+        workflow(&mut app, "feedback:4", "create_watchlist", json!({"name":"Two"}));
+        app.agent_pane.workflows.proposals.last_mut().unwrap().selected = false;
+        app.confirm_workflows("feedback:4", true);
+        assert!(app.agent_pane.workflows.decision_line("feedback:4").is_none());
+        app.confirm_workflows("feedback:4", false);
+        assert_eq!(
+            app.agent_pane.workflows.turn_summary("feedback:4").as_deref(),
+            Some("Created One, declined creating Two")
+        );
+        assert!(app.agent_pane.workflows.decision_line("feedback:4").unwrap().starts_with("You approved 1 of 2 · "));
+    }
+
+    #[test]
+    fn review_all_unticked_symbol_proposal_is_left_pending_like_an_unselected_row() {
+        use crate::agent_bridge::ProposalStatus;
+        use serde_json::json;
+        let mut app = workflow_app("review-symbol-none-pending");
+        app.create_watchlist("Agent Test".into(), vec![]).unwrap();
+        workflow(&mut app, "rnone:1", "create_watchlist", json!({"name":"Unselected"}));
+        workflow(
+            &mut app,
+            "rnone:1",
+            "add_watchlist_symbols",
+            json!({"watchlist":"Agent Test","symbols":["AAPL US Equity","MSFT US Equity"]}),
+        );
+        workflow(&mut app, "rnone:1", "create_watchlist", json!({"name":"Selected"}));
+        app.agent_pane.workflows.proposals[0].selected = false;
+        for symbol in &mut app.agent_pane.workflows.proposals[1].symbols {
+            symbol.selected = false;
+        }
+        app.confirm_workflows("rnone:1", true);
+        assert_eq!(app.agent_pane.workflows.proposals[0].status, ProposalStatus::Pending, "unselected row stays");
+        assert_eq!(
+            app.agent_pane.workflows.proposals[1].status,
+            ProposalStatus::Pending,
+            "all-unticked counts as unselected, so it must be treated the same"
+        );
+    }
+
+    #[test]
+    fn review_failed_approval_decision_line_does_not_claim_nothing_was_approved() {
+        use crate::agent_bridge::ProposalStatus;
+        use serde_json::json;
+        let mut app = workflow_app("review-failed-line");
+        workflow(&mut app, "rfail:1", "create_watchlist", json!({"name":"Agent Test"}));
+        // The user creates the same list before approving, so the approval fails at click time.
+        app.create_watchlist("Agent Test".into(), vec![]).unwrap();
+        app.confirm_workflows("rfail:1", true);
+        assert!(matches!(app.agent_pane.workflows.proposals[0].status, ProposalStatus::Failed(_)));
+        let line = app.agent_pane.workflows.decision_line("rfail:1").unwrap();
+        assert!(line.starts_with("You approved this · 1 change failed · "), "{line}");
+        workflow(&mut app, "rfail:2", "create_watchlist", json!({"name":"One"}));
+        workflow(&mut app, "rfail:2", "create_watchlist", json!({"name":"Two"}));
+        workflow(&mut app, "rfail:2", "create_watchlist", json!({"name":"Three"}));
+        app.create_watchlist("Two".into(), vec![]).unwrap();
+        app.agent_pane.workflows.proposals.last_mut().unwrap().selected = false;
+        app.confirm_workflows("rfail:2", true);
+        app.confirm_workflows("rfail:2", false);
+        let line = app.agent_pane.workflows.decision_line("rfail:2").unwrap();
+        assert!(line.starts_with("You approved 2 of 3 · 1 failed · "), "{line}");
+    }
+
+    #[test]
+    fn review_expired_status_time_is_the_deadline_not_when_it_was_noticed() {
+        use serde_json::json;
+        let mut app = workflow_app("review-expired-time");
+        workflow(&mut app, "rexp:1", "create_watchlist", json!({"name":"Agent Test"}));
+        // e.g. the laptop slept through the deadline and the app noticed two hours later.
+        let now = std::time::Instant::now();
+        app.agent_pane.workflows.proposals[0].deadline = now - std::time::Duration::from_secs(7200);
+        app.agent_pane.workflows.expire(now, None);
+        let decided = app.agent_pane.workflows.proposals[0].decided_at.unwrap();
+        let expected = chrono::Local::now().timestamp() - 7200;
+        assert!((decided - expected).abs() < 2, "decided_at {decided} should be about the deadline {expected}");
+        let time = chrono::DateTime::from_timestamp(decided, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(app.agent_pane.workflows.decision_line("rexp:1").unwrap(), format!("Expired · {time}"));
+    }
+
+    #[test]
+    fn workflow_decision_line_reports_undo_time_and_kept_items() {
+        use serde_json::json;
+        for kept in [false, true] {
+            let mut app = workflow_app(&format!("workflow-undo-line-{kept}"));
+            workflow(&mut app, "undo-line:1", "create_watchlist", json!({"name":"Research"}));
+            app.confirm_workflows("undo-line:1", true);
+            if kept {
+                app.add_to_named_watchlist("Research", "AAPL US Equity".into(), None).unwrap();
+            }
+            let summary = app.undo_agent_turn("undo-line:1").unwrap();
+            assert_eq!(!summary.skipped.is_empty(), kept);
+            let (timestamp, recorded_kept) = app.agent_pane.workflows.undone["undo-line:1"];
+            assert_eq!(recorded_kept, kept);
+            assert!((timestamp - chrono::Local::now().timestamp()).abs() < 2);
+            let time = chrono::DateTime::from_timestamp(timestamp, 0)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+                .format("%H:%M")
+                .to_string();
+            assert_eq!(
+                app.agent_pane.workflows.decision_line("undo-line:1").unwrap(),
+                format!("You approved this · {} {time}", if kept { "partly undone" } else { "undone" })
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_decision_line_distinguishes_declined_and_expired() {
+        use serde_json::json;
+        let mut app = workflow_app("workflow-declined-expired-line");
+        workflow(&mut app, "mixed-expiry:1", "create_watchlist", json!({"name":"One"}));
+        workflow(&mut app, "mixed-expiry:1", "create_watchlist", json!({"name":"Two"}));
+        let shown = [app.agent_pane.workflows.proposals[0].id];
+        app.confirm_shown_workflows("mixed-expiry:1", false, Some(&shown));
+        app.agent_pane.workflows.proposals[1].deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        app.agent_pane.workflows.expire(std::time::Instant::now(), None);
+        for p in &mut app.agent_pane.workflows.proposals {
+            p.decided_at = Some(crate::agent_demo::SAMPLE_NOW);
+        }
+        let time = chrono::DateTime::from_timestamp(crate::agent_demo::SAMPLE_NOW, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(
+            app.agent_pane.workflows.decision_line("mixed-expiry:1").unwrap(),
+            format!("You declined 1 · 1 expired · {time}")
+        );
+    }
+
+    #[test]
+    fn single_symbol_noop_confirmation_reports_approved_without_change() {
+        use serde_json::json;
+        let mut app = workflow_app("single-symbol-noop-model-report");
+        app.create_watchlist("Research".into(), vec!["AAPL US Equity".into()]).unwrap();
+        for (tool, reason) in
+            [("add_watchlist_symbols", "already in list"), ("remove_watchlist_symbols", "not in list")]
+        {
+            let symbol = if tool == "add_watchlist_symbols" { "AAPL US Equity" } else { "MSFT US Equity" };
+            workflow(&mut app, tool, tool, json!({"watchlist":"Research","symbols":[symbol]}));
+            app.confirm_workflows(tool, true);
+            let tr_agent::codex::WorkflowResult::Confirmation { status, summary, .. } =
+                app.agent_pane.workflows.context.last().unwrap()
+            else {
+                panic!("confirmation")
+            };
+            assert!(matches!(status, tr_agent::codex::WorkflowStatus::Approved));
+            assert!(summary.contains(&format!("approved, no change ({reason}) symbols: [{symbol}]")), "{summary}");
+            assert!(summary.contains("approved symbols: []"), "{summary}");
+            assert!(app.agent_pane.workflows.decision_line(tool).unwrap().starts_with("You approved this · "));
+        }
+        assert_eq!(app.watchlists[1].symbols, ["AAPL US Equity"]);
     }
 
     #[test]

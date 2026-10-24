@@ -47,6 +47,9 @@ impl State {
             .map(Self)
             .ok_or_else(|| format!("Unknown TR_AGENT_DEMO state {name:?}; expected one of: {}", STATES.join(", ")))
     }
+    pub fn workflows(self) -> bool {
+        matches!(self.0, "proposal" | "approved")
+    }
     pub fn approved(self) -> bool {
         self.0 == "approved"
     }
@@ -223,35 +226,52 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
         pane.settings.tools = ToolsMode::Edit;
         pane.session_tools = Some(tr_agent_tools::ToolSet::Workflows);
         pane.start_prompt(Prompt {
-            text: "Create Crypto and Research watchlists for me.".into(),
+            text: "Create Research and add AAPL, MSFT and BTC-USD to Agent Test.".into(),
             requires_tools: false,
         });
         pane.event(BridgeEvent::Started { turn: TURN.into() });
         pane.turns[0].local_time = crate::agent_pane::local_time(SAMPLE_NOW);
-        for (id, name) in [(1, "Crypto"), (2, "Research")] {
-            tool(
-                &mut pane,
-                &format!("proposal-{id}"),
-                "create_watchlist",
-                Some(true),
-                Some("Awaiting user confirmation"),
-            );
+        for id in [1, 2] {
+            let (name, arguments, args, summary) = if id == 1 {
+                (
+                    "create_watchlist",
+                    json!({"name":"Research"}),
+                    tr_agent_tools::args::LiveArgs::CreateWatchlist(tr_agent_tools::args::CreateWatchlist {
+                        name: "Research".into(),
+                    }),
+                    "Create watchlist · Research",
+                )
+            } else {
+                let arguments =
+                    json!({"watchlist":"Agent Test","symbols":["AAPL US Equity","MSFT US Equity","COINBASE:BTC-USD"]});
+                (
+                    "add_watchlist_symbols",
+                    arguments.clone(),
+                    tr_agent_tools::args::LiveArgs::AddWatchlistSymbols(serde_json::from_value(arguments).unwrap()),
+                    "Add to Agent Test",
+                )
+            };
+            pane.wire("item/completed", &json!({"item":{"id":format!("proposal-{id}"),"type":"dynamicToolCall","tool":name,"success":true,"arguments":arguments}}));
+            let mut symbols = Proposal::symbol_choices(&args);
+            if let Some(symbol) = symbols.get_mut(1) {
+                symbol.selected = false;
+            }
             pane.workflows.proposals.push(Proposal {
                 id,
                 turn: TURN.into(),
-                args: tr_agent_tools::args::LiveArgs::CreateWatchlist(tr_agent_tools::args::CreateWatchlist {
-                    name: name.into(),
-                }),
-                summary: format!("Create watchlist · {name}"),
+                args,
+                symbols,
+                decided_at: None,
+                summary: summary.into(),
                 user_owned: false,
                 selected: true,
                 deadline: Instant::now() + Duration::from_secs(600),
                 status: ProposalStatus::Pending,
-                before: serde_json::Value::Null,
+                before: if id == 1 { serde_json::Value::Null } else { json!({"name":"Agent Test","symbols":[]}) },
             });
         }
         pane.workflows.next_id = 2;
-        pane.wire("item/completed", &json!({"item":{"type":"agentMessage","id":"workflow-reply","text":"These changes are proposals only. Approve the lists you want to create."}}));
+        pane.wire("item/completed", &json!({"item":{"type":"agentMessage","id":"workflow-reply","text":"Creating Research and adding AAPL, MSFT and Coinbase BTC-USD is awaiting your confirmation."}}));
         complete(&mut pane, "completed");
     }
     if state.0 == "queue" {

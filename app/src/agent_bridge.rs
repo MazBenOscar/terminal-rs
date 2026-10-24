@@ -70,6 +70,13 @@ pub enum ProposalStatus {
 }
 
 #[derive(Debug, Clone)]
+pub struct SymbolChoice {
+    pub symbol: String,
+    pub selected: bool,
+    pub outcome: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Proposal {
     pub id: u64,
     pub turn: String,
@@ -80,9 +87,228 @@ pub struct Proposal {
     pub deadline: Instant,
     pub status: ProposalStatus,
     pub before: Value,
+    /// Multi-symbol proposals only; single-symbol cards keep their compact layout.
+    pub symbols: Vec<SymbolChoice>,
+    pub decided_at: Option<i64>,
 }
 
 impl Proposal {
+    pub fn symbol_choices(args: &LiveArgs) -> Vec<SymbolChoice> {
+        let symbols = match args {
+            LiveArgs::AddWatchlistSymbols(a) => &a.symbols,
+            LiveArgs::RemoveWatchlistSymbols(a) => &a.symbols,
+            _ => return Vec::new(),
+        };
+        if symbols.len() <= 1 {
+            return Vec::new();
+        }
+        symbols.iter().map(|symbol| SymbolChoice { symbol: symbol.clone(), selected: true, outcome: None }).collect()
+    }
+
+    pub fn is_selected(&self) -> bool {
+        self.selected && (self.symbols.is_empty() || self.symbols.iter().any(|s| s.selected))
+    }
+
+    pub fn card_summary(&self) -> String {
+        if self.symbols.is_empty() {
+            return self.summary.clone();
+        }
+        let name = self.before["name"].as_str().unwrap_or_else(|| match &self.args {
+            LiveArgs::AddWatchlistSymbols(a) => &a.watchlist,
+            LiveArgs::RemoveWatchlistSymbols(a) => &a.watchlist,
+            _ => "",
+        });
+        format!(
+            "{} {name}",
+            if matches!(self.args, LiveArgs::AddWatchlistSymbols(_)) { "Add to" } else { "Remove from" }
+        )
+    }
+
+    pub fn approved_count(&self) -> usize {
+        if self.status != ProposalStatus::Approved {
+            return 0;
+        }
+        if self.symbols.is_empty() { 1 } else { self.symbols.iter().filter(|s| s.selected).count() }
+    }
+
+    /// Counts the user's approval, even if applying it failed.
+    pub fn approval_count(&self) -> usize {
+        if matches!(self.status, ProposalStatus::Approved | ProposalStatus::Failed(_)) {
+            if self.symbols.is_empty() { 1 } else { self.symbols.iter().filter(|s| s.selected).count() }
+        } else {
+            0
+        }
+    }
+
+    pub fn change_count(&self) -> usize {
+        self.symbols.len().max(1)
+    }
+
+    pub fn outcome_summary(&self) -> String {
+        let approved = self.status == ProposalStatus::Approved;
+        if self.status == ProposalStatus::Expired {
+            return "Proposal expired".into();
+        }
+        if let ProposalStatus::Failed(reason) = &self.status {
+            return format!("Failed: {reason}");
+        }
+        let verb = |yes: &str, no: &str| if approved { yes.to_owned() } else { format!("Declined {no}") };
+        let name = self.before["name"].as_str();
+        match &self.args {
+            LiveArgs::CreateWatchlist(a) => format!("{} {}", verb("Created", "creating"), a.name.trim()),
+            LiveArgs::DeleteWatchlist(a) => format!("{} {}", verb("Deleted", "deleting"), name.unwrap_or(&a.watchlist)),
+            LiveArgs::AddWatchlistSymbols(a) => {
+                self.symbol_summary(true, name.unwrap_or(&a.watchlist), a.symbols.len())
+            }
+            LiveArgs::RemoveWatchlistSymbols(a) => {
+                self.symbol_summary(false, name.unwrap_or(&a.watchlist), a.symbols.len())
+            }
+            LiveArgs::CreateAlert(a) => format!(
+                "{} alert {} {} {} {} · {}",
+                verb("Created", "creating"),
+                crate::security_names::label(&a.symbol),
+                if matches!(a.kind, tr_agent_tools::args::AlertKind::Close) { "close" } else { "price" },
+                if matches!(a.direction, tr_agent_tools::args::AlertRule::Above) { "above" } else { "below" },
+                crate::price_alerts::display_price(&a.symbol, a.level),
+                a.timeframe.as_deref().unwrap_or("Live")
+            ),
+            LiveArgs::UpdateAlert(_) => format!(
+                "{}{}",
+                verb("Updated", "updating"),
+                self.summary.strip_prefix("Update").unwrap_or(&self.summary)
+            ),
+            LiveArgs::DeleteAlert(_) => format!(
+                "{}{}",
+                verb("Deleted", "deleting"),
+                self.summary.strip_prefix("Delete").unwrap_or(&self.summary)
+            ),
+            _ => self.summary.clone(),
+        }
+    }
+
+    fn symbol_summary(&self, add: bool, name: &str, total: usize) -> String {
+        let n = if self.symbols.is_empty() {
+            usize::from(self.status == ProposalStatus::Approved)
+        } else {
+            self.approved_count()
+        };
+        let noops = if self.status == ProposalStatus::Approved {
+            self.symbol_decisions()
+                .iter()
+                .filter(|(symbol, selected)| *selected && self.symbol_no_change_reason(symbol).is_some())
+                .count()
+        } else {
+            0
+        };
+        let changed = n.saturating_sub(noops);
+        let count = if changed > 0 && changed < total { format!("{changed} of {total}") } else { total.to_string() };
+        let verb = match (add, changed > 0) {
+            (true, true) => "Added",
+            (false, true) => "Removed",
+            (true, false) => "Declined adding",
+            (false, false) => "Declined removing",
+        };
+        let summary = if n > 0 && changed == 0 {
+            format!("No symbols {} {} {name}", if add { "added" } else { "removed" }, if add { "to" } else { "from" })
+        } else {
+            format!(
+                "{verb} {count} symbol{} {} {name}",
+                if total == 1 { "" } else { "s" },
+                if add { "to" } else { "from" }
+            )
+        };
+        if noops == 0 {
+            summary
+        } else {
+            format!("{summary} · {noops} {}", if add { "already in list" } else { "not in list" })
+        }
+    }
+
+    fn symbol_decisions(&self) -> Vec<(&str, bool)> {
+        if self.symbols.is_empty() {
+            match &self.args {
+                LiveArgs::AddWatchlistSymbols(a) => a.symbols.iter().map(|s| (s.as_str(), true)).collect(),
+                LiveArgs::RemoveWatchlistSymbols(a) => a.symbols.iter().map(|s| (s.as_str(), true)).collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            self.symbols.iter().map(|s| (s.symbol.as_str(), s.selected)).collect()
+        }
+    }
+
+    fn symbol_no_change_reason(&self, symbol: &str) -> Option<&'static str> {
+        let existed = self.before["symbols"].as_array().is_some_and(|items| {
+            items.iter().any(|s| s.as_str().is_some_and(|s| crate::symbol_search::same_key(s, symbol)))
+        });
+        match &self.args {
+            LiveArgs::AddWatchlistSymbols(_) if existed => Some("already in list"),
+            LiveArgs::RemoveWatchlistSymbols(_) if !existed => Some("not in list"),
+            _ => None,
+        }
+    }
+
+    pub fn decision_summary(&self) -> String {
+        let symbols = self.symbol_decisions();
+        if symbols.is_empty() {
+            return self.summary.clone();
+        }
+        let mut approved = Vec::new();
+        let mut declined = Vec::new();
+        let mut failed = Vec::new();
+        let mut expired = Vec::new();
+        let mut already_in_list = Vec::new();
+        let mut not_in_list = Vec::new();
+        for (symbol, selected) in symbols {
+            let names = if self.status == ProposalStatus::Expired {
+                &mut expired
+            } else if self.status == ProposalStatus::Declined || !selected {
+                &mut declined
+            } else if self.status == ProposalStatus::Approved {
+                match self.symbol_no_change_reason(symbol) {
+                    Some("already in list") => &mut already_in_list,
+                    Some("not in list") => &mut not_in_list,
+                    _ => &mut approved,
+                }
+            } else {
+                &mut failed
+            };
+            names.push(crate::security_names::label(symbol));
+        }
+        let mut summary = format!(
+            "{}; approved symbols: [{}]; declined symbols: [{}]",
+            self.outcome_summary(),
+            approved.join(", "),
+            declined.join(", ")
+        );
+        for (reason, names) in [("already in list", already_in_list), ("not in list", not_in_list)] {
+            if !names.is_empty() {
+                summary.push_str(&format!("; approved, no change ({reason}) symbols: [{}]", names.join(", ")));
+            }
+        }
+        if !failed.is_empty() {
+            summary.push_str(&format!("; failed symbols: [{}]", failed.join(", ")));
+        }
+        if !expired.is_empty() {
+            summary.push_str(&format!("; expired symbols: [{}]", expired.join(", ")));
+        }
+        summary
+    }
+
+    pub fn expire(&mut self) {
+        self.status = ProposalStatus::Expired;
+        let now = Instant::now();
+        let local_now = chrono::Local::now();
+        let decided_at = if self.deadline >= now {
+            local_now + chrono::Duration::from_std(self.deadline.duration_since(now)).unwrap()
+        } else {
+            local_now - chrono::Duration::from_std(now.duration_since(self.deadline)).unwrap()
+        };
+        self.decided_at = Some(decided_at.timestamp());
+        for symbol in &mut self.symbols {
+            symbol.outcome = Some("Expired".into());
+        }
+    }
+
     pub fn ownership_label(&self) -> Option<&'static str> {
         self.user_owned.then(|| {
             if self.before["agent_created"].as_bool() == Some(true) || self.before["agent_turn"].as_str().is_some() {
@@ -106,18 +332,103 @@ pub struct Workflows {
     pub undo: Vec<(String, WorkflowUndo)>,
     pub context: Vec<tr_agent::codex::WorkflowResult>,
     pub next_id: u64,
+    /// Local timestamp and whether any items were kept on the user's undo.
+    pub undone: HashMap<String, (i64, bool)>,
 }
 impl Workflows {
+    pub fn turn_summary(&self, turn: &str) -> Option<String> {
+        let rows: Vec<_> = self.proposals.iter().filter(|p| p.turn == turn).collect();
+        if rows.is_empty() {
+            return None;
+        }
+        if rows.iter().any(|p| p.status == ProposalStatus::Pending) {
+            let n: usize = rows.iter().filter(|p| p.status == ProposalStatus::Pending).map(|p| p.change_count()).sum();
+            return Some(format!("Awaiting approval · {n} change{}", if n == 1 { "" } else { "s" }));
+        }
+        if rows.iter().all(|p| p.status == ProposalStatus::Expired) {
+            return Some("Proposal expired".into());
+        }
+        let mut parts = Vec::new();
+        for p in rows {
+            let summary = p.outcome_summary();
+            if !parts.contains(&summary) {
+                parts.push(summary);
+            }
+        }
+        Some(
+            parts
+                .into_iter()
+                .enumerate()
+                .map(|(i, part)| {
+                    if i == 0 {
+                        part
+                    } else {
+                        let mut chars = part.chars();
+                        chars
+                            .next()
+                            .map_or_else(String::new, |first| first.to_lowercase().collect::<String>() + chars.as_str())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+
+    pub fn decision_line(&self, turn: &str) -> Option<String> {
+        let rows: Vec<_> = self.proposals.iter().filter(|p| p.turn == turn).collect();
+        if rows.is_empty() || rows.iter().any(|p| p.status == ProposalStatus::Pending) {
+            return None;
+        }
+        let total: usize = rows.iter().map(|p| p.change_count()).sum();
+        let approved: usize = rows.iter().map(|p| p.approval_count()).sum();
+        let failed: usize =
+            rows.iter().filter(|p| matches!(p.status, ProposalStatus::Failed(_))).map(|p| p.approval_count()).sum();
+        let expired: usize =
+            rows.iter().filter(|p| p.status == ProposalStatus::Expired).map(|p| p.change_count()).sum();
+        let mut label = if expired == total {
+            "Expired".into()
+        } else if approved == total {
+            "You approved this".into()
+        } else if approved > 0 {
+            format!("You approved {approved} of {total}")
+        } else if expired > 0 {
+            format!("You declined {}", total - expired)
+        } else {
+            "You declined this".into()
+        };
+        if failed > 0 {
+            if approved == total {
+                label.push_str(&format!(" · {failed} change{} failed", if failed == 1 { "" } else { "s" }));
+            } else {
+                label.push_str(&format!(" · {failed} failed"));
+            }
+        }
+        if expired > 0 && expired < total {
+            label.push_str(&format!(" · {expired} expired"));
+        }
+        let undone = self.undone.get(turn);
+        let timestamp = undone.map(|(time, _)| *time).or_else(|| rows.iter().filter_map(|p| p.decided_at).max());
+        let time = timestamp
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_else(|| "time unavailable".into());
+        if let Some((_, kept)) = undone {
+            Some(format!("{label} · {} {time}", if *kept { "partly undone" } else { "undone" }))
+        } else {
+            Some(format!("{label} · {time}"))
+        }
+    }
+
     pub fn expire(&mut self, now: Instant, turn: Option<&str>) {
         for proposal in &mut self.proposals {
             if proposal.status == ProposalStatus::Pending
                 && (now >= proposal.deadline || turn.is_some_and(|t| t == proposal.turn))
             {
-                proposal.status = ProposalStatus::Expired;
+                proposal.expire();
                 self.context.push(tr_agent::codex::WorkflowResult::Confirmation {
                     proposal_id: proposal.id,
                     status: tr_agent::codex::WorkflowStatus::Expired,
-                    summary: proposal.summary.clone(),
+                    summary: proposal.decision_summary(),
                 });
             }
         }
@@ -125,7 +436,7 @@ impl Workflows {
     pub fn reset(&mut self) {
         for proposal in &mut self.proposals {
             if proposal.status == ProposalStatus::Pending {
-                proposal.status = ProposalStatus::Expired;
+                proposal.expire();
             }
         }
         self.context.clear();
