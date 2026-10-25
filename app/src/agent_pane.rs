@@ -1092,7 +1092,7 @@ impl AgentPane {
                             .and_then(|t| t.id.as_deref())
                             .and_then(|id| self.workflows.decision_line(id))
                     {
-                        ui.label(RichText::new(line).font(theme::mono(10.5)).color(readable(theme::muted())));
+                        ui.label(RichText::new(line).font(theme::ui_font(10.5)).color(readable(theme::muted())));
                     }
                 }
                 RenderedBlock::Notice(text) => {

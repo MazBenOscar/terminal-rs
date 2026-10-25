@@ -199,8 +199,8 @@ impl TerminalApp {
                 if let Err(error) = self.check_watchlist_name(&a.name, None) { return ToolResult::error("invalid_watchlist", &error, None); }
                 format!("Create watchlist · {}", a.name.trim())
             }
-            AddWatchlistSymbols(a) => format!("Add {} symbols to {}: {}", a.symbols.len(), matched_name, a.symbols.iter().map(|s| label(s)).collect::<Vec<_>>().join(", ")),
-            RemoveWatchlistSymbols(a) => format!("Remove {} symbols from {}: {}", a.symbols.len(), matched_name, a.symbols.iter().map(|s| label(s)).collect::<Vec<_>>().join(", ")),
+            AddWatchlistSymbols(a) => format!("Add {} to {}: {}", symbol_count(a.symbols.len()), matched_name, a.symbols.iter().map(|s| label(s)).collect::<Vec<_>>().join(", ")),
+            RemoveWatchlistSymbols(a) => format!("Remove {} from {}: {}", symbol_count(a.symbols.len()), matched_name, a.symbols.iter().map(|s| label(s)).collect::<Vec<_>>().join(", ")),
             DeleteWatchlist(_) => {
                 if self.watchlists.len() == 1 { return ToolResult::error("last_watchlist", "Cannot delete the last watchlist", None); }
                 format!("Delete watchlist · {}", matched_name)
@@ -2636,4 +2636,8 @@ mod review_tests {
         });
         assert_ne!(app.agent_pane.next_prompt().map(|p| p.text), Some("A".into()));
     }
+}
+
+fn symbol_count(n: usize) -> String {
+    if n == 1 { "1 symbol".into() } else { format!("{n} symbols") }
 }
