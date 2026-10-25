@@ -190,6 +190,21 @@ mod answer_instruction_tests {
     }
 
     #[test]
+    fn exact_workflow_symbol_instruction_is_scoped_to_exposed_workflow_tools() {
+        let mut options = super::BridgeOptions::new(String::new());
+        options.tools = tr_agent_tools::ToolSet::Workflows;
+        let sentence = "Pass symbols to workflow tools exactly as find_symbol returns them in `symbol`.";
+        for tools in
+            [tr_agent_tools::ToolSet::ReadOnly, tr_agent_tools::ToolSet::Edit, tr_agent_tools::ToolSet::Workflows]
+        {
+            let registry = tr_agent_tools::Registry::new(tools);
+            let text = super::thread_options(&options, &registry).base_instructions;
+            assert_eq!(text.matches(sentence).count(), usize::from(tools == tr_agent_tools::ToolSet::Workflows));
+            assert_eq!(text, super::session_instructions(&options, &registry));
+        }
+    }
+
+    #[test]
     fn read_only_instructions_describe_levels_without_drawing_guidance() {
         let mut options = super::BridgeOptions::new(String::new());
         // The exposed registry is authoritative, even if an opt-in was requested.
@@ -860,7 +875,12 @@ fn session_instructions(options: &BridgeOptions, registry: &Registry) -> String 
     } else {
         "Describe support/resistance levels in text only, using analyze mode levels and the returned low and high bounds."
     };
-    format!("{} {mode_instructions}", options.base_instructions)
+    let workflow_instructions = if registry.schemas().iter().any(|tool| tool.name == "create_watchlist") {
+        " Pass symbols to workflow tools exactly as find_symbol returns them in `symbol`."
+    } else {
+        ""
+    };
+    format!("{} {mode_instructions}{workflow_instructions}", options.base_instructions)
 }
 
 fn thread_options(options: &BridgeOptions, registry: &Registry) -> ThreadOptions {

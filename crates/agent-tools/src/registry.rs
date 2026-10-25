@@ -190,6 +190,7 @@ impl Registry {
                 None,
             );
         }
+        let removing = matches!(&args, LiveArgs::RemoveWatchlistSymbols(_));
         let symbols = match &mut args {
             LiveArgs::CreateAlert(a) => Some(std::slice::from_mut(&mut a.symbol)),
             LiveArgs::AddWatchlistSymbols(a) => Some(a.symbols.as_mut_slice()),
@@ -200,23 +201,34 @@ impl Registry {
         if let Some(symbols) = symbols {
             let mut unknown = Vec::new();
             for symbol in symbols {
-                match ctx.data.search(symbol).await {
-                    Ok(hits) => {
-                        let key = tr_data::security(symbol).key();
-                        if let Some(hit) = hits.iter().find(|hit| tr_data::security(&hit.key).key() == key) {
-                            *symbol = tr_data::security(&hit.key).key();
-                        } else {
-                            unknown.push(serde_json::json!({"symbol":symbol,"error":"unknown_symbol"}));
-                        }
-                    }
-                    Err(error) => unknown.push(serde_json::json!({"symbol":symbol,"error":error})),
+                match data::resolve_workflow_symbol(ctx.data, symbol).await {
+                    Ok(key) => *symbol = key,
+                    // Membership is authoritative for removal, even when discovery
+                    // is offline or a listing has disappeared from search.
+                    Err(_) if removing => {}
+                    Err(error) => unknown.push(error),
                 }
             }
             if !unknown.is_empty() {
-                let mut result =
-                    ToolResult::json(serde_json::json!({"error":{"code":"unknown_symbols"},"symbols":unknown}));
+                let details = unknown
+                    .iter()
+                    .map(|error| {
+                        let mut text = error["symbol"].as_str().unwrap_or_default().to_owned();
+                        for field in ["hint", "message"] {
+                            if let Some(message) = error[field].as_str() {
+                                text.push_str(&format!(" ({message})"));
+                            }
+                        }
+                        text
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut result = ToolResult::json(serde_json::json!({
+                    "error":{"code":"unknown_symbols","message":format!("Unknown symbols: {}", details.chars().take(512).collect::<String>())},
+                    "symbols":unknown
+                }));
                 result.success = false;
-                return result;
+                return result.capped();
             }
         }
         ctx.live.call_live(name, args).await.capped()
@@ -565,6 +577,397 @@ mod tests {
             value(registry.call("create_drawing", &base.to_string(), &mut ctx).await)["error"]["code"],
             "budget_exhausted"
         );
+    }
+
+    /// Like live search, this fake recognizes tickers but not full equity market keys.
+    #[derive(Default)]
+    struct SymbolHost {
+        queries: std::sync::Mutex<Vec<String>>,
+    }
+    impl DataHost for SymbolHost {
+        fn history<'a>(&'a self, s: &'a str, tf: Timeframe, end: Option<i64>, n: usize) -> HostFuture<'a, History> {
+            Host.history(s, tf, end, n)
+        }
+        fn quotes<'a>(&'a self, s: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
+            Host.quotes(s)
+        }
+        fn search<'a>(&'a self, query: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+            self.queries.lock().unwrap().push(query.into());
+            Box::pin(async move {
+                let key = match query.to_ascii_uppercase().as_str() {
+                    "NVDA" => "NVDA US Equity",
+                    "TSLA" => "TSLA US Equity",
+                    "AAPL" => "AAPL US Equity",
+                    "IBM" => "IBM US Equity",
+                    "SHOP.TO" => "SHOP.TO US Equity",
+                    "ABC.V" => "ABC.V US Equity",
+                    "SPY" | "SPY US EQUITY" => "SPY US Equity",
+                    "ETH-USD" | "ETH" => "ETHUSD Curncy",
+                    "BTC" | "BTC-USD" => "BTCUSD Curncy",
+                    "BINANCE:BTCUSDT" => "BINANCE:BTCUSDT Curncy",
+                    "EURUSD" => "EURUSD Curncy",
+                    "SPX" => "SPX Index",
+                    "CL1" => "CL1 Comdty",
+                    "US10Y" => "US10Y Govt",
+                    "NVD" | "NVDA WRONG" => "NVDA US Equity",
+                    "?BTC" => "BTCUSD Curncy",
+                    "FAIL" | "FAIL US EQUITY" => return Err("Search unavailable".into()),
+                    _ => return Ok(vec![]),
+                };
+                let mut hits = vec![SearchHit {
+                    key: key.into(),
+                    name: key.into(),
+                    class: tr_data::security(key).class,
+                    exchange: None,
+                }];
+                if query.eq_ignore_ascii_case("aapl") {
+                    hits.insert(
+                        0,
+                        SearchHit {
+                            key: "AAPL Index".into(),
+                            name: "Different class".into(),
+                            class: tr_core::AssetClass::Index,
+                            exchange: None,
+                        },
+                    );
+                    hits.insert(
+                        0,
+                        SearchHit {
+                            key: "AAP US Equity".into(),
+                            name: "Different ticker".into(),
+                            class: tr_core::AssetClass::Equity,
+                            exchange: None,
+                        },
+                    );
+                }
+                Ok(hits)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn find_symbol_results_round_trip_through_every_symbol_workflow() {
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(100);
+        let mut ctx = CallContext::new(&host, &Host, &mut budget);
+        for query in ["NVDA", "TSLA", "SPY", "ETH-USD", "BTC", "BINANCE:BTCUSDT", "EURUSD", "SPX", "CL1", "US10Y"] {
+            let found = value(registry.call("find_symbol", &json!({"query":query}).to_string(), &mut ctx).await);
+            let symbol = found["results"][0]["symbol"].as_str().unwrap();
+            for (name, args) in [
+                ("create_alert", json!({"symbol":symbol,"kind":"price","direction":"above","level":100})),
+                ("add_watchlist_symbols", json!({"watchlist":"Agent Test","symbols":[symbol]})),
+                ("remove_watchlist_symbols", json!({"watchlist":"Agent Test","symbols":[symbol]})),
+                ("list_alerts", json!({"symbol":symbol})),
+            ] {
+                host.queries.lock().unwrap().clear();
+                let result = registry.call(name, &args.to_string(), &mut ctx).await;
+                assert!(result.success, "{query} -> {symbol} -> {name}: {result:?}");
+                assert!(host.queries.lock().unwrap().len() <= 2);
+                let forwarded = value(result);
+                let actual = if name.contains("watchlist") {
+                    &forwarded["args"]["symbols"][0]
+                } else {
+                    &forwarded["args"]["symbol"]
+                };
+                let expected = tr_data::security(symbol);
+                let expected =
+                    expected.crypto_instrument().map(|i| i.security().key()).unwrap_or_else(|_| expected.key());
+                assert_eq!(actual, &json!(expected));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_resolves_canonical_bare_pairs_and_qualified_symbols_with_bounded_search() {
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(100);
+        let mut ctx = CallContext::new(&host, &Host, &mut budget);
+        for (input, expected, queries) in [
+            ("NVDA US Equity", "NVDA US Equity", vec!["NVDA US Equity", "NVDA"]),
+            ("TSLA US Equity", "TSLA US Equity", vec!["TSLA US Equity", "TSLA"]),
+            ("NVDA", "NVDA US Equity", vec!["NVDA"]),
+            ("SPY US Equity", "SPY US Equity", vec!["SPY US Equity"]),
+            ("aapl US Equity", "AAPL US Equity", vec!["aapl US Equity", "AAPL"]),
+            ("ETH-USD", "COINBASE:ETH-USD Curncy", vec!["ETH-USD"]),
+            ("BTC/USD Coinbase", "COINBASE:BTC-USD Curncy", vec!["COINBASE:BTC-USD", "BTC"]),
+            ("COINBASE:BTC-USD", "COINBASE:BTC-USD Curncy", vec!["COINBASE:BTC-USD", "BTC"]),
+            ("BTCUSD Curncy", "COINBASE:BTC-USD Curncy", vec!["BTCUSD Curncy", "BTC"]),
+            ("BINANCE:BTCUSDT", "BINANCE:BTCUSDT Curncy", vec!["BINANCE:BTCUSDT"]),
+            ("NASDAQ:NVDA", "NVDA US Equity", vec!["NVDA US Equity", "NVDA"]),
+            ("NYSE:IBM", "IBM US Equity", vec!["IBM US Equity", "IBM"]),
+            ("TSX:SHOP", "SHOP.TO US Equity", vec!["SHOP.TO US Equity", "SHOP.TO"]),
+            ("TSXV:ABC", "ABC.V US Equity", vec!["ABC.V US Equity", "ABC.V"]),
+        ] {
+            host.queries.lock().unwrap().clear();
+            let result = registry
+                .call(
+                    "add_watchlist_symbols",
+                    &json!({"watchlist":"Agent Test","symbols":[input]}).to_string(),
+                    &mut ctx,
+                )
+                .await;
+            assert!(result.success, "{input}: {result:?}");
+            assert_eq!(value(result)["args"]["symbols"][0], expected);
+            assert_eq!(*host.queries.lock().unwrap(), queries);
+        }
+        for input in ["NVD", "NVDA WRONG", "NVDA US Index", "?UNKNOWN"] {
+            host.queries.lock().unwrap().clear();
+            let result = registry
+                .call(
+                    "add_watchlist_symbols",
+                    &json!({"watchlist":"Agent Test","symbols":[input]}).to_string(),
+                    &mut ctx,
+                )
+                .await;
+            assert!(!result.success);
+            let error = value(result);
+            assert_eq!(error["error"]["code"], "unknown_symbols");
+            assert_eq!(error["symbols"][0]["error"], "unknown_symbol");
+            assert_eq!(error["symbols"][0]["symbol"], input);
+            if input == "?UNKNOWN" {
+                assert!(error["symbols"][0].get("hint").is_none());
+            } else {
+                assert_eq!(error["symbols"][0]["hint"], "did you mean \"NVDA US Equity\"");
+            }
+            assert!(error["error"]["message"].as_str().unwrap().starts_with("Unknown symbols:"));
+            assert!(host.queries.lock().unwrap().len() <= 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_unknown_symbols_never_reach_the_proposal_host_and_hints_use_find_symbol_values() {
+        struct NoProposals;
+        impl LiveHost for NoProposals {
+            fn call_live<'a>(
+                &'a self,
+                _: &'a str,
+                _: LiveArgs,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+                panic!("invalid batches must not reach the proposal host")
+            }
+        }
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(10);
+        let mut ctx = CallContext::new(&host, &NoProposals, &mut budget);
+        ctx.confirmed = true; // Adapter consent must not bypass symbol validation either.
+        let result = registry.call("add_watchlist_symbols", &json!({"watchlist":"Agent Test","symbols":["NVDA US Equity","NVD","?BTC","FAIL US Equity","?UNKNOWN"]}).to_string(), &mut ctx).await;
+        assert!(!result.success);
+        let error = value(result);
+        assert_eq!(error["symbols"].as_array().unwrap().len(), 4);
+        assert_eq!(error["symbols"][1]["hint"], "did you mean \"COINBASE:BTC-USD\"");
+        assert_eq!(error["symbols"][2]["error"], "search_unavailable");
+        assert_eq!(error["symbols"][2]["message"], "Symbol search failed; try again");
+        assert_eq!(host.queries.lock().unwrap().iter().filter(|q| *q == "FAIL" || *q == "FAIL US Equity").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn find_symbol_and_workflows_handle_equity_qualifiers_without_crypto_errors() {
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(20);
+        let mut ctx = CallContext::new(&host, &Host, &mut budget);
+        for (input, expected) in [
+            ("NASDAQ:NVDA", "NVDA US Equity"),
+            ("NYSE:IBM", "IBM US Equity"),
+            ("BINANCE:BTCUSDT", "BINANCE:BTCUSDT"),
+            ("TSX:SHOP", "SHOP.TO US Equity"),
+            ("TSXV:ABC", "ABC.V US Equity"),
+        ] {
+            let result = registry.call("find_symbol", &json!({"query":input}).to_string(), &mut ctx).await;
+            assert!(result.success);
+            assert_eq!(value(result)["results"][0]["symbol"], expected);
+        }
+        for input in ["LSE:VOD", "UNKNOWN:NVDA"] {
+            host.queries.lock().unwrap().clear();
+            let found = registry.call("find_symbol", &json!({"query":input}).to_string(), &mut ctx).await;
+            assert!(!found.success);
+            assert!(
+                value(found)["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Use the symbol returned by find_symbol, e.g.")
+            );
+            let result = registry.call("list_alerts", &json!({"symbol":input}).to_string(), &mut ctx).await;
+            assert!(!result.success);
+            let error = value(result);
+            let message = error["symbols"][0]["message"].as_str().unwrap();
+            assert!(message.starts_with("Use the symbol returned by find_symbol, e.g."));
+            assert!(!message.contains("crypto"));
+            assert!(host.queries.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn review_remove_watchlist_symbols_does_not_require_search_success() {
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(10);
+        let mut ctx = CallContext::new(&host, &Host, &mut budget);
+        for input in ["ZZZZ US Equity", "FAIL US Equity", "BTCUSD Curncy"] {
+            let result = registry
+                .call(
+                    "remove_watchlist_symbols",
+                    &json!({"watchlist":"Agent Test","symbols":[input]}).to_string(),
+                    &mut ctx,
+                )
+                .await;
+            assert!(result.success, "an existing list entry must be removable without a search hit: {result:?}");
+            let expected = if input == "BTCUSD Curncy" { "COINBASE:BTC-USD Curncy" } else { input };
+            assert_eq!(value(result)["args"]["symbols"][0], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn review_bare_ticker_ambiguous_same_ticker_hits_fail_instead_of_guessing() {
+        struct Ambiguous(Vec<&'static str>);
+        impl DataHost for Ambiguous {
+            fn history<'a>(&'a self, s: &'a str, tf: Timeframe, end: Option<i64>, n: usize) -> HostFuture<'a, History> {
+                Host.history(s, tf, end, n)
+            }
+            fn quotes<'a>(&'a self, s: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
+                Host.quotes(s)
+            }
+            fn search<'a>(&'a self, _: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+                Box::pin(async move {
+                    Ok(self
+                        .0
+                        .iter()
+                        .copied()
+                        .map(|key| SearchHit {
+                            key: key.into(),
+                            name: key.into(),
+                            class: tr_data::security(key).class,
+                            exchange: None,
+                        })
+                        .collect())
+                })
+            }
+        }
+        let registry = Registry::new(ToolSet::Workflows);
+        let mut budget = CallBudget::new(20);
+        for (input, keys, hints) in [
+            ("XYZ", vec!["XYZ Index", "XYZ Comdty"], vec!["XYZ Index", "XYZ Comdty"]),
+            ("BTC", vec!["BTC US Equity", "BTCUSD Curncy"], vec!["BTC US Equity", "COINBASE:BTC-USD"]),
+            ("BTC", vec!["BTCUSD Curncy", "BTC US Equity"], vec!["COINBASE:BTC-USD", "BTC US Equity"]),
+            (
+                "XYZ",
+                vec![
+                    "XYZ US Equity",
+                    "XYZ Index",
+                    "XYZ Comdty",
+                    "XYZ Govt",
+                    "BINANCE:XYZUSDT Curncy",
+                    "COINBASE:XYZ-USD Curncy",
+                ],
+                vec!["XYZ US Equity", "XYZ Index", "XYZ Comdty", "XYZ Govt", "BINANCE:XYZUSDT"],
+            ),
+        ] {
+            let host = Ambiguous(keys);
+            let mut ctx = CallContext::new(&host, &Host, &mut budget);
+            let result = registry
+                .call(
+                    "add_watchlist_symbols",
+                    &json!({"watchlist":"Agent Test","symbols":[input]}).to_string(),
+                    &mut ctx,
+                )
+                .await;
+            assert!(!result.success, "ambiguous bare ticker must fail with a hint, got {result:?}");
+            let error = value(result);
+            assert_eq!(error["symbols"][0]["error"], "ambiguous_symbol");
+            assert_eq!(error["symbols"][0]["hints"], json!(hints));
+        }
+        // Duplicate rows and equivalent crypto aliases are one distinct key.
+        for (input, keys, expected) in [
+            ("XYZ", vec!["XYZ Index", "XYZ Index"], "XYZ Index"),
+            ("BTC", vec!["BTCUSD Curncy", "COINBASE:BTC-USD Curncy"], "COINBASE:BTC-USD Curncy"),
+        ] {
+            let host = Ambiguous(keys);
+            let mut ctx = CallContext::new(&host, &Host, &mut budget);
+            let result = registry
+                .call(
+                    "add_watchlist_symbols",
+                    &json!({"watchlist":"Agent Test","symbols":[input]}).to_string(),
+                    &mut ctx,
+                )
+                .await;
+            assert!(result.success, "{result:?}");
+            assert_eq!(value(result)["args"]["symbols"][0], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn find_symbol_colons_in_free_text_are_not_exchange_qualifiers() {
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(20);
+        let mut ctx = CallContext::new(&host, &Host, &mut budget);
+        for query in [
+            "nyse:IBM",
+            "sector: technology",
+            "TOP PICKS:NVDA",
+            "NYSE:IBM company",
+            "notes:NVDA",
+            "notes: Coinbase",
+            "notes: Binance",
+        ] {
+            host.queries.lock().unwrap().clear();
+            let result = registry.call("find_symbol", &json!({"query":query}).to_string(), &mut ctx).await;
+            assert!(result.success, "{query}: {result:?}");
+            assert_eq!(*host.queries.lock().unwrap(), [query]);
+        }
+        let result = registry.call("find_symbol", r#"{"query":"FAIL"}"#, &mut ctx).await;
+        assert!(!result.success);
+        let error = value(result);
+        assert_eq!(error["error"]["code"], "search_unavailable");
+        assert_eq!(error["error"]["message"], "Symbol search failed; try again");
+    }
+
+    #[tokio::test]
+    async fn workflow_symbol_errors_are_scrubbed_echo_bounded_and_result_capped() {
+        struct UntrustedSearch;
+        impl DataHost for UntrustedSearch {
+            fn history<'a>(&'a self, s: &'a str, tf: Timeframe, end: Option<i64>, n: usize) -> HostFuture<'a, History> {
+                Host.history(s, tf, end, n)
+            }
+            fn quotes<'a>(&'a self, s: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
+                Host.quotes(s)
+            }
+            fn search<'a>(&'a self, _: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+                Box::pin(async {
+                    Ok(vec![SearchHit {
+                        key: format!("{} Bearer secret-token trader@example.com /Users/alice/key", "🦀".repeat(300)),
+                        name: String::new(),
+                        class: tr_core::AssetClass::Equity,
+                        exchange: None,
+                    }])
+                })
+            }
+        }
+        let registry = Registry::new(ToolSet::Workflows);
+        let mut budget = CallBudget::new(10);
+        let mut ctx = CallContext::new(&UntrustedSearch, &Host, &mut budget);
+        let input = "?🦀".repeat(80);
+        let result = registry
+            .call("add_watchlist_symbols", &json!({"watchlist":"List","symbols":[input]}).to_string(), &mut ctx)
+            .await;
+        assert!(!result.success);
+        let error = value(result);
+        assert_eq!(error["symbols"][0]["symbol"].as_str().unwrap().chars().count(), 64);
+        let text = error.to_string();
+        for secret in ["secret-token", "trader@example.com", "/Users/alice"] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        assert!(text.contains("[REDACTED]"));
+        let result = registry
+            .call("add_watchlist_symbols", &json!({"watchlist":"List","symbols":vec![input;20]}).to_string(), &mut ctx)
+            .await;
+        assert!(!result.success);
+        let Content::Text(text) = &result.content[0] else { panic!("JSON output") };
+        assert!(text.len() <= crate::MAX_TEXT_BYTES);
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap()["truncated"], true);
     }
 
     #[tokio::test]

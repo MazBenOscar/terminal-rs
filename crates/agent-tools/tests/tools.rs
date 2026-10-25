@@ -708,10 +708,14 @@ mod adversarial {
                 assert_eq!(schema_accepts(&schema(name), &input), valid);
                 assert!(typed_accepts(name, input.clone()));
                 let result = review_call(&ReviewHost::default(), name, input).await;
-                assert!(!result.success, "{result:?}");
-                // A syntactically valid string is no longer sufficient: symbols
-                // must resolve through search, which returns no hits in this fixture.
-                assert_eq!(value(result)["error"]["code"], if valid { "unknown_symbols" } else { "invalid_args" });
+                if valid && name == "remove_watchlist_symbols" {
+                    // The app host checks membership; discovery cannot gate removal.
+                    assert!(result.success, "{result:?}");
+                } else {
+                    assert!(!result.success, "{result:?}");
+                    // Adds still require a successful discovery result.
+                    assert_eq!(value(result)["error"]["code"], if valid { "unknown_symbols" } else { "invalid_args" });
+                }
             }
         }
     }

@@ -77,6 +77,32 @@ impl ToolResult {
     }
 }
 
+/// Shared redaction for tool diagnostics and agent transcripts.
+pub fn scrub_text(text: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            r"(?i)[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}",
+            r#"(?i)https?://[^\s"<>]+\?[^\s"<>]+"#,
+            r"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+            r"(?i)\b(?:sk-|acct[-_]|account[-_]|user[-_]|org[-_]|rate[-_]limit[-_])[A-Za-z0-9_-]+",
+            r"(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/-]+=*",
+            r#"(?i)["']?(?:authorization|set-cookie|cookie|session(?:id)?|password|secret|api[_-]?key)["']?\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n,;}]+)"#,
+            r"\b[A-Za-z0-9_-]{32,}\b",
+        ]
+        .iter()
+        .map(|pattern| Regex::new(pattern).unwrap())
+        .collect()
+    });
+    static HOME: OnceLock<Regex> = OnceLock::new();
+    // Home-directory paths name the local user; keep the rest of the path for debugging.
+    let home = HOME.get_or_init(|| Regex::new(r#"/(Users|home)/[^/\s"']+"#).unwrap());
+    let text = home.replace_all(text, "/$1/[USER]");
+    patterns.iter().fold(text.into_owned(), |text, pattern| pattern.replace_all(&text, "[REDACTED]").into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

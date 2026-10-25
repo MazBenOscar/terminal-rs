@@ -2192,6 +2192,39 @@ fn tool_group_summary_outcome(traces: &[&Trace], reverted: Option<usize>, final_
             _ => format!("{}…", tool_label(&trace.name)),
         };
     }
+    let workflow_calls: Vec<_> = traces
+        .iter()
+        .filter(|trace| {
+            matches!(
+                trace.name.as_str(),
+                "create_watchlist"
+                    | "add_watchlist_symbols"
+                    | "remove_watchlist_symbols"
+                    | "delete_watchlist"
+                    | "create_alert"
+                    | "update_alert"
+                    | "delete_alert"
+            )
+        })
+        .collect();
+    if !traces.iter().any(|trace| trace.interrupted)
+        && !traces.iter().any(|trace| is_edit_tool(&trace.name) && trace.success == Some(true))
+        && !workflow_calls.is_empty()
+        && workflow_calls.iter().all(|trace| trace.success == Some(false))
+    {
+        let trace = workflow_calls.last().unwrap();
+        let action = match trace.name.as_str() {
+            "add_watchlist_symbols" => "add symbols to",
+            "remove_watchlist_symbols" => "remove symbols from",
+            "create_watchlist" => "create watchlist",
+            "delete_watchlist" => "delete watchlist",
+            "create_alert" => "create alert for",
+            "update_alert" => "update alert",
+            _ => "delete alert",
+        };
+        let target = trace.summary.as_deref().map(main_tool_label).unwrap_or_default();
+        return format!("Couldn't {action}{}", if target.is_empty() { String::new() } else { format!(" {target}") });
+    }
     if traces.iter().any(|trace| trace.interrupted) {
         "Stopped before finishing".into()
     } else if traces.iter().any(|trace| trace.success == Some(false))
@@ -2201,22 +2234,7 @@ fn tool_group_summary_outcome(traces: &[&Trace], reverted: Option<usize>, final_
     } else {
         let edits: Vec<_> =
             traces.iter().filter(|trace| is_edit_tool(&trace.name) && trace.success == Some(true)).collect();
-        let workflow_changes = traces
-            .iter()
-            .filter(|trace| {
-                trace.success == Some(true)
-                    && matches!(
-                        trace.name.as_str(),
-                        "create_watchlist"
-                            | "add_watchlist_symbols"
-                            | "remove_watchlist_symbols"
-                            | "delete_watchlist"
-                            | "create_alert"
-                            | "update_alert"
-                            | "delete_alert"
-                    )
-            })
-            .count();
+        let workflow_changes = workflow_calls.iter().filter(|trace| trace.success == Some(true)).count();
         if workflow_changes > 0 {
             format!("Awaiting approval · {workflow_changes} change{}", if workflow_changes == 1 { "" } else { "s" })
         } else if edits.is_empty() {
@@ -2386,9 +2404,22 @@ pub(crate) fn tool_error(item: &Value) -> Option<String> {
     for content in item["contentItems"].as_array().into_iter().flatten() {
         if let Some(text) = content["text"].as_str() {
             let value = serde_json::from_str::<Value>(text).ok();
-            let message = value.as_ref().and_then(|v| v["error"]["message"].as_str());
+            let message = value.as_ref().and_then(|v| {
+                v["error"]["message"].as_str().map(str::to_owned).or_else(|| {
+                    (v["error"]["code"] == "unknown_symbols").then(|| {
+                        let symbols = v["symbols"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|s| s["symbol"].as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("Unknown symbols: {symbols}")
+                    })
+                })
+            });
             if let Some(message) = message {
-                messages.push(short_label(message));
+                messages.push(short_label(&message));
             } else if value.is_none() {
                 messages.push(short_label(text));
             }
@@ -2617,6 +2648,60 @@ mod polish_tests {
         pane.wire("item/completed", &serde_json::json!({"item":{"id":"workflow","type":"dynamicToolCall","tool":name,"arguments":args,"success":success}}));
         let RenderedBlock::Tool(trace) = pane.blocks.remove(0) else { panic!("trace") };
         trace
+    }
+
+    #[test]
+    fn failed_workflow_shows_plain_muted_error_below_row_and_workflow_turn_header() {
+        use serde_json::json;
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("edits").unwrap(), 1);
+        for query in ["NVDA", "TSLA", "ETH-USD"] {
+            pane.wire("item/completed", &json!({"item":{"type":"dynamicToolCall","id":query,"tool":"find_symbol","arguments":{"query":query},"success":true}}));
+        }
+        // Exercise both the new message and the legacy message-less workflow payload.
+        let message = "Unknown symbols: NVDA US Equity";
+        for with_message in [false, true] {
+            let mut error = json!({"error":{"code":"unknown_symbols"},"symbols":[{"symbol":"NVDA US Equity","error":"unknown_symbol"}]});
+            if with_message {
+                error["error"]["message"] = json!(message);
+            }
+            let item = json!({
+                "type":"dynamicToolCall","id":"add","tool":"add_watchlist_symbols","success":false,
+                "arguments":{"watchlist":"Agent Test","symbols":["NVDA US Equity"]},
+                "contentItems":[{"type":"inputText","text":error.to_string()}]
+            });
+            assert_eq!(tool_error(&item).as_deref(), Some(message));
+            if with_message {
+                pane.wire("item/completed", &json!({"item":item}));
+            }
+        }
+        pane.wire("item/completed", &json!({"item":{"type":"dynamicToolCall","id":"qualified","tool":"find_symbol","arguments":{"query":"NASDAQ:NVDA"},"success":false}}));
+        crate::agent_demo::complete(&mut pane, "completed");
+        pane.turns[0].duration = Some(Duration::from_secs(12));
+        let traces: Vec<_> = pane
+            .blocks
+            .iter()
+            .filter_map(|block| if let RenderedBlock::Tool(t) = block { Some(t) } else { None })
+            .collect();
+        assert_eq!(traces.len(), 5);
+        assert_eq!(traces[3].error.as_deref(), Some(message));
+        assert_eq!(tool_group_label(&traces, None), "Couldn't add symbols to Agent Test · 5 steps · 2 failed");
+        let mut literal = traces[3].clone();
+        literal.error = Some("Unknown symbols: **NVDA** [link](https://example.invalid)".into());
+        let ctx = egui::Context::default();
+        let plain = render(&ctx, dp(1000.0), vec![], |ui| tool_row(ui, &literal));
+        assert!(
+            texts(&plain).iter().any(|(s, _)| Some(s) == literal.error.as_ref()),
+            "errors are plain text, not markdown"
+        );
+        let output = render(&ctx, dp(1000.0), vec![], |ui| pane.conversation(ui, &mut Vec::new()));
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s == "Couldn't add symbols to Agent Test · 5 steps · 2 failed · 12s"));
+        let row = text.iter().find(|(s, _)| s == "Propose adding symbols · Agent Test").unwrap();
+        let error = text.iter().find(|(s, _)| s == message).unwrap();
+        assert!(error.1.top() >= row.1.bottom(), "error belongs below the workflow row");
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t)
+            if t.galley.text() == message && t.galley.job.sections.iter().all(|s| s.format.color == readable(theme::muted())))));
+        assert!(pane.workflows.proposals.is_empty());
     }
 
     #[test]

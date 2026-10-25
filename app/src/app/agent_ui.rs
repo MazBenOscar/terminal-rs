@@ -149,7 +149,7 @@ impl TerminalApp {
     pub(crate) fn agent_workflow(
         &mut self,
         turn: &str,
-        args: tr_agent_tools::args::LiveArgs,
+        mut args: tr_agent_tools::args::LiveArgs,
     ) -> tr_agent_tools::ToolResult {
         use crate::agent_bridge::{Proposal, ProposalStatus};
         use serde_json::json;
@@ -157,6 +157,34 @@ impl TerminalApp {
             ToolResult,
             args::{AlertKind, LiveArgs::*},
         };
+        // Resolve removals against the actual list before constructing a proposal.
+        // Search is only a best-effort normalization step, never a membership gate.
+        let mut symbol_errors = Vec::new();
+        if let RemoveWatchlistSymbols(a) = &mut args {
+            let Some(index) = self.workflow_list_index(&a.watchlist) else {
+                return ToolResult::error("not_found", "Watchlist no longer exists", None);
+            };
+            a.symbols.retain_mut(|symbol| {
+                if let Some(stored) =
+                    self.watchlists[index].symbols.iter().find(|stored| crate::symbol_search::same_key(stored, symbol))
+                {
+                    *symbol = stored.clone();
+                    true
+                } else {
+                    symbol_errors
+                        .push(json!({"symbol":tr_agent_tools::scrub_text(symbol).chars().take(64).collect::<String>(),
+                        "error":"not_in_list","message":"not in list"}));
+                    false
+                }
+            });
+            if a.symbols.is_empty() {
+                let mut result = ToolResult::json(
+                    json!({"error":{"code":"unknown_symbols","message":"Symbols not in list"},"symbols":symbol_errors}),
+                );
+                result.success = false;
+                return result.capped();
+            }
+        }
         let before = self.workflow_snapshot(&args);
         let label = |s: &str| crate::security_names::label(s);
         let matched_name = before["name"].as_str().unwrap_or_default();
@@ -164,7 +192,7 @@ impl TerminalApp {
             ListWatchlists(_) => return workflow_rows("watchlists", self.watchlists.iter().take(50).map(|list|
                 json!({"name":list.name,"symbol_count":list.symbols.len(),"symbols":list.symbols.iter().take(50).collect::<Vec<_>>(),"symbols_truncated":list.symbols.len()>50,"agent_turn":list.agent_turn,"agent_entries":list.agent_entries.iter().take(50).collect::<std::collections::BTreeMap<_,_>>()})).collect(), self.watchlists.len()),
             ListAlerts(a) => {
-                let alerts: Vec<_> = self.price_alerts.book.alerts.iter().filter(|alert| a.symbol.as_ref().is_none_or(|symbol| symbol == &alert.symbol)).collect();
+                let alerts: Vec<_> = self.price_alerts.book.alerts.iter().filter(|alert| a.symbol.as_ref().is_none_or(|symbol| crate::symbol_search::same_key(symbol, &alert.symbol))).collect();
                 return workflow_rows("alerts", alerts.iter().take(50).map(|a| json!(a)).collect(), alerts.len());
             },
             CreateWatchlist(a) => {
@@ -231,7 +259,11 @@ impl TerminalApp {
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(600),
             status: ProposalStatus::Pending,
         });
-        ToolResult::json(json!({"status":"awaiting_user_confirmation","proposal_id":id,"summary":summary}))
+        let mut value = json!({"status":"awaiting_user_confirmation","proposal_id":id,"summary":summary});
+        if !symbol_errors.is_empty() {
+            value["symbols"] = json!(symbol_errors);
+        }
+        ToolResult::json(value).capped()
     }
 
     fn apply_workflow(
@@ -369,7 +401,9 @@ impl TerminalApp {
                 if list.workflow_id.is_none() {
                     list.workflow_id = Some(format!("{turn}:{}", proposal.id));
                 }
-                for symbol in next.iter().filter(|s| !before.symbols.contains(s)) {
+                for symbol in
+                    next.iter().filter(|s| !before.symbols.iter().any(|old| crate::symbol_search::same_key(s, old)))
+                {
                     list.agent_entries.insert(symbol.clone(), turn.clone());
                 }
                 Ok(WorkflowUndo::Watchlist { before: Some(before), after: Some(list.clone()) })
@@ -1150,24 +1184,29 @@ mod tests {
         );
         assert_eq!(app.undo_agent_turn("noop:1").unwrap().reverted, 1);
         assert_eq!(app.watchlists[1].symbols, ["AAPL US Equity"]);
-        workflow(
+        let result = workflow(
             &mut app,
             "noop:2",
             "remove_watchlist_symbols",
             json!({"watchlist":"Agent Test","symbols":["AAPL US Equity","MSFT US Equity"]}),
         );
+        assert!(result.success);
+        let tr_agent_tools::Content::Text(text) = &result.content[0] else { panic!("JSON output") };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["symbols"][0]["symbol"], "MSFT US Equity");
+        assert_eq!(value["symbols"][0]["error"], "not_in_list");
         app.confirm_workflows("noop:2", true);
-        assert_eq!(app.agent_pane.workflows.proposals[1].symbols[1].outcome.as_deref(), Some("Not in list"));
+        assert!(app.agent_pane.workflows.proposals[1].symbols.is_empty());
         let tr_agent::codex::WorkflowResult::Confirmation { summary, .. } =
             app.agent_pane.workflows.context.last().unwrap()
         else {
             panic!("confirmation")
         };
         assert!(summary.contains("approved symbols: [AAPL US Equity]"), "{summary}");
-        assert!(summary.contains("approved, no change (not in list) symbols: [MSFT US Equity]"), "{summary}");
+        assert!(!summary.contains("MSFT US Equity"), "missing entries are rejected before proposal: {summary}");
         assert_eq!(
             app.agent_pane.workflows.turn_summary("noop:2").as_deref(),
-            Some("Removed 1 of 2 symbols from Agent Test · 1 not in list")
+            Some("Removed 1 symbol from Agent Test")
         );
         workflow(
             &mut app,
@@ -1367,22 +1406,30 @@ mod tests {
         use serde_json::json;
         let mut app = workflow_app("single-symbol-noop-model-report");
         app.create_watchlist("Research".into(), vec!["AAPL US Equity".into()]).unwrap();
-        for (tool, reason) in
-            [("add_watchlist_symbols", "already in list"), ("remove_watchlist_symbols", "not in list")]
-        {
-            let symbol = if tool == "add_watchlist_symbols" { "AAPL US Equity" } else { "MSFT US Equity" };
-            workflow(&mut app, tool, tool, json!({"watchlist":"Research","symbols":[symbol]}));
-            app.confirm_workflows(tool, true);
-            let tr_agent::codex::WorkflowResult::Confirmation { status, summary, .. } =
-                app.agent_pane.workflows.context.last().unwrap()
-            else {
-                panic!("confirmation")
-            };
-            assert!(matches!(status, tr_agent::codex::WorkflowStatus::Approved));
-            assert!(summary.contains(&format!("approved, no change ({reason}) symbols: [{symbol}]")), "{summary}");
-            assert!(summary.contains("approved symbols: []"), "{summary}");
-            assert!(app.agent_pane.workflows.decision_line(tool).unwrap().starts_with("You approved this · "));
-        }
+        workflow(
+            &mut app,
+            "add",
+            "add_watchlist_symbols",
+            json!({"watchlist":"Research","symbols":["AAPL US Equity"]}),
+        );
+        app.confirm_workflows("add", true);
+        let tr_agent::codex::WorkflowResult::Confirmation { status, summary, .. } =
+            app.agent_pane.workflows.context.last().unwrap()
+        else {
+            panic!("confirmation")
+        };
+        assert!(matches!(status, tr_agent::codex::WorkflowStatus::Approved));
+        assert!(summary.contains("approved, no change (already in list) symbols: [AAPL US Equity]"), "{summary}");
+        assert!(summary.contains("approved symbols: []"), "{summary}");
+        assert!(app.agent_pane.workflows.decision_line("add").unwrap().starts_with("You approved this · "));
+        let result = workflow(
+            &mut app,
+            "remove",
+            "remove_watchlist_symbols",
+            json!({"watchlist":"Research","symbols":["MSFT US Equity"]}),
+        );
+        assert!(!result.success, "missing removals fail before a proposal exists");
+        assert_eq!(app.agent_pane.workflows.proposals.len(), 1);
         assert_eq!(app.watchlists[1].symbols, ["AAPL US Equity"]);
     }
 
@@ -1932,6 +1979,66 @@ mod tests {
         app.confirm_workflows("stale:2", true);
         assert_eq!(app.watchlists[0].symbols, ["NVDA US Equity"]);
         assert!(app.agent_pane.workflows.proposals.iter().all(|p| matches!(p.status, ProposalStatus::Failed(_))));
+    }
+
+    #[test]
+    fn review_list_alerts_symbol_filter_matches_equivalent_crypto_keys() {
+        use serde_json::json;
+        use tr_agent_tools::{Content, args::*};
+        let mut app = workflow_app("workflow-review-crypto-alert-filter");
+        let aliases = ["BTCUSD Curncy", "BTC-USD", "COINBASE:BTC-USD Curncy"];
+        for stored in aliases.into_iter().chain(["BINANCE:BTCUSDT Curncy", "BTC US Equity"]) {
+            let id = app
+                .price_alerts
+                .book
+                .add("BTCUSD Curncy".into(), 100_000., tr_core::price_alerts::Direction::Above, true)
+                .unwrap();
+            // Include legacy persisted spellings, even those new-alert validation normalizes.
+            app.price_alerts.book.alerts.iter_mut().find(|a| a.id == id).unwrap().symbol = stored.into();
+        }
+        for symbol in aliases {
+            let result = app.agent_workflow("read:1", LiveArgs::ListAlerts(ListAlerts { symbol: Some(symbol.into()) }));
+            let Content::Text(text) = &result.content[0] else { panic!("JSON output") };
+            let value: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(value["total"], json!(3), "{symbol}: {value}");
+        }
+        assert!(app.agent_pane.workflows.proposals.is_empty());
+    }
+
+    #[test]
+    fn removal_membership_is_validated_before_proposal_and_only_matches_are_proposed() {
+        use serde_json::json;
+        use tr_agent_tools::{Content, args::LiveArgs};
+        let mut app = workflow_app("workflow-remove-membership");
+        app.watchlists[0].symbols = vec!["BTCUSD Curncy".into(), "ZZZZ US Equity".into(), "FAIL US Equity".into()];
+        let before = app.watchlists[0].symbols.clone();
+        let name = app.watchlists[0].name.clone();
+        let args = |symbols: serde_json::Value| {
+            LiveArgs::RemoveWatchlistSymbols(
+                serde_json::from_value(json!({"watchlist":name,"symbols":symbols})).unwrap(),
+            )
+        };
+        let result = app.agent_workflow("remove:0", args(json!(["?MISSING"])));
+        assert!(!result.success);
+        let Content::Text(text) = &result.content[0] else { panic!("JSON output") };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["symbols"][0]["error"], "not_in_list");
+        assert!(app.agent_pane.workflows.proposals.is_empty());
+
+        let result =
+            app.agent_workflow("remove:1", args(json!(["BTC-USD", "ZZZZ US Equity", "FAIL US Equity", "?MISSING"])));
+        assert!(result.success);
+        let Content::Text(text) = &result.content[0] else { panic!("JSON output") };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["symbols"][0]["symbol"], "?MISSING");
+        assert_eq!(value["symbols"][0]["message"], "not in list");
+        let LiveArgs::RemoveWatchlistSymbols(a) = &app.agent_pane.workflows.proposals[0].args else {
+            panic!("removal")
+        };
+        assert_eq!(a.symbols, before);
+        assert_eq!(app.watchlists[0].symbols, before, "a proposal must not mutate the list");
+        app.confirm_workflows("remove:1", true);
+        assert!(app.watchlists[0].symbols.is_empty());
     }
 
     #[test]
