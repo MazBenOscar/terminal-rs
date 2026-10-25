@@ -19,7 +19,7 @@ pub use tr_agent::codex::ResponseStyle;
 
 pub const STREAM_INTERVAL: Duration = Duration::from_millis(33);
 pub const UNDO_UNAVAILABLE: &str = "undo for this agent turn is no longer available (layout changed/app restarted)";
-const CHART_EDITS_HELP: &str = "The agent can add, change and remove its own drawings, indicators and comparisons on the pinned chart. Your objects are never changed, and every agent edit can be undone.";
+const CHART_EDITS_HELP: &str = "The agent can add, change and remove its own drawings, indicators and comparisons on the pinned chart, and propose watchlist and alert changes for you to approve. Your objects are never changed without approval, and every agent edit can be undone.";
 pub(crate) const INSTALLATION_URL: &str = "https://developers.openai.com/codex";
 const CHECKING_STATUS: &str = "Checking Codex, your account and chart tools…";
 const RETRY_HELP: &str = "Sends the same prompt again and starts a new answer.";
@@ -31,7 +31,7 @@ const PRIVACY_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "What the agent can change",
-        "In Chart edits mode: only its own drawings, indicators and comparisons on the pinned chart. Your objects are never changed. Every agent edit can be undone.",
+        "In Chart edits mode: its own drawings, indicators and comparisons on the pinned chart, plus watchlist and alert proposals that require your approval. Your objects are never changed without approval. Every agent edit can be undone.",
     ),
     (
         "What is stored on this Mac",
@@ -70,7 +70,7 @@ impl Settings {
     }
 
     fn tool_set_if_available(&self, available: bool) -> ToolSet {
-        if available && self.tools == ToolsMode::Edit { ToolSet::Edit } else { ToolSet::ReadOnly }
+        if available && self.tools == ToolsMode::Edit { ToolSet::Workflows } else { ToolSet::ReadOnly }
     }
 
     pub fn select_defaults(&mut self, models: &[Model]) {
@@ -211,8 +211,11 @@ pub struct Trace {
     pub success: Option<bool>,
     pub duration_ms: Option<u64>,
     pub arguments: String,
+    // In-memory identity only; never rendered in the tool row or persisted to layouts.
+    target_args: Value,
     pub summary: Option<String>,
     pub interrupted: bool,
+    pub error: Option<String>,
 }
 
 /// Local conversation metadata, never part of Settings or a layout.
@@ -221,12 +224,15 @@ pub struct ConversationTurn {
     pub id: Option<String>,
     pub prompt_index: usize,
     pub finished: bool,
+    pub final_answer_succeeded: bool,
     pub made_edits: bool,
     pub chart_changes: Option<usize>,
     pub undo_available: bool,
     pub undo_summary: Option<String>,
     pub reverted_changes: Option<usize>,
     pub local_time: String,
+    pub(crate) started_at: Instant,
+    pub(crate) duration: Option<Duration>,
 }
 
 impl ConversationTurn {
@@ -293,8 +299,15 @@ pub(crate) fn reset_time_at(timestamp: Option<i64>, now: i64) -> String {
     let today = chrono::DateTime::from_timestamp(now, 0).map(|t| t.with_timezone(&chrono::Local).date_naive());
     let day = if Some(date) == today { String::new() } else { format!("{} ", date.format("%b %d")) };
     let minutes = ((time.timestamp() - now).max(0) + 59) / 60;
-    let relative =
-        if minutes == 0 { "now".into() } else { format!("in {minutes} minute{}", if minutes == 1 { "" } else { "s" }) };
+    let relative = if minutes == 0 {
+        "now".into()
+    } else if minutes < 90 {
+        format!("in {minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    } else if minutes < 48 * 60 {
+        format!("in {}h {}m", minutes / 60, minutes % 60)
+    } else {
+        format!("in {}d {}h", minutes / (24 * 60), minutes / 60 % 24)
+    };
     format!("{relative} · {day}{}", local_time(time.timestamp()))
 }
 
@@ -364,6 +377,7 @@ struct ReplyMessage {
 pub struct DataBasis {
     pub sample: bool,
     pub last_bar: Option<i64>,
+    pub latest_price_update: Option<i64>,
     pub incomplete: Option<String>,
 }
 impl DataBasis {
@@ -372,6 +386,7 @@ impl DataBasis {
         Self {
             sample,
             last_bar: bars.bars.last().map(|bar| bar.ts),
+            latest_price_update: chart.price_update_time(),
             incomplete: bars.last_in_progress.then(|| match chart.tf.to_string().as_str() {
                 "1W" => "Weekly".into(),
                 "1D" => "Daily".into(),
@@ -381,12 +396,26 @@ impl DataBasis {
     }
 
     fn freshness(&self) -> Option<String> {
-        self.last_bar.map(|ts| format!("as of {}", local_time(ts)))
+        self.latest_price_update
+            .map(|ts| format!("as of {}", local_time(ts)))
+            .or_else(|| self.last_bar.map(|ts| format!("bar opened {}", local_time(ts))))
     }
 }
 
 pub struct AgentPane {
     pub settings: Settings,
+    pub workflows: crate::agent_bridge::Workflows,
+    pub proposal_focus: HashMap<egui::Id, String>,
+    /// Only buttons have an Enter action; other card controls only own Escape.
+    pub proposal_buttons: HashMap<egui::Id, bool>,
+    /// Pending proposal ids drawn last frame, per turn; persists across frames.
+    proposal_seen: HashMap<String, Vec<u64>>,
+    /// Pending ids drawn in both the previous and the current frame. Approve and
+    /// Decline act only on these, so a proposal that arrives as the user clicks is
+    /// never decided without having been on screen.
+    pub proposal_shown: HashMap<String, Vec<u64>>,
+    symbol_seen: HashMap<String, Vec<(u64, usize, String)>>,
+    pub symbol_shown: HashMap<String, Vec<(u64, usize, String)>>,
     pub state: Onboarding,
     pub models: Vec<Model>,
     pub limits: Vec<Limit>,
@@ -421,6 +450,13 @@ impl Default for AgentPane {
     fn default() -> Self {
         Self {
             settings: Settings::default(),
+            workflows: Default::default(),
+            proposal_focus: Default::default(),
+            proposal_buttons: Default::default(),
+            proposal_seen: Default::default(),
+            proposal_shown: Default::default(),
+            symbol_seen: Default::default(),
+            symbol_shown: Default::default(),
             state: Onboarding::Dormant,
             models: Vec::new(),
             limits: Vec::new(),
@@ -466,6 +502,12 @@ pub enum Action {
     Send(Prompt),
     SetTools(ToolsMode),
     UndoTurn(String),
+    /// `ids` are the pending proposals the user saw; others in the turn stay pending.
+    Confirm {
+        turn: String,
+        approve: bool,
+        ids: Vec<u64>,
+    },
     Pin,
     Close,
 }
@@ -489,6 +531,9 @@ impl AgentPane {
             return false;
         }
         self.settings.tools = mode;
+        if mode == ToolsMode::ReadOnly {
+            self.workflows.reset();
+        }
         self.queue_paused = true;
         self.notice(&format!("{} on restart. Queue stays paused; nothing is resent.", mode.label()));
         true
@@ -531,6 +576,8 @@ impl AgentPane {
                 if summary.reverted == 1 { "" } else { "s" },
                 if summary.skipped.is_empty() {
                     String::new()
+                } else if summary.skipped.iter().any(|reason| reason.contains(' ')) {
+                    format!(" · {} kept: {}", summary.skipped.len(), summary.skipped.join("; "))
                 } else {
                     format!(" · {} kept because you edited them", summary.skipped.len())
                 }
@@ -549,7 +596,9 @@ impl AgentPane {
 
     fn finish_turn(&mut self) {
         if let Some(index) = self.active_turn.take() {
-            self.turns[index].finished = true;
+            let turn = &mut self.turns[index];
+            turn.duration = Some(turn.started_at.elapsed());
+            turn.finished = true;
         }
     }
 
@@ -576,6 +625,7 @@ impl AgentPane {
             self.queue_paused = true;
         }
         if matches!(state, Onboarding::Stopped { .. }) {
+            self.workflows.reset();
             self.flush(Instant::now());
             self.running = false;
             self.interrupt_tools();
@@ -633,12 +683,15 @@ impl AgentPane {
             id: None,
             prompt_index: self.blocks.len(),
             finished: false,
+            final_answer_succeeded: false,
             made_edits: false,
             chart_changes: None,
             undo_available: false,
             undo_summary: None,
             reverted_changes: None,
             local_time: local_time(chrono::Local::now().timestamp()),
+            started_at: Instant::now(),
+            duration: None,
         });
         self.retryable = false;
         self.blocks.push(RenderedBlock::Prompt(prompt.text.clone()));
@@ -678,6 +731,16 @@ impl AgentPane {
                 // Completion also supplies the canonical id if Started was absent.
                 if let Some(index) = self.active_turn {
                     self.turns[index].id.get_or_insert(turn);
+                    let start = self.turns[index].prompt_index;
+                    let last_failure = self.blocks[start..]
+                        .iter()
+                        .rposition(|block| matches!(block, RenderedBlock::Tool(t) if t.success == Some(false)))
+                        .map(|i| start + i);
+                    self.turns[index].final_answer_succeeded = status == "completed"
+                        && self
+                            .replies
+                            .values()
+                            .any(|reply| !reply.text.trim().is_empty() && last_failure.is_none_or(|i| reply.index > i));
                 }
                 self.finish_turn();
                 self.flush(Instant::now());
@@ -701,6 +764,9 @@ impl AgentPane {
                 self.transition(Onboarding::ToolsUnavailable { reason: scrub_text(&reason) });
             }
             BridgeEvent::Recovered(recovery) => {
+                if matches!(&recovery, Recovery::HistoryLost { .. }) {
+                    self.workflows.reset();
+                }
                 self.finish_turn();
                 self.flush(Instant::now());
                 self.running = false;
@@ -749,13 +815,14 @@ impl AgentPane {
             "item/completed" | "item/started" if params["item"]["type"] == "dynamicToolCall" => {
                 let item = &params["item"];
                 let name = item["tool"].as_str().unwrap_or("chart tool");
-                let summary =
+                let summary = workflow_tool_target(name, &item["arguments"], &self.workflows.proposals).or_else(|| {
                     item["editSummary"].as_str().map(short_label).or_else(|| edit_tool_summary(item)).or_else(|| {
                         let args = &item["arguments"];
                         Some(short_label(
                             args["symbol"].as_str().or_else(|| args["query"].as_str()).unwrap_or("Pinned chart"),
                         ))
-                    });
+                    })
+                });
                 let trace = Trace {
                     id: scrub_text(item["id"].as_str().unwrap_or_default()),
                     name: scrub_text(name),
@@ -766,8 +833,10 @@ impl AgentPane {
                     } else {
                         safe_arguments(&item["arguments"])
                     },
+                    target_args: normalized_args(&item["arguments"]),
                     summary,
                     interrupted: false,
+                    error: tool_error(item),
                 };
                 let start = self.active_turn.map_or(0, |index| self.turns[index].prompt_index + 1);
                 if let Some(RenderedBlock::Tool(old)) = self.blocks[start..]
@@ -804,6 +873,15 @@ impl AgentPane {
     }
 
     pub fn show(&mut self, ui: &mut Ui, pin_label: &str, pane_id: egui::Id) -> Vec<Action> {
+        if ui
+            .memory(|m| m.focused())
+            .is_some_and(|id| self.proposal_focus.contains_key(&id) && !self.proposal_buttons.contains_key(&id))
+        {
+            // egui checkboxes also accept Enter by default; cards reserve it for buttons.
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        }
+        self.proposal_focus.clear();
+        self.proposal_buttons.clear();
         egui::Frame::new().inner_margin(dp(12.0)).show(ui, |ui| self.show_content(ui, pin_label, pane_id)).inner
     }
 
@@ -870,11 +948,7 @@ impl AgentPane {
                         "Read trends, levels and momentum on the pinned chart; Chart edits also lets you mark it up.",
                         readable(theme::muted()),
                     );
-                    for prompt in ["What's the trend?", "Find support and resistance", "Summarise the last 20 bars"] {
-                        if control(ui, prompt).clicked() {
-                            actions.push(Action::Send(Prompt { text: prompt.into(), requires_tools: true }));
-                        }
-                    }
+                    suggested_prompts(ui, self.settings.tools, &mut actions);
                 }
                 self.conversation(ui, &mut actions);
                 if self.state != Onboarding::Ready {
@@ -890,7 +964,7 @@ impl AgentPane {
                         n => format!("{n}-minute"),
                     };
                     let source = if limit.id == "ordinary" { String::new() } else { format!("{} · ", limit.id) };
-                    let usage = format!("{source}{window} limit · {:.0}% used", limit.used);
+                    let usage = format!("{source}{window} limit {:.0}% used", limit.used);
                     let label = if matches!(self.state, Onboarding::RateLimited { .. }) {
                         usage
                     } else {
@@ -960,6 +1034,8 @@ impl AgentPane {
     }
 
     fn conversation(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        // Expire before deriving headers as well as cards on the single deadline wake.
+        self.workflows.expire(Instant::now(), None);
         for i in 0..self.blocks.len() {
             match &self.blocks[i] {
                 RenderedBlock::Prompt(text) => {
@@ -1001,6 +1077,23 @@ impl AgentPane {
                             agent_markdown::show(ui, &agent_markdown::prepare(blocks));
                         }
                     });
+                    // Host-authored feedback follows the last answer block of this turn;
+                    // the model's (possibly now stale) answer remains untouched.
+                    let end = self.blocks[i + 1..]
+                        .iter()
+                        .position(|b| matches!(b, RenderedBlock::Prompt(_)))
+                        .map_or(self.blocks.len(), |n| i + 1 + n);
+                    if !self.blocks[i + 1..end].iter().any(|b| matches!(b, RenderedBlock::Reply(_)))
+                        && let Some(line) = self
+                            .turns
+                            .iter()
+                            .rev()
+                            .find(|t| t.prompt_index < i)
+                            .and_then(|t| t.id.as_deref())
+                            .and_then(|id| self.workflows.decision_line(id))
+                    {
+                        ui.label(RichText::new(line).font(theme::ui_font(10.5)).color(readable(theme::muted())));
+                    }
                 }
                 RenderedBlock::Notice(text) => {
                     // A stop has one block and one adjacent action; its diagnostic stays in the tooltip.
@@ -1042,6 +1135,7 @@ impl AgentPane {
             .filter_map(|b| if let RenderedBlock::Tool(t) = b { Some(t) } else { None })
             .collect();
         let turn = self.turns.iter().find(|turn| turn.prompt_index == key);
+        let turn_id = turn.and_then(|turn| turn.id.clone());
         if traces.is_empty() && !turn.is_some_and(|turn| turn.made_edits) {
             return;
         }
@@ -1049,9 +1143,29 @@ impl AgentPane {
         let label = if traces.is_empty() && reverted.is_none() {
             "Chart changes".into()
         } else {
-            turn.and_then(ConversationTurn::reverted_summary)
-                .map_or_else(|| tool_group_label(&traces, reverted), str::to_owned)
+            turn.and_then(ConversationTurn::reverted_summary).map_or_else(
+                || tool_group_label_outcome(&traces, reverted, turn.is_some_and(|t| t.final_answer_succeeded)),
+                str::to_owned,
+            )
         };
+        let label = if reverted.is_none() {
+            turn_id.as_deref().and_then(|id| self.workflows.turn_summary(id)).map_or(label.clone(), |summary| {
+                let chart_edits: Vec<_> = traces.iter().copied().filter(|trace| is_edit_tool(&trace.name)).collect();
+                let summary = if chart_edits.is_empty() {
+                    summary
+                } else {
+                    format!("{} · {summary}", tool_group_summary_outcome(&chart_edits, None, false))
+                };
+                tool_step_suffix(summary, &traces)
+            })
+        } else {
+            label
+        };
+        let label = tool_group_duration(label, turn);
+        let recovered = recovered_failures(&traces);
+        let retries =
+            if traces.iter().filter(|trace| trace.success == Some(false)).count() == recovered { recovered } else { 0 };
+        let label = retry_suffix(label, retries);
         let expanded = self.expanded_tools.contains(&key);
         let wash = ui.painter().add(egui::Shape::Noop);
         let response = ui
@@ -1065,7 +1179,11 @@ impl AgentPane {
                     let label = if changes == 0 {
                         "Undo chart changes".into()
                     } else {
-                        format!("Undo {changes} chart change{}", if changes == 1 { "" } else { "s" })
+                        if turn_id.as_ref().is_some_and(|id| self.workflows.undo.iter().any(|(owner, _)| owner == id)) {
+                            format!("Undo {changes} change{}", if changes == 1 { "" } else { "s" })
+                        } else {
+                            format!("Undo {changes} chart change{}", if changes == 1 { "" } else { "s" })
+                        }
                     };
                     if undo_button(ui, &label, turn.undo_available && !self.running, self.running).clicked()
                         && let Some(id) = &turn.id
@@ -1096,7 +1214,13 @@ impl AgentPane {
                                 readable(theme::muted()),
                             );
                         }
-                        agent_markdown::wrapped(ui, &label, readable(theme::muted()));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&label).font(theme::ui_font(12.0)).color(readable(theme::muted())),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&label);
                     },
                 )
                 .response
@@ -1120,6 +1244,165 @@ impl AgentPane {
                 tool_row_with_history(ui, trace, reverted.is_some_and(|n| n > 0));
             }
         }
+        if let Some(id) = turn_id {
+            self.confirmation_card(ui, &id, actions);
+        }
+    }
+
+    fn confirmation_card(&mut self, ui: &mut Ui, turn: &str, actions: &mut Vec<Action>) {
+        use crate::agent_bridge::ProposalStatus;
+        let now = Instant::now();
+        self.workflows.expire(now, None);
+        let rows: Vec<_> =
+            self.workflows.proposals.iter().enumerate().filter(|(_, p)| p.turn == turn).map(|(i, _)| i).collect();
+        if rows.is_empty() {
+            self.proposal_seen.remove(turn);
+            self.proposal_shown.remove(turn);
+            self.symbol_seen.remove(turn);
+            self.symbol_shown.remove(turn);
+            return;
+        }
+        let pending: Vec<u64> = rows
+            .iter()
+            .map(|&i| &self.workflows.proposals[i])
+            .filter(|p| p.status == ProposalStatus::Pending)
+            .map(|p| p.id)
+            .collect();
+        let seen = self.proposal_seen.insert(turn.into(), pending.clone()).unwrap_or_default();
+        let symbols: Vec<_> = rows
+            .iter()
+            .flat_map(|&i| {
+                let p = &self.workflows.proposals[i];
+                p.symbols.iter().enumerate().map(move |(index, s)| (p.id, index, s.symbol.clone()))
+            })
+            .collect();
+        let seen_symbols = self.symbol_seen.insert(turn.into(), symbols.clone()).unwrap_or_default();
+        let shown_symbols: Vec<_> = symbols.into_iter().filter(|s| seen_symbols.contains(s)).collect();
+        // Fail closed for the whole proposal if any sub-row is new. This also prevents
+        // unticked, newly arrived symbols being implicitly declined by Approve selected.
+        let shown: Vec<u64> = pending
+            .into_iter()
+            .filter(|id| {
+                seen.contains(id)
+                    && rows.iter().all(|&i| {
+                        let p = &self.workflows.proposals[i];
+                        p.id != *id
+                            || p.symbols
+                                .iter()
+                                .enumerate()
+                                .all(|(n, s)| shown_symbols.contains(&(p.id, n, s.symbol.clone())))
+                    })
+            })
+            .collect();
+        self.symbol_shown.insert(turn.into(), shown_symbols);
+        self.proposal_shown.insert(turn.into(), shown.clone());
+        let multi = rows.len() > 1 || rows.iter().any(|&i| !self.workflows.proposals[i].symbols.is_empty());
+        let focused = ui.memory(|m| m.focused());
+        let card_focused = focused.is_some_and(|id| self.proposal_focus.get(&id).is_some_and(|owner| owner == turn));
+        if card_focused {
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                actions.push(Action::Confirm { turn: turn.into(), approve: false, ids: shown.clone() });
+            }
+            if focused.is_some_and(|id| !self.proposal_buttons.contains_key(&id)) {
+                ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            }
+        }
+        ui.push_id(("workflow-card", turn), |ui| {
+            egui::Frame::new().fill(theme::header()).inner_margin(dp(6.0)).show(ui, |ui| {
+                for &index in &rows {
+                    let proposal = &mut self.workflows.proposals[index];
+                    ui.horizontal_wrapped(|ui| {
+                        if multi && proposal.symbols.is_empty() && proposal.status == ProposalStatus::Pending {
+                            let response = ui.checkbox(&mut proposal.selected, "");
+                            self.proposal_focus.insert(response.id, turn.into());
+                        }
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(proposal.card_summary()).font(theme::ui_font(12.0)).color(theme::text()),
+                            )
+                            .wrap(),
+                        );
+                        let status = match &proposal.status {
+                            ProposalStatus::Pending => "Awaiting approval",
+                            ProposalStatus::Approved => "Approved",
+                            ProposalStatus::Declined => "Declined",
+                            ProposalStatus::Expired => "Expired",
+                            ProposalStatus::Failed(reason) => reason.as_str(),
+                        };
+                        ui.label(RichText::new(status).font(theme::ui_font(10.5)).color(theme::muted()));
+                    });
+                    for (n, symbol) in proposal.symbols.iter_mut().enumerate() {
+                        ui.push_id((proposal.id, n), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_space(dp(12.0));
+                                let label = crate::security_names::label(&symbol.symbol);
+                                if proposal.status == ProposalStatus::Pending {
+                                    let response = ui.checkbox(&mut symbol.selected, label);
+                                    focus_ring(ui, &response);
+                                    self.proposal_focus.insert(response.id, turn.into());
+                                } else {
+                                    ui.label(RichText::new(label).font(theme::ui_font(12.0)).color(theme::text()));
+                                    if let Some(outcome) = &symbol.outcome {
+                                        ui.label(
+                                            RichText::new(outcome).font(theme::ui_font(10.5)).color(theme::muted()),
+                                        );
+                                    }
+                                }
+                            });
+                        });
+                    }
+                    let note = match &proposal.args {
+                        tr_agent_tools::args::LiveArgs::CreateAlert(args) => args.note.as_deref(),
+                        _ => proposal.before["note"].as_str(),
+                    };
+                    if let Some(note) = note {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(note.replace(['\n', '\r'], " "))
+                                    .font(theme::ui_font(10.5))
+                                    .color(theme::muted()),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(note);
+                    }
+                    if let Some(label) = proposal.ownership_label() {
+                        ui.label(RichText::new(label).font(theme::ui_font(10.5)).color(theme::muted()));
+                    }
+                    if proposal.status == ProposalStatus::Pending {
+                        // One deadline wake, never a periodic/idle repaint.
+                        ui.ctx().request_repaint_after(proposal.deadline.saturating_duration_since(now));
+                    }
+                }
+                if rows.iter().any(|&i| self.workflows.proposals[i].status == ProposalStatus::Pending) {
+                    ui.horizontal(|ui| {
+                        let selected = rows.iter().any(|&i| {
+                            let p = &self.workflows.proposals[i];
+                            p.status == ProposalStatus::Pending && p.is_selected() && shown.contains(&p.id)
+                        });
+                        let approve = ui
+                            .add_enabled(selected, primary_button(if multi { "Approve selected" } else { "Approve" }));
+                        let decline = control(ui, if multi { "Decline all" } else { "Decline" });
+                        self.proposal_focus.insert(approve.id, turn.into());
+                        self.proposal_focus.insert(decline.id, turn.into());
+                        if selected {
+                            self.proposal_buttons.insert(approve.id, true);
+                        }
+                        self.proposal_buttons.insert(decline.id, false);
+                        let focused = approve.has_focus() || decline.has_focus();
+                        let enter = focused && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                        let escape =
+                            focused && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                        if (approve.clicked() || (enter && approve.has_focus())) && selected {
+                            actions.push(Action::Confirm { turn: turn.into(), approve: true, ids: shown.clone() });
+                        }
+                        if decline.clicked() || (enter && decline.has_focus()) || escape {
+                            actions.push(Action::Confirm { turn: turn.into(), approve: false, ids: shown.clone() });
+                        }
+                    });
+                }
+            });
+        });
     }
 
     fn show_retry(&self) -> bool {
@@ -1713,11 +1996,190 @@ fn tool_label(name: &str) -> &str {
         "remove_indicator" => "Remove indicator",
         "set_view" => "Change view",
         "compare" => "Compare",
+        "list_watchlists" => "List watchlists",
+        "list_alerts" => "List alerts",
+        "create_watchlist" => "Propose watchlist",
+        "add_watchlist_symbols" => "Propose adding symbols",
+        "remove_watchlist_symbols" => "Propose removing symbols",
+        "delete_watchlist" => "Propose deleting watchlist",
+        "create_alert" => "Propose alert",
+        "update_alert" => "Propose alert update",
+        "delete_alert" => "Propose deleting alert",
         _ => "Chart tool",
     }
 }
 
+fn suggested_prompts(ui: &mut Ui, mode: ToolsMode, actions: &mut Vec<Action>) {
+    for (heading, prompts, edits) in [
+        ("Analyze", &["What's the trend?", "Find support and resistance", "Summarise the last 20 bars"][..], false),
+        ("Find a setup", &["Where could a breakout confirm?", "What would invalidate a pullback setup?"][..], false),
+        ("Add to chart", &["Mark support and resistance zones", "Add RSI 14"][..], true),
+    ] {
+        ui.add_space(dp(6.0));
+        ui.label(RichText::new(heading).font(theme::ui_font(10.5)).color(readable(theme::muted())));
+        for prompt in prompts {
+            let enabled = !edits || mode == ToolsMode::Edit;
+            let response = if enabled {
+                control(ui, prompt)
+            } else {
+                ui.add_enabled(false, egui::Button::new(*prompt).wrap()).on_disabled_hover_text("Switch to Chart edits")
+            };
+            if response.clicked() {
+                actions.push(Action::Send(Prompt { text: (*prompt).into(), requires_tools: true }));
+            }
+        }
+    }
+}
+
+fn tool_group_duration(label: String, turn: Option<&ConversationTurn>) -> String {
+    let Some(duration) = turn.filter(|turn| turn.finished).and_then(|turn| turn.duration) else { return label };
+    let seconds = if duration < Duration::from_secs(1) {
+        "<1s".into()
+    } else {
+        format!("{:.0}s", duration.as_secs_f64().round())
+    };
+    format!("{label} · {seconds}")
+}
+
+fn normalized_args(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(fields.iter().map(|(k, v)| (k.clone(), normalized_args(v))).collect()),
+        Value::Array(values) => Value::Array(values.iter().map(normalized_args).collect()),
+        Value::String(text) => Value::String(text.trim().into()),
+        _ => value.clone(),
+    }
+}
+
+fn workflow_tool_target(name: &str, args: &Value, proposals: &[crate::agent_bridge::Proposal]) -> Option<String> {
+    let text = match name {
+        "list_watchlists" => "All watchlists".into(),
+        "list_alerts" => "All alerts".into(),
+        "create_watchlist" => args["name"].as_str().unwrap_or("Watchlist").trim().to_owned(),
+        "add_watchlist_symbols" | "remove_watchlist_symbols" | "delete_watchlist" => {
+            args["watchlist"].as_str().unwrap_or("Watchlist").trim().to_owned()
+        }
+        "create_alert" | "update_alert" | "delete_alert" => {
+            let before = proposals.iter().rev().find_map(|p| {
+                use tr_agent_tools::args::LiveArgs;
+                let id = match &p.args {
+                    LiveArgs::UpdateAlert(a) => a.id,
+                    LiveArgs::DeleteAlert(a) => a.id,
+                    _ => return None,
+                };
+                (args["id"].as_u64() == Some(id)).then_some(&p.before)
+            });
+            let key = args["symbol"].as_str().or_else(|| before.and_then(|b| b["symbol"].as_str()));
+            let symbol = key
+                .map(crate::security_names::label)
+                .unwrap_or_else(|| args["id"].as_u64().map_or_else(|| "Alert".into(), |id| format!("Alert #{id}")));
+            if let Some(level) = args["level"].as_f64().or_else(|| before.and_then(|b| b["level"].as_f64())) {
+                let level = crate::price_alerts::display_price(key.unwrap_or(""), level);
+                if symbol.chars().count() + level.chars().count() < 45 {
+                    format!("{symbol} · {level}")
+                } else {
+                    symbol
+                }
+            } else {
+                symbol
+            }
+        }
+        _ => return None,
+    };
+    Some(short_label(&text))
+}
+
+fn same_tool_target(failed: &Trace, later: &Trace) -> bool {
+    if failed.name != later.name {
+        return false;
+    }
+    let (a, b) = (&failed.target_args, &later.target_args);
+    if !a.is_object() || !b.is_object() {
+        return false;
+    }
+    match failed.name.as_str() {
+        "create_watchlist" | "add_watchlist_symbols" | "remove_watchlist_symbols" | "delete_watchlist" => {
+            let key = if failed.name == "create_watchlist" { "name" } else { "watchlist" };
+            return a[key].as_str().zip(b[key].as_str()).is_some_and(|(a, b)| {
+                a.trim().to_uppercase().to_lowercase() == b.trim().to_uppercase().to_lowercase()
+            });
+        }
+        "update_alert" | "delete_alert" => return !a["id"].is_null() && a["id"] == b["id"],
+        "create_alert" => {
+            return a["symbol"]
+                .as_str()
+                .zip(b["symbol"].as_str())
+                .is_some_and(|(a, b)| crate::symbol_search::same_key(a, b))
+                && a["level"].as_f64().is_some()
+                && a["level"].as_f64() == b["level"].as_f64()
+                && a["direction"] == b["direction"];
+        }
+        _ => {}
+    }
+    for scope in ["symbol", "chart_id"] {
+        if !a[scope].is_null() && !b[scope].is_null() && a[scope] != b[scope] {
+            return false;
+        }
+    }
+    match failed.name.as_str() {
+        "create_drawing" => {
+            // An explicit label can identify the intended drawing even when its geometry changes.
+            if a["label"].as_str().is_some_and(|label| !label.is_empty() && a["label"] == b["label"]) {
+                return true;
+            }
+            if a["kind"].is_null()
+                || a["kind"] != b["kind"]
+                || a["zone_role"] != b["zone_role"]
+                || a["side"] != b["side"]
+            {
+                return false;
+            }
+            let range = |args: &Value| -> Option<(f64, f64)> {
+                let prices: Option<Vec<_>> = args["anchors"].as_array()?.iter().map(|p| p["price"].as_f64()).collect();
+                let prices = prices?;
+                if prices.is_empty() || prices.iter().any(|p| !p.is_finite()) {
+                    return None;
+                }
+                Some((
+                    prices.iter().copied().fold(f64::INFINITY, f64::min),
+                    prices.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                ))
+            };
+            range(a).zip(range(b)).is_some_and(|((al, ah), (bl, bh))| al <= bh && bl <= ah)
+        }
+        "update_drawing" | "delete_drawing" => !a["id"].is_null() && a["id"] == b["id"],
+        _ => a == b,
+    }
+}
+
+fn recovered_failures(traces: &[&Trace]) -> usize {
+    traces
+        .iter()
+        .enumerate()
+        .filter(|(i, trace)| {
+            trace.success == Some(false)
+                && traces[i + 1..].iter().any(|later| later.success == Some(true) && same_tool_target(trace, later))
+        })
+        .count()
+}
+
+fn retry_suffix(label: String, retries: usize) -> String {
+    if retries == 0 { label } else { format!("{label} · {retries} retr{}", if retries == 1 { "y" } else { "ies" }) }
+}
+
 fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
+    tool_group_label_outcome(traces, reverted, false)
+}
+
+fn tool_group_label_outcome(traces: &[&Trace], reverted: Option<usize>, final_answer: bool) -> String {
+    let summary = tool_group_summary_outcome(traces, reverted, final_answer);
+    if reverted.is_some() || traces.iter().any(|trace| trace.success.is_none() && !trace.interrupted) {
+        summary
+    } else {
+        tool_step_suffix(summary, traces)
+    }
+}
+
+fn tool_group_summary_outcome(traces: &[&Trace], reverted: Option<usize>, final_answer: bool) -> String {
     if let Some(n) = reverted {
         return format!("{n} change{} reverted", if n == 1 { "" } else { "s" });
     }
@@ -1730,15 +2192,59 @@ fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
             _ => format!("{}…", tool_label(&trace.name)),
         };
     }
-    let summary = if traces.iter().any(|trace| trace.interrupted) {
+    let workflow_calls: Vec<_> = traces
+        .iter()
+        .filter(|trace| {
+            matches!(
+                trace.name.as_str(),
+                "create_watchlist"
+                    | "add_watchlist_symbols"
+                    | "remove_watchlist_symbols"
+                    | "delete_watchlist"
+                    | "create_alert"
+                    | "update_alert"
+                    | "delete_alert"
+            )
+        })
+        .collect();
+    if !traces.iter().any(|trace| trace.interrupted)
+        && !traces.iter().any(|trace| is_edit_tool(&trace.name) && trace.success == Some(true))
+        && !workflow_calls.is_empty()
+        && workflow_calls.iter().all(|trace| trace.success == Some(false))
+    {
+        let trace = workflow_calls.last().unwrap();
+        let action = match trace.name.as_str() {
+            "add_watchlist_symbols" => "add symbols to",
+            "remove_watchlist_symbols" => "remove symbols from",
+            "create_watchlist" => "create watchlist",
+            "delete_watchlist" => "delete watchlist",
+            "create_alert" => "create alert for",
+            "update_alert" => "update alert",
+            _ => "delete alert",
+        };
+        let target = trace.summary.as_deref().map(main_tool_label).unwrap_or_default();
+        return format!("Couldn't {action}{}", if target.is_empty() { String::new() } else { format!(" {target}") });
+    }
+    if traces.iter().any(|trace| trace.interrupted) {
         "Stopped before finishing".into()
-    } else if traces.iter().any(|trace| trace.success == Some(false)) {
+    } else if traces.iter().any(|trace| trace.success == Some(false))
+        && !traces.iter().any(|trace| trace.success == Some(true))
+    {
         "Chart tools failed".into()
     } else {
         let edits: Vec<_> =
             traces.iter().filter(|trace| is_edit_tool(&trace.name) && trace.success == Some(true)).collect();
-        if edits.is_empty() {
-            if traces.iter().any(|trace| trace.name == "analyze") {
+        let workflow_changes = workflow_calls.iter().filter(|trace| trace.success == Some(true)).count();
+        if workflow_changes > 0 {
+            format!("Awaiting approval · {workflow_changes} change{}", if workflow_changes == 1 { "" } else { "s" })
+        } else if edits.is_empty() {
+            if final_answer && !traces.iter().any(|trace| trace.success == Some(true)) {
+                "Answered".into()
+            } else if traces.iter().any(|trace| {
+                trace.success == Some(true) && matches!(trace.name.as_str(), "list_watchlists" | "list_alerts")
+            }) {
+                "Read watchlists and alerts".into()
+            } else if traces.iter().any(|trace| trace.success == Some(true) && trace.name == "analyze") {
                 "Analyzed chart".into()
             } else {
                 "Read chart data".into()
@@ -1751,11 +2257,41 @@ fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
                         && trace.summary.as_deref().is_some_and(|s| s.to_ascii_lowercase().contains("line"))
                 })
                 .count();
+            let zones = edits
+                .iter()
+                .filter(|trace| {
+                    trace.name == "create_drawing"
+                        && trace.target_args["kind"] == "rectangle"
+                        && !trace.target_args["zone_role"].is_null()
+                })
+                .count();
+            let rectangles = edits
+                .iter()
+                .filter(|trace| {
+                    trace.name == "create_drawing"
+                        && trace.target_args["kind"] == "rectangle"
+                        && trace.target_args["zone_role"].is_null()
+                })
+                .count();
             let indicators: Vec<_> = edits.iter().filter(|trace| trace.name == "add_indicator").collect();
-            if lines + indicators.len() == edits.len() && indicators.len() <= 1 {
+            if lines + zones + rectangles + indicators.len() == edits.len() && indicators.len() <= 1 {
                 let mut parts = Vec::new();
+                if zones > 0 {
+                    parts.push(format!("Drew {zones} zone{}", if zones == 1 { "" } else { "s" }));
+                }
+                if rectangles > 0 {
+                    parts.push(format!(
+                        "{}{rectangles} rectangle{}",
+                        if parts.is_empty() { "Drew " } else { "" },
+                        if rectangles == 1 { "" } else { "s" }
+                    ));
+                }
                 if lines > 0 {
-                    parts.push(format!("Drew {lines} line{}", if lines == 1 { "" } else { "s" }));
+                    parts.push(format!(
+                        "{}{lines} line{}",
+                        if parts.is_empty() { "Drew " } else { "" },
+                        if lines == 1 { "" } else { "s" }
+                    ));
                 }
                 if let Some(trace) = indicators.first() {
                     let object = main_tool_label(trace.summary.as_deref().unwrap_or("indicator"));
@@ -1766,8 +2302,13 @@ fn tool_group_label(traces: &[&Trace], reverted: Option<usize>) -> String {
                 "Chart edit tools finished".into()
             }
         }
-    };
-    format!("{summary} · {} step{}", traces.len(), if traces.len() == 1 { "" } else { "s" })
+    }
+}
+
+fn tool_step_suffix(summary: String, traces: &[&Trace]) -> String {
+    let label = format!("{summary} · {} step{}", traces.len(), if traces.len() == 1 { "" } else { "s" });
+    let failures = traces.iter().filter(|trace| trace.success == Some(false)).count() - recovered_failures(traces);
+    if failures > 0 { format!("{label} · {failures} failed") } else { label }
 }
 
 fn tool_status(trace: &Trace) -> &'static str {
@@ -1838,6 +2379,11 @@ fn tool_row_with_history(ui: &mut Ui, trace: &Trace, reverted: bool) {
         duration,
         theme::text(),
     );
+    if trace.success == Some(false)
+        && let Some(error) = &trace.error
+    {
+        ui.indent(("tool-error", &trace.id), |ui| agent_markdown::wrapped(ui, error, readable(theme::muted())));
+    }
     response.on_hover_text(format!(
         "{} · {status}\n{}\nCall: {}\n{}",
         trace.name,
@@ -1845,6 +2391,42 @@ fn tool_row_with_history(ui: &mut Ui, trace: &Trace, reverted: bool) {
         trace.id,
         trace.arguments,
     ));
+}
+
+pub(crate) fn tool_error(item: &Value) -> Option<String> {
+    if item["success"] != false {
+        return None;
+    }
+    let mut messages = Vec::new();
+    if let Some(message) = item["error"]["message"].as_str().or_else(|| item["error"].as_str()) {
+        messages.push(short_label(message));
+    }
+    for content in item["contentItems"].as_array().into_iter().flatten() {
+        if let Some(text) = content["text"].as_str() {
+            let value = serde_json::from_str::<Value>(text).ok();
+            let message = value.as_ref().and_then(|v| {
+                v["error"]["message"].as_str().map(str::to_owned).or_else(|| {
+                    (v["error"]["code"] == "unknown_symbols").then(|| {
+                        let symbols = v["symbols"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|s| s["symbol"].as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("Unknown symbols: {symbols}")
+                    })
+                })
+            });
+            if let Some(message) = message {
+                messages.push(short_label(&message));
+            } else if value.is_none() {
+                messages.push(short_label(text));
+            }
+        }
+    }
+    messages.dedup();
+    (!messages.is_empty()).then(|| messages.join(" · "))
 }
 
 fn main_tool_label(summary: &str) -> String {
@@ -1930,6 +2512,9 @@ pub(crate) fn edit_tool_summary(item: &Value) -> Option<String> {
             "trend_line" => "Trend line".into(),
             "vertical" => "vertical line".into(),
             "ray" => "ray (2 anchors)".into(),
+            "rectangle" if args["zone_role"].as_str().is_some() => {
+                format!("{} zone", args["zone_role"].as_str().unwrap())
+            }
             "rectangle" => "rectangle (2 anchors)".into(),
             "text" => "text annotation".into(),
             _ => "drawing update".into(),
@@ -2056,6 +2641,463 @@ mod polish_tests {
             style.interaction.tooltip_delay = 0.0;
             style.interaction.tooltip_grace_time = 0.0;
         });
+    }
+
+    fn workflow_trace(name: &str, args: Value, success: bool) -> Trace {
+        let mut pane = AgentPane::default();
+        pane.wire("item/completed", &serde_json::json!({"item":{"id":"workflow","type":"dynamicToolCall","tool":name,"arguments":args,"success":success}}));
+        let RenderedBlock::Tool(trace) = pane.blocks.remove(0) else { panic!("trace") };
+        trace
+    }
+
+    #[test]
+    fn failed_workflow_shows_plain_muted_error_below_row_and_workflow_turn_header() {
+        use serde_json::json;
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("edits").unwrap(), 1);
+        for query in ["NVDA", "TSLA", "ETH-USD"] {
+            pane.wire("item/completed", &json!({"item":{"type":"dynamicToolCall","id":query,"tool":"find_symbol","arguments":{"query":query},"success":true}}));
+        }
+        // Exercise both the new message and the legacy message-less workflow payload.
+        let message = "Unknown symbols: NVDA US Equity";
+        for with_message in [false, true] {
+            let mut error = json!({"error":{"code":"unknown_symbols"},"symbols":[{"symbol":"NVDA US Equity","error":"unknown_symbol"}]});
+            if with_message {
+                error["error"]["message"] = json!(message);
+            }
+            let item = json!({
+                "type":"dynamicToolCall","id":"add","tool":"add_watchlist_symbols","success":false,
+                "arguments":{"watchlist":"Agent Test","symbols":["NVDA US Equity"]},
+                "contentItems":[{"type":"inputText","text":error.to_string()}]
+            });
+            assert_eq!(tool_error(&item).as_deref(), Some(message));
+            if with_message {
+                pane.wire("item/completed", &json!({"item":item}));
+            }
+        }
+        pane.wire("item/completed", &json!({"item":{"type":"dynamicToolCall","id":"qualified","tool":"find_symbol","arguments":{"query":"NASDAQ:NVDA"},"success":false}}));
+        crate::agent_demo::complete(&mut pane, "completed");
+        pane.turns[0].duration = Some(Duration::from_secs(12));
+        let traces: Vec<_> = pane
+            .blocks
+            .iter()
+            .filter_map(|block| if let RenderedBlock::Tool(t) = block { Some(t) } else { None })
+            .collect();
+        assert_eq!(traces.len(), 5);
+        assert_eq!(traces[3].error.as_deref(), Some(message));
+        assert_eq!(tool_group_label(&traces, None), "Couldn't add symbols to Agent Test · 5 steps · 2 failed");
+        let mut literal = traces[3].clone();
+        literal.error = Some("Unknown symbols: **NVDA** [link](https://example.invalid)".into());
+        let ctx = egui::Context::default();
+        let plain = render(&ctx, dp(1000.0), vec![], |ui| tool_row(ui, &literal));
+        assert!(
+            texts(&plain).iter().any(|(s, _)| Some(s) == literal.error.as_ref()),
+            "errors are plain text, not markdown"
+        );
+        let output = render(&ctx, dp(1000.0), vec![], |ui| pane.conversation(ui, &mut Vec::new()));
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s == "Couldn't add symbols to Agent Test · 5 steps · 2 failed · 12s"));
+        let row = text.iter().find(|(s, _)| s == "Propose adding symbols · Agent Test").unwrap();
+        let error = text.iter().find(|(s, _)| s == message).unwrap();
+        assert!(error.1.top() >= row.1.bottom(), "error belongs below the workflow row");
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t)
+            if t.galley.text() == message && t.galley.job.sections.iter().all(|s| s.format.color == readable(theme::muted())))));
+        assert!(pane.workflows.proposals.is_empty());
+    }
+
+    #[test]
+    fn workflow_retry_identity_recovers_the_reported_create_add_find_add_sequence() {
+        use serde_json::json;
+        let calls = [
+            workflow_trace("create_watchlist", json!({"name":"Agent Test"}), true),
+            workflow_trace(
+                "add_watchlist_symbols",
+                json!({"watchlist":"Agent Test","symbols":["AAPL","MSFT","BTC-USD"]}),
+                false,
+            ),
+            workflow_trace("find_symbol", json!({"query":"BTC-USD"}), true),
+            workflow_trace(
+                "add_watchlist_symbols",
+                json!({"watchlist":"aGENT tEST","symbols":["AAPL US Equity","MSFT US Equity","COINBASE:BTC-USD"]}),
+                true,
+            ),
+        ];
+        let traces: Vec<_> = calls.iter().collect();
+        assert_eq!(recovered_failures(&traces), 1);
+        let label = retry_suffix(tool_group_label(&traces, None), recovered_failures(&traces));
+        assert!(label.ends_with(" · 4 steps · 1 retry"), "{label}");
+        assert!(!label.contains("failed"));
+        assert_eq!(calls[1].summary.as_deref(), Some("Agent Test"));
+        assert_eq!(calls[1].success, Some(false), "failed detail row is retained");
+        assert_eq!(recovered_failures(&[&calls[3], &calls[1]]), 0, "only later success recovers");
+        let other = workflow_trace("add_watchlist_symbols", json!({"watchlist":"Other","symbols":["AAPL"]}), true);
+        assert_eq!(recovered_failures(&[&calls[1], &other]), 0);
+        let remove =
+            workflow_trace("remove_watchlist_symbols", json!({"watchlist":"Agent Test","symbols":["AAPL"]}), true);
+        assert_eq!(recovered_failures(&[&calls[1], &remove]), 0, "same target but different tool is not a retry");
+    }
+
+    #[test]
+    fn workflow_retry_identity_matches_each_workflow_target_not_changed_payloads() {
+        use serde_json::json;
+        for tool in ["create_watchlist", "add_watchlist_symbols", "remove_watchlist_symbols", "delete_watchlist"] {
+            let key = if tool == "create_watchlist" { "name" } else { "watchlist" };
+            let a = workflow_trace(tool, json!({key:" Agent Test ","symbols":["BTC-USD"]}), false);
+            let b = workflow_trace(tool, json!({key:"agent test","symbols":["COINBASE:BTC-USD"]}), true);
+            assert!(same_tool_target(&a, &b), "{tool}");
+        }
+        for tool in ["update_alert", "delete_alert"] {
+            let a = workflow_trace(tool, json!({"id":7,"level":10}), false);
+            let b = workflow_trace(tool, json!({"id":7,"level":20}), true);
+            let other = workflow_trace(tool, json!({"id":8,"level":20}), true);
+            assert!(same_tool_target(&a, &b));
+            assert!(!same_tool_target(&a, &other));
+        }
+    }
+
+    #[test]
+    fn create_alert_retry_requires_same_symbol_level_and_direction() {
+        use serde_json::json;
+        let a =
+            workflow_trace("create_alert", json!({"symbol":"BINANCE:XRPUSDT","level":10,"direction":"above"}), false);
+        let canonical = tr_data::security("BINANCE:XRPUSDT").key();
+        let b = workflow_trace("create_alert", json!({"symbol":canonical,"level":10.0,"direction":"above"}), true);
+        assert!(same_tool_target(&a, &b));
+        assert_eq!(recovered_failures(&[&a, &b]), 1);
+        for args in [
+            json!({"symbol":canonical,"level":20,"direction":"above"}),
+            json!({"symbol":canonical,"level":10,"direction":"below"}),
+            json!({"symbol":"AAPL US Equity","level":10,"direction":"above"}),
+        ] {
+            let other = workflow_trace("create_alert", args, true);
+            assert!(!same_tool_target(&a, &other));
+            assert_eq!(recovered_failures(&[&a, &other]), 0);
+            assert!(tool_group_label(&[&a, &other], None).ends_with(" · 1 failed"));
+        }
+    }
+
+    #[test]
+    fn review_workflow_tool_target_is_scrubbed_and_capped_like_other_tool_summaries() {
+        use serde_json::json;
+        let name = format!("me@example.com\nsecond line {}", "x".repeat(400));
+        for (tool, key) in [("create_watchlist", "name"), ("add_watchlist_symbols", "watchlist")] {
+            let trace = workflow_trace(tool, json!({key: name}), false);
+            let summary = trace.summary.unwrap();
+            assert!(!summary.contains("me@example.com"), "{tool}: model-supplied text must be scrubbed");
+            assert!(!summary.contains('\n'), "{tool}: control characters must be stripped");
+            assert!(summary.chars().count() <= 180, "{tool}: summary must be capped");
+        }
+    }
+
+    #[test]
+    fn workflow_tool_rows_show_targets_and_leave_chart_tool_labels_unchanged() {
+        use serde_json::json;
+        for (tool, args, expected) in [
+            ("create_watchlist", json!({"name":"Agent Test"}), "Agent Test"),
+            ("add_watchlist_symbols", json!({"watchlist":"Agent Test"}), "Agent Test"),
+            ("remove_watchlist_symbols", json!({"watchlist":"Agent Test"}), "Agent Test"),
+            ("delete_watchlist", json!({"watchlist":"Agent Test"}), "Agent Test"),
+            ("list_watchlists", json!({}), "All watchlists"),
+            ("list_alerts", json!({"symbol":"AAPL US Equity"}), "All alerts"),
+            ("create_alert", json!({"symbol":"COINBASE:BTC-USD"}), "BTC/USD · Coinbase"),
+            ("read_chart", json!({}), "Pinned chart"),
+        ] {
+            let trace = workflow_trace(tool, args, true);
+            assert_eq!(trace.summary.as_deref(), Some(expected), "{tool}");
+            let ctx = egui::Context::default();
+            let output = render(&ctx, dp(600.0), vec![], |ui| tool_row(ui, &trace));
+            assert!(texts(&output).iter().any(|(s, _)| s == &format!("{} · {expected}", tool_label(tool))), "{tool}");
+        }
+        let mut p = card_pane().workflows.proposals.remove(0);
+        p.before = json!({"symbol":"AAPL US Equity"});
+        for tool in ["update_alert", "delete_alert"] {
+            p.args = if tool == "update_alert" {
+                tr_agent_tools::args::LiveArgs::UpdateAlert(
+                    serde_json::from_value(json!({"id":7,"level":123})).unwrap(),
+                )
+            } else {
+                tr_agent_tools::args::LiveArgs::DeleteAlert(serde_json::from_value(json!({"id":7})).unwrap())
+            };
+            assert_eq!(workflow_tool_target(tool, &json!({"id":7}), &[p.clone()]).as_deref(), Some("AAPL US Equity"));
+        }
+        let label = workflow_tool_target("create_alert", &json!({"symbol":"AAPL US Equity","level":100}), &[]).unwrap();
+        assert!(label.starts_with("AAPL US Equity · 100"), "{label}");
+    }
+
+    #[test]
+    fn symbol_subrows_are_plain_text_focusable_space_only_and_all_unticked_disables_approve() {
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("proposal").unwrap(), 1);
+        pane.workflows.proposals.remove(0);
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        for _ in 0..2 {
+            render(&ctx, dp(600.0), vec![], |ui| {
+                actions = pane.show(ui, "Pinned", egui::Id::new("symbols"));
+            });
+        }
+        assert!(actions.is_empty());
+        let output = render(&ctx, dp(600.0), vec![], |ui| {
+            actions = pane.show(ui, "Pinned", egui::Id::new("symbols"));
+        });
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s == "Add to Agent Test"));
+        assert!(text.iter().any(|(s, _)| s == "AAPL US Equity"));
+        assert!(text.iter().any(|(s, _)| s == "BTC/USD · Coinbase"));
+        assert!(text.iter().any(|(s, _)| s == "Approve selected"));
+        let boxes: Vec<_> =
+            pane.proposal_focus.keys().filter(|id| !pane.proposal_buttons.contains_key(id)).copied().collect();
+        assert_eq!(boxes.len(), 3);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let before: Vec<_> = pane.workflows.proposals[0].symbols.iter().map(|s| s.selected).collect();
+        ctx.memory_mut(|m| m.request_focus(boxes[0]));
+        render(&ctx, dp(600.0), vec![key(egui::Key::Enter)], |ui| {
+            actions = pane.show(ui, "Pinned", egui::Id::new("symbols"));
+        });
+        assert!(actions.is_empty(), "Enter on sub-row cannot approve");
+        assert_eq!(
+            pane.workflows.proposals[0].symbols.iter().map(|s| s.selected).collect::<Vec<_>>(),
+            before,
+            "Enter does not toggle"
+        );
+        ctx.memory_mut(|m| m.request_focus(boxes[0]));
+        render(&ctx, dp(600.0), vec![key(egui::Key::Space)], |ui| {
+            actions = pane.show(ui, "Pinned", egui::Id::new("symbols"));
+        });
+        assert_eq!(
+            pane.workflows.proposals[0].symbols.iter().map(|s| s.selected).zip(before).filter(|(a, b)| a != b).count(),
+            1
+        );
+        assert!(actions.is_empty());
+        for s in &mut pane.workflows.proposals[0].symbols {
+            s.selected = false;
+        }
+        render(&ctx, dp(600.0), vec![], |ui| {
+            actions = pane.show(ui, "Pinned", egui::Id::new("symbols"));
+        });
+        assert!(!pane.proposal_buttons.values().any(|approve| *approve), "no enabled approval button");
+    }
+
+    #[test]
+    fn symbol_subrow_guard_requires_previous_frame_even_for_new_unticked_rows() {
+        use crate::agent_bridge::SymbolChoice;
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("proposal").unwrap(), 1);
+        let turn = crate::agent_demo::TURN;
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, turn, &mut actions));
+        assert!(pane.proposal_shown[turn].is_empty());
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, turn, &mut actions));
+        assert_eq!(pane.proposal_shown[turn], [1, 2]);
+        pane.workflows.proposals[1].symbols.push(SymbolChoice {
+            symbol: "NVDA US Equity".into(),
+            selected: false,
+            outcome: None,
+        });
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, turn, &mut actions));
+        assert_eq!(pane.proposal_shown[turn], [1], "new sub-row blocks approval AND implicit decline of its proposal");
+        assert!(!pane.symbol_shown[turn].iter().any(|(_, _, s)| s == "NVDA US Equity"));
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, turn, &mut actions));
+        assert_eq!(pane.proposal_shown[turn], [1, 2]);
+        assert!(pane.symbol_shown[turn].iter().any(|(_, _, s)| s == "NVDA US Equity"));
+    }
+
+    #[test]
+    fn workflow_outcome_header_truncates_with_tooltip_and_host_line_does_not_rewrite_answer() {
+        check_workflow_outcome_header(false);
+    }
+
+    #[test]
+    fn mixed_chart_and_workflow_header_keeps_both_summaries_and_full_tooltip() {
+        check_workflow_outcome_header(true);
+    }
+
+    fn check_workflow_outcome_header(with_chart_edit: bool) {
+        use crate::agent_bridge::ProposalStatus;
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("proposal").unwrap(), 1);
+        let turn = crate::agent_demo::TURN;
+        pane.turns[0].duration = Some(Duration::from_secs(57));
+        for p in &mut pane.workflows.proposals {
+            p.status = ProposalStatus::Approved;
+            p.decided_at = Some(crate::agent_demo::SAMPLE_NOW);
+            for s in &mut p.symbols {
+                s.outcome = Some(if s.selected { "Added" } else { "Declined" }.into());
+            }
+        }
+        if with_chart_edit {
+            crate::agent_demo::tool(&mut pane, "chart-line", "create_drawing", Some(true), Some("Horizontal line"));
+        }
+        let summary = pane.workflows.turn_summary(turn).unwrap();
+        let line = pane.workflows.decision_line(turn).unwrap();
+        let ctx = egui::Context::default();
+        immediate_tooltips(&ctx);
+        let mut actions = Vec::new();
+        let output = render(&ctx, dp(360.0), vec![], |ui| pane.conversation(ui, &mut actions));
+        let text = texts(&output);
+        let expected = if with_chart_edit {
+            format!("Drew 1 line · {summary} · 3 steps · 57s")
+        } else {
+            format!("{summary} · 2 steps · 57s")
+        };
+        let (_, rect) = text.iter().find(|(s, _)| s == &expected).expect("outcome header");
+        assert!(rect.height() < dp(24.0));
+        assert_eq!(text.iter().filter(|(s, _)| s == &line).count(), 1, "one host decision line under the answer");
+        assert!(text.iter().any(|(s, _)| s.contains("awaiting your confirmation")), "model text stays unchanged");
+        let hover = rect.center();
+        for _ in 0..2 {
+            render(&ctx, dp(360.0), vec![egui::Event::PointerMoved(hover)], |ui| pane.conversation(ui, &mut actions));
+        }
+        let output =
+            render(&ctx, dp(360.0), vec![egui::Event::PointerMoved(hover)], |ui| pane.conversation(ui, &mut actions));
+        assert!(
+            texts(&output).iter().filter(|(s, _)| s == &expected).count() >= 2,
+            "full outcome text is also in tooltip"
+        );
+        assert!(actions.is_empty());
+    }
+
+    fn card_pane() -> AgentPane {
+        use crate::agent_bridge::{Proposal, ProposalStatus};
+        let mut pane = AgentPane::default();
+        pane.workflows.proposals.push(Proposal {
+            id: 1,
+            turn: "card:1".into(),
+            args: tr_agent_tools::args::LiveArgs::CreateAlert(tr_agent_tools::args::CreateAlert {
+                symbol: "AAPL US Equity".into(),
+                kind: tr_agent_tools::args::AlertKind::Price,
+                direction: tr_agent_tools::args::AlertRule::Above,
+                level: 100.,
+                timeframe: None,
+                repeat: None,
+                note: Some(
+                    "A long note about the alert\nwith its complete explanation visible only in the tooltip. "
+                        .repeat(8),
+                ),
+            }),
+            symbols: Vec::new(),
+            decided_at: None,
+            summary: "Create [Actual **Name**](https://example.invalid)".into(),
+            user_owned: false,
+            selected: true,
+            deadline: Instant::now() + Duration::from_secs(600),
+            status: ProposalStatus::Pending,
+            before: Value::Null,
+        });
+        pane
+    }
+
+    #[test]
+    fn confirmation_card_uses_plain_summary_and_muted_single_line_note_with_full_tooltip() {
+        let mut pane = card_pane();
+        let ctx = egui::Context::default();
+        immediate_tooltips(&ctx);
+        let mut actions = Vec::new();
+        render(&ctx, dp(360.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+        let output = render(&ctx, dp(360.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+        let text = texts(&output);
+        assert!(
+            text.iter().any(|(text, _)| text == &pane.workflows.proposals[0].summary),
+            "summary must not parse Markdown"
+        );
+        let (_, rect) = text.iter().find(|(text, _)| text.starts_with("A long note")).expect("note is on the card");
+        assert!(rect.height() < dp(24.0), "note must occupy one line: {rect:?}");
+        fn note_color(shape: &egui::Shape) -> Option<egui::Color32> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text().starts_with("A long note") => {
+                    Some(text.galley.job.sections[0].format.color)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(note_color),
+                _ => None,
+            }
+        }
+        assert_eq!(output.shapes.iter().find_map(|shape| note_color(&shape.shape)), Some(theme::muted()));
+        let hover = rect.center();
+        let note = match &pane.workflows.proposals[0].args {
+            tr_agent_tools::args::LiveArgs::CreateAlert(args) => args.note.clone().unwrap(),
+            _ => unreachable!(),
+        };
+        render(&ctx, dp(360.0), vec![egui::Event::PointerMoved(hover)], |ui| {
+            pane.confirmation_card(ui, "card:1", &mut actions)
+        });
+        let output = render(&ctx, dp(360.0), vec![egui::Event::PointerMoved(hover)], |ui| {
+            pane.confirmation_card(ui, "card:1", &mut actions)
+        });
+        assert!(texts(&output).iter().any(|(text, _)| text == &note), "tooltip keeps the full note");
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn confirmation_card_never_decides_a_proposal_that_arrived_as_the_user_clicked() {
+        use crate::agent_bridge::ProposalStatus;
+        let mut pane = card_pane();
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+        assert_eq!(pane.proposal_shown["card:1"], vec![1]);
+        // A second proposal lands in the same frame as the click: it is drawn, but the
+        // user cannot have seen it, so it must not be part of the decision.
+        let mut late = pane.workflows.proposals[0].clone();
+        late.id = 2;
+        late.status = ProposalStatus::Pending;
+        pane.workflows.proposals.push(late);
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+        assert_eq!(pane.proposal_shown["card:1"], vec![1]);
+        render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+        assert_eq!(pane.proposal_shown["card:1"], vec![1, 2]);
+    }
+
+    #[test]
+    fn confirmation_card_enter_only_acts_on_focused_button_without_app_hotkeys() {
+        for target in ["approve", "decline", "checkbox"] {
+            let mut pane = card_pane();
+            let mut second = pane.workflows.proposals[0].clone();
+            second.id = 2;
+            pane.workflows.proposals.push(second);
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            // Two frames: a proposal is decidable only once it has been on screen.
+            render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+            render(&ctx, dp(600.0), vec![], |ui| pane.confirmation_card(ui, "card:1", &mut actions));
+            let id = *pane
+                .proposal_focus
+                .keys()
+                .find(|id| match target {
+                    "approve" => pane.proposal_buttons.get(id) == Some(&true),
+                    "decline" => pane.proposal_buttons.get(id) == Some(&false),
+                    _ => !pane.proposal_buttons.contains_key(id),
+                })
+                .unwrap();
+            ctx.memory_mut(|m| m.request_focus(id));
+            let key = |key| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            render(&ctx, dp(600.0), vec![key(egui::Key::Enter)], |ui| {
+                pane.confirmation_card(ui, "card:1", &mut actions)
+            });
+            if target == "checkbox" {
+                assert!(actions.is_empty());
+            } else {
+                assert_eq!(actions.len(), 1, "{target}");
+                assert!(matches!(&actions[0], Action::Confirm { approve, .. } if *approve == (target == "approve")));
+            }
+            actions.clear();
+            ctx.memory_mut(|m| m.request_focus(id));
+            render(&ctx, dp(600.0), vec![key(egui::Key::Escape)], |ui| {
+                ctx.memory_mut(|m| m.request_focus(id));
+                pane.confirmation_card(ui, "card:1", &mut actions)
+            });
+            assert_eq!(actions.len(), 1, "{target}: Escape emits one action");
+            assert!(matches!(actions.as_slice(), [Action::Confirm { approve: false, .. }]), "{target}");
+        }
     }
 
     #[test]
@@ -2387,7 +3429,18 @@ mod polish_tests {
             assert!(basis.sample);
             assert_eq!(basis.last_bar, Some(ts));
             assert_eq!(basis.incomplete.as_deref(), Some(word));
-            assert_eq!(basis.freshness(), Some(format!("as of {}", local_time(ts))));
+            assert_eq!(basis.freshness(), Some(format!("bar opened {}", local_time(ts))));
+            let worker = crate::worker::Worker::inert();
+            let mut updated = bars.as_ref().clone();
+            updated[0].close = 1.5;
+            chart.on_live_bars(0, 0, updated, 1, &worker);
+            let live_basis = DataBasis::from_chart(&chart, false);
+            let received = chart.price_update_time().expect("accepted live update");
+            assert!(received >= now);
+            assert_eq!(live_basis.latest_price_update, Some(received));
+            assert_eq!(live_basis.freshness(), Some(format!("as of {}", local_time(received))));
+            chart.on_live_bars(1, 0, vec![], 0, &worker);
+            assert_eq!(chart.price_update_time(), Some(received), "stale generation cannot refresh freshness");
             assert!(!DataBasis::from_chart(&chart, false).sample);
             let old = Arc::new(vec![Bar::new(ts - 2 * tf.seconds(), 1., 2., 1., 2., 3.)]);
             chart.on_history(
@@ -2417,7 +3470,7 @@ mod polish_tests {
         let mut output = ctx.run_ui(Default::default(), |ui| pane.conversation(ui, &mut Vec::new()));
         output.textures_delta.clear();
         let text = texts(&output);
-        for label in ["1 change reverted", "Reverted"] {
+        for label in ["1 change reverted · 7s", "Reverted"] {
             assert_eq!(text.iter().filter(|(s, _)| s == label).count(), 1, "{text:?}");
         }
         assert!(!text.iter().any(|(s, _)| s.starts_with("Undid")));
@@ -2426,6 +3479,84 @@ mod polish_tests {
         assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Path(path) if path.stroke.color == egui::epaint::ColorMode::Solid(readable(theme::up())))));
         pane.undo_result(crate::agent_demo::TURN, Err("unavailable".into()));
         assert_eq!(pane.turns[0].reverted_changes, Some(1));
+    }
+
+    #[test]
+    fn grouped_suggestions_gate_only_chart_edits_with_disabled_tooltip() {
+        for mode in [ToolsMode::ReadOnly, ToolsMode::Edit] {
+            let ctx = egui::Context::default();
+            immediate_tooltips(&ctx);
+            let mut actions = Vec::new();
+            let mut draw = |events| render(&ctx, 450.0, events, |ui| suggested_prompts(ui, mode, &mut actions));
+            draw(vec![]);
+            let output = draw(vec![]);
+            let text = texts(&output);
+            let mut previous = 0.0;
+            for heading in ["Analyze", "Find a setup", "Add to chart"] {
+                let rect = text.iter().find(|(s, _)| s == heading).unwrap().1;
+                assert!(rect.top() >= previous);
+                previous = rect.bottom();
+            }
+            for prompt in [
+                "What's the trend?",
+                "Where could a breakout confirm?",
+                "Mark support and resistance zones",
+                "Add RSI 14",
+            ] {
+                let rect = text.iter().find(|(s, _)| s == prompt).unwrap().1;
+                let mut tooltip_seen = false;
+                // Egui suppresses tooltips briefly after a click; advance input frames, not wall time.
+                for _ in 0..90 {
+                    let output = draw(vec![egui::Event::PointerMoved(rect.center())]);
+                    tooltip_seen |= texts(&output).iter().any(|(s, _)| s == "Switch to Chart edits");
+                }
+                let enabled =
+                    mode == ToolsMode::Edit || !["Mark support and resistance zones", "Add RSI 14"].contains(&prompt);
+                if !enabled {
+                    assert!(tooltip_seen, "{prompt}: {rect:?}");
+                }
+                for pressed in [true, false] {
+                    draw(pointer(rect.center(), pressed));
+                }
+            }
+            let sent: Vec<_> = actions
+                .iter()
+                .filter_map(|a| if let Action::Send(p) = a { Some(p.text.as_str()) } else { None })
+                .collect();
+            assert_eq!(sent.len(), if mode == ToolsMode::Edit { 4 } else { 2 }, "{mode:?}: {sent:?}");
+            assert!(sent.contains(&"What's the trend?") && sent.contains(&"Where could a breakout confirm?"));
+        }
+    }
+
+    #[test]
+    fn finished_tool_group_uses_frozen_total_turn_time_not_tool_sum() {
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("answer").unwrap(), 1);
+        let turn = &mut pane.turns[0];
+        let label = "Analyzed chart · 3 steps".to_owned();
+        assert_eq!(tool_group_duration(label.clone(), Some(turn)), "Analyzed chart · 3 steps · 7s");
+        for (millis, expected) in
+            [(0, "<1s"), (999, "<1s"), (1000, "1s"), (1499, "1s"), (1500, "2s"), (7499, "7s"), (7500, "8s")]
+        {
+            turn.duration = Some(Duration::from_millis(millis));
+            assert_eq!(tool_group_duration(label.clone(), Some(turn)), format!("{label} · {expected}"));
+        }
+        turn.finished = false;
+        assert_eq!(tool_group_duration(label.clone(), Some(turn)), label);
+        assert_eq!(pane.coalescer.due_in(Instant::now(), true), None);
+
+        let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
+        pane.start_prompt(Prompt { text: "Read chart".into(), requires_tools: true });
+        pane.turns[0].started_at = Instant::now() - Duration::from_secs(7);
+        pane.event(BridgeEvent::Completed {
+            turn: "duration".into(),
+            status: "completed".into(),
+            calls: 0,
+            interrupt_elapsed: None,
+        });
+        let measured = pane.turns[0].duration.unwrap();
+        assert!(measured >= Duration::from_secs(7));
+        pane.finish_turn();
+        assert_eq!(pane.turns[0].duration, Some(measured), "completion freezes the duration");
     }
 
     #[test]
@@ -2452,6 +3583,213 @@ mod polish_tests {
             assert_eq!(label(&running), expected);
             assert_eq!(running.coalescer.due_in(Instant::now(), true), None, "static running icons add no timer");
         }
+    }
+
+    #[test]
+    fn recovered_zone_headers_keep_failed_rows_and_muted_actionable_errors() {
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("edits").unwrap(), 1);
+        pane.wire("item/completed", &serde_json::json!({"item": {
+            "type":"dynamicToolCall", "id":"failed", "tool":"create_drawing", "success":false,
+            "arguments":{"symbol":crate::agent_demo::SYMBOL,"kind":"rectangle","zone_role":"support",
+                "anchors":[{"time":86400,"price":8.},{"time":172800,"price":12.}]},
+            "contentItems":[{"type":"inputText","text":"{\"error\":{\"message\":\"anchors[1].price must differ from anchors[0].price\"}}"}]
+        }}));
+        crate::agent_demo::tool(&mut pane, "retry", "create_drawing", Some(true), Some("Support zone"));
+        crate::agent_demo::tool(&mut pane, "second", "create_drawing", Some(true), Some("Resistance zone"));
+        crate::agent_demo::complete(&mut pane, "completed");
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| pane.conversation(ui, &mut Vec::new()));
+        output.textures_delta.clear();
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s == "Drew 2 zones · 3 steps · 7s · 1 retry"));
+        assert!(text.iter().any(|(s, _)| s == "anchors[1].price must differ from anchors[0].price"));
+        let traces: Vec<_> =
+            pane.blocks.iter().filter_map(|b| if let RenderedBlock::Tool(t) = b { Some(t) } else { None }).collect();
+        assert_eq!(traces[0].success, Some(false));
+        assert_eq!(recovered_failures(&traces), 1);
+        let mut line = (*traces[2]).clone();
+        line.summary = Some("Horizontal line".into());
+        line.target_args["kind"] = "horizontal".into();
+        line.target_args["zone_role"] = Value::Null;
+        assert_eq!(tool_group_label(&[traces[1], &line], None), "Drew 1 zone and 1 line · 2 steps");
+        assert_eq!(
+            tool_group_label(&[traces[1], traces[0]], None),
+            "Drew 1 zone · 2 steps · 1 failed",
+            "an earlier success cannot recover a later failure"
+        );
+        assert_eq!(tool_group_label_outcome(&[traces[0]], None, true), "Chart tools failed · 1 step · 1 failed");
+        assert_eq!(retry_suffix("Finished".into(), 2), "Finished · 2 retries");
+        assert_eq!(recovered_failures(&[traces[0], traces[0], traces[1]]), 2);
+        let mut other = (*traces[1]).clone();
+        other.name = "analyze".into();
+        assert_eq!(recovered_failures(&[traces[0], &other]), 0);
+    }
+
+    #[test]
+    fn final_answer_completion_does_not_recover_a_tool_failure() {
+        for (status, answer, recovered) in
+            [("completed", true, true), ("failed", true, false), ("completed", false, false)]
+        {
+            let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("edits").unwrap(), 1);
+            crate::agent_demo::tool(&mut pane, "failed", "analyze", Some(false), None);
+            if answer {
+                pane.wire("item/completed", &serde_json::json!({"item":{"type":"agentMessage", "id":"answer", "text":"Confirmed results only."}}));
+            }
+            crate::agent_demo::complete(&mut pane, status);
+            assert_eq!(pane.turns[0].final_answer_succeeded, recovered);
+            let traces: Vec<_> = pane
+                .blocks
+                .iter()
+                .filter_map(|b| if let RenderedBlock::Tool(t) = b { Some(t) } else { None })
+                .collect();
+            assert_eq!(recovered_failures(&traces), 0);
+            assert_eq!(tool_group_label_outcome(&traces, None, recovered), "Chart tools failed · 1 step · 1 failed");
+        }
+    }
+
+    fn review_trace(id: &str, success: bool, summary: &str) -> Trace {
+        Trace {
+            id: id.into(),
+            name: "create_drawing".into(),
+            success: Some(success),
+            duration_ms: Some(10),
+            arguments: String::new(),
+            target_args: serde_json::json!({"kind":"rectangle", "zone_role":if summary.contains("support") { Some("support") } else if summary.contains("resistance") { Some("resistance") } else { None },
+                "anchors":[{"time":86400,"price":8.},{"time":172800,"price":12.}]}),
+            summary: Some(summary.into()),
+            interrupted: false,
+            error: (!success).then(|| "anchors[1].time must be within the loaded range".into()),
+        }
+    }
+
+    #[test]
+    fn review_different_drawing_success_is_not_a_retry() {
+        let failed = review_trace("r", false, "resistance zone");
+        let other = review_trace("s", true, "#7 · support zone");
+        assert_eq!(recovered_failures(&[&failed, &other]), 0);
+        assert_eq!(tool_group_label(&[&failed, &other], None), "Drew 1 zone · 2 steps · 1 failed");
+    }
+
+    #[test]
+    fn retries_require_the_same_drawing_identity_or_normalized_tool_arguments() {
+        let failed = review_trace("failed", false, "support zone");
+        let mut later = review_trace("later", true, "support zone");
+        assert_eq!(recovered_failures(&[&failed, &later]), 1);
+        later.target_args["anchors"] = serde_json::json!([{"price":11.},{"price":15.}]);
+        assert_eq!(recovered_failures(&[&failed, &later]), 1, "overlapping ranges");
+        later.target_args["anchors"] = serde_json::json!([{"price":20.},{"price":25.}]);
+        assert_eq!(recovered_failures(&[&failed, &later]), 0, "different price target");
+        let mut labeled = failed.clone();
+        labeled.target_args["label"] = "weekly demand".into();
+        later.target_args["label"] = "weekly demand".into();
+        assert_eq!(recovered_failures(&[&labeled, &later]), 1, "same explicit label");
+        for (field, value) in [("kind", "horizontal"), ("zone_role", "resistance"), ("side", "sell")] {
+            let mut other = later.clone();
+            other.target_args["anchors"] = failed.target_args["anchors"].clone();
+            other.target_args[field] = value.into();
+            assert_eq!(recovered_failures(&[&failed, &other]), 0, "{field}");
+        }
+        assert_eq!(recovered_failures(&[&later, &labeled]), 0, "success must be later");
+        for tool in ["update_drawing", "delete_drawing"] {
+            let mut failed = failed.clone();
+            failed.name = tool.into();
+            failed.target_args = serde_json::json!({"id":7,"label":"before"});
+            let mut later = failed.clone();
+            later.success = Some(true);
+            later.target_args["label"] = "after".into();
+            assert_eq!(recovered_failures(&[&failed, &later]), 1);
+            later.target_args["id"] = 8.into();
+            assert_eq!(recovered_failures(&[&failed, &later]), 0);
+        }
+        let mut failed = failed;
+        failed.name = "analyze".into();
+        failed.target_args = normalized_args(
+            &serde_json::from_str::<Value>(r#"{ "mode": "trend", "symbol": " AAA ", "options": {"limit":20} }"#)
+                .unwrap(),
+        );
+        let mut later = failed.clone();
+        later.success = Some(true);
+        later.target_args = normalized_args(&serde_json::json!({"options":{"limit":20},"symbol":"AAA","mode":"trend"}));
+        assert_eq!(recovered_failures(&[&failed, &later]), 1);
+        later.target_args["options"]["limit"] = 30.into();
+        assert_eq!(recovered_failures(&[&failed, &later]), 0);
+    }
+
+    #[test]
+    fn partially_retried_failures_keep_success_summary_and_only_failed_suffix() {
+        let failed = review_trace("support-failed", false, "support zone");
+        let unresolved = review_trace("resistance-failed", false, "resistance zone");
+        let success = review_trace("support-success", true, "support zone");
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("edits").unwrap(), 1);
+        pane.blocks.extend([failed, unresolved.clone(), success].map(RenderedBlock::Tool));
+        crate::agent_demo::complete(&mut pane, "completed");
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| pane.conversation(ui, &mut Vec::new()));
+        output.textures_delta.clear();
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s.starts_with("Drew 1 zone · 3 steps · 1 failed")));
+        assert!(!text.iter().any(|(s, _)| s.contains("1 retry")));
+        let recovered = Trace { id: "resistance-success".into(), success: Some(true), error: None, ..unresolved };
+        pane.blocks.push(RenderedBlock::Tool(recovered));
+        let mut output = ctx.run_ui(Default::default(), |ui| pane.conversation(ui, &mut Vec::new()));
+        output.textures_delta.clear();
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s == "Drew 2 zones · 4 steps · 7s · 2 retries"));
+        assert!(!text.iter().any(|(s, _)| s.contains("1 failed")));
+    }
+
+    #[test]
+    fn review_plain_rectangle_is_not_a_zone() {
+        let rectangle = review_trace("p", true, "#9 · rectangle (2 anchors)");
+        assert_eq!(tool_group_label(&[&rectangle], None), "Drew 1 rectangle · 1 step");
+        assert_eq!(tool_group_label(&[&rectangle, &rectangle], None), "Drew 2 rectangles · 2 steps");
+        let zone = review_trace("zone", true, "support zone");
+        assert_eq!(tool_group_label(&[&zone, &rectangle], None), "Drew 1 zone and 1 rectangle · 2 steps");
+    }
+
+    #[test]
+    fn compact_reset_thresholds_include_local_date_only_when_needed() {
+        let now = crate::agent_demo::SAMPLE_NOW;
+        for (minutes, expected) in [
+            (1, "in 1 minute"),
+            (42, "in 42 minutes"),
+            (89, "in 89 minutes"),
+            (90, "in 1h 30m"),
+            (320, "in 5h 20m"),
+            (2879, "in 47h 59m"),
+            (2880, "in 2d 0h"),
+            (9420, "in 6d 13h"),
+        ] {
+            let reset = reset_time_at(Some(now + minutes * 60), now);
+            assert!(reset.starts_with(&format!("{expected} · ")), "{reset}");
+            assert!(reset.ends_with(&local_time(now + minutes * 60)));
+            if minutes >= 2880 {
+                let date = chrono::DateTime::from_timestamp(now + minutes * 60, 0)
+                    .unwrap()
+                    .with_timezone(&chrono::Local)
+                    .format("%b %d")
+                    .to_string();
+                assert!(reset.contains(&date), "{reset}");
+            }
+        }
+        assert!(reset_time_at(Some(now - 1), now).starts_with("now · "));
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("rate-limited").unwrap(), 1);
+        pane.limits[0] =
+            Limit { id: "weekly".into(), used: 25., reset: reset_time_at(Some(now + 9420 * 60), now), minutes: 10080 };
+        pane.limits_value = Value::Null;
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            pane.show(ui, "BTC/USD · 4H", egui::Id::new("long-reset"));
+        });
+        output.textures_delta.clear();
+        assert!(texts(&output).iter().any(|(s, _)| s == "weekly · Weekly limit 25% used"));
+        // When not blocked, meters may still expose their own reset windows.
+        pane.state = Onboarding::Ready;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            pane.show(ui, "BTC/USD · 4H", egui::Id::new("long-reset-ready"));
+        });
+        output.textures_delta.clear();
+        assert!(texts(&output).iter().any(|(s, _)| s.contains("Weekly limit 25% used · resets in 6d 13h")));
     }
 
     #[test]
@@ -2486,7 +3824,7 @@ mod polish_tests {
         assert_eq!(RETRY_HELP, "Sends the same prompt again and starts a new answer.");
         assert_eq!(
             CHART_EDITS_HELP,
-            "The agent can add, change and remove its own drawings, indicators and comparisons on the pinned chart. Your objects are never changed, and every agent edit can be undone."
+            "The agent can add, change and remove its own drawings, indicators and comparisons on the pinned chart, and propose watchlist and alert changes for you to approve. Your objects are never changed without approval, and every agent edit can be undone."
         );
     }
 
@@ -2928,7 +4266,7 @@ mod polish_tests {
         let output = frame(&mut pane, &ctx, vec![]);
         let text = texts(&output);
         assert!(!text.iter().any(|(s, _)| s.contains("Horizontal line")));
-        let pos = text.iter().find(|(s, _)| s == "Drew 1 line · 4 steps").unwrap().1.center();
+        let pos = text.iter().find(|(s, _)| s == "Drew 1 line · 4 steps · 7s").unwrap().1.center();
         let click = |pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -2943,7 +4281,7 @@ mod polish_tests {
         assert!(text.iter().any(|(s, _)| s == "Draw · Horizontal line at 27,534.92"));
         assert!(text.iter().any(|(s, _)| s == "42 ms"));
         assert!(!text.iter().any(|(s, _)| s.contains("#1:3") || s == "Details" || s.contains("chart_id")));
-        assert!(text.iter().any(|(s, _)| s == "Drew 1 line · 4 steps"));
+        assert!(text.iter().any(|(s, _)| s == "Drew 1 line · 4 steps · 7s"));
         assert_eq!(price_label(27534.92), "27,534.92");
         assert_eq!(main_tool_label("#1:3 · RSI 14"), "RSI 14");
     }
@@ -2982,8 +4320,10 @@ mod polish_tests {
                 success: Some(true),
                 duration_ms: Some(42),
                 arguments: "safe projected arguments".into(),
+                target_args: Value::Null,
                 summary: Some("#1:3 · Horizontal line at 27,534.92".into()),
                 interrupted: false,
+                error: None,
             };
             for (success, interrupted, expected) in [
                 (Some(true), false, "ok"),
@@ -3180,7 +4520,7 @@ mod polish_tests {
             let undo = text.iter().find(|(s, _)| s == "Undo 3 chart changes").unwrap().1;
             let prompt = text.iter().find(|(s, _)| s.starts_with("Mark support")).unwrap().1;
             let time = text.iter().find(|(s, _)| s == &pane.turns[0].local_time).unwrap().1;
-            let tools = text.iter().find(|(s, _)| s == "Drew 2 lines and added RSI 14 · 3 steps").unwrap().1;
+            let tools = text.iter().find(|(s, _)| s == "Drew 2 lines and added RSI 14 · 3 steps · 7s").unwrap().1;
             assert!(undo.top() >= prompt.bottom());
             assert!(time.bottom() <= prompt.top());
             assert!(tools.right() <= undo.left());
@@ -3229,7 +4569,7 @@ mod polish_tests {
         });
         output.textures_delta.clear();
         let text = texts(&output);
-        assert!(text.iter().any(|(s, _)| s == "5-hour limit · 100% used"));
+        assert!(text.iter().any(|(s, _)| s == "5-hour limit 100% used"));
         assert_eq!(text.iter().filter(|(s, _)| s.contains("20:42 EDT")).count(), 1);
         assert_eq!(text.iter().filter(|(s, _)| s.contains("in 42 minutes")).count(), 1);
     }
@@ -3368,8 +4708,8 @@ mod tests {
             crate::layouts::PaneSettings::Agent(settings.clone())
         );
         assert_eq!(settings.tool_set_if_available(false), ToolSet::ReadOnly);
-        assert_eq!(settings.tool_set_if_available(true), ToolSet::Edit);
-        assert_eq!(settings.tool_set(), ToolSet::Edit);
+        assert_eq!(settings.tool_set_if_available(true), ToolSet::Workflows);
+        assert_eq!(settings.tool_set(), ToolSet::Workflows);
         assert_eq!(Settings::default().tool_set(), ToolSet::ReadOnly);
         assert!(serde_json::from_str::<Settings>("{\"token\":\"never\"}").is_err());
     }
@@ -3592,7 +4932,7 @@ mod wire_tests {
         assert!(
             matches!(pane.blocks.last(), Some(RenderedBlock::Notice(text)) if text.contains("Queue stays paused") && text.contains("restart"))
         );
-        assert_eq!(pane.prepare_session_start(), Some(ToolSet::Edit));
+        assert_eq!(pane.prepare_session_start(), Some(ToolSet::Workflows));
         pane.transition(Onboarding::Ready);
         assert!(pane.next_prompt().is_none());
         pane.resume_queue();
@@ -3738,7 +5078,13 @@ mod wire_tests {
             );
             pane.refresh_undo(&[], None);
             let (_, output) = frame(&mut pane, &ctx, vec![]);
-            text_position(&output, "2 changes reverted · 1 kept because you edited them");
+            text_position(
+                &output,
+                &tool_group_duration(
+                    "2 changes reverted · 1 kept because you edited them".into(),
+                    Some(&pane.turns[0]),
+                ),
+            );
             frame(&mut pane, &ctx, vec![click(true)]);
             let (actions, _) = frame(&mut pane, &ctx, vec![click(false)]);
             assert!(!actions.iter().any(|a| matches!(a, Action::UndoTurn(_))));

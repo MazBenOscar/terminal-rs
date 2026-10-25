@@ -839,6 +839,8 @@ impl TerminalApp {
     pub(super) fn apply_doc(&mut self, mut doc: LayoutDoc) {
         // Layout documents retain provenance, but never the in-memory inverse edits.
         self.agent_turns.clear();
+        self.agent_pane.workflows.reset();
+        self.agent_pane.workflows.undo.clear();
         doc.repair();
         // Imported identities must not alias charts that are live at load time,
         // even though those charts are about to be replaced.

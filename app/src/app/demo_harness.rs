@@ -47,6 +47,11 @@ impl TerminalApp {
         let uid = app.peek_chart().expect("demo chart").uid;
         app.pinned_agent_chart = Some(uid);
         app.agent_pane = agent_demo::pane(state, uid);
+        if state.workflows() {
+            app.create_watchlist("Agent Test".into(), Vec::new()).expect("offline fixture watchlist");
+            let before = serde_json::json!(app.watchlists.last().unwrap());
+            app.agent_pane.workflows.proposals[1].before = before;
+        }
         let agent = app.new_pane(PaneKind::Agent(app.agent_pane.settings.clone()));
         app.dock = Node::split_with(Dir::Row, vec![Node::leaf(chart), Node::leaf(agent)], vec![0.58, 0.42]);
         app.focus = agent;
@@ -69,6 +74,10 @@ impl TerminalApp {
         }
         let state = demo.config.state;
         self.agent_demo.as_mut().unwrap().populated = true;
+        if state.approved() {
+            // Construct the already-approved offline fixture; interactive demo controls stay inert.
+            self.confirm_workflows(TURN, true);
+        }
         if state.edits()
             && let Err(reason) = self.populate_demo_edits(state.undone())
         {
@@ -84,17 +93,36 @@ impl TerminalApp {
         }
         let a = bars[bars.len() - 40];
         let b = bars[bars.len() - 10];
-        let support = bars[bars.len() - 60..].iter().map(|b| b.low).fold(f64::INFINITY, f64::min);
-        let edits = [
+        let zones = tr_agent_tools::analytics::support_resistance(bars, 10);
+        let support = zones
+            .iter()
+            .filter(|z| z.low <= bars.last().unwrap().close)
+            .min_by(|a, b| {
+                (a.high - bars.last().unwrap().close).abs().total_cmp(&(b.high - bars.last().unwrap().close).abs())
+            })
+            .ok_or("Demo support missing")?;
+        let resistance = zones
+            .iter()
+            .filter(|z| z.high >= bars.last().unwrap().close)
+            .min_by(|a, b| {
+                (a.low - bars.last().unwrap().close).abs().total_cmp(&(b.low - bars.last().unwrap().close).abs())
+            })
+            .ok_or("Demo resistance missing")?;
+        let edits: [(&str, LiveArgs, String); 3] = [
             ("create_drawing", LiveArgs::CreateDrawing(serde_json::from_value(json!({
-                "symbol":agent_demo::SYMBOL, "kind":"horizontal", "anchors":[{"time":a.ts,"price":support}], "label":"Sample support"
-            })).map_err(|e| e.to_string())?), format!("Horizontal line at {}", crate::agent_pane::price_label(support))),
+                "symbol":agent_demo::SYMBOL, "kind":"rectangle", "zone_role":"support", "source_timeframe":"1W", "anchors":[{"time":a.ts,"price":support.low},{"time":b.ts,"price":support.high}]
+            })).map_err(|e| e.to_string())?), "Support zone".into()),
             ("create_drawing", LiveArgs::CreateDrawing(serde_json::from_value(json!({
-                "symbol":agent_demo::SYMBOL, "kind":"trend_line", "anchors":[{"time":a.ts,"price":a.low},{"time":b.ts,"price":b.low}], "label":"Sample trend"
-            })).map_err(|e| e.to_string())?), "Trend line".into()),
+                "symbol":agent_demo::SYMBOL, "kind":"rectangle", "zone_role":"resistance", "source_timeframe":"1W", "anchors":[{"time":a.ts,"price":resistance.low},{"time":b.ts,"price":resistance.high}]
+            })).map_err(|e| e.to_string())?), "Resistance zone".into()),
             ("add_indicator", LiveArgs::AddIndicator(serde_json::from_value(json!({"code":"RSI","params":[14]})).map_err(|e| e.to_string())?), "RSI 14".into()),
         ];
         let mut session = Session::default();
+        self.agent_pane.wire("item/completed", &json!({"item":{
+            "type":"dynamicToolCall", "id":"edit-retry", "tool":"create_drawing", "success":false,
+            "arguments":{"kind":"rectangle","zone_role":"support"},
+            "error":{"message":"anchors[1].price must differ from anchors[0].price; use analyze low and high for a non-zero zone"}
+        }}));
         for (index, (name, args, label)) in edits.into_iter().enumerate() {
             let uid = self.pinned_agent_chart.ok_or("Demo pin missing")?;
             let chart = self.agent_chart_mut(crate::agent_queue::ChartTarget::Uid(uid)).ok_or("Demo chart missing")?;
@@ -103,6 +131,7 @@ impl TerminalApp {
                 uid,
                 symbol: &chart.symbol,
                 timeframe: chart.tf,
+                price_decimals: chart.agent_price_decimals,
                 bars: chart.source_bars().bars,
                 drawings: &chart.drawings,
                 indicators: &chart.indicators,
@@ -133,7 +162,7 @@ impl TerminalApp {
         }
         self.agent_turns.push(TURN.into());
         self.agent_pane.wire("item/completed", &json!({"item":{
-            "type":"agentMessage", "id":"edits-reply", "text":"Added two lines and **RSI 14** to the weekly sample chart.\n\n- A horizontal support level at the recent sample low.\n- A two-anchor trend line using loaded weekly lows.\n- RSI 14 in its own pane.\n\nEach object is badged Agent. Undo this turn removes all three; your own chart objects are unchanged. Synthetic sample data only."
+            "type":"agentMessage", "id":"edits-reply", "text":"Drew labelled weekly support and resistance zones and added **RSI 14** to the sample chart.\n\nThe first rectangle attempt failed; its corrected retry succeeded. Labels show W1 and the zone bounds. Undo this turn removes all three changes; your own chart objects are unchanged. Synthetic sample data only."
         }}));
         agent_demo::complete(&mut self.agent_pane, "completed");
         if undone {
@@ -250,6 +279,47 @@ mod tests {
     }
 
     #[test]
+    fn workflow_fixtures_show_two_pending_rows_or_applied_undoable_changes() {
+        use crate::agent_bridge::ProposalStatus;
+        for name in ["proposal", "approved"] {
+            let scratch = agent_demo::Scratch::create(&root()).unwrap();
+            let mut app = fixture(&scratch.0, name);
+            assert_eq!(app.agent_pane.workflows.proposals.len(), 2);
+            let approved = name == "approved";
+            assert!(
+                app.agent_pane
+                    .workflows
+                    .proposals
+                    .iter()
+                    .all(|p| p.status == if approved { ProposalStatus::Approved } else { ProposalStatus::Pending })
+            );
+            assert_eq!(app.watchlists.len(), if approved { 3 } else { 2 });
+            let symbols = &app.agent_pane.workflows.proposals[1].symbols;
+            assert_eq!(symbols.len(), 3);
+            assert!(!symbols[1].selected);
+            if approved {
+                assert_eq!(symbols[0].outcome.as_deref(), Some("Added"));
+                assert_eq!(symbols[1].outcome.as_deref(), Some("Declined"));
+                assert!(
+                    app.agent_pane.workflows.turn_summary(TURN).unwrap().contains("added 2 of 3 symbols to Agent Test")
+                );
+                assert!(app.agent_pane.workflows.decision_line(TURN).unwrap().starts_with("You approved 3 of 4 · "));
+                assert!(app.agent_pane.turns[0].undo_available);
+                assert_eq!(app.agent_pane.turns[0].chart_changes, Some(2));
+                assert_eq!(app.undo_agent_turn(TURN).unwrap().reverted, 2);
+                assert_eq!(app.watchlists.len(), 2);
+                assert!(app.watchlists[1].symbols.is_empty());
+            } else {
+                assert_eq!(
+                    app.agent_pane.workflows.turn_summary(TURN).as_deref(),
+                    Some("Awaiting approval · 4 changes")
+                );
+                assert!(app.agent_pane.workflows.decision_line(TURN).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn edit_fixtures_use_real_agent_objects_ids_and_inverse_undo() {
         for name in ["edits", "undone"] {
             let scratch = agent_demo::Scratch::create(&root()).unwrap();
@@ -262,13 +332,15 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 traces.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
-                ["create_drawing", "create_drawing", "add_indicator"]
+                ["create_drawing", "create_drawing", "create_drawing", "add_indicator"]
             );
             assert!(
-                traces
+                traces[1..]
                     .iter()
                     .all(|t| t.success == Some(true) && t.summary.as_ref().is_some_and(|s| s.starts_with('#')))
             );
+            assert_eq!(traces[0].success, Some(false));
+            assert!(traces[0].error.as_deref().unwrap().contains("anchors[1].price"));
             let chart = app.peek_chart().unwrap();
             let turn = &app.agent_pane.turns[0];
             assert!(turn.finished && turn.made_edits);
@@ -277,11 +349,14 @@ mod tests {
                 for (index, drawing) in chart.drawings.iter().enumerate() {
                     assert_eq!(drawing.created_by, tr_chart::drawings::Author::Agent);
                     assert_eq!(drawing.turn_id.as_deref(), Some(TURN));
-                    assert!(traces[index].summary.as_ref().unwrap().starts_with(&format!("#{} ·", drawing.id)));
+                    assert!(traces[index + 1].summary.as_ref().unwrap().starts_with(&format!("#{} ·", drawing.id)));
+                    assert_eq!(drawing.tool, tr_chart::drawings::Tool::Rectangle);
+                    assert!(drawing.zone_role.is_some());
+                    assert!(drawing.text.starts_with("W1 ") && drawing.text.contains('–'));
                 }
                 let rsi = chart.indicators.iter().find(|s| s.code == "RSI").unwrap().chart.as_ref().unwrap();
                 assert!(rsi.agent_highlight());
-                assert!(traces[2].summary.as_ref().unwrap().starts_with(&format!("#{}:{} ·", chart.uid, rsi.id)));
+                assert!(traces[3].summary.as_ref().unwrap().starts_with(&format!("#{}:{} ·", chart.uid, rsi.id)));
                 assert!(turn.undo_available);
                 assert_eq!(turn.chart_changes, Some(3));
                 assert!(app.agent_turn_undo_available(TURN));

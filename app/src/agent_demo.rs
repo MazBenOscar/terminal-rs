@@ -29,6 +29,8 @@ pub const STATES: &[&str] = &[
     "stopped-unsafe",
     "stopped-recoverable",
     "privacy",
+    "proposal",
+    "approved",
 ];
 pub const TURN: &str = "000000000000000000000000000000a2c0:1";
 pub const SAMPLE_NOW: i64 = 1_792_713_600; // 2026-10-23 UTC, fixed across captures.
@@ -44,6 +46,12 @@ impl State {
             .copied()
             .map(Self)
             .ok_or_else(|| format!("Unknown TR_AGENT_DEMO state {name:?}; expected one of: {}", STATES.join(", ")))
+    }
+    pub fn workflows(self) -> bool {
+        matches!(self.0, "proposal" | "approved")
+    }
+    pub fn approved(self) -> bool {
+        self.0 == "approved"
     }
     pub fn edits(self) -> bool {
         matches!(self.0, "edits" | "undone")
@@ -124,6 +132,7 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
     pane.data_basis = crate::agent_pane::DataBasis {
         sample: true,
         last_bar: Some(tr_core::Timeframe::W1.bucket_start(SAMPLE_NOW)),
+        latest_price_update: None,
         incomplete: Some("Weekly".into()),
     };
     // Same model projection as a model/list reply, with no account or backend access.
@@ -167,7 +176,7 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
         "streaming" | "answer" | "markdown" | "edits" | "undone" | "interrupted" | "queue" | "tools-unavailable"
     ) {
         let prompt = if state.edits() {
-            "Mark support and the rising trend; add RSI 14. Use sample bars only."
+            "Mark support and resistance zones; add RSI 14. Use sample bars only."
         } else if state.0 == "markdown" {
             "Give me a structured weekly review with a comparison table."
         } else {
@@ -212,6 +221,59 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
             // Chart object IDs and the completed answer are filled after sample history arrives.
         }
     }
+    if matches!(state.0, "proposal" | "approved") {
+        use crate::agent_bridge::{Proposal, ProposalStatus};
+        pane.settings.tools = ToolsMode::Edit;
+        pane.session_tools = Some(tr_agent_tools::ToolSet::Workflows);
+        pane.start_prompt(Prompt {
+            text: "Create Research and add AAPL, MSFT and BTC-USD to Agent Test.".into(),
+            requires_tools: false,
+        });
+        pane.event(BridgeEvent::Started { turn: TURN.into() });
+        pane.turns[0].local_time = crate::agent_pane::local_time(SAMPLE_NOW);
+        for id in [1, 2] {
+            let (name, arguments, args, summary) = if id == 1 {
+                (
+                    "create_watchlist",
+                    json!({"name":"Research"}),
+                    tr_agent_tools::args::LiveArgs::CreateWatchlist(tr_agent_tools::args::CreateWatchlist {
+                        name: "Research".into(),
+                    }),
+                    "Create watchlist · Research",
+                )
+            } else {
+                let arguments =
+                    json!({"watchlist":"Agent Test","symbols":["AAPL US Equity","MSFT US Equity","COINBASE:BTC-USD"]});
+                (
+                    "add_watchlist_symbols",
+                    arguments.clone(),
+                    tr_agent_tools::args::LiveArgs::AddWatchlistSymbols(serde_json::from_value(arguments).unwrap()),
+                    "Add to Agent Test",
+                )
+            };
+            pane.wire("item/completed", &json!({"item":{"id":format!("proposal-{id}"),"type":"dynamicToolCall","tool":name,"success":true,"arguments":arguments}}));
+            let mut symbols = Proposal::symbol_choices(&args);
+            if let Some(symbol) = symbols.get_mut(1) {
+                symbol.selected = false;
+            }
+            pane.workflows.proposals.push(Proposal {
+                id,
+                turn: TURN.into(),
+                args,
+                symbols,
+                decided_at: None,
+                summary: summary.into(),
+                user_owned: false,
+                selected: true,
+                deadline: Instant::now() + Duration::from_secs(600),
+                status: ProposalStatus::Pending,
+                before: if id == 1 { serde_json::Value::Null } else { json!({"name":"Agent Test","symbols":[]}) },
+            });
+        }
+        pane.workflows.next_id = 2;
+        pane.wire("item/completed", &json!({"item":{"type":"agentMessage","id":"workflow-reply","text":"Creating Research and adding AAPL, MSFT and Coinbase BTC-USD is awaiting your confirmation."}}));
+        complete(&mut pane, "completed");
+    }
     if state.0 == "queue" {
         pane.queue_review = true;
         pane.input = "Check momentum after those prompts.".into();
@@ -239,6 +301,18 @@ pub fn tool(pane: &mut AgentPane, id: &str, name: &str, success: Option<bool>, s
     let arguments = match name {
         "read_data" => json!({"symbol":SYMBOL, "timeframe":"1W", "limit":20}),
         "analyze" => json!({"symbol":SYMBOL, "mode":"trend", "timeframe":"1W", "limit":20}),
+        "create_drawing" => {
+            let summary = summary.unwrap_or_default().to_ascii_lowercase();
+            let role = if summary.contains("support") {
+                Some("support")
+            } else if summary.contains("resistance") {
+                Some("resistance")
+            } else {
+                None
+            };
+            json!({"symbol":SYMBOL, "kind":if role.is_some() || summary.contains("rectangle") { "rectangle" } else { "horizontal" },
+                "zone_role":role, "anchors":[{"time":86400,"price":8.},{"time":172800,"price":12.}]})
+        }
         _ => json!({"chart_id":"pinned"}),
     };
     pane.wire(
@@ -250,7 +324,13 @@ pub fn tool(pane: &mut AgentPane, id: &str, name: &str, success: Option<bool>, s
     );
 }
 pub fn complete(pane: &mut AgentPane, status: &str) {
+    if let Some(turn) = pane.turns.last_mut() {
+        turn.started_at = Instant::now() - Duration::from_secs(7);
+    }
     pane.event(BridgeEvent::Completed { turn: TURN.into(), status: status.into(), calls: 3, interrupt_elapsed: None });
+    if let Some(turn) = pane.turns.last_mut() {
+        turn.duration = Some(Duration::from_secs(7));
+    }
 }
 
 const ANSWER: &str = "BTC's weekly trend is recovering, but it is not yet a confirmed breakout.\n\n- **Momentum:** 3 consecutive higher closes; RSI 14 at **56.8**.\n- **Levels:** support near **$62,400**; resistance near **$68,200**.\n- **Risk:** a weekly close below support would weaken the recovery.\n\nThese are synthetic sample bars, not live quotes. The current weekly bar is provisional.";
@@ -371,7 +451,7 @@ mod tests {
 
     #[test]
     fn all_exact_state_names_populate_a_session_free_pane() {
-        assert_eq!(STATES.len(), 19);
+        assert_eq!(STATES.len(), 21);
         for name in STATES {
             let state = State::parse(name).unwrap();
             let mut pane = pane(state, 7);

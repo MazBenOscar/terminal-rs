@@ -24,7 +24,7 @@ use tr_core::{AssetClass, Bar, Security, Timeframe};
 use crate::chart_compare::Axis as CompareAxis;
 use crate::command::{IndicatorSpec, Range};
 use crate::congress_view::Action;
-use crate::theme::{self, amber, amber_dim, mono, muted, text, ui_font};
+use crate::theme::{self, amber, amber_dim, dp, mono, muted, text, ui_font};
 use crate::widgets;
 use crate::worker::{BuiltIndicator, PaneId, Request, Worker, initial_limit};
 
@@ -203,11 +203,12 @@ pub(crate) fn label_text(
     text: impl Into<String>,
     font: egui::FontId,
     color: Color32,
-) {
+) -> Rect {
     let galley = painter.layout_no_wrap(text.into(), font, color);
     let rect = anchor.anchor_size(pos, galley.size());
     label_plate(painter, rect);
     painter.galley(rect.min, galley, color);
+    rect.expand2(vec2(2., 1.))
 }
 
 const AXIS_W: f32 = 66.0;
@@ -466,6 +467,9 @@ pub struct ChartState {
     /// Resolved security for `symbol`.
     sec: Security,
     last_live: Option<std::time::Instant>,
+    /// Receipt time of an accepted live price/bar update, not the bar's open.
+    pub latest_price_update: Option<i64>,
+    pub agent_price_decimals: usize,
     last_indicator_req: Option<std::time::Instant>,
     indicator_revision: u64,
     indicator_snapshot: Option<(u64, u64, usize, Option<Bar>)>,
@@ -603,6 +607,8 @@ impl ChartState {
             hover_marker: None,
             sec: tr_data::security(symbol),
             last_live: None,
+            latest_price_update: None,
+            agent_price_decimals: 2,
             last_indicator_req: None,
             indicator_revision: 0,
             indicator_snapshot: None,
@@ -920,6 +926,7 @@ impl ChartState {
             limit: initial_limit(self.tf),
         });
         self.last_live = None;
+        self.latest_price_update = None;
         self.live_notice = None;
         if self.sec.has_congress_trades() {
             w.send(Request::Markers { pane: self.id, symbol: self.symbol.clone() });
@@ -1980,6 +1987,10 @@ impl ChartState {
         }
     }
 
+    pub fn price_update_time(&self) -> Option<i64> {
+        self.replay_cutoff.is_none().then_some(self.latest_price_update).flatten()
+    }
+
     #[cfg(test)]
     pub fn on_live_bars(&mut self, generation: u64, from: usize, tail: Vec<Bar>, len: usize, w: &Worker) {
         self.on_live_bars_revision(generation, self.series_revision + 1, from, tail, len, w);
@@ -2056,6 +2067,7 @@ impl ChartState {
         bars.truncate(from);
         bars.extend(tail);
         self.last_live = Some(std::time::Instant::now());
+        self.latest_price_update = Some(chrono::Utc::now().timestamp());
         self.cached_history = false;
         self.paging = false;
         self.loading = false;
@@ -2209,6 +2221,7 @@ impl ChartState {
         let crate::worker::SessionHistory { prepended, from_cache, exhausted, live, .. } = history;
         if live {
             self.last_live = Some(std::time::Instant::now());
+            self.latest_price_update = Some(chrono::Utc::now().timestamp());
         }
         self.source_bars = bars.clone();
         self.cached_history = from_cache;
@@ -3353,6 +3366,7 @@ impl ChartState {
                 let ticks = scale::price_ticks(scale.lo, scale.hi, tick_count);
                 let step = if ticks.len() > 1 { ticks[1] - ticks[0] } else { 1.0 };
                 let dec = scale::decimals_for(step).max(self.sec.decimals(scale.hi).min(3));
+                self.agent_price_decimals = dec;
                 let labels = ticks.iter().map(|t| scale::format_price(*t, dec)).collect();
                 (ticks, labels)
             }
@@ -3632,11 +3646,19 @@ impl ChartState {
             );
         }
 
+        let mut label_occupancy = Vec::new();
         if self.replay_cutoff.is_none() && self.chart_type != ChartType::Renko {
-            self.paint_price_alerts(ui, price_rect, &scale);
+            label_occupancy.extend(self.paint_price_alerts(ui, price_rect, &scale));
         }
-        self.data.analytics.paint_profile(ui, price_rect, &v, &self.bars, (self.tf, us), &scale);
-        self.data.context.paint(
+        label_occupancy.extend(self.data.analytics.paint_profile(
+            ui,
+            price_rect,
+            &v,
+            &self.bars,
+            (self.tf, us),
+            &scale,
+        ));
+        label_occupancy.extend(self.data.context.paint(
             ui,
             price_rect,
             &scale,
@@ -3647,7 +3669,7 @@ impl ChartState {
                 self.effective_session(),
                 self.replay_cutoff.is_none() && self.chart_type != ChartType::Renko,
             ),
-        );
+        ));
         if self.data.show_events && self.replay_cutoff.is_none() && self.chart_type != ChartType::Renko {
             crate::chart_events::paint(ui, price_rect, &v, &self.bars, self.tf, &self.events);
         }
@@ -3656,7 +3678,12 @@ impl ChartState {
             && !self.positions_orders_hidden
             && (self.data.account.positions || self.data.account.orders)
         {
-            self.account_overlay.paint(ui, price_rect, &scale, self.bars.last().map(|b| b.close));
+            label_occupancy.extend(self.account_overlay.paint(
+                ui,
+                price_rect,
+                &scale,
+                self.bars.last().map(|b| b.close),
+            ));
         }
 
         // ---- drawings ----
@@ -3666,7 +3693,7 @@ impl ChartState {
             plot_resp.clone()
         };
         if self.chart_type != ChartType::Renko && self.replay_cutoff.is_none() {
-            self.paint_drawings(ui, price_rect, &v, &scale, hover, &drawing_response);
+            self.paint_drawings(ui, price_rect, &v, &scale, (hover, &drawing_response), label_occupancy);
         }
 
         // ---- congress markers ----
@@ -4458,7 +4485,8 @@ impl ChartState {
         }));
     }
 
-    fn paint_price_alerts(&self, ui: &Ui, plot: Rect, scale: &PriceScale) {
+    fn paint_price_alerts(&self, ui: &Ui, plot: Rect, scale: &PriceScale) -> Vec<Rect> {
+        let mut bounds = Vec::new();
         use tr_core::price_alerts::Status;
         let painter = ui.painter_at(plot);
         for alert in self.price_alerts.iter().filter(|a| a.status != Status::Triggered && a.rule.is_none()) {
@@ -4490,7 +4518,9 @@ impl ChartState {
             );
             painter.rect_filled(rect, 0., theme::card());
             painter.galley(rect.min + vec2(3., 0.), galley, color);
+            bounds.push(rect);
         }
+        bounds
     }
 
     fn context_menu(&mut self, ui: &mut Ui, w: &Worker) {
@@ -5096,7 +5126,8 @@ impl ChartState {
             ui.add(egui::DragValue::new(&mut edited.width).range(0.5..=6.0).speed(0.1).prefix("Width "));
             let mut custom = edited.color.is_some();
             if ui.checkbox(&mut custom, "Custom drawing color").changed() {
-                edited.color = custom.then_some(theme::cyan().to_array()[..3].try_into().unwrap());
+                edited.color =
+                    custom.then(|| crate::drawing_paint::drawing_color(&edited).to_array()[..3].try_into().unwrap());
             }
             if let Some(color) = &mut edited.color {
                 ui.color_edit_button_srgb(color);
@@ -5471,9 +5502,10 @@ impl ChartState {
         rect: Rect,
         v: &Viewport,
         s: &PriceScale,
-        hover: Option<Pos2>,
-        resp: &egui::Response,
+        interaction: (Option<Pos2>, &egui::Response),
+        mut occupied: Vec<Rect>,
     ) {
+        let (hover, resp) = interaction;
         if self.drawings_hidden {
             return;
         }
@@ -5755,22 +5787,49 @@ impl ChartState {
             preview.pattern_points.push(pointer_anchor(self, h));
             all.push((preview, true));
         }
-        for (d, selected) in all {
+        let prepared: Vec<_> = all
+            .into_iter()
+            .map(|(d, selected)| {
+                let shapes = self.drawing_shapes(ui, &d, rect, v, s);
+                (d, selected, shapes)
+            })
+            .collect();
+        let context = crate::drawing_paint::Paint {
+            painter: &p,
+            rect,
+            stroke: Stroke::new(dp(1.), theme::muted()),
+            selected: false,
+        };
+        occupied.extend(
+            prepared.iter().flat_map(|(d, _, shapes)| crate::drawing_paint::label_bounds(&context, shapes, d.tool)),
+        );
+        let mut tags = Vec::new();
+        for (d, selected, shapes) in prepared {
             if d.agent_highlight() {
-                let at =
-                    pos2(rect.left() + v.x_of(self.index_of_ts(d.a.ts)) as f32, rect.top() + s.y_of(d.a.price) as f32);
-                if at.is_finite() {
-                    p.text(
-                        at + vec2(5., -8.),
-                        Align2::LEFT_BOTTOM,
-                        "Agent",
-                        mono(9.),
-                        theme::cyan().gamma_multiply(0.65),
-                    );
+                let size = p.layout_no_wrap("Agent".into(), mono(9.), theme::muted()).size();
+                let preferred = if d.tool == Tool::Rectangle {
+                    shapes.iter().find_map(|(shape, _)| {
+                        if let drawings::Shape::Rect(a, b) = shape {
+                            let zone =
+                                Rect::from_two_pos(pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32));
+                            Some((zone.intersect(rect), zone.min + vec2(dp(5.), dp(5.))))
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    crate::drawing_paint::label_bounds(&context, &shapes, d.tool)
+                        .first()
+                        .map(|label| (rect, pos2(label.left() - size.x - dp(6.), label.top() + dp(3.))))
+                };
+                if let Some(tag) =
+                    preferred.and_then(|(area, at)| crate::drawing_paint::provenance_rect(area, at, size, &occupied))
+                {
+                    occupied.push(tag);
+                    tags.push(tag);
                 }
             }
-            let color =
-                if selected { amber() } else { d.color.map_or(theme::cyan(), |[r, g, b]| Color32::from_rgb(r, g, b)) };
+            let color = if selected { amber() } else { crate::drawing_paint::drawing_color(&d) };
             let stroke = Stroke::new(if selected { d.width.clamp(2.0, 6.0) } else { d.width.clamp(0.5, 6.0) }, color);
             if selected {
                 for anchor in drawings::handles(&d) {
@@ -5786,8 +5845,11 @@ impl ChartState {
             crate::drawing_paint::paint(
                 &d,
                 &crate::drawing_paint::Paint { painter: &p, rect, stroke, selected },
-                self.drawing_shapes(ui, &d, rect, v, s),
+                shapes,
             );
+        }
+        for tag in tags {
+            p.text(tag.min, Align2::LEFT_TOP, "Agent", mono(9.), theme::muted());
         }
     }
 
@@ -6862,7 +6924,7 @@ mod tests {
             let v = Viewport { right: 100., bar_px: 8., width_px: 800. };
             let scale = PriceScale::new(100., 200., log, 400.);
             let response = ui.interact(rect, egui::Id::new("expanded-drawing-test"), Sense::click_and_drag());
-            chart.paint_drawings(ui, rect, &v, &scale, ui.input(|i| i.pointer.hover_pos()), &response);
+            chart.paint_drawings(ui, rect, &v, &scale, (ui.input(|i| i.pointer.hover_pos()), &response), Vec::new());
         })
     }
 
@@ -7005,7 +7067,14 @@ mod tests {
                     let v = Viewport { right: 100., bar_px: 8., width_px: 800. };
                     let scale = PriceScale::new(100., 200., false, 400.);
                     let response = ui.interact(rect, egui::Id::new("expanded-drawing-test"), Sense::click_and_drag());
-                    chart.paint_drawings(ui, rect, &v, &scale, ui.input(|i| i.pointer.hover_pos()), &response);
+                    chart.paint_drawings(
+                        ui,
+                        rect,
+                        &v,
+                        &scale,
+                        (ui.input(|i| i.pointer.hover_pos()), &response),
+                        Vec::new(),
+                    );
                 },
             );
             output.textures_delta.clear();
@@ -8597,6 +8666,30 @@ mod tests {
     }
 
     #[test]
+    fn zone_custom_color_checkbox_seeds_current_theme_role() {
+        use tr_chart::drawings::ZoneRole;
+        for role in [ZoneRole::Support, ZoneRole::Resistance] {
+            let ctx = egui::Context::default();
+            let mut chart = sample_chart();
+            let mut drawing =
+                Drawing::new(Tool::Rectangle, Anchor { ts: 0, price: 10. }, Anchor { ts: 86400, price: 12. });
+            drawing.zone_role = Some(role);
+            let expected: [u8; 3] = crate::drawing_paint::drawing_color(&drawing).to_array()[..3].try_into().unwrap();
+            chart.drawings = vec![drawing];
+            chart.draw.selected = Some(0);
+            ui_frame(&ctx, vec![], |ui| chart.draw_menu(ui));
+            for custom in [true, false, true] {
+                let texts = ui_frame(&ctx, vec![], |ui| chart.draw_menu(ui));
+                let at = texts.iter().find(|(text, _)| text == "Custom drawing color").unwrap().1.center();
+                ui_frame(&ctx, vec![egui::Event::PointerMoved(at), pointer_button(at, true)], |ui| chart.draw_menu(ui));
+                ui_frame(&ctx, vec![pointer_button(at, false)], |ui| chart.draw_menu(ui));
+                assert_eq!(chart.drawings[0].color, custom.then_some(expected));
+                assert_eq!(chart.drawings[0].zone_role, Some(role));
+            }
+        }
+    }
+
+    #[test]
     fn context_menu_deletes_only_the_selected_drawing_and_undo_restores_it() {
         let ctx = egui::Context::default();
         let mut chart = sample_chart();
@@ -8895,7 +8988,14 @@ mod tests {
             let mut output =
                 ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events, ..Default::default() }, |ui| {
                     let response = ui.interact(rect, egui::Id::new("drawing-test"), Sense::click_and_drag());
-                    chart.paint_drawings(ui, rect, &v, &scale, ui.input(|i| i.pointer.hover_pos()), &response);
+                    chart.paint_drawings(
+                        ui,
+                        rect,
+                        &v,
+                        &scale,
+                        (ui.input(|i| i.pointer.hover_pos()), &response),
+                        Vec::new(),
+                    );
                 });
             output.textures_delta.clear();
         };

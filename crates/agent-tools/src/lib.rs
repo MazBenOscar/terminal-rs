@@ -9,4 +9,4 @@ mod result;
 
 pub use host::{DataHost, History, HostFuture, LiveHost, MarketDataHost, PriceBasis};
 pub use registry::{CallBudget, CallContext, Registry, ToolKind, ToolSet, ToolSpec};
-pub use result::{Content, MAX_TEXT_BYTES, ToolResult};
+pub use result::{Content, MAX_TEXT_BYTES, ToolResult, scrub_text};

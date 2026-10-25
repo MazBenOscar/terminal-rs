@@ -263,6 +263,7 @@ impl LiveHost for TurnHost<'_> {
             let chart = Chart {
                 uid: self.host.pin.uid,
                 symbol: &self.host.pin.symbol,
+                price_decimals: 2,
                 timeframe,
                 bars,
                 drawings: &before,

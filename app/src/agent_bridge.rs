@@ -60,6 +60,389 @@ pub struct UndoSummary {
     pub skipped: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalStatus {
+    Pending,
+    Approved,
+    Declined,
+    Expired,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolChoice {
+    pub symbol: String,
+    pub selected: bool,
+    pub outcome: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Proposal {
+    pub id: u64,
+    pub turn: String,
+    pub args: LiveArgs,
+    pub summary: String,
+    pub user_owned: bool,
+    pub selected: bool,
+    pub deadline: Instant,
+    pub status: ProposalStatus,
+    pub before: Value,
+    /// Multi-symbol proposals only; single-symbol cards keep their compact layout.
+    pub symbols: Vec<SymbolChoice>,
+    pub decided_at: Option<i64>,
+}
+
+impl Proposal {
+    pub fn symbol_choices(args: &LiveArgs) -> Vec<SymbolChoice> {
+        let symbols = match args {
+            LiveArgs::AddWatchlistSymbols(a) => &a.symbols,
+            LiveArgs::RemoveWatchlistSymbols(a) => &a.symbols,
+            _ => return Vec::new(),
+        };
+        if symbols.len() <= 1 {
+            return Vec::new();
+        }
+        symbols.iter().map(|symbol| SymbolChoice { symbol: symbol.clone(), selected: true, outcome: None }).collect()
+    }
+
+    pub fn is_selected(&self) -> bool {
+        self.selected && (self.symbols.is_empty() || self.symbols.iter().any(|s| s.selected))
+    }
+
+    pub fn card_summary(&self) -> String {
+        if self.symbols.is_empty() {
+            return self.summary.clone();
+        }
+        let name = self.before["name"].as_str().unwrap_or_else(|| match &self.args {
+            LiveArgs::AddWatchlistSymbols(a) => &a.watchlist,
+            LiveArgs::RemoveWatchlistSymbols(a) => &a.watchlist,
+            _ => "",
+        });
+        format!(
+            "{} {name}",
+            if matches!(self.args, LiveArgs::AddWatchlistSymbols(_)) { "Add to" } else { "Remove from" }
+        )
+    }
+
+    pub fn approved_count(&self) -> usize {
+        if self.status != ProposalStatus::Approved {
+            return 0;
+        }
+        if self.symbols.is_empty() { 1 } else { self.symbols.iter().filter(|s| s.selected).count() }
+    }
+
+    /// Counts the user's approval, even if applying it failed.
+    pub fn approval_count(&self) -> usize {
+        if matches!(self.status, ProposalStatus::Approved | ProposalStatus::Failed(_)) {
+            if self.symbols.is_empty() { 1 } else { self.symbols.iter().filter(|s| s.selected).count() }
+        } else {
+            0
+        }
+    }
+
+    pub fn change_count(&self) -> usize {
+        self.symbols.len().max(1)
+    }
+
+    pub fn outcome_summary(&self) -> String {
+        let approved = self.status == ProposalStatus::Approved;
+        if self.status == ProposalStatus::Expired {
+            return "Proposal expired".into();
+        }
+        if let ProposalStatus::Failed(reason) = &self.status {
+            return format!("Failed: {reason}");
+        }
+        let verb = |yes: &str, no: &str| if approved { yes.to_owned() } else { format!("Declined {no}") };
+        let name = self.before["name"].as_str();
+        match &self.args {
+            LiveArgs::CreateWatchlist(a) => format!("{} {}", verb("Created", "creating"), a.name.trim()),
+            LiveArgs::DeleteWatchlist(a) => format!("{} {}", verb("Deleted", "deleting"), name.unwrap_or(&a.watchlist)),
+            LiveArgs::AddWatchlistSymbols(a) => {
+                self.symbol_summary(true, name.unwrap_or(&a.watchlist), a.symbols.len())
+            }
+            LiveArgs::RemoveWatchlistSymbols(a) => {
+                self.symbol_summary(false, name.unwrap_or(&a.watchlist), a.symbols.len())
+            }
+            LiveArgs::CreateAlert(a) => format!(
+                "{} alert {} {} {} {} · {}",
+                verb("Created", "creating"),
+                crate::security_names::label(&a.symbol),
+                if matches!(a.kind, tr_agent_tools::args::AlertKind::Close) { "close" } else { "price" },
+                if matches!(a.direction, tr_agent_tools::args::AlertRule::Above) { "above" } else { "below" },
+                crate::price_alerts::display_price(&a.symbol, a.level),
+                a.timeframe.as_deref().unwrap_or("Live")
+            ),
+            LiveArgs::UpdateAlert(_) => format!(
+                "{}{}",
+                verb("Updated", "updating"),
+                self.summary.strip_prefix("Update").unwrap_or(&self.summary)
+            ),
+            LiveArgs::DeleteAlert(_) => format!(
+                "{}{}",
+                verb("Deleted", "deleting"),
+                self.summary.strip_prefix("Delete").unwrap_or(&self.summary)
+            ),
+            _ => self.summary.clone(),
+        }
+    }
+
+    fn symbol_summary(&self, add: bool, name: &str, total: usize) -> String {
+        let n = if self.symbols.is_empty() {
+            usize::from(self.status == ProposalStatus::Approved)
+        } else {
+            self.approved_count()
+        };
+        let noops = if self.status == ProposalStatus::Approved {
+            self.symbol_decisions()
+                .iter()
+                .filter(|(symbol, selected)| *selected && self.symbol_no_change_reason(symbol).is_some())
+                .count()
+        } else {
+            0
+        };
+        let changed = n.saturating_sub(noops);
+        let count = if changed > 0 && changed < total { format!("{changed} of {total}") } else { total.to_string() };
+        let verb = match (add, changed > 0) {
+            (true, true) => "Added",
+            (false, true) => "Removed",
+            (true, false) => "Declined adding",
+            (false, false) => "Declined removing",
+        };
+        let summary = if n > 0 && changed == 0 {
+            format!("No symbols {} {} {name}", if add { "added" } else { "removed" }, if add { "to" } else { "from" })
+        } else {
+            format!(
+                "{verb} {count} symbol{} {} {name}",
+                if total == 1 { "" } else { "s" },
+                if add { "to" } else { "from" }
+            )
+        };
+        if noops == 0 {
+            summary
+        } else {
+            format!("{summary} · {noops} {}", if add { "already in list" } else { "not in list" })
+        }
+    }
+
+    fn symbol_decisions(&self) -> Vec<(&str, bool)> {
+        if self.symbols.is_empty() {
+            match &self.args {
+                LiveArgs::AddWatchlistSymbols(a) => a.symbols.iter().map(|s| (s.as_str(), true)).collect(),
+                LiveArgs::RemoveWatchlistSymbols(a) => a.symbols.iter().map(|s| (s.as_str(), true)).collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            self.symbols.iter().map(|s| (s.symbol.as_str(), s.selected)).collect()
+        }
+    }
+
+    fn symbol_no_change_reason(&self, symbol: &str) -> Option<&'static str> {
+        let existed = self.before["symbols"].as_array().is_some_and(|items| {
+            items.iter().any(|s| s.as_str().is_some_and(|s| crate::symbol_search::same_key(s, symbol)))
+        });
+        match &self.args {
+            LiveArgs::AddWatchlistSymbols(_) if existed => Some("already in list"),
+            LiveArgs::RemoveWatchlistSymbols(_) if !existed => Some("not in list"),
+            _ => None,
+        }
+    }
+
+    pub fn decision_summary(&self) -> String {
+        let symbols = self.symbol_decisions();
+        if symbols.is_empty() {
+            return self.summary.clone();
+        }
+        let mut approved = Vec::new();
+        let mut declined = Vec::new();
+        let mut failed = Vec::new();
+        let mut expired = Vec::new();
+        let mut already_in_list = Vec::new();
+        let mut not_in_list = Vec::new();
+        for (symbol, selected) in symbols {
+            let names = if self.status == ProposalStatus::Expired {
+                &mut expired
+            } else if self.status == ProposalStatus::Declined || !selected {
+                &mut declined
+            } else if self.status == ProposalStatus::Approved {
+                match self.symbol_no_change_reason(symbol) {
+                    Some("already in list") => &mut already_in_list,
+                    Some("not in list") => &mut not_in_list,
+                    _ => &mut approved,
+                }
+            } else {
+                &mut failed
+            };
+            names.push(crate::security_names::label(symbol));
+        }
+        let mut summary = format!(
+            "{}; approved symbols: [{}]; declined symbols: [{}]",
+            self.outcome_summary(),
+            approved.join(", "),
+            declined.join(", ")
+        );
+        for (reason, names) in [("already in list", already_in_list), ("not in list", not_in_list)] {
+            if !names.is_empty() {
+                summary.push_str(&format!("; approved, no change ({reason}) symbols: [{}]", names.join(", ")));
+            }
+        }
+        if !failed.is_empty() {
+            summary.push_str(&format!("; failed symbols: [{}]", failed.join(", ")));
+        }
+        if !expired.is_empty() {
+            summary.push_str(&format!("; expired symbols: [{}]", expired.join(", ")));
+        }
+        summary
+    }
+
+    pub fn expire(&mut self) {
+        self.status = ProposalStatus::Expired;
+        let now = Instant::now();
+        let local_now = chrono::Local::now();
+        let decided_at = if self.deadline >= now {
+            local_now + chrono::Duration::from_std(self.deadline.duration_since(now)).unwrap()
+        } else {
+            local_now - chrono::Duration::from_std(now.duration_since(self.deadline)).unwrap()
+        };
+        self.decided_at = Some(decided_at.timestamp());
+        for symbol in &mut self.symbols {
+            symbol.outcome = Some("Expired".into());
+        }
+    }
+
+    pub fn ownership_label(&self) -> Option<&'static str> {
+        self.user_owned.then(|| {
+            if self.before["agent_created"].as_bool() == Some(true) || self.before["agent_turn"].as_str().is_some() {
+                "Created by the agent in an earlier conversation"
+            } else {
+                "This alert was created by you"
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum WorkflowUndo {
+    Alert { before: Option<tr_core::price_alerts::Alert>, after: Option<tr_core::price_alerts::Alert>, position: usize },
+    Watchlist { before: Option<crate::app::NamedWatchlist>, after: Option<crate::app::NamedWatchlist> },
+}
+
+#[derive(Default)]
+pub struct Workflows {
+    pub proposals: Vec<Proposal>,
+    pub undo: Vec<(String, WorkflowUndo)>,
+    pub context: Vec<tr_agent::codex::WorkflowResult>,
+    pub next_id: u64,
+    /// Local timestamp and whether any items were kept on the user's undo.
+    pub undone: HashMap<String, (i64, bool)>,
+}
+impl Workflows {
+    pub fn turn_summary(&self, turn: &str) -> Option<String> {
+        let rows: Vec<_> = self.proposals.iter().filter(|p| p.turn == turn).collect();
+        if rows.is_empty() {
+            return None;
+        }
+        if rows.iter().any(|p| p.status == ProposalStatus::Pending) {
+            let n: usize = rows.iter().filter(|p| p.status == ProposalStatus::Pending).map(|p| p.change_count()).sum();
+            return Some(format!("Awaiting approval · {n} change{}", if n == 1 { "" } else { "s" }));
+        }
+        if rows.iter().all(|p| p.status == ProposalStatus::Expired) {
+            return Some("Proposal expired".into());
+        }
+        let mut parts = Vec::new();
+        for p in rows {
+            let summary = p.outcome_summary();
+            if !parts.contains(&summary) {
+                parts.push(summary);
+            }
+        }
+        Some(
+            parts
+                .into_iter()
+                .enumerate()
+                .map(|(i, part)| {
+                    if i == 0 {
+                        part
+                    } else {
+                        let mut chars = part.chars();
+                        chars
+                            .next()
+                            .map_or_else(String::new, |first| first.to_lowercase().collect::<String>() + chars.as_str())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+
+    pub fn decision_line(&self, turn: &str) -> Option<String> {
+        let rows: Vec<_> = self.proposals.iter().filter(|p| p.turn == turn).collect();
+        if rows.is_empty() || rows.iter().any(|p| p.status == ProposalStatus::Pending) {
+            return None;
+        }
+        let total: usize = rows.iter().map(|p| p.change_count()).sum();
+        let approved: usize = rows.iter().map(|p| p.approval_count()).sum();
+        let failed: usize =
+            rows.iter().filter(|p| matches!(p.status, ProposalStatus::Failed(_))).map(|p| p.approval_count()).sum();
+        let expired: usize =
+            rows.iter().filter(|p| p.status == ProposalStatus::Expired).map(|p| p.change_count()).sum();
+        let mut label = if expired == total {
+            "Expired".into()
+        } else if approved == total {
+            "You approved this".into()
+        } else if approved > 0 {
+            format!("You approved {approved} of {total}")
+        } else if expired > 0 {
+            format!("You declined {}", total - expired)
+        } else {
+            "You declined this".into()
+        };
+        if failed > 0 {
+            if approved == total {
+                label.push_str(&format!(" · {failed} change{} failed", if failed == 1 { "" } else { "s" }));
+            } else {
+                label.push_str(&format!(" · {failed} failed"));
+            }
+        }
+        if expired > 0 && expired < total {
+            label.push_str(&format!(" · {expired} expired"));
+        }
+        let undone = self.undone.get(turn);
+        let timestamp = undone.map(|(time, _)| *time).or_else(|| rows.iter().filter_map(|p| p.decided_at).max());
+        let time = timestamp
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_else(|| "time unavailable".into());
+        if let Some((_, kept)) = undone {
+            Some(format!("{label} · {} {time}", if *kept { "partly undone" } else { "undone" }))
+        } else {
+            Some(format!("{label} · {time}"))
+        }
+    }
+
+    pub fn expire(&mut self, now: Instant, turn: Option<&str>) {
+        for proposal in &mut self.proposals {
+            if proposal.status == ProposalStatus::Pending
+                && (now >= proposal.deadline || turn.is_some_and(|t| t == proposal.turn))
+            {
+                proposal.expire();
+                self.context.push(tr_agent::codex::WorkflowResult::Confirmation {
+                    proposal_id: proposal.id,
+                    status: tr_agent::codex::WorkflowStatus::Expired,
+                    summary: proposal.decision_summary(),
+                });
+            }
+        }
+    }
+    pub fn reset(&mut self) {
+        for proposal in &mut self.proposals {
+            if proposal.status == ProposalStatus::Pending {
+                proposal.expire();
+            }
+        }
+        self.context.clear();
+    }
+}
+
 impl TerminalApp {
     fn execute_agent_edit(
         &mut self,
@@ -71,7 +454,10 @@ impl TerminalApp {
     ) -> ToolResult {
         use tr_agent_tools::edits::{Chart, error};
         let Some(pinned) = self.agent_chart(ChartTarget::Uid(call.pin.uid)) else {
-            return error("chart_not_found", "Pinned chart was closed");
+            return error(
+                "chart_not_found",
+                "Pinned chart was closed; stop edits and ask the user to pin an open chart for a new turn",
+            );
         };
         if self.agent_chart_uid(ChartTarget::Pinned) != Some(call.pin.uid) {
             return error("pin_changed", "Chart pin changed during the turn; start a new turn");
@@ -79,7 +465,10 @@ impl TerminalApp {
         let (symbol, timeframe) =
             expected.get(&call.turn).cloned().unwrap_or_else(|| (call.pin.symbol.clone(), call.pin.timeframe.clone()));
         if pinned.symbol != symbol || pinned.tf.to_string() != timeframe {
-            return error("pin_changed", "Pinned chart symbol or timeframe changed during the turn");
+            return error(
+                "pin_changed",
+                "Pinned chart symbol or timeframe changed during the turn; stop edits and start a new turn with read_chart",
+            );
         }
         for pane in &self.panes {
             if let PaneKind::Chart(chart) = &pane.kind {
@@ -87,6 +476,7 @@ impl TerminalApp {
                     uid: chart.uid,
                     symbol: &chart.symbol,
                     timeframe: chart.tf,
+                    price_decimals: chart.agent_price_decimals,
                     bars: chart.source_bars().bars,
                     drawings: &chart.drawings,
                     indicators: &chart.indicators,
@@ -94,7 +484,12 @@ impl TerminalApp {
                 });
             }
         }
-        let Some(selected) = self.agent_chart(target) else { return error("chart_not_found", "Chart was closed") };
+        let Some(selected) = self.agent_chart(target) else {
+            return error(
+                "chart_not_found",
+                "chart_id no longer identifies an open chart; call read_chart for valid ids or omit chart_id for the pinned chart",
+            );
+        };
         let uid = selected.uid;
         if matches!(args, LiveArgs::SetView(_)) && uid != call.pin.uid {
             return error("wrong_chart", "set_view only changes the pinned chart");
@@ -104,6 +499,7 @@ impl TerminalApp {
             uid,
             symbol: &selected.symbol,
             timeframe: selected.tf,
+            price_decimals: selected.agent_price_decimals,
             bars: selected.source_bars().bars,
             drawings: &selected.drawings,
             indicators: &selected.indicators,
@@ -139,7 +535,8 @@ impl TerminalApp {
 
     /// Pane-facing availability: provenance survives saves, inverse edits do not.
     pub fn agent_turn_undo_available(&self, turn: &str) -> bool {
-        self.panes.iter().any(|pane| matches!(&pane.kind, PaneKind::Chart(chart) if chart.has_agent_turn(turn)))
+        self.agent_pane.workflows.undo.iter().any(|(owner, _)| owner == turn)
+            || self.panes.iter().any(|pane| matches!(&pane.kind, PaneKind::Chart(chart) if chart.has_agent_turn(turn)))
     }
 
     pub fn undoable_agent_turns(&self) -> Vec<&str> {
@@ -165,6 +562,7 @@ impl TerminalApp {
     /// Revert by identity, not by restoring a chart snapshot. Conflicting user
     /// changes (including Keep) are reported rather than overwritten.
     pub fn undo_agent_turn(&mut self, turn_id: &str) -> Result<UndoSummary, String> {
+        self.agent_pane.workflows.expire(Instant::now(), Some(turn_id));
         self.prune_agent_turns();
         if !self.agent_turns.iter().any(|turn| turn == turn_id) {
             return Err("undo for this agent turn is no longer available (layout changed/app restarted)".into());
@@ -183,6 +581,7 @@ impl TerminalApp {
                 summary.skipped.extend(skipped);
             }
         }
+        self.undo_workflows(turn_id, &mut summary);
         self.agent_turns.retain(|turn| turn != turn_id);
         self.observe_edits(true);
         self.edit_log.record(
@@ -332,7 +731,9 @@ impl ScopedHost {
 
     fn target(&self, chart: &Option<String>) -> Result<ChartTarget, String> {
         chart.as_ref().map_or(Ok(ChartTarget::Uid(self.call.pin.uid)), |id| {
-            id.parse().map(ChartTarget::Uid).map_err(|_| "chart_id must be a chart uid".into())
+            id.parse().map(ChartTarget::Uid).map_err(|_| {
+                "chart_id must be a numeric chart uid from read_chart; omit chart_id for the pinned chart".into()
+            })
         })
     }
     async fn worker<T>(&self, request: Request, receive: oneshot::Receiver<Result<T, String>>) -> Result<T, String> {
@@ -431,6 +832,20 @@ impl DataHost for ScopedHost {
 impl LiveHost for ScopedHost {
     fn call_live<'a>(&'a self, _: &'a str, args: LiveArgs) -> BridgeFuture<'a, ToolResult> {
         Box::pin(async move {
+            if args.name().contains("watchlist") || args.name().contains("alert") {
+                let turn = self.call.turn.clone();
+                return match self
+                    .job(ChartTarget::Application, move |app| {
+                        let result = app.agent_workflow(&turn, args);
+                        AgentReply { success: true, value: serde_json::to_value(result).unwrap() }
+                    })
+                    .await
+                {
+                    Ok(value) => serde_json::from_value(value)
+                        .unwrap_or_else(|_| ToolResult::error("host_error", "Invalid workflow reply", None)),
+                    Err(error) => ToolResult::error("host_error", &error, None),
+                };
+            }
             let chart = match &args {
                 LiveArgs::ReadChart(a) => &a.chart_id,
                 LiveArgs::IndicatorValues(a) => &a.chart_id,
@@ -480,12 +895,15 @@ impl LiveHost for ScopedHost {
                                 self.wait_view(load, deadline).await
                             } else {
                                 serde_json::from_value(value["result"].clone())
-                                    .unwrap_or_else(|_| ToolResult::error("host_error", "Invalid UI reply", None))
+                                    .unwrap_or_else(|_| ToolResult::error("host_error", "Invalid UI edit reply; outcome unconfirmed, inspect read_chart before any retry", None))
                             }
                         }
                         Err(error) => ToolResult::error(
                             if error.contains("chart not found") { "chart_not_found" } else { "host_error" },
-                            &error,
+                            &format!(
+                                "{}: {error}; edit outcome unconfirmed. Inspect read_chart before a retry; if cancelled, stop until a new user turn",
+                                self.call.name
+                            ),
                             None,
                         ),
                     };
@@ -544,6 +962,43 @@ mod tests {
                 confirmed: false,
             },
         }
+    }
+
+    #[test]
+    fn workflow_reads_and_confirmed_calls_work_without_a_chart_but_never_auto_apply() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/workflow-global-host");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.panes.clear();
+        let executor = AppExecutor::new(&app);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (name, arguments, tools) in [
+                ("list_watchlists", "{}", tr_agent_tools::ToolSet::ReadOnly),
+                ("list_alerts", "{}", tr_agent_tools::ToolSet::ReadOnly),
+                ("create_watchlist", r#"{"name":"Proposed"}"#, tr_agent_tools::ToolSet::Workflows),
+            ] {
+                let registry = Arc::new(Registry::new(tools));
+                let call = ToolCall {
+                    turn: "global:1".into(),
+                    pin: ChartPin { uid: 0, symbol: String::new(), timeframe: String::new(), visible_range: None },
+                    name: name.into(),
+                    arguments: arguments.into(),
+                    confirmed: true,
+                };
+                let mut result = executor.execute(registry, call);
+                assert!(futures::poll!(result.as_mut()).is_pending());
+                app.process_logic();
+                let result = result.await;
+                assert!(result.success, "{name}: {result:?}");
+                if name == "create_watchlist" {
+                    assert!(
+                        matches!(&result.content[0], Content::Text(text) if text.contains("awaiting_user_confirmation"))
+                    );
+                }
+            }
+        });
+        assert_eq!(app.watchlists.len(), 1, "confirmed=true must not bypass the card");
+        app.confirm_workflows("global:1", true);
+        assert_eq!(app.watchlists.len(), 2);
     }
 
     #[tokio::test]
@@ -1163,6 +1618,49 @@ mod tests {
             f.deliver(f.weekly.clone(), false);
             f.app.process_logic();
             assert_eq!(f.app.agent_chart(ChartTarget::Pinned).unwrap().visible_date_range(), before);
+        });
+    }
+
+    #[test]
+    fn agent_objects_and_timeframe_labels_persist_across_set_view() {
+        let mut f = ViewFixture::new("a3c-persistent-zones");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let result = edit_call(
+                &mut f.app,
+                &f.executor,
+                &f.pin,
+                "zones",
+                "create_drawing",
+                json!({
+                    "symbol":"AAA", "kind":"rectangle", "label":"Support", "zone_role":"support",
+                    "anchors":[{"time":f.weekly[200].ts,"price":10.},{"time":f.weekly[600].ts,"price":12.}]
+                }),
+            )
+            .await;
+            assert!(result.success, "{result:?}");
+            let result = edit_call(
+                &mut f.app,
+                &f.executor,
+                &f.pin,
+                "zones",
+                "add_indicator",
+                json!({"code":"RSI","params":[14.]}),
+            )
+            .await;
+            assert!(result.success, "{result:?}");
+            let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+            let drawings = chart.drawings.clone();
+            let indicators = chart.indicators.clone();
+            assert_eq!(drawings[0].text, "W1 Support");
+            assert!(f.switch("zones", "4H", false).await.success);
+            let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+            assert_eq!(chart.drawings, drawings);
+            assert_eq!(chart.indicators, indicators);
+            assert!(chart.drawings.iter().all(|d| d.visible_on(&chart.symbol)), "no timeframe visibility filter");
+            assert!(f.switch("zones", "1W", true).await.success);
+            let chart = f.app.agent_chart(ChartTarget::Pinned).unwrap();
+            assert_eq!(chart.drawings, drawings);
+            assert_eq!(chart.indicators, indicators);
         });
     }
 

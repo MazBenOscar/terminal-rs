@@ -84,7 +84,7 @@ impl Registry {
                 .into_iter()
                 .filter(|spec| match enabled {
                     ToolSet::ReadOnly => !spec.mutating,
-                    ToolSet::Edit => !workflow(&spec.name),
+                    ToolSet::Edit => !spec.mutating || !workflow(&spec.name),
                     ToolSet::Workflows => true,
                 })
                 .collect(),
@@ -97,7 +97,11 @@ impl Registry {
 
     pub async fn call(&self, name: &str, args_json: &str, ctx: &mut CallContext<'_>) -> ToolResult {
         if !ctx.budget.take() {
-            return ToolResult::error("budget_exhausted", "Per-turn tool call budget exhausted", None);
+            return ToolResult::error(
+                "budget_exhausted",
+                "Per-turn tool call budget exhausted; stop calling tools and summarize confirmed results (failed attempts also consume the budget)",
+                None,
+            );
         }
         let value = match self.validate_call(name, args_json) {
             Ok(value) => value,
@@ -131,6 +135,23 @@ impl Registry {
         {
             return Err(invalid("from must not exceed to".into(), Some("from")));
         }
+        if name == "create_alert" {
+            if value["kind"] == "close" && value.get("timeframe").is_none_or(Value::is_null) {
+                return Err(invalid("Close alerts require a timeframe".into(), Some("timeframe")));
+            }
+            if value["level"].as_f64().is_none_or(|v| !v.is_finite() || v <= 0.0) {
+                return Err(invalid("Level must be finite and positive".into(), Some("level")));
+            }
+        }
+        if name == "update_alert" {
+            if ["level", "direction", "repeat"].iter().all(|key| value.get(*key).is_none_or(Value::is_null)) {
+                return Err(invalid("Supply at least one change".into(), None));
+            }
+            if value.get("level").is_some_and(|v| !v.is_null() && v.as_f64().is_none_or(|n| !n.is_finite() || n <= 0.0))
+            {
+                return Err(invalid("Level must be finite and positive".into(), Some("level")));
+            }
+        }
         Ok(value)
     }
 
@@ -160,12 +181,55 @@ impl Registry {
         if let Err(error) = validate_live(&mut args, ctx.now) {
             return error;
         }
-        if spec.needs_confirmation && !ctx.confirmed {
+        // Workflow hosts always enqueue a proposal, even if an adapter supplies confirmed.
+        // Only screenshot consent is consumed here; workflow approval is an explicit UI action.
+        if spec.name == "screenshot" && !ctx.confirmed {
             return ToolResult::error(
                 "confirmation_required",
                 "Host UI confirmation is required for this operation",
                 None,
             );
+        }
+        let removing = matches!(&args, LiveArgs::RemoveWatchlistSymbols(_));
+        let symbols = match &mut args {
+            LiveArgs::CreateAlert(a) => Some(std::slice::from_mut(&mut a.symbol)),
+            LiveArgs::AddWatchlistSymbols(a) => Some(a.symbols.as_mut_slice()),
+            LiveArgs::RemoveWatchlistSymbols(a) => Some(a.symbols.as_mut_slice()),
+            LiveArgs::ListAlerts(a) => a.symbol.as_mut().map(std::slice::from_mut),
+            _ => None,
+        };
+        if let Some(symbols) = symbols {
+            let mut unknown = Vec::new();
+            for symbol in symbols {
+                match data::resolve_workflow_symbol(ctx.data, symbol).await {
+                    Ok(key) => *symbol = key,
+                    // Membership is authoritative for removal, even when discovery
+                    // is offline or a listing has disappeared from search.
+                    Err(_) if removing => {}
+                    Err(error) => unknown.push(error),
+                }
+            }
+            if !unknown.is_empty() {
+                let details = unknown
+                    .iter()
+                    .map(|error| {
+                        let mut text = error["symbol"].as_str().unwrap_or_default().to_owned();
+                        for field in ["hint", "message"] {
+                            if let Some(message) = error[field].as_str() {
+                                text.push_str(&format!(" ({message})"));
+                            }
+                        }
+                        text
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut result = ToolResult::json(serde_json::json!({
+                    "error":{"code":"unknown_symbols","message":format!("Unknown symbols: {}", details.chars().take(512).collect::<String>())},
+                    "symbols":unknown
+                }));
+                result.success = false;
+                return result.capped();
+            }
         }
         ctx.live.call_live(name, args).await.capped()
     }
@@ -176,11 +240,11 @@ fn invalid(message: String, field: Option<&str>) -> ToolResult {
 }
 
 fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult> {
-    let fail = |message: &str| invalid(message.into(), (!path.is_empty()).then_some(path));
+    let fail = |message: &str| invalid(format!("{path}: {message}"), (!path.is_empty()).then_some(path));
     if let Some(choices) = schema["enum"].as_array()
         && !choices.contains(value)
     {
-        return Err(fail("Value is not in the allowed enum"));
+        return Err(fail(&format!("use one of {}", serde_json::to_string(choices).unwrap())));
     }
     let types = &schema["type"];
     if value.is_null() && types.as_array().is_some_and(|types| types.iter().any(|t| t == "null")) {
@@ -193,13 +257,18 @@ fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult>
             let properties = schema["properties"].as_object().unwrap();
             for (key, value) in object {
                 let field = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
-                let property = properties.get(key).ok_or_else(|| invalid("Unknown field".into(), Some(&field)))?;
+                let property = properties.get(key).ok_or_else(|| {
+                    invalid(format!("{field}: unknown field; omit it and use the tool schema"), Some(&field))
+                })?;
                 validate(value, property, &field)?;
             }
             for required in schema["required"].as_array().unwrap() {
                 let key = required.as_str().unwrap();
                 if !object.contains_key(key) {
-                    return Err(invalid("Missing required field".into(), Some(key)));
+                    return Err(invalid(
+                        format!("{key}: missing required field; supply it using the tool schema"),
+                        Some(key),
+                    ));
                 }
             }
         }
@@ -210,7 +279,12 @@ fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult>
                 || schema["maxLength"].as_u64().is_some_and(|max| length > max)
                 || schema["pattern"] == "\\S" && text.chars().all(char::is_whitespace)
             {
-                return Err(fail("String is outside the allowed length or pattern"));
+                return Err(fail(&format!(
+                    "supply non-whitespace text of {}–{} characters{}",
+                    schema["minLength"],
+                    schema["maxLength"],
+                    if path == "label" { ", or omit the optional label" } else { "" }
+                )));
             }
         }
         "integer" => {
@@ -223,12 +297,16 @@ fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult>
                     || schema["maximum"].as_i64().is_some_and(|max| number > max)
             };
             if outside {
-                return Err(fail("Integer is outside the allowed range"));
+                return Err(fail(&format!("integer must be within {}–{}", schema["minimum"], schema["maximum"])));
             }
         }
         "number" => {
-            if !value.is_number() {
-                return Err(fail("Expected a number"));
+            let number = value.as_f64().ok_or_else(|| fail("Expected a number"))?;
+            if !number.is_finite()
+                || schema["minimum"].as_f64().is_some_and(|min| number < min)
+                || schema["maximum"].as_f64().is_some_and(|max| number > max)
+            {
+                return Err(fail("Number is outside the allowed range"));
             }
         }
         "boolean" => {
@@ -241,7 +319,12 @@ fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult>
             if schema["minItems"].as_u64().is_some_and(|min| array.len() < (min as usize))
                 || schema["maxItems"].as_u64().is_some_and(|max| array.len() > (max as usize))
             {
-                return Err(fail("Array length is outside the allowed range"));
+                return Err(fail(&format!(
+                    "supply {}–{} items{}",
+                    schema["minItems"],
+                    schema["maxItems"],
+                    if path == "anchors" { "; rectangle anchors require exactly 2" } else { "" }
+                )));
             }
             for (i, item) in array.iter().enumerate() {
                 validate(item, &schema["items"], &format!("{path}[{i}]"))?;
@@ -262,9 +345,16 @@ fn validate_live(args: &mut LiveArgs, now: i64) -> Result<(), ToolResult> {
             if a.anchors.len() != count {
                 return Err(invalid(format!("Drawing requires {count} anchors"), Some("anchors")));
             }
-            Some(&a.anchors)
+            if let Some(tf) = &a.source_timeframe {
+                tf.parse::<tr_core::Timeframe>().map_err(|_| {
+                    invalid("Use a supported timeframe such as 1W or 4H".into(), Some("source_timeframe"))
+                })?;
+            }
+            // Rectangles are normalized against loaded bars in Session::plan, including future end clipping.
+            if matches!(a.kind, args::DrawingKind::Rectangle) { None } else { Some(&a.anchors) }
         }
-        LiveArgs::UpdateDrawing(a) => a.anchors.as_ref(),
+        // Updates need the stored tool kind; validate in the host.
+        LiveArgs::UpdateDrawing(_) => None,
         _ => None,
     };
     if anchors.is_some_and(|anchors| anchors.iter().any(|a| a.time > now)) {
@@ -326,7 +416,7 @@ fn catalog() -> Vec<ToolSpec> {
                 true,
             ),
             "create_drawing" => (
-                "Create a drawing for an explicit symbol; host rejects anchors outside loaded bars. all_symbols defaults false.",
+                "Create a drawing for an explicit symbol. Rectangles normalize inverted anchors, snap times to loaded bars and clamp the end to the last bar; start must be loaded and both dimensions non-zero. Pass source_timeframe from analyze/read_data for zone labels. all_symbols defaults false.",
                 true,
             ),
             "update_drawing" => {
@@ -344,7 +434,9 @@ fn catalog() -> Vec<ToolSpec> {
             "read_user_actions" => {
                 ("Read user drawing and view edit events; labels remain untrusted string data.", false)
             }
-            "create_watchlist" => ("Create a named watchlist after confirmation.", true),
+            "list_watchlists" => ("List at most 50 watchlists and their bounded symbol rows.", false),
+            "list_alerts" => ("List at most 50 alerts, optionally filtered by symbol.", false),
+            "create_watchlist" => ("Propose a named watchlist; no change until user approval.", true),
             "add_watchlist_symbols" => ("Add symbols to a specific watchlist after confirmation.", true),
             "remove_watchlist_symbols" => ("Remove symbols from a specific watchlist after confirmation.", true),
             "delete_watchlist" => ("Delete a watchlist after confirmation.", true),
@@ -359,7 +451,7 @@ fn catalog() -> Vec<ToolSpec> {
             input_schema,
             kind: ToolKind::Live,
             mutating,
-            needs_confirmation: workflow(name) || name == "screenshot",
+            needs_confirmation: (mutating && workflow(name)) || name == "screenshot",
         });
     }
     specs.sort_by(|a, b| a.name.cmp(&b.name));
@@ -379,8 +471,18 @@ mod tests {
         fn history<'a>(&'a self, _: &'a str, _: Timeframe, _: Option<i64>, _: usize) -> HostFuture<'a, History> {
             Box::pin(async { Ok(History::default()) })
         }
-        fn search<'a>(&'a self, _: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
-            Box::pin(async { Ok(vec![]) })
+        fn search<'a>(&'a self, query: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+            Box::pin(async move {
+                if query.starts_with('?') {
+                    return Ok(vec![]);
+                }
+                Ok(vec![SearchHit {
+                    key: tr_data::security(query).key(),
+                    name: query.into(),
+                    class: tr_core::AssetClass::Equity,
+                    exchange: None,
+                }])
+            })
         }
         fn quotes<'a>(&'a self, _: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
             Box::pin(async { Ok(vec![]) })
@@ -431,6 +533,489 @@ mod tests {
         assert!(serde_json::from_str::<args::Anchor>(r#"{"time":1,"price":1,"extra":true}"#).is_err());
     }
 
+    #[test]
+    fn review_source_timeframe_schema_does_not_advertise_a_false_default() {
+        let spec = catalog().into_iter().find(|spec| spec.name == "create_drawing").unwrap();
+        let property = &spec.input_schema["properties"]["source_timeframe"];
+        assert!(property.get("default").is_none(), "{property}");
+    }
+
+    #[tokio::test]
+    async fn rectangle_schema_rejections_identify_fields_and_future_end_reaches_normalizing_host() {
+        let registry = Registry::new(ToolSet::Edit);
+        let base = json!({"symbol":"AAA", "kind":"rectangle", "zone_role":"support", "source_timeframe":"1W",
+            "anchors":[{"time":86400,"price":8.},{"time":172800,"price":12.}]});
+        for (field, replacement) in [
+            ("source_timeframe", json!("W99")),
+            ("zone_role", json!("floor")),
+            ("kind", json!("box")),
+            ("label", json!("")),
+            ("label", json!("   ")),
+            ("label", json!("x".repeat(2049))),
+            ("anchors", json!([])),
+        ] {
+            let mut args = base.clone();
+            args[field] = replacement;
+            let error = value(registry.validate_call("create_drawing", &args.to_string()).unwrap_err());
+            assert_eq!(error["error"]["field"], field);
+        }
+        for (field, replacement) in [("time", json!(253370764800_i64)), ("time", json!(1.5)), ("price", json!("low"))] {
+            let mut args = base.clone();
+            args["anchors"][1][field] = replacement;
+            let error = value(registry.validate_call("create_drawing", &args.to_string()).unwrap_err());
+            assert_eq!(error["error"]["field"], format!("anchors[1].{field}"));
+        }
+        let mut future = base.clone();
+        future["anchors"][1]["time"] = json!(200000);
+        let mut budget = CallBudget::new(2);
+        let mut ctx = CallContext { now: 100000, ..CallContext::new(&Host, &Host, &mut budget) };
+        assert!(registry.call("create_drawing", &future.to_string(), &mut ctx).await.success);
+        future["anchors"] = json!([{"time":86400,"price":8.}]);
+        let result = value(registry.call("create_drawing", &future.to_string(), &mut ctx).await);
+        assert!(result["error"]["message"].as_str().unwrap().contains("2 anchors"));
+        assert_eq!(
+            value(registry.call("create_drawing", &base.to_string(), &mut ctx).await)["error"]["code"],
+            "budget_exhausted"
+        );
+    }
+
+    /// Like live search, this fake recognizes tickers but not full equity market keys.
+    #[derive(Default)]
+    struct SymbolHost {
+        queries: std::sync::Mutex<Vec<String>>,
+    }
+    impl DataHost for SymbolHost {
+        fn history<'a>(&'a self, s: &'a str, tf: Timeframe, end: Option<i64>, n: usize) -> HostFuture<'a, History> {
+            Host.history(s, tf, end, n)
+        }
+        fn quotes<'a>(&'a self, s: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
+            Host.quotes(s)
+        }
+        fn search<'a>(&'a self, query: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+            self.queries.lock().unwrap().push(query.into());
+            Box::pin(async move {
+                let key = match query.to_ascii_uppercase().as_str() {
+                    "NVDA" => "NVDA US Equity",
+                    "TSLA" => "TSLA US Equity",
+                    "AAPL" => "AAPL US Equity",
+                    "IBM" => "IBM US Equity",
+                    "SHOP.TO" => "SHOP.TO US Equity",
+                    "ABC.V" => "ABC.V US Equity",
+                    "SPY" | "SPY US EQUITY" => "SPY US Equity",
+                    "ETH-USD" | "ETH" => "ETHUSD Curncy",
+                    "BTC" | "BTC-USD" => "BTCUSD Curncy",
+                    "BINANCE:BTCUSDT" => "BINANCE:BTCUSDT Curncy",
+                    "EURUSD" => "EURUSD Curncy",
+                    "SPX" => "SPX Index",
+                    "CL1" => "CL1 Comdty",
+                    "US10Y" => "US10Y Govt",
+                    "NVD" | "NVDA WRONG" => "NVDA US Equity",
+                    "?BTC" => "BTCUSD Curncy",
+                    "FAIL" | "FAIL US EQUITY" => return Err("Search unavailable".into()),
+                    _ => return Ok(vec![]),
+                };
+                let mut hits = vec![SearchHit {
+                    key: key.into(),
+                    name: key.into(),
+                    class: tr_data::security(key).class,
+                    exchange: None,
+                }];
+                if query.eq_ignore_ascii_case("aapl") {
+                    hits.insert(
+                        0,
+                        SearchHit {
+                            key: "AAPL Index".into(),
+                            name: "Different class".into(),
+                            class: tr_core::AssetClass::Index,
+                            exchange: None,
+                        },
+                    );
+                    hits.insert(
+                        0,
+                        SearchHit {
+                            key: "AAP US Equity".into(),
+                            name: "Different ticker".into(),
+                            class: tr_core::AssetClass::Equity,
+                            exchange: None,
+                        },
+                    );
+                }
+                Ok(hits)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn find_symbol_results_round_trip_through_every_symbol_workflow() {
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(100);
+        let mut ctx = CallContext::new(&host, &Host, &mut budget);
+        for query in ["NVDA", "TSLA", "SPY", "ETH-USD", "BTC", "BINANCE:BTCUSDT", "EURUSD", "SPX", "CL1", "US10Y"] {
+            let found = value(registry.call("find_symbol", &json!({"query":query}).to_string(), &mut ctx).await);
+            let symbol = found["results"][0]["symbol"].as_str().unwrap();
+            for (name, args) in [
+                ("create_alert", json!({"symbol":symbol,"kind":"price","direction":"above","level":100})),
+                ("add_watchlist_symbols", json!({"watchlist":"Agent Test","symbols":[symbol]})),
+                ("remove_watchlist_symbols", json!({"watchlist":"Agent Test","symbols":[symbol]})),
+                ("list_alerts", json!({"symbol":symbol})),
+            ] {
+                host.queries.lock().unwrap().clear();
+                let result = registry.call(name, &args.to_string(), &mut ctx).await;
+                assert!(result.success, "{query} -> {symbol} -> {name}: {result:?}");
+                assert!(host.queries.lock().unwrap().len() <= 2);
+                let forwarded = value(result);
+                let actual = if name.contains("watchlist") {
+                    &forwarded["args"]["symbols"][0]
+                } else {
+                    &forwarded["args"]["symbol"]
+                };
+                let expected = tr_data::security(symbol);
+                let expected =
+                    expected.crypto_instrument().map(|i| i.security().key()).unwrap_or_else(|_| expected.key());
+                assert_eq!(actual, &json!(expected));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_resolves_canonical_bare_pairs_and_qualified_symbols_with_bounded_search() {
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(100);
+        let mut ctx = CallContext::new(&host, &Host, &mut budget);
+        for (input, expected, queries) in [
+            ("NVDA US Equity", "NVDA US Equity", vec!["NVDA US Equity", "NVDA"]),
+            ("TSLA US Equity", "TSLA US Equity", vec!["TSLA US Equity", "TSLA"]),
+            ("NVDA", "NVDA US Equity", vec!["NVDA"]),
+            ("SPY US Equity", "SPY US Equity", vec!["SPY US Equity"]),
+            ("aapl US Equity", "AAPL US Equity", vec!["aapl US Equity", "AAPL"]),
+            ("ETH-USD", "COINBASE:ETH-USD Curncy", vec!["ETH-USD"]),
+            ("BTC/USD Coinbase", "COINBASE:BTC-USD Curncy", vec!["COINBASE:BTC-USD", "BTC"]),
+            ("COINBASE:BTC-USD", "COINBASE:BTC-USD Curncy", vec!["COINBASE:BTC-USD", "BTC"]),
+            ("BTCUSD Curncy", "COINBASE:BTC-USD Curncy", vec!["BTCUSD Curncy", "BTC"]),
+            ("BINANCE:BTCUSDT", "BINANCE:BTCUSDT Curncy", vec!["BINANCE:BTCUSDT"]),
+            ("NASDAQ:NVDA", "NVDA US Equity", vec!["NVDA US Equity", "NVDA"]),
+            ("NYSE:IBM", "IBM US Equity", vec!["IBM US Equity", "IBM"]),
+            ("TSX:SHOP", "SHOP.TO US Equity", vec!["SHOP.TO US Equity", "SHOP.TO"]),
+            ("TSXV:ABC", "ABC.V US Equity", vec!["ABC.V US Equity", "ABC.V"]),
+        ] {
+            host.queries.lock().unwrap().clear();
+            let result = registry
+                .call(
+                    "add_watchlist_symbols",
+                    &json!({"watchlist":"Agent Test","symbols":[input]}).to_string(),
+                    &mut ctx,
+                )
+                .await;
+            assert!(result.success, "{input}: {result:?}");
+            assert_eq!(value(result)["args"]["symbols"][0], expected);
+            assert_eq!(*host.queries.lock().unwrap(), queries);
+        }
+        for input in ["NVD", "NVDA WRONG", "NVDA US Index", "?UNKNOWN"] {
+            host.queries.lock().unwrap().clear();
+            let result = registry
+                .call(
+                    "add_watchlist_symbols",
+                    &json!({"watchlist":"Agent Test","symbols":[input]}).to_string(),
+                    &mut ctx,
+                )
+                .await;
+            assert!(!result.success);
+            let error = value(result);
+            assert_eq!(error["error"]["code"], "unknown_symbols");
+            assert_eq!(error["symbols"][0]["error"], "unknown_symbol");
+            assert_eq!(error["symbols"][0]["symbol"], input);
+            if input == "?UNKNOWN" {
+                assert!(error["symbols"][0].get("hint").is_none());
+            } else {
+                assert_eq!(error["symbols"][0]["hint"], "did you mean \"NVDA US Equity\"");
+            }
+            assert!(error["error"]["message"].as_str().unwrap().starts_with("Unknown symbols:"));
+            assert!(host.queries.lock().unwrap().len() <= 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_unknown_symbols_never_reach_the_proposal_host_and_hints_use_find_symbol_values() {
+        struct NoProposals;
+        impl LiveHost for NoProposals {
+            fn call_live<'a>(
+                &'a self,
+                _: &'a str,
+                _: LiveArgs,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+                panic!("invalid batches must not reach the proposal host")
+            }
+        }
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(10);
+        let mut ctx = CallContext::new(&host, &NoProposals, &mut budget);
+        ctx.confirmed = true; // Adapter consent must not bypass symbol validation either.
+        let result = registry.call("add_watchlist_symbols", &json!({"watchlist":"Agent Test","symbols":["NVDA US Equity","NVD","?BTC","FAIL US Equity","?UNKNOWN"]}).to_string(), &mut ctx).await;
+        assert!(!result.success);
+        let error = value(result);
+        assert_eq!(error["symbols"].as_array().unwrap().len(), 4);
+        assert_eq!(error["symbols"][1]["hint"], "did you mean \"COINBASE:BTC-USD\"");
+        assert_eq!(error["symbols"][2]["error"], "search_unavailable");
+        assert_eq!(error["symbols"][2]["message"], "Symbol search failed; try again");
+        assert_eq!(host.queries.lock().unwrap().iter().filter(|q| *q == "FAIL" || *q == "FAIL US Equity").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn find_symbol_and_workflows_handle_equity_qualifiers_without_crypto_errors() {
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(20);
+        let mut ctx = CallContext::new(&host, &Host, &mut budget);
+        for (input, expected) in [
+            ("NASDAQ:NVDA", "NVDA US Equity"),
+            ("NYSE:IBM", "IBM US Equity"),
+            ("BINANCE:BTCUSDT", "BINANCE:BTCUSDT"),
+            ("TSX:SHOP", "SHOP.TO US Equity"),
+            ("TSXV:ABC", "ABC.V US Equity"),
+        ] {
+            let result = registry.call("find_symbol", &json!({"query":input}).to_string(), &mut ctx).await;
+            assert!(result.success);
+            assert_eq!(value(result)["results"][0]["symbol"], expected);
+        }
+        for input in ["LSE:VOD", "UNKNOWN:NVDA"] {
+            host.queries.lock().unwrap().clear();
+            let found = registry.call("find_symbol", &json!({"query":input}).to_string(), &mut ctx).await;
+            assert!(!found.success);
+            assert!(
+                value(found)["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Use the symbol returned by find_symbol, e.g.")
+            );
+            let result = registry.call("list_alerts", &json!({"symbol":input}).to_string(), &mut ctx).await;
+            assert!(!result.success);
+            let error = value(result);
+            let message = error["symbols"][0]["message"].as_str().unwrap();
+            assert!(message.starts_with("Use the symbol returned by find_symbol, e.g."));
+            assert!(!message.contains("crypto"));
+            assert!(host.queries.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn review_remove_watchlist_symbols_does_not_require_search_success() {
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(10);
+        let mut ctx = CallContext::new(&host, &Host, &mut budget);
+        for input in ["ZZZZ US Equity", "FAIL US Equity", "BTCUSD Curncy"] {
+            let result = registry
+                .call(
+                    "remove_watchlist_symbols",
+                    &json!({"watchlist":"Agent Test","symbols":[input]}).to_string(),
+                    &mut ctx,
+                )
+                .await;
+            assert!(result.success, "an existing list entry must be removable without a search hit: {result:?}");
+            let expected = if input == "BTCUSD Curncy" { "COINBASE:BTC-USD Curncy" } else { input };
+            assert_eq!(value(result)["args"]["symbols"][0], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn review_bare_ticker_ambiguous_same_ticker_hits_fail_instead_of_guessing() {
+        struct Ambiguous(Vec<&'static str>);
+        impl DataHost for Ambiguous {
+            fn history<'a>(&'a self, s: &'a str, tf: Timeframe, end: Option<i64>, n: usize) -> HostFuture<'a, History> {
+                Host.history(s, tf, end, n)
+            }
+            fn quotes<'a>(&'a self, s: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
+                Host.quotes(s)
+            }
+            fn search<'a>(&'a self, _: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+                Box::pin(async move {
+                    Ok(self
+                        .0
+                        .iter()
+                        .copied()
+                        .map(|key| SearchHit {
+                            key: key.into(),
+                            name: key.into(),
+                            class: tr_data::security(key).class,
+                            exchange: None,
+                        })
+                        .collect())
+                })
+            }
+        }
+        let registry = Registry::new(ToolSet::Workflows);
+        let mut budget = CallBudget::new(20);
+        for (input, keys, hints) in [
+            ("XYZ", vec!["XYZ Index", "XYZ Comdty"], vec!["XYZ Index", "XYZ Comdty"]),
+            ("BTC", vec!["BTC US Equity", "BTCUSD Curncy"], vec!["BTC US Equity", "COINBASE:BTC-USD"]),
+            ("BTC", vec!["BTCUSD Curncy", "BTC US Equity"], vec!["COINBASE:BTC-USD", "BTC US Equity"]),
+            (
+                "XYZ",
+                vec![
+                    "XYZ US Equity",
+                    "XYZ Index",
+                    "XYZ Comdty",
+                    "XYZ Govt",
+                    "BINANCE:XYZUSDT Curncy",
+                    "COINBASE:XYZ-USD Curncy",
+                ],
+                vec!["XYZ US Equity", "XYZ Index", "XYZ Comdty", "XYZ Govt", "BINANCE:XYZUSDT"],
+            ),
+        ] {
+            let host = Ambiguous(keys);
+            let mut ctx = CallContext::new(&host, &Host, &mut budget);
+            let result = registry
+                .call(
+                    "add_watchlist_symbols",
+                    &json!({"watchlist":"Agent Test","symbols":[input]}).to_string(),
+                    &mut ctx,
+                )
+                .await;
+            assert!(!result.success, "ambiguous bare ticker must fail with a hint, got {result:?}");
+            let error = value(result);
+            assert_eq!(error["symbols"][0]["error"], "ambiguous_symbol");
+            assert_eq!(error["symbols"][0]["hints"], json!(hints));
+        }
+        // Duplicate rows and equivalent crypto aliases are one distinct key.
+        for (input, keys, expected) in [
+            ("XYZ", vec!["XYZ Index", "XYZ Index"], "XYZ Index"),
+            ("BTC", vec!["BTCUSD Curncy", "COINBASE:BTC-USD Curncy"], "COINBASE:BTC-USD Curncy"),
+        ] {
+            let host = Ambiguous(keys);
+            let mut ctx = CallContext::new(&host, &Host, &mut budget);
+            let result = registry
+                .call(
+                    "add_watchlist_symbols",
+                    &json!({"watchlist":"Agent Test","symbols":[input]}).to_string(),
+                    &mut ctx,
+                )
+                .await;
+            assert!(result.success, "{result:?}");
+            assert_eq!(value(result)["args"]["symbols"][0], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn find_symbol_colons_in_free_text_are_not_exchange_qualifiers() {
+        let registry = Registry::new(ToolSet::Workflows);
+        let host = SymbolHost::default();
+        let mut budget = CallBudget::new(20);
+        let mut ctx = CallContext::new(&host, &Host, &mut budget);
+        for query in [
+            "nyse:IBM",
+            "sector: technology",
+            "TOP PICKS:NVDA",
+            "NYSE:IBM company",
+            "notes:NVDA",
+            "notes: Coinbase",
+            "notes: Binance",
+        ] {
+            host.queries.lock().unwrap().clear();
+            let result = registry.call("find_symbol", &json!({"query":query}).to_string(), &mut ctx).await;
+            assert!(result.success, "{query}: {result:?}");
+            assert_eq!(*host.queries.lock().unwrap(), [query]);
+        }
+        let result = registry.call("find_symbol", r#"{"query":"FAIL"}"#, &mut ctx).await;
+        assert!(!result.success);
+        let error = value(result);
+        assert_eq!(error["error"]["code"], "search_unavailable");
+        assert_eq!(error["error"]["message"], "Symbol search failed; try again");
+    }
+
+    #[tokio::test]
+    async fn workflow_symbol_errors_are_scrubbed_echo_bounded_and_result_capped() {
+        struct UntrustedSearch;
+        impl DataHost for UntrustedSearch {
+            fn history<'a>(&'a self, s: &'a str, tf: Timeframe, end: Option<i64>, n: usize) -> HostFuture<'a, History> {
+                Host.history(s, tf, end, n)
+            }
+            fn quotes<'a>(&'a self, s: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
+                Host.quotes(s)
+            }
+            fn search<'a>(&'a self, _: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+                Box::pin(async {
+                    Ok(vec![SearchHit {
+                        key: format!("{} Bearer secret-token trader@example.com /Users/alice/key", "🦀".repeat(300)),
+                        name: String::new(),
+                        class: tr_core::AssetClass::Equity,
+                        exchange: None,
+                    }])
+                })
+            }
+        }
+        let registry = Registry::new(ToolSet::Workflows);
+        let mut budget = CallBudget::new(10);
+        let mut ctx = CallContext::new(&UntrustedSearch, &Host, &mut budget);
+        let input = "?🦀".repeat(80);
+        let result = registry
+            .call("add_watchlist_symbols", &json!({"watchlist":"List","symbols":[input]}).to_string(), &mut ctx)
+            .await;
+        assert!(!result.success);
+        let error = value(result);
+        assert_eq!(error["symbols"][0]["symbol"].as_str().unwrap().chars().count(), 64);
+        let text = error.to_string();
+        for secret in ["secret-token", "trader@example.com", "/Users/alice"] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        assert!(text.contains("[REDACTED]"));
+        let result = registry
+            .call("add_watchlist_symbols", &json!({"watchlist":"List","symbols":vec![input;20]}).to_string(), &mut ctx)
+            .await;
+        assert!(!result.success);
+        let Content::Text(text) = &result.content[0] else { panic!("JSON output") };
+        assert!(text.len() <= crate::MAX_TEXT_BYTES);
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap()["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn workflow_contract_bounds_timeframe_unknown_symbols_and_readonly() {
+        let registry = Registry::new(ToolSet::Workflows);
+        for args in [json!({"watchlist":"Main","symbols":[]}), json!({"watchlist":"Main","symbols":vec!["AAPL";21]})] {
+            assert!(registry.validate_call("add_watchlist_symbols", &args.to_string()).is_err());
+        }
+        for args in [
+            json!({"symbol":"AAPL","kind":"close","direction":"below","level":100}),
+            json!({"symbol":"AAPL","kind":"close","direction":"below","level":100,"timeframe":"6H"}),
+            json!({"symbol":"AAPL","kind":"price","direction":"crossing","level":100}),
+            json!({"symbol":"AAPL","kind":"price","direction":"above","level":0}),
+        ] {
+            assert!(registry.validate_call("create_alert", &args.to_string()).is_err());
+        }
+        assert!(registry.validate_call("update_alert", r#"{"id":1}"#).is_err());
+        let mut budget = CallBudget::new(10);
+        let mut ctx = CallContext::new(&Host, &Host, &mut budget);
+        let result = registry
+            .call("add_watchlist_symbols", r#"{"watchlist":"Main","symbols":["AAPL","?UNKNOWN","?MISSING"]}"#, &mut ctx)
+            .await;
+        assert!(!result.success);
+        let result = value(result);
+        assert_eq!(result["symbols"].as_array().unwrap().len(), 2);
+        assert_eq!(result["symbols"][0]["symbol"], "?UNKNOWN");
+        assert_eq!(result["symbols"][1]["symbol"], "?MISSING");
+        let normalized =
+            value(registry.call("add_watchlist_symbols", r#"{"watchlist":"Main","symbols":["aapl"]}"#, &mut ctx).await);
+        assert_eq!(normalized["args"]["symbols"][0], "AAPL US Equity");
+        let readonly = Registry::new(ToolSet::ReadOnly);
+        assert!(!readonly.schemas().iter().any(|spec| spec.mutating));
+        for name in ["list_alerts", "list_watchlists"] {
+            assert!(readonly.call(name, "{}", &mut ctx).await.success);
+        }
+        for name in [
+            "create_watchlist",
+            "add_watchlist_symbols",
+            "remove_watchlist_symbols",
+            "delete_watchlist",
+            "create_alert",
+            "update_alert",
+            "delete_alert",
+        ] {
+            assert!(readonly.validate_call(name, "{}").is_err());
+        }
+    }
+
     #[tokio::test]
     async fn default_budget_counts_failed_calls() {
         let registry = Registry::new(ToolSet::ReadOnly);
@@ -475,7 +1060,8 @@ mod tests {
             )["error"]["field"],
             "symbol"
         );
-        for name in ["screenshot", "create_watchlist"] {
+        assert!(registry.call("create_watchlist", r#"{"name":"untrusted <text>"}"#, &mut ctx).await.success);
+        for name in ["screenshot"] {
             let args = if name == "screenshot" { "{}" } else { r#"{"name":"untrusted <text>"}"# };
             assert_eq!(value(registry.call(name, args, &mut ctx).await)["error"]["code"], "confirmation_required");
             ctx.confirmed = true;
@@ -518,21 +1104,27 @@ mod tests {
             ("screenshot", json!({})),
             ("read_user_actions", json!({"since":1})),
             ("create_watchlist", json!({"name":"list"})),
-            ("add_watchlist_symbols", json!({"id":"list","symbols":["AAPL"]})),
-            ("remove_watchlist_symbols", json!({"id":"list","symbols":["AAPL"]})),
-            ("delete_watchlist", json!({"id":"list"})),
-            ("create_alert", json!({"symbol":"AAPL","rule":"above","price":100})),
-            ("update_alert", json!({"id":"alert","rule":"crossing","price":101})),
-            ("delete_alert", json!({"id":"alert"})),
+            ("list_watchlists", json!({})),
+            ("list_alerts", json!({})),
+            ("add_watchlist_symbols", json!({"watchlist":"list","symbols":["AAPL"]})),
+            ("remove_watchlist_symbols", json!({"watchlist":"list","symbols":["AAPL"]})),
+            ("delete_watchlist", json!({"watchlist":"list"})),
+            ("create_alert", json!({"symbol":"AAPL","kind":"price","direction":"above","level":100})),
+            ("update_alert", json!({"id":1,"direction":"below","level":101})),
+            ("delete_alert", json!({"id":1})),
         ];
         assert_eq!(examples.len(), registry.schemas().iter().filter(|s| s.kind == ToolKind::Live).count());
         for (name, mut args) in examples {
-            args["chart_id"] = "pinned-chart".into();
+            if !workflow(name) {
+                args["chart_id"] = "pinned-chart".into();
+            }
             let result = registry.call(name, &args.to_string(), &mut ctx).await;
             assert!(result.success, "{name}: {result:?}");
             let result = value(result);
             assert_eq!(result["tool"], name);
-            assert_eq!(result["args"]["chart_id"], "pinned-chart");
+            if !workflow(name) {
+                assert_eq!(result["args"]["chart_id"], "pinned-chart");
+            }
         }
     }
 }

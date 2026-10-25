@@ -20,59 +20,75 @@
   "session": "Provider bars",
   "support_resistance": [
     {
-      "last_touch_time": 1708473600,
-      "price": 103.3623878,
-      "score": 5.18754904,
-      "touches": 4,
-      "zone_width": 2.79048545
-    },
-    {
-      "last_touch_time": 1709164800,
-      "price": 106.96921202,
-      "score": 4.51114221,
-      "touches": 3,
-      "zone_width": 2.79048545
-    },
-    {
-      "last_touch_time": 1707177600,
-      "price": 98.83407457,
-      "score": 3.92160073,
-      "touches": 3,
-      "zone_width": 2.79048545
-    },
-    {
-      "last_touch_time": 1710979200,
-      "price": 127.21709507,
-      "score": 3.76161109,
-      "touches": 2,
-      "zone_width": 2.79048545
-    },
-    {
-      "last_touch_time": 1710892800,
-      "price": 136.46268797,
-      "score": 3.57782437,
-      "touches": 2,
-      "zone_width": 2.79048545
-    },
-    {
-      "last_touch_time": 1707868800,
-      "price": 94.49827389,
-      "score": 3.26232418,
-      "touches": 2,
-      "zone_width": 2.79048545
-    },
-    {
+      "high": 112.12368714,
+      "in_play": false,
       "last_touch_time": 1708819200,
+      "low": 109.33320169,
       "price": 110.72844441,
       "score": 3.24350938,
+      "side": "support",
       "touches": 2,
+      "trimmed": false,
       "zone_width": 2.79048545
     },
     {
+      "high": 108.36445474,
+      "in_play": false,
+      "last_touch_time": 1709164800,
+      "low": 105.57396929,
+      "price": 106.96921202,
+      "score": 4.51114221,
+      "side": "support",
+      "touches": 3,
+      "trimmed": false,
+      "zone_width": 2.79048545
+    },
+    {
+      "high": 128.6123378,
+      "in_play": false,
+      "last_touch_time": 1710979200,
+      "low": 125.82185235,
+      "price": 127.21709507,
+      "score": 3.76161109,
+      "side": "resistance",
+      "touches": 2,
+      "trimmed": false,
+      "zone_width": 2.79048545
+    },
+    {
+      "high": 105.08339052,
+      "in_play": false,
+      "last_touch_time": 1708473600,
+      "low": 101.96714507,
+      "price": 103.3623878,
+      "score": 5.18754904,
+      "side": "support",
+      "touches": 4,
+      "trimmed": false,
+      "zone_width": 3.11624545
+    },
+    {
+      "high": 131.63788019,
+      "in_play": false,
       "last_touch_time": 1709683200,
+      "low": 128.84739474,
       "price": 130.24263747,
       "score": 2.59646144,
+      "side": "resistance",
       "touches": 1,
+      "trimmed": false,
+      "zone_width": 2.79048545
+    },
+    {
+      "high": 137.8579307,
+      "in_play": false,
+      "last_touch_time": 1710892800,
+      "low": 135.06744525,
+      "price": 136.46268797,
+      "score": 3.57782437,
+      "side": "resistance",
+      "touches": 2,
+      "trimmed": false,
       "zone_width": 2.79048545
     }
   ],

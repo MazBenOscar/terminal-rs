@@ -221,22 +221,153 @@ pub(crate) async fn analyze(host: &dyn DataHost, args: Analyze, now: i64) -> Too
     ToolResult::json(value)
 }
 
+/// Agent-only input normalization: never changes chart parsing or crypto venue routing.
+fn symbol_query(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    // Full crypto keys returned by workflow resolution may include the yellow key.
+    if input.starts_with("COINBASE:") || input.starts_with("BINANCE:") {
+        return Ok(input.into());
+    }
+    if let Some((venue, ticker)) = input.split_once(':')
+        && !venue.is_empty()
+        && venue.bytes().all(|c| c.is_ascii_uppercase())
+        && !ticker.chars().any(char::is_whitespace)
+    {
+        let suffix = match venue {
+            "NASDAQ" | "NYSE" | "AMEX" | "NYSEARCA" | "ARCA" | "BATS" => Some(""),
+            // Existing Canadian listing keys use Yahoo's .TO/.V tickers.
+            "TSX" => Some(".TO"),
+            "TSXV" => Some(".V"),
+            _ => None,
+        };
+        if let Some(suffix) = suffix
+            && tr_core::security::looks_like_ticker(&ticker.to_ascii_uppercase())
+        {
+            return Ok(format!("{}{suffix} US Equity", ticker.to_ascii_uppercase()));
+        }
+        return Err("Use the symbol returned by find_symbol, e.g. \"NVDA US Equity\"".into());
+    }
+    // A colon in free text must not trigger the pair/venue shorthand either.
+    if input.contains(':') {
+        return Ok(input.into());
+    }
+    let words: Vec<_> = input.split_whitespace().collect();
+    if let [pair, venue] = words.as_slice()
+        && matches!(venue.to_ascii_uppercase().as_str(), "COINBASE" | "BINANCE")
+    {
+        let product =
+            if venue.eq_ignore_ascii_case("COINBASE") { pair.replace('/', "-") } else { pair.replace(['/', '-'], "") };
+        return Ok(format!("{}:{product}", venue.to_ascii_uppercase()));
+    }
+    Ok(input.into())
+}
+
+/// Unlike Security::parse, require the entire input to be a well-formed instrument.
+fn workflow_security(input: &str) -> Option<tr_core::Security> {
+    let words: Vec<_> = input.split_whitespace().collect();
+    let (mut security, used) = tr_core::Security::resolve_tokens(&words)?;
+    if used != words.len() {
+        return None;
+    }
+    if words.len() == 1 && input.contains(['/', '-']) && security.class != AssetClass::Fx {
+        let compact = input.replace(['/', '-'], "");
+        if let Ok(instrument) = CryptoInstrument::parse(&compact) {
+            security = instrument.security();
+        }
+    }
+    if security.class == AssetClass::Crypto {
+        security = security.crypto_instrument().ok()?.security();
+    }
+    Some(security)
+}
+
+fn search_instrument(hit: &tr_data::SearchHit) -> Option<CryptoInstrument> {
+    if hit.class != AssetClass::Crypto {
+        return None;
+    }
+    let tokens: Vec<_> = hit.key.split_whitespace().collect();
+    tr_core::Security::resolve_tokens(&tokens).and_then(|(security, used)| {
+        (used == tokens.len()).then(|| CryptoInstrument::from_security(&security).ok()).flatten()
+    })
+}
+
+fn find_symbol_value(hit: &tr_data::SearchHit) -> String {
+    search_instrument(hit).map_or_else(|| hit.key.clone(), |i| i.canonical_ticker())
+}
+
+/// Resolve with at most two searches, retaining discovery candidates for actionable errors.
+pub(crate) async fn resolve_workflow_symbol(host: &dyn DataHost, input: &str) -> Result<String, serde_json::Value> {
+    let echo: String = crate::scrub_text(input).chars().take(64).collect();
+    let query = symbol_query(input)
+        .map_err(|message| json!({"symbol":echo,"error":"invalid_symbol","message":crate::scrub_text(&message)}))?;
+    let security = workflow_security(&query);
+    let bare = query.split_whitespace().count() == 1 && !query.contains(':');
+    let fallback = security.as_ref().map(|s| s.crypto_instrument().map_or_else(|_| s.ticker.clone(), |i| i.base));
+    let mut candidates = Vec::new();
+    let mut search_failed = false;
+    for search in std::iter::once(query.as_str()).chain(fallback.as_deref().filter(|s| !s.eq_ignore_ascii_case(&query)))
+    {
+        match host.search(search).await {
+            Ok(hits) => {
+                if let Some(target) = &security {
+                    // Bare tickers are not fully qualified keys: even an exact default
+                    // equity key must not win over another listing or a crypto base.
+                    let mut matches = Vec::new();
+                    for hit in &hits {
+                        if let Some(resolved) = workflow_security(&hit.key)
+                            && (resolved.key() == target.key()
+                                || bare
+                                    && (resolved.ticker == target.ticker
+                                        || search_instrument(hit).is_some_and(|i| i.base.eq_ignore_ascii_case(&query))))
+                            && !matches.iter().any(|(key, _)| key == &resolved.key())
+                        {
+                            matches.push((resolved.key(), find_symbol_value(hit)));
+                        }
+                    }
+                    if matches.len() == 1 {
+                        return Ok(matches.remove(0).0);
+                    }
+                    if matches.len() > 1 {
+                        let hints: Vec<_> =
+                            matches.iter().take(5).map(|(_, symbol)| crate::scrub_text(symbol)).collect();
+                        return Err(json!({"symbol":echo,"error":"ambiguous_symbol","hints":hints,
+                            "hint":crate::scrub_text(&format!("Choose a symbol returned by find_symbol: {}", hints.join(", ")))}));
+                    }
+                }
+                candidates.extend(hits);
+            }
+            Err(_) => search_failed = true,
+        }
+    }
+    let mut error = json!({"symbol":echo,"error":if search_failed {"search_unavailable"} else {"unknown_symbol"}});
+    if search_failed {
+        error["message"] = json!("Symbol search failed; try again");
+    }
+    if let Some(hit) = candidates.first() {
+        let symbol = find_symbol_value(hit);
+        error["hint"] = json!(crate::scrub_text(&format!("did you mean \"{symbol}\"")));
+    }
+    Err(error)
+}
+
 pub(crate) async fn find_symbol(host: &dyn DataHost, args: FindSymbol) -> ToolResult {
-    let hits = match host.search(&args.query).await {
+    let query = match symbol_query(&args.query) {
+        Ok(query) => query,
+        Err(message) => return ToolResult::error("invalid_symbol", &message, Some("query")),
+    };
+    let search = if args.query.contains(':') && query != args.query.trim() && !query.contains(':') {
+        workflow_security(&query).map_or(query.clone(), |s| s.ticker)
+    } else {
+        query
+    };
+    let hits = match host.search(&search).await {
         Ok(hits) => hits,
-        Err(e) => return ToolResult::error("host_error", &e, None),
+        Err(_) => return ToolResult::error("search_unavailable", "Symbol search failed; try again", None),
     };
     let total = hits.len();
     let mut results = Vec::new();
     for hit in hits.into_iter().take(100) {
-        let instrument = if hit.class == AssetClass::Crypto {
-            let tokens: Vec<_> = hit.key.split_whitespace().collect();
-            tr_core::Security::resolve_tokens(&tokens).and_then(|(security, used)| {
-                (used == tokens.len()).then(|| CryptoInstrument::from_security(&security).ok()).flatten()
-            })
-        } else {
-            None
-        };
+        let instrument = search_instrument(&hit);
         let symbol = instrument.as_ref().map_or_else(|| hit.key.clone(), CryptoInstrument::canonical_ticker);
         let display_name =
             instrument.as_ref().map(|i| format!("{}/{}", i.base, i.quote)).unwrap_or_else(|| hit.key.clone());

@@ -16,6 +16,14 @@ const LIMIT: usize = 500;
 pub fn same_key(a: &str, b: &str) -> bool {
     fn canonical(key: &str) -> String {
         let security = tr_data::security(key);
+        if key.split_whitespace().count() == 1
+            && !key.contains(':')
+            && key.contains(['/', '-'])
+            && security.class != AssetClass::Fx
+            && let Ok(instrument) = CryptoInstrument::parse(&key.replace(['/', '-'], ""))
+        {
+            return instrument.security().key();
+        }
         security.crypto_instrument().map_or_else(|_| security.key(), |c| c.security().key())
     }
     canonical(a) == canonical(b)
@@ -1374,6 +1382,12 @@ mod tests {
         assert!(same_key("aapl", "AAPL US Equity"));
         assert!(same_key("SPX", "SPX Index"));
         assert!(same_key("BINANCE:XRPUSDT", "XRPUSDT Curncy"));
+        assert!(same_key("BTC-USD", "BTCUSD Curncy"));
+        assert!(same_key("BTC/USD", "COINBASE:BTC-USD Curncy"));
+        assert!(same_key("BRK/B", "BRK.B US Equity"));
+        assert!(same_key("EUR/USD", "EURUSD Curncy"));
+        assert!(!same_key("BTC-USD", "BTC US Equity"));
+        assert!(!same_key("BTC-USD", "BINANCE:BTCUSDT Curncy"));
         assert!(!same_key("MSFT", "AAPL US Equity"));
     }
 

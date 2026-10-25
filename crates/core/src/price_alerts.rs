@@ -74,6 +74,24 @@ pub struct Alert {
     pub repeat: Repeat,
     #[serde(default)]
     pub last_fired: Option<i64>,
+    /// Conversation turn that created this alert; user configuration changes clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_turn: Option<String>,
+    /// Historical creator for the live-book limit, not ownership. User edits
+    /// clear agent_turn, but must not make an agent-created alert evade the cap.
+    #[serde(default)]
+    pub agent_created: bool,
+    #[serde(default)]
+    pub completed_only: bool,
+    /// Finished-close alerts only consider bars ending strictly after creation.
+    /// Old books predate this baseline and retain their previous behavior.
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Configuration identity for safe inverse edits; firing does not change it.
+    #[serde(default)]
+    pub config_revision: u64,
 }
 
 /// Formula values and line-distance values have their own units, not market prices.
@@ -305,6 +323,12 @@ impl Book {
             rule: None,
             repeat: Repeat::Once,
             last_fired: None,
+            agent_turn: None,
+            agent_created: false,
+            completed_only: false,
+            created_at: chrono::Utc::now().timestamp(),
+            note: None,
+            config_revision: 0,
         });
         Ok(id)
     }
@@ -313,6 +337,8 @@ impl Book {
     pub fn edit(&mut self, id: u64, level: f64, direction: Direction) -> Result<(), String> {
         let a = self.alerts.iter_mut().find(|a| a.id == id).ok_or("Alert no longer exists")?;
         validate_alert(&a.symbol, level)?;
+        a.config_revision = a.config_revision.wrapping_add(1);
+        a.agent_turn = None;
         a.level = level;
         a.direction = direction;
         a.status = Status::Armed;
@@ -324,6 +350,8 @@ impl Book {
     pub fn set_repeat(&mut self, id: u64, repeat: Repeat) -> Result<(), String> {
         repeat.validate()?;
         let a = self.alerts.iter_mut().find(|a| a.id == id).ok_or("Alert no longer exists")?;
+        a.config_revision = a.config_revision.wrapping_add(1);
+        a.agent_turn = None;
         a.repeat = repeat;
         a.status = Status::Armed;
         a.last_fired = None;
@@ -333,6 +361,8 @@ impl Book {
 
     pub fn toggle(&mut self, id: u64) {
         if let Some(a) = self.alerts.iter_mut().find(|a| a.id == id) {
+            a.config_revision = a.config_revision.wrapping_add(1);
+            a.agent_turn = None;
             a.status = if a.status == Status::Armed { Status::Disabled } else { Status::Armed };
             a.last_fired = None;
             self.previous.remove(&id);
@@ -361,6 +391,11 @@ impl Book {
             r.validate()?;
         }
         let a = self.alerts.iter_mut().find(|a| a.id == id).ok_or("Alert no longer exists")?;
+        a.config_revision = a.config_revision.wrapping_add(1);
+        a.agent_turn = None;
+        if a.rule != rule {
+            a.completed_only = false;
+        }
         a.rule = rule;
         self.version = 3;
         self.previous.remove(&id);
@@ -370,7 +405,10 @@ impl Book {
         self.previous.remove(&id);
     }
     fn observe_target(&mut self, q: Observation, now: i64, target: Option<u64>) -> Vec<Event> {
-        if !q.valid_at(now) {
+        let finished = target.is_some_and(|id| self.alerts.iter().any(|a| a.id == id && a.completed_only));
+        // Finished-close observations carry the bucket END, not a fresh quote timestamp.
+        // The evaluator separately checks quote freshness before building these observations.
+        if if finished { !q.price.is_finite() || q.ts <= 0 || q.ts > now } else { !q.valid_at(now) } {
             if let Some(id) = target {
                 self.previous.remove(&id);
             } else {
@@ -391,13 +429,28 @@ impl Book {
                 self.previous.remove(&a.id);
                 continue;
             }
-            if let Some(prev) = self.previous.get(&a.id) {
-                // Ignore out-of-order data. Source switches and gaps seed again.
-                if q.ts < prev.ts {
+            {
+                let crosses = if a.completed_only {
+                    if q.ts <= a.created_at {
+                        continue;
+                    }
+                    match a.direction {
+                        Direction::Above => q.price > a.level,
+                        Direction::Below => q.price < a.level,
+                    }
+                } else if let Some(prev) = self.previous.get(&a.id) {
+                    // Preserve the sampled-crossing semantics of all existing alerts.
+                    prev.source == q.source
+                        && q.ts >= prev.ts
+                        && q.ts - prev.ts <= 120
+                        && a.direction.crosses(prev.price, q.price, a.level)
+                } else {
+                    false
+                };
+                if self.previous.get(&a.id).is_some_and(|prev| q.ts < prev.ts) {
                     continue;
                 }
-                if prev.source == q.source && q.ts - prev.ts <= 120 && a.direction.crosses(prev.price, q.price, a.level)
-                {
+                if crosses {
                     let cooling = match a.repeat {
                         Repeat::Once => false,
                         Repeat::Rearm { cooldown_secs } => {
@@ -462,6 +515,38 @@ mod tests {
             ),
             timeframe: crate::Timeframe::D1,
         }
+    }
+
+    #[test]
+    fn user_alert_configuration_edits_clear_agent_ownership_and_preserve_close_only_for_same_rule() {
+        let mut book = Book::default();
+        let id = book.add("AAPL US Equity".into(), 100., Direction::Above, true).unwrap();
+        let rule = Rule::Formula { expression: "C".into(), timeframe: crate::Timeframe::H4 };
+        book.set_rule(id, Some(rule.clone())).unwrap();
+        book.alerts[0].agent_turn = Some("session:1".into());
+        book.alerts[0].completed_only = true;
+        let original_revision = book.alerts[0].config_revision;
+        book.edit(id, 101., Direction::Below).unwrap();
+        assert!(book.alerts[0].agent_turn.is_none());
+        assert!(book.alerts[0].completed_only);
+        assert!(book.alerts[0].config_revision > original_revision);
+        book.set_rule(id, Some(rule)).unwrap();
+        assert!(book.alerts[0].completed_only, "saving unchanged close rule must keep its semantics");
+        for change in 0..2 {
+            book.alerts[0].agent_turn = Some("session:1".into());
+            if change == 0 {
+                book.set_repeat(id, Repeat::Rearm { cooldown_secs: 60 }).unwrap();
+            } else {
+                book.toggle(id);
+            }
+            assert!(book.alerts[0].agent_turn.is_none());
+        }
+        book.alerts[0].agent_turn = Some("session:1".into());
+        book.set_rule(id, Some(Rule::Formula { expression: "C + 1".into(), timeframe: crate::Timeframe::D1 })).unwrap();
+        assert!(book.alerts[0].agent_turn.is_none());
+        assert!(!book.alerts[0].completed_only, "a user-selected different rule has normal evaluation semantics");
+        book.delete(id);
+        assert!(book.alerts.is_empty());
     }
 
     #[test]

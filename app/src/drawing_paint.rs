@@ -4,10 +4,22 @@ use egui::{Color32, Painter, Rect, Shape, Stroke, StrokeKind};
 
 use crate::{
     chart_view::{label_plate, label_text},
-    theme::{self, mono, ui_font},
+    theme::{self, dp, mono, ui_font},
 };
 use egui::{Align2, pos2, vec2};
 use tr_chart::drawings::{Drawing, Shape as DrawingShape, Tool};
+
+/// Resolve semantic zone ink at paint time so saved agent zones follow theme changes.
+pub(crate) fn drawing_color(drawing: &Drawing) -> Color32 {
+    drawing.color.map_or_else(
+        || match drawing.zone_role {
+            Some(tr_chart::drawings::ZoneRole::Support) => theme::up(),
+            Some(tr_chart::drawings::ZoneRole::Resistance) => theme::down(),
+            None => theme::cyan(),
+        },
+        |[r, g, b]| Color32::from_rgb(r, g, b),
+    )
+}
 
 type LabeledShape = (DrawingShape, Option<String>);
 pub struct Paint<'a> {
@@ -15,6 +27,67 @@ pub struct Paint<'a> {
     pub rect: Rect,
     pub stroke: Stroke,
     pub selected: bool,
+}
+
+/// Bounds use the same fonts, alignment and wrapping as the drawing painter.
+/// Used across all drawings, so provenance never covers another drawing's label.
+pub(crate) fn label_bounds(context: &Paint<'_>, shapes: &[LabeledShape], tool: Tool) -> Vec<Rect> {
+    let p = context.painter;
+    let rect = context.rect;
+    shapes
+        .iter()
+        .filter_map(|(shape, label)| {
+            let label = label.as_ref()?;
+            let size = p.layout_no_wrap(label.clone(), mono(10.), context.stroke.color).size();
+            let bounds = match shape {
+                DrawingShape::HLine(y) => {
+                    Align2::RIGHT_BOTTOM.anchor_size(pos2(rect.right() - dp(4.), *y as f32 - dp(1.)), size)
+                }
+                DrawingShape::VLine(x) => {
+                    Align2::LEFT_TOP.anchor_size(pos2(*x as f32 + dp(3.), rect.top() + dp(3.)), size)
+                }
+                DrawingShape::Segment(a, b) => {
+                    let (at, align) = if a == b {
+                        (pos2(a[0] as f32 - dp(4.), a[1] as f32 - dp(1.)), Align2::RIGHT_BOTTOM)
+                    } else {
+                        (pos2(a[0] as f32 + dp(3.), a[1] as f32 - dp(1.)), Align2::LEFT_BOTTOM)
+                    };
+                    align.anchor_size(at, size)
+                }
+                DrawingShape::Rect(a, b) => {
+                    let r = Rect::from_two_pos(pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32));
+                    if matches!(tool, Tool::Text | Tool::PriceNote | Tool::Callout | Tool::FlagMark) {
+                        let size = p.layout(label.clone(), ui_font(11.5), context.stroke.color, dp(220.)).size();
+                        return Some(Rect::from_min_size(r.min + vec2(dp(4.), dp(2.)), size).expand(theme::dp(3.)));
+                    }
+                    let size =
+                        p.layout(label.clone(), mono(11.), context.stroke.color, rect.width().min(dp(330.))).size()
+                            + vec2(dp(8.), dp(4.));
+                    Rect::from_min_size(
+                        pos2(
+                            r.left().clamp(rect.left(), (rect.right() - size.x).max(rect.left())),
+                            (r.top() - size.y - dp(2.)).max(rect.top()),
+                        ),
+                        size,
+                    )
+                }
+                _ => return None,
+            };
+            Some(bounds.expand(theme::dp(3.)))
+        })
+        .collect()
+}
+
+pub(crate) fn provenance_rect(plot: Rect, preferred: egui::Pos2, size: egui::Vec2, occupied: &[Rect]) -> Option<Rect> {
+    if !plot.is_finite() || plot.width() < size.x || plot.height() < size.y || !preferred.is_finite() {
+        return None;
+    }
+    let at = preferred.clamp(plot.min, plot.max - size);
+    let rect = Rect::from_min_size(at, size);
+    (rect.is_finite()
+        && plot.contains_rect(rect)
+        && !occupied.iter().any(|label| label.intersects(rect.expand(theme::dp(2.)))))
+    .then_some(rect)
 }
 
 pub fn paint(drawing: &Drawing, paint: &Paint<'_>, shapes: Vec<LabeledShape>) {
@@ -174,9 +247,9 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
                     label_text(
                         p,
                         if a == b {
-                            pos2(a[0] as f32 - 4., a[1] as f32 - 1.)
+                            pos2(a[0] as f32 - dp(4.), a[1] as f32 - dp(1.))
                         } else {
-                            pos2(a[0] as f32 + 3., a[1] as f32 - 1.)
+                            pos2(a[0] as f32 + dp(3.), a[1] as f32 - dp(1.))
                         },
                         if a == b { Align2::RIGHT_BOTTOM } else { Align2::LEFT_BOTTOM },
                         label,
@@ -189,7 +262,7 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
                 if let Some(label) = label {
                     label_text(
                         p,
-                        pos2(rect.right() - 4., y as f32 - 1.),
+                        pos2(rect.right() - dp(4.), y as f32 - dp(1.)),
                         Align2::RIGHT_BOTTOM,
                         label,
                         mono(10.),
@@ -199,29 +272,152 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
             }
             DrawingShape::VLine(x) => {
                 if let Some(label) = label {
-                    label_text(p, pos2(x as f32 + 3., rect.top() + 3.), Align2::LEFT_TOP, label, mono(10.), color);
+                    label_text(
+                        p,
+                        pos2(x as f32 + dp(3.), rect.top() + dp(3.)),
+                        Align2::LEFT_TOP,
+                        label,
+                        mono(10.),
+                        color,
+                    );
                 }
             }
             DrawingShape::Rect(a, b) => {
                 let r = Rect::from_two_pos(pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32));
                 if matches!(style, RectStyle::Text | RectStyle::Callout) {
-                    let galley = p.layout(label.unwrap_or_default(), ui_font(11.5), color, 220.);
-                    label_plate(p, Rect::from_min_size(r.min + vec2(4., 2.), galley.size()));
-                    p.galley(r.min + vec2(4., 2.), galley, color);
+                    let galley = p.layout(label.unwrap_or_default(), ui_font(11.5), color, dp(220.));
+                    label_plate(p, Rect::from_min_size(r.min + vec2(dp(4.), dp(2.)), galley.size()));
+                    p.galley(r.min + vec2(dp(4.), dp(2.)), galley, color);
                 } else {
                     if let Some(label) = label {
-                        let galley = p.layout(label, mono(11.), color, rect.width().min(330.));
-                        let size = galley.size() + vec2(8., 4.);
+                        let galley = p.layout(label, mono(11.), color, rect.width().min(dp(330.)));
+                        let size = galley.size() + vec2(dp(8.), dp(4.));
                         let min = pos2(
                             r.left().clamp(rect.left(), (rect.right() - size.x).max(rect.left())),
-                            (r.top() - size.y - 2.).max(rect.top()),
+                            (r.top() - size.y - dp(2.)).max(rect.top()),
                         );
-                        label_plate(p, Rect::from_min_size(min + vec2(4., 2.), galley.size()));
-                        p.galley(min + vec2(4., 2.), galley, color);
+                        label_plate(p, Rect::from_min_size(min + vec2(dp(4.), dp(2.)), galley.size()));
+                        p.galley(min + vec2(dp(4.), dp(2.)), galley, color);
                     }
                 }
             }
             DrawingShape::DashedSegment(..) | DrawingShape::Polygon(_) => {}
+        }
+    }
+}
+
+#[test]
+fn provenance_placement_avoids_right_edge_labels_other_labels_and_clipped_zones() {
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        let plot = Rect::from_min_size(pos2(0., 0.), vec2(600., 400.));
+        let context = Paint {
+            painter: ui.painter(),
+            rect: plot,
+            stroke: Stroke::new(theme::dp(1.), theme::muted()),
+            selected: false,
+        };
+        let shapes = vec![(DrawingShape::HLine(100.), Some("Prior close 81978.94".into()))];
+        let labels = label_bounds(&context, &shapes, Tool::Horizontal);
+        let size = ui.painter().layout_no_wrap("Agent".into(), mono(9.), theme::muted()).size();
+        let preferred = pos2(labels[0].left() - size.x - theme::dp(6.), labels[0].top() + theme::dp(3.));
+        let tag = provenance_rect(plot, preferred, size, &labels).expect("tag fits before price-line text");
+        assert!(!tag.intersects(labels[0]));
+        let mut occupied = labels;
+        occupied.push(tag);
+        assert!(
+            provenance_rect(plot, preferred, size, &occupied).is_none(),
+            "another label suppresses the provenance tag"
+        );
+        assert!(plot.contains_rect(provenance_rect(plot, pos2(590., 100.), size, &[]).unwrap()));
+        assert!(provenance_rect(plot, pos2(20., 100.), vec2(700., 10.), &[]).is_none());
+        let shapes = vec![(DrawingShape::Rect([50., 100.], [550., 200.]), Some("W1 support 72883–76892".into()))];
+        let labels = label_bounds(&context, &shapes, Tool::Horizontal);
+        let tag = provenance_rect(plot, pos2(50. + theme::dp(5.), 100. + theme::dp(5.)), size, &labels).unwrap();
+        assert!(!tag.intersects(labels[0]));
+        assert!(tag.left() >= 50. && tag.top() >= 100. && tag.right() <= 550. && tag.bottom() <= 200.);
+    });
+    output.textures_delta.clear();
+}
+
+/// Chart context and drawings share bounds emitted by their actual label painters.
+#[test]
+fn review_provenance_tag_avoids_prior_close_context_label() {
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        let plot = Rect::from_min_size(pos2(0., 0.), vec2(600., 400.));
+        let p = ui.painter();
+        let context =
+            Paint { painter: p, rect: plot, stroke: Stroke::new(theme::dp(1.), theme::muted()), selected: false };
+        // Agent horizontal level 2 px below the prior close line.
+        let shapes = vec![(DrawingShape::HLine(102.), Some("H4 81950.00".into()))];
+        let mut occupied = label_bounds(&context, &shapes, Tool::Horizontal);
+        let size = p.layout_no_wrap("Agent".into(), mono(9.), theme::muted()).size();
+        let preferred = pos2(occupied[0].left() - size.x - theme::dp(6.), occupied[0].top() + theme::dp(3.));
+        let bars = [
+            tr_core::Bar::new(86400, 81978., 81990., 81960., 81978.94, 1.),
+            tr_core::Bar::new(172800, 81978., 81990., 81960., 81980., 1.),
+        ];
+        let labels = crate::chart_context::Settings { countdown: false, range: true, ..Default::default() }.paint(
+            ui,
+            plot,
+            &tr_chart::viewport::PriceScale::new(81903.94, 82003.94, false, 400.),
+            &bars,
+            (tr_core::Timeframe::D1, false, tr_core::session::Session::Provider, false),
+        );
+        assert_eq!(labels.len(), 3, "prior close and both session bounds participate");
+        let prior = labels[0];
+        assert!(provenance_rect(plot, preferred, size, &occupied).unwrap().intersects(prior), "fixture must collide");
+        occupied.extend(labels);
+        let tag = provenance_rect(plot, preferred, size, &occupied);
+        assert!(tag.is_none(), "the context label suppresses the colliding tag");
+    });
+    output.textures_delta.clear();
+}
+
+/// Mirrors chart_view::paint_drawings rectangle placement (zone.min + 5 inside zone ∩ plot).
+#[test]
+fn review_provenance_tag_survives_zone_start_off_plot() {
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        let plot = Rect::from_min_size(pos2(0., 0.), vec2(600., 400.));
+        let size = ui.painter().layout_no_wrap("Agent".into(), mono(9.), theme::muted()).size();
+        let zone = Rect::from_min_max(pos2(-200., 100.), pos2(500., 200.));
+        let tag = provenance_rect(zone.intersect(plot), zone.min + vec2(theme::dp(5.), theme::dp(5.)), size, &[]);
+        assert!(tag.is_some(), "a visible agent zone should keep its provenance tag");
+    });
+    output.textures_delta.clear();
+}
+
+#[test]
+fn support_and_resistance_zones_resolve_theme_ink_and_existing_translucent_fill() {
+    use tr_chart::drawings::{Anchor, ZoneRole};
+    let ctx = egui::Context::default();
+    for name in ["Terminal Dark", "Terminal Light", "Bloomberg"] {
+        let themes = crate::themes::builtins();
+        theme::configure(&ctx, themes.iter().find(|t| t.name == name).unwrap(), theme::DEFAULT_ACCENT);
+        for (role, ink) in [(ZoneRole::Support, theme::up()), (ZoneRole::Resistance, theme::down())] {
+            let anchor = Anchor { ts: 86400, price: 10. };
+            let mut drawing = Drawing::new(Tool::Rectangle, anchor, anchor);
+            drawing.zone_role = Some(role);
+            assert_eq!(drawing_color(&drawing), ink);
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                paint(
+                    &drawing,
+                    &Paint {
+                        painter: ui.painter(),
+                        rect: ui.max_rect(),
+                        stroke: Stroke::new(theme::dp(1.0), drawing_color(&drawing)),
+                        selected: false,
+                    },
+                    vec![(DrawingShape::Rect([20., 20.], [200., 80.]), Some("W1 Support / resistance".into()))],
+                );
+            });
+            output.textures_delta.clear();
+            assert!(
+                output.shapes.iter().any(|s| matches!(&s.shape, Shape::Rect(r) if r.fill == ink.gamma_multiply(0.12))),
+                "{name} {role:?}"
+            );
         }
     }
 }

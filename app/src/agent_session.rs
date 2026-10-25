@@ -21,6 +21,7 @@ pub enum Command {
     ReopenLogin,
     RefreshLimits,
     Turn(Box<BridgeTurn>),
+    WorkflowResults(Vec<tr_agent::codex::WorkflowResult>),
     Interrupt,
 }
 // The URL is deliberately neither Debug nor serializable and is never stored in pane state.
@@ -344,8 +345,10 @@ fn classify(result: Result<()>, unsafe_backend: bool) -> Result<()> {
 
 pub(crate) fn bridge_options(cwd: String, tools: tr_agent_tools::ToolSet) -> BridgeOptions {
     let mut options = BridgeOptions::new(cwd);
-    if tools == tr_agent_tools::ToolSet::Edit && crate::agent_bridge::agent_edit_tools_available() {
-        options.tools = tr_agent_tools::ToolSet::Edit;
+    if matches!(tools, tr_agent_tools::ToolSet::Edit | tr_agent_tools::ToolSet::Workflows)
+        && crate::agent_bridge::agent_edit_tools_available()
+    {
+        options.tools = tools;
     }
     options
 }
@@ -398,6 +401,16 @@ async fn owner(
     result.map_err(|error| version_at_path(error, &binary))
 }
 
+async fn deliver_workflow_results(
+    client: &CodexAppServer,
+    undelivered: &mut Vec<tr_agent::codex::WorkflowResult>,
+    results: Vec<tr_agent::codex::WorkflowResult>,
+) {
+    if !results.is_empty() && client.workflow_results(&results).await.is_err() {
+        undelivered.extend(results);
+    }
+}
+
 async fn run_bridge(
     receive: &mut mpsc::UnboundedReceiver<Command>,
     inbox: &Inbox,
@@ -411,6 +424,9 @@ async fn run_bridge(
     inbox.push(Event::Models(models));
     inbox.state(Onboarding::Ready);
     inbox.limits(&bridge.client().rate_limits().await?);
+    // The owner serializes steers and turn starts. Only failed/no-active-turn
+    // deliveries carry over; a successful steer is never repeated next turn.
+    let mut undelivered = Vec::new();
     loop {
         tokio::select! {
             event = bridge.next_event() => {
@@ -418,11 +434,16 @@ async fn run_bridge(
                 if let Some(event) = project(event) { inbox.push(Event::Bridge(event)); }
             }
             command = receive.recv() => match command {
-                Some(Command::Turn(turn)) => {
+                Some(Command::Turn(mut turn)) => {
+                    undelivered.append(&mut turn.input.workflow_results);
+                    turn.input.workflow_results = undelivered.clone();
                     match bridge.send(*turn).await {
                         // The ack already returns the canonical key. Do not depend on
                         // a later wire turn/started notification to retain partial edits.
-                        Ok(turn) => inbox.push(Event::Bridge(BridgeEvent::Started { turn })),
+                        Ok(turn) => {
+                            undelivered.clear();
+                            inbox.push(Event::Bridge(BridgeEvent::Started { turn }));
+                        }
                         Err(error) => {
                             inbox.push(Event::Notice(scrub_text(&error.to_string())));
                             // Recovery is bridge-controlled; it never replays the failed turn.
@@ -430,6 +451,9 @@ async fn run_bridge(
                             inbox.push(Event::Bridge(BridgeEvent::Recovered(recovery)));
                         }
                     }
+                }
+                Some(Command::WorkflowResults(results)) => {
+                    deliver_workflow_results(bridge.client(), &mut undelivered, results).await;
                 }
                 Some(Command::Interrupt) => { if let Err(error) = bridge.interrupt().await { inbox.push(Event::Notice(scrub_text(&error.to_string()))); } }
                 Some(Command::RefreshLimits) => { inbox.state(Onboarding::Ready); inbox.limits(&bridge.client().rate_limits().await?); }
@@ -447,6 +471,7 @@ fn project(event: BridgeEvent) -> Option<BridgeEvent> {
             match method.as_str() {
                 "item/started" | "item/completed" if params["item"]["type"] == "dynamicToolCall" => {
                     let summary = crate::agent_pane::edit_tool_summary(&params["item"]);
+                    let error = crate::agent_pane::tool_error(&params["item"]);
                     if let Some(map) = params["item"].as_object_mut() {
                         map.retain(|key, _| {
                             matches!(key.as_str(), "id" | "type" | "tool" | "arguments" | "success" | "durationMs")
@@ -454,6 +479,9 @@ fn project(event: BridgeEvent) -> Option<BridgeEvent> {
                         if let Some(summary) = summary {
                             map.remove("arguments");
                             map.insert("editSummary".into(), summary.into());
+                        }
+                        if let Some(error) = error {
+                            map.insert("error".into(), error.into());
                         }
                     }
                 }
@@ -480,6 +508,150 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tr_agent::transport::{Transport, WireEvent};
+
+    #[test]
+    fn review_mid_turn_approval_is_delivered_once() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/review-steer-duplicate");
+        let mut app = crate::app::TerminalApp::test_workspace(&root);
+        let (sender, mut receive) = mpsc::unbounded_channel();
+        let (shutdown, _stopping) = watch::channel(());
+        let (_done, finished) = std::sync::mpsc::channel();
+        let inbox = Arc::new(Inbox {
+            events: Mutex::new(Vec::new()),
+            visible: AtomicBool::new(true),
+            ctx: egui::Context::default(),
+            last_text_wake: Mutex::new(None),
+        });
+        app.agent_pane.session = Some(Session { sender: Some(sender), inbox, shutdown, finished, owner: None });
+        app.agent_pane.running = true;
+        app.agent_workflow(
+            "steer:1",
+            tr_agent_tools::args::LiveArgs::CreateWatchlist(tr_agent_tools::args::CreateWatchlist {
+                name: "Crypto".into(),
+            }),
+        );
+        app.confirm_workflows("steer:1", true);
+        let mut steered = 0;
+        while let Ok(command) = receive.try_recv() {
+            if let Command::WorkflowResults(results) = command {
+                steered += results.len();
+            }
+        }
+        assert_eq!(steered, 1, "approval goes to the active turn via turn/steer");
+        assert!(
+            app.agent_pane.workflows.context.is_empty(),
+            "already-steered outcome is queued again as next-turn context: {:?}",
+            app.agent_pane.workflows.context
+        );
+        app.confirm_workflows("steer:1", true);
+        assert!(receive.try_recv().is_err(), "a repeated approval must not send an empty steer");
+    }
+
+    #[tokio::test]
+    async fn workflow_delivery_carries_only_failed_or_inactive_steers_and_never_sends_empty() {
+        use tr_agent::codex::{WorkflowResult, WorkflowStatus};
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(client_io);
+        let client = CodexAppServer::new(Transport::connect(
+            read,
+            write,
+            Arc::new(|_| Box::pin(async { Ok(json!({})) })),
+            Arc::new(|| {}),
+            None,
+        ));
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server_io);
+            let mut read = BufReader::new(read).lines();
+            let mut starts = 0;
+            let mut steers = 0;
+            while let Some(line) = read.next_line().await.unwrap() {
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let result = match method {
+                    "initialized" => continue,
+                    "initialize" => json!({}),
+                    "skills/list" => {
+                        json!({"data":[{"skills":tr_agent::codex::BUNDLED_SKILLS.iter().map(|name| json!({"name":name,"enabled":false})).collect::<Vec<_>>()}]})
+                    }
+                    "account/read" => json!({"account":{"type":"chatgpt"}}),
+                    "thread/start" => json!({"thread":{"id":"thread"}}),
+                    "turn/start" => {
+                        starts += 1;
+                        let outcomes = request["params"]["additionalContext"].get("application_workflow_results");
+                        assert_eq!(outcomes.is_some(), starts < 3, "only undelivered outcomes enter start context");
+                        if let Some(outcomes) = outcomes {
+                            let text = outcomes["value"].as_str().unwrap();
+                            assert!(text.contains(if starts == 1 { "inactive outcome" } else { "failed outcome" }));
+                            assert!(!text.contains("delivered outcome"));
+                        }
+                        json!({"turn":{"id":format!("turn-{starts}")}})
+                    }
+                    "turn/steer" => {
+                        steers += 1;
+                        let text = request["params"]["additionalContext"]["application_workflow_results"]["value"]
+                            .as_str()
+                            .unwrap();
+                        assert!(text.contains(if steers == 1 { "failed outcome" } else { "delivered outcome" }));
+                        if steers == 1 {
+                            write.write_all(format!("{}\n", json!({"id":request["id"],"error":{"code":-32602,"message":"turn already completed"}})).as_bytes()).await.unwrap();
+                            continue;
+                        }
+                        json!({"turnId":"turn-2"})
+                    }
+                    _ => panic!("unexpected method {method}"),
+                };
+                write.write_all(format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes()).await.unwrap();
+                if starts == 3 {
+                    assert_eq!(steers, 2, "no empty steer");
+                    return;
+                }
+            }
+            panic!("server ended before final start");
+        });
+        client.initialize().await.unwrap();
+        client
+            .start_thread(tr_agent::ThreadOptions {
+                cwd: "empty".into(),
+                base_instructions: "test".into(),
+                ephemeral: true,
+                dynamic_tools: vec![],
+            })
+            .await
+            .unwrap();
+        let outcome = |id, summary: &str| {
+            vec![WorkflowResult::Confirmation {
+                proposal_id: id,
+                status: WorkflowStatus::Approved,
+                summary: summary.into(),
+            }]
+        };
+        let mut pending = Vec::new();
+        deliver_workflow_results(&client, &mut pending, outcome(1, "inactive outcome")).await;
+        assert_eq!(pending.len(), 1, "no active turn must carry over");
+        for turn in 1..=3 {
+            client
+                .send_turn(tr_agent::TurnInput {
+                    model: "fake".into(),
+                    text: "next".into(),
+                    workflow_results: pending.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            pending.clear(); // same successful-start acknowledgement as run_bridge
+            if turn == 1 {
+                deliver_workflow_results(&client, &mut pending, outcome(2, "failed outcome")).await;
+                assert_eq!(pending.len(), 1);
+            } else if turn == 2 {
+                deliver_workflow_results(&client, &mut pending, outcome(3, "delivered outcome")).await;
+                assert!(pending.is_empty(), "successful steer must not be queued for next start");
+                deliver_workflow_results(&client, &mut pending, vec![]).await;
+                client.workflow_results(&[]).await.unwrap();
+            }
+        }
+        server.await.unwrap();
+        client.shutdown();
+    }
 
     #[tokio::test]
     async fn a0_fixture_through_fake_app_server_renders_deterministic_blocks() {
@@ -672,6 +844,26 @@ mod tests {
     }
 
     #[test]
+    fn failed_rectangle_projection_keeps_only_short_actionable_error_not_raw_content() {
+        let event = project(BridgeEvent::Wire(WireEvent::Notification { method: "item/completed".into(), params: json!({"item": {
+            "type":"dynamicToolCall", "id":"failed", "tool":"create_drawing", "success":false,
+            "arguments":{"kind":"rectangle","zone_role":"support","anchors":[{"time":123456789,"price":987654321}]},
+            "contentItems":[{"type":"inputText","text":json!({"error":{"code":"invalid_args","message":"anchors[1].time must be within the loaded range 2025-01-01–2026-01-01"}, "private":"never-forward"}).to_string()}]
+        }}) })).unwrap();
+        let mut pane = crate::agent_pane::AgentPane::default();
+        pane.event(event);
+        let crate::agent_pane::RenderedBlock::Tool(trace) = &pane.blocks[0] else { panic!() };
+        assert_eq!(
+            trace.error.as_deref(),
+            Some("anchors[1].time must be within the loaded range 2025-01-01–2026-01-01")
+        );
+        assert_eq!(trace.summary.as_deref(), Some("support zone"));
+        for private in ["never-forward", "123456789", "987654321", "contentItems"] {
+            assert!(!format!("{trace:?}").contains(private));
+        }
+    }
+
+    #[test]
     fn pane_session_start_options_keep_readonly_inventory_and_reject_edits_over_transport() {
         use tr_agent::bridge::{ToolCall, ToolExecutor, dynamic_tools};
         use tr_agent_tools::{Registry, ToolSet};
@@ -812,7 +1004,7 @@ mod tests {
         assert_eq!(app.agent_queue.len(), 0, "ReadOnly mutations must never reach UI work");
         client.shutdown();
         assert_eq!(bridge_options("empty".into(), ToolSet::Edit).tools, ToolSet::Edit);
-        assert_eq!(bridge_options("empty".into(), ToolSet::Workflows).tools, ToolSet::ReadOnly);
+        assert_eq!(bridge_options("empty".into(), ToolSet::Workflows).tools, ToolSet::Workflows);
         });
     }
 
