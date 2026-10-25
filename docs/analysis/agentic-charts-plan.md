@@ -502,7 +502,28 @@ answer-shape lessons from the same comparison.
 - The agent asks a clarifying question when the request is ambiguous.
 - The turn footer shows how long the turn took. Suggested prompts are grouped.
 
-**A5b (later): scanner and multi-chart tools.**
+**A3d: zone labels and honest status** (merged with A5a)
+
+- Zones carry host-built labels from the analysis timeframe ("W1 support 79,400–81,900").
+  Support and resistance always include the zone price is in and the nearest zone on
+  each side, capped in height by ATR.
+- Tool headers count a failure as retried only when the same target later succeeds.
+- Watchlist proposals list each symbol with its own checkbox. Workflow tools accept
+  `find_symbol` results unchanged and refuse ambiguous tickers with hints.
+
+**A5b: scanner and multi-symbol tools.** All read-only, in every mode.
+
+- A5b-scan (`codex/agent-scanner`): `list_scans`, `read_scan_results` (results already
+  in an open Scanner pane) and `run_scan` (a saved scan or a strict agent definition
+  converted to the core `ScanDefinition`). Watchlist and crypto universes use the
+  existing scan paths and limits. US market-wide universes are cache-only: the agent
+  evaluates only symbols with fresh bars in the scan store and never fetches listings
+  or bars. One agent scan runs at a time, with a 60-second timeout. Tool rows offer
+  "Open in Scanner" for the user.
+- A5b-multi (`codex/agent-multi`): `get_quotes` (up to 25 symbols) and
+  `compare_symbols` (2–8 symbols on aligned finished bars: return, volatility, drawdown,
+  ATR %, relative strength, correlation and beta to the first symbol).
+- Moving results into a watchlist reuses `add_watchlist_symbols` and its approval card.
 - mmx stays deferred. If it is added later, call the MiniMax Messages API directly
   (this needs the reqwest `stream` feature) rather than a CLI per step.
 
