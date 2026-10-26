@@ -34,7 +34,8 @@ pub struct ScannerPane {
     // End A5b-SCAN pane snapshot fields.
     snapshot_symbols: Vec<String>,
     saved: Vec<ScanSettings>,
-    notice: Option<String>,
+    notice: Option<ScanNotice>,
+    save_draft: Option<SaveDraft>,
     pub(super) matches_only: bool,
     pub universe: Universe,
     pub crypto_filter: CryptoUniverseFilter,
@@ -56,6 +57,16 @@ pub struct ScannerPane {
     crypto_stats: std::collections::BTreeMap<String, Result<tr_data::crypto_catalog::Rolling24h, String>>,
 }
 
+enum ScanNotice {
+    Saved(String),
+    Error(String),
+}
+
+struct SaveDraft {
+    name: String,
+    focus: bool,
+}
+
 impl Default for ScannerPane {
     fn default() -> Self {
         Self::new(ScanDefinition::default())
@@ -71,7 +82,7 @@ impl ScannerPane {
         settings.crypto_filter.sanitize();
         let (saved, notice) = match load_saved() {
             Ok(saved) => (saved, None),
-            Err(e) => (Vec::new(), Some(e)),
+            Err(e) => (Vec::new(), Some(ScanNotice::Error(e))),
         };
         Self {
             definition: settings.definition,
@@ -84,6 +95,7 @@ impl ScannerPane {
             snapshot_symbols: Vec::new(),
             saved,
             notice,
+            save_draft: None,
             matches_only: true,
             universe: settings.universe,
             crypto_filter: settings.crypto_filter,
@@ -155,7 +167,7 @@ impl ScannerPane {
         if let Some(error) = crate::worker::scan_discovery_failure(self.universe, &rows) {
             // Directory failures have no product row. Keep the recovery message
             // visible even when "Show unavailable" is off.
-            self.notice = Some(error.to_owned());
+            self.notice = Some(ScanNotice::Error(error.to_owned()));
         }
         self.entered.clear();
         self.exited.clear();
@@ -495,18 +507,87 @@ fn load_saved_at(dir: &std::path::Path) -> Result<Vec<ScanSettings>, String> {
     }
 }
 
+fn same_scan_name(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+fn preset_name(name: &str) -> Option<String> {
+    ScanDefinition::presets().into_iter().find(|p| same_scan_name(&p.name, name)).map(|p| p.name)
+}
+
+#[derive(Debug, PartialEq)]
+enum SaveName {
+    Empty,
+    Preset(String),
+    Replace(String),
+    New,
+}
+
+impl SaveName {
+    fn enabled(&self) -> bool {
+        matches!(self, Self::Replace(_) | Self::New)
+    }
+
+    fn button(&self) -> &'static str {
+        if matches!(self, Self::Replace(_)) { "Replace" } else { "Save" }
+    }
+
+    fn hint(&self) -> String {
+        match self {
+            Self::Empty => "Name the scan".into(),
+            Self::Preset(name) => format!("\"{name}\" is a built-in preset. Choose another name."),
+            Self::Replace(name) => format!("Replaces the saved scan \"{name}\"."),
+            Self::New => String::new(),
+        }
+    }
+}
+
+fn validate_save_name(name: &str, saved: &[ScanSettings]) -> SaveName {
+    if name.trim().is_empty() {
+        SaveName::Empty
+    } else if let Some(name) = preset_name(name) {
+        SaveName::Preset(name)
+    } else if let Some(existing) = saved.iter().find(|s| same_scan_name(&s.definition.name, name)) {
+        SaveName::Replace(existing.definition.name.trim().to_owned())
+    } else {
+        SaveName::New
+    }
+}
+
+fn save_name_prefill(name: &str, saved: &[ScanSettings]) -> String {
+    if preset_name(name).is_none() {
+        return name.trim().to_owned();
+    }
+    let base = format!("{} (custom)", name.trim());
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while validate_save_name(&candidate, saved) != SaveName::New {
+        candidate = format!("{base} {suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
+fn saved_scan_label(name: &str) -> String {
+    if preset_name(name).is_some() { format!("{name} (saved)") } else { name.to_owned() }
+}
+
 /// Merge against disk so saving from two scanner panes does not discard the other scan.
 fn save_definition(definition: &ScanSettings) -> Result<Vec<ScanSettings>, String> {
     save_definition_at(definition, &data_dir())
 }
 
 fn save_definition_at(definition: &ScanSettings, dir: &std::path::Path) -> Result<Vec<ScanSettings>, String> {
+    let name = validate_save_name(&definition.definition.name, &[]);
+    if !name.enabled() {
+        return Err(name.hint());
+    }
     definition.definition.validate()?;
     if definition.universe.crypto_venue().is_some() {
         definition.crypto_filter.validate()?;
     }
     let mut saved = load_saved_at(dir)?;
-    saved.retain(|s| !s.definition.name.eq_ignore_ascii_case(definition.definition.name.trim()));
+    saved.retain(|s| !same_scan_name(&s.definition.name, &definition.definition.name));
     let mut definition = definition.clone();
     definition.definition.name = definition.definition.name.trim().into();
     saved.push(definition);
@@ -1075,13 +1156,15 @@ pub fn show_named(
                 }
             }
             if ui.add_enabled(!pane.running && validation.is_none(), egui::Button::new("Save scan")).clicked() {
-                match save_definition(&ScanSettings { definition: pane.definition.clone(), universe: pane.universe, refresh: pane.refresh, crypto_filter: pane.crypto_filter.clone() }) {
-                    Ok(saved) => {
-                        pane.saved = saved;
-                        pane.notice = Some(SAVED_NOTICE.into());
-                    }
-                    Err(e) => pane.notice = Some(e),
+                // Refresh the library before validating replacement names (other panes may save too).
+                match load_saved() {
+                    Ok(saved) => pane.saved = saved,
+                    Err(e) => pane.notice = Some(ScanNotice::Error(e)),
                 }
+                pane.save_draft = Some(SaveDraft {
+                    name: save_name_prefill(&pane.definition.name, &pane.saved),
+                    focus: true,
+                });
             }
             let mut selected = None;
             wrap_group(ui, "load-scan", |ui| {
@@ -1099,7 +1182,7 @@ pub fn show_named(
                             ui.label(RichText::new("No saved scans yet").color(muted()));
                         }
                         for saved in &pane.saved {
-                            if ui.selectable_label(false, &saved.definition.name).clicked() {
+                            if ui.selectable_label(false, saved_scan_label(&saved.definition.name)).clicked() {
                                 selected = Some(saved.clone());
                             }
                         }
@@ -1107,6 +1190,7 @@ pub fn show_named(
                 });
             });
             if let Some(settings) = selected {
+                pane.save_draft = None;
                 pane.definition = settings.definition;
                 pane.universe = settings.universe;
                 pane.refresh = settings.refresh;
@@ -1125,6 +1209,7 @@ pub fn show_named(
                 );
             }
         });
+        save_scan_row(ui, pane, validation.is_none());
         if pane.running && market {
             let (done, total) = pane.progress.unwrap_or((0, 0));
             ui.horizontal(|ui| {
@@ -1165,8 +1250,11 @@ pub fn show_named(
             warn(ui, "This version supports up to 200 watchlist symbols. Reduce the list before running.");
         }
         if let Some(notice) = &pane.notice {
-            let color = if notice == SAVED_NOTICE { theme::up() } else { theme::down() };
-            ui.label(RichText::new(notice).color(color));
+            let (message, color) = match notice {
+                ScanNotice::Saved(message) => (message, theme::up()),
+                ScanNotice::Error(message) => (message, theme::down()),
+            };
+            ui.label(RichText::new(message).color(color));
         }
         if let Some(catalog_status) = &pane.catalog_status {
             ui.label(RichText::new(catalog_status).small().color(muted()));
@@ -1256,7 +1344,63 @@ fn compact(v: f64) -> String {
     }
 }
 
-const SAVED_NOTICE: &str = "Scan saved to scans.json";
+fn save_scan_row(ui: &mut Ui, pane: &mut ScannerPane, valid_definition: bool) {
+    let Some(draft) = &mut pane.save_draft else { return };
+    let mut confirm = false;
+    let mut cancel = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Name").color(muted()));
+        let mut field = egui::TextEdit::singleline(&mut draft.name)
+            .id_salt("scan-save-name")
+            .char_limit(100)
+            .desired_width(dp(180.0))
+            .show(ui);
+        if draft.focus {
+            field.response.request_focus();
+            field.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(draft.name.chars().count()),
+            )));
+            field.state.store(ui.ctx(), field.response.id);
+            draft.focus = false;
+        }
+        let name = validate_save_name(&draft.name, &pane.saved);
+        let enabled = name.enabled() && valid_definition && !pane.running;
+        let enter = (field.response.has_focus() || field.response.lost_focus())
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        confirm = ui.add_enabled(enabled, egui::Button::new(name.button()).fill(theme::accent())).clicked()
+            || (enabled && enter);
+        cancel =
+            ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let hint = name.hint();
+        if !hint.is_empty() {
+            ui.label(RichText::new(hint).small().color(muted()));
+        }
+    });
+    if cancel {
+        pane.save_draft = None;
+    } else if confirm {
+        let name = draft.name.trim().to_owned();
+        let replacing = matches!(validate_save_name(&name, &pane.saved), SaveName::Replace(_));
+        let mut settings = ScanSettings {
+            definition: pane.definition.clone(),
+            universe: pane.universe,
+            refresh: pane.refresh,
+            crypto_filter: pane.crypto_filter.clone(),
+        };
+        settings.definition.name = name.clone();
+        match save_definition(&settings) {
+            Ok(saved) => {
+                pane.definition.name = name.clone();
+                pane.saved = saved;
+                let verb = if replacing { "Replaced" } else { "Saved" };
+                pane.notice = Some(ScanNotice::Saved(format!("{verb} \"{name}\"")));
+                pane.save_draft = None;
+            }
+            Err(e) => pane.notice = Some(ScanNotice::Error(e)),
+        }
+    }
+}
 
 fn ready_stats<'a>(pane: &'a ScannerPane, symbol: &str, now: i64) -> Option<&'a tr_data::crypto_catalog::Rolling24h> {
     let ticker = tr_core::Security::parse(symbol)?.ticker;
@@ -1930,13 +2074,13 @@ mod tests {
             }],
         );
         assert!(!pane.show_unavailable);
-        assert!(pane.notice.as_ref().unwrap().contains("retry discovery"));
+        assert!(matches!(&pane.notice, Some(ScanNotice::Error(message)) if message.contains("retry discovery")));
     }
 
     #[test]
     fn invalid_crypto_filter_is_preserved_for_validation_and_cannot_save() {
         let dir = std::env::temp_dir().join(format!("tr-invalid-crypto-filter-{}", std::process::id()));
-        let mut settings = ScanSettings::from(ScanDefinition::default());
+        let mut settings = named_settings("Invalid filter");
         settings.universe = Universe::BinanceSpot;
         settings.crypto_filter.quote = "USD/T".into();
         let pane = ScannerPane::from_settings(settings.clone());
@@ -2820,6 +2964,7 @@ mod tests {
             snapshot_symbols: Vec::new(),
             saved: Vec::new(),
             notice: None,
+            save_draft: None,
             matches_only: true,
             universe: Universe::Watchlist,
             crypto_filter: Default::default(),
@@ -2921,6 +3066,73 @@ mod tests {
         }
     }
 
+    fn named_settings(name: &str) -> ScanSettings {
+        ScanDefinition { name: name.into(), ..Default::default() }.into()
+    }
+
+    #[test]
+    fn save_name_validation_is_live_trimmed_and_case_insensitive() {
+        let saved = vec![named_settings("My scan"), named_settings(" Volume Thrust ")];
+        for name in ["", "  ", "\t\n"] {
+            let state = validate_save_name(name, &saved);
+            assert_eq!(state, SaveName::Empty);
+            assert!(!state.enabled());
+            assert_eq!(state.hint(), "Name the scan");
+        }
+        for name in ["Volume Thrust", " volume THRUST "] {
+            let state = validate_save_name(name, &saved);
+            assert_eq!(state, SaveName::Preset("Volume Thrust".into()));
+            assert!(!state.enabled());
+            assert_eq!(state.hint(), "\"Volume Thrust\" is a built-in preset. Choose another name.");
+        }
+        let state = validate_save_name("  MY SCAN ", &saved);
+        assert_eq!(state, SaveName::Replace("My scan".into()));
+        assert!(state.enabled());
+        assert_eq!(state.button(), "Replace");
+        assert_eq!(state.hint(), "Replaces the saved scan \"My scan\".");
+        let state = validate_save_name("New scan", &saved);
+        assert_eq!(state, SaveName::New);
+        assert!(state.enabled());
+        assert_eq!(state.button(), "Save");
+        assert!(state.hint().is_empty());
+    }
+
+    #[test]
+    fn preset_save_prefill_avoids_saved_name_collisions() {
+        for preset in ScanDefinition::presets() {
+            assert_eq!(save_name_prefill(&preset.name, &[]), format!("{} (custom)", preset.name));
+        }
+        let saved = vec![named_settings(" volume thrust (CUSTOM) "), named_settings("Volume Thrust (custom) 2")];
+        assert_eq!(save_name_prefill("Volume Thrust", &saved), "Volume Thrust (custom) 3");
+        assert_eq!(save_name_prefill(" My scan ", &[named_settings("My scan")]), "My scan");
+    }
+
+    #[test]
+    fn legacy_preset_saved_label_is_unambiguous() {
+        assert_eq!(saved_scan_label("Volume Thrust"), "Volume Thrust (saved)");
+        assert_eq!(saved_scan_label("volume thrust"), "volume thrust (saved)");
+        assert_eq!(saved_scan_label("My scan"), "My scan");
+    }
+
+    #[test]
+    fn scan_library_rejects_preset_names_without_rewriting_legacy_files() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!(
+            "tr-preset-save-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = serde_json::to_vec(&vec![named_settings("Volume Thrust")]).unwrap();
+        std::fs::write(dir.join("scans.json"), &legacy).unwrap();
+        for preset in ScanDefinition::presets() {
+            let settings = named_settings(&format!(" {} ", preset.name.to_ascii_uppercase()));
+            assert!(save_definition_at(&settings, &dir).unwrap_err().contains("built-in preset"));
+            assert_eq!(std::fs::read(dir.join("scans.json")).unwrap(), legacy);
+        }
+        assert_eq!(load_saved_at(&dir).unwrap()[0].definition.name, "Volume Thrust");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn scan_library_merges_updates_and_preserves_corrupt_files() {
         let dir = std::env::temp_dir().join(format!(
@@ -2937,11 +3149,16 @@ mod tests {
         assert_eq!(save_definition_at(&definition, &dir).unwrap().len(), 1);
         definition.definition.name = "Second".into();
         definition.universe = Universe::Nyse;
-        assert_eq!(save_definition_at(&definition, &dir).unwrap().len(), 2);
+        let before = save_definition_at(&definition, &dir).unwrap();
+        assert_eq!(before.len(), 2);
+        assert_eq!(validate_save_name(" first ", &before), SaveName::Replace("First".into()));
+        let untouched = before.iter().find(|s| s.definition.name == "Second").unwrap().clone();
         definition.definition.name = " first ".into();
         definition.definition.timeframe = Timeframe::W1;
         let saved = save_definition_at(&definition, &dir).unwrap();
         assert_eq!(saved.len(), 2);
+        assert_eq!(saved.iter().filter(|s| same_scan_name(&s.definition.name, "First")).count(), 1);
+        assert!(saved.contains(&untouched));
         assert!(saved.iter().any(|s| s.definition.name == "first"
             && s.definition.timeframe == Timeframe::W1
             && s.universe == Universe::Nyse));

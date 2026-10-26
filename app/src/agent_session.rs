@@ -464,13 +464,14 @@ async fn run_bridge(
     }
 }
 
-fn project(event: BridgeEvent) -> Option<BridgeEvent> {
+pub(crate) fn project(event: BridgeEvent) -> Option<BridgeEvent> {
     match event {
         BridgeEvent::Wire(tr_agent::transport::WireEvent::Notification { method, mut params }) => {
             // Only visible text, tool metadata, limits and failures wake the pane.
             match method.as_str() {
                 "item/started" | "item/completed" if params["item"]["type"] == "dynamicToolCall" => {
                     // A5b-MULTI: retain only the bounded numeric projection, not raw results.
+                    let scan = crate::agent_pane::scan_tool_projection(&params["item"]);
                     let multi = crate::agent_pane::multi_tool_projection(&params["item"]);
                     let summary = crate::agent_pane::edit_tool_summary(&params["item"]);
                     let error = crate::agent_pane::tool_error(&params["item"]);
@@ -478,6 +479,9 @@ fn project(event: BridgeEvent) -> Option<BridgeEvent> {
                         map.retain(|key, _| {
                             matches!(key.as_str(), "id" | "type" | "tool" | "arguments" | "success" | "durationMs")
                         });
+                        if let Some(scan) = scan {
+                            map.insert("scanRead".into(), scan);
+                        }
                         if let Some(multi) = multi {
                             map.insert("multiRead".into(), multi);
                         }

@@ -819,7 +819,7 @@ impl AgentPane {
             "item/completed" | "item/started" if params["item"]["type"] == "dynamicToolCall" => {
                 let item = &params["item"];
                 let name = item["tool"].as_str().unwrap_or("chart tool");
-                let scan = scan_tool_projection(item);
+                let scan = item.get("scanRead").cloned().or_else(|| scan_tool_projection(item));
                 let multi = item.get("multiRead").cloned().or_else(|| multi_tool_projection(item));
                 let summary = scan
                     .as_ref()
@@ -828,6 +828,9 @@ impl AgentPane {
                     .or_else(|| multi.as_ref().and_then(|v| v["summary"].as_str().map(str::to_owned)))
                     .or_else(|| workflow_tool_target(name, &item["arguments"], &self.workflows.proposals))
                     .or_else(|| {
+                        if is_scan_tool(name) || matches!(name, "get_quotes" | "compare_symbols") {
+                            return None;
+                        }
                         item["editSummary"].as_str().map(short_label).or_else(|| edit_tool_summary(item)).or_else(
                             || {
                                 let args = &item["arguments"];
@@ -2009,6 +2012,9 @@ fn tool_label(name: &str) -> &str {
     match name {
         "read_chart" => "Read chart",
         "read_data" => "Read bars",
+        "list_scans" => "List scans",
+        "read_scan_results" => "Read scan results",
+        "run_scan" => "Run scan",
         "get_quotes" => "Quotes",
         "compare_symbols" => "Compared symbols",
         "analyze" => "Analyze",
@@ -2266,7 +2272,8 @@ fn tool_group_summary_outcome(traces: &[&Trace], reverted: Option<usize>, final_
     } else if traces.iter().any(|trace| trace.success == Some(false))
         && !traces.iter().any(|trace| trace.success == Some(true))
     {
-        "Chart tools failed".into()
+        if traces.iter().all(|trace| is_scan_tool(&trace.name)) { "Scan tools failed" } else { "Chart tools failed" }
+            .into()
     } else {
         let edits: Vec<_> =
             traces.iter().filter(|trace| is_edit_tool(&trace.name) && trace.success == Some(true)).collect();
@@ -2296,6 +2303,13 @@ fn tool_group_summary_outcome(traces: &[&Trace], reverted: Option<usize>, final_
             // End A5b-MULTI summary.
             if let Some(summary) = traces.iter().rev().find_map(|t| t.target_args["_scan"]["group"].as_str()) {
                 summary.to_owned()
+            } else if let Some(trace) = traces.iter().rev().find(|t| is_scan_tool(&t.name) && t.success == Some(true)) {
+                match trace.name.as_str() {
+                    "list_scans" => "Listed scans",
+                    "read_scan_results" => "Read scan results",
+                    _ => "Ran scan",
+                }
+                .into()
             } else if final_answer && !traces.iter().any(|trace| trace.success == Some(true)) {
                 "Answered".into()
             } else if traces.iter().any(|trace| {
@@ -2575,18 +2589,32 @@ fn tool_row_with_history(ui: &mut Ui, trace: &Trace, reverted: bool) {
 pub(crate) fn count_label(n: u64, singular: &str, plural: &str) -> String {
     format!("{n} {}", if n == 1 { singular } else { plural })
 }
-fn scan_tool_projection(item: &Value) -> Option<Value> {
+fn is_scan_tool(name: &str) -> bool {
+    matches!(name, "list_scans" | "read_scan_results" | "run_scan")
+}
+
+pub(crate) fn scan_tool_projection(item: &Value) -> Option<Value> {
     use serde_json::json;
     let tool = item["tool"].as_str()?;
-    if !matches!(tool, "run_scan" | "list_scans" | "read_scan_results") || item["success"] != true {
+    if !is_scan_tool(tool) || item["success"] != true {
         return None;
     }
-    let result = item["contentItems"]
-        .as_array()?
-        .iter()
-        .find_map(|c| c["text"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()))?;
+    let result = item["contentItems"].as_array()?.iter().filter(|c| c["type"] == "inputText").find_map(|c| {
+        c["text"]
+            .as_str()
+            .filter(|s| s.len() <= tr_agent_tools::MAX_TEXT_BYTES)
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+    })?;
     if tool == "list_scans" {
-        return Some(json!({"row":"Listed scans","note":""}));
+        let entries = result["entries"].as_array();
+        let count = |kind: &str| entries.into_iter().flatten().take(50).filter(|e| e["kind"] == kind).count();
+        let note = format!(
+            "{} saved · {} open{}",
+            count("saved"),
+            count("pane"),
+            if result["truncated"] == true { " · truncated" } else { "" }
+        );
+        return Some(json!({"row":"Listed scans","group":"Listed scans","note":note}));
     }
     let name = short_label(result["name"].as_str().unwrap_or("Scan"));
     let universe = scan_universe_label(result["universe"].as_str().unwrap_or("Unknown universe"));
@@ -2620,9 +2648,8 @@ fn scan_tool_projection(item: &Value) -> Option<Value> {
     let settings = serde_json::from_value::<crate::layouts::ScanSettings>(result["scanner_settings"].clone())
         .ok()
         .filter(|s| s.definition.validate().is_ok());
-    Some(
-        json!({"row":row,"note":notes.join(" · "),"group":format!("Scanned {universe} · {matched}"),"symbols":symbols,"settings":settings}),
-    )
+    let group = if tool == "run_scan" { format!("Scanned {universe} · {matched}") } else { row.clone() };
+    Some(json!({"row":row,"note":notes.join(" · "),"group":group,"symbols":symbols,"settings":settings}))
 }
 fn scan_universe_label(value: &str) -> String {
     match value {
@@ -2905,6 +2932,145 @@ mod polish_tests {
         assert_eq!(settings.universe, tr_data::universe::Universe::Nasdaq);
         assert_eq!(settings.refresh, None);
     }
+    // Mirror DynamicToolCallThreadItem from the pinned app-server schema, including the
+    // session privacy projection. Direct pane.wire fixtures miss content stripped there.
+    fn session_tool_trace(tool: &str, args: Value, result: Value) -> Trace {
+        use serde_json::json;
+        use tr_agent::{bridge::BridgeEvent, transport::WireEvent};
+        let mut pane = AgentPane::default();
+        for completed in [false, true] {
+            let event = crate::agent_session::project(BridgeEvent::Wire(WireEvent::Notification {
+                method: if completed { "item/completed" } else { "item/started" }.into(),
+                params: json!({"threadId":"thread","turnId":"turn","item":{
+                    "type":"dynamicToolCall","id":"call","tool":tool,"namespace":null,
+                    "arguments":args,"status":if completed {"completed"} else {"inProgress"},
+                    "success":if completed {json!(true)} else {Value::Null},
+                    "durationMs":if completed {json!(7000)} else {Value::Null},
+                    "contentItems":if completed {json!([
+                        {"type":"inputText","text":result.to_string()},
+                        {"type":"inputImage","imageUrl":"never-forward"}
+                    ])} else {Value::Null}
+                }}),
+            }))
+            .unwrap();
+            pane.event(event);
+        }
+        assert_eq!(pane.blocks.len(), 1, "completion must replace the started row");
+        let RenderedBlock::Tool(trace) = pane.blocks.remove(0) else { panic!("tool row") };
+        assert_eq!(trace.success, Some(true));
+        assert_eq!(trace.duration_ms, Some(7000));
+        let projected = format!("{trace:?}");
+        assert!(!projected.contains("never-forward") && !projected.contains("contentItems"));
+        trace
+    }
+
+    #[test]
+    fn real_session_scan_completions_keep_rows_notes_and_group_headers() {
+        use serde_json::json;
+        // Exact output reported from the real list_scans call (no saved definitions).
+        let output = r#"{"entries":[{"errors":0,"kind":"pane","last_run":null,"matched":0,"name":"Volume Thrust","pane_id":5,"scanned":0,"timeframe":"1D","universe":"BinanceSpot"}],"total":1,"truncated":false}"#;
+        let mut list: Value = serde_json::from_str(output).unwrap();
+        let trace = session_tool_trace("list_scans", json!({}), list.clone());
+        assert_eq!(trace.summary.as_deref(), Some("Listed scans"));
+        assert_eq!(trace.target_args["_scan"]["note"], "0 saved · 1 open");
+        assert_eq!(tool_group_label(&[&trace], None), "Listed scans · 1 step");
+        let mut pane = AgentPane::default();
+        pane.transition(Onboarding::Ready);
+        assert!(pane.start_prompt(Prompt { text: "List my scans".into(), requires_tools: true }).is_some());
+        pane.blocks.push(RenderedBlock::Tool(trace));
+        pane.finish_turn();
+        pane.running = false;
+        pane.turns[0].duration = Some(Duration::from_secs(7));
+        let output = render(&egui::Context::default(), dp(1000.0), vec![], |ui| pane.conversation(ui, &mut Vec::new()));
+        let headers = texts(&output);
+        assert!(headers.iter().any(|(s, _)| s == "Listed scans · 1 step · 7s"));
+        assert!(!headers.iter().any(|(s, _)| s.contains("Read chart data")));
+        list["entries"].as_array_mut().unwrap().push(json!({"kind":"saved","name":"My scan"}));
+        list["total"] = json!(2);
+        let list = session_tool_trace("list_scans", json!({}), list);
+        assert_eq!(list.target_args["_scan"]["note"], "1 saved · 1 open");
+        let read = session_tool_trace(
+            "read_scan_results",
+            json!({"pane_id":5}),
+            json!({
+                "name":"My scan","universe":"BinanceSpot","matched":1,"rows":[],"private":"never-forward"
+            }),
+        );
+        let run = session_tool_trace(
+            "run_scan",
+            json!({}),
+            json!({
+                "name":"My scan","universe":"BinanceSpot","matched":1,"rows":[],"private":"never-forward"
+            }),
+        );
+        assert_eq!(tool_group_label(&[&read], None), "Read scan results · My scan · 1 step");
+        assert_eq!(tool_group_label(&[&run], None), "Scanned Binance spot · 1 match · 1 step");
+        let ctx = egui::Context::default();
+        let rendered = render(&ctx, dp(1000.0), vec![], |ui| {
+            tool_row(ui, &list);
+            tool_row(ui, &read);
+            tool_row(ui, &run);
+        });
+        let labels = texts(&rendered);
+        for expected in [
+            "Listed scans",
+            "1 saved · 1 open",
+            "Read scan results · My scan",
+            "Ran scan · My scan · Binance spot · 1 match",
+        ] {
+            assert!(labels.iter().any(|(s, _)| s == expected), "missing {expected}: {labels:?}");
+        }
+        assert!(!labels.iter().any(|(s, _)| s.contains("Pinned chart") || s.contains("Chart tool")));
+        assert!(rendered.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t)
+            if t.galley.job.text == "1 saved · 1 open" && t.galley.job.sections.iter().all(|s| s.format.color == theme::muted()))));
+    }
+
+    #[test]
+    fn real_session_multi_completions_keep_quote_and_comparison_rows_without_chart_targets() {
+        use serde_json::json;
+        let args = json!({"symbols":["NVDA US Equity","XLK US Equity"],"timeframe":"1D"});
+        let result = json!({"timeframe":"1D","bars_used":120,"symbols":[
+            {"symbol":"NVDA US Equity","return_percent":10.,"correlation":1.},
+            {"symbol":"XLK US Equity","return_percent":5.,"correlation":0.8}
+        ],"private":"never-forward"});
+        let quotes = session_tool_trace("get_quotes", args.clone(), result.clone());
+        let compared = session_tool_trace("compare_symbols", args, result);
+        assert_eq!(quotes.summary.as_deref(), Some("Quotes · 2 symbols"));
+        assert_eq!(compared.summary.as_deref(), Some("Compared 2 symbols · 1D · 120 bars"));
+        assert_eq!(compared.multi.as_ref().unwrap()["rows"][0]["return_percent"], 10.);
+        assert_eq!(tool_group_label(&[&compared], None), "Compared NVDA with 1 symbol · 1 step");
+        let ctx = egui::Context::default();
+        let rendered = render(&ctx, dp(1000.0), vec![], |ui| {
+            tool_row(ui, &quotes);
+            tool_row(ui, &compared);
+        });
+        let labels = texts(&rendered);
+        for expected in ["Quotes · 2 symbols", "Compared 2 symbols · 1D · 120 bars"] {
+            assert!(labels.iter().any(|(s, _)| s == expected));
+        }
+        assert!(!labels.iter().any(|(s, _)| s.contains("Pinned chart")));
+    }
+
+    #[test]
+    fn scanner_tool_names_and_pending_or_failed_rows_are_not_chart_targeted() {
+        use serde_json::json;
+        for (name, label) in
+            [("list_scans", "List scans"), ("read_scan_results", "Read scan results"), ("run_scan", "Run scan")]
+        {
+            assert_eq!(tool_label(name), label);
+            for success in [Value::Null, json!(false)] {
+                let mut pane = AgentPane::default();
+                pane.wire(
+                    "item/started",
+                    &json!({"item":{"type":"dynamicToolCall","id":"call","tool":name,"success":success}}),
+                );
+                let RenderedBlock::Tool(trace) = &pane.blocks[0] else { panic!("tool row") };
+                assert!(trace.summary.is_none());
+                assert!(!tool_group_label(&[trace], None).to_lowercase().contains("chart"));
+            }
+        }
+    }
+
     #[test]
     fn scanner_trace_summaries_are_bounded_plain_text_and_details_stop_at_ten_symbols() {
         use serde_json::json;
