@@ -189,6 +189,23 @@ mod answer_instruction_tests {
         assert_eq!(text, super::session_instructions(&options, &registry));
     }
 
+    // A5b-MULTI instruction snapshot: identical guidance in every mode and on resume.
+    #[test]
+    fn multi_symbol_instruction_snapshot_all_modes() {
+        const SNAPSHOT: &str = " Use compare_symbols for cross-symbol questions instead of repeated read_data calls. Report the window, timeframe and as-of, and state that only finished bars are used.";
+        for tools in
+            [tr_agent_tools::ToolSet::ReadOnly, tr_agent_tools::ToolSet::Edit, tr_agent_tools::ToolSet::Workflows]
+        {
+            let options = super::BridgeOptions::new(String::new());
+            let registry = tr_agent_tools::Registry::new(tools);
+            let text = super::thread_options(&options, &registry).base_instructions;
+            assert!(text.ends_with(SNAPSHOT));
+            assert_eq!(text.matches(SNAPSHOT).count(), 1);
+            assert_eq!(text, super::session_instructions(&options, &registry));
+        }
+    }
+    // End A5b-MULTI instruction snapshot.
+
     #[test]
     fn exact_workflow_symbol_instruction_is_scoped_to_exposed_workflow_tools() {
         let mut options = super::BridgeOptions::new(String::new());
@@ -880,7 +897,9 @@ fn session_instructions(options: &BridgeOptions, registry: &Registry) -> String 
     } else {
         ""
     };
-    format!("{} {mode_instructions}{workflow_instructions}", options.base_instructions)
+    // A5b-MULTI guidance applies to every tool mode, including read-only.
+    let multi_instructions = " Use compare_symbols for cross-symbol questions instead of repeated read_data calls. Report the window, timeframe and as-of, and state that only finished bars are used.";
+    format!("{} {mode_instructions}{workflow_instructions}{multi_instructions}", options.base_instructions)
 }
 
 fn thread_options(options: &BridgeOptions, registry: &Registry) -> ThreadOptions {
@@ -1162,6 +1181,26 @@ mod tests {
         assert!(connector.replies.lock().unwrap().iter().all(|reply| reply["success"] == true));
     }
 
+    // A5b-MULTI fake transport integration; no real Codex or network.
+    #[tokio::test]
+    async fn multi_symbol_tools_use_readonly_chart_namespace() {
+        let calls = vec![
+            call("get_quotes", json!({"symbols":["AAPL US Equity","MSFT US Equity"]})),
+            call("compare_symbols", json!({"symbols":["AAPL US Equity","MSFT US Equity"],"timeframe":"1D"})),
+        ];
+        let connector = FakeConnector::new(vec![(Script::Calls(calls), false)]);
+        let mut bridge = bridge(connector.clone(), executor()).await;
+        bridge.send(turn()).await.unwrap();
+        assert!(matches!(finish(&mut bridge).await, BridgeEvent::Completed { calls: 2, .. }));
+        let replies = connector.replies.lock().unwrap();
+        assert!(replies.iter().all(|v| v["success"] == true), "{replies:?}");
+        for reply in replies.iter() {
+            let value: Value = serde_json::from_str(reply["contentItems"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(value["version"], 1);
+        }
+    }
+    // End A5b-MULTI transport test.
+
     #[tokio::test]
     async fn every_readonly_tool_uses_chart_namespace_with_registry_specs_and_pin() {
         let calls = vec![
@@ -1173,7 +1212,8 @@ mod tests {
             call("read_user_actions", json!({})),
             call("screenshot", json!({})),
         ];
-        assert_eq!(calls.len() + 2, Registry::new(ToolSet::ReadOnly).schemas().len());
+        // Workflow reads and multi-symbol reads have their own bounded-turn tests.
+        assert_eq!(calls.len() + 4, Registry::new(ToolSet::ReadOnly).schemas().len());
         let connector = FakeConnector::new(vec![(Script::Calls(calls), false)]);
         let mut bridge = bridge(connector.clone(), executor()).await;
         bridge.send(turn()).await.unwrap();

@@ -135,6 +135,14 @@ impl Registry {
         {
             return Err(invalid("from must not exceed to".into(), Some("from")));
         }
+        // A5b-MULTI range contract: bars or a complete date window, never both.
+        if name == "compare_symbols" {
+            let has = |key: &str| value.get(key).is_some_and(|v| !v.is_null());
+            if has("from") != has("to") || has("lookback") && has("from") {
+                return Err(invalid("Supply lookback or both from and to, not both".into(), Some("lookback")));
+            }
+        }
+        // End A5b-MULTI validation.
         if name == "create_alert" {
             if value["kind"] == "close" && value.get("timeframe").is_none_or(Value::is_null) {
                 return Err(invalid("Close alerts require a timeframe".into(), Some("timeframe")));
@@ -171,6 +179,16 @@ impl Registry {
                     Ok(args) => data::find_symbol(ctx.data, args).await,
                     Err(e) => invalid(e.to_string(), None),
                 },
+                // A5b-MULTI data dispatch.
+                "get_quotes" => match serde_json::from_value::<args::GetQuotes>(value) {
+                    Ok(args) => data::multi::get_quotes(ctx.data, args, ctx.now).await,
+                    Err(e) => invalid(e.to_string(), None),
+                },
+                "compare_symbols" => match serde_json::from_value::<args::CompareSymbols>(value) {
+                    Ok(args) => data::multi::compare_symbols(ctx.data, args, ctx.now).await,
+                    Err(e) => invalid(e.to_string(), None),
+                },
+                // End A5b-MULTI dispatch.
                 _ => unreachable!("registered data tool"),
             };
         }
@@ -378,6 +396,18 @@ fn workflow(name: &str) -> bool {
 
 fn catalog() -> Vec<ToolSpec> {
     let data = [
+        // A5b-MULTI catalog block.
+        (
+            "get_quotes",
+            "Read one bounded quote batch for up to 25 resolved symbols; errors are per symbol.",
+            args::GetQuotes::schema(),
+        ),
+        (
+            "compare_symbols",
+            "Compare 2–8 symbols numerically on common finished bars: return, annualised volatility, drawdown, ATR, relative strength, correlation and beta to the first symbol. Does not change the chart.",
+            args::CompareSymbols::schema(),
+        ),
+        // End A5b-MULTI catalog.
         (
             "read_data",
             "Read bounded OHLCV summaries, recent bars and a full-range LTTB close series.",
@@ -427,7 +457,7 @@ fn catalog() -> Vec<ToolSpec> {
             }
             "add_indicator" => ("Add an indicator validated and normalized against the core catalog.", true),
             "remove_indicator" => ("Remove a study instance by id.", true),
-            "compare" => ("Add or remove an instrument comparison.", true),
+            "compare" => ("Adds an overlay to the chart, or removes one; use compare_symbols for numbers.", true),
             "screenshot" => {
                 ("Capture chart PNG only after host consent; fail immediately if the window is hidden.", false)
             }

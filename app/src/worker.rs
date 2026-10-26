@@ -1355,6 +1355,8 @@ async fn handle_agent(s: &Shared, request: AgentRequest) {
                     bars,
                     session: options.session,
                     instrument: s.provider.crypto_instrument(&symbol),
+                    source: Some(s.provider.name().into()),
+                    simulated: matches!(s.provider.name(), "sample" | "offline").then_some(true),
                     ..Default::default()
                 })
             });

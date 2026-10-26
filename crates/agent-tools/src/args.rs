@@ -133,6 +133,45 @@ args!(Analyze { symbol: String => String, mode: Mode => Mode } {
     timeframe: Option<String> => Timeframe, from: Option<i64> => Timestamp,
     to: Option<i64> => Timestamp, limit: Option<usize> => Limit, top: Option<usize> => Top
 });
+// A5b-MULTI: bounded, read-only batch arguments (kept separate from scanner tools).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetQuotes {
+    pub symbols: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompareSymbols {
+    pub symbols: Vec<String>,
+    pub timeframe: String,
+    #[serde(default)]
+    pub lookback: Option<usize>,
+    #[serde(default)]
+    pub from: Option<i64>,
+    #[serde(default)]
+    pub to: Option<i64>,
+}
+impl Arguments for GetQuotes {
+    fn schema() -> Value {
+        json!({"type":"object","properties":{"symbols":{"type":"array","items":field_schema!(String),
+            "minItems":1,"maxItems":25}},"required":["symbols"],"additionalProperties":false})
+    }
+}
+impl Arguments for CompareSymbols {
+    fn schema() -> Value {
+        json!({"type":"object","properties":{
+            "symbols":{"type":"array","items":field_schema!(String),"minItems":2,"maxItems":8,
+                "description":"First symbol is the base."},
+            "timeframe":field_schema!(Timeframe),
+            "lookback":{"type":["integer","null"],"minimum":1,"maximum":1000,"default":120,
+                "description":"Finished bars per symbol; omit when using from/to. Date ranges are capped at 1000 bars per symbol."},
+            "from":optional_schema::<Option<i64>>(field_schema!(Timestamp)),
+            "to":optional_schema::<Option<i64>>(field_schema!(Timestamp))},
+            "required":["symbols","timeframe"],"additionalProperties":false})
+    }
+}
+// End A5b-MULTI arguments.
+
 args!(FindSymbol { query: String => String } {});
 args!(ReadChart {} { chart_id: Option<String> => String });
 args!(IndicatorValues {} { chart_id: Option<String> => String, id: Option<String> => String });
