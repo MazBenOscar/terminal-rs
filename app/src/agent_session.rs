@@ -510,6 +510,20 @@ mod tests {
     use tr_agent::transport::{Transport, WireEvent};
 
     #[test]
+    fn review_bridge_executor_timeout_outlasts_scan_deadline() {
+        for tools in [tr_agent_tools::ToolSet::ReadOnly, tr_agent_tools::ToolSet::Workflows] {
+            let options = bridge_options(String::new(), tools);
+            assert_eq!(options.executor_timeout, std::time::Duration::from_secs(30));
+            assert_eq!(options.executor_timeout_for("read_scan_results"), options.executor_timeout);
+            assert_eq!(options.executor_timeout_for("analyze"), options.executor_timeout);
+            assert_eq!(
+                options.executor_timeout_for("run_scan"),
+                tr_agent_tools::args::scanner::SCAN_DEADLINE + std::time::Duration::from_secs(15)
+            );
+        }
+    }
+
+    #[test]
     fn review_mid_turn_approval_is_delivered_once() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/review-steer-duplicate");
         let mut app = crate::app::TerminalApp::test_workspace(&root);

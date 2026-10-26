@@ -176,7 +176,7 @@ async fn golden_mode(mode: &str) {
 #[test]
 fn schema_snapshots_for_all_presets() {
     for (name, preset, count) in
-        [("read_only", ToolSet::ReadOnly, 9), ("edit", ToolSet::Edit, 16), ("workflows", ToolSet::Workflows, 23)]
+        [("read_only", ToolSet::ReadOnly, 12), ("edit", ToolSet::Edit, 19), ("workflows", ToolSet::Workflows, 26)]
     {
         let registry = Registry::new(preset);
         assert_eq!(registry.schemas().len(), count);
@@ -187,6 +187,7 @@ fn schema_snapshots_for_all_presets() {
             if tool.kind == tr_agent_tools::ToolKind::Live
                 && !tool.name.contains("watchlist")
                 && !tool.name.contains("alert")
+                && !matches!(tool.name.as_str(), "list_scans" | "read_scan_results" | "run_scan")
             {
                 assert!(tool.input_schema["properties"].get("chart_id").is_some());
             }
@@ -194,9 +195,36 @@ fn schema_snapshots_for_all_presets() {
                 assert_eq!(tool.needs_confirmation, tool.mutating);
             }
         }
-        snapshot("snapshots", name, &json!(registry.schemas()));
+        // A5b-SCAN schemas have their own contiguous inline snapshots below, so the
+        // parallel multi-symbol worker can update the historical JSON arrays independently.
+        let historical: Vec<_> = registry
+            .schemas()
+            .iter()
+            .filter(|s| !matches!(s.name.as_str(), "list_scans" | "read_scan_results" | "run_scan"))
+            .collect();
+        snapshot("snapshots", name, &json!(historical));
     }
 }
+
+// A5b-SCAN inline full-schema fingerprint snapshots, independently in EVERY mode.
+// FNV-1a over canonical serde JSON includes descriptions, bounds and nested schema branches.
+#[test]
+fn scanner_schema_snapshots_in_every_tool_set() {
+    for set in [ToolSet::ReadOnly, ToolSet::Edit, ToolSet::Workflows] {
+        let registry = Registry::new(set);
+        let fingerprints: Vec<_> = ["list_scans", "read_scan_results", "run_scan"]
+            .into_iter()
+            .map(|name| {
+                let spec = registry.schemas().iter().find(|s| s.name == name).unwrap();
+                assert!(!spec.mutating && !spec.needs_confirmation);
+                let bytes = serde_json::to_vec(spec).unwrap();
+                bytes.iter().fold(0xcbf29ce484222325_u64, |hash, b| (hash ^ u64::from(*b)).wrapping_mul(0x100000001b3))
+            })
+            .collect();
+        assert_eq!(fingerprints, vec![9073003766203700283, 6375807022164428620, 8576708177699259949]);
+    }
+}
+// End A5b-SCAN snapshot block.
 
 #[test]
 fn committed_fixtures_match_seeded_and_handmade_generators() {
@@ -391,6 +419,10 @@ mod adversarial {
 
     fn examples() -> Vec<(&'static str, Value)> {
         vec![
+            // A5b-SCAN examples.
+            ("list_scans", json!({})),
+            ("read_scan_results", json!({})),
+            ("run_scan", json!({"saved":"Momentum","universe":"watchlist"})),
             ("read_data", json!({"symbol":"X"})),
             ("analyze", json!({"symbol":"X","mode":"trend"})),
             ("find_symbol", json!({"query":"X"})),
@@ -427,6 +459,7 @@ mod adversarial {
             };
         }
         parse!(
+            "list_scans" => ListScans, "read_scan_results" => ReadScanResults, "run_scan" => RunScan,
             "read_data" => ReadData, "analyze" => Analyze, "find_symbol" => FindSymbol,
             "read_chart" => ReadChart, "indicator_values" => IndicatorValues, "set_view" => SetView,
             "create_drawing" => CreateDrawing, "update_drawing" => UpdateDrawing, "delete_drawing" => DeleteDrawing,
@@ -444,6 +477,12 @@ mod adversarial {
     // JSON Schema integers have no implicit signed-64-bit or calendar-year bound.
     // This is deliberately not the registry's private validator reused as an oracle.
     fn schema_accepts(schema: &Value, value: &Value) -> bool {
+        if let Some(branches) = schema["anyOf"].as_array() {
+            return branches.iter().any(|s| schema_accepts(s, value));
+        }
+        if schema["type"] == "null" {
+            return value.is_null();
+        }
         if let Some(choices) = schema["enum"].as_array()
             && !choices.contains(value)
         {
@@ -488,6 +527,18 @@ mod adversarial {
     }
 
     fn assert_schema_shape(schema: &Value) {
+        if let Some(branches) = schema["anyOf"].as_array() {
+            assert_eq!(schema.as_object().unwrap().len(), 1);
+            assert!(!branches.is_empty());
+            for branch in branches {
+                assert_schema_shape(branch);
+            }
+            return;
+        }
+        if schema["type"] == "null" {
+            assert_eq!(schema.as_object().unwrap().len(), 1);
+            return;
+        }
         let kind = if let Some(types) = schema["type"].as_array() {
             assert_eq!(types.len(), 2);
             assert_eq!(types[1], "null");

@@ -31,6 +31,7 @@ pub const STATES: &[&str] = &[
     "privacy",
     "proposal",
     "approved",
+    "scan",
 ];
 pub const TURN: &str = "000000000000000000000000000000a2c0:1";
 pub const SAMPLE_NOW: i64 = 1_792_713_600; // 2026-10-23 UTC, fixed across captures.
@@ -274,6 +275,24 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
         pane.wire("item/completed", &json!({"item":{"type":"agentMessage","id":"workflow-reply","text":"Creating Research and adding AAPL, MSFT and Coinbase BTC-USD is awaiting your confirmation."}}));
         complete(&mut pane, "completed");
     }
+    // A5b-SCAN: deterministic cache-only result disclosure, no backend or worker.
+    if state.0 == "scan" {
+        pane.start_prompt(Prompt {
+            text: "Scan cached Nasdaq stocks above their 20-day SMA.".into(),
+            requires_tools: true,
+        });
+        pane.event(BridgeEvent::Started { turn: TURN.into() });
+        pane.turns[0].local_time = crate::agent_pane::local_time(SAMPLE_NOW);
+        let mut settings = crate::layouts::ScanSettings::from(tr_core::scanner::ScanDefinition::default());
+        settings.universe = tr_data::universe::Universe::Nasdaq;
+        let result = json!({"name":settings.definition.name,"universe":"Nasdaq","timeframe":"1D","as_of":"2026-10-23T00:00:00Z",
+            "scanned":40,"matched":14,"errors":{"count":2},"skipped_not_cached":120,"rows":[{"symbol":"AAPL US Equity"},{"symbol":"MSFT US Equity"}],"scanner_settings":settings});
+        pane.wire("item/completed",&json!({"item":{"type":"dynamicToolCall","id":"scan-demo","tool":"run_scan","success":true,
+            "durationMs":9000,"arguments":{"saved":"Price above SMA 20","universe":"nasdaq"},"contentItems":[{"type":"inputText","text":result.to_string()}]}}));
+        pane.wire("item/completed",&json!({"item":{"type":"agentMessage","id":"scan-answer","text":"Cached Nasdaq stocks, 1D, as of 2026-10-23 00:00 UTC: 14 matches / 40 scanned. 120 symbols were skipped without fresh cache and 2 errored; this is not full-market coverage. These are offline demonstration results."}}));
+        complete(&mut pane, "completed");
+        pane.expanded_tools.insert(0);
+    }
     if state.0 == "queue" {
         pane.queue_review = true;
         pane.input = "Check momentum after those prompts.".into();
@@ -451,7 +470,7 @@ mod tests {
 
     #[test]
     fn all_exact_state_names_populate_a_session_free_pane() {
-        assert_eq!(STATES.len(), 21);
+        assert_eq!(STATES.len(), 22);
         for name in STATES {
             let state = State::parse(name).unwrap();
             let mut pane = pane(state, 7);
@@ -465,7 +484,7 @@ mod tests {
             assert!(!pane.settings.model.is_empty());
             assert!(!pane.state.primary().is_empty());
             assert_eq!(pane.settings.response_style, crate::agent_pane::ResponseStyle::Analyst);
-            assert_eq!(pane.expanded_tools.contains(&0), state.edits());
+            assert_eq!(pane.expanded_tools.contains(&0), state.edits() || name == &"scan");
             assert!(pane.turns.iter().all(|turn| turn.local_time == crate::agent_pane::local_time(SAMPLE_NOW)));
             let ctx = Context::default();
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {

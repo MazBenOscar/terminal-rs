@@ -869,6 +869,15 @@ impl TerminalApp {
             return;
         }
         match action {
+            // A5b-SCAN: click-only preload; no request is submitted or refresh scheduled.
+            Action::OpenScanner(mut settings) => {
+                settings.refresh = None;
+                if settings.definition.validate().is_ok() {
+                    self.open_panel(PaneKind::Scanner(Box::new(super::scanner_view::ScannerPane::from_settings(
+                        settings,
+                    ))));
+                }
+            }
             Action::Confirm { turn, approve, ids } => {
                 self.confirm_shown_workflows(&turn, approve, Some(&ids));
                 self.refresh_agent_undo();
@@ -1024,6 +1033,26 @@ mod tests {
         app.price_alerts.book = Default::default();
         app
     }
+    // A5b-SCAN: application action only preloads a NEW pane, never starts a scan.
+    #[test]
+    fn open_scanner_action_preloads_definition_universe_and_disables_refresh() {
+        let mut app = workflow_app("agent-open-scanner");
+        let before = app.panes.len();
+        let mut settings = crate::layouts::ScanSettings::from(tr_core::scanner::ScanDefinition::volume_thrust());
+        settings.universe = tr_data::universe::Universe::Nasdaq;
+        settings.refresh = Some(1);
+        app.agent_action(&egui::Context::default(), 0, Action::OpenScanner(settings.clone()));
+        assert_eq!(app.panes.len(), before + 1);
+        let PaneKind::Scanner(scanner) = &app.panes.last().unwrap().kind else { panic!() };
+        assert_eq!(scanner.definition, settings.definition);
+        assert_eq!(scanner.universe, settings.universe);
+        assert!(!scanner.running);
+        assert!(scanner.rows.is_empty());
+        assert_eq!(scanner.generation, 0);
+        assert_eq!(scanner.refresh, None);
+    }
+    // End A5b-SCAN action test.
+
     fn price() -> serde_json::Value {
         serde_json::json!({"symbol":"AAPL US Equity","kind":"price","direction":"above","level":100})
     }
@@ -2639,5 +2668,5 @@ mod review_tests {
 }
 
 fn symbol_count(n: usize) -> String {
-    if n == 1 { "1 symbol".into() } else { format!("{n} symbols") }
+    crate::agent_pane::count_label(n as u64, "symbol", "symbols")
 }

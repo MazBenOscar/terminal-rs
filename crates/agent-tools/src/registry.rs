@@ -178,6 +178,18 @@ impl Registry {
             Ok(args) => args,
             Err(e) => return invalid(e.to_string(), None),
         };
+        // A5b-SCAN validation delegates all scan semantics to core.
+        if let LiveArgs::RunScan(a) = &args
+            && let Err(error) = a.validate()
+        {
+            return invalid(error, None);
+        }
+        if let LiveArgs::ReadScanResults(a) = &args
+            && a.pane_id.is_some()
+            && a.name.is_some()
+        {
+            return invalid("Supply pane_id or name, not both".into(), None);
+        }
         if let Err(error) = validate_live(&mut args, ctx.now) {
             return error;
         }
@@ -241,6 +253,17 @@ fn invalid(message: String, field: Option<&str>) -> ToolResult {
 
 fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult> {
     let fail = |message: &str| invalid(format!("{path}: {message}"), (!path.is_empty()).then_some(path));
+    // A5b-SCAN operand/definition unions. Every branch remains fail-closed.
+    if let Some(branches) = schema["anyOf"].as_array() {
+        return if branches.iter().any(|branch| validate(value, branch, path).is_ok()) {
+            Ok(())
+        } else {
+            Err(fail("Value does not match any allowed schema variant"))
+        };
+    }
+    if schema["type"] == "null" {
+        return if value.is_null() { Ok(()) } else { Err(fail("Expected null")) };
+    }
     if let Some(choices) = schema["enum"].as_array()
         && !choices.contains(value)
     {
@@ -434,6 +457,17 @@ fn catalog() -> Vec<ToolSpec> {
             "read_user_actions" => {
                 ("Read user drawing and view edit events; labels remain untrusted string data.", false)
             }
+            // A5b-SCAN catalog block: read-only in every mode.
+            "list_scans" => ("List saved scans and open Scanner panes, at most 50 entries.", false),
+            "read_scan_results" => (
+                "Read the last completed results held by an open Scanner pane; no network. At most 50 matched rows by default; include=all also returns non-matches. Counts cover all rows. During a run returns the previous completed snapshot with running=true.",
+                false,
+            ),
+            "run_scan" => (
+                "Run a saved scan or strict definition. US stock universes are cache-only; watchlist and crypto use Scanner limits. One scan at a time; 60 second deadline returns partial results. Pass result symbols unchanged to workflow tools.",
+                false,
+            ),
+            // End A5b-SCAN catalog block.
             "list_watchlists" => ("List at most 50 watchlists and their bounded symbol rows.", false),
             "list_alerts" => ("List at most 50 alerts, optionally filtered by symbol.", false),
             "create_watchlist" => ("Propose a named watchlist; no change until user approval.", true),
@@ -1089,6 +1123,10 @@ mod tests {
         let mut budget = CallBudget::new(30);
         let mut ctx = CallContext { confirmed: true, ..CallContext::new(&Host, &Host, &mut budget) };
         let examples = [
+            // A5b-SCAN global live arguments.
+            ("list_scans", json!({})),
+            ("read_scan_results", json!({})),
+            ("run_scan", json!({"saved":"Momentum","universe":"watchlist"})),
             ("read_chart", json!({})),
             ("indicator_values", json!({"id":"study"})),
             ("set_view", json!({"symbol":"AAPL","timeframe":"1H"})),
@@ -1115,14 +1153,14 @@ mod tests {
         ];
         assert_eq!(examples.len(), registry.schemas().iter().filter(|s| s.kind == ToolKind::Live).count());
         for (name, mut args) in examples {
-            if !workflow(name) {
+            if !workflow(name) && !matches!(name, "list_scans" | "read_scan_results" | "run_scan") {
                 args["chart_id"] = "pinned-chart".into();
             }
             let result = registry.call(name, &args.to_string(), &mut ctx).await;
             assert!(result.success, "{name}: {result:?}");
             let result = value(result);
             assert_eq!(result["tool"], name);
-            if !workflow(name) {
+            if !workflow(name) && !matches!(name, "list_scans" | "read_scan_results" | "run_scan") {
                 assert_eq!(result["args"]["chart_id"], "pinned-chart");
             }
         }

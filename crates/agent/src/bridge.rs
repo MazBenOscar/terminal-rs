@@ -204,6 +204,22 @@ mod answer_instruction_tests {
         }
     }
 
+    // A5b-SCAN instruction paragraph snapshot in every tool mode.
+    #[test]
+    fn scanner_instruction_snapshot_all_modes() {
+        const SNAPSHOT: &str = " Prefer read_scan_results and saved scans from list_scans before run_scan. For scan findings always state universe, timeframe, as-of and matched/scanned counts, and mention skipped or errored symbols; never imply full-market coverage when symbols were skipped. To put results in a watchlist, pass row symbols unchanged to add_watchlist_symbols; user approval is still required.";
+        let options = super::BridgeOptions::new(String::new());
+        for set in
+            [tr_agent_tools::ToolSet::ReadOnly, tr_agent_tools::ToolSet::Edit, tr_agent_tools::ToolSet::Workflows]
+        {
+            let registry = tr_agent_tools::Registry::new(set);
+            let text = super::thread_options(&options, &registry).base_instructions;
+            let start = text.find(" Prefer read_scan_results").unwrap();
+            assert_eq!(&text[start..], SNAPSHOT);
+            assert_eq!(text, super::session_instructions(&options, &registry));
+        }
+    }
+
     #[test]
     fn read_only_instructions_describe_levels_without_drawing_guidance() {
         let mut options = super::BridgeOptions::new(String::new());
@@ -227,6 +243,16 @@ mod answer_instruction_tests {
 }
 
 impl BridgeOptions {
+    // A5b-SCAN: only run_scan may outlast the normal executor timeout, so its
+    // worker can return partial rows before the executor is cancelled.
+    pub fn executor_timeout_for(&self, tool: &str) -> Duration {
+        if tool == "run_scan" {
+            tr_agent_tools::args::scanner::SCAN_DEADLINE + Duration::from_secs(15)
+        } else {
+            self.executor_timeout
+        }
+    }
+
     pub fn new(cwd: String) -> Self {
         Self {
             tools: tr_agent_tools::ToolSet::ReadOnly,
@@ -298,6 +324,7 @@ struct Dispatch {
     registry: Arc<Registry>,
     executor: Arc<dyn ToolExecutor>,
     timeout: Duration,
+    run_scan_timeout: Duration,
     thread: Mutex<Option<String>>,
     turn: Mutex<Option<TurnState>>,
     activity: Notify,
@@ -385,10 +412,11 @@ impl Dispatch {
             }
         };
         let key = call.turn.clone();
+        let timeout = if call.name == "run_scan" { self.run_scan_timeout } else { self.timeout };
         let this = self.clone();
         let task = tokio::spawn(async move { this.executor.execute(this.registry.clone(), call).await });
         let abort = AbortExecution(task.abort_handle());
-        let result = tokio::time::timeout(self.timeout, task).await;
+        let result = tokio::time::timeout(timeout, task).await;
         drop(abort);
         let result = match result {
             Ok(Ok(result)) => result,
@@ -531,6 +559,7 @@ impl AgentBridge {
             registry: Arc::new(registry),
             executor,
             timeout: options.executor_timeout,
+            run_scan_timeout: options.executor_timeout_for("run_scan"),
             thread: Mutex::new(None),
             turn: Mutex::new(None),
             activity: Notify::new(),
@@ -880,7 +909,9 @@ fn session_instructions(options: &BridgeOptions, registry: &Registry) -> String 
     } else {
         ""
     };
-    format!("{} {mode_instructions}{workflow_instructions}", options.base_instructions)
+    // A5b-SCAN: applies in every mode, without changing workflow approval rules.
+    let scan_instructions = " Prefer read_scan_results and saved scans from list_scans before run_scan. For scan findings always state universe, timeframe, as-of and matched/scanned counts, and mention skipped or errored symbols; never imply full-market coverage when symbols were skipped. To put results in a watchlist, pass row symbols unchanged to add_watchlist_symbols; user approval is still required.";
+    format!("{} {mode_instructions}{workflow_instructions}{scan_instructions}", options.base_instructions)
 }
 
 fn thread_options(options: &BridgeOptions, registry: &Registry) -> ThreadOptions {
@@ -1152,6 +1183,71 @@ mod tests {
         .unwrap()
     }
 
+    // A5b-SCAN: fake protocol bridge, no real codex or provider.
+    struct ScanDeadlineExecutor;
+    impl ToolExecutor for ScanDeadlineExecutor {
+        fn execute(&self, _: Arc<Registry>, _: ToolCall) -> BridgeFuture<'_, ToolResult> {
+            Box::pin(async {
+                tokio::time::sleep(tr_agent_tools::args::scanner::SCAN_DEADLINE).await;
+                ToolResult::json(json!({"partial":true,"rows":[],"scanned":0}))
+            })
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn run_scan_executor_returns_deadline_partial_while_other_tools_keep_their_timeout() {
+        let options = BridgeOptions::new(String::new());
+        let dispatch = Arc::new(Dispatch {
+            registry: Arc::new(Registry::new(ToolSet::ReadOnly)),
+            executor: Arc::new(ScanDeadlineExecutor),
+            timeout: options.executor_timeout,
+            run_scan_timeout: options.executor_timeout_for("run_scan"),
+            thread: Mutex::new(Some("thread".into())),
+            turn: Mutex::new(Some(TurnState {
+                key: "local-turn".into(),
+                wire_id: Some("turn".into()),
+                pin: turn().pin,
+                requires_tools: true,
+                consent: false,
+                calls: 0,
+                direct_calls: 0,
+                budget: CallBudget::default(),
+                text: 0,
+                images: 0,
+                interrupted: None,
+                last_event: Instant::now(),
+                unavailable: None,
+            })),
+            activity: Notify::new(),
+            acknowledged: Notify::new(),
+        });
+        let start = Instant::now();
+        let scan = dispatch
+            .clone()
+            .call(call("run_scan", json!({"saved":"Momentum","universe":"watchlist"}))["params"].clone())
+            .await;
+        assert_eq!(scan["success"], true);
+        assert!(scan.to_string().contains("partial"));
+        assert_eq!(start.elapsed(), tr_agent_tools::args::scanner::SCAN_DEADLINE);
+        let start = Instant::now();
+        let other = dispatch.call(call("list_scans", json!({}))["params"].clone()).await;
+        assert_eq!(other["success"], false);
+        assert!(other.to_string().contains("timed out"));
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
+    }
+    #[tokio::test]
+    async fn scanner_reads_use_chart_namespace_in_readonly_without_confirmation() {
+        let calls = vec![
+            call("list_scans", json!({})),
+            call("read_scan_results", json!({"pane_id":42})),
+            call("run_scan", json!({"saved":"Momentum","universe":"watchlist"})),
+        ];
+        let connector = FakeConnector::new(vec![(Script::Calls(calls), false)]);
+        let mut bridge = bridge(connector.clone(), executor()).await;
+        bridge.send(turn()).await.unwrap();
+        assert!(matches!(finish(&mut bridge).await, BridgeEvent::Completed { calls: 3, .. }));
+        assert!(connector.replies.lock().unwrap().iter().all(|reply| reply["success"] == true));
+    }
+
     #[tokio::test]
     async fn workflow_reads_are_available_in_readonly_without_confirmation() {
         let calls = vec![call("list_alerts", json!({})), call("list_watchlists", json!({}))];
@@ -1173,7 +1269,8 @@ mod tests {
             call("read_user_actions", json!({})),
             call("screenshot", json!({})),
         ];
-        assert_eq!(calls.len() + 2, Registry::new(ToolSet::ReadOnly).schemas().len());
+        // Workflow reads (+2) and scanner reads (+3) have separate round-trip tests.
+        assert_eq!(calls.len() + 5, Registry::new(ToolSet::ReadOnly).schemas().len());
         let connector = FakeConnector::new(vec![(Script::Calls(calls), false)]);
         let mut bridge = bridge(connector.clone(), executor()).await;
         bridge.send(turn()).await.unwrap();

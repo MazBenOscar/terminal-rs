@@ -502,6 +502,8 @@ pub enum Action {
     Send(Prompt),
     SetTools(ToolsMode),
     UndoTurn(String),
+    // A5b-SCAN: emitted only by the user's button click, never by tool dispatch.
+    OpenScanner(crate::layouts::ScanSettings),
     /// `ids` are the pending proposals the user saw; others in the turn stay pending.
     Confirm {
         turn: String,
@@ -815,14 +817,25 @@ impl AgentPane {
             "item/completed" | "item/started" if params["item"]["type"] == "dynamicToolCall" => {
                 let item = &params["item"];
                 let name = item["tool"].as_str().unwrap_or("chart tool");
-                let summary = workflow_tool_target(name, &item["arguments"], &self.workflows.proposals).or_else(|| {
-                    item["editSummary"].as_str().map(short_label).or_else(|| edit_tool_summary(item)).or_else(|| {
-                        let args = &item["arguments"];
-                        Some(short_label(
-                            args["symbol"].as_str().or_else(|| args["query"].as_str()).unwrap_or("Pinned chart"),
-                        ))
-                    })
-                });
+                let scan = scan_tool_projection(item);
+                let summary = scan
+                    .as_ref()
+                    .and_then(|v| v["row"].as_str())
+                    .map(str::to_owned)
+                    .or_else(|| workflow_tool_target(name, &item["arguments"], &self.workflows.proposals))
+                    .or_else(|| {
+                        item["editSummary"].as_str().map(short_label).or_else(|| edit_tool_summary(item)).or_else(
+                            || {
+                                let args = &item["arguments"];
+                                Some(short_label(
+                                    args["symbol"]
+                                        .as_str()
+                                        .or_else(|| args["query"].as_str())
+                                        .unwrap_or("Pinned chart"),
+                                ))
+                            },
+                        )
+                    });
                 let trace = Trace {
                     id: scrub_text(item["id"].as_str().unwrap_or_default()),
                     name: scrub_text(name),
@@ -833,7 +846,13 @@ impl AgentPane {
                     } else {
                         safe_arguments(&item["arguments"])
                     },
-                    target_args: normalized_args(&item["arguments"]),
+                    target_args: {
+                        let mut args = normalized_args(&item["arguments"]);
+                        if let Some(scan) = scan {
+                            args["_scan"] = scan;
+                        }
+                        args
+                    },
                     summary,
                     interrupted: false,
                     error: tool_error(item),
@@ -1242,6 +1261,7 @@ impl AgentPane {
         if expanded {
             for trace in traces {
                 tool_row_with_history(ui, trace, reverted.is_some_and(|n| n > 0));
+                scan_tool_details(ui, trace, actions);
             }
         }
         if let Some(id) = turn_id {
@@ -2238,7 +2258,9 @@ fn tool_group_summary_outcome(traces: &[&Trace], reverted: Option<usize>, final_
         if workflow_changes > 0 {
             format!("Awaiting approval · {workflow_changes} change{}", if workflow_changes == 1 { "" } else { "s" })
         } else if edits.is_empty() {
-            if final_answer && !traces.iter().any(|trace| trace.success == Some(true)) {
+            if let Some(summary) = traces.iter().rev().find_map(|t| t.target_args["_scan"]["group"].as_str()) {
+                summary.to_owned()
+            } else if final_answer && !traces.iter().any(|trace| trace.success == Some(true)) {
                 "Answered".into()
             } else if traces.iter().any(|trace| {
                 trace.success == Some(true) && matches!(trace.name.as_str(), "list_watchlists" | "list_alerts")
@@ -2333,7 +2355,9 @@ fn tool_row_with_history(ui: &mut Ui, trace: &Trace, reverted: bool) {
     let duration = trace.duration_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "—".into());
     let duration = ui.painter().layout_no_wrap(duration, theme::mono(10.5), readable(theme::muted()));
     let object = main_tool_label(trace.summary.as_deref().unwrap_or(""));
-    let label = if object.is_empty() {
+    let label = if let Some(row) = trace.target_args["_scan"]["row"].as_str() {
+        row.to_owned()
+    } else if object.is_empty() {
         tool_label(&trace.name).to_owned()
     } else {
         format!("{} · {object}", tool_label(&trace.name))
@@ -2379,6 +2403,11 @@ fn tool_row_with_history(ui: &mut Ui, trace: &Trace, reverted: bool) {
         duration,
         theme::text(),
     );
+    if let Some(note) = trace.target_args["_scan"]["note"].as_str().filter(|s| !s.is_empty()) {
+        ui.indent(("scan-note", &trace.id), |ui| {
+            ui.label(RichText::new(note).font(theme::ui_font(10.5)).color(theme::muted()));
+        });
+    }
     if trace.success == Some(false)
         && let Some(error) = &trace.error
     {
@@ -2392,6 +2421,93 @@ fn tool_row_with_history(ui: &mut Ui, trace: &Trace, reverted: bool) {
         trace.arguments,
     ));
 }
+
+// A5b-SCAN: bounded, plain-text trace projection. Never render tool text as markdown.
+pub(crate) fn count_label(n: u64, singular: &str, plural: &str) -> String {
+    format!("{n} {}", if n == 1 { singular } else { plural })
+}
+fn scan_tool_projection(item: &Value) -> Option<Value> {
+    use serde_json::json;
+    let tool = item["tool"].as_str()?;
+    if !matches!(tool, "run_scan" | "list_scans" | "read_scan_results") || item["success"] != true {
+        return None;
+    }
+    let result = item["contentItems"]
+        .as_array()?
+        .iter()
+        .find_map(|c| c["text"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()))?;
+    if tool == "list_scans" {
+        return Some(json!({"row":"Listed scans","note":""}));
+    }
+    let name = short_label(result["name"].as_str().unwrap_or("Scan"));
+    let universe = scan_universe_label(result["universe"].as_str().unwrap_or("Unknown universe"));
+    let matched = count_label(result["matched"].as_u64().unwrap_or(0), "match", "matches");
+    let display =
+        if name == "Agent scan" { short_label(result["summary"].as_str().unwrap_or(&name)) } else { name.clone() };
+    let row = if tool == "run_scan" {
+        format!("Ran scan · {display} · {universe} · {matched}")
+    } else {
+        format!("Read scan results · {name}")
+    };
+    let mut notes = Vec::new();
+    if let Some(n) = result["errors"]["count"].as_u64().filter(|n| *n > 0) {
+        notes.push(count_label(n, "error", "errors"));
+    }
+    if let Some(n) = result["skipped_not_cached"].as_u64().filter(|n| *n > 0) {
+        notes.push(format!("{} skipped (not cached)", count_label(n, "symbol", "symbols")));
+    }
+    if result["partial"] == true {
+        notes.push("Partial results".into());
+    }
+    let symbols: Vec<_> = result["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["outcome"].is_null() || r["outcome"] == "match")
+        .take(10)
+        .filter_map(|r| r["symbol"].as_str())
+        .map(short_label)
+        .collect();
+    let settings = serde_json::from_value::<crate::layouts::ScanSettings>(result["scanner_settings"].clone())
+        .ok()
+        .filter(|s| s.definition.validate().is_ok());
+    Some(
+        json!({"row":row,"note":notes.join(" · "),"group":format!("Scanned {universe} · {matched}"),"symbols":symbols,"settings":settings}),
+    )
+}
+fn scan_universe_label(value: &str) -> String {
+    match value {
+        "Watchlist" => "Watchlist",
+        "UsStocks" => "US stocks",
+        "Nasdaq" => "Nasdaq",
+        "Nyse" => "NYSE",
+        "BinanceSpot" => "Binance spot",
+        "CoinbaseSpot" => "Coinbase spot",
+        _ => value,
+    }
+    .to_owned()
+}
+fn scan_tool_details(ui: &mut Ui, trace: &Trace, actions: &mut Vec<Action>) {
+    let scan = &trace.target_args["_scan"];
+    if scan.is_null() {
+        return;
+    }
+    ui.indent(("scan-details", &trace.id), |ui| {
+        if let Some(symbols) = scan["symbols"].as_array() {
+            let text = symbols.iter().take(10).filter_map(Value::as_str).collect::<Vec<_>>().join(" · ");
+            if !text.is_empty() {
+                ui.label(RichText::new(text).font(theme::mono(11.0)).color(theme::text()));
+            }
+        }
+        if let Ok(mut settings) = serde_json::from_value::<crate::layouts::ScanSettings>(scan["settings"].clone()) {
+            settings.refresh = None;
+            if control(ui, "Open in Scanner").clicked() {
+                actions.push(Action::OpenScanner(settings));
+            }
+        }
+    });
+}
+// End A5b-SCAN trace block.
 
 pub(crate) fn tool_error(item: &Value) -> Option<String> {
     if item["success"] != false {
@@ -2590,6 +2706,105 @@ fn safe_arguments(value: &Value) -> String {
 #[cfg(test)]
 mod polish_tests {
     use super::*;
+
+    // A5b-SCAN: click the rendered control, and inspect only plain-text projections.
+    #[test]
+    fn scanner_tool_row_group_and_open_button_emit_click_only_preload_action() {
+        let ctx = egui::Context::default();
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("scan").unwrap(), 1);
+        let mut actions = Vec::new();
+        let mut frame = |pane: &mut AgentPane, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(660., 850.))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    actions.extend(pane.show(ui, "BTC/USD · 1W", egui::Id::new("scan-pane")));
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        frame(&mut pane, vec![]);
+        let output = frame(&mut pane, vec![]);
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s == "Ran scan · Price above SMA 20 · Nasdaq · 14 matches"));
+        assert!(text.iter().any(|(s, _)| s == "2 errors · 120 symbols skipped (not cached)"));
+        assert!(text.iter().any(|(s, _)| s == "Scanned Nasdaq · 14 matches · 1 step · 7s"));
+        let position = text.iter().find(|(s, _)| s == "Open in Scanner").unwrap().1.center();
+        for pressed in [true, false] {
+            frame(
+                &mut pane,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(actions.iter().filter(|a| matches!(a, Action::OpenScanner(_))).count(), 1);
+        let Action::OpenScanner(settings) = actions.into_iter().find(|a| matches!(a, Action::OpenScanner(_))).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(settings.universe, tr_data::universe::Universe::Nasdaq);
+        assert_eq!(settings.refresh, None);
+    }
+    #[test]
+    fn scanner_trace_summaries_are_bounded_plain_text_and_details_stop_at_ten_symbols() {
+        use serde_json::json;
+        for (tool, row) in [("list_scans", "Listed scans"), ("read_scan_results", "Read scan results · Fake pane")] {
+            let item = json!({"tool":tool,"success":true,"contentItems":[{"type":"inputText","text":json!({"name":"Fake pane","universe":"Watchlist","rows":[]}).to_string()}]});
+            assert_eq!(scan_tool_projection(&item).unwrap()["row"], row);
+        }
+        let item = json!({"tool":"run_scan","success":true,"contentItems":[{"type":"inputText","text":json!({"name":"[plain **text**]","universe":"Nasdaq","matched":20,"rows":vec![json!({"symbol":"<script>"});50]}).to_string()}]});
+        let value = scan_tool_projection(&item).unwrap();
+        assert_eq!(value["symbols"].as_array().unwrap().len(), 10);
+        assert!(value["row"].as_str().unwrap().contains("[plain **text**]"));
+        let item = json!({"tool":"read_scan_results","success":true,"contentItems":[{"type":"inputText","text":json!({
+            "name":"Held outcomes","universe":"Watchlist","matched":1,"rows":[
+                {"symbol":"AAPL US Equity","outcome":"no_match"},
+                {"symbol":"MSFT US Equity","outcome":"unavailable"},
+                {"symbol":"NVDA US Equity","outcome":"match"}
+            ]
+        }).to_string()}]});
+        assert_eq!(scan_tool_projection(&item).unwrap()["symbols"], json!(["NVDA US Equity"]));
+    }
+    #[test]
+    fn review_scan_row_uses_singular_counts() {
+        use serde_json::json;
+        let item = json!({"tool":"run_scan","success":true,"contentItems":[{"type":"inputText","text":json!({
+            "name":"Momentum","universe":"Nasdaq","matched":1,"errors":{"count":1},"rows":[]}).to_string()}]});
+        let value = scan_tool_projection(&item).unwrap();
+        assert_eq!(value["row"], "Ran scan · Momentum · Nasdaq · 1 match");
+        assert_eq!(value["note"], "1 error");
+        assert_eq!(value["group"], "Scanned Nasdaq · 1 match");
+        for n in [0, 1, 2] {
+            let item = json!({"tool":"run_scan","success":true,"contentItems":[{"type":"inputText","text":json!({
+                "name":"Momentum","universe":"Nasdaq","matched":n,"errors":{"count":n},"skipped_not_cached":n,"rows":[]}).to_string()}]});
+            let value = scan_tool_projection(&item).unwrap();
+            let matches = count_label(n, "match", "matches");
+            assert_eq!(value["row"], format!("Ran scan · Momentum · Nasdaq · {matches}"));
+            assert_eq!(value["group"], format!("Scanned Nasdaq · {matches}"));
+            let expected = if n == 0 {
+                String::new()
+            } else {
+                format!(
+                    "{} · {} skipped (not cached)",
+                    count_label(n, "error", "errors"),
+                    count_label(n, "symbol", "symbols")
+                )
+            };
+            assert_eq!(value["note"], expected);
+        }
+    }
+    // End A5b-SCAN UI tests.
 
     fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
         fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
