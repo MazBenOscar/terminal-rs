@@ -1410,6 +1410,7 @@ mod tests {
                 ts: 1_700_000_000,
                 spark: Vec::new(),
                 crypto_source: None,
+                simulated: None,
             },
         );
         app.watch_details = true;
@@ -1715,6 +1716,7 @@ mod tests {
                 ts: 1_700_000_000,
                 spark: Vec::new(),
                 crypto_source: None,
+                simulated: None,
             },
         );
         let items = app.watchlists[0].items();
@@ -1750,6 +1752,7 @@ mod tests {
                 ts: 1_700_000_000,
                 spark: Vec::new(),
                 crypto_source: None,
+                simulated: None,
             },
         );
         click_ui("AAPL", |ui| {

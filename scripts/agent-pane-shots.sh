@@ -19,7 +19,7 @@ trap 'rm -rf -- "$tmp"' EXIT
 
 states=(dormant missing unsupported signed-out signing-in checking empty-ready
         streaming answer markdown edits undone interrupted queue tools-unavailable
-        rate-limited stopped-unsafe stopped-recoverable privacy proposal approved scan)
+        rate-limited stopped-unsafe stopped-recoverable privacy proposal approved scan compare)
 for state in "${states[@]}"; do
     for theme in 'Terminal Dark' 'Terminal Light' 'Bloomberg'; do
         case "$theme" in

@@ -32,6 +32,7 @@ pub const STATES: &[&str] = &[
     "proposal",
     "approved",
     "scan",
+    "compare",
 ];
 pub const TURN: &str = "000000000000000000000000000000a2c0:1";
 pub const SAMPLE_NOW: i64 = 1_792_713_600; // 2026-10-23 UTC, fixed across captures.
@@ -222,6 +223,47 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
             // Chart object IDs and the completed answer are filled after sample history arrives.
         }
     }
+    // A5b-MULTI: session-free numeric comparison demo, including a partial failure.
+    if state.0 == "compare" {
+        pane.start_prompt(Prompt {
+            text: "Compare NVDA with XLK, SPY and an unknown symbol.".into(),
+            requires_tools: true,
+        });
+        pane.event(BridgeEvent::Started { turn: TURN.into() });
+        pane.turns[0].local_time = crate::agent_pane::local_time(SAMPLE_NOW);
+        let symbols = ["NVDA US Equity", "XLK US Equity", "SPY US Equity", "UNKNOWN"];
+        let rows = json!([
+            {"symbol":symbols[0],"return_percent":24.6,"annualised_volatility_percent":42.3,"max_drawdown_percent":-12.1,"correlation":1.0},
+            {"symbol":symbols[1],"return_percent":15.2,"annualised_volatility_percent":22.4,"max_drawdown_percent":-6.2,"correlation":0.84},
+            {"symbol":symbols[2],"return_percent":10.8,"annualised_volatility_percent":16.8,"max_drawdown_percent":-4.5,"correlation":0.71},
+            {"requested_symbol":symbols[3],"error":"unknown_symbol"}
+        ]);
+        for (id, name, args, result) in [
+            (
+                "quotes",
+                "get_quotes",
+                json!({"symbols":[symbols[0],symbols[1],symbols[2],symbols[3],"AAPL US Equity"]}),
+                json!({"version":1,"symbols":[{"symbol":symbols[0]},{"symbol":symbols[1]},{"symbol":symbols[2]},{"symbol":symbols[3],"error":"unknown_symbol"},{"symbol":"AAPL US Equity"}]}),
+            ),
+            (
+                "compared",
+                "compare_symbols",
+                json!({"symbols":symbols,"timeframe":"1D","lookback":120}),
+                json!({"version":1,"timeframe":"1D","bars_used":120,"symbols":rows}),
+            ),
+        ] {
+            pane.wire(
+                "item/completed",
+                &json!({"item":{"id":id,"type":"dynamicToolCall","tool":name,"arguments":args,
+                "success":true,"durationMs":42,"contentItems":[{"type":"inputText","text":result.to_string()}]}}),
+            );
+        }
+        pane.wire("item/completed",&json!({"item":{"id":"comparison-answer","type":"agentMessage","text":"NVDA led this synthetic comparison. Over 120 aligned finished 1D bars, it returned 24.6%, versus XLK at 15.2% and SPY at 10.8%, with higher volatility and drawdown. One symbol could not be resolved. As of 2026-10-23 UTC; demo numbers only, not market observations."}}));
+        complete(&mut pane, "completed");
+        pane.turns[0].duration = Some(Duration::from_secs(4));
+        pane.expanded_tools.insert(0);
+    }
+    // End A5b-MULTI demo.
     if matches!(state.0, "proposal" | "approved") {
         use crate::agent_bridge::{Proposal, ProposalStatus};
         pane.settings.tools = ToolsMode::Edit;
@@ -470,7 +512,7 @@ mod tests {
 
     #[test]
     fn all_exact_state_names_populate_a_session_free_pane() {
-        assert_eq!(STATES.len(), 22);
+        assert_eq!(STATES.len(), 23);
         for name in STATES {
             let state = State::parse(name).unwrap();
             let mut pane = pane(state, 7);
@@ -484,7 +526,7 @@ mod tests {
             assert!(!pane.settings.model.is_empty());
             assert!(!pane.state.primary().is_empty());
             assert_eq!(pane.settings.response_style, crate::agent_pane::ResponseStyle::Analyst);
-            assert_eq!(pane.expanded_tools.contains(&0), state.edits() || name == &"scan");
+            assert_eq!(pane.expanded_tools.contains(&0), state.edits() || *name == "scan" || *name == "compare");
             assert!(pane.turns.iter().all(|turn| turn.local_time == crate::agent_pane::local_time(SAMPLE_NOW)));
             let ctx = Context::default();
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {

@@ -466,9 +466,17 @@ pub fn parse_spark(json: &str) -> Result<Vec<Quote>> {
             d["close"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
         let Some(&last) = closes.last() else { continue };
         let prev =
-            if closes.len() >= 2 { closes[closes.len() - 2] } else { d["chartPreviousClose"].as_f64().unwrap_or(last) };
+            if closes.len() >= 2 { closes[closes.len() - 2] } else { d["chartPreviousClose"].as_f64().unwrap_or(0.) };
         let ts = d["timestamp"].as_array().and_then(|a| a.last()).and_then(|t| t.as_i64()).unwrap_or_default();
-        out.push(Quote { symbol: sym.clone(), last, prev_close: prev, ts, spark: closes, crypto_source: None });
+        out.push(Quote {
+            symbol: sym.clone(),
+            last,
+            prev_close: prev,
+            ts,
+            spark: closes,
+            crypto_source: None,
+            simulated: Some(false),
+        });
     }
     Ok(out)
 }
@@ -624,6 +632,16 @@ mod tests {
         assert!(!n.is_empty());
         assert!(n.windows(2).all(|w| w[0].ts >= w[1].ts));
         assert!(n.iter().all(|x| !x.title.is_empty() && x.link.starts_with("https://")));
+    }
+
+    #[test]
+    fn spark_missing_previous_close_remains_unknown_and_quotes_have_provenance() {
+        for previous in ["", ",\"chartPreviousClose\":0"] {
+            let payload = format!(r#"{{"X":{{"timestamp":[1700000000],"close":[105]{previous}}}}}"#);
+            let quotes = parse_spark(&payload).unwrap();
+            assert_eq!(quotes[0].prev_close, 0.);
+            assert_eq!(quotes[0].simulated, Some(false));
+        }
     }
 
     #[test]

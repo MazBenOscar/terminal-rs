@@ -470,12 +470,17 @@ fn project(event: BridgeEvent) -> Option<BridgeEvent> {
             // Only visible text, tool metadata, limits and failures wake the pane.
             match method.as_str() {
                 "item/started" | "item/completed" if params["item"]["type"] == "dynamicToolCall" => {
+                    // A5b-MULTI: retain only the bounded numeric projection, not raw results.
+                    let multi = crate::agent_pane::multi_tool_projection(&params["item"]);
                     let summary = crate::agent_pane::edit_tool_summary(&params["item"]);
                     let error = crate::agent_pane::tool_error(&params["item"]);
                     if let Some(map) = params["item"].as_object_mut() {
                         map.retain(|key, _| {
                             matches!(key.as_str(), "id" | "type" | "tool" | "arguments" | "success" | "durationMs")
                         });
+                        if let Some(multi) = multi {
+                            map.insert("multiRead".into(), multi);
+                        }
                         if let Some(summary) = summary {
                             map.remove("arguments");
                             map.insert("editSummary".into(), summary.into());
@@ -856,6 +861,27 @@ mod tests {
             }
         }
     }
+
+    // A5b-MULTI: exercise the real session-to-pane projection, not only demo events.
+    #[test]
+    fn multi_completion_projection_keeps_numeric_rows_but_discards_raw_tool_content() {
+        let result = json!({"version":1,"timeframe":"1D","bars_used":120,"symbols":[
+            {"symbol":"NVDA US Equity","return_percent":10.,"annualised_volatility_percent":20.,"max_drawdown_percent":-5.,"correlation":1.},
+            {"symbol":"XLK US Equity","return_percent":5.,"correlation":0.8}],"private":"never-forward"});
+        let event = project(BridgeEvent::Wire(WireEvent::Notification {method:"item/completed".into(),params:json!({"item":{
+            "type":"dynamicToolCall","id":"multi","tool":"compare_symbols","success":true,
+            "arguments":{"symbols":["NVDA US Equity","XLK US Equity"],"timeframe":"1D"},
+            "contentItems":[{"type":"inputText","text":result.to_string()},{"type":"inputImage","imageUrl":"never-forward"}]
+        }})})).unwrap();
+        let mut pane = crate::agent_pane::AgentPane::default();
+        pane.event(event);
+        let crate::agent_pane::RenderedBlock::Tool(trace) = &pane.blocks[0] else { panic!("tool row") };
+        assert_eq!(trace.summary.as_deref(), Some("Compared 2 symbols · 1D · 120 bars"));
+        let projected = format!("{trace:?}");
+        assert!(projected.contains("return_percent") && projected.contains("20.0"));
+        assert!(!projected.contains("never-forward") && !projected.contains("contentItems"));
+    }
+    // End A5b-MULTI session test.
 
     #[test]
     fn failed_rectangle_projection_keeps_only_short_actionable_error_not_raw_content() {

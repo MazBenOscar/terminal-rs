@@ -484,6 +484,7 @@ impl CryptoProvider {
             ts: chrono::Utc::now().timestamp(),
             spark: Vec::new(),
             crypto_source: Some(route.clone()),
+            simulated: Some(false),
         })
     }
 

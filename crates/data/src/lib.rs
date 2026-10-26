@@ -82,6 +82,7 @@ pub struct ChartEvent {
 pub struct Quote {
     pub symbol: String,
     pub last: f64,
+    #[serde(default)]
     pub prev_close: f64,
     pub ts: i64,
     /// Recent daily closes (oldest first) for sparklines; may be empty.
@@ -90,6 +91,10 @@ pub struct Quote {
     /// Actual fixed crypto product; absent for non-crypto and explicitly simulated quotes.
     #[serde(default)]
     pub crypto_source: Option<tr_core::crypto::CryptoInstrument>,
+    // A5b-MULTI: preserve per-observation provenance through fallback wrappers.
+    /// None means unknown, not verified live.
+    #[serde(default)]
+    pub simulated: Option<bool>,
 }
 
 /// A symbol-search result.
@@ -336,7 +341,7 @@ pub trait MarketData: Send + Sync {
         for s in symbols {
             let bars = self.history(s, Timeframe::D1, None, 2).await?;
             if let Some(last) = bars.last() {
-                let prev = if bars.len() > 1 { bars[bars.len() - 2].close } else { last.open };
+                let prev = if bars.len() > 1 { bars[bars.len() - 2].close } else { 0. };
                 out.push(Quote {
                     symbol: s.clone(),
                     last: last.close,
@@ -344,6 +349,7 @@ pub trait MarketData: Send + Sync {
                     ts: last.ts,
                     spark: vec![],
                     crypto_source: None,
+                    simulated: matches!(self.name(), "sample" | "offline").then_some(true),
                 });
             }
         }
@@ -754,7 +760,15 @@ mod tests {
 
     #[test]
     fn quote_change() {
-        let q = Quote { symbol: "X".into(), last: 110.0, prev_close: 100.0, ts: 0, spark: vec![], crypto_source: None };
+        let q = Quote {
+            symbol: "X".into(),
+            last: 110.0,
+            prev_close: 100.0,
+            ts: 0,
+            spark: vec![],
+            crypto_source: None,
+            simulated: None,
+        };
         assert_eq!(q.change(), 10.0);
         assert!((q.change_pct() - 10.0).abs() < 1e-9);
     }
@@ -769,6 +783,7 @@ mod tests {
         let mixed = provider.quotes(&["BTCUSD Curncy".into(), "AAPL US Equity".into()]).await.unwrap();
         assert_eq!(mixed.len(), 1);
         assert_eq!(mixed[0].symbol, "AAPL US Equity");
+        assert_eq!(mixed[0].simulated, Some(true), "fallback quote provenance must survive the primary wrapper");
     }
 
     #[test]
@@ -776,6 +791,9 @@ mod tests {
         let quote: Quote =
             serde_json::from_str(r#"{"symbol":"BTCUSD Curncy","last":1,"prev_close":1,"ts":0}"#).unwrap();
         assert!(quote.crypto_source.is_none());
+        assert_eq!(quote.simulated, None);
+        let missing: Quote = serde_json::from_str(r#"{"symbol":"X","last":1,"ts":0}"#).unwrap();
+        assert_eq!(missing.prev_close, 0.);
         let mut json = serde_json::to_value(&quote).unwrap();
         json["crypto_source"] =
             serde_json::json!({"venue":"Binance","kind":"Spot","native_symbol":"BTCUSDT","base":"ETH","quote":"USD"});
