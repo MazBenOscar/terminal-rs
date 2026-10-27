@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+feed-rs.workspace = true
 tr-core.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
