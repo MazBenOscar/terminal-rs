@@ -125,25 +125,35 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   SQLite by configured provider route, with cached history labeled on the chart. Older history
   pages in as you scroll left. Auxiliary quote/options/book views retain their sample fallbacks.
 - **Congress trades** (key feature)
-  - Ingests Periodic Transaction Reports from the **Senate eFD** (efdsearch.senate.gov: agreement
-    + CSRF session, DataTables search API, HTML transaction tables) and the **House Clerk**
-    (disclosures-clerk.house.gov: yearly `{year}FD.zip` XML index, PTR PDFs parsed with pure-Rust
-    text extraction). Scanned paper filings are detected and recorded as such.
+  - Live ingest is **House Clerk only** (disclosures-clerk.house.gov: current-year `{year}FD.zip`
+    XML index, PTR PDFs parsed with pure-Rust text extraction). Scanned paper filings are detected
+    and recorded as such. **Senate: paused — needs a third-party source (senate.gov blocked this
+    network)**. All senate.gov hosts are permanently denied before transport. Senate parsers,
+    fixtures and stored trades remain available for display and a future third-party source.
   - Normalises politician, party, chamber, state, ticker, buy/sell, amount range, transaction date
-    and filed date into SQLite. Party comes from the official rosters (clerk.house.gov
-    `MemberData.xml`, senate.gov `senators_cfm.xml`); politicians are keyed by bioguide ID, which
-    also repairs typos in the source index.
-  - Refreshed on a schedule (every 30 minutes by default, `TR_CONGRESS_REFRESH_MIN`, `0` disables;
-    `REFRESH`/F6 requests an enabled refresh), incrementally — only unseen filings are fetched.
-    Sample-provider runs disable refresh unless the interval is explicitly set. First-run discovery
-    covers the last 90 days independently for each chamber with no stored filings, capped at 200
-    new filings per chamber per run, newest first. Otherwise each chamber starts seven days before
-    its own last complete refresh (`last_refresh_date_house` / `last_refresh_date_senate`); a pause,
-    error or cap keeps only that chamber's date unchanged. A one-time migration seeds each key from
-    the legacy `last_refresh_date` only if that chamber already has filings; the legacy key is left
-    unchanged and no longer written. Requests are sequential per site and spaced by at least one second. Refusals/challenges pause that site
-    for 6/12/24 hours (or longer via `Retry-After`), persisted across restarts; the Congress freshness
-    line shows the local resume time. Manual refresh also respects pauses.
+    and filed date into SQLite. The live House roster is clerk.house.gov `MemberData.xml`;
+    politicians are keyed by bioguide ID, which also repairs source-index typos.
+  - Every **30 minutes** by default (`TR_CONGRESS_REFRESH_MIN`, `0` disables; sample defaults off).
+    Values 1–14 clamp to 15 minutes (logged); the maximum is seven days, with checked parsing.
+    Automatic refresh runs only while the window is visible and not minimised; tracked-politician
+    alerts need not refresh while hidden. The scheduled interval is claimed in a machine-wide ledger,
+    not reset by a fresh data dir. `REFRESH`/F6 works while hidden and bypasses cadence only:
+    all requests still obey the shared guard. Live discovery requests the current-year index,
+    plus one guarded previous-year index check on the first run each year for late prior-year PTRs.
+    That rollover snapshot is persisted and bounded to 50 recent entries; the combined plan fetches
+    at most **50 newest initial PTR PDFs**.
+    Older initial IDs are persisted as omitted, so later runs do not drain that historical backlog.
+    Later runs fetch newly discovered filings (and bounded stored parse-error retries), at most
+    50/run; reused sources send index ETag/Last-Modified validators and reuse parsed entries on 304.
+  - House disclosures and roster each have ≥3 s spacing and one in-flight request, with
+    machine-wide ceilings of **400/day** and **20/day** respectively (**420 total HTTP attempts/day**,
+    including redirects/failures and the annual rollover check). Per-PDF HTTP/body/parse failures
+    are persisted and do not block later filings (at most three attempts total, one per day).
+    Refusals/challenges and invalid PDF/ZIP or non-XML roster signatures pause the group
+    for 6/12/24 hours (or longer via `Retry-After`, up to seven days), shared across instances and
+    restarts. Settings → Data sources shows House switches, usage and cooldowns, a disabled Senate
+    explanation and a global kill switch. `TR_DATA_DIR` instances make **zero Congress requests**
+    unless `TR_ALLOW_EXTERNAL=1` exactly. No cadence override is needed for a normal live launch.
   - Panels: latest trades feed with party/chamber/side filters (`CONG`); per-ticker "who in
     Congress traded it" (`NVDA CONG`, or right-click any ticker); politician profile with trade
     history and **estimated performance** (amount-weighted directional return, hit rate, average
@@ -227,9 +237,13 @@ QUESTRADE_REFRESH_TOKEN=… cargo run --release                  # Questrade (fi
 ```
 
 Data lives in `~/Library/Application Support/terminal-rs` (macOS) or
-`$XDG_DATA_HOME/terminal-rs` (Linux), or `TR_DATA_DIR`. The first congress ingest covers the
-current and previous year (a few minutes; it runs in the background while you work).
-`cargo run -p tr-congress --example ingest -- congress.sqlite3` runs one ingest from the CLI.
+`$XDG_DATA_HOME/terminal-rs` (Linux), or `TR_DATA_DIR`. The first Congress ingest requests
+the current House index, a bounded previous-year rollover check, and at most 50 newest PDFs,
+spread by the machine-wide guard; it never backfills older history or contacts Senate. `TR_DATA_DIR` overrides are offline for Congress/news/filings
+unless `TR_ALLOW_EXTERNAL=1` is explicitly set.
+`cargo run -p tr-congress --example ingest -- --i-know congress.sqlite3` opts into one live CLI ingest.
+It claims the same machine-wide `congress:refresh` cadence slot as the app before ingesting;
+without `--i-know` it performs no requests or database changes.
 
 Appearance: `TR_THEME=light|dark|<theme name>` overrides the saved theme, `TR_MSAA=1|2|4|8` sets
 chart anti-aliasing (default 4 on macOS), `TR_VIBRANCY=0` disables the translucent sidebar, and
@@ -403,7 +417,7 @@ crates/data     MarketData trait; per-class router (Binance/Coinbase, Treasury.g
                 Alpaca, Questrade), websocket live feeds, sample provider with simulated ticks;
                 bar cache, scanner bar store and US symbol directory (universes)
 crates/chart    wgpu renderer, LOD pyramids, viewport math, axes, drawings, egui paint callback
-crates/congress Senate eFD + House Clerk parsers, rosters, SQLite store, refresh, alerts, performance
+crates/congress House-only guarded refresh; House + historical Senate parsers, rosters, SQLite, alerts, performance
 crates/broker   SnapTrade client (request signing, accounts, balances, positions, orders, activity),
                 order entry (impact preview, place, cancel, capabilities), portfolio model and P&L,
                 Keychain / owner-only credential store, simulated sample and order simulator

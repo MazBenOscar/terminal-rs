@@ -27,7 +27,7 @@ pub fn ptr_pdf_url(year: i32, doc_id: &str) -> String {
 }
 
 /// One row of the yearly filing index.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IndexEntry {
     pub doc_id: String,
     pub prefix: String,
