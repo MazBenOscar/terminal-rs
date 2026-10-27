@@ -2099,6 +2099,7 @@ mod tests {
         assert_eq!(app.watchlist.last(), Some(&key("MSFT")));
     }
 
+    #[test]
     fn add_dialog_is_dropped_when_the_active_watchlist_switches() {
         let mut app = sections_app();
         click_ui("+", |ui| {
@@ -2113,6 +2114,7 @@ mod tests {
         assert_eq!(app.watchlist, vec![key("MSFT")]);
     }
 
+    #[test]
     fn search_mode_dialog_survives_list_switch_and_still_opens_charts() {
         let mut app = sections_app();
         app.apply(super::super::command::Function::Search("MSFT".into()));
@@ -2125,6 +2127,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn trash_remove_then_re_add_restores_the_symbol() {
         let mut app = sections_app();
         let aapl = key("AAPL");
@@ -2139,6 +2142,7 @@ mod tests {
         assert_eq!(app.watchlist.iter().filter(|s| **s == key("MSFT")).count(), 1);
     }
 
+    #[test]
     fn adding_the_same_symbol_twice_never_leaves_duplicates() {
         let mut app = sections_app();
         click_ui("+", |ui| {

@@ -1842,6 +1842,7 @@ mod tests {
         pairs.iter().map(|(t, n)| hit(t, n)).collect()
     }
 
+    #[test]
     fn empty_and_whitespace_queries_browse_catalog_without_search_request() {
         for query in ["", "   ", "\t\n"] {
             let mut dialog = Dialog::new(query.into(), Some(Target::Append));
@@ -1862,6 +1863,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn very_long_query_never_panics_and_matches_nothing() {
         let long = "X".repeat(10_000);
         let mut dialog = Dialog::new(long.clone(), Some(Target::Append));
@@ -1876,6 +1878,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn lowercase_and_padded_query_match_like_canonical_case() {
         for query in ["xrp", "Xrp", "  xrp  ", "xRp"] {
             let mut dialog = Dialog::new(query.into(), Some(Target::Append));
@@ -1889,6 +1892,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn hyphen_pair_and_qualified_venue_queries_match_exact_instruments() {
         let mut dialog = xrp();
         dialog.query = "XRP-USD".into();
@@ -1899,6 +1903,7 @@ mod tests {
         assert!(has_key(&dialog.results(), "BINANCE:XRPUSDT"));
     }
 
+    #[test]
     fn name_phrase_queries_with_spaces_match_by_substring() {
         let dialog = Dialog::new("apple inc".into(), Some(Target::Append));
         let hits = dialog.results();
@@ -1909,6 +1914,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn category_change_clears_source_and_kind_filters_that_would_hide_everything() {
         let mut dialog = xrp();
         dialog.category = Some(AssetClass::Crypto);
@@ -1965,6 +1971,7 @@ mod tests {
         assert!(hits.iter().all(|h| h.class == AssetClass::Equity));
     }
 
+    #[test]
     fn keyboard_selection_is_clamped_after_filters_shrink_the_list() {
         let mut dialog = Dialog::new("ZZKEY".into(), Some(Target::Append));
         dialog.network("ZZKEY", &(0..20).map(|i| hit(&format!("ZZKEY{i}"), "Test")).collect::<Vec<_>>());
@@ -1986,6 +1993,7 @@ mod tests {
         assert!(key.starts_with("ZZKEY"), "clamped selection picked {key}");
     }
 
+    #[test]
     fn search_mode_enter_with_no_results_keeps_the_dialog_open() {
         let mut dialog = Dialog::new("ZZZNOSUCHSYMBOL".into(), None);
         let ctx = egui::Context::default();
@@ -1996,6 +2004,7 @@ mod tests {
         assert!(labels.iter().any(|s| s == "Symbol search"), "dialog chrome still rendered: {labels:?}");
     }
 
+    #[test]
     fn shift_enter_with_no_results_does_not_close_or_add() {
         let mut dialog = Dialog::new("ZZZNOSUCHSYMBOL".into(), Some(Target::Append));
         let ctx = egui::Context::default();
@@ -2005,6 +2014,7 @@ mod tests {
         assert!(!out.close);
     }
 
+    #[test]
     fn debounced_search_query_round_trips_through_the_stale_check() {
         let mut dialog = Dialog::new("  XRP  ".into(), None);
         dialog.pending = Some(Instant::now() - Duration::from_millis(300));
@@ -2023,6 +2033,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn adding_the_same_symbol_twice_never_duplicates_the_list() {
         let mut items = Vec::new();
         let mut target = Target::Append;
