@@ -382,6 +382,52 @@ fn mark_seen(n: &mut NewsPane, story: &Cluster) {
 fn chart_ticker<'a>(story: &'a Cluster, linked: Option<&str>) -> Option<&'a String> {
     story.tickers.iter().find(|ticker| Some(ticker.as_str()) != linked).or_else(|| story.tickers.first())
 }
+/// Readable story preview: a solid-edged card (the pane colour alone blends into charts),
+/// headline first, then source/time/tickers, the summary at a reading width, and the host.
+fn hover_card(title: &egui::Response, story: &Cluster, full_time: &str) {
+    let summary = story.lead.summary.trim();
+    let mut tooltip = egui::Tooltip::for_enabled(title);
+    tooltip.popup = tooltip
+        .popup
+        .frame(
+            egui::Frame::popup(&title.ctx.global_style())
+                .fill(theme::card())
+                .stroke(egui::Stroke::new(dp(1.0), theme::muted()))
+                .inner_margin(egui::Margin::symmetric(dp(10.0) as i8, dp(8.0) as i8)),
+        )
+        .width(dp(380.0));
+    tooltip.show(|ui| {
+        ui.spacing_mut().item_spacing.y = dp(4.0);
+        ui.add(
+            egui::Label::new(RichText::new(&story.lead.item.title).font(ui_font(13.5)).color(theme::text()).strong())
+                .wrap(),
+        );
+        let mut meta = vec![story.lead.source.clone(), full_time.to_owned()];
+        if !story.tickers.is_empty() {
+            meta.push(
+                story.tickers.iter().map(|t| t.split_whitespace().next().unwrap_or(t)).collect::<Vec<_>>().join(" "),
+            );
+        }
+        ui.add(egui::Label::new(RichText::new(meta.join(" · ")).font(mono(10.5)).color(theme::muted())).wrap());
+        if !summary.is_empty() {
+            ui.add_space(dp(2.0));
+            let clipped: String = summary.chars().take(600).collect();
+            let clipped = if clipped.len() < summary.len() { format!("{}…", clipped.trim_end()) } else { clipped };
+            ui.add(egui::Label::new(RichText::new(clipped).font(ui_font(12.5)).color(theme::text())).wrap());
+        }
+        if let Some(host) =
+            reqwest::Url::parse(&story.lead.item.link).ok().and_then(|u| u.host_str().map(str::to_owned))
+        {
+            ui.add_space(dp(2.0));
+            ui.label(
+                RichText::new(format!("{} · click to open", host.trim_start_matches("www.")))
+                    .font(ui_font(10.5))
+                    .color(theme::muted()),
+            );
+        }
+    });
+}
+
 fn open(ui: &Ui, story: &Cluster) {
     if !tr_data::news_store::normalize_link(&story.lead.item.link).is_empty() {
         ui.ctx().open_url(egui::OpenUrl::new_tab(&story.lead.item.link));
@@ -908,13 +954,17 @@ pub(super) fn show(
             dp(0.0),
             egui::TextFormat { font_id: ui_font(13.0), color: base, ..Default::default() },
         );
-        let title = ui.put(title_rect, egui::Label::new(job).truncate().sense(egui::Sense::click()));
+        // The hover card below replaces egui's elided-text tip, so only one popup ever shows.
+        let title = ui.put(
+            title_rect,
+            egui::Label::new(job).truncate().show_tooltip_when_elided(false).sense(egui::Sense::click()),
+        );
         if title.clicked() {
             open(ui, story);
             mark_seen(n, story);
             child_clicked = true;
         }
-        title.on_hover_text(format!("{}\n{}\n{}", model.headline, story.lead.summary, story.lead.item.link));
+        hover_card(&title, story, &model.full_time);
         let meta = ui
             .scope_builder(
                 egui::UiBuilder::new().max_rect(meta_rect).layout(egui::Layout::right_to_left(egui::Align::Center)),
