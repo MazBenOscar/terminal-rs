@@ -527,6 +527,22 @@ answer-shape lessons from the same comparison.
 - mmx stays deferred. If it is added later, call the MiniMax Messages API directly
   (this needs the reqwest `stream` feature) rather than a CLI per step.
 
+## Status after A5 (2026-10-26)
+
+- A5a, A3c and A3d merged into `personal/main` (`b2f5c23`): watchlist and alert
+  proposals with per-symbol approval, outcome headers and decision lines; the symbol
+  resolver accepts `find_symbol` results and refuses ambiguous tickers.
+- A5b merged into `personal/main` (`20bc8f4`): `list_scans`, `read_scan_results` and
+  `run_scan`; US market-wide scans are cache-only, one scan at a time, with a 60 s
+  deadline and a `run_scan` executor timeout of deadline + 15 s. Agent concurrency is 2.
+- Multi-symbol tools shipped with A5b: `get_quotes` (≤25) and `compare_symbols` (2–8),
+  aligned by NY trading date for exchange-listed symbols, UTC date for crypto, and
+  the close-containing bucket for intraday. Annualisation uses 252/260/365.
+- Follow-ups shipped with A5b: saved-scan name prompt (preset names reserved, Replace
+  confirmation); session projection keeps scan results so tool rows and Open in Scanner
+  work; press-drag-release placement for two-point drawings.
+- Next: A4 (MCP shim and mimo) is the only remaining phase.
+
 ## Testing and evaluation
 
 - **Unit tests.** Golden tests for the analysis tools, snapshot tests for the schemas,
@@ -538,6 +554,10 @@ answer-shape lessons from the same comparison.
 
 ## Risks and open items
 
+- **Senate data.** senate.gov permanently blocked the user's IP (2026-10-26) after
+  repeated fresh-data-dir test launches. Senate data needs a third-party source.
+  Every new external source must use shared pacing, a machine-wide request ledger
+  and offline-by-default test instances.
 - **Experimental APIs.** Codex app-server and dynamicTools are both experimental.
   Mitigations: pin the Codex version range, commit the schema snapshot, run the canary
   per version, and keep MCP as the fallback.

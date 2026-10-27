@@ -1052,6 +1052,38 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap()
     }
 
+    struct ManualTime(tokio::task::JoinHandle<()>);
+
+    impl Drop for ManualTime {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    fn manual_time() -> ManualTime {
+        tokio::time::pause();
+        // Loopback I/O is external to Tokio's timer driver. Keep a task runnable
+        // so an I/O wait cannot auto-advance to the seed/idle/receive deadline.
+        // Tests advance time explicitly, only after an observable handshake.
+        ManualTime(tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }))
+    }
+
+    async fn socket_barrier(ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
+        ws.send(Message::Ping(vec![42].into())).await.unwrap();
+        assert!(matches!(ws.next().await.unwrap().unwrap(), Message::Pong(bytes) if bytes.as_ref() == [42]));
+    }
+
+    async fn no_update(ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, rx: &mut LiveFeed) {
+        // Pong is flushed by the client after it processes all preceding frames.
+        // Unlike recv-with-a-deadline, this cannot mistake slow delivery for silence.
+        socket_barrier(ws).await;
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
     fn kline(ts: i64) -> Message {
         Message::Text(
             serde_json::json!({
@@ -1087,28 +1119,40 @@ mod tests {
             if s == "Binance live stream restored; filling missed bars"));
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Reconnected { since: Some(120) }));
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 180));
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         drop(rx);
         tokio::time::timeout(Duration::from_secs(1), server).await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn idle_timeout_retries_and_receiver_drop_stops_attempts() {
+        let _time = manual_time();
         let (listener, url) = loopback().await;
         let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_millis(100));
         let (tcp, _) = listener.accept().await.unwrap();
-        let _first = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let mut first = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        socket_barrier(&mut first).await;
+        tokio::time::advance(Duration::from_millis(101)).await;
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s)
             if s == "Binance live stream unavailable; retrying…"));
-        let (tcp, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
-        let _second = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        tokio::time::advance(Duration::from_millis(1001)).await;
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut second = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        socket_barrier(&mut second).await;
+        tokio::time::advance(Duration::from_millis(101)).await;
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(_)));
         drop(rx);
-        assert!(tokio::time::timeout(Duration::from_millis(2100), listener.accept()).await.is_err());
+        // The second socket is already closed by the idle timeout. Let the
+        // cancelled backoff run, then check that no third connection was queued.
+        tokio::time::advance(Duration::from_millis(2101)).await;
+        tokio::task::yield_now().await;
+        use futures::FutureExt;
+        assert!(listener.accept().now_or_never().is_none());
     }
 
     #[tokio::test]
     async fn coinbase_heartbeats_keep_idle_product_healthy_and_ping_has_one_pong() {
+        let _time = manual_time();
         let (listener, url) = loopback().await;
         let mut rx = test_feed("COINBASE:BTC-USD", url, Duration::from_millis(200));
         let (tcp, _) = listener.accept().await.unwrap();
@@ -1118,8 +1162,8 @@ mod tests {
         assert_eq!(sub["product_ids"], serde_json::json!(["BTC-USD"]));
         assert_eq!(sub["channels"], serde_json::json!(["matches", "heartbeats"]));
         ws.send(Message::Ping(vec![1, 2].into())).await.unwrap();
-        assert!(matches!(tokio::time::timeout(Duration::from_millis(100), ws.next()).await.unwrap(),
-            Some(Ok(Message::Pong(bytes))) if bytes.as_ref() == [1, 2]));
+        assert!(matches!(ws.next().await.unwrap().unwrap(),
+            Message::Pong(bytes) if bytes.as_ref() == [1, 2]));
         for _ in 0..6 {
             ws.send(Message::Text(
                 serde_json::json!({
@@ -1133,13 +1177,16 @@ mod tests {
             let mut other: Value = serde_json::from_str(&fix("coinbase_ws_ticker.json")).unwrap();
             other["product_id"] = serde_json::json!("ETH-USD");
             ws.send(Message::Text(other.to_string().into())).await.unwrap();
-            assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+            no_update(&mut ws, &mut rx).await;
+            tokio::time::advance(Duration::from_millis(50)).await;
         }
-        assert!(tokio::time::timeout(Duration::from_millis(20), ws.next()).await.is_err());
-        assert!(tokio::time::timeout(Duration::from_millis(20), listener.accept()).await.is_err());
+        // A second Pong would precede this barrier's Pong and fail its assertion.
+        no_update(&mut ws, &mut rx).await;
         drop(rx);
-        assert!(tokio::time::timeout(Duration::from_millis(100), ws.next()).await.unwrap().is_some());
-        assert!(tokio::time::timeout(Duration::from_millis(1100), listener.accept()).await.is_err());
+        assert!(ws.next().await.is_some());
+        tokio::time::advance(Duration::from_millis(1101)).await;
+        use futures::FutureExt;
+        assert!(listener.accept().now_or_never().is_none());
     }
 
     #[tokio::test]
@@ -1154,7 +1201,7 @@ mod tests {
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
         ws.send(kline(60)).await.unwrap();
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60));
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
     }
 
     #[tokio::test]
@@ -1242,7 +1289,7 @@ mod tests {
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60));
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 120));
         // No status messages: the connection never dropped.
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
     }
@@ -1263,7 +1310,7 @@ mod tests {
         let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_secs(2));
         // Only the BTCUSDT bar is delivered; the wrong-symbol frames are silent.
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 180));
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
     }
@@ -1327,7 +1374,7 @@ mod tests {
             crate::LiveUpdate::Partial(b) => assert!(b.close > 100.0),
             other => panic!("expected Partial, got {other:?}"),
         }
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
     }
@@ -1376,7 +1423,9 @@ mod tests {
     /// heartbeat is a valid liveness signal but does not advance `last`).
     #[tokio::test]
     async fn coinbase_heartbeat_first_after_reconnect_reports_pre_gap_since() {
+        let _time = manual_time();
         let (listener, url) = loopback().await;
+        let (delivered, delivery) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
@@ -1386,6 +1435,9 @@ mod tests {
             ))
             .await
             .unwrap();
+            // A trade is buffered until REST completes. Do not close the socket
+            // until the consumer has actually observed the pre-gap bar.
+            delivery.await.unwrap();
             ws.close(None).await.unwrap();
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
@@ -1400,49 +1452,42 @@ mod tests {
             while ws.next().await.is_some_and(|m| m.is_ok()) {}
         });
         let mut rx = test_feed("COINBASE:BTC-USD", url, Duration::from_secs(2));
-        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(_)));
+        let before_gap = partial(&mut rx).await;
+        assert_eq!(before_gap.ts, 1_704_067_800);
+        delivered.send(()).unwrap();
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s) if s.contains("disconnected")));
+        tokio::time::advance(Duration::from_millis(1001)).await;
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s) if s.contains("restored")));
-        // Heartbeat-triggered Reconnected carries the pre-gap bar bucket.
-        match update(&mut rx).await {
-            crate::LiveUpdate::Reconnected { since } => {
-                assert!(since.is_some(), "heartbeat recovery must report since")
-            }
-            other => panic!("expected Reconnected, got {other:?}"),
-        }
-        assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(_)));
+        assert!(matches!(update(&mut rx).await,
+            crate::LiveUpdate::Reconnected { since: Some(ts) } if ts == before_gap.ts));
+        assert_eq!(partial(&mut rx).await.ts, before_gap.ts + 60);
         drop(rx);
-        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+        server.await.unwrap();
     }
 
     /// Probe 6: sparse messages that arrive within the idle timeout keep the
     /// connection alive; the timeout is per-read, not a global deadline.
     #[tokio::test]
     async fn sparse_messages_within_idle_timeout_keep_connection_alive() {
+        let _time = manual_time();
         let (listener, url) = loopback().await;
-        let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            for i in 0..5 {
-                ws.send(kline(60 * (i + 1))).await.unwrap();
-                tokio::time::sleep(Duration::from_millis(80)).await;
-            }
-            while ws.next().await.is_some_and(|m| m.is_ok()) {}
-        });
-        // Idle 250ms; messages arrive every ~80ms so each read resets the timer.
         let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_millis(250));
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
         for i in 0..5 {
-            assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60 * (i + 1)));
+            ws.send(kline(60 * (i + 1))).await.unwrap();
+            assert_eq!(partial(&mut rx).await.ts, 60 * (i + 1));
+            // Each delivered bar establishes that the idle deadline was reset.
+            tokio::time::advance(Duration::from_millis(80)).await;
         }
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
-        drop(rx);
-        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+        no_update(&mut ws, &mut rx).await;
     }
 
     /// Probe 6b: if messages stop for longer than idle, the connection is
     /// treated as dead and the loop retries (with a status message).
     #[tokio::test]
     async fn silence_beyond_idle_timeout_triggers_reconnect_status() {
+        let _time = manual_time();
         let (listener, url) = loopback().await;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
@@ -1457,8 +1502,10 @@ mod tests {
         });
         let mut rx = test_feed("BINANCE:BTCUSDT", url, Duration::from_millis(150));
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60));
+        tokio::time::advance(Duration::from_millis(151)).await;
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s)
             if s == "Binance live stream disconnected; reconnecting…"));
+        tokio::time::advance(Duration::from_millis(1001)).await;
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(s) if s.contains("restored")));
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Reconnected { .. }));
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 120));
@@ -1545,7 +1592,7 @@ mod tests {
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 60));
         // Invalid bars are silently skipped; the connection survives.
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Partial(b) if b.ts == 240));
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
     }
@@ -1605,6 +1652,7 @@ mod tests {
 
     #[tokio::test]
     async fn coinbase_seed_extends_rest_ohlcv_ignores_pre_cutoff_and_rolls_over() {
+        let _time = manual_time();
         let (host, http) = seed_http(vec![Some(10.0)], 0).await;
         let (listener, url) = loopback().await;
         let route = resolved_instrument(&crate::security("COINBASE:BTC-USD")).unwrap();
@@ -1627,6 +1675,7 @@ mod tests {
 
     #[tokio::test]
     async fn coinbase_replayed_trade_id_is_counted_once_across_reconnect() {
+        let _time = manual_time();
         let (host, http) = seed_http(vec![Some(10.0), Some(11.0)], 0).await;
         let (listener, url) = loopback().await;
         let route = resolved_instrument(&crate::security("COINBASE:BTC-USD")).unwrap();
@@ -1637,6 +1686,7 @@ mod tests {
         assert_eq!(partial(&mut rx).await.volume, 11.0);
         ws.close(None).await.unwrap();
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(_)));
+        tokio::time::advance(Duration::from_millis(1001)).await;
         let mut ws = coinbase_socket(&listener).await;
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Status(_)));
         assert!(matches!(update(&mut rx).await, crate::LiveUpdate::Reconnected { .. }));
@@ -1645,12 +1695,13 @@ mod tests {
         ws.send(trade(1, now, 120.0, 1.0)).await.unwrap();
         ws.send(trade(2, now, 121.0, 2.0)).await.unwrap();
         assert_eq!(partial(&mut rx).await.volume, 13.0);
-        assert!(tokio::time::timeout(Duration::from_millis(30), rx.recv()).await.is_err());
+        no_update(&mut ws, &mut rx).await;
         http.await.unwrap();
     }
 
     #[tokio::test]
     async fn coinbase_seed_failure_delivers_unseeded_bars_without_chart_error() {
+        let _time = manual_time();
         let (host, http) = seed_http(vec![None], 0).await;
         let (listener, url) = loopback().await;
         let route = resolved_instrument(&crate::security("COINBASE:BTC-USD")).unwrap();
@@ -1659,11 +1710,12 @@ mod tests {
         http.await.unwrap();
         ws.send(trade(1, chrono::Utc::now(), 100.0, 3.0)).await.unwrap();
         assert_eq!(partial(&mut rx).await.volume, 3.0);
-        assert!(tokio::time::timeout(Duration::from_millis(30), rx.recv()).await.is_err());
+        no_update(&mut ws, &mut rx).await;
     }
 
     #[tokio::test]
     async fn coinbase_stale_rest_bucket_is_not_seeded() {
+        let _time = manual_time();
         let (host, http) = seed_http(vec![Some(10.0)], -86_400).await;
         let (listener, url) = loopback().await;
         let route = resolved_instrument(&crate::security("COINBASE:BTC-USD")).unwrap();
@@ -1676,19 +1728,19 @@ mod tests {
 
     #[tokio::test]
     async fn coinbase_seed_timeout_keeps_websocket_reading_and_falls_back() {
-        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let host = format!("http://{}", http.local_addr().unwrap());
+        let _time = manual_time();
+        let (http, host) = pending_seed_http().await;
         let (listener, url) = loopback().await;
         let route = resolved_instrument(&crate::security("COINBASE:BTC-USD")).unwrap();
         let mut rx = live_with(route, Timeframe::D1, vec![url], Duration::from_secs(2), host);
         let mut ws = coinbase_socket(&listener).await;
-        let (_pending, _) = tokio::time::timeout(Duration::from_secs(1), http.accept()).await.unwrap().unwrap();
-        ws.send(trade(1, chrono::Utc::now(), 100.0, 3.0)).await.unwrap();
-        ws.send(Message::Ping(vec![7].into())).await.unwrap();
-        assert!(matches!(tokio::time::timeout(Duration::from_millis(200), ws.next()).await.unwrap(),
-            Some(Ok(Message::Pong(bytes))) if bytes.as_ref() == [7]));
+        let (_pending, after_cutoff) = seed_request(&http).await;
+        ws.send(trade(1, after_cutoff, 100.0, 3.0)).await.unwrap();
+        no_update(&mut ws, &mut rx).await;
+        // Cross the 800 ms seed deadline, including Tokio's 1 ms timer resolution.
+        tokio::time::advance(Duration::from_millis(801)).await;
         assert_eq!(partial(&mut rx).await.volume, 3.0);
-        assert!(tokio::time::timeout(Duration::from_millis(30), rx.recv()).await.is_err());
+        no_update(&mut ws, &mut rx).await;
     }
 
     #[test]
@@ -1714,38 +1766,32 @@ mod tests {
 
     // ---- adversarial seed/dedupe/merge tests (task C03b) ----
 
-    /// HTTP endpoint that reads the request and never answers, so the seed future
-    /// hits its 800 ms deadline while the websocket keeps flowing.
-    async fn silent_http() -> String {
-        use tokio::io::AsyncReadExt;
+    async fn pending_seed_http() -> (tokio::net::TcpListener, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let host = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            while let Ok((mut tcp, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let _ = tcp.read(&mut buf).await;
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        });
-        host
+        (listener, host)
     }
 
-    /// REST seed that answers after `delay_ms` with a single candle at `bucket`.
-    async fn delayed_seed_http(volume: f64, bucket: i64, delay_ms: u64) -> (String, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let host = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let (mut tcp, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            let _ = tcp.read(&mut request).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            let body = format!("[[{bucket},90,110,100,105,{volume}]]");
-            let response =
-                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-            tcp.write_all(response.as_bytes()).await.unwrap();
-        });
-        (host, server)
+    async fn seed_request(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, DateTime<chrono::Utc>) {
+        use tokio::io::AsyncReadExt;
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let byte = tcp.read_u8().await.unwrap();
+            request.push(byte);
+            assert!(request.len() < 4096);
+        }
+        assert!(request.starts_with(b"GET /products/BTC-USD/candles?"));
+        // The client samples its cutoff before issuing this request. Sampling
+        // here, rather than before connect, guarantees a post-cutoff trade.
+        (tcp, chrono::Utc::now())
+    }
+
+    async fn answer_seed(mut tcp: tokio::net::TcpStream, volume: f64, bucket: i64) {
+        use tokio::io::AsyncWriteExt;
+        let body = format!("[[{bucket},90,110,100,105,{volume}]]");
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        tcp.write_all(response.as_bytes()).await.unwrap();
     }
 
     fn coinbase_feed(host: String, url: String) -> LiveFeed {
@@ -1758,125 +1804,99 @@ mod tests {
         trade(id, time, price, size)
     }
 
-    /// Collect Partial bars until `quiet` elapses after the first update (or `budget`).
-    async fn collect_bars(rx: &mut LiveFeed, quiet: Duration, budget: Duration) -> Vec<Bar> {
-        let mut bars = Vec::new();
-        let deadline = tokio::time::Instant::now() + budget;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let wait = if bars.is_empty() { remaining } else { remaining.min(quiet) };
-            match tokio::time::timeout(wait, rx.recv()).await {
-                Ok(Some(crate::LiveUpdate::Partial(b))) => bars.push(b),
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-        bars
-    }
-
-    /// Last observed state per bucket (Partials are cumulative snapshots).
-    fn latest_by_bucket(bars: &[Bar]) -> std::collections::BTreeMap<i64, Bar> {
-        bars.iter().map(|b| (b.ts, *b)).collect()
-    }
-
     /// Probe: trades that arrive after the cutoff but before the REST seed returns
     /// must be kept and added on top of the seed exactly once.
     #[tokio::test]
     async fn coinbase_inflight_trade_is_kept_once_on_top_of_late_seed() {
-        let now = chrono::Utc::now().timestamp();
-        let today = Timeframe::D1.bucket_start(now);
-        let (host, http) = delayed_seed_http(10.0, today, 300).await;
+        let _time = manual_time();
+        let (http, host) = pending_seed_http().await;
         let (listener, url) = loopback().await;
         let mut rx = coinbase_feed(host, url);
         let mut ws = coinbase_socket(&listener).await;
-        // Post-cutoff (stamped in the future) while the seed is still in flight.
-        let ts = (now + 1) * 1_000_000_000;
+        let (request, after_cutoff) = seed_request(&http).await;
+        let today = Timeframe::D1.bucket_start(after_cutoff.timestamp());
+        let ts = after_cutoff.timestamp_nanos_opt().unwrap();
         ws.send(trade_at(1, ts, 120.0, 1.0)).await.unwrap();
-        let bars = collect_bars(&mut rx, Duration::from_millis(300), Duration::from_secs(2)).await;
-        let map = latest_by_bucket(&bars);
-        let bar = map.get(&today).expect("seeded current bucket must be delivered");
-        assert_eq!(bar.volume, 11.0, "seed 10 + in-flight trade 1, exactly once: {bar:?}");
-        assert_eq!(bar.close, 120.0);
-        http.await.unwrap();
+        ws.send(trade_at(1, ts, 120.0, 1.0)).await.unwrap();
+        // Prove the trade and its replay were processed while REST was pending.
+        no_update(&mut ws, &mut rx).await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+        answer_seed(request, 10.0, today).await;
+        let bar = partial(&mut rx).await;
+        assert_eq!(bar, Bar::new(today, 100.0, 120.0, 90.0, 120.0, 11.0));
+        ws.send(trade_at(1, ts, 120.0, 1.0)).await.unwrap();
+        no_update(&mut ws, &mut rx).await;
     }
 
     /// Probe: the seed returning after the live bar has already rolled into the next
     /// bucket must not swallow the previous bucket's live trades.
     #[tokio::test]
     async fn coinbase_inflight_trades_not_lost_when_bucket_rolls_before_seed_returns() {
-        let now = chrono::Utc::now().timestamp();
-        let today = Timeframe::D1.bucket_start(now);
-        let (host, http) = delayed_seed_http(10.0, today, 400).await;
+        let _time = manual_time();
+        let (http, host) = pending_seed_http().await;
         let (listener, url) = loopback().await;
         let mut rx = coinbase_feed(host, url);
         let mut ws = coinbase_socket(&listener).await;
-        let ts1 = (now + 1) * 1_000_000_000;
-        let ts2 = (now + 1 + 86_400) * 1_000_000_000;
-        let b1 = Timeframe::D1.bucket_start(now + 1);
-        let b2 = Timeframe::D1.bucket_start(now + 1 + 86_400);
-        // Both post-cutoff and both before the seed resolves; the second rolls the bar.
-        ws.send(trade_at(1, ts1, 100.0, 1.0)).await.unwrap();
-        ws.send(trade_at(2, ts2, 95.0, 2.0)).await.unwrap();
-        let bars = collect_bars(&mut rx, Duration::from_millis(300), Duration::from_secs(2)).await;
-        let map = latest_by_bucket(&bars);
-        assert!(
-            map.get(&b1).is_some_and(|b| b.volume >= 1.0),
-            "post-cutoff trade for the previous bucket must be kept: {bars:?}"
-        );
-        assert!(
-            map.get(&b2).is_some_and(|b| b.volume >= 2.0),
-            "post-cutoff trade for the fresh bucket must be kept: {bars:?}"
-        );
-        let _ = http.await;
+        let (request, after_cutoff) = seed_request(&http).await;
+        let today = Timeframe::D1.bucket_start(after_cutoff.timestamp());
+        let ts = after_cutoff.timestamp_nanos_opt().unwrap();
+        ws.send(trade_at(1, ts, 100.0, 1.0)).await.unwrap();
+        ws.send(trade_at(2, ts + 86_400_000_000_000, 95.0, 2.0)).await.unwrap();
+        no_update(&mut ws, &mut rx).await;
+        tokio::time::advance(Duration::from_millis(400)).await;
+        answer_seed(request, 10.0, today).await;
+        assert_eq!(partial(&mut rx).await, Bar::new(today, 100.0, 110.0, 90.0, 100.0, 11.0));
+        assert_eq!(partial(&mut rx).await, Bar::new(today + 86_400, 95.0, 95.0, 95.0, 95.0, 2.0));
+        no_update(&mut ws, &mut rx).await;
     }
 
     /// Probe: without a REST seed, all connection trades contribute to the lower bound.
     #[tokio::test]
     async fn coinbase_unseeded_fallback_counts_pre_cutoff_trades() {
-        let host = silent_http().await;
+        let _time = manual_time();
+        let (http, host) = pending_seed_http().await;
+        let before_cutoff = chrono::Utc::now();
         let (listener, url) = loopback().await;
         let mut rx = coinbase_feed(host, url);
         let mut ws = coinbase_socket(&listener).await;
-        let now = chrono::Utc::now().timestamp();
-        let today = Timeframe::D1.bucket_start(now);
-        // Before the cutoff, but counted because no REST seed is applied.
-        ws.send(trade_at(1, today * 1_000_000_000, 100.0, 100.0)).await.unwrap();
-        // At/after the cutoff: kept.
-        ws.send(trade_at(2, (now + 1) * 1_000_000_000, 101.0, 1.0)).await.unwrap();
-        let bars = collect_bars(&mut rx, Duration::from_millis(300), Duration::from_secs(2)).await;
-        let map = latest_by_bucket(&bars);
-        let total: f64 = map.values().map(|b| b.volume).sum();
-        assert!(map.values().any(|b| b.volume >= 1.0), "post-cutoff trade kept: {bars:?}");
-        assert!(
-            (total - 101.0).abs() < 1e-9,
-            "all connection trades contribute without a seed, got total {total}: {bars:?}"
-        );
+        let (_request, after_cutoff) = seed_request(&http).await;
+        ws.send(trade(1, before_cutoff, 100.0, 100.0)).await.unwrap();
+        ws.send(trade(2, after_cutoff, 101.0, 1.0)).await.unwrap();
+        no_update(&mut ws, &mut rx).await;
+        tokio::time::advance(Duration::from_millis(801)).await;
+        let first = partial(&mut rx).await;
+        let total = if Timeframe::D1.bucket_start(before_cutoff.timestamp())
+            == Timeframe::D1.bucket_start(after_cutoff.timestamp())
+        {
+            first.volume
+        } else {
+            first.volume + partial(&mut rx).await.volume
+        };
+        assert_eq!(total, 101.0, "all connection trades contribute without a seed");
+        no_update(&mut ws, &mut rx).await;
     }
 
     /// Probe: out-of-order trades in one bucket — open must be the earliest trade by
     /// time, close the latest, regardless of arrival order.
     #[tokio::test]
     async fn coinbase_out_of_order_trades_keep_time_ordered_open_and_close() {
+        let _time = manual_time();
         let (host, http) = seed_http(vec![None], 0).await;
         let (listener, url) = loopback().await;
         let mut rx = coinbase_feed(host, url);
         let mut ws = coinbase_socket(&listener).await;
-        let now = chrono::Utc::now().timestamp();
-        let b = Timeframe::D1.bucket_start(now + 10);
-        // Later trade arrives first, earlier trade second: same bucket, both post-cutoff.
-        ws.send(trade_at(1, (now + 11) * 1_000_000_000, 100.0, 1.0)).await.unwrap();
-        ws.send(trade_at(2, (now + 10) * 1_000_000_000, 90.0, 1.0)).await.unwrap();
-        let bars = collect_bars(&mut rx, Duration::from_millis(300), Duration::from_secs(2)).await;
-        let map = latest_by_bucket(&bars);
-        let bar = map.get(&b).expect("bar for the trade bucket");
-        assert!((bar.open - 90.0).abs() < 1e-9, "open must be the earliest trade by time: {bar:?}");
-        assert!((bar.close - 100.0).abs() < 1e-9, "close must be the latest trade by time: {bar:?}");
-        assert!((bar.high - 100.0).abs() < 1e-9 && (bar.low - 90.0).abs() < 1e-9, "{bar:?}");
-        let _ = http.await;
+        http.await.unwrap();
+        // Fixed fixture times: with no seed, both trades count even before cutoff.
+        let ts = 1_704_067_210_000_000_000;
+        ws.send(trade_at(1, ts + 1_000_000_000, 100.0, 1.0)).await.unwrap();
+        ws.send(trade_at(2, ts, 90.0, 1.0)).await.unwrap();
+        socket_barrier(&mut ws).await;
+        let mut bar = partial(&mut rx).await;
+        if bar.volume == 1.0 {
+            bar = partial(&mut rx).await;
+        }
+        assert_eq!(bar, Bar::new(1_704_067_200, 90.0, 100.0, 90.0, 100.0, 2.0));
+        no_update(&mut ws, &mut rx).await;
     }
 
     /// Returns the Partial produced by a probe trade with `ts`, if any.
@@ -1887,9 +1907,11 @@ mod tests {
         id: u64,
     ) -> Option<Bar> {
         ws.send(trade_at(id, ts, 50.0, 0.5)).await.unwrap();
-        match tokio::time::timeout(Duration::from_millis(150), rx.recv()).await {
-            Ok(Some(crate::LiveUpdate::Partial(b))) => Some(b),
-            _ => None,
+        socket_barrier(ws).await;
+        match rx.try_recv() {
+            Ok(crate::LiveUpdate::Partial(bar)) => Some(bar),
+            Err(mpsc::error::TryRecvError::Empty) => None,
+            other => panic!("unexpected probe update: {other:?}"),
         }
     }
 
@@ -1900,6 +1922,7 @@ mod tests {
     /// that one is kept while one nanosecond earlier is dropped.
     #[tokio::test]
     async fn coinbase_trade_exactly_at_cutoff_is_kept_and_one_nanosecond_before_is_dropped() {
+        let _time = manual_time();
         let (host, http) = seed_http(vec![Some(10.0)], 0).await;
         let (listener, url) = loopback().await;
         let mut rx = coinbase_feed(host, url);
@@ -1948,25 +1971,27 @@ mod tests {
     /// post-cutoff trade exactly once.
     #[tokio::test]
     async fn coinbase_seed_timeout_delivers_all_inflight_post_cutoff_trades() {
-        let host = silent_http().await;
+        let _time = manual_time();
+        let (http, host) = pending_seed_http().await;
         let (listener, url) = loopback().await;
         let mut rx = coinbase_feed(host, url);
         let mut ws = coinbase_socket(&listener).await;
-        let now = chrono::Utc::now().timestamp();
-        let b = Timeframe::D1.bucket_start(now + 1);
+        let (_request, after_cutoff) = seed_request(&http).await;
         for (i, size) in [(1u64, 1.0), (2, 2.0), (3, 3.0)] {
-            ws.send(trade_at(i, (now + i as i64) * 1_000_000_000, 100.0 + i as f64, size)).await.unwrap();
+            ws.send(trade(i, after_cutoff, 100.0 + i as f64, size)).await.unwrap();
         }
-        let bars = collect_bars(&mut rx, Duration::from_millis(300), Duration::from_secs(2)).await;
-        let map = latest_by_bucket(&bars);
-        let bar = map.get(&b).expect("in-flight trades delivered after seed timeout");
+        no_update(&mut ws, &mut rx).await;
+        tokio::time::advance(Duration::from_millis(801)).await;
+        let bar = partial(&mut rx).await;
         assert_eq!(bar.volume, 6.0, "1+2+3 exactly once: {bar:?}");
+        no_update(&mut ws, &mut rx).await;
     }
 
     /// Probe: heartbeat-only connections stay healthy and seed the REST bar once
     /// without inventing trade volume.
     #[tokio::test]
     async fn coinbase_heartbeat_only_seeds_rest_bar_once_without_extra_volume() {
+        let _time = manual_time();
         let (host, http) = seed_http(vec![Some(10.0)], 0).await;
         let (listener, url) = loopback().await;
         let mut rx = coinbase_feed(host, url);
@@ -1974,10 +1999,10 @@ mod tests {
         for _ in 0..4 {
             ws.send(Message::Text(r#"{"type":"heartbeat","product_id":"BTC-USD"}"#.into())).await.unwrap();
         }
-        let bars = collect_bars(&mut rx, Duration::from_millis(300), Duration::from_secs(2)).await;
-        assert_eq!(bars.len(), 1, "exactly one seeded partial: {bars:?}");
-        assert_eq!(bars[0].volume, 10.0);
-        assert_eq!(bars[0].close, 105.0);
+        let bar = partial(&mut rx).await;
+        assert_eq!(bar.volume, 10.0);
+        assert_eq!(bar.close, 105.0);
+        no_update(&mut ws, &mut rx).await;
         http.await.unwrap();
     }
 
