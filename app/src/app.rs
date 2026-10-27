@@ -183,8 +183,8 @@ impl OptionsPane {
     }
 }
 
-// N1a
-mod news_view;
+// N1b
+pub(crate) mod news_view;
 pub struct NewsPane {
     pub symbol: Option<String>,
     pub items: Vec<tr_data::news_store::Story>,
@@ -197,6 +197,9 @@ pub struct NewsPane {
     pub loading: bool,
     pub fetched: Option<Instant>,
     pub query: Option<crate::worker::NewsView>,
+    pub display: news_view::Display,
+    pub interaction: news_view::Interaction,
+    pub seen_queue: Vec<String>,
 }
 impl NewsPane {
     pub fn new(symbol: Option<String>) -> Self {
@@ -212,6 +215,9 @@ impl NewsPane {
             loading: true,
             fetched: None,
             query: None,
+            display: Default::default(),
+            interaction: Default::default(),
+            seen_queue: vec![],
         }
     }
     fn apply(&mut self, items: Vec<tr_data::news_store::Story>) {
@@ -256,7 +262,7 @@ impl NewsPane {
             .count()
     }
 }
-// N1a
+// N1b
 
 pub struct BookPane {
     pub symbol: String,
@@ -402,12 +408,17 @@ impl PaneKind {
             PaneKind::Wei => PaneSettings::Wei,
             PaneKind::Curve => PaneSettings::Curve,
             PaneKind::Search { query } => PaneSettings::Search(query.clone()),
-            // N1a
+            // N1b
             PaneKind::News(n) => PaneSettings::News(
-                (n.symbol.is_some() || n.filters != Default::default())
-                    .then(|| crate::layouts::NewsSettings { symbol: n.symbol.clone(), filters: n.filters.clone() }),
+                (n.symbol.is_some() || n.filters != Default::default() || n.display != Default::default()).then(|| {
+                    crate::layouts::NewsSettings {
+                        symbol: n.symbol.clone(),
+                        filters: n.filters.clone(),
+                        display: n.display.clone(),
+                    }
+                }),
             ),
-            // N1a
+            // N1b
             // N2
             PaneKind::Filings(f) => PaneSettings::Filings(f.clone()),
             PaneKind::OrderBook(b) => {
@@ -487,14 +498,15 @@ impl PaneKind {
             PaneSettings::Wei => PaneKind::Wei,
             PaneSettings::Curve => PaneKind::Curve,
             PaneSettings::Search(q) => PaneKind::Search { query: q },
-            // N1a
+            // N1b
             PaneSettings::News(s) => {
                 let saved = s.unwrap_or_default();
                 let mut pane = NewsPane::new(saved.symbol);
                 pane.filters = saved.filters;
+                pane.display = saved.display;
                 PaneKind::News(Box::new(pane))
             }
-            // N1a
+            // N1b
             // N2
             PaneSettings::Filings(f) => PaneKind::Filings(f),
             PaneSettings::OrderBook { symbol, depth, group } => {
@@ -2340,27 +2352,23 @@ impl TerminalApp {
                         }
                     }
                 }
-                // N1a: stale query replies cannot replace a newly selected scope.
-                Response::NewsStatus { view, status } => {
+                // N1b: stale query replies cannot replace a newly selected scope.
+                Response::NewsStatus { view, status, updated } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == view.pane)
                         && let PaneKind::News(n) = &mut p.kind
                         && n.query.as_ref() == Some(&view)
                     {
-                        if status.contains("updated just now") {
-                            n.updated = Some(Instant::now());
-                        }
+                        n.updated = updated;
                         n.status = status;
                     }
                 }
-                Response::NewsSaved { view, items, status } => {
+                Response::NewsSaved { view, items, status, updated } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == view.pane)
                         && let PaneKind::News(n) = &mut p.kind
                         && n.query.as_ref() == Some(&view)
                     {
                         n.loading = false;
-                        if status.contains("updated just now") {
-                            n.updated = Some(Instant::now());
-                        }
+                        n.updated = updated;
                         n.status = status;
                         match items {
                             Ok(items) => {
@@ -2371,7 +2379,7 @@ impl TerminalApp {
                         }
                     }
                 }
-                // N1a
+                // N1b
                 Response::OrderBook { pane, symbol, book } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
                         && let PaneKind::OrderBook(b) = &mut p.kind
@@ -2562,6 +2570,15 @@ impl TerminalApp {
         if other_text_focused {
             return;
         }
+        // N1b: feed navigation owns these unmodified keys before type-anywhere.
+        if !cmd_focused
+            && self.cmd.is_empty()
+            && self.idx(self.focus).is_some_and(|i| matches!(self.panes[i].kind, PaneKind::News(_)))
+            && presses.iter().any(|(key, modifiers)| *modifiers == Modifiers::NONE && news_view::owns_key(*key))
+        {
+            return;
+        }
+        // N1b
         if !cmd_focused && self.cmd.is_empty() && self.focused_is_chart() {
             let mut handled = false;
             self.with_chart(|chart, worker| handled = chart.replay_keys(ctx, worker));

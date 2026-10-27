@@ -135,8 +135,28 @@ impl TerminalApp {
                 let watched: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
                 crate::filings_view::show(ui, settings, &self.edgar, &watched);
             }
-            PaneKind::News(n) => {
-                actions.extend(super::news_view::show(ui, n, &self.watchlists));
+            PaneKind::News(_) => {
+                let link = self.panes[i].link;
+                let PaneKind::News(n) = &mut self.panes[i].kind else { unreachable!() };
+                let before = self.prefs.keyword_watches.clone();
+                actions.extend(super::news_view::show(
+                    ui,
+                    n,
+                    &self.watchlists,
+                    &mut self.prefs.keyword_watches,
+                    focused,
+                    link,
+                    self.active_watchlist,
+                ));
+                if !n.seen_queue.is_empty() {
+                    self.worker.send(Request::NewsSeen(std::mem::take(&mut n.seen_queue)));
+                }
+                if std::mem::take(&mut n.interaction.open_data_sources) {
+                    self.settings_tab = super::SettingsTab::DataSources;
+                }
+                if before != self.prefs.keyword_watches {
+                    self.save_prefs();
+                }
             }
             // N1a
             PaneKind::Options(o) => {

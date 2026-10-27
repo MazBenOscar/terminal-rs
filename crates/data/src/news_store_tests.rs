@@ -176,3 +176,33 @@ fn review_today_uses_local_calendar_midnight() {
         assert_eq!(local_start.year(), local_now.year());
     }
 }
+
+#[test]
+fn n1a_schema_lazy_backfill_precedes_symbol_filter_and_runs_once() {
+    let now = chrono::Utc::now().timestamp();
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch("CREATE TABLE items(id TEXT PRIMARY KEY,source TEXT NOT NULL,provider_id TEXT NOT NULL,url TEXT NOT NULL,headline TEXT NOT NULL,summary TEXT NOT NULL,published INTEGER NOT NULL,tickers TEXT NOT NULL,category TEXT NOT NULL,fetched INTEGER NOT NULL,seen INTEGER NOT NULL DEFAULT 0,bookmark INTEGER NOT NULL DEFAULT 0);").unwrap();
+    connection.execute("INSERT INTO items VALUES('old','Reuters','','https://fixture.test/old','$NVDA acquired startup','',?1,'[]','general',?1,1,0)",[now]).unwrap();
+    let db = NewsStore::init(connection).unwrap();
+    let before: i64 = db.db.query_row("SELECT intelligence FROM items", [], |r| r.get(0)).unwrap();
+    assert_eq!(before, 0, "opening must not synchronously enrich retained history");
+    let q = Query { symbols: vec!["NVDA US Equity".into()], ..Default::default() };
+    let rows = db.query(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].tags, vec!["M&A"]);
+    assert!(rows[0].seen);
+    assert_eq!(db.db.query_row("SELECT intelligence FROM items", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    db.db.execute("UPDATE items SET headline='$MSFT new guidance'", []).unwrap();
+    let again = db.query(&q).unwrap();
+    assert_eq!(again[0].item.tickers, rows[0].item.tickers, "already migrated rows are not recomputed on each query");
+    assert_eq!(again[0].tags, rows[0].tags);
+}
+#[test]
+fn duplicate_keeps_tags_of_the_retained_headline() {
+    let mut db = NewsStore::memory().unwrap();
+    let a = story("https://fixture.test/a", "Earnings and guidance", 10, "", "Reuters");
+    let b = story("https://fixture.test/a", "Later lawsuit", 20, "", "Yahoo");
+    db.insert(&[a, b], 30).unwrap();
+    let rows = db.query(&Query::default()).unwrap();
+    assert_eq!(rows[0].tags, vec!["Earnings", "Guidance"]);
+}

@@ -14,20 +14,31 @@ pub struct Story {
     pub item: NewsItem,
     pub source: String,
     pub provider_id: String,
+    /// Transport provider is separate from the publisher used for story leads.
+    #[serde(default)]
+    pub provider: String,
     pub summary: String,
     pub category: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub seen: bool,
 }
 impl Story {
     pub fn new(item: NewsItem, source: &str) -> Self {
         let link = normalize_link(&item.link);
         let identity = if link.is_empty() { format!("{source}|{}", item.title) } else { link.clone() };
+        let tags = crate::news_intelligence::topic_tags(&item.title);
         Self {
             id: Sha1::digest(identity.as_bytes()).iter().map(|b| format!("{b:02x}")).collect(),
             item: NewsItem { link, ..item },
             source: source.into(),
             provider_id: String::new(),
+            provider: source.into(),
             summary: String::new(),
             category: "general".into(),
+            tags,
+            seen: false,
         }
     }
 }
@@ -115,7 +126,7 @@ pub fn matches(story: &Story, q: &Query) -> bool {
         && !(f.scope == Scope::Watchlist && q.symbols.is_empty())
         && !(f.scope == Scope::Symbol && q.symbols.is_empty() && story.category != "general")
         && (q.symbols.is_empty() || q.symbols.iter().any(|key| story.item.tickers.contains(key)))
-        && (f.sources.is_empty() || f.sources.contains(&story.source))
+        && (f.sources.is_empty() || f.sources.contains(&story.source) || f.sources.contains(&story.provider))
         && (f.include.is_empty() || whole_word(&text, &f.include))
         && (f.exclude.is_empty() || !whole_word(&text, &f.exclude))
         && search_matches(&text, &f.search)
@@ -173,6 +184,8 @@ impl NewsStore {
                 let q: Query =
                     serde_json::from_str(&raw).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
                 let tickers: String = ctx.get(2)?;
+                let provenance: String = ctx.get(3)?;
+                let (source, provider) = provenance.split_once('\0').unwrap_or((&provenance, &provenance));
                 let mut story = Story::new(
                     NewsItem {
                         title: ctx.get(0)?,
@@ -181,8 +194,9 @@ impl NewsStore {
                         ts: ctx.get(5)?,
                         tickers: serde_json::from_str(&tickers).unwrap_or_default(),
                     },
-                    &ctx.get::<String>(3)?,
+                    source,
                 );
+                story.provider = provider.into();
                 story.summary = ctx.get(1)?;
                 story.category = ctx.get(4)?;
                 Ok(matches(&story, &q))
@@ -197,6 +211,18 @@ impl NewsStore {
             CREATE INDEX IF NOT EXISTS news_published ON items(published DESC);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
+        let columns: Vec<String> =
+            db.prepare("PRAGMA table_info(items)")?.query_map([], |r| r.get(1))?.collect::<rusqlite::Result<_>>()?;
+        if !columns.iter().any(|c| c == "tags") {
+            db.execute("ALTER TABLE items ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'", [])?;
+        }
+        if !columns.iter().any(|c| c == "intelligence") {
+            db.execute("ALTER TABLE items ADD COLUMN intelligence INTEGER NOT NULL DEFAULT 0", [])?;
+        }
+        if !columns.iter().any(|c| c == "provider") {
+            db.execute("ALTER TABLE items ADD COLUMN provider TEXT NOT NULL DEFAULT ''", [])?;
+        }
+        db.execute("CREATE INDEX IF NOT EXISTS news_backfill ON items(published DESC) WHERE intelligence=0", [])?;
         let fts = db
             .execute_batch(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS news_fts USING fts5(id UNINDEXED, headline, summary);
@@ -219,20 +245,23 @@ impl NewsStore {
         for story in stories {
             let canonical = Story::new(story.item.clone(), &story.source);
             let id = canonical.id;
-            tx.execute("INSERT OR IGNORE INTO items(id,source,provider_id,url,headline,summary,published,tickers,category,fetched) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![id, story.source, story.provider_id, canonical.item.link, story.item.title, story.summary, story.item.ts, serde_json::to_string(&story.item.tickers)?, story.category, now])?;
-            let raw: String = tx.query_row("SELECT tickers FROM items WHERE id=?1", [&id], |r| r.get(0))?;
+            tx.execute("INSERT OR IGNORE INTO items(id,source,provider_id,url,headline,summary,published,tickers,category,fetched,provider) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![id, story.source, story.provider_id, canonical.item.link, story.item.title, story.summary, story.item.ts, serde_json::to_string(&story.item.tickers)?, story.category, now, story.provider])?;
+            let (raw, title): (String, String) =
+                tx.query_row("SELECT tickers,headline FROM items WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?)))?;
             let mut tickers: Vec<String> = serde_json::from_str(&raw)?;
-            tickers.extend(story.item.tickers.iter().cloned());
+            tickers.extend(crate::news_intelligence::extract_tickers(&title, &[]));
+            tickers.extend(crate::news_intelligence::extract_tickers(&story.item.title, &story.item.tickers));
+            let tags = crate::news_intelligence::topic_tags(&title);
             tickers.sort();
             tickers.dedup();
             // A company/general duplicate must still reach the default market pane.
             // Preserve general membership if later fetched through a narrower endpoint.
             tx.execute(
-                "UPDATE items SET tickers=?2, category=CASE
+                "UPDATE items SET tickers=?2, tags=?4, intelligence=1, category=CASE
                 WHEN category='general' OR ?3='general' THEN 'general'
                 WHEN ?3 IN ('forex','crypto','merger') THEN ?3 ELSE category END WHERE id=?1",
-                params![id, serde_json::to_string(&tickers)?, story.category],
+                params![id, serde_json::to_string(&tickers)?, story.category, serde_json::to_string(&tags)?],
             )?;
         }
         tx.commit()?;
@@ -255,8 +284,43 @@ impl NewsStore {
             |r| r.get(0),
         )?)
     }
+    pub fn mark_seen(&self, ids: &[String]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        for id in ids {
+            tx.execute("UPDATE items SET seen=1 WHERE id=?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Bounded lazy migration, executed only by the history worker, never by UI.
+    fn backfill(&self, q: &Query) -> Result<()> {
+        let mut stmt = self.db.prepare("SELECT id,headline,tickers FROM items WHERE intelligence=0 AND published>=?1 AND published<=?2 ORDER BY published DESC LIMIT 2000")?;
+        let rows = stmt
+            .query_map(params![q.start, q.end], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.unchecked_transaction()?;
+        for (id, title, raw) in rows {
+            let tickers = crate::news_intelligence::extract_tickers(
+                &title,
+                &serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default(),
+            );
+            let tags = crate::news_intelligence::topic_tags(&title);
+            tx.execute(
+                "UPDATE items SET tickers=?2,tags=?3,intelligence=1 WHERE id=?1",
+                params![id, serde_json::to_string(&tickers)?, serde_json::to_string(&tags)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn query(&self, q: &Query) -> Result<Vec<Story>> {
-        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category FROM items WHERE published>=?1 AND published<=?2".to_string();
+        self.backfill(q)?;
+        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category,tags,seen,provider FROM items WHERE published>=?1 AND published<=?2".to_string();
         let search = if self.fts && !q.filters.search.trim().is_empty() {
             sql.push_str(" AND id IN (SELECT id FROM news_fts WHERE news_fts MATCH ?3)");
             let terms = terms(&q.filters.search);
@@ -270,7 +334,7 @@ impl NewsStore {
             let first = terms(&q.filters.search).into_iter().next().unwrap_or_default();
             format!("%{}%", first.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
         };
-        sql.push_str(" AND news_matches(headline,summary,tickers,source,category,published,?4) ORDER BY published DESC,id LIMIT ?5 OFFSET ?6");
+        sql.push_str(" AND news_matches(headline,summary,tickers,source||char(0)||provider,category,published,?4) ORDER BY published DESC,id LIMIT ?5 OFFSET ?6");
         let mut stmt = self.db.prepare(&sql)?;
         let rows = stmt.query_map(
             params![
@@ -278,7 +342,7 @@ impl NewsStore {
                 q.end,
                 search,
                 serde_json::to_string(q)?,
-                q.limit.min(1000) as i64,
+                q.limit.min(crate::news_intelligence::MAX_ITEMS) as i64,
                 q.offset.min(i64::MAX as usize) as i64
             ],
             |r| {
@@ -287,8 +351,11 @@ impl NewsStore {
                     id: r.get(0)?,
                     source: r.get(1)?,
                     provider_id: r.get(2)?,
+                    provider: r.get(11)?,
                     summary: r.get(5)?,
                     category: r.get(8)?,
+                    tags: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+                    seen: r.get(10)?,
                     item: NewsItem {
                         link: r.get(3)?,
                         title: r.get(4)?,
