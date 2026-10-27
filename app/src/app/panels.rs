@@ -130,6 +130,11 @@ impl TerminalApp {
                 }
             }
             // N1a
+            // N2
+            PaneKind::Filings(settings) => {
+                let watched: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
+                crate::filings_view::show(ui, settings, &self.edgar, &watched);
+            }
             PaneKind::News(n) => {
                 actions.extend(super::news_view::show(ui, n, &self.watchlists));
             }

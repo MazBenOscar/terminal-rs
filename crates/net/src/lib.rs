@@ -236,6 +236,14 @@ pub struct Status {
     pub needs_contact: bool,
 }
 
+/// Headers needed by incremental consumers. A 304 has no body and is a success.
+#[derive(Clone, Debug, Default)]
+pub struct ResponseMetadata {
+    pub status: u16,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
 pub struct Guard {
     config: Config,
     settings: RwLock<Settings>,
@@ -246,7 +254,7 @@ pub struct Guard {
     #[cfg(any(test, feature = "test-support"))]
     fixture: Option<reqwest::Url>,
 }
-type FlightResult = (Instant, Result<Vec<u8>, Refused>);
+type FlightResult = (Instant, Result<(Vec<u8>, ResponseMetadata), Refused>);
 #[derive(Default)]
 struct CacheSlot {
     flight: tokio::sync::Mutex<()>,
@@ -324,6 +332,10 @@ impl Guard {
             CREATE TABLE IF NOT EXISTS inflight (\"group\" TEXT PRIMARY KEY, until INTEGER);
             CREATE TABLE IF NOT EXISTS transport_failures (\"group\" TEXT PRIMARY KEY, count INTEGER);")?;
         let db = guard.db()?;
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS slots (key TEXT PRIMARY KEY, at INTEGER NOT NULL, until INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS counters (key TEXT PRIMARY KEY, count INTEGER NOT NULL);",
+        )?;
         let has_owner = |db: &Connection| -> rusqlite::Result<bool> {
             Ok(db
                 .prepare("PRAGMA table_info(inflight)")?
@@ -353,6 +365,49 @@ impl Guard {
         let mut guard = Self::new(config, settings)?;
         guard.fixture = Some(base);
         Ok(guard)
+    }
+    /// Machine-wide cadence independent of data directories. A failed ledger never grants work.
+    pub fn claim_slot(&self, key: &str, interval: Duration) -> Result<bool, Refused> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = Utc::now().timestamp_millis();
+        let interval = i64::try_from(interval.as_millis()).map_err(|_| Refused::InvalidRequest)?;
+        let previous: Option<(i64, i64)> = tx
+            .query_row("SELECT at,until FROM slots WHERE key=?1", [key], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        if previous.is_some_and(|(at, until)| now < until.max(at.saturating_add(interval))) {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO slots VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET at=excluded.at,until=excluded.until",
+            params![key, now, now.saturating_add(interval)],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+    /// Extend a claimed slot after a consumer failure. Other instances cannot shorten this backoff.
+    pub fn defer_slot(&self, key: &str, interval: Duration) -> Result<(), Refused> {
+        let until = Utc::now()
+            .timestamp_millis()
+            .saturating_add(i64::try_from(interval.as_millis()).map_err(|_| Refused::InvalidRequest)?);
+        self.db()?.execute("UPDATE slots SET until=max(until,?2) WHERE key=?1", params![key, until])?;
+        Ok(())
+    }
+    /// Durable consumer attempt counters accompany slots so a new instance cannot reset retries.
+    pub fn increment_counter(&self, key: &str) -> Result<i64, Refused> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let count = tx.query_row(
+            "INSERT INTO counters VALUES(?1,1) ON CONFLICT(key) DO UPDATE SET count=count+1 RETURNING count",
+            [key],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(count)
+    }
+    pub fn clear_counter(&self, key: &str) -> Result<(), Refused> {
+        self.db()?.execute("DELETE FROM counters WHERE key=?1", [key])?;
+        Ok(())
     }
     pub fn set_cache_ttl(&self, group: &str, ttl: Duration) -> Result<(), Refused> {
         if !GROUPS.contains(&group) {
@@ -526,11 +581,29 @@ impl Guard {
     }
     /// Uses the guard's own client: caller-supplied redirect/retry policies cannot bypass budgets.
     pub async fn send(&self, group: &str, request: reqwest::RequestBuilder) -> Result<Vec<u8>, Refused> {
+        self.send_with_metadata(group, request).await.map(|(body, _)| body)
+    }
+    /// Metadata travels with the requested URL's flight, including redirect and coalesced results.
+    pub async fn send_with_metadata(
+        &self,
+        group: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
+        self.send_with_metadata_budget(group, request, u32::MAX).await
+    }
+    /// A lower ceiling reserves capacity for higher-priority consumers. Enforced in each hop's
+    /// IMMEDIATE budget transaction, not by a racy preflight status check.
+    pub async fn send_with_metadata_budget(
+        &self,
+        group: &str,
+        request: reqwest::RequestBuilder,
+        daily_limit: u32,
+    ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
         self.identity(group)?;
         let request = request.build().map_err(|_| Refused::InvalidRequest)?;
         let policy = self.policy(group, request.url())?;
         if request.method() != reqwest::Method::GET {
-            return self.send_uncached(group, request).await;
+            return self.send_uncached(group, request, daily_limit).await;
         }
         let key = (group.to_owned(), request.url().to_string());
         let slot = {
@@ -551,11 +624,23 @@ impl Guard {
                 return result.clone();
             }
         }
-        let result = self.send_uncached(group, request).await;
+        let result = self.send_uncached(group, request, daily_limit).await;
         // Failures are only delivered to current waiters, never reused as cached content.
         *slot.result.lock().expect("cache result lock") = Some((Instant::now(), result.clone()));
         slot.generation.fetch_add(1, Ordering::Release);
         result
+    }
+    /// Preflight without reserving budget or making a connection.
+    pub fn check(&self, group: &str) -> Result<(), Refused> {
+        self.identity(group)?;
+        let status = self.status()?.into_iter().find(|s| s.group == group).ok_or(Refused::UnknownHost)?;
+        if let Some(until) = status.paused_until {
+            return Err(Refused::Paused { until });
+        }
+        if status.requests_today >= status.cap {
+            return Err(Refused::Budget);
+        }
+        Ok(())
     }
     fn policy(&self, group: &str, url: &reqwest::Url) -> Result<HostPolicy, Refused> {
         if url.scheme() != "https"
@@ -573,7 +658,12 @@ impl Guard {
             .cloned()
             .ok_or(Refused::UnknownHost)
     }
-    async fn send_uncached(&self, group: &str, mut request: reqwest::Request) -> Result<Vec<u8>, Refused> {
+    async fn send_uncached(
+        &self,
+        group: &str,
+        mut request: reqwest::Request,
+        daily_limit: u32,
+    ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
         let max_wait = if group == "yahoo-news" && !self.config.max_wait.is_zero() {
             Duration::from_secs(30)
         } else {
@@ -581,7 +671,8 @@ impl Guard {
         };
         let deadline = Instant::now() + max_wait;
         for hop in 0..=3 {
-            let policy = self.policy(group, request.url())?;
+            let mut policy = self.policy(group, request.url())?;
+            policy.daily_cap = policy.daily_cap.min(daily_limit);
             let owner = format!(
                 "{}-{}-{}",
                 std::process::id(),
@@ -655,14 +746,23 @@ impl Guard {
             if html_response(&content_type, &body) && blocked_body(&body) {
                 return Err(self.pause(group, "Access denied / captcha", retry.as_deref())?);
             }
-            if !(200..300).contains(&status) {
+            if !(200..300).contains(&status) && status != 304 {
                 return Err(Refused::Http(status));
+            }
+            let header = |name| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+            let metadata = ResponseMetadata {
+                status,
+                etag: header(reqwest::header::ETAG),
+                last_modified: header(reqwest::header::LAST_MODIFIED),
+            };
+            if status == 304 {
+                body.clear();
             }
             let db = self.db()?;
             db.execute("DELETE FROM transport_failures WHERE \"group\"=?1", [group])?;
             db.execute("DELETE FROM cooldowns WHERE \"group\"=?1", [group])?;
             self.cooldowns.write().expect("cooldown lock").remove(group);
-            return Ok(body);
+            return Ok((body, metadata));
         }
         unreachable!("redirect loop is bounded")
     }

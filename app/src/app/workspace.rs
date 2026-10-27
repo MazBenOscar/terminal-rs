@@ -20,7 +20,9 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 16] = [
+pub const PANELS: [(&str, &str); 17] = [
+    // N2
+    ("Filings", "CF"),
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("Scanner", "SCAN"),
@@ -527,6 +529,10 @@ impl TerminalApp {
                     self.worker.send(Request::TickerTrades { pane: id, symbol: key });
                 }
             }
+            // N2: follow linked symbols without resetting the saved scope/filter.
+            PaneKind::Filings(f) => {
+                f.symbol = Some(key);
+            }
             PaneKind::News(n) => {
                 if n.symbol.as_deref() != Some(key.as_str()) {
                     // N1a: linking preserves history, scope, filters and pause state.
@@ -731,6 +737,8 @@ impl TerminalApp {
             "WL" | "WATCHLIST" | "W" => PaneKind::Watchlist,
             "SCAN" | "SCANNER" | "EASYSCAN" => PaneKind::Scanner(Box::default()),
             "NEWS" | "N" | "CN" | "TOP" => PaneKind::News(Box::new(NewsPane::new(current))),
+            // N2
+            "CF" | "FILINGS" => PaneKind::Filings(crate::filings_view::Settings::new(current)),
             "BOOK" | "OB" | "DEPTH" | "DOM" => {
                 // Default to a market with a public book.
                 let sym = given

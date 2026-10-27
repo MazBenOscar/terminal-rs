@@ -155,6 +155,8 @@ pub enum PaneSettings {
     Search(String),
     /// Headlines for a security (`None` = general market news).
     News(Option<NewsSettings>),
+    // N2: serde defaults keep existing layouts valid.
+    Filings(crate::filings_view::Settings),
     OrderBook {
         symbol: String,
         depth: usize,

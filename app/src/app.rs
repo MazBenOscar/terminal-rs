@@ -118,6 +118,8 @@ pub enum PaneKind {
         query: String,
     },
     News(Box<NewsPane>),
+    // N2
+    Filings(crate::filings_view::Settings),
     OrderBook(Box<BookPane>),
     Options(Box<OptionsPane>),
     /// Brokerage accounts through SnapTrade (`PORT`, `ACCT`, `POS`, `ORD`, `ACTV`).
@@ -296,6 +298,10 @@ impl PaneKind {
                 Some(s) => format!("{} News", short(s)),
                 None => "Top News".into(),
             },
+            // N2
+            PaneKind::Filings(f) => {
+                f.symbol.as_deref().map_or_else(|| "Filings".into(), |s| format!("{} Filings", short(s)))
+            }
             PaneKind::OrderBook(b) => format!("{} Depth", short(&b.symbol)),
             PaneKind::Options(o) => format!("{} Options", short(&o.symbol)),
             PaneKind::Portfolio(p) => p.title(),
@@ -318,6 +324,8 @@ impl PaneKind {
             PaneKind::Curve => "GC",
             PaneKind::Search { .. } => "SECF",
             PaneKind::News(_) => "CN",
+            // N2
+            PaneKind::Filings(_) => "CF",
             PaneKind::OrderBook(_) => "OB",
             PaneKind::Options(_) => "OMON",
             PaneKind::Portfolio(p) => p.view.code(),
@@ -332,6 +340,8 @@ impl PaneKind {
             PaneKind::Chart(c) => Some(&c.symbol),
             PaneKind::Ticker { symbol, .. } => Some(symbol),
             PaneKind::News(n) => n.symbol.as_deref(),
+            // N2
+            PaneKind::Filings(f) => f.symbol.as_deref(),
             PaneKind::OrderBook(b) => Some(&b.symbol),
             PaneKind::Options(o) => Some(&o.symbol),
             _ => None,
@@ -344,6 +354,8 @@ impl PaneKind {
             PaneKind::Chart(_)
                 | PaneKind::Ticker { .. }
                 | PaneKind::News(_)
+                // N2
+                | PaneKind::Filings(_)
                 | PaneKind::OrderBook(_)
                 | PaneKind::Options(_)
         )
@@ -396,6 +408,8 @@ impl PaneKind {
                     .then(|| crate::layouts::NewsSettings { symbol: n.symbol.clone(), filters: n.filters.clone() }),
             ),
             // N1a
+            // N2
+            PaneKind::Filings(f) => PaneSettings::Filings(f.clone()),
             PaneKind::OrderBook(b) => {
                 PaneSettings::OrderBook { symbol: b.symbol.clone(), depth: b.depth, group: b.group }
             }
@@ -481,6 +495,8 @@ impl PaneKind {
                 PaneKind::News(Box::new(pane))
             }
             // N1a
+            // N2
+            PaneSettings::Filings(f) => PaneKind::Filings(f),
             PaneSettings::OrderBook { symbol, depth, group } => {
                 PaneKind::OrderBook(Box::new(BookPane::new(&symbol, depth, group)))
             }
@@ -826,6 +842,8 @@ pub struct Drag {
 }
 
 pub struct TerminalApp {
+    // N2
+    edgar: crate::filings_view::State,
     drawing_ids: crate::drawing_history::SharedDrawingIds,
     pub agent_queue: crate::agent_queue::AgentToolQueue,
     pub pinned_agent_chart: Option<u64>,
@@ -1073,6 +1091,8 @@ impl TerminalApp {
             provider.eq_ignore_ascii_case("sample"),
         );
         let mut app = Self {
+            // N2
+            edgar: Default::default(),
             drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(ctx.clone()),
             pinned_agent_chart: None,
@@ -1671,6 +1691,10 @@ impl TerminalApp {
                 self.open_panel(PaneKind::Ticker { symbol: s.clone(), trades: Vec::new(), loading: true });
                 self.status = format!("{s}: congressional trades");
             }
+            // N2
+            Command::SymbolFunction(s, Function::Filings) => {
+                self.open_panel(PaneKind::Filings(crate::filings_view::Settings::new(Some(s.clone()))));
+            }
             Command::SymbolFunction(s, Function::News) => {
                 self.open_panel(PaneKind::News(Box::new(NewsPane::new(Some(s.clone())))));
                 self.status = format!("{s}: news");
@@ -1838,6 +1862,10 @@ impl TerminalApp {
                 self.set_link(focus, link);
             }
             Function::News => self.open_panel(PaneKind::News(Box::new(NewsPane::new(self.focused_symbol())))),
+            // N2
+            Function::Filings => {
+                self.open_panel(PaneKind::Filings(crate::filings_view::Settings::new(self.focused_symbol())))
+            }
             Function::OrderBook(depth) => {
                 let sym = self.focused_symbol().unwrap_or_else(|| "BTCUSD Curncy".into());
                 let depth = depth.unwrap_or(self.prefs.panels.book_depth).clamp(5, 200);
@@ -2092,6 +2120,12 @@ impl TerminalApp {
     fn drain(&mut self) {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
+                // N2: shared store snapshot, never clear rows on a failed refresh.
+                Response::Edgar { rows, status, updated } => {
+                    self.edgar.rows = rows;
+                    self.edgar.status = status;
+                    self.edgar.updated = updated;
+                }
                 Response::WatchlistColumns { revision, cells, computed_at } => {
                     if let Some((cells, computed_at)) = finish_columns_reply(
                         &mut self.columns_in_flight,
@@ -2979,10 +3013,43 @@ fn native_chrome(_frame: &eframe::Frame) -> Option<tr_macos::Chrome> {
     None
 }
 
+// N2: called on native visibility events too, not by an idle repaint loop.
+#[cfg(target_os = "macos")]
+fn edgar_window_visible(frame: &eframe::Frame) -> bool {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = frame.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return false;
+    };
+    // SAFETY: eframe logic is on the main thread with a live NSView.
+    unsafe { tr_macos::window_visible(h.ns_view.as_ptr()).unwrap_or(false) }
+}
+// N2
+#[cfg(not(target_os = "macos"))]
+fn edgar_window_visible(_frame: &eframe::Frame) -> bool {
+    true
+}
+
 impl eframe::App for TerminalApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.agent_logic(ctx);
         self.process_logic();
+        // N2: publish interest only on changes, never an HTTP request per frame.
+        let active = self.agent_demo.is_none()
+            && edgar_window_visible(frame)
+            && ctx.input(|i| i.viewport().minimized != Some(true))
+            && self.visible_panes().iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Filings(_)));
+        let mut symbols: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
+        symbols.sort();
+        symbols.dedup();
+        let interest = (active, symbols);
+        if self.edgar.interest.as_ref() != Some(&interest) {
+            self.worker.send(Request::EdgarInterest { active, symbols: interest.1.clone() });
+            self.edgar.interest = Some(interest);
+        }
+
         self.populate_agent_demo(ctx);
         // An edit arriving during an in-flight save still needs a fresh snapshot
         // while hidden. Poll only until that snapshot can start; never tick idle.
@@ -3197,6 +3264,8 @@ impl TerminalApp {
     /// Shared by the offline review harness and session-free workspace tests.
     fn isolated_workspace(root: &std::path::Path, worker: Worker) -> Self {
         Self {
+            // N2
+            edgar: Default::default(),
             drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(egui::Context::default()),
             pinned_agent_chart: None,
