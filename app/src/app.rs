@@ -1642,6 +1642,9 @@ impl TerminalApp {
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
                 // N3: an explicit Reload wakes the worker, without resetting durable cadence.
                 Action::ReloadFilings => self.edgar.interest = None,
+                Action::LoadFilingsOnce(symbol) => {
+                    self.worker.send(Request::EdgarOnce { symbol });
+                }
                 // N3
                 Action::AddToWatchlist(symbol) => {
                     let name = self.watchlists[self.active_watchlist].name.clone();
@@ -2168,6 +2171,10 @@ impl TerminalApp {
     fn drain(&mut self) {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
+                Response::EdgarStatus { status, flags } => {
+                    self.edgar.status = status;
+                    self.edgar.flags = flags;
+                }
                 // N2: shared store snapshot, never clear rows on a failed refresh.
                 Response::Edgar { rows, status, updated, flags } => {
                     self.edgar.rows = rows;

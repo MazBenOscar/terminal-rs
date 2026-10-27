@@ -276,6 +276,9 @@ pub enum AgentRequest {
 }
 
 pub enum Request {
+    EdgarOnce {
+        symbol: String,
+    },
     // N2
     EdgarInterest {
         active: bool,
@@ -581,6 +584,10 @@ pub struct Profile {
 }
 
 pub enum Response {
+    EdgarStatus {
+        status: String,
+        flags: tr_edgar::scheduler::StatusFlags,
+    },
     // N2
     Edgar {
         rows: Arc<Vec<tr_edgar::Filing>>,
@@ -1767,6 +1774,28 @@ async fn handle_agent(s: &Shared, request: AgentRequest) {
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
         // N2
+        Request::EdgarOnce { symbol } => match tr_edgar::store::Store::open(data_dir().join("edgar.sqlite3")) {
+            Ok(store) => {
+                let mut scheduler = tr_edgar::scheduler::Scheduler::new(store, tr_edgar::scheduler::Sec);
+                scheduler.load_once(chrono::Utc::now().timestamp(), &symbol).await;
+                match scheduler.store.filings() {
+                    Ok(rows) => s.send(Response::Edgar {
+                        rows: Arc::new(rows),
+                        status: scheduler.status,
+                        updated: scheduler.store.number("updated").unwrap_or(0),
+                        flags: scheduler.flags,
+                    }),
+                    Err(_) => s.send(Response::EdgarStatus {
+                        status: "SEC EDGAR · Load once: store unavailable".into(),
+                        flags: tr_edgar::scheduler::StatusFlags { unavailable: true, ..Default::default() },
+                    }),
+                }
+            }
+            Err(_) => s.send(Response::EdgarStatus {
+                status: "SEC EDGAR · Load once: store unavailable".into(),
+                flags: tr_edgar::scheduler::StatusFlags { unavailable: true, ..Default::default() },
+            }),
+        },
         Request::EdgarInterest { active, symbols } => {
             s.edgar_interest.send_replace((active, symbols));
         }

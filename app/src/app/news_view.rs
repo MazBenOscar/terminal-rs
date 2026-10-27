@@ -297,6 +297,7 @@ pub struct RowModel {
     pub about: String,
     pub headline: String,
     pub meta: String,
+    pub meta_steps: Vec<String>,
     pub unread: bool,
 }
 #[cfg(test)]
@@ -315,7 +316,11 @@ fn row_model_watched(story: &Cluster, linked: Option<&str>, watched: &[String], 
     let (time, full_time) = crate::feed_time::feed_time(story.newest, now, false);
     let ticker_is_subject = !story.subjects.is_empty();
     let tickers: Vec<_> = if ticker_is_subject {
-        story.subjects.iter().filter(|t| Some(t.as_str()) != linked).cloned().collect()
+        // Subjects are ordered by first mention. Never promote a later subject
+        // into the column merely because the first subject is linked.
+        let preceding =
+            linked.and_then(|key| story.subjects.iter().position(|s| s == key)).unwrap_or(story.subjects.len());
+        story.subjects[..preceding].to_vec()
     } else {
         fallback_ticker(story, linked, watched).cloned().into_iter().collect()
     };
@@ -338,17 +343,16 @@ fn row_model_watched(story: &Cluster, linked: Option<&str>, watched: &[String], 
             .map(|key| format!("Returned by {} for {}; not mentioned in the story", story.lead.provider, short(key)))
             .unwrap_or_default()
     };
-    let mut meta = story.lead.source.clone();
-    if story.sources.len() > 1 {
-        meta.push_str(&format!(" +{}", story.sources.len() - 1));
-    }
-    if tickers.len() > 1 {
-        meta.push_str(&format!(" · +{}", tickers.len() - 1));
-    }
+    let source = story.lead.source.clone();
+    let sources =
+        if story.sources.len() > 1 { format!("{source} +{}", story.sources.len() - 1) } else { source.clone() };
+    let tickers_meta = if tickers.len() > 1 { format!("{sources} · +{}", tickers.len() - 1) } else { sources.clone() };
+    let mut meta = tickers_meta.clone();
     for tag in &story.tags {
         meta.push_str(" · ");
         meta.push_str(tag);
     }
+    let meta_steps = vec![meta.clone(), tickers_meta, sources, source, String::new()];
     RowModel {
         id: story.lead.id.clone(),
         time,
@@ -360,6 +364,7 @@ fn row_model_watched(story: &Cluster, linked: Option<&str>, watched: &[String], 
         about,
         headline: story.lead.item.title.clone(),
         meta,
+        meta_steps,
         unread: story.unread(),
     }
 }
@@ -436,17 +441,7 @@ fn chart_ticker<'a>(story: &'a Cluster, linked: Option<&str>, watched: &[String]
 /// headline first, then source/time/tickers, the summary at a reading width, and the host.
 fn hover_card(title: &egui::Response, story: &Cluster, model: &RowModel) {
     let summary = story.lead.summary.trim();
-    let mut tooltip = egui::Tooltip::for_enabled(title);
-    tooltip.popup = tooltip
-        .popup
-        .frame(
-            egui::Frame::popup(&title.ctx.global_style())
-                .fill(theme::card())
-                .stroke(egui::Stroke::new(dp(1.0), theme::muted()))
-                .inner_margin(egui::Margin::symmetric(dp(10.0) as i8, dp(8.0) as i8)),
-        )
-        .width(dp(380.0));
-    tooltip.show(|ui| {
+    crate::feed_time::tooltip(title).show(|ui| {
         ui.spacing_mut().item_spacing.y = dp(4.0);
         ui.add(
             egui::Label::new(RichText::new(&story.lead.item.title).font(ui_font(13.5)).color(theme::text()).strong())
@@ -489,15 +484,15 @@ fn toggle_expanded(n: &mut NewsPane, story: &Cluster) {
     }
     mark_seen(n, story);
 }
-fn chips(ui: &mut Ui, display: &mut Display) {
+fn chips(ui: &mut Ui, display: &mut Display, unread: usize) {
+    ui.toggle_value(&mut display.unread, format!("Unread {unread}")).on_hover_text("Unread only (u)");
     ui.toggle_value(&mut display.watch_hits, "Watch hits");
-    ui.toggle_value(&mut display.unread, "Unread").on_hover_text("Unread only (u)");
 }
-fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narrow: bool) {
+fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narrow: bool, unread: usize) {
     let mut changed = false;
     let mut finished = false;
     if narrow {
-        ui.horizontal(|ui| chips(ui, &mut n.display));
+        ui.horizontal(|ui| chips(ui, &mut n.display, unread));
     }
     ui.label("Sources");
     let sources: std::collections::BTreeSet<_> = n
@@ -543,11 +538,21 @@ fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narro
             finished |= response.lost_focus();
             ui.horizontal(|ui| {
                 for colour in 0..6 {
-                    if ui
-                        .selectable_label(watch.colour.min(5) == colour, RichText::new("●").color(watch_colour(colour)))
-                        .on_hover_text(format!("Watch colour {}", colour + 1))
-                        .clicked()
-                    {
+                    let response = crate::feed_time::icon_button(
+                        ui,
+                        crate::widgets::Icon::Circle,
+                        &format!("Watch colour {}", colour + 1),
+                    );
+                    ui.painter().circle_filled(response.rect.center(), dp(3.), watch_colour(colour));
+                    if watch.colour.min(5) == colour {
+                        ui.painter().rect_stroke(
+                            response.rect,
+                            theme::CONTROL_RADIUS,
+                            egui::Stroke::new(dp(1.), theme::accent()),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if response.clicked() {
                         changed |= watch.colour != colour;
                         watch.colour = colour;
                     }
@@ -610,83 +615,110 @@ pub(super) fn show(
     let mut cache = std::mem::take(&mut n.cache);
     cache.update(n, watches, &watched, now);
     let unread = cache.unread;
-    ui.horizontal(|ui| {
+    ui.horizontal_top(|ui| {
         chrome(ui);
-        ui.selectable_value(&mut n.filters.scope, Scope::Symbol, "Symbol");
-        ui.selectable_value(&mut n.filters.scope, Scope::Watchlist, "Watchlist");
-        ui.selectable_value(&mut n.filters.scope, Scope::All, "Market");
-        if n.filters.scope == Scope::Watchlist {
-            egui::ComboBox::from_id_salt("news-watchlist")
-                .width(dp(70.0))
-                .wrap_mode(egui::TextWrapMode::Truncate)
-                .selected_text(&watchlist_name)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut n.filters.watchlist, None, "Active watchlist");
-                    for list in lists {
-                        ui.selectable_value(&mut n.filters.watchlist, Some(list.name.clone()), &list.name);
+        // Reserve the overflow first, at the right edge, independent of status length.
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), dp(20.)),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                let more = crate::feed_time::icon_button(ui, crate::widgets::Icon::More, "News options");
+                egui::Popup::menu(&more).show(|ui| {
+                    ui.add(egui::Label::new(&status).wrap());
+                    ui.separator();
+                    if ui.button("Reload").on_hover_text("Reload saved history; source pacing is unchanged").clicked() {
+                        n.fetched = None;
+                        n.read_in_view.clear();
+                        n.item_revision = n.item_revision.wrapping_add(1);
+                        ui.close();
                     }
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut n.display.wire, false, "Stories");
+                        ui.selectable_value(&mut n.display.wire, true, "Wire");
+                    });
+                    if ui.button(if n.paused { "Show new updates" } else { "Pause updates" }).clicked() {
+                        n.paused = !n.paused;
+                        if !n.paused && !n.pending.is_empty() {
+                            let incoming = std::mem::take(&mut n.pending);
+                            n.apply(incoming);
+                        }
+                        ui.close();
+                    }
+                    ui.menu_button("About this source", |ui| {
+                        ui.label("Finnhub free tier: personal, non-commercial use.");
+                        ui.label("Headlines and metadata only; links open the publisher.");
+                    });
                 });
-        } else if n.filters.scope == Scope::Symbol {
-            if let Some(symbol) = &n.symbol {
-                ui.label(
-                    RichText::new(symbol.split_whitespace().next().unwrap_or(symbol))
-                        .font(mono(12.0))
-                        .color(theme::amber()),
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), dp(20.)),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.selectable_value(&mut n.filters.scope, Scope::Symbol, "Symbol");
+                        ui.selectable_value(&mut n.filters.scope, Scope::Watchlist, "Watchlist");
+                        ui.selectable_value(&mut n.filters.scope, Scope::All, "Market");
+                        if n.filters.scope == Scope::Watchlist {
+                            egui::ComboBox::from_id_salt("news-watchlist")
+                                .width(dp(70.0))
+                                .wrap_mode(egui::TextWrapMode::Truncate)
+                                .selected_text(&watchlist_name)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut n.filters.watchlist, None, "Active watchlist");
+                                    for list in lists {
+                                        ui.selectable_value(
+                                            &mut n.filters.watchlist,
+                                            Some(list.name.clone()),
+                                            &list.name,
+                                        );
+                                    }
+                                });
+                        } else if n.filters.scope == Scope::Symbol {
+                            if let Some(symbol) = &n.symbol {
+                                ui.label(
+                                    RichText::new(symbol.split_whitespace().next().unwrap_or(symbol))
+                                        .font(mono(12.0))
+                                        .color(theme::amber()),
+                                );
+                            }
+                            if let Some(link) = link {
+                                crate::feed_time::dot(ui, link.color());
+                            }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if n.paused
+                                && ui
+                                    .small_button(format!("{} new · Show", cache.pending_count))
+                                    .on_hover_text("Updates paused in this pane; show new saved headlines")
+                                    .clicked()
+                            {
+                                n.paused = false;
+                                if !n.pending.is_empty() {
+                                    let incoming = std::mem::take(&mut n.pending);
+                                    n.apply(incoming);
+                                }
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(crate::feed_time::compact_status(&status))
+                                        .font(ui_font(10.5))
+                                        .color(theme::muted()),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&status);
+                        });
+                    },
                 );
-            }
-            if let Some(link) = link {
-                ui.label(RichText::new("●").color(link.color()));
-            }
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.menu_button("⋯", |ui| {
-                if ui.button("Reload").on_hover_text("Reload saved history; source pacing is unchanged").clicked() {
-                    n.fetched = None;
-                    n.read_in_view.clear();
-                    n.item_revision = n.item_revision.wrapping_add(1);
-                    ui.close();
-                }
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut n.display.wire, false, "Stories");
-                    ui.selectable_value(&mut n.display.wire, true, "Wire");
-                });
-                if !n.paused && ui.button("Pause updates").clicked() {
-                    n.paused = true;
-                    ui.close();
-                }
-                ui.menu_button("About this source", |ui| {
-                    ui.label("Finnhub free tier: personal, non-commercial use.");
-                    ui.label("Headlines and metadata only; links open the publisher.");
-                });
-            });
-            if n.paused
-                && ui
-                    .small_button(format!("{} new · Show", cache.pending_count))
-                    .on_hover_text("Updates paused in this pane; show new saved headlines")
-                    .clicked()
-            {
-                n.paused = false;
-                if !n.pending.is_empty() {
-                    let incoming = std::mem::take(&mut n.pending);
-                    n.apply(incoming);
-                }
-            }
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!("{unread} unread · {status}")).font(mono(10.5)).color(theme::muted()),
-                )
-                .truncate(),
-            )
-            .on_hover_text(&status);
-        });
+            },
+        );
     });
     ui.horizontal(|ui| {
         chrome(ui);
         for (days, label) in [(1, "Today"), (7, "7D"), (30, "30D"), (90, "90D")] {
             ui.selectable_value(&mut n.filters.days, days, label);
         }
+        ui.toggle_value(&mut n.display.unread, format!("Unread {unread}")).on_hover_text("Unread only (u)");
         if !narrow {
-            chips(ui, &mut n.display);
+            ui.toggle_value(&mut n.display.watch_hits, "Watch hits");
         }
         let count = n.filters.sources.len()
             + usize::from(!n.filters.include.is_empty())
@@ -694,9 +726,9 @@ pub(super) fn show(
             + usize::from(narrow && n.display.unread)
             + usize::from(narrow && n.display.watch_hits);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.menu_button(format!("Filters ({count})"), |ui| filters(ui, n, watches, narrow));
+            ui.menu_button(format!("Filters ({count})"), |ui| filters(ui, n, watches, narrow, unread));
             if narrow && !n.interaction.search_open && n.filters.search.is_empty() {
-                if ui.small_button("⌕").on_hover_text("Search (/)").clicked() {
+                if crate::feed_time::icon_button(ui, crate::widgets::Icon::Search, "Search (/)").clicked() {
                     n.interaction.search_open = true;
                     n.interaction.focus_search = true;
                 }
@@ -917,6 +949,14 @@ pub(super) fn show(
         let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), dp(22.0)), egui::Sense::click());
         if n.interaction.selected.as_ref() == Some(&model.id) {
             ui.painter().rect_filled(rect, dp(0.0), theme::accent_wash());
+            if focused {
+                ui.painter().rect_stroke(
+                    rect.shrink(dp(0.5)),
+                    dp(0.),
+                    egui::Stroke::new(dp(1.), theme::accent()),
+                    egui::StrokeKind::Inside,
+                );
+            }
         } else if response.hovered() {
             ui.painter().rect_filled(rect, dp(0.0), theme::control_hover());
         }
@@ -933,7 +973,7 @@ pub(super) fn show(
             ui.painter().circle_filled(rect.left_center() + egui::vec2(dp(3.0), dp(0.0)), dp(2.0), theme::accent());
         }
         let time_width = ui.fonts_mut(|f| f.glyph_width(&mono(11.0), '0')) * crate::feed_time::WIDTH_CHARS as f32;
-        let ticker_width = time_width;
+        let ticker_width = if linked.is_some() && model.ticker.is_none() { 0. } else { time_width };
         let time_rect =
             egui::Rect::from_min_size(rect.min + egui::vec2(dp(6.0), dp(0.0)), egui::vec2(time_width, rect.height()));
         ui.scope_builder(
@@ -964,7 +1004,16 @@ pub(super) fn show(
                 child_clicked = true;
             }
         }
-        let meta_width = (rect.width() * 0.30).min(dp(230.0));
+        let available = rect.right() - ticker_rect.right() - dp(4.);
+        let budget = crate::feed_time::tail_budget(rect.width(), available);
+        let (meta_text, meta_width) = model
+            .meta_steps
+            .iter()
+            .find_map(|text| {
+                let width = ui.painter().layout_no_wrap(text.clone(), ui_font(10.5), theme::muted()).size().x;
+                (width <= budget).then_some((text, width))
+            })
+            .expect("empty metadata always fits");
         let meta_rect = egui::Rect::from_min_max(
             egui::pos2((rect.right() - meta_width).max(ticker_rect.right()), rect.top()),
             rect.max,
@@ -1017,7 +1066,7 @@ pub(super) fn show(
                 egui::UiBuilder::new().max_rect(meta_rect).layout(egui::Layout::right_to_left(egui::Align::Center)),
                 |ui| {
                     ui.add(
-                        egui::Label::new(RichText::new(&model.meta).font(ui_font(10.5)).color(theme::muted()))
+                        egui::Label::new(RichText::new(meta_text).font(ui_font(10.5)).color(theme::muted()))
                             .truncate()
                             .sense(egui::Sense::click()),
                     )

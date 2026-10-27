@@ -45,10 +45,104 @@ where
     (label, time.format("%a %b %d %Y %H:%M (UTC%:z)").to_string())
 }
 
+/// Feed controls are vector-drawn, density-scaled and input-driven (no animation timer).
+pub(crate) fn icon_button(ui: &mut egui::Ui, icon: crate::widgets::Icon, label: &str) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(crate::theme::dp(22.), crate::theme::dp(20.)), egui::Sense::click());
+    if response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(rect, crate::theme::CONTROL_RADIUS, crate::theme::control_hover());
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            crate::theme::CONTROL_RADIUS,
+            egui::Stroke::new(crate::theme::dp(1.), crate::theme::accent()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    crate::widgets::draw_icon(ui.painter(), rect.shrink(crate::theme::dp(4.)), icon, crate::theme::text());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
+    response.on_hover_text(label)
+}
+
+pub(crate) fn dot(ui: &mut egui::Ui, colour: egui::Color32) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(crate::theme::dp(8.), crate::theme::dp(16.)), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), crate::theme::dp(2.5), colour);
+    response
+}
+
+/// The main column owns the row. A short tail never leaves a fixed empty block.
+pub(crate) fn tail_budget(row: f32, available: f32) -> f32 {
+    (row * 0.30).min((available - row * 0.60 - crate::theme::dp(6.)).max(0.))
+}
+
+/// One actionable problem, otherwise source and age. Full diagnostic stays in the menu/tip.
+pub(crate) fn compact_status(status: &str) -> String {
+    let lower = status.to_ascii_lowercase();
+    for (needle, label) in [
+        ("offline", "Offline"),
+        ("needs contact", "Needs contact"),
+        ("needs a finnhub key", "Needs key"),
+        ("unavailable", "Source unavailable"),
+        ("reserve", "Budget reserved"),
+    ] {
+        if lower.contains(needle) {
+            return label.into();
+        }
+    }
+    if let Some(at) = lower.find("paused until") {
+        return status[at..].split(" · ").next().unwrap_or(status).into();
+    }
+    status.split(" · ").take(2).collect::<Vec<_>>().join(" · ")
+}
+
+pub(crate) fn tooltip(response: &egui::Response) -> egui::Tooltip<'_> {
+    let mut tooltip = egui::Tooltip::for_enabled(response);
+    tooltip.popup = tooltip
+        .popup
+        .frame(
+            egui::Frame::popup(&response.ctx.global_style())
+                .fill(crate::theme::card())
+                .stroke(egui::Stroke::new(crate::theme::dp(1.), crate::theme::muted()))
+                .inner_margin(egui::Margin::symmetric(crate::theme::dp(10.) as i8, crate::theme::dp(8.) as i8)),
+        )
+        .width(crate::theme::dp(380.));
+    tooltip
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::FixedOffset;
+
+    #[test]
+    fn tails_leave_sixty_percent_for_main_text_when_fixed_columns_allow_it() {
+        for row in [340., 600., 1200.] {
+            for fixed in [60., 110., 180.] {
+                let available = row - fixed;
+                let tail = tail_budget(row, available);
+                assert!(tail <= row * 0.30);
+                assert!(tail >= 0.);
+                if available >= row * 0.60 + crate::theme::dp(6.) {
+                    assert!(available - tail - crate::theme::dp(6.) >= row * 0.60 - 0.001);
+                } else {
+                    assert_eq!(tail, 0.);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_status_keeps_actionable_failures_not_backlog_prose() {
+        assert_eq!(
+            compact_status("SEC EDGAR · updated now · Reading insider forms: 216 left"),
+            "SEC EDGAR · updated now"
+        );
+        assert_eq!(compact_status("SEC EDGAR · Offline (test instance)"), "Offline");
+        assert_eq!(compact_status("SEC EDGAR · Needs contact email (Settings)"), "Needs contact");
+        assert_eq!(compact_status("SEC EDGAR · waiting: reserved feed budget"), "Budget reserved");
+    }
 
     // 2026-10-27 13:00 UTC = 09:00 EDT.
     const NOW: i64 = 1_793_106_000;

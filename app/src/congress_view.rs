@@ -16,6 +16,7 @@ pub enum Action {
     Notice(String),
     /// N3: reread the local feed through its existing visible worker interest path.
     ReloadFilings,
+    LoadFilingsOnce(String),
     OpenChart(String),
     AddToCompare(String),
     ScanChart {

@@ -50,6 +50,15 @@ impl Store {
         if !has_provenance {
             db.execute_batch("ALTER TABLE filings ADD COLUMN from_submissions INTEGER NOT NULL DEFAULT 0; UPDATE filings SET from_submissions=1 WHERE primary_doc!='';")?;
         }
+        let has_transient = db
+            .prepare("PRAGMA table_info(filings)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|c| c == "transient_symbol");
+        if !has_transient {
+            db.execute_batch("ALTER TABLE filings ADD COLUMN transient_symbol TEXT NOT NULL DEFAULT '';")?;
+        }
         db.execute_batch(
             "CREATE INDEX IF NOT EXISTS filings_cik_time ON filings(cik,coalesce(accepted,filed));
             DELETE FROM meta WHERE key LIKE 'body:%'; COMMIT;",
@@ -131,8 +140,9 @@ impl Store {
                 f.reporting_owner
             };
             tx.execute(
-                "INSERT INTO filings VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                "INSERT INTO filings VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
                 ON CONFLICT(cik,accession,reporting_owner) DO UPDATE SET
+                transient_symbol=CASE WHEN excluded.transient_symbol='' THEN '' ELSE filings.transient_symbol END,
                 from_submissions=max(excluded.from_submissions,filings.from_submissions),
                 filed=CASE WHEN excluded.from_submissions THEN excluded.filed ELSE filings.filed END,
                 accepted=CASE WHEN excluded.from_submissions THEN coalesce(excluded.accepted,filings.accepted) ELSE coalesce(filings.accepted,excluded.accepted) END,
@@ -154,7 +164,8 @@ impl Store {
                     f.description,
                     f.url,
                     reporting_owner,
-                    f.from_submissions
+                    f.from_submissions,
+                    f.transient_symbol
                 ],
             )?;
         }
@@ -180,6 +191,9 @@ impl Store {
             insiders: vec![],
             insider_unavailable: false,
             insider_parsed: false,
+            insider_queued: false,
+            insider_retry: 0,
+            transient_symbol: r.get(13)?,
         })
     }
     fn with_tickers(&self, mut rows: Vec<Filing>) -> Result<Vec<Filing>> {
@@ -193,7 +207,7 @@ impl Store {
             .query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?
             .collect::<rusqlite::Result<_>>()?;
         let meta: BTreeMap<String, i64> = self
-            .read("SELECT key,CAST(value AS INTEGER) FROM meta WHERE key LIKE 'f4:%'")?
+            .read("SELECT key,CAST(value AS INTEGER) FROM meta WHERE key LIKE 'f4:%' OR key LIKE 'window:%'")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut lots: BTreeMap<(String, u64), Vec<crate::insider::Transaction>> = BTreeMap::new();
@@ -217,6 +231,13 @@ impl Store {
                     || (matches!(row.form.as_str(), "4" | "4/A")
                         && !row.primary_doc.is_empty()
                         && crate::insider::xml_url(row).is_none()));
+            row.insider_retry = meta.get(&format!("f4:retry:{}", row.accession)).copied().unwrap_or(0);
+            row.insider_queued = !row.insider_parsed
+                && !row.insider_unavailable
+                && !row.reporting_owner
+                && row.transient_symbol.is_empty()
+                && row.filed >= meta.get(&format!("window:{}", row.cik)).copied().unwrap_or(0)
+                && crate::insider::xml_url(row).is_some();
         }
         Ok(rows)
     }
@@ -226,18 +247,18 @@ impl Store {
             .read(
                 "SELECT filings.*,CAST(coalesce(retry.value,'0') AS INTEGER) FROM filings
             LEFT JOIN meta retry ON retry.key='f4:retry:'||accession
-            WHERE reporting_owner=0 AND form IN ('4','4/A') AND primary_doc!=''
+            WHERE reporting_owner=0 AND transient_symbol='' AND form IN ('4','4/A') AND primary_doc!=''
             AND filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER)
             AND NOT EXISTS(SELECT 1 FROM insider_documents d WHERE d.accession=filings.accession)
             AND NOT EXISTS(SELECT 1 FROM meta WHERE key='f4:terminal:'||accession)
             AND CAST(coalesce((SELECT value FROM meta WHERE key='f4:attempts:'||accession),'0') AS INTEGER)<3
             ORDER BY coalesce(accepted,filed) DESC,accession DESC",
             )?
-            .query_map([], |r| Ok((Self::row(r)?, r.get(13)?)))?
+            .query_map([], |r| Ok((Self::row(r)?, r.get(14)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
     pub fn filings(&self) -> Result<Vec<Filing>> {
-        let rows = self.read("SELECT * FROM filings WHERE filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER) ORDER BY coalesce(accepted,filed) DESC,accession DESC")?.query_map([], Self::row)?.collect::<rusqlite::Result<_>>()?;
+        let rows = self.read("SELECT * FROM filings WHERE transient_symbol!='' OR filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER) ORDER BY coalesce(accepted,filed) DESC,accession DESC")?.query_map([], Self::row)?.collect::<rusqlite::Result<_>>()?;
         self.with_tickers(rows)
     }
     /// Uses the CIK/time index; chart loads never scan the entire filings store.
@@ -250,7 +271,7 @@ impl Store {
         let Some(cik) = cik else {
             return Ok(vec![]);
         };
-        let mut rows: Vec<Filing> = self.read("SELECT * FROM filings WHERE cik=?1 AND coalesce(accepted,filed) BETWEEN ?2 AND ?3 AND reporting_owner=0 AND filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER) ORDER BY coalesce(accepted,filed)")?.query_map(params![cik,start,end], Self::row)?.collect::<rusqlite::Result<_>>()?;
+        let mut rows: Vec<Filing> = self.read("SELECT * FROM filings WHERE cik=?1 AND coalesce(accepted,filed) BETWEEN ?2 AND ?3 AND reporting_owner=0 AND transient_symbol='' AND filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER) ORDER BY coalesce(accepted,filed)")?.query_map(params![cik,start,end], Self::row)?.collect::<rusqlite::Result<_>>()?;
         // N3: trade dates can precede acceptance. Use the insider CIK/date index as a
         // second path rather than incorrectly restricting trades to filing-time range.
         let dates = chrono::DateTime::from_timestamp(start, 0).zip(chrono::DateTime::from_timestamp(end, 0));
@@ -266,7 +287,7 @@ impl Store {
                 if rows.iter().any(|f| f.accession == accession) {
                     continue;
                 }
-                if let Some(f) = self.db.query_row("SELECT * FROM filings WHERE cik=?1 AND accession=?2 AND reporting_owner=0 AND filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER)",params![cik,accession],Self::row).optional()? { rows.push(f); }
+                if let Some(f) = self.db.query_row("SELECT * FROM filings WHERE cik=?1 AND accession=?2 AND reporting_owner=0 AND transient_symbol='' AND filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER)",params![cik,accession],Self::row).optional()? { rows.push(f); }
             }
         }
         self.with_tickers(rows)
@@ -386,6 +407,67 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transient_rows_are_symbol_only_never_documents_and_promote_on_tracking() {
+        let mut store = Store::memory().unwrap();
+        store
+            .replace_companies(&[
+                Company { cik: 1, ticker: "BRK-A".into(), title: String::new() },
+                Company { cik: 1, ticker: "BRK-B".into(), title: String::new() },
+            ])
+            .unwrap();
+        let mut row = Filing {
+            accession: "once".into(),
+            cik: 1,
+            ticker: "BRK-A".into(),
+            form: "4".into(),
+            filed: 100,
+            primary_doc: "form4.xml".into(),
+            transient_symbol: "BRK-A".into(),
+            ..Default::default()
+        };
+        store.upsert(&[row.clone()]).unwrap();
+        let saved = store.filings().unwrap().remove(0);
+        assert!(saved.matches_symbol("BRK.A US Equity"));
+        assert!(!saved.matches_symbol("BRK.B US Equity"));
+        assert!(!saved.insider_queued);
+        assert!(store.insider_backlog().unwrap().is_empty());
+        assert!(store.chart_filings("BRK.A US Equity", 0, 200).unwrap().is_empty());
+        row.transient_symbol.clear();
+        store.upsert(&[row.clone()]).unwrap();
+        assert!(store.filings().unwrap()[0].transient_symbol.is_empty());
+        assert_eq!(store.insider_backlog().unwrap().len(), 1);
+        row.transient_symbol = "BRK-A".into();
+        store.upsert(&[row]).unwrap(); // a later one-shot cannot demote tracked rows
+        assert!(store.filings().unwrap()[0].transient_symbol.is_empty());
+        assert_eq!(store.prune(100 + 90 * 86400 + 1).unwrap(), 1);
+        assert!(store.filings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn queued_snapshot_respects_the_document_window_and_retry() {
+        let mut store = Store::memory().unwrap();
+        store
+            .upsert(&[Filing {
+                accession: "queued".into(),
+                cik: 1,
+                ticker: "AAPL".into(),
+                form: "4".into(),
+                filed: 100,
+                primary_doc: "form4.xml".into(),
+                ..Default::default()
+            }])
+            .unwrap();
+        store.set("window:1", 101).unwrap();
+        assert!(store.filings().unwrap().is_empty());
+        assert!(store.insider_backlog().unwrap().is_empty());
+        store.set("window:1", 100).unwrap();
+        store.set("f4:retry:queued", 200).unwrap();
+        let row = store.filings().unwrap().remove(0);
+        assert!(row.insider_queued);
+        assert_eq!(row.insider_retry, 200);
+    }
+
     #[test]
     fn chart_queries_use_cik_time_index_and_all_share_classes() {
         let mut store = Store::memory().unwrap();
