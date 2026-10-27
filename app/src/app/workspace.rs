@@ -589,11 +589,14 @@ impl TerminalApp {
 
     /// Load a security: into the focused pane when it follows symbols (and its link group),
     /// else into the focused pane's link group, else into a chart.
+    /// News and Filings never capture a bare ticker: the chart takes it, linked feed panes
+    /// follow, and an unlinked feed pane changes only through `TICKER N` / `TICKER CF`.
     pub(super) fn open_security(&mut self, symbol: &str) {
         let key = tr_data::security(symbol).key();
         if let Some(i) = self.idx(self.focus) {
             let link = self.panes[i].link;
-            if self.panes[i].kind.follows_symbol() {
+            let focused_feed = is_feed(&self.panes[i].kind);
+            if self.panes[i].kind.follows_symbol() && !focused_feed {
                 self.set_pane_symbol(i, &key);
                 match link {
                     Some(l) => self.broadcast(l, &key, Some(self.focus)),
@@ -602,9 +605,17 @@ impl TerminalApp {
                 return;
             }
             if let Some(l) = link
-                && self.panes.iter().any(|p| p.link == Some(l) && p.kind.follows_symbol())
+                && let Some(target) = self.panes.iter().find(|p| {
+                    p.link == Some(l)
+                        && p.kind.follows_symbol()
+                        && (!focused_feed || matches!(p.kind, PaneKind::Chart(_)))
+                })
             {
+                let target = target.id;
                 self.broadcast(l, &key, None);
+                if focused_feed {
+                    self.focus = target;
+                }
                 return;
             }
         }
@@ -617,6 +628,39 @@ impl TerminalApp {
                 None => self.status = key,
             }
         }
+    }
+
+    /// `TICKER N` / `TICKER CF`: point an existing feed pane (visible first) at the symbol
+    /// in Symbol scope, keeping its filters. Returns false when there is none to reuse.
+    pub(super) fn retarget_feed(&mut self, symbol: &str, news: bool) -> bool {
+        let wanted =
+            |k: &PaneKind| if news { matches!(k, PaneKind::News(_)) } else { matches!(k, PaneKind::Filings(_)) };
+        let visible = self.dock.visible();
+        let Some(id) = visible
+            .iter()
+            .copied()
+            .find(|&id| self.idx(id).is_some_and(|i| wanted(&self.panes[i].kind)))
+            .or_else(|| self.panes.iter().find(|p| wanted(&p.kind)).map(|p| p.id))
+        else {
+            return false;
+        };
+        let Some(i) = self.idx(id) else { return false };
+        let key = tr_data::security(symbol).key();
+        self.set_pane_symbol(i, &key);
+        match &mut self.panes[i].kind {
+            PaneKind::News(n) => {
+                if n.filters.scope != tr_data::news_store::Scope::Symbol {
+                    n.filters.scope = tr_data::news_store::Scope::Symbol;
+                    n.fetched = None;
+                    n.query = None;
+                }
+            }
+            PaneKind::Filings(f) => f.scope = crate::filings_view::Scope::Symbol,
+            _ => {}
+        }
+        self.reveal(id);
+        self.focus = id;
+        true
     }
 
     // ---- choosing where things open ------------------------------------------------------
@@ -1704,6 +1748,11 @@ fn tab_menu(ui: &mut Ui, pid: PaneId, link: Option<Link>, cmds: &mut Vec<GroupCm
         cmds.push(GroupCmd::Close(pid));
         ui.close();
     }
+}
+
+/// Feed panes (News, Filings) follow symbols but never capture a bare ticker.
+fn is_feed(kind: &PaneKind) -> bool {
+    matches!(kind, PaneKind::News(_) | PaneKind::Filings(_))
 }
 
 #[cfg(test)]

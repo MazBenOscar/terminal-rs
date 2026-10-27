@@ -1736,10 +1736,15 @@ impl TerminalApp {
             }
             // N2
             Command::SymbolFunction(s, Function::Filings) => {
-                self.open_panel(PaneKind::Filings(crate::filings_view::Settings::new(Some(s.clone()))));
+                if !self.retarget_feed(&s, false) {
+                    self.open_panel(PaneKind::Filings(crate::filings_view::Settings::new(Some(s.clone()))));
+                }
+                self.status = format!("{s}: filings");
             }
             Command::SymbolFunction(s, Function::News) => {
-                self.open_panel(PaneKind::News(Box::new(NewsPane::new(Some(s.clone())))));
+                if !self.retarget_feed(&s, true) {
+                    self.open_panel(PaneKind::News(Box::new(NewsPane::new(Some(s.clone())))));
+                }
                 self.status = format!("{s}: news");
             }
             Command::SymbolFunction(s, Function::OrderBook(depth)) => {
@@ -3523,6 +3528,56 @@ mod tests {
         assert_eq!(take_open_urls(&ctx), vec![form4.to_string()]);
         assert!(take_open_urls(&ctx).is_empty());
         assert!(ctx.output(|o| o.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(_)))));
+    }
+
+    #[test]
+    fn bare_ticker_from_a_feed_pane_goes_to_the_chart() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/feed-ticker-routing");
+        let mut app = TerminalApp::test_workspace(&root);
+        let chart_symbol = |app: &TerminalApp| {
+            app.panes.iter().find_map(|p| match &p.kind {
+                PaneKind::Chart(c) => Some(c.symbol.clone()),
+                _ => None,
+            })
+        };
+        for (open, feed_symbol) in [("AAPL N", "news"), ("AAPL CF", "filings")] {
+            app.execute(open);
+            let feed = app.focus;
+            let symbol_of =
+                |app: &TerminalApp| app.idx(feed).and_then(|i| app.panes[i].kind.symbol().map(str::to_owned));
+            let before = symbol_of(&app);
+            app.execute("JPM");
+            assert_eq!(chart_symbol(&app).as_deref(), Some("JPM US Equity"), "{feed_symbol}: chart takes the ticker");
+            assert_eq!(symbol_of(&app), before, "{feed_symbol}: unlinked feed pane keeps its symbol");
+            assert!(matches!(app.panes[app.idx(app.focus).unwrap()].kind, PaneKind::Chart(_)));
+        }
+    }
+
+    #[test]
+    fn ticker_news_and_filings_retarget_the_existing_pane_and_keep_filters() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/feed-retarget");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.execute("AAPL N");
+        let news = app.focus;
+        let index = app.idx(news).unwrap();
+        if let PaneKind::News(n) = &mut app.panes[index].kind {
+            n.filters.search = "earnings".into();
+            n.filters.scope = tr_data::news_store::Scope::All;
+        }
+        let count = app.panes.len();
+        app.execute("MSFT N");
+        assert_eq!(app.panes.len(), count, "no duplicate News pane");
+        assert_eq!(app.focus, news);
+        let PaneKind::News(n) = &app.panes[app.idx(news).unwrap()].kind else { panic!("news pane replaced") };
+        assert_eq!(n.symbol.as_deref(), Some("MSFT US Equity"));
+        assert_eq!(n.filters.search, "earnings");
+        assert_eq!(n.filters.scope, tr_data::news_store::Scope::Symbol);
+        app.execute("AAPL CF");
+        let filings = app.focus;
+        let count = app.panes.len();
+        app.execute("MSFT CF");
+        assert_eq!((app.panes.len(), app.focus), (count, filings));
+        assert_eq!(app.panes[app.idx(filings).unwrap()].kind.symbol(), Some("MSFT US Equity"));
     }
 
     type SaveLog = std::sync::Arc<std::sync::Mutex<Vec<(SaveWrite, std::thread::ThreadId)>>>;
