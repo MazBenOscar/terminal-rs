@@ -116,6 +116,44 @@ fn age(guard: &Guard, group: &str) {
 }
 
 #[tokio::test]
+async fn conditional_304_is_success_exposes_validators_and_consumes_one_attempt() {
+    let temp = Temp::new();
+    let server = Server::sequence(
+        &[
+            (200, "ETag: \"sec-fixture\"\r\nLast-Modified: Mon, 26 Oct 2026 22:00:00 GMT\r\n", "{}"),
+            (304, "ETag: \"sec-fixture\"\r\n", ""),
+        ],
+        Duration::ZERO,
+    );
+    let guard = server.attach(temp.guard(false));
+    guard.configure(Settings { sec_contact: "research@example.test".into(), ..Settings::default() });
+    let url = "https://data.sec.gov/submissions/CIK0000320193.json";
+    let (body, metadata) = guard.send_with_metadata("sec", reqwest::Client::new().get(url)).await.unwrap();
+    assert_eq!(body, b"{}");
+    assert_eq!(metadata.status, 200);
+    assert_eq!(metadata.etag.as_deref(), Some("\"sec-fixture\""));
+    assert!(metadata.last_modified.is_some());
+    age(&guard, "sec");
+    let (body, metadata) = guard
+        .send_with_metadata(
+            "sec",
+            reqwest::Client::new()
+                .get(url)
+                .header("If-None-Match", metadata.etag.unwrap())
+                .header("If-Modified-Since", metadata.last_modified.unwrap()),
+        )
+        .await
+        .unwrap();
+    assert!(body.is_empty());
+    assert_eq!(metadata.status, 304);
+    assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+    let request = &server.requests.lock().unwrap()[1];
+    assert!(request.to_ascii_lowercase().contains("if-none-match: \"sec-fixture\""));
+    assert!(request.contains("research@example.test"));
+    assert_eq!(guard.status().unwrap().into_iter().find(|s| s.group == "sec").unwrap().requests_today, 2);
+}
+
+#[tokio::test]
 async fn offline_gate_opens_no_socket() {
     let temp = Temp::new();
     let server = Server::new(200, "", "{}");
@@ -712,6 +750,73 @@ async fn different_yahoo_queries_queue_within_thirty_seconds() {
     assert_eq!(server.hits.load(Ordering::SeqCst), 3);
 }
 
+#[tokio::test]
+async fn company_budget_ceiling_is_atomic_across_instances_and_leaves_feeds_running() {
+    let temp = Temp::new();
+    let server = Server::new(200, "", "{}");
+    let one = server.attach(temp.guard(false));
+    let two = server.attach(temp.guard(false));
+    for guard in [&one, &two] {
+        guard.configure(Settings { sec_contact: "research@example.test".into(), ..Settings::default() });
+        fast_redirects(guard);
+    }
+    one.db().unwrap().execute("INSERT INTO requests VALUES('sec',?1,1199)", [Utc::now().timestamp() / 86400]).unwrap();
+    let (a, b) = tokio::join!(
+        one.send_with_metadata_budget(
+            "sec",
+            reqwest::Client::new().get("https://data.sec.gov/submissions/CIK1.json"),
+            1200
+        ),
+        two.send_with_metadata_budget(
+            "sec",
+            reqwest::Client::new().get("https://data.sec.gov/submissions/CIK2.json"),
+            1200
+        )
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    assert_eq!(a.err().or_else(|| b.err()), Some(Refused::Budget));
+    assert_eq!(one.status().unwrap()[1].requests_today, 1200);
+    one.send("sec", reqwest::Client::new().get("https://www.sec.gov/cgi-bin/browse-edgar?output=atom")).await.unwrap();
+    assert_eq!(two.status().unwrap()[1].requests_today, 1201);
+    assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+    one.db().unwrap().execute("UPDATE requests SET count=1500 WHERE \"group\"='sec'", []).unwrap();
+    assert_eq!(two.send("sec", reqwest::Client::new().get("https://www.sec.gov/feed")).await, Err(Refused::Budget));
+    assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn slots_are_atomic_shared_expiring_and_fail_closed() {
+    let temp = Temp::new();
+    let one = Arc::new(temp.guard(false));
+    let two = Arc::new(temp.guard(false));
+    for (key, seconds) in
+        [("sec:feed:8-K", 600), ("sec:feed:4", 600), ("sec:map", 86400), ("sec:sweep:42", 86400), ("sec:sub:42", 600)]
+    {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let spawn = |guard: Arc<Guard>| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                guard.claim_slot(key, Duration::from_secs(seconds)).unwrap()
+            })
+        };
+        let (a, b) = (spawn(one.clone()), spawn(two.clone()));
+        assert_eq!(u8::from(a.join().unwrap()) + u8::from(b.join().unwrap()), 1);
+        assert!(!one.claim_slot(key, Duration::ZERO).unwrap());
+        one.db().unwrap().execute("UPDATE slots SET at=0,until=0 WHERE key=?1", [key]).unwrap();
+        assert!(two.claim_slot(key, Duration::from_secs(seconds)).unwrap());
+    }
+    assert_eq!(one.increment_counter("sec:failure:sub:42").unwrap(), 1);
+    assert_eq!(two.increment_counter("sec:failure:sub:42").unwrap(), 2);
+    assert_eq!(temp.guard(false).increment_counter("sec:failure:sub:42").unwrap(), 3);
+    two.clear_counter("sec:failure:sub:42").unwrap();
+    assert_eq!(one.increment_counter("sec:failure:sub:42").unwrap(), 1);
+    one.defer_slot("sec:sub:42", Duration::from_secs(21600)).unwrap();
+    assert!(!two.claim_slot("sec:sub:42", Duration::from_secs(600)).unwrap());
+    one.db().unwrap().execute("DROP TABLE slots", []).unwrap();
+    assert_eq!(two.claim_slot("sec:map", Duration::ZERO), Err(Refused::Ledger));
+}
+
 fn fast_redirects(guard: &Guard) {
     for policy in guard.policies.write().unwrap().iter_mut() {
         policy.min_interval = Duration::ZERO;
@@ -759,4 +864,26 @@ fn past_and_long_retry_after_respect_floor_and_cap() {
         let Refused::Paused { until } = guard.pause("finnhub", "fixture", Some(retry)).unwrap() else { panic!() };
         assert!((before + seconds..=Utc::now().timestamp() + seconds).contains(&until));
     }
+}
+
+#[tokio::test]
+async fn review_redirected_response_metadata_keyed_by_requested_url() {
+    let temp = Temp::new();
+    let server = Server::sequence(
+        &[(301, "Location: https://www.sec.gov/files/moved.json\r\n", ""), (200, "ETag: \"moved\"\r\n", "{}")],
+        Duration::ZERO,
+    );
+    let guard = server.attach(temp.guard(false));
+    guard.configure(Settings { sec_contact: "research@example.test".into(), ..Settings::default() });
+    fast_redirects(&guard);
+    let url = "https://www.sec.gov/files/company_tickers.json";
+    let (first, second) = tokio::join!(
+        guard.send_with_metadata("sec", reqwest::Client::new().get(url)),
+        guard.send_with_metadata("sec", reqwest::Client::new().get(url))
+    );
+    let (body, metadata) = first.unwrap();
+    assert_eq!(body, b"{}");
+    assert_eq!(second.unwrap().1.etag, metadata.etag);
+    assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+    assert_eq!(metadata.etag.as_deref(), Some("\"moved\""));
 }

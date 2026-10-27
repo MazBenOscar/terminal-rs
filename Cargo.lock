@@ -4167,6 +4167,7 @@ dependencies = [
  "tr-congress",
  "tr-core",
  "tr-data",
+ "tr-edgar",
  "tr-macos",
  "tr-net",
  "tracing",
@@ -4610,6 +4611,21 @@ dependencies = [
  "tr-core",
  "tr-net",
  "tracing",
+]
+
+[[package]]
+name = "tr-edgar"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "feed-rs",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tr-net",
 ]
 
 [[package]]

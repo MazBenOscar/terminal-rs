@@ -129,6 +129,11 @@ impl TerminalApp {
                     self.search_pending = Some((query.clone(), Instant::now()));
                 }
             }
+            // N2
+            PaneKind::Filings(settings) => {
+                let watched: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
+                crate::filings_view::show(ui, settings, &self.edgar, &watched);
+            }
             PaneKind::News(n) => {
                 let offline = self.provider.eq_ignore_ascii_case("sample");
                 if let Some(refresh) = news(ui, n, offline) {

@@ -67,6 +67,8 @@ pub enum EventKind {
     Earnings,
     Dividend,
     Split,
+    /// SEC filing metadata from the local EDGAR store (never fetched on chart load).
+    Filing,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChartEvent {

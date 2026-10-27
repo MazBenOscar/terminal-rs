@@ -14,6 +14,7 @@ tr-broker.workspace = true
 tr-congress.workspace = true
 tr-data.workspace = true
 tr-net.workspace = true
+tr-edgar.workspace = true
 reqwest.workspace = true
 tr-chart.workspace = true
 anyhow.workspace = true

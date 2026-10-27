@@ -21,6 +21,26 @@ pub fn imported(path: &std::path::Path, symbol: &str, start: i64, end: i64) -> R
     }
     Ok(events.into_iter().filter(|e| e.symbol == symbol && e.ts >= start && e.ts <= end).collect())
 }
+// N2: pure store-to-chart mapping, no network on chart load.
+pub fn filings(rows: &[tr_edgar::Filing], symbol: &str, start: i64, end: i64) -> Vec<ChartEvent> {
+    if tr_edgar::ticker(symbol).is_none() {
+        return vec![];
+    }
+    rows.iter()
+        .filter_map(|f| {
+            let ts = f.accepted.unwrap_or(f.filed);
+            (f.matches_symbol(symbol) && !f.reporting_owner && f.chart_marker() && ts >= start && ts <= end).then(
+                || ChartEvent {
+                    symbol: symbol.into(),
+                    ts,
+                    kind: EventKind::Filing,
+                    detail: f.detail(),
+                    source: "SEC EDGAR · local store".into(),
+                },
+            )
+        })
+        .collect()
+}
 fn bar_index(bars: &[Bar], tf: tr_core::Timeframe, timestamp: i64) -> Option<usize> {
     let bucket = |ts: i64| if tf.is_intraday() { ts.div_euclid(86_400) } else { tf.bucket_start(ts) };
     let target = bucket(timestamp);
@@ -45,19 +65,23 @@ pub fn paint(
             continue;
         }
         let stack = stacked.entry(index).or_default();
-        let center =
-            pos2(rect.left() + viewport.x_center(index) as f32, rect.bottom() - 12. - (*stack).min(5) as f32 * 19.);
+        let center = pos2(
+            rect.left() + viewport.x_center(index) as f32,
+            rect.bottom() - crate::theme::dp(12.) - (*stack).min(5) as f32 * crate::theme::dp(19.),
+        );
         *stack += 1;
         let (letter, color) = match event.kind {
             EventKind::Earnings => ("E", crate::theme::amber()),
             EventKind::Dividend => ("D", crate::theme::up()),
             EventKind::Split => ("S", crate::theme::cyan()),
+            // N2
+            EventKind::Filing => ("F", crate::theme::accent()),
         };
-        ui.painter().circle_filled(center, 8., crate::theme::card());
-        ui.painter().circle_stroke(center, 8., egui::Stroke::new(1., color));
+        ui.painter().circle_filled(center, crate::theme::dp(8.), crate::theme::card());
+        ui.painter().circle_stroke(center, crate::theme::dp(8.), egui::Stroke::new(1., color));
         ui.painter().text(center, Align2::CENTER_CENTER, letter, crate::theme::mono(10.), color);
         ui.interact(
-            Rect::from_center_size(center, egui::vec2(18., 18.)),
+            Rect::from_center_size(center, egui::vec2(crate::theme::dp(18.), crate::theme::dp(18.))),
             ui.id().with(("corp-event", event.ts, &event.detail)),
             egui::Sense::hover(),
         )
@@ -72,6 +96,33 @@ pub fn paint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // N2
+    #[test]
+    fn filing_events_use_stored_acceptance_items_symbol_and_range() {
+        let rows = vec![
+            tr_edgar::Filing {
+                ticker: "AAPL".into(),
+                form: "8-K".into(),
+                filed: 100,
+                accepted: Some(150),
+                items: "2.02,9.01".into(),
+                ..Default::default()
+            },
+            tr_edgar::Filing { ticker: "AAPL".into(), form: "4".into(), filed: 100, ..Default::default() },
+            tr_edgar::Filing { ticker: "MSFT".into(), form: "10-Q".into(), filed: 100, ..Default::default() },
+        ];
+        let events = filings(&rows, "AAPL US Equity", 140, 200);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ts, 150);
+        assert_eq!(events[0].kind, EventKind::Filing);
+        assert!(events[0].detail.contains("2.02 Results of Operations"));
+        assert!(filings(&rows, "BTCUSD Curncy", 0, 200).is_empty());
+        assert!(filings(&rows, "AAPL US Equity", 0, 149).is_empty());
+        for form in ["8-K/A", "10-Q", "10-K", "10-K/A"] {
+            let row = tr_edgar::Filing { ticker: "AAPL".into(), form: form.into(), filed: 100, ..Default::default() };
+            assert_eq!(filings(&[row], "AAPL US Equity", 0, 200).len(), 1);
+        }
+    }
     #[test]
     fn events_map_to_daily_and_aggregate_buckets_without_inventing_missing_days() {
         let monday = 1_792_368_000; // UTC Monday 2026-10-19

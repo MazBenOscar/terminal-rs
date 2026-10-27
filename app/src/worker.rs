@@ -276,6 +276,11 @@ pub enum AgentRequest {
 }
 
 pub enum Request {
+    // N2
+    EdgarInterest {
+        active: bool,
+        symbols: Vec<String>,
+    },
     DataSources {
         action: crate::app::data_sources::Action,
     },
@@ -571,6 +576,12 @@ pub struct Profile {
 }
 
 pub enum Response {
+    // N2
+    Edgar {
+        rows: Arc<Vec<tr_edgar::Filing>>,
+        status: String,
+        updated: i64,
+    },
     SessionHistory {
         history: SessionHistory,
         bars: Arc<Vec<Bar>>,
@@ -1033,6 +1044,8 @@ impl CompareCache {
 }
 
 struct Shared {
+    // N2
+    edgar_interest: tokio::sync::watch::Sender<(bool, Vec<String>)>,
     provider: Provider,
     /// Shared across scanner panes; opening more panes cannot multiply exchange load.
     scan_slots: tokio::sync::Semaphore,
@@ -1106,7 +1119,11 @@ impl Worker {
             .build()?;
         let (tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<Request>();
         let (out, rx) = mpsc::channel();
+        // N2
+        let (edgar_interest, _edgar_rx) = tokio::sync::watch::channel((false, Vec::new()));
         let shared = Arc::new(Shared {
+            // N2
+            edgar_interest,
             provider,
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
@@ -1146,6 +1163,10 @@ impl Worker {
             }
         });
 
+        // N2: independent timer, no per-frame polling and no repaint unless the snapshot changes.
+        let s = shared.clone();
+        rt.spawn(edgar_loop(s, _edgar_rx));
+
         // Scheduled congressional disclosure refresh.
         let s = shared.clone();
         rt.spawn(async move {
@@ -1171,6 +1192,67 @@ impl Worker {
 
     pub fn send(&self, req: Request) {
         let _ = self.tx.send(req);
+    }
+}
+
+// N2: the task owns the SQLite connection; charts independently read the same WAL store.
+async fn edgar_loop(s: Arc<Shared>, mut interest: tokio::sync::watch::Receiver<(bool, Vec<String>)>) {
+    let store = match tr_edgar::store::Store::open(data_dir().join("edgar.sqlite3")) {
+        Ok(store) => store,
+        Err(_) => {
+            s.send(Response::Edgar {
+                rows: Default::default(),
+                status: "SEC EDGAR · store unavailable".into(),
+                updated: 0,
+            });
+            return;
+        }
+    };
+    let mut scheduler = tr_edgar::scheduler::Scheduler::new(store, tr_edgar::scheduler::Sec);
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut previous = None;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {},
+            changed = interest.changed() => { if changed.is_err() { return; } },
+        }
+        let (active, symbols) = interest.borrow_and_update().clone();
+        if !active || s.ctx.input(|i| i.viewport().minimized == Some(true)) {
+            continue;
+        }
+        let now = chrono::Utc::now().timestamp();
+        // N2: show persisted history immediately, before a potentially slow guarded refresh.
+        if previous.is_none() {
+            let updated = scheduler.store.number("updated").unwrap_or(0);
+            if updated > 0 {
+                scheduler.status = "SEC EDGAR · updated".into();
+            }
+            if let Ok(rows) = scheduler.store.filings() {
+                let snapshot = (rows, scheduler.status.clone(), updated);
+                s.send(Response::Edgar { rows: Arc::new(snapshot.0.clone()), status: snapshot.1.clone(), updated });
+                previous = Some(snapshot);
+            }
+        }
+        tokio::select! {
+            _ = scheduler.tick(now, true, &symbols) => {},
+            changed = interest.changed() => { if changed.is_err() { return; } else { continue; } },
+        }
+        let rows = match scheduler.store.filings() {
+            Ok(rows) => rows,
+            Err(_) => continue,
+        };
+        let status = if scheduler.status.starts_with("SEC EDGAR · updated") {
+            "SEC EDGAR · updated".into()
+        } else {
+            scheduler.status.clone()
+        };
+        let updated = scheduler.store.number("updated").unwrap_or(0);
+        let snapshot = (rows, status, updated);
+        if previous.as_ref() != Some(&snapshot) {
+            s.send(Response::Edgar { rows: Arc::new(snapshot.0.clone()), status: snapshot.1.clone(), updated });
+            previous = Some(snapshot);
+        }
     }
 }
 
@@ -1636,6 +1718,10 @@ async fn handle_agent(s: &Shared, request: AgentRequest) {
 
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
+        // N2
+        Request::EdgarInterest { active, symbols } => {
+            s.edgar_interest.send_replace((active, symbols));
+        }
         Request::Agent(request) => handle_agent(s, request).await,
         Request::SecurityNames(symbols) => {
             use futures::StreamExt;
@@ -2137,6 +2223,26 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 }
                 Err(e) => {
                     notice.push_str(&format!(" · import error: {e}"));
+                }
+            }
+            // N2: only the local store; a chart request can never trigger an SEC fetch.
+            let edgar_path = data_dir().join("edgar.sqlite3");
+            if edgar_path.exists() {
+                // N2: cache one connection per local store; schema work occurs only at first open.
+                static STORES: std::sync::OnceLock<
+                    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, tr_edgar::store::Store>>,
+                > = std::sync::OnceLock::new();
+                let rows = (|| -> anyhow::Result<_> {
+                    let mut stores =
+                        STORES.get_or_init(Default::default).lock().map_err(|_| anyhow::anyhow!("SEC store lock"))?;
+                    if !stores.contains_key(&edgar_path) {
+                        stores.insert(edgar_path.clone(), tr_edgar::store::Store::open(&edgar_path)?);
+                    }
+                    stores[&edgar_path].chart_filings(&symbol, start, end)
+                })();
+                match rows {
+                    Ok(rows) => events.extend(crate::chart_events::filings(&rows, &symbol, start, end)),
+                    Err(_) => notice.push_str(" · SEC EDGAR store unavailable"),
                 }
             }
             events.sort_by_key(|e| e.ts);
@@ -3115,6 +3221,8 @@ mod tests {
         let (out, rx) = mpsc::channel();
         (
             Arc::new(Shared {
+                // N2
+                edgar_interest: tokio::sync::watch::channel((false, Vec::new())).0,
                 provider,
                 scan_slots: tokio::sync::Semaphore::new(4),
                 study_histories: Default::default(),
@@ -4244,7 +4352,11 @@ mod tests {
     #[test]
     fn automatic_refresh_reports_a_changed_route_instead_of_staying_loading() {
         let (out, rx) = mpsc::channel();
+        // N2
+        let (edgar_interest, _edgar_rx) = tokio::sync::watch::channel((false, Vec::new()));
         let shared = Arc::new(Shared {
+            // N2
+            edgar_interest,
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)),
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
@@ -4389,6 +4501,8 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let (out, rx) = mpsc::channel();
         let s = Arc::new(Shared {
+            // N2
+            edgar_interest: tokio::sync::watch::channel((false, Vec::new())).0,
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 20)),
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
@@ -4470,6 +4584,8 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let (out, _rx) = mpsc::channel();
         let s = Shared {
+            // N2
+            edgar_interest: tokio::sync::watch::channel((false, Vec::new())).0,
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 400)),
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
@@ -4546,6 +4662,8 @@ mod tests {
         });
         let (out, _rx) = mpsc::channel();
         let s = Shared {
+            // N2
+            edgar_interest: tokio::sync::watch::channel((false, Vec::new())).0,
             provider: fixture.clone(),
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
@@ -4629,6 +4747,8 @@ mod tests {
     fn series_generations_only_move_forward() {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
+            // N2
+            edgar_interest: tokio::sync::watch::channel((false, Vec::new())).0,
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),

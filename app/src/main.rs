@@ -16,6 +16,7 @@ mod chart_context;
 mod chart_controls;
 mod chart_data;
 mod chart_events;
+// N2
 mod chart_export;
 mod chart_fill;
 mod chart_legend;
@@ -30,6 +31,7 @@ mod dock;
 pub mod drawing_history;
 mod drawing_paint;
 pub mod edit_log;
+mod filings_view;
 mod layout;
 mod layouts;
 mod markets_view;

@@ -262,6 +262,8 @@ pub enum Function {
     Link(Option<crate::layouts::Link>),
     /// Headlines (for a security when used after one).
     News,
+    // N2
+    Filings,
     /// Order book depth (levels).
     OrderBook(Option<usize>),
     /// Option chain monitor (Bloomberg OMON).
@@ -459,6 +461,8 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             Some(c) => Some(crate::layouts::Link::ALL.into_iter().find(|l| l.label().eq_ignore_ascii_case(c))?),
         }),
         "N" | "CN" | "NEWS" | "TOP" => Function::News,
+        // N2
+        "CF" | "FILINGS" => Function::Filings,
         "OB" | "BOOK" | "DEPTH" | "DOM" => Function::OrderBook(num(rest.first())),
         "OMON" | "OMST" | "OPT" | "OPTIONS" | "CHAIN" => Function::Options,
         "SIDEBAR" | "SB" => Function::Sidebar(words().join(" ")),
@@ -628,6 +632,8 @@ fn describe(f: &Function) -> String {
         Function::Link(Some(l)) => format!("Link focused pane to the {} group", l.label()),
         Function::Link(None) => "Unlink focused pane".into(),
         Function::News => "News headlines".into(),
+        // N2
+        Function::Filings => "SEC EDGAR filings (watchlist only)".into(),
         Function::OrderBook(_) => "Order book (depth)".into(),
         Function::Options => "Option chain: calls and puts by strike, IV and greeks".into(),
         Function::Sidebar(s) if s.is_empty() => "Toggle the sidebar".into(),
