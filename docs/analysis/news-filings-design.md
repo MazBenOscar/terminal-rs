@@ -109,3 +109,8 @@ Warnings use `amber` text only when the user can act; otherwise `muted`.
 ## Out of scope here
 
 Visual polish of spacing, density variants and light themes (the polish pass), desktop notifications (N4), sentiment.
+
+## Polish backlog (2026-10-27, from in-app testing)
+
+- **Filings "Load once" for untracked symbols.** Beside "Add to watchlist" in the not-tracked empty state, a "Load once" button makes one guarded submissions request for that company and shows its last 30 days without tracking it. No later refreshes and no Form 4 document reads (those stay watchlist-only). Machine-wide at most once per CIK per 24 h (`claim_slot("sec:once:<cik>", 24 h)`), counted under the 80% reserve; refusals show in the status line.
+- **News header shows a symbol in Market scope** ("Market NVDA"): the effective-symbol label should appear only in Symbol scope (the list name in Watchlist scope, nothing in Market).
