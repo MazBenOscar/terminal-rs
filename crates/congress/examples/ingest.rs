@@ -17,6 +17,20 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    let minutes = tr_congress::refresh::refresh_minutes(
+        std::env::var("TR_PROVIDER").ok().as_deref(),
+        std::env::var("TR_CONGRESS_REFRESH_MIN").ok().as_deref(),
+    );
+    if minutes == 0 {
+        println!("Congress refresh disabled");
+        return Ok(());
+    }
+    let net = tr_net::shared()?;
+    net.check("house-disclosures")?;
+    if !net.claim_slot("congress:refresh", std::time::Duration::from_secs(minutes * 60))? {
+        println!("Congress refresh slot already claimed; no requests");
+        return Ok(());
+    }
     let path = args.next().unwrap_or_else(|| "congress.sqlite3".into());
     let db = Db::open(&path)?;
     let mut cfg = RefreshConfig::incremental(&db);

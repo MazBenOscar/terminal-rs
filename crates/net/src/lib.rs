@@ -25,6 +25,25 @@ fn disabled_host(url: &reqwest::Url) -> bool {
 }
 const BODY_CAP: usize = 8 * 1024 * 1024;
 
+fn trim_signature_prefix(mut bytes: &[u8]) -> &[u8] {
+    loop {
+        bytes = bytes.trim_ascii_start();
+        match bytes.strip_prefix(b"\xef\xbb\xbf") {
+            Some(rest) => bytes = rest,
+            None => return bytes,
+        }
+    }
+}
+
+fn house_roster_signature(bytes: &[u8]) -> bool {
+    let mut text = String::from_utf8_lossy(bytes);
+    if text.starts_with("<?xml") {
+        let Some((_, rest)) = text.split_once("?>") else { return false };
+        text = std::borrow::Cow::Owned(rest.trim_start().to_owned());
+    }
+    text.strip_prefix("<MemberData").is_some_and(|rest| rest.starts_with(['>', '/', ' ', '\t', '\r', '\n']))
+}
+
 #[derive(Clone, Debug)]
 pub struct HostPolicy {
     pub host: &'static str,
@@ -116,6 +135,8 @@ impl Settings {
             sec: false,
             yahoo_news: false,
             coindesk: false,
+            house_disclosures: false,
+            house_roster: false,
             settings_error: true,
             ..Self::default()
         }
@@ -850,14 +871,19 @@ impl Guard {
                 }
                 body.extend_from_slice(&chunk);
             }
+            // Signatures ignore the whitespace / UTF-8 BOM sometimes prepended by the Clerk.
+            let signature = trim_signature_prefix(&body);
+            let roster_refused =
+                group == "house-roster" && (200..300).contains(&status) && !house_roster_signature(signature);
             let house_download_refused = group == "house-disclosures"
                 && (200..300).contains(&status)
-                && ((original.path().ends_with(".pdf") && !body.starts_with(b"%PDF-"))
+                && ((original.path().ends_with(".pdf") && !signature.starts_with(b"%PDF-"))
                     || (original.path().ends_with(".zip")
                         && ![b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"]
                             .iter()
                             .any(|magic| body.starts_with(*magic))));
-            if (html_response(&content_type, &body) && blocked_body(&body)) || house_download_refused {
+            if (html_response(&content_type, &body) && blocked_body(&body)) || house_download_refused || roster_refused
+            {
                 return Err(self.pause(
                     group,
                     "Access denied / captcha or invalid disclosure download",

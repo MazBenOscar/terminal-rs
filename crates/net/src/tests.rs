@@ -1039,3 +1039,53 @@ async fn review_redirected_response_metadata_keyed_by_requested_url() {
     assert_eq!(server.hits.load(Ordering::SeqCst), 2);
     assert_eq!(metadata.etag.as_deref(), Some("\"moved\""));
 }
+
+#[tokio::test]
+async fn house_signatures_allow_bom_whitespace_and_xml_roster() {
+    for (group, url, body) in [
+        (
+            "house-disclosures",
+            "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/1.pdf",
+            " \r\n\u{feff}\t%PDF-1.7\nfixture",
+        ),
+        (
+            "house-roster",
+            "https://clerk.house.gov/xml/lists/MemberData.xml",
+            "\u{feff} \n<?xml version=\"1.0\"?>\n<MemberData></MemberData>",
+        ),
+        ("house-roster", "https://clerk.house.gov/xml/lists/MemberData.xml", "\n<MemberData />"),
+    ] {
+        let temp = Temp::new();
+        let server = Server::new(200, "", body);
+        let guard = server.attach(temp.guard(false));
+        assert_eq!(guard.send(group, reqwest::Client::new().get(url)).await.unwrap(), body.as_bytes());
+        assert!(guard.status().unwrap().iter().all(|s| s.paused_until.is_none()));
+    }
+}
+
+#[test]
+fn corrupt_settings_disable_both_house_switches() {
+    let settings = Settings::corrupt();
+    assert!(!settings.house_disclosures);
+    assert!(!settings.house_roster);
+    assert!(!settings.enabled("house-disclosures"));
+    assert!(!settings.enabled("house-roster"));
+}
+
+// ---- N0b adversarial review (enabled). ----
+
+#[tokio::test]
+async fn review_roster_non_xml_200_pauses_group() {
+    let temp = Temp::new();
+    let server = Server::new(
+        200,
+        "Content-Type: text/html\r\n",
+        "<html><body>The requested URL was rejected. Please consult with your administrator.</body></html>",
+    );
+    let guard = server.attach(temp.guard(false));
+    let roster = || reqwest::Client::new().get("https://clerk.house.gov/xml/lists/MemberData.xml");
+    assert!(matches!(guard.send("house-roster", roster()).await, Err(Refused::Paused { .. })));
+    age(&guard, "house-roster");
+    assert!(matches!(guard.send("house-roster", roster()).await, Err(Refused::Paused { .. })));
+    assert_eq!(server.hits.load(Ordering::SeqCst), 1, "a rejected roster must not be requested again");
+}

@@ -280,6 +280,8 @@ pub enum Request {
     EdgarInterest {
         active: bool,
         symbols: Vec<String>,
+        /// Native window visibility, independent of whether a Filings pane is open.
+        window_visible: bool,
     },
     DataSources {
         action: crate::app::data_sources::Action,
@@ -1082,6 +1084,7 @@ struct Shared {
     scan_store: std::sync::Mutex<Option<ScanStore>>,
     db: Mutex<Db>,
     congress_source: Mutex<Option<HttpSource>>,
+    congress_window_visible: std::sync::atomic::AtomicBool,
     out: mpsc::Sender<Response>,
     ctx: egui::Context,
 }
@@ -1160,6 +1163,7 @@ impl Worker {
             scan_store: std::sync::Mutex::new(scan_store),
             db: Mutex::new(db),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx,
         });
@@ -1192,7 +1196,7 @@ impl Worker {
         rt.spawn(async move {
             while let Some(req) = req_rx.recv().await {
                 // N1a: serialize subscription changes so an older snapshot cannot resurrect a hidden pane.
-                if matches!(&req, Request::NewsVisible { .. }) {
+                if matches!(&req, Request::NewsVisible { .. } | Request::EdgarInterest { .. }) {
                     handle(&s, req).await;
                     continue;
                 }
@@ -1300,7 +1304,29 @@ async fn edgar_loop(s: Arc<Shared>, mut interest: tokio::sync::watch::Receiver<(
     }
 }
 
+fn congress_refresh_allowed(manual: bool, visible: bool, minimised: bool) -> bool {
+    manual || (visible && !minimised)
+}
+
+#[cfg(test)]
+#[test]
+fn congress_visibility_gates_automatic_but_never_manual_refresh() {
+    for visible in [false, true] {
+        for minimised in [false, true] {
+            assert_eq!(congress_refresh_allowed(false, visible, minimised), visible && !minimised);
+            assert!(congress_refresh_allowed(true, visible, minimised));
+        }
+    }
+}
+
 async fn congress_refresh(s: &Shared, manual: bool) {
+    if !congress_refresh_allowed(
+        manual,
+        s.congress_window_visible.load(std::sync::atomic::Ordering::Relaxed),
+        s.ctx.input(|i| i.viewport().minimized == Some(true)),
+    ) {
+        return;
+    }
     let minutes = congress_refresh_minutes();
     if minutes == 0 {
         return s.send(Response::Status("Congress refresh disabled".into()));
@@ -1779,7 +1805,8 @@ async fn handle_agent(s: &Shared, request: AgentRequest) {
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
         // N2
-        Request::EdgarInterest { active, symbols } => {
+        Request::EdgarInterest { active, symbols, window_visible } => {
+            s.congress_window_visible.store(window_visible, std::sync::atomic::Ordering::Relaxed);
             s.edgar_interest.send_replace((active, symbols));
         }
         Request::Agent(request) => handle_agent(s, request).await,
@@ -3315,6 +3342,7 @@ mod tests {
                 scan_store: std::sync::Mutex::new(None),
                 db: Mutex::new(Db::open_in_memory().unwrap()),
                 congress_source: Mutex::new(None),
+                congress_window_visible: std::sync::atomic::AtomicBool::new(false),
                 out,
                 ctx: egui::Context::default(),
             }),
@@ -4452,6 +4480,7 @@ mod tests {
             scan_store: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx: egui::Context::default(),
         });
@@ -4601,6 +4630,7 @@ mod tests {
             scan_store: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx: egui::Context::default(),
         });
@@ -4687,6 +4717,7 @@ mod tests {
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx: egui::Context::default(),
         };
@@ -4768,6 +4799,7 @@ mod tests {
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx: egui::Context::default(),
         };
@@ -4856,6 +4888,7 @@ mod tests {
             scan_store: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx: egui::Context::default(),
         };

@@ -92,7 +92,22 @@ pub fn paused_sources(db: &Db) -> Result<Vec<String>> {
 /// Shared by the scheduler and the app's freshness display. An explicit zero disables.
 pub fn refresh_minutes(provider: Option<&str>, configured: Option<&str>) -> u64 {
     let sample = provider.map(str::trim).filter(|v| !v.is_empty()).is_some_and(|v| v.eq_ignore_ascii_case("sample"));
-    configured.and_then(|v| v.parse().ok()).unwrap_or(if sample { 0 } else { 30 })
+    let default = if sample { 0 } else { 30 };
+    let Some(raw) = configured.map(str::trim).filter(|v| !v.is_empty()) else { return default };
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return default;
+    }
+    // Checked decimal parsing: even an overflowing numeric value is capped, never wrapped.
+    let minutes =
+        raw.bytes().try_fold(0_u64, |n, b| n.checked_mul(10)?.checked_add(u64::from(b - b'0'))).unwrap_or(u64::MAX);
+    if minutes == 0 {
+        return 0;
+    }
+    let bounded = minutes.clamp(15, 7 * 24 * 60);
+    if bounded != minutes {
+        warn!("TR_CONGRESS_REFRESH_MIN={raw} clamped to {bounded} minutes");
+    }
+    bounded
 }
 
 /// Where filings come from. [`HttpSource`] talks only to guarded House hosts;
@@ -118,7 +133,7 @@ pub trait Source: Sync {
 
 #[derive(Debug, Clone)]
 pub struct RefreshConfig {
-    /// Index years for fixture imports. Live HTTP always uses only the current year.
+    /// Index years for fixture imports. Live HTTP uses current year plus a once-per-year rollover check.
     pub house_years: Vec<i32>,
     /// House discovery lower bound, independent of the Senate window.
     pub house_since: Option<NaiveDate>,
@@ -204,6 +219,7 @@ impl RefreshReport {
             if !self.parse_errors.is_empty() {
                 parts.push(format!("{} parse errors", self.parse_errors.len()));
             }
+            parts.extend(self.errors.clone());
             parts.extend(self.notes.clone());
             return parts.join(" · ");
         }
@@ -215,7 +231,7 @@ impl RefreshReport {
             self.errors.len() + self.parse_errors.len(),
             self.alerts.len()
         );
-        std::iter::once(counts).chain(self.notes.clone()).collect::<Vec<_>>().join(" · ")
+        std::iter::once(counts).chain(self.errors.clone()).chain(self.notes.clone()).collect::<Vec<_>>().join(" · ")
     }
 }
 
@@ -254,6 +270,8 @@ impl TransportFailures {
 }
 
 struct Parsed {
+    /// Fetch errors are persisted like parse errors, but reported separately.
+    fetch_failed: bool,
     record_paper: bool,
     status: FilingStatus,
     error: Option<String>,
@@ -363,6 +381,19 @@ pub async fn refresh<S: Source>(src: &S, db: &Mutex<Db>, cfg: &RefreshConfig) ->
     Ok(report)
 }
 
+/// Ordinary HTTP / body errors belong to one filing. All other guard failures
+/// fail closed for the run; pauses themselves are imposed by the guard.
+fn source_wide_failure(error: &anyhow::Error) -> bool {
+    if error.is::<SiteRefused>() {
+        return true;
+    }
+    match error.downcast_ref::<tr_net::Refused>() {
+        Some(tr_net::Refused::Http(status)) => matches!(status, 403 | 429 | 503),
+        Some(tr_net::Refused::BodyTooLarge) | None => false,
+        Some(_) => true,
+    }
+}
+
 async fn record_failure(
     db: &Mutex<Db>,
     report: &mut RefreshReport,
@@ -371,12 +402,13 @@ async fn record_failure(
     blocked: &mut Vec<Site>,
 ) -> Result<()> {
     if let Some(refusal) = error.downcast_ref::<tr_net::Refused>() {
-        let text = match refusal {
-            tr_net::Refused::Paused { until } => pause_text(site, *until),
-            _ => format!("{}: {refusal}", site.label()),
-        };
-        report.paused.push(text);
-        blocked.push(site);
+        match refusal {
+            tr_net::Refused::Paused { until } => report.paused.push(pause_text(site, *until)),
+            _ => report.errors.push(format!("{}: {refusal}", site.label())),
+        }
+        if source_wide_failure(&error) {
+            blocked.push(site);
+        }
     } else if let Some(refusal) = error.downcast_ref::<SiteRefused>() {
         if !blocked.contains(&refusal.site) {
             db.lock().await.refuse_source(refusal.site.key(), Utc::now().timestamp(), refusal.retry_after)?;
@@ -413,6 +445,11 @@ async fn store(
     report.chamber_counts[chamber].1 += n;
     match parsed.status {
         FilingStatus::Scanned => report.scanned += 1,
+        FilingStatus::Error if parsed.fetch_failed => report.errors.push(format!(
+            "{}: 1 filing failed ({})",
+            rec.chamber.as_str(),
+            parsed.error.unwrap_or_default()
+        )),
         FilingStatus::Error => report.parse_errors.push(format!("{}: {}", rec.id, parsed.error.unwrap_or_default())),
         FilingStatus::Parsed => {}
     }
@@ -464,18 +501,37 @@ async fn refresh_house<S: Source>(
     let retries = db.lock().await.retry_filing_ids(Chamber::House)?;
     let live = src.guarded_house_only();
     let current_year = Utc::now().year();
-    let years = if live { vec![current_year] } else { cfg.house_years.clone() };
+    let years = if live { vec![current_year, current_year - 1] } else { cfg.house_years.clone() };
+    let rollover_key = format!("house:rollover:{current_year}");
     let baseline_key = format!("house:skipped-initial:{current_year}");
     let skipped = db.lock().await.meta(&baseline_key)?;
     let mut todo: Vec<IndexEntry> = Vec::new();
     for &year in &years {
-        let entries = match failures.observe(Site::House, src.house_index(year).await, report) {
-            Ok(entries) => entries,
-            Err(e) if e.is::<IndexNotPublished>() => {
-                report.notes.push(format!("House {year} index not published yet; skipped"));
-                continue;
+        let rollover = live && year == current_year - 1;
+        let saved = if rollover { db.lock().await.meta(&rollover_key)? } else { None };
+        let entries = if let Some(json) = saved {
+            serde_json::from_str(&json).context("House rollover snapshot")?
+        } else {
+            let mut entries = match failures.observe(Site::House, src.house_index(year).await, report) {
+                Ok(entries) => entries,
+                Err(e) if e.is::<IndexNotPublished>() => {
+                    report.notes.push(format!("House {year} index not published yet; skipped"));
+                    vec![]
+                }
+                Err(e) => return Err(e).with_context(|| format!("house index {year}")),
+            };
+            if rollover {
+                // One guarded prior-year index check per calendar year. Retain only a
+                // bounded recent snapshot so capped work and retries survive restart
+                // without fetching that index again or opening a historical backfill.
+                entries.retain(|e| {
+                    e.is_ptr() && cfg.house_since.is_none_or(|since| e.filing_date.is_some_and(|d| d >= since))
+                });
+                entries.sort_by_key(|e| std::cmp::Reverse(e.filing_date));
+                entries.truncate(50);
+                db.lock().await.set_meta(&rollover_key, &serde_json::to_string(&entries)?)?;
             }
-            Err(e) => return Err(e).with_context(|| format!("house index {year}")),
+            entries
         };
         todo.extend(entries.into_iter().filter(|e| {
             e.is_ptr()
@@ -509,26 +565,39 @@ async fn refresh_house<S: Source>(
     debug!("house: {} new PTRs to fetch", todo.len());
 
     for entry in todo {
+        let mut stop = None;
         let parsed = match failures.observe(Site::House, src.house_pdf(&entry).await, report) {
             Err(e) => {
-                if e.is::<tr_net::Refused>() {
-                    return Err(e);
-                }
                 let id = format!("house:{}", entry.doc_id);
+                let message = format!("{e:#}");
+                let source_wide = source_wide_failure(&e);
                 if retries.contains(&id) {
+                    // Charge before any early return, including guard HTTP / pause errors.
                     db.lock().await.record_failed_retry(&id)?;
+                    report.errors.push(format!("House: 1 filing failed ({message})"));
+                    if source_wide {
+                        return Err(e);
+                    }
+                    continue;
                 }
-                if e.is::<SiteRefused>() {
-                    return Err(e);
+                if source_wide {
+                    stop = Some(e);
                 }
-                // Network errors are not stored, so the filing is retried next run.
-                report.errors.push(format!("house:{} fetch: {e:#}", entry.doc_id));
-                continue;
+                // Persist initial fetch failures too: otherwise they bypass retry budgets.
+                Parsed {
+                    fetch_failed: true,
+                    record_paper: false,
+                    status: FilingStatus::Error,
+                    error: Some(message),
+                    filed: entry.filing_date,
+                    trades: vec![],
+                }
             }
             Ok(bytes) => {
                 let bytes_owned = bytes;
                 match tokio::task::spawn_blocking(move || house::parse_ptr_pdf(&bytes_owned)).await? {
                     Ok(ptr) => Parsed {
+                        fetch_failed: false,
                         record_paper: false,
                         status: FilingStatus::Parsed,
                         error: None,
@@ -536,6 +605,7 @@ async fn refresh_house<S: Source>(
                         trades: ptr.trades,
                     },
                     Err(PdfError::Scanned) => Parsed {
+                        fetch_failed: false,
                         record_paper: true,
                         status: FilingStatus::Scanned,
                         error: None,
@@ -543,6 +613,7 @@ async fn refresh_house<S: Source>(
                         trades: vec![],
                     },
                     Err(e) => Parsed {
+                        fetch_failed: false,
                         record_paper: false,
                         status: FilingStatus::Error,
                         error: Some(e.to_string()),
@@ -586,6 +657,9 @@ async fn refresh_house<S: Source>(
             parsed,
         )
         .await?;
+        if let Some(error) = stop {
+            return Err(error);
+        }
     }
     Ok(capped)
 }
@@ -635,6 +709,7 @@ async fn refresh_senate<S: Source>(
                 continue;
             }
             Ok(None) => Parsed {
+                fetch_failed: false,
                 record_paper: true,
                 status: FilingStatus::Scanned,
                 error: None,
@@ -643,6 +718,7 @@ async fn refresh_senate<S: Source>(
             },
             Ok(Some(html)) => match senate::parse_ptr_html(&html) {
                 Ok(p) => Parsed {
+                    fetch_failed: false,
                     record_paper: false,
                     status: FilingStatus::Parsed,
                     error: None,
@@ -650,6 +726,7 @@ async fn refresh_senate<S: Source>(
                     trades: p.trades,
                 },
                 Err(e) => Parsed {
+                    fetch_failed: false,
                     record_paper: false,
                     status: FilingStatus::Error,
                     error: Some(format!("{e:#}")),
@@ -813,8 +890,9 @@ impl Source for HttpSource {
     }
 
     async fn house_index(&self, year: i32) -> Result<Vec<IndexEntry>> {
-        // Even an explicit historical refresh plan cannot backfill live hosts.
-        anyhow::ensure!(year == Utc::now().year(), "Live House discovery is current-year only");
+        // The previous year is allowed only for the bounded annual rollover plan.
+        let current = Utc::now().year();
+        anyhow::ensure!((current - 1..=current).contains(&year), "Live House discovery is current/previous-year only");
         let mut cached = self.index.lock().await;
         let (_, mut request) = self.request(&house::index_zip_url(year))?;
         if let Some((_, _, meta)) = cached.as_ref().filter(|(y, _, _)| *y == year) {
@@ -842,7 +920,11 @@ impl Source for HttpSource {
     }
 
     async fn house_pdf(&self, entry: &IndexEntry) -> Result<Vec<u8>> {
-        anyhow::ensure!(entry.year == Utc::now().year(), "Live House PDFs are current-year only");
+        let current = Utc::now().year();
+        anyhow::ensure!(
+            (current - 1..=current).contains(&entry.year),
+            "Live House PDFs are current/previous-year only"
+        );
         self.get_bytes(&entry.pdf_url()).await
     }
 
@@ -889,6 +971,8 @@ mod tests {
                 while !stopped.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // macOS: accepted sockets inherit the listener's non-blocking mode.
+                            stream.set_nonblocking(false).unwrap();
                             stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                             let mut bytes = Vec::new();
                             let mut buf = [0; 8192];
@@ -960,7 +1044,8 @@ mod tests {
                 cfg.max_new_per_chamber = usize::MAX;
                 let report = refresh(&source, &db, &cfg).await.unwrap();
                 assert!(report.summary().contains(SENATE_PAUSED));
-                assert!(report.errors.is_empty(), "{:?}", report.errors);
+                assert!(report.paused.is_empty(), "only actual cooldowns are pauses: {:?}", report.paused);
+                assert!(!report.errors.is_empty(), "HTTP 404 / Offline / Busy must be reported as errors");
             }
             assert!(source.roster_for(Site::Senate).await.unwrap_err().is::<tr_net::Refused>());
             assert!(source.senate_reports(None).await.unwrap_err().is::<tr_net::Refused>());
@@ -978,7 +1063,11 @@ mod tests {
                 let url = reqwest::Url::parse(url).unwrap();
                 assert!(matches!(url.host_str(), Some("clerk.house.gov" | "disclosures-clerk.house.gov")));
                 if url.path().ends_with("FD.zip") {
-                    assert!(url.path().contains(&Utc::now().year().to_string()));
+                    assert!(
+                        [Utc::now().year(), Utc::now().year() - 1]
+                            .iter()
+                            .any(|year| url.path().contains(&year.to_string()))
+                    );
                 }
             }
             let sent = server.seen.lock().unwrap().clone();
@@ -1098,7 +1187,8 @@ mod tests {
             self.0.roster_for(site).await
         }
         async fn house_index(&self, year: i32) -> Result<Vec<IndexEntry>> {
-            assert_eq!(year, Utc::now().year());
+            let current = Utc::now().year();
+            assert!((current - 1..=current).contains(&year));
             self.0.house_index(year).await
         }
         async fn house_pdf(&self, entry: &IndexEntry) -> Result<Vec<u8>> {
@@ -1777,5 +1867,258 @@ mod tests {
         assert_eq!(refresh_minutes(Some("sample"), Some("0")), 0);
         assert_eq!(refresh_minutes(None, Some("0")), 0);
         assert_eq!(refresh_minutes(None, None), 30);
+    }
+
+    #[test]
+    fn cadence_clamps_checked_values_and_preserves_zero() {
+        for value in ["1", "7", "14", " 14 "] {
+            assert_eq!(refresh_minutes(None, Some(value)), 15);
+        }
+        for value in ["10081", "18446744073709551615", "18446744073709551616", "999999999999999999999999999999999"] {
+            assert_eq!(refresh_minutes(None, Some(value)), 10080);
+        }
+        for value in ["-1", "garbage", ""] {
+            assert_eq!(refresh_minutes(None, Some(value)), 30);
+        }
+        assert_eq!(refresh_minutes(None, Some("0")), 0);
+        assert_eq!(refresh_minutes(None, Some("15")), 15);
+        assert_eq!(refresh_minutes(None, Some("10080")), 10080);
+    }
+
+    struct PdfFailure {
+        plan: HousePlan,
+        error: tr_net::Refused,
+    }
+    impl Source for PdfFailure {
+        fn guarded_house_only(&self) -> bool {
+            true
+        }
+        async fn roster_for(&self, site: Site) -> Result<Roster> {
+            self.plan.roster_for(site).await
+        }
+        async fn house_index(&self, year: i32) -> Result<Vec<IndexEntry>> {
+            self.plan.house_index(year).await
+        }
+        async fn house_pdf(&self, entry: &IndexEntry) -> Result<Vec<u8>> {
+            let bytes = self.plan.house_pdf(entry).await?;
+            if entry.doc_id == "0" {
+                return Err(self.error.clone().into());
+            }
+            Ok(bytes)
+        }
+        async fn senate_reports(&self, _: Option<NaiveDate>) -> Result<Vec<ReportRef>> {
+            panic!("Senate")
+        }
+        async fn senate_ptr(&self, _: &ReportRef) -> Result<String> {
+            panic!("Senate")
+        }
+    }
+
+    #[tokio::test]
+    async fn all_per_pdf_guard_errors_continue_and_initial_failures_are_retry_bounded() {
+        for error in [
+            tr_net::Refused::Http(404),
+            tr_net::Refused::Http(500),
+            tr_net::Refused::Http(502),
+            tr_net::Refused::BodyTooLarge,
+        ] {
+            let mut fake = Fake::new(None);
+            fake.count = 3;
+            let source = PdfFailure { plan: HousePlan(fake), error };
+            let db = Mutex::new(Db::open_in_memory().unwrap());
+            let first = refresh(&source, &db, &config()).await.unwrap();
+            assert_eq!(source.plan.0.requests(Site::House, "pdf"), 3);
+            assert!(first.paused.is_empty());
+            assert_eq!(first.errors.len(), 1);
+            assert!(first.parse_errors.is_empty(), "fetch errors must not be double-counted as parse errors");
+            assert!(first.summary().contains("House: 1 filing failed"));
+            for attempt in 1..=3 {
+                let report = refresh(&source, &db, &config()).await.unwrap();
+                assert!(report.paused.is_empty());
+                let count: i64 = db
+                    .lock()
+                    .await
+                    .conn()
+                    .query_row("SELECT attempt_count FROM filings WHERE id='house:0'", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, attempt);
+                db.lock()
+                    .await
+                    .conn()
+                    .execute("UPDATE filings SET fetched_at=fetched_at-86400 WHERE id='house:0'", [])
+                    .unwrap();
+                refresh(&source, &db, &config()).await.unwrap();
+            }
+            assert_eq!(source.plan.0.requests(Site::House, "pdf"), 5, "two successes plus three failed attempts");
+        }
+    }
+
+    #[tokio::test]
+    async fn source_wide_guard_refusals_stop_but_only_real_pauses_are_paused() {
+        for error in [
+            tr_net::Refused::Budget,
+            tr_net::Refused::Busy,
+            tr_net::Refused::Disabled,
+            tr_net::Refused::Offline,
+            tr_net::Refused::NeedsContact,
+            tr_net::Refused::Ledger,
+            tr_net::Refused::Transport,
+            tr_net::Refused::Paused { until: Utc::now().timestamp() + 3600 },
+            tr_net::Refused::Http(403),
+            tr_net::Refused::Http(429),
+            tr_net::Refused::Http(503),
+        ] {
+            let paused = matches!(error, tr_net::Refused::Paused { .. });
+            let mut fake = Fake::new(None);
+            fake.count = 3;
+            let source = PdfFailure { plan: HousePlan(fake), error };
+            let db = Mutex::new(Db::open_in_memory().unwrap());
+            let report = refresh(&source, &db, &config()).await.unwrap();
+            assert_eq!(source.plan.0.requests(Site::House, "pdf"), 1);
+            assert_eq!(report.paused.len(), usize::from(paused));
+            assert!(!report.errors.is_empty());
+            assert!(db.lock().await.known_filing_ids(Chamber::House).unwrap().contains("house:0"));
+        }
+    }
+
+    #[tokio::test]
+    async fn annual_rollover_fetches_prior_index_once_through_guard_and_survives_reopen() {
+        use std::io::Write;
+        let year = Utc::now().year();
+        let prior = year - 1;
+        let index = |xml: &str| {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            zip.start_file("index.xml", zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(xml.as_bytes()).unwrap();
+            zip.finish().unwrap().into_inner()
+        };
+        let current_zip = index("<FinancialDisclosure></FinancialDisclosure>");
+        let prior_zip = index(&format!(
+            "<FinancialDisclosure><Member><Prefix/><Last>Late</Last><First>Test</First><Suffix/><FilingType>P</FilingType><StateDst>CA01</StateDst><Year>{prior}</Year><FilingDate>12/31/{prior}</FilingDate><DocID>late</DocID></Member></FinancialDisclosure>"
+        ));
+        let server = LocalServer::respond(move |request| {
+            let body = if request.contains("MemberData.xml") {
+                include_bytes!("../tests/fixtures/roster/house_members.xml").to_vec()
+            } else if request.contains("/late.pdf ") {
+                include_bytes!("../tests/fixtures/house/8221321.pdf").to_vec()
+            } else if request.contains(&format!("/{prior}FD.zip ")) {
+                prior_zip.clone()
+            } else {
+                current_zip.clone()
+            };
+            (200, String::new(), body)
+        });
+        let ledger = ledger_file();
+        let data = ledger_file();
+        for _ in 0..2 {
+            let guard = tr_net::Guard::for_fixture(
+                tr_net::Config {
+                    ledger: ledger.0.clone(),
+                    data_dir: Some(ledger.0.with_extension("instance")),
+                    allow_external: true,
+                    max_wait: Duration::from_secs(30),
+                },
+                tr_net::Settings::default(),
+                server.base.clone(),
+            )
+            .unwrap();
+            let source = HttpSource::with_guard(Arc::new(guard));
+            let db = Mutex::new(Db::open(&data.0).unwrap());
+            let mut cfg = config();
+            cfg.house_since = NaiveDate::from_ymd_opt(prior, 12, 25);
+            cfg.house_years = vec![1999, year + 1]; // ignored by live discovery
+            let report = refresh(&source, &db, &cfg).await.unwrap();
+            assert!(report.errors.is_empty(), "{}", report.summary());
+            assert!(db.lock().await.known_filing_ids(Chamber::House).unwrap().contains("house:late"));
+        }
+        let seen = server.seen.lock().unwrap();
+        assert_eq!(seen.iter().filter(|r| r.contains(&format!("/{prior}FD.zip "))).count(), 1);
+        assert_eq!(seen.iter().filter(|r| r.contains(&format!("/{year}FD.zip "))).count(), 2);
+        assert_eq!(seen.iter().filter(|r| r.contains(&format!("/ptr-pdfs/{prior}/late.pdf "))).count(), 1);
+        assert!(seen.iter().all(|r| !r.contains("senate.gov") && !r.contains("1999FD")));
+    }
+
+    // ---- N0b adversarial review (enabled). ----
+
+    /// Fixture House server: current-year index of three PTRs, roster, and PDFs; `fail`
+    /// answers one doc ID's PDF with `status`. The guard paces at its real 3 s spacing.
+    fn review_source(fail: &'static str, status: u16) -> (LocalServer, TestDbFile, HttpSource) {
+        use std::io::Write;
+        let year = Utc::now().year();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(format!("{year}FD.xml"), zip::write::SimpleFileOptions::default()).unwrap();
+        let xml = include_str!("../tests/fixtures/house/2026FD.xml").replace("2026", &year.to_string());
+        zip.write_all(xml.as_bytes()).unwrap();
+        let zip = zip.finish().unwrap().into_inner();
+        let server = LocalServer::respond(move |request| {
+            let pdf = |bytes: &[u8]| (200, String::new(), bytes.to_vec());
+            if request.contains("MemberData.xml") {
+                pdf(include_bytes!("../tests/fixtures/roster/house_members.xml"))
+            } else if request.contains(&format!("/{fail}.pdf ")) {
+                (status, String::new(), b"Not Found".to_vec())
+            } else if request.contains("/8221321.pdf ") {
+                pdf(include_bytes!("../tests/fixtures/house/8221321.pdf"))
+            } else if request.contains("/20033751.pdf ") {
+                pdf(include_bytes!("../tests/fixtures/house/20033751.pdf"))
+            } else if request.contains("/20034201.pdf ") {
+                pdf(include_bytes!("../tests/fixtures/house/20034201.pdf"))
+            } else {
+                (200, String::new(), zip.clone())
+            }
+        });
+        let ledger = ledger_file();
+        let guard = tr_net::Guard::for_fixture(
+            tr_net::Config {
+                ledger: ledger.0.clone(),
+                data_dir: Some(ledger.0.with_extension("instance")),
+                allow_external: true,
+                max_wait: Duration::from_secs(10),
+            },
+            tr_net::Settings::default(),
+            server.base.clone(),
+        )
+        .unwrap();
+        (server, ledger, HttpSource::with_guard(Arc::new(guard)))
+    }
+
+    #[tokio::test]
+    async fn review_pdf_http_error_aborts_whole_house_run() {
+        let (server, _ledger, source) = review_source("20034201", 404);
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let report = refresh(&source, &db, &config()).await.unwrap();
+        let pdfs = server.seen.lock().unwrap().iter().filter(|r| r.contains(".pdf ")).count();
+        assert_eq!(pdfs, 3, "{}", report.summary());
+        assert!(report.new_filings >= 2, "the two available PDFs must still ingest: {}", report.summary());
+    }
+
+    #[tokio::test]
+    async fn review_guard_http_error_skips_retry_budget() {
+        let (server, _ledger, source) = review_source("20034201", 500);
+        let year = Utc::now().year();
+        let mut db = Db::open_in_memory().unwrap();
+        seed_filing(&mut db, Chamber::House, "house:20034201", Utc::now().date_naive());
+        let old = Utc::now().timestamp() - 2 * 86400;
+        db.conn()
+            .execute(
+                "UPDATE filings SET status='error', attempt_count=1, fetched_at=?1, first_attempt_at=?1 WHERE id='house:20034201'",
+                [old],
+            )
+            .unwrap();
+        db.set_meta(&format!("house:skipped-initial:{year}"), r#"["8221321","20033751"]"#).unwrap();
+        let db = Mutex::new(db);
+        let report = refresh(&source, &db, &config()).await.unwrap();
+        assert_eq!(
+            server.seen.lock().unwrap().iter().filter(|r| r.contains("/20034201.pdf ")).count(),
+            1,
+            "{}",
+            report.summary()
+        );
+        let attempts: i64 = db
+            .lock()
+            .await
+            .conn()
+            .query_row("SELECT attempt_count FROM filings WHERE id='house:20034201'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, 2, "a failed retry download must consume the daily/total retry budget");
     }
 }
