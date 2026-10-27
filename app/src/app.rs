@@ -3032,6 +3032,36 @@ fn edgar_window_visible(_frame: &eframe::Frame) -> bool {
     true
 }
 
+/// eframe is built without its `links` feature, so `Context::open_url` is otherwise a no-op.
+/// Hand every requested http(s) URL to the system opener, like the layout folder action.
+fn open_requested_urls(ctx: &egui::Context) {
+    for url in take_open_urls(ctx) {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let _ = std::process::Command::new(opener).arg(&url).spawn();
+    }
+}
+
+/// Remove this frame's open-URL requests, keeping only http(s) links.
+fn take_open_urls(ctx: &egui::Context) -> Vec<String> {
+    let urls = ctx.output_mut(|o| {
+        let mut urls = Vec::new();
+        o.commands.retain(|c| match c {
+            egui::OutputCommand::OpenUrl(open) => {
+                urls.push(open.url.clone());
+                false
+            }
+            _ => true,
+        });
+        urls
+    });
+    urls.into_iter().filter(|u| external_url(u)).collect()
+}
+
+fn external_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://")) && !url.chars().any(char::is_control)
+}
+
 impl eframe::App for TerminalApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.agent_logic(ctx);
@@ -3224,6 +3254,7 @@ impl eframe::App for TerminalApp {
             }
         }
         self.observe_edits(true);
+        open_requested_urls(&ctx);
         self.capture_agent_demo(&ctx, screen);
         let cpu = frame_start.elapsed().as_secs_f64() * 1e3;
         self.perf_cpu_ms = self.perf_cpu_ms * 0.9 + cpu * 0.1;
@@ -3386,6 +3417,20 @@ impl TerminalApp {
 mod tests {
     use super::*;
     use tr_core::Timeframe;
+
+    #[test]
+    fn link_clicks_reach_the_system_opener_http_only() {
+        // eframe's own opener is compiled out; the app must drain OpenUrl itself.
+        let ctx = egui::Context::default();
+        let form4 = "https://www.sec.gov/Archives/edgar/data/320193/x/xslF345X06/form4.xml";
+        ctx.open_url(egui::OpenUrl::new_tab(form4));
+        ctx.open_url(egui::OpenUrl::new_tab("file:///etc/passwd"));
+        ctx.open_url(egui::OpenUrl::new_tab("javascript:alert(1)"));
+        ctx.copy_text("kept".into());
+        assert_eq!(take_open_urls(&ctx), vec![form4.to_string()]);
+        assert!(take_open_urls(&ctx).is_empty());
+        assert!(ctx.output(|o| o.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(_)))));
+    }
 
     type SaveLog = std::sync::Arc<std::sync::Mutex<Vec<(SaveWrite, std::thread::ThreadId)>>>;
 

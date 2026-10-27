@@ -36,6 +36,14 @@ pub struct Filing {
     pub url: String,
 }
 impl Filing {
+    /// The document link, rebuilt from the primary document so rows stored before a URL rule change stay current.
+    pub fn link(&self) -> String {
+        if self.primary_doc.is_empty() {
+            self.url.clone()
+        } else {
+            filing_url(self.cik, &self.accession, &self.primary_doc)
+        }
+    }
     pub fn matches_symbol(&self, symbol: &str) -> bool {
         ticker(symbol).is_some_and(|t| t == self.ticker || self.tickers.contains(&t))
     }
@@ -91,12 +99,14 @@ fn accession(value: &str) -> Option<String> {
 }
 pub fn filing_url(cik: u64, acc: &str, primary: &str) -> String {
     let compact = acc.replace('-', "");
-    let document = if primary.is_empty() || primary.contains(['/', '\\', '?', '#']) || primary == "." || primary == ".."
-    {
-        format!("{acc}-index.html")
-    } else {
-        primary.to_owned()
+    // Relative segments are allowed (Form 3/4/5 render via "xslF345X06/form4.xml"); nothing that escapes.
+    let safe_segment = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     };
+    let document = if !primary.split('/').all(safe_segment) { format!("{acc}-index.html") } else { primary.to_owned() };
     format!("https://www.sec.gov/Archives/edgar/data/{cik}/{compact}/{document}")
 }
 pub fn parse_feed(bytes: &[u8]) -> Result<Vec<Filing>> {

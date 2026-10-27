@@ -124,6 +124,14 @@ fn real_submissions_arrays_metadata_windows_and_urls() {
     );
     assert!(filing_url(320193, "0000320193-26-000001", "").ends_with("0000320193-26-000001-index.html"));
     assert!(filing_url(320193, "0000320193-26-000001", "../bad").ends_with("-index.html"));
+    // Insider forms render through an XSL subdirectory; that relative path is kept.
+    assert_eq!(
+        filing_url(320193, "0001140361-26-040540", "xslF345X06/form4.xml"),
+        "https://www.sec.gov/Archives/edgar/data/320193/000114036126040540/xslF345X06/form4.xml"
+    );
+    for bad in ["a/../b.xml", "/abs.xml", "a//b.xml", "a\\b.xml", "a/b.xml?x=1", "a/b#c", "a/./b"] {
+        assert!(filing_url(320193, "0000320193-26-000001", bad).ends_with("-index.html"), "{bad}");
+    }
 }
 #[test]
 fn eight_k_decode_table_covers_all_requested_items_and_preserves_unknown() {

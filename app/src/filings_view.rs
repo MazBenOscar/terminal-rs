@@ -131,10 +131,13 @@ pub fn show(ui: &mut Ui, settings: &mut Settings, state: &State, watched: &[Stri
                 let response = ui.add(
                     egui::Button::new(RichText::new(&detail).font(theme::mono(11.)).color(theme::text())).frame(false),
                 );
-                if response.clicked() && safe_url(&f.url) {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(&f.url));
+                let link = f.link();
+                if response.clicked() && safe_url(&link) {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(&link));
                 }
-                response.on_hover_text(format!("{detail}\n{}\n{}", f.accession, f.url));
+                response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(format!("{detail}\n{}\n{link}", f.accession));
             });
         }
     });
