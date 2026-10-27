@@ -71,7 +71,7 @@ fn subjects_real_headline_table_and_false_positive_guards() {
         ("Block stock sets record", "", "XYZ"),
         ("Block sets record", "XYZ", "XYZ"),
         ("Gap CEO outlines turnaround", "", "GAP"),
-        ("Ford Motor recalls vehicles", "", "F"),
+        ("Ford Motor recalls vehicles", "", ""), // Ford is WEAK under the new rules.
         ("Intel wins chip subsidy", "", "INTC"),
         ("Alphabet's earnings beat estimates", "", "GOOGL"),
         ("Google unveils AI search features", "", "GOOGL"),
@@ -385,4 +385,575 @@ fn review_tags_cover_sues_and_merge_inflections() {
     ] {
         assert!(topic_tags(headline).contains(&tag.to_string()), "{headline}: {:?}", topic_tags(headline));
     }
+}
+/// Real rows from the SEC company map (edgar.sqlite3 `companies`, rowid order).
+fn review_sec_names() -> NameIndex {
+    let companies = [
+        (1045810, "NVDA", "NVIDIA CORP"),
+        (320193, "AAPL", "Apple Inc."),
+        (789019, "MSFT", "MICROSOFT CORP"),
+        (1652044, "GOOGL", "Alphabet Inc."),
+        (1018724, "AMZN", "AMAZON COM INC"),
+        (19617, "JPM", "JPMORGAN CHASE & CO"),
+        (1932770, "HERE", "Here Group Ltd"),
+        (1564708, "NWSA", "NEWS CORP"),
+        (1845338, "MNDY", "monday.com Ltd."),
+        (1688126, "CRCW", "Crypto Co"),
+        (1530950, "POST", "Post Holdings, Inc."),
+        (1050446, "MSTR", "Strategy Inc"),
+        (2020027, "CLIK", "Click Holdings Ltd."),
+        (1989930, "FGL", "Founder Group Ltd"),
+        (1045942, "TRCK", "Track Group, Inc."),
+        (1800227, "PPLI", "People Inc"),
+        (1872195, "BLSH", "Bullish"),
+        (1786352, "BILL", "BILL Holdings, Inc."),
+        (318833, "TISI", "TEAM INC"),
+        (726854, "CHCO", "CITY HOLDING CO"),
+        (1120193, "NDAQ", "NASDAQ, INC."),
+        (1527762, "CD", "Chaince Digital Holdings Inc."),
+        (1998056, "PC", "Premium Catering (Holdings) Ltd"),
+        (1276187, "ET", "Energy Transfer LP"),
+        (891478, "SAN", "Banco Santander, S.A."),
+        (1577526, "AI", "C3.ai, Inc."),
+        (749251, "IT", "GARTNER INC"),
+        (23795, "CTO", "CTO Realty Growth, Inc."),
+        (3570, "LNG", "Cheniere Energy, Inc."),
+        (1067983, "BRK-A", "BERKSHIRE HATHAWAY INC"),
+        (1067983, "BRK-B", "BERKSHIRE HATHAWAY INC"),
+        (763901, "BPOPO", "POPULAR, INC."),
+        (763901, "BPOP", "POPULAR, INC."),
+        (72971, "WFC", "WELLS FARGO & COMPANY/MN"),
+        (1091667, "CHTR", "CHARTER COMMUNICATIONS, INC. /MO/"),
+        (1973239, "ARM", "ARM HOLDINGS PLC /UK"),
+        (1086600, "ARLP", "ALLIANCE RESOURCE PARTNERS LP"),
+        (1181412, "SPCX", "SPACE EXPLORATION TECHNOLOGIES CORP"),
+        (1162283, "MGHL", "MORGAN GROUP HOLDING CO"),
+        (732717, "T", "AT&T INC."),
+        (1283699, "TMUS", "T-Mobile US, Inc."),
+        (732712, "VZ", "VERIZON COMMUNICATIONS INC"),
+        (858877, "CSCO", "CISCO SYSTEMS, INC."),
+        (1571996, "DELL", "Dell Technologies Inc."),
+        (37996, "F", "FORD MOTOR CO"),
+        (999991, "PAYD", "Paid Inc"),
+    ]
+    .map(|(cik, ticker, title)| (cik, ticker.into(), title.into()));
+    NameIndex::new(&companies)
+}
+fn review_short(subjects: Vec<String>) -> Vec<String> {
+    subjects.iter().map(|s| s.split_whitespace().next().unwrap().to_owned()).collect()
+}
+#[test]
+fn review_common_word_company_names_need_evidence() {
+    let index = review_sec_names();
+    // Real headlines/summaries from the store; ~40 false subjects per 100 items come from this class.
+    for (headline, summary, expected) in [
+        ("Investor Who Called the AI Boom Predicts a Bitcoin Crash", "", "BTCUSD"),
+        ("Here's Why Nvidia Stock Rallied", "", "NVDA"),
+        ("Crypto could outperform AI stocks: Wall Street veteran", "", ""),
+        ("Stocks Inch Higher After Monday's Anthropic Rally", "", ""),
+        ("Bill Gates Says Robots Will Build Houses", "", ""),
+        ("Still Bullish Into Year-End", "", ""),
+        (
+            "Microsoft offers buyouts",
+            "Click here for the latest news. People familiar with the strategy say the team will post updates in the city on Monday.",
+            "MSFT",
+        ),
+        ("GRO Advisory Founder Announces Collective", "", ""),
+        ("Economists track the labor differential", "", ""),
+    ] {
+        let actual = review_short(index.subjects(headline, summary, &["NVDA US Equity".into()]));
+        assert_eq!(actual, expected.split_whitespace().collect::<Vec<_>>(), "{headline} / {summary}");
+    }
+}
+#[test]
+fn review_exchange_names_and_prefixes_are_not_subjects() {
+    let index = review_sec_names();
+    for (headline, summary, expected) in [
+        ("S&P 500, Nasdaq advance as oil eases ahead of Fed decision", "", ""),
+        ("Janus Henderson launch tokenized Nasdaq-100 fund", "", ""),
+        (
+            "Scotiabank maintains Microsoft",
+            "Analyst maintains Microsoft (NASDAQ:MSFT) with a Sector Outperform.",
+            "MSFT",
+        ),
+        (
+            "AstraZeneca offers compelling risk-reward",
+            "AstraZeneca PLC (LSE:AZN, NYSE:AZN) offers ... Phase III results",
+            "AZN",
+        ),
+        ("Apple delivery tracking", "Apple Inc (NASDAQ:AAPL, XETRA:APC) is expected to deliver", "AAPL"),
+    ] {
+        let actual = review_short(index.subjects(headline, summary, &[]));
+        assert_eq!(actual, expected.split_whitespace().collect::<Vec<_>>(), "{headline} / {summary}");
+    }
+}
+#[test]
+fn review_bare_acronyms_are_not_sec_tickers() {
+    let index = review_sec_names();
+    for (headline, summary) in [
+        ("Best CD rates today, Tuesday, October 27, 2026", ""),
+        ("PC Sales Just Crashed 21% as AI Eats the World's Memory Chips", ""),
+        ("Consumer confidence due", "It's released at 10 am ET on the last Tuesday of the month."),
+        ("Mintlify launches enterprise offering", "SAN FRANCISCO, October 27, 2026--Mintlify, the AI-native platform"),
+        ("Musk warns on capex", "Musk warned that the artificial intelligence (AI) infrastructure boom could slow."),
+        ("Former CTO steps up to CEO role", ""),
+        ("Qatar extends force majeure on LNG cargoes", ""),
+        ("Information Technology (IT) Resilience Orchestration Market", ""),
+    ] {
+        assert!(
+            index.subjects(headline, summary, &[]).is_empty(),
+            "{headline} / {summary}: {:?}",
+            index.subjects(headline, summary, &[])
+        );
+    }
+    // Real tickers in ordinary positions still work.
+    // Rule 3 explicitly curates AMD, independently of the SEC ticker list.
+    assert_eq!(review_short(index.subjects("AMD, NVDA and AAPL lead gains", "", &[])), ["AMD", "NVDA", "AAPL"]);
+}
+#[test]
+fn review_state_and_partnership_suffixes_are_stripped() {
+    for (title, normalized) in [
+        ("WELLS FARGO & COMPANY/MN", "wells fargo"),
+        ("CHARTER COMMUNICATIONS, INC. /MO/", "charter communications"),
+        ("Energy Transfer LP", "energy transfer"),
+        ("ALLIANCE RESOURCE PARTNERS LP", "alliance resource partners"),
+    ] {
+        assert_eq!(company_name(title), normalized, "{title}");
+    }
+    let index = review_sec_names();
+    assert_eq!(review_short(index.subjects("Wells Fargo rejects tokenized shares", "", &[])), ["WFC"]);
+    // All three tokens are common words: rule 1 forbids SEC-name-only evidence.
+    assert!(index.subjects("Alliance Resource Partners, L.P. Q3 2026 Earnings Call", "", &[]).is_empty());
+    assert_eq!(review_short(index.subjects("Alliance Resource Partners (ARLP) Q3 Earnings", "", &[])), ["ARLP"]);
+}
+#[test]
+fn review_share_class_prefers_catalogue_and_common_stock() {
+    let index = review_sec_names();
+    assert_eq!(index.subjects("Berkshire Hathaway buys more shares", "", &[]), vec!["BRK.B US Equity"]);
+    assert!(index.subjects("Popular, Inc. reports record earnings", "", &[]).is_empty());
+    // Exercise preferred/common choice with a distinctive SEC name, not a word-like name.
+    let index =
+        NameIndex::new(&[(1, "BPOPO".into(), "Popularez Inc".into()), (1, "BPOP".into(), "Popularez Inc".into())]);
+    assert_eq!(index.subjects("Popularez reports earnings", "", &[]), vec!["BPOP US Equity"]);
+}
+#[test]
+fn review_common_brand_forms_resolve_to_the_right_company() {
+    let index = review_sec_names();
+    assert_eq!(review_short(index.subjects("SpaceX Jumps 10% as AI Trade Returns", "", &[])), ["SPCX"]);
+    assert_eq!(review_short(index.subjects("Rockefeller Adds J.P. Morgan Team in Houston", "", &[])), ["JPM"]);
+    assert!(!index.subjects("Analysts look at T-Mobile's subscriber growth", "", &[]).contains(&"T US Equity".into()));
+    assert_eq!(review_short(index.subjects("AT&T and Verizon slide on results", "", &[])), ["T", "VZ"]);
+    assert_eq!(
+        review_short(index.subjects("Dell, Lenovo, Cisco sign on to AMD blueprint", "", &[])),
+        ["DELL", "CSCO", "AMD"]
+    );
+}
+#[test]
+fn review_people_possessives_are_not_company_evidence() {
+    let index = review_sec_names();
+    assert!(index.subjects("Harrison Ford's new film tops the box office", "", &[]).is_empty());
+}
+#[test]
+fn review_famous_word_names_in_company_lists() {
+    let index = review_sec_names();
+    assert_eq!(
+        review_short(index.subjects(
+            "Nvidia, Apple, Alphabet, Microsoft, and Amazon Now Make Up 30.8% of VOO",
+            "",
+            &["NVDA US Equity".into()]
+        )),
+        ["NVDA", "AAPL", "GOOGL", "MSFT", "AMZN"]
+    );
+}
+#[test]
+fn review_doge_and_ether_need_crypto_context() {
+    let index = review_sec_names();
+    assert!(index.subjects("DOGE cuts federal contracts again", "", &[]).is_empty());
+    assert!(index.subjects("Musk says DOGE savings were overstated", "", &[]).is_empty());
+    assert!(index.subjects("Ad budgets vanish into the ether", "", &[]).is_empty());
+}
+
+#[test]
+fn sec_names_require_distinctive_tokens_and_choose_longest_phrase() {
+    let index = NameIndex::new(&[
+        (1, "LONG".into(), "Xylophorics Networks Inc".into()),
+        (2, "SHORT".into(), "Xylophorics Inc".into()),
+        (3, "WORD".into(), "People News Group Inc".into()),
+        (4, "DIGIT".into(), "12345 Holdings Inc".into()),
+        (5, "AXO".into(), "AXO Inc".into()),
+    ]);
+    assert_eq!(
+        index.subjects("xylophorics networks and xylophorics expand", "", &[]),
+        ["LONG US Equity", "SHORT US Equity"]
+    );
+    assert!(index.subjects("People News Group stock earnings CEO", "", &["WORD US Equity".into()]).is_empty());
+    assert!(index.subjects("12345 and AXO expand", "", &[]).is_empty());
+    assert!(index.subjects("xylophoricsnetwork expands", "", &[]).is_empty());
+    assert_eq!(index.subjects("$WORD and $AXO expand", "", &[]), ["WORD US Equity", "AXO US Equity"]);
+    assert_eq!(default_names().explicit_tickers("BTC and ETH rally", &[], &[]), ["BTCUSD Curncy", "ETHUSD Curncy"]);
+    assert!(default_names().explicit_tickers("DOGE cuts contracts", &[], &[]).is_empty());
+}
+#[test]
+fn watched_symbols_admit_bare_tickers_not_weak_name_evidence() {
+    let index = NameIndex::new(&[(1, "FROG".into(), "JFrog Ltd".into())]);
+    assert!(index.subjects("FROG announces results", "", &[]).is_empty());
+    assert_eq!(
+        review_short(index.subjects_watched("FROG announces results", "", &[], &["FROG US Equity".into()])),
+        ["FROG"]
+    );
+    assert_eq!(review_short(index.subjects("FROG announces results", "", &["FROG US Equity".into()])), ["FROG"]);
+    assert!(index.subjects_watched("Target practice resumes", "", &[], &["TGT US Equity".into()]).is_empty());
+    assert!(index.subjects_watched("AI tools improve", "", &[], &["AI US Equity".into()]).is_empty());
+}
+#[test]
+fn explicit_tickers_parentheses_classes_and_separate_scope() {
+    let index = review_sec_names();
+    for (text, expected) in [
+        ("Visa (V) announces results", "V"),
+        ("Arm (ARM) expands", "ARM"),
+        ("Here (HERE) announces results", "HERE"),
+        ("$HERE announces results", "HERE"),
+        ("NASDAQ:NVDA gains", "NVDA"),
+        ("NYSE:BRK-B gains", "BRK.B"),
+        ("$BRK.B gains", "BRK.B"),
+        ("Berkshire (BRK.B) gains", "BRK.B"),
+        ("Standalone (HERE) gains", "HERE"),
+        ("standalone (HERE) gains", ""),
+        ("HERE gains", ""),
+        ("at t and At T sell products", ""),
+        ("Samsung announces devices", ""),
+        ("$ether rises", ""),
+        ("$ETHER rises", ""),
+        ("Ether price rises", "ETHUSD"),
+        ("ether price rises", ""),
+        ("$DOGE rises", "DOGEUSD"),
+        ("$Ether rises", "ETHUSD"),
+        ("DOGE cuts $10 billion in federal contracts", ""),
+        ("Dogecoin rises", "DOGEUSD"),
+        ("SOL rises", "SOLUSD"),
+        ("Sol shines", ""),
+        ("ADA rises", "ADAUSD"),
+        ("Ada writes", ""),
+    ] {
+        assert_eq!(
+            review_short(index.subjects(text, "", &[])),
+            expected.split_whitespace().collect::<Vec<_>>(),
+            "{text}"
+        );
+    }
+    assert!(index.explicit_tickers("Alphabet joins Nvidia and Bitcoin", &[], &[]).is_empty());
+    assert_eq!(index.explicit_tickers("Nvidia (NVDA) joins Alphabet", &[], &[]), ["NVDA US Equity"]);
+    assert_eq!(review_short(index.subjects("jfrog (FROG) expands", "", &[])), Vec::<String>::new());
+    let index = NameIndex::new(&[(1, "FROG".into(), "JFrog Ltd".into())]);
+    assert_eq!(index.explicit_tickers("jfrog (FROG) expands", &[], &[]), ["FROG US Equity"]);
+}
+#[test]
+fn summaries_decode_html_entities_before_matching() {
+    let index = review_sec_names();
+    assert_eq!(
+        review_short(index.subjects(
+            "Microsoft expands",
+            "AT&amp;T, McDonald&#39;s, Lowe&rsquo;s and J&amp;J grow; &#36;NVDA gains; &quot;Alphabet&quot; reports",
+            &[]
+        )),
+        ["MSFT", "T", "MCD", "LOW", "JNJ", "NVDA", "GOOGL"]
+    );
+    assert_eq!(
+        review_short(index.subjects("", "Here&#39;s why people paid for Monday&#x2019;s news and strategy", &[])),
+        Vec::<String>::new()
+    );
+    assert_eq!(decode_entities("a &unknown; b &amp; c &#x27; &#8217;"), "a &unknown; b & c ' ’");
+}
+#[test]
+fn all_curated_aliases_use_explicit_keys_and_weak_evidence() {
+    let index = NameIndex::new(&[]);
+    for &(aliases, ticker, weak) in FAMOUS {
+        for alias in aliases.split('|') {
+            let headline = if weak { format!("{alias} stock gains") } else { format!("{alias} announces results") };
+            assert_eq!(index.subjects(&headline, "", &[]).first(), Some(&equity_key(ticker)), "{headline}");
+            if weak {
+                // Uppercase abbreviations are themselves explicitly allowed tickers.
+                if alias != ticker {
+                    assert!(index.subjects(&format!("{alias} appears today"), "", &[]).is_empty(), "{alias}");
+                }
+                for headline in [format!("stock {alias}"), format!("price target {alias}"), format!("{alias} Q3")] {
+                    assert!(index.subjects(&headline, "", &[]).contains(&equity_key(ticker)), "{headline}");
+                }
+            }
+        }
+    }
+    assert!(index.subjects("Meta-Platforms discusses meta-analysis", "", &["META US Equity".into()]).is_empty());
+}
+#[test]
+fn sec_share_selection_is_order_independent_and_never_uses_derivatives() {
+    let companies = [
+        (1, "XYLPP", "Xylophorics Inc"),
+        (1, "XYLPO", "Xylophorics Inc"),
+        (1, "XYLPW", "Xylophorics Inc"),
+        (1, "XYLPR", "Xylophorics Inc"),
+        (1, "XYLPU", "Xylophorics Inc"),
+        (1, "XYLPZ", "Xylophorics Inc"),
+        (1, "XYL-PA", "Xylophorics Inc"),
+        (1, "XYLP", "Xylophorics Inc"),
+        (1, "XYL", "Xylophorics Inc"),
+        (2, "PREF-PB", "Preforica Inc"),
+        (3, "BRK-A", "Berkshire Hathaway Inc"),
+        (3, "BRK-B", "Berkshire Hathaway Inc"),
+    ]
+    .map(|(cik, ticker, title)| (cik, ticker.into(), title.into()));
+    for offset in 0..companies.len() {
+        let mut reordered = companies.to_vec();
+        reordered.rotate_left(offset);
+        for rows in [reordered.clone(), reordered.into_iter().rev().collect()] {
+            let index = NameIndex::new(&rows);
+            assert_eq!(index.subjects("Xylophorics expands", "", &[]), ["XYL US Equity"]);
+            assert!(index.subjects("Preforica expands", "", &[]).is_empty());
+            assert_eq!(index.subjects("Berkshire Hathaway expands", "", &[]), ["BRK.B US Equity"]);
+        }
+    }
+}
+
+// Labels checked against the task's rules. The reviewer fixtures supply some real
+// headlines; other cases are specification examples. These are NOT represented as
+// 120 headlines sampled from the inaccessible external audit files.
+const LABELLED_CASES: [(&str, &str); 120] = [
+    ("Here's Why Nvidia Stock Rallied", "NVDA"),
+    ("Crypto could outperform AI stocks: Wall Street veteran", ""),
+    ("Stocks Inch Higher After Monday's Anthropic Rally", ""),
+    ("Bill Gates Says Robots Will Build Houses", ""),
+    ("Still Bullish Into Year-End", ""),
+    ("GRO Advisory Founder Announces Collective", ""),
+    ("Economists track the labor differential", ""),
+    ("S&P 500, Nasdaq advance as oil eases ahead of Fed decision", ""),
+    ("Janus Henderson launch tokenized Nasdaq-100 fund", ""),
+    ("Best CD rates today, Tuesday, October 27, 2026", ""),
+    ("PC Sales Just Crashed 21% as AI Eats the World's Memory Chips", ""),
+    ("Former CTO steps up to CEO role", ""),
+    ("Qatar extends force majeure on LNG cargoes", ""),
+    ("Information Technology (IT) Resilience Orchestration Market", ""),
+    ("Harrison Ford's new film tops the box office", ""),
+    ("DOGE cuts federal contracts again", ""),
+    ("Musk says DOGE savings were overstated", ""),
+    ("Ad budgets vanish into the ether", ""),
+    ("Click here for the latest news", ""),
+    ("People familiar with the strategy will post updates on Monday", ""),
+    ("Workers were paid after the shutdown", ""),
+    ("Apple pie recipes", ""),
+    ("Amazon rainforest faces drought", ""),
+    ("Oracle of Omaha speaks at meeting", ""),
+    ("Meta-analysis shows better outcomes", ""),
+    ("META-analysis shows better outcomes", ""),
+    ("Meta-data describes the sample", ""),
+    ("Nasdaq, NYSE, Dow Jones and Russell climb", ""),
+    ("Nikkei, FTSE, DAX and Hang Seng fall", ""),
+    ("CBOE, LSE, Xetra, TSX, ASX and Euronext announce hours", ""),
+    ("Visa rules for H-1B", ""),
+    ("Target practice resumes", ""),
+    ("Gap between rich and poor", ""),
+    ("Shell game in Washington", ""),
+    ("Block sets record", ""),
+    ("Strategy changes overnight", ""),
+    ("Arm of the government announces findings", ""),
+    ("Lucid dreams inspire artists", ""),
+    ("Snap decisions prove costly", ""),
+    ("Unity among the allies", ""),
+    ("Delta variant remains in circulation", ""),
+    ("Southwest winds bring rain", ""),
+    ("Strive to improve public schools", ""),
+    ("Economists see a V-shaped recovery", ""),
+    ("Fed CEO sees AI GDP CPI SEC FDA EPS growth", ""),
+    ("AP CTO CFO ET PT LNG OLED OCC WTI MA MW HR FT CD PC IPO ETF EV reports", ""),
+    ("PCE PPI FOMC US UK EU UN AM PM Q1 Q2 Q3 Q4 IQ NRC SMR BC NYC SAN LA DC reports", ""),
+    ("apple amazon alphabet meta oracle remain lowercase", ""),
+    ("Alphabet expands its cloud business", "GOOGL"),
+    ("Amazon opens another warehouse", "AMZN"),
+    ("Meta announces new AI tools", "META"),
+    ("Oracle wins cloud contract", "ORCL"),
+    ("Wells Fargo rejects tokenized shares", "WFC"),
+    ("Cisco signs chip agreement", "CSCO"),
+    ("Dell announces new servers", "DELL"),
+    ("Verizon slides on results", "VZ"),
+    ("Visa shares rally as spending grows", "V"),
+    ("Berkshire Hathaway buys more shares", "BRK.B"),
+    ("Rockefeller Adds J.P. Morgan Team in Houston", "JPM"),
+    ("JPMorgan Chase reports results", "JPM"),
+    ("Apple launches new iPhone", "AAPL"),
+    ("Google unveils AI search features", "GOOGL"),
+    ("Facebook changes its platform", "META"),
+    ("Microsoft expands cloud capacity", "MSFT"),
+    ("Nvidia unveils a new AI chip", "NVDA"),
+    ("Intel wins chip subsidy", "INTC"),
+    ("Netflix raises subscription prices", "NFLX"),
+    ("AT&T and Verizon slide on results", "T VZ"),
+    ("T-Mobile adds subscribers", "TMUS"),
+    ("Goldman Sachs raises outlook", "GS"),
+    ("Morgan Stanley expands wealth division", "MS"),
+    ("Bank of America reports results", "BAC"),
+    ("Citigroup and Citi announce restructuring", "C"),
+    ("Salesforce buys software startup", "CRM"),
+    ("Adobe launches creative tools", "ADBE"),
+    ("IBM announces quantum advance", "IBM"),
+    ("Walmart and Costco add stores", "WMT COST"),
+    ("Disney and Boeing announce results", "DIS BA"),
+    ("Nike and Starbucks expand overseas", "NKE SBUX"),
+    ("McDonald's raises prices", "MCD"),
+    ("Coca-Cola and PepsiCo report sales", "KO PEP"),
+    ("Pfizer and Moderna present vaccine data", "PFE MRNA"),
+    ("Eli Lilly and Novo Nordisk report trials", "LLY NVO"),
+    ("ExxonMobil and Chevron add production", "XOM CVX"),
+    ("Palantir signs defense contract", "PLTR"),
+    ("AMD and Broadcom win AI orders", "AMD AVGO"),
+    ("Qualcomm and Micron report earnings", "QCOM MU"),
+    ("Arm shares gain after earnings", "ARM"),
+    ("Supermicro and Super Micro announce servers", "SMCI"),
+    ("Marvell and TSMC partner on chips", "MRVL TSM"),
+    ("Uber and Airbnb expand services", "UBER ABNB"),
+    ("Shopify and Spotify release updates", "SHOP SPOT"),
+    ("PayPal and Coinbase report earnings", "PYPL COIN"),
+    ("Block stock sets record", "XYZ"),
+    ("MicroStrategy announces purchase", "MSTR"),
+    ("Strategy CEO outlines plan", "MSTR"),
+    ("Tesla and Rivian release vehicles", "TSLA RIVN"),
+    ("Ford shares rise on EV demand", "F"),
+    ("Lucid earnings beat forecasts", "LCID"),
+    ("Target investors welcome results", "TGT"),
+    ("Gap rating upgraded", "GAP"),
+    ("Shell price target rises", "SHEL"),
+    ("Snowflake and CrowdStrike expand partnerships", "SNOW CRWD"),
+    ("Datadog and ServiceNow report sales", "DDOG NOW"),
+    ("Reddit and Roblox add users", "RDDT RBLX"),
+    ("Sony and Alibaba release results", "SONY BABA"),
+    ("Toyota and Honda expand factories", "TM HMC"),
+    ("Rocket Lab and IonQ announce contracts", "RKLB IONQ"),
+    ("CoreWeave and Nebius expand data centers", "CRWV NBIS"),
+    ("Investor Who Called the AI Boom Predicts a Bitcoin Crash", "BTCUSD"),
+    ("Bitcoin and Ethereum surge", "BTCUSD ETHUSD"),
+    ("Solana outpaces Bitcoin", "SOLUSD BTCUSD"),
+    ("XRP and Cardano rally", "XRPUSD ADAUSD"),
+    ("DOGE token price climbs", "DOGEUSD"),
+    ("Ether rallies after crypto demand", "ETHUSD"),
+    ("$NVDA outpaces $MSFT", "NVDA MSFT"),
+    ("Apple (AAPL) launches new iPhone", "AAPL"),
+    ("Microsoft (NASDAQ:MSFT) raises outlook", "MSFT"),
+    ("SpaceX Jumps 10% as AI Trade Returns", "SPCX"),
+    ("Dell, Lenovo, Cisco sign on to AMD blueprint", "DELL CSCO AMD"),
+];
+
+#[derive(Default)]
+struct AuditCounts {
+    items: usize,
+    false_subjects: usize,
+    false_first: usize,
+    misses: usize,
+    expected: usize,
+}
+impl AuditCounts {
+    fn add(&mut self, actual: &[String], expected: &[String]) {
+        self.items += 1;
+        self.expected += expected.len();
+        self.false_subjects += actual.iter().filter(|s| !expected.contains(s)).count();
+        self.false_first += usize::from(actual.first().is_some_and(|s| !expected.contains(s)));
+        self.misses += expected.iter().filter(|s| !actual.contains(s)).count();
+    }
+    fn print(&self, label: &str) {
+        let per100 = |n| n as f64 * 100.0 / self.items.max(1) as f64;
+        eprintln!(
+            "{label}: {} items; false subjects/100={:.2}; items with false first subject={} ({:.2}/100); misses/100={:.2}; found={}/{}",
+            self.items,
+            per100(self.false_subjects),
+            self.false_first,
+            per100(self.false_first),
+            per100(self.misses),
+            self.expected - self.misses,
+            self.expected
+        );
+    }
+}
+#[test]
+fn labelled_120_specification_regressions() {
+    let index = review_sec_names();
+    let mut counts = AuditCounts::default();
+    for (headline, expected) in LABELLED_CASES {
+        let expected: Vec<String> = expected.split_whitespace().map(str::to_owned).collect();
+        let actual = review_short(index.subjects(headline, "", &[]));
+        counts.add(&actual, &expected);
+        assert_eq!(actual, expected, "{headline}");
+    }
+    counts.print("SPECIFICATION TABLE (not a real-data audit)");
+    assert_eq!(counts.false_subjects, 0);
+    assert!(counts.misses * 10 <= counts.expected);
+}
+
+/// Manual, read-only audit. TR_NEWS_AUDIT_DIR must contain news.sqlite3,
+/// edgar.sqlite3, and labels.jsonl. Each JSONL row is hand-labelled:
+/// {"headline":"...","expected":["NVDA","BTCUSD"]}
+/// Labels must refer to exact stored headlines; provider associations are NOT labels.
+/// Run: cargo test --offline --locked -p tr-data real_data_subject_audit -- --ignored --nocapture
+#[test]
+#[ignore = "manual read-only audit; requires TR_NEWS_AUDIT_DIR and hand-labelled labels.jsonl"]
+fn real_data_subject_audit() {
+    #[derive(Deserialize)]
+    struct Label {
+        headline: String,
+        expected: Vec<String>,
+    }
+    let dir = std::path::PathBuf::from(std::env::var("TR_NEWS_AUDIT_DIR").expect(
+        "set TR_NEWS_AUDIT_DIR to the directory containing the two read-only audit database copies and labels.jsonl",
+    ));
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    let news =
+        rusqlite::Connection::open_with_flags(dir.join("news.sqlite3"), flags).expect("read-only news audit copy");
+    let edgar =
+        rusqlite::Connection::open_with_flags(dir.join("edgar.sqlite3"), flags).expect("read-only SEC audit copy");
+    let companies = edgar
+        .prepare("SELECT cik,ticker,title FROM companies")
+        .unwrap()
+        .query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let index = NameIndex::new(&companies);
+    let raw = std::fs::read_to_string(dir.join("labels.jsonl"))
+        .expect("hand-labelled labels.jsonl (never infer truth from stored subjects)");
+    let mut counts = AuditCounts::default();
+    let mut labelled = std::collections::HashSet::new();
+    for line in raw.lines().filter(|s| !s.trim().is_empty()) {
+        let label: Label = serde_json::from_str(line).expect("valid JSONL label");
+        assert!(labelled.insert(label.headline.clone()), "duplicate headline label: {}", label.headline);
+        assert_eq!(
+            label.expected.iter().collect::<std::collections::HashSet<_>>().len(),
+            label.expected.len(),
+            "duplicate expected ticker"
+        );
+        let (summary, associated): (String, String) = news
+            .query_row(
+                "SELECT summary,tickers FROM items WHERE headline=?1 ORDER BY published DESC LIMIT 1",
+                [&label.headline],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("label headline exists in real news copy");
+        let associated: Vec<String> = serde_json::from_str(&associated).unwrap();
+        let actual = review_short(index.subjects(&label.headline, &summary, &associated));
+        if actual.iter().any(|s| !label.expected.contains(s)) || label.expected.iter().any(|s| !actual.contains(s)) {
+            eprintln!("AUDIT mismatch: {}\n  expected={:?}; actual={actual:?}", label.headline, label.expected);
+        }
+        counts.add(&actual, &label.expected);
+    }
+    assert!(counts.items >= 120, "audit requires at least 120 hand-labelled stored headlines");
+    counts.print("REAL-DATA AUDIT");
+    assert_eq!(counts.false_subjects, 0, "precision target");
+    assert!(counts.misses * 10 <= counts.expected, "recall target >=90%");
+}
+
+#[test]
+fn fund_titles_and_bank_brands_are_not_company_subjects() {
+    let index = NameIndex::new(&[
+        (1050446, "MSTR".into(), "Strategy Inc".into()),
+        (62234, "MCS".into(), "MARCUS CORP".into()),
+        (886982, "GS".into(), "GOLDMAN SACHS GROUP INC".into()),
+    ]);
+    let short = |s: Vec<String>| s.iter().map(|t| t.split_whitespace().next().unwrap().to_owned()).collect::<Vec<_>>();
+    assert!(short(index.subjects("Mar Vista U.S. Quality Strategy Q3 2026 Portfolio Review", "", &[])).is_empty());
+    assert_eq!(short(index.subjects("Strategy Q3 earnings miss as bitcoin slides", "", &[])), ["MSTR", "BTCUSD"]);
+    assert_eq!(short(index.subjects("Best CD rates today", "Marcus by Goldman Sachs on its 12-month CD", &[])), ["GS"]);
 }

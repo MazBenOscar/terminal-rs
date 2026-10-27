@@ -65,6 +65,7 @@ struct CacheKey {
     watches: Vec<KeywordWatch>,
     symbol: Option<String>,
     symbols: Vec<String>,
+    watched: Vec<String>,
 }
 struct CachedRow {
     story: Cluster,
@@ -74,7 +75,7 @@ struct CachedRow {
     height: f32,
 }
 impl RowCache {
-    fn update(&mut self, n: &mut NewsPane, watches: &[KeywordWatch], now: i64) {
+    fn update(&mut self, n: &mut NewsPane, watches: &[KeywordWatch], watched: &[String], now: i64) {
         let symbols = n.query.as_ref().map(|q| q.symbols.as_slice()).unwrap_or_default();
         if self.key.as_ref().is_some_and(|k| {
             k.revision == n.item_revision
@@ -85,6 +86,7 @@ impl RowCache {
                 && k.watches == watches
                 && k.symbol == n.symbol
                 && k.symbols == symbols
+                && k.watched == watched
         }) {
             return;
         }
@@ -94,6 +96,7 @@ impl RowCache {
                 || k.watches != watches
                 || k.symbol != n.symbol
                 || k.symbols != symbols
+                || k.watched != watched
         }) {
             n.read_in_view.clear();
         }
@@ -129,7 +132,7 @@ impl RowCache {
                 }
                 let height = story.member_ids.iter().filter_map(|id| heights.get(id)).copied().fold(dp(22.0), f32::max);
                 Some(CachedRow {
-                    model: row_model(&story, linked, now),
+                    model: row_model_watched(&story, linked, watched, now),
                     highlights: intelligence::watch_highlights(&story.lead.item.title, watches),
                     story,
                     stripe,
@@ -169,6 +172,7 @@ impl RowCache {
             watches: watches.to_vec(),
             symbol: n.symbol.clone(),
             symbols: symbols.to_vec(),
+            watched: watched.to_vec(),
         });
     }
 }
@@ -295,13 +299,25 @@ pub struct RowModel {
     pub meta: String,
     pub unread: bool,
 }
+#[cfg(test)]
 pub fn row_model(story: &Cluster, linked: Option<&str>, now: i64) -> RowModel {
+    row_model_watched(story, linked, &[], now)
+}
+fn fallback_ticker<'a>(story: &'a Cluster, linked: Option<&str>, watched: &[String]) -> Option<&'a String> {
+    story
+        .tickers
+        .iter()
+        .find(|key| Some(key.as_str()) == linked)
+        .or_else(|| story.tickers.iter().find(|key| watched.contains(key)))
+        .or_else(|| story.tickers.first())
+}
+fn row_model_watched(story: &Cluster, linked: Option<&str>, watched: &[String], now: i64) -> RowModel {
     let (time, full_time) = crate::feed_time::feed_time(story.newest, now, false);
     let ticker_is_subject = !story.subjects.is_empty();
     let tickers: Vec<_> = if ticker_is_subject {
         story.subjects.iter().filter(|t| Some(t.as_str()) != linked).cloned().collect()
     } else {
-        story.tickers.first().cloned().into_iter().collect()
+        fallback_ticker(story, linked, watched).cloned().into_iter().collect()
     };
     let short = |key: &String| key.split_whitespace().next().unwrap_or(key).to_owned();
     let about = if story.subjects.is_empty() {
@@ -409,9 +425,9 @@ fn mark_seen(n: &mut NewsPane, story: &Cluster) {
     }
     n.seen_queue = queued.into_iter().collect();
 }
-fn chart_ticker<'a>(story: &'a Cluster, linked: Option<&str>) -> Option<&'a String> {
+fn chart_ticker<'a>(story: &'a Cluster, linked: Option<&str>, watched: &[String]) -> Option<&'a String> {
     if story.subjects.is_empty() {
-        story.tickers.first()
+        fallback_ticker(story, linked, watched)
     } else {
         story.subjects.iter().find(|ticker| Some(ticker.as_str()) != linked).or_else(|| story.subjects.first())
     }
@@ -590,8 +606,9 @@ pub(super) fn show(
         .or_else(|| lists.get(active_watchlist))
         .map(|l| l.name.clone())
         .unwrap_or_else(|| "Watchlist".into());
+    let watched: Vec<_> = lists.iter().flat_map(|list| list.symbols.iter().cloned()).collect();
     let mut cache = std::mem::take(&mut n.cache);
-    cache.update(n, watches, now);
+    cache.update(n, watches, &watched, now);
     let unread = cache.unread;
     ui.horizontal(|ui| {
         chrome(ui);
@@ -707,7 +724,7 @@ pub(super) fn show(
             }
         });
     });
-    cache.update(n, watches, now);
+    cache.update(n, watches, &watched, now);
     let ids = &cache.ids;
     let rows = &cache.rows;
     let text_focused = ui.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(ui.ctx(), id).is_some());
@@ -755,7 +772,7 @@ pub(super) fn show(
                     Effect::Expand => toggle_expanded(n, story),
                     Effect::Chart => {
                         let linked = n.symbol.as_deref().filter(|_| n.filters.scope == Scope::Symbol);
-                        if let Some(t) = chart_ticker(story, linked) {
+                        if let Some(t) = chart_ticker(story, linked, &watched) {
                             actions.push(Action::OpenChart(t.clone()));
                         }
                     }
@@ -1063,7 +1080,7 @@ pub(super) fn show(
                             mark_seen(n, story);
                         }
                         if ui.small_button("Chart").clicked()
-                            && let Some(t) = chart_ticker(story, linked.as_deref())
+                            && let Some(t) = chart_ticker(story, linked.as_deref(), &watched)
                         {
                             actions.push(Action::OpenChart(t.clone()));
                         }

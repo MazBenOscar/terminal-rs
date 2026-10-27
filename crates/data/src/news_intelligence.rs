@@ -8,27 +8,239 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_ITEMS: usize = 2_000;
 
+/// Bump whenever subject semantics change; stored rows are lazily re-derived.
+pub const MATCHER_VERSION: &str = "n1b-subjects-3";
+
 /// Pure token/phrase index. Construction is worker-only; matching never scans
-/// company names. SEC input order preserves its primary share class per CIK.
+/// company names. Share-class selection is independent of SEC row ordering.
 #[derive(Default)]
 pub struct NameIndex {
     names: std::collections::HashMap<String, Name>,
     lengths: std::collections::HashMap<String, Vec<usize>>,
     tickers: std::collections::HashMap<String, String>,
+    bare: std::collections::HashSet<String>,
+}
+#[derive(Clone, Copy)]
+enum Evidence {
+    Sec,
+    Strong,
+    Weak,
+    Crypto,
 }
 struct Name {
     key: String,
-    guarded: bool,
-    crypto_context: bool,
+    evidence: Evidence,
 }
+fn common_words() -> &'static std::collections::HashSet<&'static str> {
+    static WORDS: std::sync::LazyLock<std::collections::HashSet<&str>> = std::sync::LazyLock::new(|| {
+        include_str!("common_name_words.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with('#'))
+            .collect()
+    });
+    &WORDS
+}
+fn distinctive(name: &str) -> bool {
+    name.split_whitespace()
+        .any(|s| s.chars().count() >= 4 && !s.chars().all(|c| c.is_numeric()) && !common_words().contains(s))
+}
+fn market_word(word: &str) -> bool {
+    matches!(
+        word,
+        "nasdaq"
+            | "nyse"
+            | "dow"
+            | "russell"
+            | "nikkei"
+            | "ftse"
+            | "dax"
+            | "cboe"
+            | "lse"
+            | "xetra"
+            | "tsx"
+            | "asx"
+            | "euronext"
+            | "exchange"
+    )
+}
+fn equity_key(ticker: &str) -> String {
+    let ticker = ticker.replace('-', ".");
+    tr_core::catalog::lookup(&ticker, None).map(|l| l.key()).unwrap_or_else(|| format!("{ticker} US Equity"))
+}
+fn common_ticker(ticker: &str, title: &str) -> bool {
+    let class = ticker.rsplit_once(['-', '.']);
+    let plain = class.map_or(ticker, |(base, _)| base);
+    !title.to_ascii_lowercase().contains("preferred")
+        && plain.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        && class.is_none_or(|(_, suffix)| matches!(suffix, "A" | "B" | "C"))
+        && !(plain.len() == 5 && plain.ends_with(['P', 'O', 'W', 'R', 'U', 'Z']))
+}
+
+/// Explicit app keys, not inferred from ambiguous SEC names. `|` separates aliases.
+/// Weak aliases are never promoted by possessives or title case alone.
+const FAMOUS: &[(&str, &str, bool)] = &[
+    ("Apple", "AAPL", false),
+    ("Amazon|Amazon.com", "AMZN", false),
+    ("Alphabet|Google", "GOOGL", false),
+    ("Meta|Meta Platforms|Facebook", "META", false),
+    ("Oracle", "ORCL", false),
+    ("Netflix", "NFLX", false),
+    ("Microsoft", "MSFT", false),
+    ("Nvidia", "NVDA", false),
+    ("Intel", "INTC", false),
+    ("Cisco|Cisco Systems", "CSCO", false),
+    ("Dell|Dell Technologies", "DELL", false),
+    ("Verizon|Verizon Communications", "VZ", false),
+    ("AT&T", "T", false),
+    ("T-Mobile|T-Mobile US", "TMUS", false),
+    ("Wells Fargo", "WFC", false),
+    ("JPMorgan|J.P. Morgan|JPMorgan Chase", "JPM", false),
+    ("Berkshire|Berkshire Hathaway", "BRK.B", false),
+    ("Goldman Sachs", "GS", false),
+    ("Morgan Stanley", "MS", false),
+    ("Bank of America", "BAC", false),
+    ("Citigroup|Citi", "C", false),
+    ("Salesforce", "CRM", false),
+    ("Adobe", "ADBE", false),
+    ("IBM", "IBM", false),
+    ("Walmart", "WMT", false),
+    ("Costco", "COST", false),
+    ("Disney", "DIS", false),
+    ("Boeing", "BA", false),
+    ("Nike", "NKE", false),
+    ("Starbucks", "SBUX", false),
+    ("McDonald's", "MCD", false),
+    ("Coca-Cola", "KO", false),
+    ("PepsiCo", "PEP", false),
+    ("Pfizer", "PFE", false),
+    ("Moderna", "MRNA", false),
+    ("Eli Lilly|Lilly", "LLY", false),
+    ("Novo Nordisk", "NVO", false),
+    ("Exxon|ExxonMobil|Exxon Mobil", "XOM", false),
+    ("Chevron", "CVX", false),
+    ("Palantir|Palantir Technologies", "PLTR", false),
+    ("AMD|Advanced Micro Devices", "AMD", false),
+    ("Broadcom", "AVGO", false),
+    ("Qualcomm", "QCOM", false),
+    ("Micron", "MU", false),
+    ("Arm|Arm Holdings", "ARM", true),
+    ("Super Micro|Supermicro", "SMCI", false),
+    ("Marvell", "MRVL", false),
+    ("TSMC|Taiwan Semiconductor", "TSM", false),
+    ("Uber", "UBER", false),
+    ("Airbnb", "ABNB", false),
+    ("Shopify", "SHOP", false),
+    ("Spotify", "SPOT", false),
+    ("PayPal", "PYPL", false),
+    ("Block", "XYZ", true),
+    ("Coinbase|Coinbase Global", "COIN", false),
+    ("Robinhood", "HOOD", false),
+    ("MicroStrategy", "MSTR", false),
+    ("Strategy", "MSTR", true),
+    ("Tesla", "TSLA", false),
+    ("Ford|Ford Motor", "F", true),
+    ("GM|General Motors", "GM", false),
+    ("Rivian", "RIVN", false),
+    ("Lucid", "LCID", true),
+    ("Visa", "V", true),
+    ("Mastercard", "MA", false),
+    ("American Express|Amex", "AXP", false),
+    ("Target", "TGT", true),
+    ("Gap", "GAP", true),
+    ("Shell", "SHEL", true),
+    ("BP", "BP", false),
+    ("Home Depot", "HD", false),
+    ("Lowe's", "LOW", false),
+    ("UnitedHealth", "UNH", false),
+    ("CVS", "CVS", false),
+    ("Johnson & Johnson|J&J", "JNJ", false),
+    ("Merck", "MRK", false),
+    ("AbbVie", "ABBV", false),
+    ("Amgen", "AMGN", false),
+    ("Gilead", "GILD", false),
+    ("Snowflake", "SNOW", false),
+    ("CrowdStrike", "CRWD", false),
+    ("Datadog", "DDOG", false),
+    ("ServiceNow", "NOW", false),
+    ("Workday", "WDAY", false),
+    ("Intuit", "INTU", false),
+    ("Zoom", "ZM", false),
+    ("Dropbox", "DBX", false),
+    ("Pinterest", "PINS", false),
+    ("Snap", "SNAP", true),
+    ("Reddit", "RDDT", false),
+    ("Roblox", "RBLX", false),
+    ("Unity", "U", true),
+    ("Sony", "SONY", false),
+    ("Alibaba", "BABA", false),
+    ("Baidu", "BIDU", false),
+    ("JD.com", "JD", false),
+    ("PDD|Temu", "PDD", false),
+    ("Toyota", "TM", false),
+    ("Honda", "HMC", false),
+    ("SoFi", "SOFI", false),
+    ("Nu|Nu Holdings", "NU", true),
+    ("Carvana", "CVNA", false),
+    ("Chewy", "CHWY", false),
+    ("Etsy", "ETSY", false),
+    ("eBay", "EBAY", false),
+    ("Zillow", "Z", false),
+    ("Expedia", "EXPE", false),
+    ("Booking", "BKNG", false),
+    ("Marriott", "MAR", false),
+    ("Hilton", "HLT", false),
+    ("Delta", "DAL", true),
+    ("United Airlines", "UAL", false),
+    ("American Airlines", "AAL", false),
+    ("Southwest", "LUV", true),
+    ("JetBlue", "JBLU", false),
+    ("FedEx", "FDX", false),
+    ("UPS", "UPS", false),
+    ("Caterpillar", "CAT", false),
+    ("Deere|John Deere", "DE", false),
+    ("Lockheed Martin", "LMT", false),
+    ("Northrop|Northrop Grumman", "NOC", false),
+    ("Raytheon|RTX", "RTX", false),
+    ("General Electric|GE", "GE", false),
+    ("GE Vernova", "GEV", false),
+    ("Honeywell", "HON", false),
+    ("3M", "MMM", false),
+    ("Dow Inc", "DOW", false),
+    ("Bloom Energy", "BE", false),
+    ("Constellation Energy", "CEG", false),
+    ("Vistra", "VST", false),
+    ("NextEra|NextEra Energy", "NEE", false),
+    ("Duke Energy", "DUK", false),
+    ("Southern Company", "SO", true),
+    ("Rocket Lab", "RKLB", false),
+    ("IonQ", "IONQ", false),
+    ("Rigetti", "RGTI", false),
+    ("D-Wave", "QBTS", false),
+    ("SoundHound", "SOUN", false),
+    ("BigBear.ai", "BBAI", false),
+    ("CoreWeave", "CRWV", false),
+    ("Nebius", "NBIS", false),
+    ("IREN", "IREN", false),
+    ("Oklo", "OKLO", false),
+    ("NuScale", "SMR", false),
+    ("Cameco", "CCJ", false),
+    ("Centrus", "LEU", false),
+    ("Strive", "ASST", true),
+    ("AstraZeneca", "AZN", false),
+    ("First Solar", "FSLR", false),
+    ("First Majestic Silver", "AG", false),
+];
 /// Removing trailing legal/share-class decorations is deliberately iterative.
 pub fn company_name(title: &str) -> String {
+    // SEC uses slash-delimited state/country decorations, with or without a closing slash.
+    let title = title.split('/').next().unwrap_or(title);
     let mut tokens = words(title);
     loop {
         let n = tokens.len();
         if n >= 2
             && (tokens[n - 2] == "class" && matches!(tokens[n - 1].as_str(), "a" | "b" | "c")
-                || matches!((tokens[n - 2].as_str(), tokens[n - 1].as_str()), ("n", "v") | ("s", "a")))
+                || matches!((tokens[n - 2].as_str(), tokens[n - 1].as_str()), ("n", "v") | ("s", "a") | ("l", "p")))
         {
             tokens.truncate(n - 2);
         } else if tokens.last().is_some_and(|s| {
@@ -52,6 +264,8 @@ pub fn company_name(title: &str) -> String {
                     | "se"
                     | "de"
                     | "com"
+                    | "lp"
+                    | "llc"
             )
         }) {
             tokens.pop();
@@ -60,73 +274,6 @@ pub fn company_name(title: &str) -> String {
         }
     }
     tokens.join(" ")
-}
-fn ambiguous_name(name: &str) -> bool {
-    name.chars().count() <= 3
-        || matches!(
-            name,
-            // Famous word-names are allowed, but only with evidence, not globally.
-            "apple"
-                | "amazon"
-                | "meta"
-                | "oracle"
-                | "visa"
-                | "target"
-                | "ford"
-                | "shell"
-                | "block"
-                | "gap"
-                | "alphabet"
-                | "arm"
-                | "unity"
-                | "toast"
-                | "snap"
-                | "zoom"
-                | "uber"
-                | "bloom"
-                | "box"
-                | "match"
-                | "first"
-                | "best"
-                | "new"
-                | "one"
-                | "on"
-                | "all"
-                | "it"
-                | "now"
-                | "open"
-                | "real"
-                | "life"
-                | "global"
-                | "core"
-                | "power"
-                | "energy"
-                | "future"
-                | "next"
-                | "shift"
-                | "work"
-                | "play"
-                | "way"
-                | "bright"
-                | "root"
-                | "lemonade"
-                | "affirm"
-                | "agora"
-                | "catalyst"
-                | "prime"
-                | "eagle"
-                | "star"
-                | "sun"
-                | "silver"
-                | "gold"
-                | "black"
-                | "white"
-                | "red"
-                | "blue"
-                | "green"
-                | "ever"
-                | "safe"
-        )
 }
 fn text_spans(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     let mut out = vec![];
@@ -143,45 +290,46 @@ fn text_spans(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
 impl NameIndex {
     pub fn new(companies: &[(u64, String, String)]) -> Self {
         let mut index = Self::default();
-        let mut primary = std::collections::HashMap::new();
+        let mut primary: std::collections::HashMap<u64, &str> = std::collections::HashMap::new();
+        let priority = |ticker: &str| {
+            let key = equity_key(ticker);
+            (!tr_core::catalog::CATALOG.iter().any(|l| l.key() == key), ticker.len(), ticker.to_owned())
+        };
         for (cik, ticker, title) in companies {
-            // SEC also lists warrants, units and preferred shares. Prefer plain
-            // US common tickers, preserving first-listed order within that tier.
-            let common = ticker.len() <= 5
-                && !ticker.contains(['-', '^', '/'])
-                && !(ticker.len() == 5 && ticker.ends_with(['W', 'R', 'U']))
-                && !title.to_ascii_lowercase().contains("preferred");
-            let candidate = primary.entry(*cik).or_insert((ticker.as_str(), common));
-            if common && !candidate.1 {
-                *candidate = (ticker, true);
-            }
-        }
-        for (cik, ticker, title) in companies {
-            let key = format!("{} US Equity", primary[cik].0);
-            index.tickers.insert(ticker.to_ascii_uppercase(), format!("{ticker} US Equity"));
-            index.add(&company_name(title), &key, false);
-        }
-        for listing in tr_core::catalog::CATALOG.iter() {
-            if matches!(listing.class, tr_core::security::AssetClass::Equity | tr_core::security::AssetClass::Etf) {
-                index.tickers.entry(listing.ticker.into()).or_insert_with(|| listing.key());
-                if listing.class == tr_core::security::AssetClass::Equity {
-                    index.add(&company_name(listing.name), &listing.key(), false);
+            if common_ticker(ticker, title) {
+                let candidate = primary.entry(*cik).or_insert(ticker);
+                if priority(ticker) < priority(candidate) {
+                    *candidate = ticker;
                 }
             }
         }
-        // Useful aliases not obtainable by stripping legal suffixes.
-        for (alias, full) in [
-            ("meta", "meta platforms"),
-            ("facebook", "meta platforms"),
-            ("google", "alphabet"),
-            ("jpmorgan", "jpmorgan chase"),
-            ("coinbase", "coinbase global"),
-            ("palantir", "palantir technologies"),
-            ("ford", "ford motor"),
-        ] {
-            if let Some(name) = index.names.get(full) {
-                let key = name.key.clone();
-                index.add(alias, &key, false);
+        for (cik, ticker, title) in companies {
+            index.tickers.insert(ticker.replace('-', "."), equity_key(ticker));
+            if let Some(ticker) = primary.get(cik) {
+                let alias = company_name(title);
+                if distinctive(&alias)
+                    && !alias.split_whitespace().any(market_word)
+                    && alias.split_whitespace().next() != Some("samsung")
+                {
+                    index.add(&alias, &equity_key(ticker), Evidence::Sec);
+                }
+                if alias == "space exploration technologies" {
+                    index.add("spacex", &equity_key(ticker), Evidence::Strong);
+                }
+            }
+        }
+        for listing in tr_core::catalog::CATALOG.iter() {
+            if matches!(listing.class, tr_core::security::AssetClass::Equity | tr_core::security::AssetClass::Etf) {
+                index.tickers.insert(listing.ticker.into(), listing.key());
+                index.bare.insert(listing.ticker.into());
+            }
+        }
+        for &(aliases, ticker, weak) in FAMOUS {
+            let key = equity_key(ticker);
+            index.tickers.insert(ticker.into(), key.clone());
+            index.bare.insert(ticker.into());
+            for alias in aliases.split('|') {
+                index.add(&words(alias).join(" "), &key, if weak { Evidence::Weak } else { Evidence::Strong });
             }
         }
         for (aliases, ticker) in [
@@ -194,29 +342,26 @@ impl NameIndex {
         ] {
             let key = tr_core::catalog::lookup(ticker, None).expect("catalog crypto").key();
             index.tickers.insert(ticker.into(), key.clone());
+            index.bare.insert(ticker.into());
             for alias in aliases.split_whitespace() {
-                index.add(alias, &key, alias == "ripple");
-                // Fixed crypto names take precedence over similarly named issuers.
-                index.names.insert(
-                    alias.into(),
-                    Name { key: key.clone(), guarded: ambiguous_name(alias), crypto_context: alias == "ripple" },
-                );
-                if alias.len() <= 4 {
-                    index.tickers.insert(alias.to_ascii_uppercase(), key.clone());
+                index.add(alias, &key, Evidence::Crypto);
+                // Short crypto tickers still count as explicit scope evidence. DOGE is
+                // context-checked in the explicit pass as well as the name pass.
+                if matches!(alias, "btc" | "eth" | "sol" | "xrp" | "ada" | "doge") {
+                    index.bare.insert(alias.to_ascii_uppercase());
+                } else {
+                    index.bare.remove(&alias.to_ascii_uppercase());
                 }
+                index.tickers.insert(alias.to_ascii_uppercase(), key.clone());
             }
         }
         index
     }
-    fn add(&mut self, alias: &str, key: &str, crypto_context: bool) {
+    fn add(&mut self, alias: &str, key: &str, evidence: Evidence) {
         if alias.is_empty() {
             return;
         }
-        self.names.entry(alias.into()).or_insert_with(|| Name {
-            key: key.into(),
-            guarded: ambiguous_name(alias),
-            crypto_context,
-        });
+        self.names.insert(alias.into(), Name { key: key.into(), evidence });
         let mut tokens = alias.split_whitespace();
         let first = tokens.next().expect("nonempty alias");
         let len = 1 + tokens.count();
@@ -227,35 +372,45 @@ impl NameIndex {
         }
     }
     /// Headline appearance order, then summary appearance order, deduplicated.
-    /// Provider/queried associations only disambiguate a name actually present.
+    /// Associations disambiguate a name actually present; watched keys only admit bare tickers.
     pub fn subjects(&self, headline: &str, summary: &str, provider: &[String]) -> Vec<String> {
-        let texts = [headline, summary];
+        self.subjects_watched(headline, summary, provider, &[])
+    }
+    pub fn subjects_watched(
+        &self,
+        headline: &str,
+        summary: &str,
+        provider: &[String],
+        watched: &[String],
+    ) -> Vec<String> {
+        self.match_subjects(headline, summary, provider, watched, true)
+    }
+    fn match_subjects(
+        &self,
+        headline: &str,
+        summary: &str,
+        provider: &[String],
+        watched: &[String],
+        by_name: bool,
+    ) -> Vec<String> {
+        let decoded = [decode_entities(headline), decode_entities(summary)];
+        let texts = decoded.each_ref().map(String::as_str);
         let spans = texts.map(text_spans);
-        let mut explicit = std::collections::HashMap::new();
-        for (part, tokens) in spans.iter().enumerate() {
-            let text = texts[part];
-            let letters: Vec<_> = text.chars().filter(|c| c.is_alphabetic()).collect();
-            let shouting =
-                !letters.is_empty() && letters.iter().filter(|c| c.is_uppercase()).count() * 100 >= letters.len() * 80;
-            for (i, (range, _)) in tokens.iter().enumerate() {
-                let raw = &text[range.clone()];
-                let upper = raw.to_ascii_uppercase();
-                let cash = text[..range.start].ends_with('$');
-                let paren = text[..range.start].ends_with('(') && text[range.end..].starts_with(')');
-                if !cash && tokens[i].1 == "meta" && tokens.get(i + 1).is_some_and(|(_, w)| w == "analysis") {
-                    continue;
-                }
-                if let Some(key) = self.tickers.get(&upper)
-                    && (cash || (raw == upper && (paren || bare_ticker_allowed(raw, shouting))))
-                {
-                    explicit.insert((part, i), key.clone());
-                }
-            }
-        }
+        let extra: std::collections::HashMap<_, _> = provider
+            .iter()
+            .chain(watched)
+            .filter_map(|key| key.split_whitespace().next().map(|ticker| (ticker.to_owned(), key.clone())))
+            .collect();
+        // A cashtag is explicit evidence below. An unrelated dollar amount (e.g.
+        // "DOGE cuts $10 billion") is not crypto context.
         let crypto = spans.iter().flatten().any(|(_, w)| {
             matches!(
                 w.as_str(),
-                "crypto"
+                "price"
+                    | "prices"
+                    | "coin"
+                    | "coins"
+                    | "crypto"
                     | "cryptocurrency"
                     | "bitcoin"
                     | "ethereum"
@@ -265,46 +420,90 @@ impl NameIndex {
                     | "xrp"
                     | "dogecoin"
                     | "solana"
+                    | "etf"
             )
         });
+        let mut explicit = std::collections::HashMap::new();
+        for (part, tokens) in spans.iter().enumerate() {
+            let text = texts[part];
+            let letters: Vec<_> = text.chars().filter(|c| c.is_alphabetic()).collect();
+            let shouting =
+                !letters.is_empty() && letters.iter().filter(|c| c.is_uppercase()).count() * 100 >= letters.len() * 80;
+            for (i, (range, word)) in tokens.iter().enumerate() {
+                if market_word(word) || excluded_form(text, tokens, i, 1) || dateline(text, range.start) {
+                    continue;
+                }
+                let mut end = range.end;
+                let mut len = 1;
+                if let Some((next, _)) = tokens.get(i + 1)
+                    && matches!(&text[end..next.start], "." | "-")
+                    && next.end - next.start == 1
+                {
+                    end = next.end;
+                    len = 2;
+                }
+                let raw = &text[range.start..end];
+                let upper = raw.to_ascii_uppercase().replace('-', ".");
+                let before = &text[..range.start];
+                let cash = before.ends_with('$');
+                let exchange = before.ends_with(':') && i > 0 && market_word(&tokens[i - 1].1);
+                let parenthetical = before.ends_with('(') && text[end..].starts_with(')');
+                let preceding_sec = parenthetical
+                    && (i.saturating_sub(8)..i).any(|start| {
+                        let phrase = tokens[start..i].iter().map(|t| t.1.as_str()).collect::<Vec<_>>().join(" ");
+                        self.names.get(&phrase).is_some_and(|name| {
+                            matches!(name.evidence, Evidence::Sec) && self.tickers.get(&upper) == Some(&name.key)
+                        })
+                    });
+                let paren = parenthetical
+                    && i > 0
+                    && (text[tokens[i - 1].0.clone()].chars().any(char::is_uppercase) || preceding_sec);
+                let bare =
+                    (self.bare.contains(&upper) || extra.contains_key(&upper)) && bare_ticker_allowed(&upper, shouting);
+                let crypto_alias = self.names.get(word).is_some_and(|n| matches!(n.evidence, Evidence::Crypto));
+                if (cash
+                    || exchange
+                    || raw == raw.to_ascii_uppercase()
+                        && (bare || paren && (upper.len() == 1 || bare_ticker_allowed(&upper, false))))
+                    && (!crypto_alias || cash && word != "ether" || crypto_alias_allowed(word, raw, crypto || cash))
+                    && let Some(key) = self.tickers.get(&upper).or_else(|| extra.get(&upper))
+                {
+                    explicit.insert((part, i), (key.clone(), len));
+                }
+            }
+        }
         let mut result = vec![];
         for (part, tokens) in spans.iter().enumerate() {
+            let text = texts[part];
             let mut i = 0;
             while i < tokens.len() {
-                let mut found = explicit.get(&(part, i)).map(|key| (key.as_str(), 1));
-                if let Some(lengths) = self.lengths.get(&tokens[i].1) {
+                let mut found = explicit.get(&(part, i)).map(|(key, len)| (key.as_str(), *len));
+                if by_name
+                    && !dateline(text, tokens[i].0.start)
+                    && let Some(lengths) = self.lengths.get(&tokens[i].1)
+                {
                     for &len in lengths {
-                        if i + len > tokens.len() {
+                        if i + len > tokens.len() || excluded_form(text, tokens, i, len) {
                             continue;
                         }
                         let phrase = tokens[i..i + len].iter().map(|(_, w)| w.as_str()).collect::<Vec<_>>().join(" ");
-                        let Some(name) = self.names.get(&phrase) else {
-                            continue;
-                        };
-                        let next = tokens.get(i + len).map(|(_, w)| w.as_str()).unwrap_or("");
-                        // Neither a hyphenated meta-analysis nor a possessive-like
-                        // word fragment is a company mention.
-                        if phrase == "meta" && next == "analysis" {
+                        let Some(name) = self.names.get(&phrase) else { continue };
+                        let raw = &text[tokens[i].0.start..tokens[i + len - 1].0.end];
+                        // Punctuation-sensitive brand spelling must not collapse to English words.
+                        if phrase == "at t" && raw != "AT&T" {
                             continue;
                         }
-                        let context = matches!(
-                            next,
-                            "stock"
-                                | "shares"
-                                | "inc"
-                                | "incorporated"
-                                | "corp"
-                                | "corporation"
-                                | "ltd"
-                                | "limited"
-                                | "plc"
-                                | "earnings"
-                                | "ceo"
-                        ) || (next == "s"
-                            && texts[part][tokens[i + len - 1].0.end..].starts_with(['\'', '’']))
+                        let capitalised = raw.chars().any(char::is_uppercase);
+                        let context = stock_context(text, tokens, i, len)
                             || provider.contains(&name.key)
-                            || explicit.values().any(|key| key == &name.key);
-                        if (!name.guarded || context) && (!name.crypto_context || crypto) {
+                            || explicit.values().any(|(key, _)| key == &name.key);
+                        let allowed = match name.evidence {
+                            Evidence::Sec => true,
+                            Evidence::Strong => capitalised,
+                            Evidence::Weak => capitalised && context,
+                            Evidence::Crypto => crypto_alias_allowed(&phrase, raw, crypto),
+                        };
+                        if allowed {
                             found = Some((&name.key, len));
                             break;
                         }
@@ -322,6 +521,125 @@ impl NameIndex {
         }
         result
     }
+    /// Scope membership includes explicit symbols, never inferred company-name subjects.
+    pub fn explicit_tickers(&self, text: &str, associated: &[String], watched: &[String]) -> Vec<String> {
+        let mut result = associated.to_vec();
+        result.extend(self.match_subjects(text, "", associated, watched, false));
+        result.sort();
+        result.dedup();
+        result
+    }
+}
+
+type TextSpan = (std::ops::Range<usize>, String);
+fn stock_context(text: &str, tokens: &[TextSpan], i: usize, len: usize) -> bool {
+    let quarter = |word: &str| matches!(word, "q1" | "q2" | "q3" | "q4");
+    let context = |word: &str| {
+        matches!(
+            word,
+            "stock"
+                | "shares"
+                | "inc"
+                | "incorporated"
+                | "corp"
+                | "corporation"
+                | "earnings"
+                | "ceo"
+                | "investors"
+                | "rating"
+                | "upgrade"
+                | "upgrades"
+                | "downgrade"
+                | "downgrades"
+        )
+    };
+    let before = i.checked_sub(1).map(|j| tokens[j].1.as_str()).unwrap_or("");
+    let after = tokens.get(i + len).map(|t| t.1.as_str()).unwrap_or("");
+    // "Quality Strategy Q3 2026 Portfolio Review": a quarter after the tail of a longer
+    // capitalised title names a fund report, not the company.
+    let inside_title = i.checked_sub(1).is_some_and(|j| text[tokens[j].0.clone()].starts_with(char::is_uppercase));
+    context(before)
+        || context(after)
+        || quarter(after) && !inside_title
+        || (after == "price" && tokens.get(i + len + 1).is_some_and(|t| t.1 == "target"))
+        || (before == "target" && i >= 2 && tokens[i - 2].1 == "price")
+}
+fn crypto_alias_allowed(alias: &str, raw: &str, context: bool) -> bool {
+    match alias {
+        "doge" | "ripple" => context,
+        "ether" => raw == "Ether" && context,
+        "sol" | "ada" | "btc" | "eth" | "xrp" => raw == raw.to_ascii_uppercase(),
+        _ => true,
+    }
+}
+fn excluded_form(text: &str, tokens: &[TextSpan], i: usize, len: usize) -> bool {
+    let word = tokens[i].1.as_str();
+    let after = &text[tokens[i + len - 1].0.end..];
+    let next = tokens.get(i + len).map(|t| t.1.as_str()).unwrap_or("");
+    // Do not reinterpret an exchange prefix, or the protected non-company meanings.
+    after.starts_with(':') && market_word(word)
+        || word == "meta" && (text[tokens[i].0.end..].starts_with('-') || next == "analysis")
+        || word == "apple" && next == "pie"
+        || word == "amazon" && next == "rainforest"
+        || word == "oracle" && next == "of" && tokens.get(i + len + 1).is_some_and(|t| t.1 == "omaha")
+        || word == "dow" && tokens.get(i + 1).is_none_or(|t| t.1 != "inc")
+        || word == "hang" && next == "seng"
+        || i > 0 && matches!((tokens[i - 1].1.as_str(), word), ("hang", "seng") | ("dow", "jones"))
+}
+fn dateline(text: &str, pos: usize) -> bool {
+    let Some(comma) = text.find(',') else { return false };
+    if pos > comma {
+        return false;
+    }
+    let prefix = &text[..comma];
+    let date = text[comma + 1..].trim_start().to_ascii_lowercase();
+    prefix.chars().any(char::is_uppercase)
+        && !prefix.chars().any(char::is_lowercase)
+        && ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+            .iter()
+            .any(|month| date.starts_with(month))
+}
+/// Decode numeric and common HTML named entities before tokenisation, without I/O.
+fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        if let Some(end) = rest.find(';').filter(|end| *end <= 16) {
+            let entity = &rest[1..end];
+            let decoded = match entity {
+                "amp" => Some('&'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "rsquo" => Some('’'),
+                "lsquo" => Some('‘'),
+                "rdquo" => Some('”'),
+                "ldquo" => Some('“'),
+                "nbsp" => Some(' '),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "ndash" => Some('–'),
+                "mdash" => Some('—'),
+                "hellip" => Some('…'),
+                _ => entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+                    .and_then(char::from_u32)
+                    .or_else(|| entity.strip_prefix('#').and_then(|s| s.parse().ok()).and_then(char::from_u32)),
+            };
+            if let Some(c) = decoded {
+                out.push(c);
+                rest = &rest[end + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = &rest[1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn default_names() -> &'static NameIndex {
@@ -504,28 +822,7 @@ pub fn cluster_stats(items: &[Story]) -> (Vec<Cluster>, usize) {
 }
 
 pub fn extract_tickers(text: &str, provider: &[String]) -> Vec<String> {
-    let letters: Vec<_> = text.chars().filter(|c| c.is_alphabetic()).collect();
-    let shouting =
-        !letters.is_empty() && letters.iter().filter(|c| c.is_uppercase()).count() * 100 >= letters.len() * 80;
-    let mut result = provider.to_vec();
-    for raw in text.split(|c: char| !c.is_alphanumeric() && c != '$') {
-        let cash = raw.starts_with('$');
-        let word = raw.trim_start_matches('$');
-        let upper = word.to_ascii_uppercase();
-        let word = if cash { upper.as_str() } else { word };
-        if word.is_empty() || word.len() > 5 || !word.bytes().all(|b| b.is_ascii_uppercase()) {
-            continue;
-        }
-        if !cash && !bare_ticker_allowed(word, shouting) {
-            continue;
-        }
-        if let Some(listing) = tr_core::catalog::lookup(word, None) {
-            result.push(listing.key());
-        }
-    }
-    result.sort();
-    result.dedup();
-    result
+    default_names().explicit_tickers(text, provider, &[])
 }
 fn bare_ticker_allowed(word: &str, shouting: bool) -> bool {
     !(shouting
@@ -624,6 +921,38 @@ fn bare_ticker_allowed(word: &str, shouting: bool) -> bool {
                 | "ANY"
                 | "PEAK"
                 | "TECH"
+                | "AP"
+                | "CTO"
+                | "ET"
+                | "PT"
+                | "LNG"
+                | "OLED"
+                | "OCC"
+                | "WTI"
+                | "MA"
+                | "MW"
+                | "HR"
+                | "FT"
+                | "CD"
+                | "PC"
+                | "EV"
+                | "PCE"
+                | "PPI"
+                | "FOMC"
+                | "UN"
+                | "Q1"
+                | "Q2"
+                | "Q3"
+                | "Q4"
+                | "IQ"
+                | "NRC"
+                | "SMR"
+                | "LSE"
+                | "BC"
+                | "NYC"
+                | "SAN"
+                | "LA"
+                | "DC"
         ))
 }
 pub fn topic_tags(text: &str) -> Vec<String> {

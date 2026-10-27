@@ -202,12 +202,13 @@ fn n1b_subject_column_migration_and_user_examples_preserve_scope_and_seen() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subjects, vec![subject]);
         assert!(rows[0].item.tickers.contains(&association.into()));
-        assert!(rows[0].item.tickers.contains(&subject.into()));
+        assert!(!rows[0].item.tickers.contains(&subject.into()), "subjects must not expand scope");
         assert!(rows[0].seen);
         assert_eq!(rows[0].provider, "Finnhub");
     }
     let q = Query { symbols: vec!["FROG US Equity".into()], ..Default::default() };
-    assert_eq!(db.query(&q).unwrap().len(), 1, "extracted subjects join association membership");
+    assert!(db.query(&q).unwrap().is_empty(), "inferred subjects never join association membership");
+    let q = Query { symbols: vec!["MSFT US Equity".into()], ..Default::default() };
     db.db.execute("UPDATE items SET headline='Unmentioned' WHERE id='frog'", []).unwrap();
     assert_eq!(db.query(&q).unwrap()[0].subjects, vec!["FROG US Equity"], "completed rows are not rescanned");
 }
@@ -258,8 +259,14 @@ fn worker_names_read_only_edgar_map_refresh_and_missing_file() {
     db.insert(&[s], 101).unwrap();
     let q = Query { symbols: vec!["MSFT US Equity".into()], ..Default::default() };
     assert_eq!(db.query(&q).unwrap()[0].subjects, vec!["FROG US Equity", "GOOGL US Equity", "NVDA US Equity"]);
+    let cached_companies = db.edgar.as_ref().unwrap().companies.as_ptr();
     source.execute("INSERT INTO meta VALUES('filing','new')", []).unwrap();
     db.refresh_names(&path).unwrap();
+    assert_eq!(
+        db.edgar.as_ref().unwrap().companies.as_ptr(),
+        cached_companies,
+        "filing commits do not reload companies"
+    );
     assert_eq!(
         db.db.query_row("SELECT intelligence FROM items", [], |r| r.get::<_, i64>(0)).unwrap(),
         2,
@@ -270,7 +277,7 @@ fn worker_names_read_only_edgar_map_refresh_and_missing_file() {
     assert_eq!(db.db.query_row("SELECT intelligence FROM items", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     let rows = db.query(&q).unwrap();
     assert_eq!(rows[0].subjects[0], "FROG2 US Equity");
-    assert!(rows[0].item.tickers.contains(&"FROG US Equity".into()), "association history is retained");
+    assert_eq!(rows[0].item.tickers, vec!["MSFT US Equity"], "names never contaminate association history");
     drop(db);
     drop(source);
     std::fs::remove_file(path).unwrap();
@@ -355,4 +362,83 @@ fn linkless_refetch_keeps_n1a_transport_identity_and_seen() {
     assert_eq!(rows[0].id, old.id);
     assert!(rows[0].seen);
     assert_eq!((rows[0].source.as_str(), rows[0].provider.as_str()), ("Reuters", "Finnhub"));
+}
+#[test]
+fn review_read_only_store_still_keeps_edgar_name_index() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join(format!(
+        "review-ro-edgar-{}-{}.sqlite3",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+    ));
+    let source = Connection::open(&path).unwrap();
+    source
+        .execute_batch(
+            "CREATE TABLE companies(ticker TEXT PRIMARY KEY,cik INTEGER,title TEXT);
+            INSERT INTO companies VALUES('FROG',2,'JFrog Ltd');",
+        )
+        .unwrap();
+    let mut db = NewsStore::memory().unwrap();
+    db.db.execute_batch("PRAGMA query_only=ON").unwrap();
+    let _ = db.refresh_names(&path);
+    let found = db.names.as_ref().map(|n| n.subjects("JFrog rises", "", &[]));
+    drop(db);
+    drop(source);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(found, Some(vec!["FROG US Equity".to_string()]));
+}
+
+#[test]
+fn matcher_version_invalidates_old_subjects_without_expanding_associations() {
+    let mut db = NewsStore::memory().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let s = story("https://fixture.test/version", "Alphabet and Amazon expand", now, "MSFT US Equity", "Reuters");
+    db.insert(&[s], now).unwrap();
+    db.db.execute("UPDATE items SET subjects='[\"HERE US Equity\"]'", []).unwrap();
+    db.set_meta("subject_matcher", "old-matcher").unwrap();
+    // Re-open the same connection as a startup migration, retaining all columns.
+    let db = NewsStore::init(db.db).unwrap();
+    assert_eq!(db.meta("subject_matcher").unwrap().as_deref(), Some(crate::news_intelligence::MATCHER_VERSION));
+    assert_eq!(db.db.query_row("SELECT intelligence FROM items", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    let rows = db.query(&Query::default()).unwrap();
+    assert_eq!(rows[0].subjects, ["GOOGL US Equity", "AMZN US Equity"]);
+    assert_eq!(rows[0].item.tickers, ["MSFT US Equity"]);
+}
+#[test]
+fn read_only_query_never_displays_stale_subjects_after_invalidation() {
+    let mut db = NewsStore::memory().unwrap();
+    let s = story("https://fixture.test/stale", "Alphabet expands", 100, "MSFT US Equity", "Reuters");
+    db.insert(&[s], 101).unwrap();
+    db.db.execute("UPDATE items SET subjects='[\"HERE US Equity\"]',intelligence=1", []).unwrap();
+    db.db.execute_batch("PRAGMA query_only=ON").unwrap();
+    assert!(db.query(&Query::default()).unwrap()[0].subjects.is_empty(), "failed backfill must mute old subjects");
+    // Simulate a newly installed SEC index whose invalidation transaction failed.
+    db.pending_names = Some("new-index".into());
+    let rows = db.query(&Query::default()).unwrap();
+    assert_eq!(rows[0].subjects, ["GOOGL US Equity"]);
+    assert_eq!(rows[0].item.tickers, ["MSFT US Equity"]);
+}
+#[test]
+fn stored_subjects_and_watchlist_evidence_never_expand_name_based_scope() {
+    let mut db = NewsStore::memory().unwrap();
+    db.names = Some(crate::news_intelligence::NameIndex::new(&[(1, "FROG".into(), "JFrog Ltd".into())]));
+    let name =
+        story("https://fixture.test/subjects-only", "JFrog and Alphabet expand", 100, "MSFT US Equity", "Reuters");
+    let bare = story("https://fixture.test/watched-bare", "FROG expands", 100, "MSFT US Equity", "Reuters");
+    db.insert(&[name, bare], 101).unwrap();
+    db.set_watched(&["FROG US Equity".into()]).unwrap();
+    let all = db.query(&Query::default()).unwrap();
+    assert!(all.iter().all(|s| s.subjects.contains(&"FROG US Equity".into())));
+    assert_eq!(
+        db.query(&Query { symbols: vec!["FROG US Equity".into()], ..Default::default() }).unwrap().len(),
+        1,
+        "only the explicitly written watched ticker joins scope"
+    );
+    let by_name = all.iter().find(|s| s.item.title.starts_with("JFrog")).unwrap();
+    assert_eq!(by_name.item.tickers, ["MSFT US Equity"]);
+    db.set_watched(&[]).unwrap();
+    let all = db.query(&Query::default()).unwrap();
+    // An admitted explicit ticker is retained as an association; names still never leak.
+    assert_eq!(all.iter().find(|s| s.item.title.starts_with("JFrog")).unwrap().item.tickers, ["MSFT US Equity"]);
 }

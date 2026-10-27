@@ -191,12 +191,16 @@ pub struct NewsStore {
     fts: bool,
     names: Option<crate::news_intelligence::NameIndex>,
     edgar: Option<EdgarNames>,
+    watched: Vec<String>,
+    pending_names: Option<String>,
+    pending_watched: bool,
 }
 type CompanyNames = Vec<(u64, String, String)>;
 struct EdgarNames {
     db: Connection,
     version: i64,
     companies: CompanyNames,
+    signature: (i64, i64),
 }
 
 impl NewsStore {
@@ -269,7 +273,17 @@ impl NewsStore {
             INSERT INTO news_fts SELECT id,headline,summary FROM items WHERE id NOT IN (SELECT id FROM news_fts);",
             )
             .is_ok();
-        let store = Self { db, fts, names: None, edgar: None };
+        let store =
+            Self { db, fts, names: None, edgar: None, watched: vec![], pending_names: None, pending_watched: false };
+        if store.meta("subject_matcher")?.as_deref() != Some(crate::news_intelligence::MATCHER_VERSION) {
+            let tx = store.db.unchecked_transaction()?;
+            tx.execute("UPDATE items SET intelligence=1 WHERE intelligence>=2", [])?;
+            tx.execute(
+                "INSERT OR REPLACE INTO meta VALUES('subject_matcher',?1)",
+                [crate::news_intelligence::MATCHER_VERSION],
+            )?;
+            tx.commit()?;
+        }
         store.prune(chrono::Utc::now().timestamp())?;
         Ok(store)
     }
@@ -283,33 +297,63 @@ impl NewsStore {
             }
             let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             db.busy_timeout(std::time::Duration::from_millis(100))?;
-            self.edgar = Some(EdgarNames { db, version: -1, companies: vec![] });
+            self.edgar = Some(EdgarNames { db, version: -1, companies: vec![], signature: (-1, -1) });
         }
         let source = self.edgar.as_mut().expect("opened above");
         let version = source.db.query_row("PRAGMA data_version", [], |r| r.get(0))?;
-        if source.version == version {
-            return Ok(());
+        if source.version != version {
+            // Most external commits are filings. Pre-check before loading any Rust company rows.
+            let signature = source.db.query_row("SELECT count(*),coalesce(max(rowid),0) FROM companies", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+            let changed = self.names.is_none() || signature != source.signature
+                // Count/rowid alone cannot detect in-place ticker/title corrections. Compare in
+                // SQLite without reloading companies or rebuilding the index on filing-only commits.
+                || source.db.query_row("SELECT EXISTS(SELECT cik,ticker,title FROM companies EXCEPT SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]'),json_extract(value,'$[2]') FROM json_each(?1))",
+                    [serde_json::to_string(&source.companies)?], |r| r.get::<_, bool>(0))?;
+            if changed {
+                let companies: CompanyNames = source
+                    .db
+                    .prepare("SELECT cik,ticker,title FROM companies ORDER BY cik,ticker")?
+                    .query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let fingerprint: String =
+                    Sha1::digest(serde_json::to_vec(&companies)?).iter().map(|b| format!("{b:02x}")).collect();
+                // Install memory state BEFORE optional writes: a read-only history disk must not
+                // discard the names index or rebuild 10k names on each refresh.
+                self.names = Some(crate::news_intelligence::NameIndex::new(&companies));
+                source.companies = companies;
+                self.pending_names = Some(fingerprint);
+            }
+            source.signature = signature;
+            source.version = version;
         }
-        // rowid is SEC insertion order, unlike the filing UI's alphabetical view.
-        let companies: CompanyNames = source
-            .db
-            .prepare("SELECT cik,ticker,title FROM companies ORDER BY rowid")?
-            .query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        if self.names.is_none() || companies != source.companies {
-            let fingerprint: String =
-                Sha1::digest(serde_json::to_vec(&companies)?).iter().map(|b| format!("{b:02x}")).collect();
-            let names = crate::news_intelligence::NameIndex::new(&companies);
-            if self.meta("subject_names")?.as_deref() != Some(&fingerprint) {
+        if let Some(fingerprint) = self.pending_names.as_ref() {
+            if self.meta("subject_names")?.as_deref() != Some(fingerprint) {
                 let tx = self.db.unchecked_transaction()?;
                 tx.execute("UPDATE items SET intelligence=1 WHERE intelligence>=2", [])?;
-                tx.execute("INSERT OR REPLACE INTO meta VALUES('subject_names',?1)", [&fingerprint])?;
+                tx.execute("INSERT OR REPLACE INTO meta VALUES('subject_names',?1)", [fingerprint])?;
                 tx.commit()?;
             }
-            self.names = Some(names);
-            self.edgar.as_mut().expect("opened above").companies = companies;
+            self.pending_names = None;
         }
-        self.edgar.as_mut().expect("opened above").version = version;
+        Ok(())
+    }
+    /// User watchlists admit bare tickers, but never create scope associations by name.
+    pub fn set_watched(&mut self, watched: &[String]) -> Result<()> {
+        let mut watched = watched.to_vec();
+        watched.sort();
+        watched.dedup();
+        self.watched = watched;
+        let fingerprint = serde_json::to_string(&self.watched)?;
+        if self.meta("subject_watched")?.as_deref() != Some(&fingerprint) {
+            self.pending_watched = true;
+            let tx = self.db.unchecked_transaction()?;
+            tx.execute("UPDATE items SET intelligence=1 WHERE intelligence>=2", [])?;
+            tx.execute("INSERT OR REPLACE INTO meta VALUES('subject_watched',?1)", [&fingerprint])?;
+            tx.commit()?;
+        }
+        self.pending_watched = false;
         Ok(())
     }
     fn names(&self) -> &crate::news_intelligence::NameIndex {
@@ -335,10 +379,9 @@ impl NewsStore {
                 })?;
             let mut tickers: Vec<String> = serde_json::from_str(&raw)?;
             tickers.extend(story.item.tickers.clone());
-            let subjects = names.subjects(&title, &summary, &tickers);
-            tickers.extend(subjects.clone());
-            tickers.extend(crate::news_intelligence::extract_tickers(&title, &[]));
-            tickers.extend(crate::news_intelligence::extract_tickers(&story.item.title, &story.item.tickers));
+            tickers = names.explicit_tickers(&format!("{title} {summary}"), &tickers, &self.watched);
+            tickers.extend(names.explicit_tickers(&story.item.title, &story.item.tickers, &self.watched));
+            let subjects = names.subjects_watched(&title, &summary, &tickers, &self.watched);
             let tags = crate::news_intelligence::topic_tags(&title);
             tickers.sort();
             tickers.dedup();
@@ -402,11 +445,8 @@ impl NewsStore {
         let tx = self.db.unchecked_transaction()?;
         for (id, title, raw, summary) in rows {
             let associated = serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default();
-            let subjects = self.names().subjects(&title, &summary, &associated);
-            let mut tickers = crate::news_intelligence::extract_tickers(&title, &associated);
-            tickers.extend(subjects.clone());
-            tickers.sort();
-            tickers.dedup();
+            let tickers = self.names().explicit_tickers(&format!("{title} {summary}"), &associated, &self.watched);
+            let subjects = self.names().subjects_watched(&title, &summary, &tickers, &self.watched);
             let tags = crate::news_intelligence::topic_tags(&title);
             tx.execute(
                 "UPDATE items SET tickers=?2,tags=?3,subjects=?4,intelligence=2,provider=CASE WHEN provider='' THEN source ELSE provider END WHERE id=?1",
@@ -420,7 +460,7 @@ impl NewsStore {
         // Enrichment is optional: read-only disks and transient write failures
         // must never hide otherwise readable saved history.
         let _ = self.backfill(q);
-        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category,tags,seen,provider,subjects FROM items WHERE published>=?1 AND published<=?2".to_string();
+        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category,tags,seen,provider,subjects,intelligence FROM items WHERE published>=?1 AND published<=?2".to_string();
         let search = if self.fts && !q.filters.search.trim().is_empty() {
             sql.push_str(" AND id IN (SELECT id FROM news_fts WHERE news_fts MATCH ?3)");
             let terms = terms(&q.filters.search);
@@ -453,7 +493,13 @@ impl NewsStore {
                     provider_id: r.get(2)?,
                     provider: r.get(11)?,
                     summary: r.get(5)?,
-                    subjects: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
+                    // Rows beyond this bounded backfill may still contain old matcher output.
+                    // Prefer a muted association until they have been re-derived.
+                    subjects: if r.get::<_, i64>(13)? < 2 {
+                        vec![]
+                    } else {
+                        serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default()
+                    },
                     category: r.get(8)?,
                     tags: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
                     seen: r.get(10)?,
@@ -467,6 +513,19 @@ impl NewsStore {
                 })
             },
         )?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        if self.pending_names.is_some() || self.pending_watched {
+            // Optional invalidation writes can fail on read-only disks. Never display stale
+            // amber chips when the installed in-memory matcher has newer evidence.
+            for story in &mut rows {
+                story.subjects = self.names().subjects_watched(
+                    &story.item.title,
+                    &story.summary,
+                    &story.item.tickers,
+                    &self.watched,
+                );
+            }
+        }
+        Ok(rows)
     }
 }

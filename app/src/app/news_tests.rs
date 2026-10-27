@@ -196,7 +196,7 @@ fn row_columns_omit_linked_symbol_and_include_union_meta() {
     assert_eq!(model.time, "12m");
     assert!(model.full_time.contains("UTC"));
     assert_eq!(model.ticker.as_deref(), Some("MSFT US Equity"));
-    assert_eq!(chart_ticker(&cluster, Some("AAPL US Equity")).map(String::as_str), Some("MSFT US Equity"));
+    assert_eq!(chart_ticker(&cluster, Some("AAPL US Equity"), &[]).map(String::as_str), Some("MSFT US Equity"));
     assert_eq!(model.extra_tickers, vec!["NVDA US Equity"]);
     assert!(model.meta.starts_with("Reuters +2 · +1"));
     assert!(model.meta.contains("Earnings"));
@@ -237,7 +237,7 @@ fn subject_display_is_amber_association_fallback_is_muted_and_chart_target_agree
         assert!(model.ticker_is_subject);
         assert!(model.extra_tickers.is_empty());
         assert_eq!(model.about, "About: FROG · Also returned for: MSFT");
-        assert_eq!(chart_ticker(&cluster, linked), model.ticker.as_ref());
+        assert_eq!(chart_ticker(&cluster, linked, &[]), model.ticker.as_ref());
     }
     s.subjects.clear();
     let cluster = Cluster::wire(&s);
@@ -245,7 +245,7 @@ fn subject_display_is_amber_association_fallback_is_muted_and_chart_target_agree
     assert_eq!(model.ticker.as_deref(), Some("MSFT US Equity"));
     assert!(!model.ticker_is_subject);
     assert_eq!(model.ticker_hover, "Returned by Finnhub for MSFT; not mentioned in the story");
-    assert_eq!(chart_ticker(&cluster, Some("MSFT US Equity")), model.ticker.as_ref());
+    assert_eq!(chart_ticker(&cluster, Some("MSFT US Equity"), &[]), model.ticker.as_ref());
     s.subjects = vec!["BTCUSD Curncy".into(), "FROG US Equity".into(), "NVDA US Equity".into()];
     s.item.tickers.push("NVDA US Equity".into());
     let cluster = Cluster::wire(&s);
@@ -254,6 +254,50 @@ fn subject_display_is_amber_association_fallback_is_muted_and_chart_target_agree
     assert_eq!(model.extra_tickers, vec!["FROG US Equity"]);
     assert!(model.meta.contains(" · +1"));
     assert!(model.about.contains("About: BTCUSD · FROG · NVDA"));
+}
+#[test]
+fn review_muted_fallback_prefers_linked_association() {
+    let mut s = tr_data::news_store::Story::new(
+        tr_data::NewsItem {
+            title: "AI agents raise concerns for banks".into(),
+            publisher: "Publisher".into(),
+            link: "https://fixture.test/fallback".into(),
+            ts: 100,
+            // Store order is sorted, so an older AAPL association precedes MSFT.
+            tickers: vec!["AAPL US Equity".into(), "MSFT US Equity".into()],
+        },
+        "Publisher",
+    );
+    s.provider = "Finnhub".into();
+    let cluster = Cluster::wire(&s);
+    let model = row_model(&cluster, Some("MSFT US Equity"), 101);
+    assert_eq!(model.ticker.as_deref(), Some("MSFT US Equity"));
+    assert_eq!(model.ticker_hover, "Returned by Finnhub for MSFT; not mentioned in the story");
+}
+#[test]
+fn muted_fallback_prefers_watched_association_for_display_and_chart() {
+    let s = tr_data::news_store::Story::new(
+        tr_data::NewsItem {
+            title: "Market commentary".into(),
+            publisher: "Publisher".into(),
+            link: "https://fixture.test/watched-fallback".into(),
+            ts: 100,
+            tickers: vec!["AAPL US Equity".into(), "MSFT US Equity".into(), "NVDA US Equity".into()],
+        },
+        "Publisher",
+    );
+    let cluster = Cluster::wire(&s);
+    let watched = vec!["MSFT US Equity".into()];
+    for (linked, expected) in [
+        (None, "MSFT US Equity"),
+        (Some("NVDA US Equity"), "NVDA US Equity"),
+        (Some("UNKNOWN US Equity"), "MSFT US Equity"),
+    ] {
+        let model = row_model_watched(&cluster, linked, &watched, 101);
+        assert_eq!(model.ticker.as_deref(), Some(expected));
+        assert!(!model.ticker_is_subject);
+        assert_eq!(chart_ticker(&cluster, linked, &watched), model.ticker.as_ref());
+    }
 }
 #[test]
 fn keyboard_reducer_boundaries_actions_escape_and_reordering() {
