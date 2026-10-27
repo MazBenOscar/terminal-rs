@@ -1,0 +1,4 @@
+[
+  {"category":"technology","datetime":1793016000,"headline":"Apple reports earnings growth","id":101,"image":"https://images.example.test/a.jpg","related":"AAPL, MSFT","source":"Fixture Wire","summary":"Revenue rises as services expand.","url":"https://example.test/apple/?utm_source=finnhub#top"},
+  {"category":"business","datetime":1793015900,"headline":"Markets await central bank decision","id":102,"image":"","related":"","source":"Fixture Journal","summary":"Policy makers meet today.","url":"https://example.test/markets"}
+]

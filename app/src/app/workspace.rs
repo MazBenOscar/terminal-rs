@@ -20,7 +20,9 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 16] = [
+pub const PANELS: [(&str, &str); 17] = [
+    // N2
+    ("Filings", "CF"),
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("Scanner", "SCAN"),
@@ -527,9 +529,17 @@ impl TerminalApp {
                     self.worker.send(Request::TickerTrades { pane: id, symbol: key });
                 }
             }
+            // N2: follow linked symbols without resetting the saved scope/filter.
+            PaneKind::Filings(f) => {
+                f.symbol = Some(key);
+            }
             PaneKind::News(n) => {
                 if n.symbol.as_deref() != Some(key.as_str()) {
-                    **n = NewsPane::new(Some(key));
+                    // N1a: linking preserves history, scope, filters and pause state.
+                    n.symbol = Some(key);
+                    n.fetched = None;
+                    n.query = None;
+                    // N1a
                 }
             }
             PaneKind::OrderBook(b) => {
@@ -665,7 +675,8 @@ impl TerminalApp {
 
     /// The chart commands act on: the focused one, a visible one, any (revealed), or a new
     /// chart beside the focused pane.
-    fn chart_target(&mut self) -> PaneId {
+    // N1a: shared by the News ticker-chip symbol-open action.
+    pub(super) fn chart_target(&mut self) -> PaneId {
         if self.focused_is_chart() {
             return self.focus;
         }
@@ -726,6 +737,8 @@ impl TerminalApp {
             "WL" | "WATCHLIST" | "W" => PaneKind::Watchlist,
             "SCAN" | "SCANNER" | "EASYSCAN" => PaneKind::Scanner(Box::default()),
             "NEWS" | "N" | "CN" | "TOP" => PaneKind::News(Box::new(NewsPane::new(current))),
+            // N2
+            "CF" | "FILINGS" => PaneKind::Filings(crate::filings_view::Settings::new(current)),
             "BOOK" | "OB" | "DEPTH" | "DOM" => {
                 // Default to a market with a public book.
                 let sym = given

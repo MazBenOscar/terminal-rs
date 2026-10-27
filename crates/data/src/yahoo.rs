@@ -343,16 +343,14 @@ impl YahooProvider {
 
     /// Headlines related to a Yahoo symbol or free-text query.
     pub async fn news(&self, query: &str) -> Result<Vec<crate::NewsItem>> {
-        let resp = self
-            .client
-            .get(SEARCH)
-            .query(&[("q", query), ("quotesCount", "0"), ("newsCount", "25"), ("listsCount", "0")])
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            bail!("yahoo news: HTTP {}", resp.status());
-        }
-        parse_news(&resp.text().await?)
+        let request = self.client.get(SEARCH).query(&[
+            ("q", query),
+            ("quotesCount", "0"),
+            ("newsCount", "25"),
+            ("listsCount", "0"),
+        ]);
+        let body = tr_net::shared()?.send("yahoo-news", request).await?;
+        parse_news(std::str::from_utf8(&body)?)
     }
 }
 

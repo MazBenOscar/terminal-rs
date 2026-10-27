@@ -10,6 +10,7 @@ mod agent_ui;
 mod broker;
 mod chrome;
 mod columns_view;
+pub(crate) mod data_sources;
 mod demo;
 mod demo_harness;
 mod hotkeys_view;
@@ -34,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tr_chart::drawings::Tool;
 use tr_congress::Trade;
 use tr_congress::db::{Alert, PoliticianSummary};
-use tr_data::{NewsItem, OrderBook, Quote, SearchHit, YieldCurves};
+use tr_data::{OrderBook, Quote, SearchHit, YieldCurves};
 
 use crate::anim;
 use crate::chart_view::ChartState;
@@ -117,6 +118,8 @@ pub enum PaneKind {
         query: String,
     },
     News(Box<NewsPane>),
+    // N2
+    Filings(crate::filings_view::Settings),
     OrderBook(Box<BookPane>),
     Options(Box<OptionsPane>),
     /// Brokerage accounts through SnapTrade (`PORT`, `ACCT`, `POS`, `ORD`, `ACTV`).
@@ -180,20 +183,80 @@ impl OptionsPane {
     }
 }
 
+// N1a
+mod news_view;
 pub struct NewsPane {
-    /// `None` = general market headlines.
     pub symbol: Option<String>,
-    pub items: Vec<NewsItem>,
+    pub items: Vec<tr_data::news_store::Story>,
+    pub filters: tr_data::news_store::Filters,
+    pub paused: bool,
+    pub pending: Vec<tr_data::news_store::Story>,
+    pub status: String,
+    pub updated: Option<Instant>,
     pub error: Option<String>,
     pub loading: bool,
     pub fetched: Option<Instant>,
+    pub query: Option<crate::worker::NewsView>,
 }
-
 impl NewsPane {
     pub fn new(symbol: Option<String>) -> Self {
-        Self { symbol, items: Vec::new(), error: None, loading: true, fetched: None }
+        Self {
+            symbol,
+            items: vec![],
+            filters: Default::default(),
+            paused: false,
+            pending: vec![],
+            status: "Showing saved headlines".into(),
+            updated: None,
+            error: None,
+            loading: true,
+            fetched: None,
+            query: None,
+        }
+    }
+    fn apply(&mut self, items: Vec<tr_data::news_store::Story>) {
+        if items.is_empty() {
+            return;
+        }
+        if self.paused {
+            self.pending = items;
+        } else {
+            self.items = items;
+            self.pending.clear();
+        }
+    }
+    fn empty_message(&self, query: &tr_data::news_store::Query) -> Option<String> {
+        if self.items.iter().any(|story| tr_data::news_store::matches(story, query)) {
+            return None;
+        }
+        let selection = if self.filters.scope == tr_data::news_store::Scope::Symbol {
+            self.symbol.as_deref().unwrap_or("this selection")
+        } else {
+            "this selection"
+        };
+        Some(format!("No saved headlines for {selection} yet"))
+    }
+    fn new_count(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|s| {
+                let visible = self.query.as_ref().is_none_or(|view| {
+                    let days = view.filters.days.clamp(1, 90) as i64;
+                    let now = chrono::Utc::now().timestamp();
+                    let query = tr_data::news_store::Query {
+                        symbols: view.symbols.clone(),
+                        filters: view.filters.clone(),
+                        start: if days == 1 { tr_data::news_store::day_start(now) } else { now - days * 86400 },
+                        ..Default::default()
+                    };
+                    tr_data::news_store::matches(s, &query)
+                });
+                visible && !self.items.iter().any(|old| old.id == s.id)
+            })
+            .count()
     }
 }
+// N1a
 
 pub struct BookPane {
     pub symbol: String,
@@ -235,6 +298,10 @@ impl PaneKind {
                 Some(s) => format!("{} News", short(s)),
                 None => "Top News".into(),
             },
+            // N2
+            PaneKind::Filings(f) => {
+                f.symbol.as_deref().map_or_else(|| "Filings".into(), |s| format!("{} Filings", short(s)))
+            }
             PaneKind::OrderBook(b) => format!("{} Depth", short(&b.symbol)),
             PaneKind::Options(o) => format!("{} Options", short(&o.symbol)),
             PaneKind::Portfolio(p) => p.title(),
@@ -257,6 +324,8 @@ impl PaneKind {
             PaneKind::Curve => "GC",
             PaneKind::Search { .. } => "SECF",
             PaneKind::News(_) => "CN",
+            // N2
+            PaneKind::Filings(_) => "CF",
             PaneKind::OrderBook(_) => "OB",
             PaneKind::Options(_) => "OMON",
             PaneKind::Portfolio(p) => p.view.code(),
@@ -271,6 +340,8 @@ impl PaneKind {
             PaneKind::Chart(c) => Some(&c.symbol),
             PaneKind::Ticker { symbol, .. } => Some(symbol),
             PaneKind::News(n) => n.symbol.as_deref(),
+            // N2
+            PaneKind::Filings(f) => f.symbol.as_deref(),
             PaneKind::OrderBook(b) => Some(&b.symbol),
             PaneKind::Options(o) => Some(&o.symbol),
             _ => None,
@@ -283,6 +354,8 @@ impl PaneKind {
             PaneKind::Chart(_)
                 | PaneKind::Ticker { .. }
                 | PaneKind::News(_)
+                // N2
+                | PaneKind::Filings(_)
                 | PaneKind::OrderBook(_)
                 | PaneKind::Options(_)
         )
@@ -329,7 +402,14 @@ impl PaneKind {
             PaneKind::Wei => PaneSettings::Wei,
             PaneKind::Curve => PaneSettings::Curve,
             PaneKind::Search { query } => PaneSettings::Search(query.clone()),
-            PaneKind::News(n) => PaneSettings::News(n.symbol.clone()),
+            // N1a
+            PaneKind::News(n) => PaneSettings::News(
+                (n.symbol.is_some() || n.filters != Default::default())
+                    .then(|| crate::layouts::NewsSettings { symbol: n.symbol.clone(), filters: n.filters.clone() }),
+            ),
+            // N1a
+            // N2
+            PaneKind::Filings(f) => PaneSettings::Filings(f.clone()),
             PaneKind::OrderBook(b) => {
                 PaneSettings::OrderBook { symbol: b.symbol.clone(), depth: b.depth, group: b.group }
             }
@@ -407,7 +487,16 @@ impl PaneKind {
             PaneSettings::Wei => PaneKind::Wei,
             PaneSettings::Curve => PaneKind::Curve,
             PaneSettings::Search(q) => PaneKind::Search { query: q },
-            PaneSettings::News(s) => PaneKind::News(Box::new(NewsPane::new(s))),
+            // N1a
+            PaneSettings::News(s) => {
+                let saved = s.unwrap_or_default();
+                let mut pane = NewsPane::new(saved.symbol);
+                pane.filters = saved.filters;
+                PaneKind::News(Box::new(pane))
+            }
+            // N1a
+            // N2
+            PaneSettings::Filings(f) => PaneKind::Filings(f),
             PaneSettings::OrderBook { symbol, depth, group } => {
                 PaneKind::OrderBook(Box::new(BookPane::new(&symbol, depth, group)))
             }
@@ -577,6 +666,8 @@ pub(crate) fn sanitize_watchlists(lists: Vec<NamedWatchlist>) -> Vec<NamedWatchl
 /// App-wide state persisted in `settings.json` (layouts live in their own files).
 #[derive(Serialize, Deserialize)]
 struct Settings {
+    #[serde(default, deserialize_with = "data_sources::deserialize_settings")]
+    data_sources: tr_net::Settings,
     #[serde(default)]
     watchlist: Vec<String>,
     #[serde(default)]
@@ -751,6 +842,8 @@ pub struct Drag {
 }
 
 pub struct TerminalApp {
+    // N2
+    edgar: crate::filings_view::State,
     drawing_ids: crate::drawing_history::SharedDrawingIds,
     pub agent_queue: crate::agent_queue::AgentToolQueue,
     pub pinned_agent_chart: Option<u64>,
@@ -801,6 +894,7 @@ pub struct TerminalApp {
     rebinding: Option<prefs::Action>,
     hotkey_filter: String,
     settings_tab: SettingsTab,
+    data_sources: data_sources::State,
     io_path: String,
 
     curves: Option<Box<YieldCurves>>,
@@ -822,6 +916,9 @@ pub struct TerminalApp {
     status: String,
     toasts: Vec<(String, Instant)>,
     alert_toasts: Vec<(Instant, tr_core::price_alerts::Event)>,
+    // N1a
+    news_subscription: Option<(Vec<crate::worker::NewsView>, Vec<String>)>,
+    // N1a
     watchlist_undo: Option<(Instant, Vec<String>, Vec<String>)>,
 
     latest: Vec<Trade>,
@@ -994,6 +1091,8 @@ impl TerminalApp {
             provider.eq_ignore_ascii_case("sample"),
         );
         let mut app = Self {
+            // N2
+            edgar: Default::default(),
             drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(ctx.clone()),
             pinned_agent_chart: None,
@@ -1037,6 +1136,7 @@ impl TerminalApp {
             rebinding: None,
             hotkey_filter: String::new(),
             settings_tab: SettingsTab::Appearance,
+            data_sources: data_sources::State::default(),
             io_path: String::new(),
             curves: None,
             last_wei: None,
@@ -1053,6 +1153,9 @@ impl TerminalApp {
             status: "Ready. Type a ticker and press <GO> (Enter). F1 for help.".into(),
             toasts: Vec::new(),
             alert_toasts: Vec::new(),
+            // N1a
+            news_subscription: None,
+            // N1a
             watchlist_undo: None,
             latest: Vec::new(),
             politicians: Vec::new(),
@@ -1100,8 +1203,15 @@ impl TerminalApp {
             last_chrome_poll: None,
             palette: crate::palette::Palette::load(&data_dir().join("palette.json")),
         };
+        // Do not accidentally re-enable sources when another settings field prevents restoration.
+        app.data_sources = data_sources::State::new(match std::fs::read(settings_path()) {
+            Ok(bytes) => tr_net::Settings::from_document(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => tr_net::Settings::default(),
+            Err(_) => tr_net::Settings::corrupt(),
+        });
         let mut doc = None;
         if let Some(s) = &settings {
+            app.data_sources = data_sources::State::new(s.data_sources.clone());
             (app.watchlists, app.active_watchlist) = s.sanitized_watchlists();
             app.watchlist = app.watchlists[app.active_watchlist].symbols.clone();
             app.sidebar_open = s.sidebar;
@@ -1161,6 +1271,7 @@ impl TerminalApp {
 
     fn settings_json(&self) -> Vec<u8> {
         let s = Settings {
+            data_sources: self.data_sources.settings.clone(),
             watchlist: Vec::new(),
             watchlists: self.watchlists.clone(),
             active_watchlist: self.active_watchlist,
@@ -1466,7 +1577,19 @@ impl TerminalApp {
         for a in actions {
             match a {
                 Action::Notice(message) => self.toasts.push((message, Instant::now())),
-                Action::OpenChart(s) => self.open_security(&s),
+                // N1a: ticker chips target a linked chart, else the existing chart target (never just News).
+                Action::OpenChart(s) => {
+                    if self.idx(self.focus).is_some_and(|i| {
+                        matches!(self.panes[i].kind, PaneKind::News(_))
+                            && !self.panes[i].link.is_some_and(|link| {
+                                self.panes.iter().any(|p| p.link == Some(link) && matches!(p.kind, PaneKind::Chart(_)))
+                            })
+                    }) {
+                        self.focus = self.chart_target();
+                    }
+                    self.open_security(&s);
+                }
+                // N1a
                 Action::ScanChart { symbol, symbols, definition } => {
                     self.open_security(&symbol);
                     self.with_chart(|c, w| {
@@ -1567,6 +1690,10 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Congress) => {
                 self.open_panel(PaneKind::Ticker { symbol: s.clone(), trades: Vec::new(), loading: true });
                 self.status = format!("{s}: congressional trades");
+            }
+            // N2
+            Command::SymbolFunction(s, Function::Filings) => {
+                self.open_panel(PaneKind::Filings(crate::filings_view::Settings::new(Some(s.clone()))));
             }
             Command::SymbolFunction(s, Function::News) => {
                 self.open_panel(PaneKind::News(Box::new(NewsPane::new(Some(s.clone())))));
@@ -1735,6 +1862,10 @@ impl TerminalApp {
                 self.set_link(focus, link);
             }
             Function::News => self.open_panel(PaneKind::News(Box::new(NewsPane::new(self.focused_symbol())))),
+            // N2
+            Function::Filings => {
+                self.open_panel(PaneKind::Filings(crate::filings_view::Settings::new(self.focused_symbol())))
+            }
             Function::OrderBook(depth) => {
                 let sym = self.focused_symbol().unwrap_or_else(|| "BTCUSD Curncy".into());
                 let depth = depth.unwrap_or(self.prefs.panels.book_depth).clamp(5, 200);
@@ -1989,6 +2120,12 @@ impl TerminalApp {
     fn drain(&mut self) {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
+                // N2: shared store snapshot, never clear rows on a failed refresh.
+                Response::Edgar { rows, status, updated } => {
+                    self.edgar.rows = rows;
+                    self.edgar.status = status;
+                    self.edgar.updated = updated;
+                }
                 Response::WatchlistColumns { revision, cells, computed_at } => {
                     if let Some((cells, computed_at)) = finish_columns_reply(
                         &mut self.columns_in_flight,
@@ -2203,21 +2340,38 @@ impl TerminalApp {
                         }
                     }
                 }
-                Response::News { pane, symbol, items } => {
-                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                // N1a: stale query replies cannot replace a newly selected scope.
+                Response::NewsStatus { view, status } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == view.pane)
                         && let PaneKind::News(n) = &mut p.kind
-                        && n.symbol == symbol
+                        && n.query.as_ref() == Some(&view)
+                    {
+                        if status.contains("updated just now") {
+                            n.updated = Some(Instant::now());
+                        }
+                        n.status = status;
+                    }
+                }
+                Response::NewsSaved { view, items, status } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == view.pane)
+                        && let PaneKind::News(n) = &mut p.kind
+                        && n.query.as_ref() == Some(&view)
                     {
                         n.loading = false;
+                        if status.contains("updated just now") {
+                            n.updated = Some(Instant::now());
+                        }
+                        n.status = status;
                         match items {
                             Ok(items) => {
-                                n.items = items;
+                                n.apply(items);
                                 n.error = None;
                             }
                             Err(e) => n.error = Some(e),
                         }
                     }
                 }
+                // N1a
                 Response::OrderBook { pane, symbol, book } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
                         && let PaneKind::OrderBook(b) = &mut p.kind
@@ -2237,6 +2391,7 @@ impl TerminalApp {
                     self.on_portfolio(result)
                 }
                 Response::BrokerRegistered(result) => self.on_broker_registered(result),
+                Response::DataSources(reply) => self.data_sources.receive(reply),
                 Response::Questrade(result) => {
                     self.broker.questrade_busy = false;
                     self.broker.questrade_message = Some(match result {
@@ -2602,6 +2757,61 @@ impl TerminalApp {
         }
     }
 
+    // N1a: the worker owns timing; UI sends only changed visibility/query snapshots.
+    fn news_periodic(&mut self, visible: &[usize], hidden: bool) {
+        use tr_data::news_store::Scope;
+        let mut views = vec![];
+        if !hidden {
+            for &i in visible {
+                let pane = self.panes[i].id;
+                if let PaneKind::News(n) = &mut self.panes[i].kind {
+                    let symbols = match n.filters.scope {
+                        Scope::Symbol => n.symbol.iter().cloned().collect(),
+                        Scope::Watchlist => self
+                            .watchlists
+                            .iter()
+                            .find(|l| Some(&l.name) == n.filters.watchlist.as_ref())
+                            .map(|l| l.symbols.clone())
+                            .unwrap_or_else(|| self.watchlist.clone()),
+                        Scope::All => vec![],
+                    };
+                    let view =
+                        crate::worker::NewsView { pane, symbol: n.symbol.clone(), filters: n.filters.clone(), symbols };
+                    if n.query.as_ref() != Some(&view) {
+                        n.pending.clear();
+                        n.loading = true;
+                        n.fetched = None;
+                    }
+                    n.query = Some(view.clone());
+                    if n.fetched.is_none() {
+                        n.fetched = Some(Instant::now());
+                        self.worker.send(Request::NewsRead(view.clone()));
+                    }
+                    views.push(view);
+                }
+            }
+        }
+        let mut symbols: Vec<_> = if views.is_empty() {
+            vec![]
+        } else {
+            self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect()
+        };
+        symbols.sort();
+        symbols.dedup();
+        // Linked visible panes are eligible even outside every watchlist, and go first.
+        let mut linked: Vec<_> =
+            views.iter().filter(|v| v.filters.scope == Scope::Symbol).flat_map(|v| v.symbols.iter().cloned()).collect();
+        linked.sort();
+        linked.dedup();
+        symbols.retain(|s| !linked.contains(s));
+        linked.extend(symbols);
+        let next = (views, linked);
+        if self.news_subscription.as_ref() != Some(&next) {
+            self.worker.send(Request::NewsVisible { views: next.0.clone(), watchlist: next.1.clone() });
+            self.news_subscription = Some(next);
+        }
+    }
+    // N1a
     fn periodic(&mut self) {
         if self.agent_demo.is_some() {
             return;
@@ -2630,10 +2840,7 @@ impl TerminalApp {
         for &i in &visible {
             let p = &mut self.panes[i];
             match &mut p.kind {
-                PaneKind::News(n) if n.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) => {
-                    n.fetched = Some(Instant::now());
-                    self.worker.send(Request::News { pane: p.id, symbol: n.symbol.clone() });
-                }
+                // N1a: no per-frame news polling; the worker scheduler owns refreshes.
                 PaneKind::Options(o) if o.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) => {
                     o.fetched = Some(Instant::now());
                     self.worker.send(Request::Options {
@@ -2806,10 +3013,73 @@ fn native_chrome(_frame: &eframe::Frame) -> Option<tr_macos::Chrome> {
     None
 }
 
+// N2: called on native visibility events too, not by an idle repaint loop.
+#[cfg(target_os = "macos")]
+fn edgar_window_visible(frame: &eframe::Frame) -> bool {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = frame.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return false;
+    };
+    // SAFETY: eframe logic is on the main thread with a live NSView.
+    unsafe { tr_macos::window_visible(h.ns_view.as_ptr()).unwrap_or(false) }
+}
+// N2
+#[cfg(not(target_os = "macos"))]
+fn edgar_window_visible(_frame: &eframe::Frame) -> bool {
+    true
+}
+
+/// eframe is built without its `links` feature, so `Context::open_url` is otherwise a no-op.
+/// Hand every requested http(s) URL to the system opener, like the layout folder action.
+fn open_requested_urls(ctx: &egui::Context) {
+    for url in take_open_urls(ctx) {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let _ = std::process::Command::new(opener).arg(&url).spawn();
+    }
+}
+
+/// Remove this frame's open-URL requests, keeping only http(s) links.
+fn take_open_urls(ctx: &egui::Context) -> Vec<String> {
+    let urls = ctx.output_mut(|o| {
+        let mut urls = Vec::new();
+        o.commands.retain(|c| match c {
+            egui::OutputCommand::OpenUrl(open) => {
+                urls.push(open.url.clone());
+                false
+            }
+            _ => true,
+        });
+        urls
+    });
+    urls.into_iter().filter(|u| external_url(u)).collect()
+}
+
+fn external_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://")) && !url.chars().any(char::is_control)
+}
+
 impl eframe::App for TerminalApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.agent_logic(ctx);
         self.process_logic();
+        // N2: publish interest only on changes, never an HTTP request per frame.
+        let active = self.agent_demo.is_none()
+            && edgar_window_visible(frame)
+            && ctx.input(|i| i.viewport().minimized != Some(true))
+            && self.visible_panes().iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Filings(_)));
+        let mut symbols: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
+        symbols.sort();
+        symbols.dedup();
+        let interest = (active, symbols);
+        if self.edgar.interest.as_ref() != Some(&interest) {
+            self.worker.send(Request::EdgarInterest { active, symbols: interest.1.clone() });
+            self.edgar.interest = Some(interest);
+        }
+
         self.populate_agent_demo(ctx);
         // An edit arriving during an in-flight save still needs a fresh snapshot
         // while hidden. Poll only until that snapshot can start; never tick idle.
@@ -2859,6 +3129,11 @@ impl eframe::App for TerminalApp {
             self.applied_theme = Some(self.themes[ti].clone());
         }
         theme::refresh(&ctx, &self.themes[ti], self.system_accent);
+        // N1a
+        // Focus is not visibility: visible background windows must keep polling.
+        let news_hidden = ctx.input(|i| !i.raw.viewports.values().any(news_view::window_visible));
+        self.news_periodic(&self.visible_panes(), news_hidden);
+        // N1a
         self.periodic();
         self.sync_chart_navigation();
 
@@ -2979,6 +3254,7 @@ impl eframe::App for TerminalApp {
             }
         }
         self.observe_edits(true);
+        open_requested_urls(&ctx);
         self.capture_agent_demo(&ctx, screen);
         let cpu = frame_start.elapsed().as_secs_f64() * 1e3;
         self.perf_cpu_ms = self.perf_cpu_ms * 0.9 + cpu * 0.1;
@@ -3019,6 +3295,8 @@ impl TerminalApp {
     /// Shared by the offline review harness and session-free workspace tests.
     fn isolated_workspace(root: &std::path::Path, worker: Worker) -> Self {
         Self {
+            // N2
+            edgar: Default::default(),
             drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(egui::Context::default()),
             pinned_agent_chart: None,
@@ -3065,6 +3343,7 @@ impl TerminalApp {
             rebinding: None,
             hotkey_filter: String::new(),
             settings_tab: SettingsTab::Appearance,
+            data_sources: data_sources::State::default(),
             io_path: String::new(),
             curves: None,
             last_wei: None,
@@ -3081,6 +3360,9 @@ impl TerminalApp {
             status: String::new(),
             toasts: Vec::new(),
             alert_toasts: Vec::new(),
+            // N1a
+            news_subscription: None,
+            // N1a
             watchlist_undo: None,
             columns_in_flight: None,
             latest: Vec::new(),
@@ -3136,6 +3418,20 @@ mod tests {
     use super::*;
     use tr_core::Timeframe;
 
+    #[test]
+    fn link_clicks_reach_the_system_opener_http_only() {
+        // eframe's own opener is compiled out; the app must drain OpenUrl itself.
+        let ctx = egui::Context::default();
+        let form4 = "https://www.sec.gov/Archives/edgar/data/320193/x/xslF345X06/form4.xml";
+        ctx.open_url(egui::OpenUrl::new_tab(form4));
+        ctx.open_url(egui::OpenUrl::new_tab("file:///etc/passwd"));
+        ctx.open_url(egui::OpenUrl::new_tab("javascript:alert(1)"));
+        ctx.copy_text("kept".into());
+        assert_eq!(take_open_urls(&ctx), vec![form4.to_string()]);
+        assert!(take_open_urls(&ctx).is_empty());
+        assert!(ctx.output(|o| o.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(_)))));
+    }
+
     type SaveLog = std::sync::Arc<std::sync::Mutex<Vec<(SaveWrite, std::thread::ThreadId)>>>;
 
     fn autosave_fixture(tag: &str) -> (TerminalApp, SaveLog) {
@@ -3176,6 +3472,29 @@ mod tests {
         app.autosave();
         assert!(app.saves.job.is_none());
         assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn data_source_settings_persist_in_app_settings() {
+        let (mut app, log) = autosave_fixture("data-source-settings");
+        let sources = tr_net::Settings {
+            pause_all: true,
+            finnhub: false,
+            sec: false,
+            yahoo_news: false,
+            coindesk: false,
+            sec_contact: "research@example.test".into(),
+            ..Default::default()
+        };
+        app.data_sources.settings = sources.clone();
+        app.save_settings();
+        let writes = log.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0.0, app.settings_file);
+        let restored: Settings = serde_json::from_slice(&writes[0].0.1).unwrap();
+        assert!(restored.data_sources == sources);
+        let legacy: Settings = serde_json::from_str(r#"{"watchlist":[]}"#).unwrap();
+        assert!(legacy.data_sources == tr_net::Settings::default());
     }
 
     #[test]

@@ -53,6 +53,43 @@ impl Link {
     }
 }
 
+// N1a: untagged legacy string support preserves pre-news-store layouts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "NewsCompat")]
+pub struct NewsSettings {
+    pub symbol: Option<String>,
+    pub filters: tr_data::news_store::Filters,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NewsCompat {
+    Legacy(String),
+    Current {
+        #[serde(default)]
+        symbol: Option<String>,
+        #[serde(default)]
+        filters: tr_data::news_store::Filters,
+    },
+}
+impl From<NewsCompat> for NewsSettings {
+    fn from(value: NewsCompat) -> Self {
+        match value {
+            NewsCompat::Legacy(symbol) => Self { symbol: Some(symbol), ..Default::default() },
+            NewsCompat::Current { symbol, filters } => Self { symbol, filters },
+        }
+    }
+}
+impl From<String> for NewsSettings {
+    fn from(symbol: String) -> Self {
+        Self { symbol: Some(symbol), ..Default::default() }
+    }
+}
+impl From<&str> for NewsSettings {
+    fn from(symbol: &str) -> Self {
+        symbol.to_string().into()
+    }
+}
+// N1a
 fn default_drawing_tools() -> [tr_chart::drawings::Tool; 5] {
     crate::drawing_toolbar::State::default().last
 }
@@ -117,7 +154,9 @@ pub enum PaneSettings {
     Curve,
     Search(String),
     /// Headlines for a security (`None` = general market news).
-    News(Option<String>),
+    News(Option<NewsSettings>),
+    // N2: serde defaults keep existing layouts valid.
+    Filings(crate::filings_view::Settings),
     OrderBook {
         symbol: String,
         depth: usize,

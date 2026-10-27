@@ -16,7 +16,9 @@ pub mod alpaca;
 pub mod cache;
 pub mod crypto;
 pub mod crypto_catalog;
+pub mod finnhub;
 pub mod markets;
+pub mod news_store;
 pub mod questrade;
 pub mod rss;
 pub mod sample;
@@ -67,6 +69,8 @@ pub enum EventKind {
     Earnings,
     Dividend,
     Split,
+    /// SEC filing metadata from the local EDGAR store (never fetched on chart load).
+    Filing,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChartEvent {

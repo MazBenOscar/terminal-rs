@@ -20,7 +20,7 @@ Every new external source follows these rules:
 
 | Host | Published limit | Our rate | Concurrency | Daily cap | Poll cadence |
 |---|---|---|---|---|---|
-| finnhub.io (free) | ~60 calls/min | ≤ 20/min | 1 | 3,000 | market news every 5 min; company news per watchlist symbol every 30 min, round-robin |
+| finnhub.io (free) | ~60 calls/min | ≤ 20/min | 1 | 3,000 | general every 5 min; forex/crypto/merger every 15 min only with All-market visible; company interval max(30 min, ceil(US symbols × 24 h / 2,000)), max 2,000 company jobs/day |
 | sec.gov / data.sec.gov | 10 req/s | ≤ 1 req/s | 1 | 1,500 | latest-filings Atom feed every 10 min; per-company JSON only for new hits |
 | query1.finance.yahoo.com | unpublished | unchanged, but via the guard | 1 | 1,000 | fallback only |
 | coindesk.com RSS | unpublished | 1 per 5 min | 1 | 300 | crypto only |
@@ -52,6 +52,14 @@ Hidden window or no visible news/filings pane → no polling (fixes the perf-aud
 - News pane: scope selector (symbol / watchlist / all), source filter, include/exclude keywords, search over history, date range, pause, ticker chips that open a chart. Layout saves scope and filters.
 - Tests: Finnhub fixtures, cursor handling, ID normalisation, never-blank rules, filters, pane scope.
 
+#### N1a review fixes (2026-10-26)
+- Store the requested market category, not Finnhub's topic label. Resolve related ticker chips only through the local symbol catalogue; skip individual malformed items and nonpositive timestamps.
+- Plan at most 2,576 Finnhub jobs/day with All-market visible (288 general + 288 other categories + 2,000 company). Twenty US symbols plan 1,536/day; 150 plan 2,576/day. Without All-market, these are 1,248 and 2,288/day. Visible linked symbols join the scheduler with priority; non-US/crypto symbol panes retain the guarded Yahoo/CoinDesk path even with a Finnhub key.
+- Fallback watchlists select at most one symbol/minute and one attempt/symbol/hour, sharing one round across visible panes. Completion, not round start, sets the next-round delay. An error consumes only that symbol's slot. Symbol/market panes retain a five-minute cadence, with shared requests cached by the guard. All fallback selections additionally share a rolling 60/hour ceiling; Yahoo's machine-wide 1,000/day cap still applies. Watchlist-only bounds: 480 selections/day for 20 symbols; at most 1,440 for 150 (at most 1,000 Yahoo network requests after the guard).
+- Preserve a bad database as `news.sqlite3.corrupt-<unix>` (and preserve its journals), reopen fresh, otherwise use an in-memory store and show “Saved headlines unavailable”.
+- Today starts at local midnight; FTS and LIKE use matching per-term prefixes; SQL applies filters before LIMIT/OFFSET. Retain existing headlines but explain empty selections, keep pause counts view-local, and show relative update times. Suppress unchanged item replies; status transitions are separate and are not a heartbeat.
+- Window visibility/minimization gates polling, never focus. Load the Finnhub secret at startup and on Settings saves/removals only. Spacing refusal is `Busy`, retried after Finnhub's three-second spacing rather than an hour-long budget backoff.
+
 ### N1b: story intelligence and pane polish (`codex/news-stories`)
 Ideas taken from FinceptTerminal's news module (ideas only; no code is copied):
 - Story clusters: Jaccard similarity of headline tokens (0.25, relaxed to 0.20 within a category) inside 24 h; one row per story with "N sources", lead item from the best source, and a rising/stable/falling badge. A wire/stories toggle.
@@ -66,6 +74,18 @@ Ideas taken from FinceptTerminal's news module (ideas only; no code is copied):
 - Latest-filings Atom feed (8-K, 10-Q, 10-K, S-1, 13D/G, 4) every 10 min; keep only CIKs on the user's watchlists; fetch `submissions/CIK##########.json` only for those, conditionally.
 - Filings pane (CF-style): per symbol or watchlist, form filter, 8-K item codes decoded ("2.02 Results of Operations"), opens the filing in the browser. 8-Ks also appear in the News pane as a source.
 - Chart: filing markers via the existing generic `ChartEvent` path (new `EventKind::Filing`).
+
+#### N2-FIX implementation notes (2026-10-26)
+
+- Cadence is claimed atomically in the machine-wide `tr_net` ledger: `sec:feed:8-K` and `sec:feed:4` (600 s), `sec:map` (24 h), `sec:sweep:<cik>` (at least 24 h), and `sec:sub:<cik>` (600 s). Generic slot deferrals and durable counters keep failure escalation and pending limits from resetting in a fresh data directory.
+- Failed CIKs consume their round-robin turn. Retry backoff is 1 h → 6 h → 24 h; three consecutive failed daily turns suspend that CIK for seven days, with an explicit pane status. Pending accessions remain pending until submissions contain them, with at most three pending requests per sweep cycle across instances.
+- Newly added CIKs bypass stale local sweep scheduling, but not pacing. First imports are separated by at least 60 s; sweep requests also share a machine-wide 144 s turn, limiting sweeps to 600 requests/day. Above 600 companies the refresh period is `ceil(companies / 600)` days, displayed in the pane.
+- The 1,500/day SEC cap remains machine-wide. All submissions requests stop at 1,200 requests today (80%), atomically in the guard's reservation transaction, reserving room for feeds. Feed requests keep the full cap. Redirect hops count individually and obey both ceilings.
+- `send_with_metadata` returns the body and its own validators together, including coalesced and redirected responses. Validators are saved only after successful processing. Only parsed, tracked filings within 90 days are stored; legacy whole-body submissions cache entries are deleted. The first import displays 30 days; later refreshes can expose the already-parsed 90-day cache after a 304.
+- Filing identity is `(CIK, accession, issuer/reporting-owner role)`. The stored ticker is stable, while pane and chart readers resolve all share classes through the company map. Pane timestamps use acceptance time when available and otherwise show only the filing date. Reporting-owner Form 4 hits are retained but hidden from the default issuer pane.
+- Chart loads reuse a cached store connection and query the charted CIK through the CIK/acceptance-or-filing-time index. XML legacy decoding is restricted to the declaration; body text is not rewritten.
+
+Budget examples (continuous visible polling, direct responses): the two feeds cost 288/day, the map at most 1/day, and an ordinary daily sweep costs 50/day or 300/day: **339/day for 50 companies; 589/day for 300** before pending enrichment. A conservative sweep-cycle allowance of three pending fetches per company adds 150 or 900, giving **489** or **1,489**. A UTC calendar day can straddle a pending-counter reset at a daily sweep: for a fixed machine-wide set of N companies, allow up to six pending requests plus one sweep per company across the two partial cycles. This gives a conservative direct-response calendar-day bound of `min(289 + 7*N, 1489)`: **639/day for 50 companies; 1,489/day for 300**. Watchlist churn, additional instances with different watched sets, or redirect hops are not covered by that fixed-set estimate: the unconditional machine-wide maximum is **1,500/day for either size**. With direct responses, the 1,200 submissions cutoff plus at most 288 remaining feed requests and one map request gives a tighter traffic ceiling of **1,489/day**, independent of watchlist size. These are request bounds, not promises that every company refresh will complete when budget is deferred.
 
 ### N3: insider trades, Form 4 (`codex/edgar-insiders`)
 - Parse Form 4 XML (owner, role, transaction code, shares, price, post-transaction holdings); only for watchlist CIKs found in the feed.

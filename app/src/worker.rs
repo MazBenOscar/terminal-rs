@@ -276,6 +276,14 @@ pub enum AgentRequest {
 }
 
 pub enum Request {
+    // N2
+    EdgarInterest {
+        active: bool,
+        symbols: Vec<String>,
+    },
+    DataSources {
+        action: crate::app::data_sources::Action,
+    },
     Agent(AgentRequest),
     SecurityNames(Vec<String>),
     WatchlistColumns {
@@ -327,11 +335,13 @@ pub enum Request {
         symbol: String,
         expiration: Option<i64>,
     },
-    /// Headlines for a market key (`None` = general market news).
-    News {
-        pane: PaneId,
-        symbol: Option<String>,
+    // N1a: visibility changes carry the complete query; fetching is scheduler-only.
+    NewsVisible {
+        views: Vec<NewsView>,
+        watchlist: Vec<String>,
     },
+    NewsRead(NewsView),
+    // N1a
     OrderBook {
         pane: PaneId,
         symbol: String,
@@ -568,6 +578,12 @@ pub struct Profile {
 }
 
 pub enum Response {
+    // N2
+    Edgar {
+        rows: Arc<Vec<tr_edgar::Filing>>,
+        status: String,
+        updated: i64,
+    },
     SessionHistory {
         history: SessionHistory,
         bars: Arc<Vec<Bar>>,
@@ -633,6 +649,7 @@ pub enum Response {
     },
     /// Outcome of a [`QuestradeAction`]: a status line or an error.
     Questrade(Result<String, String>),
+    DataSources(crate::app::data_sources::Reply),
     Scan {
         pane: PaneId,
         generation: u64,
@@ -661,11 +678,17 @@ pub enum Response {
         symbol: String,
         chain: Result<Box<tr_data::OptionChain>, String>,
     },
-    News {
-        pane: PaneId,
-        symbol: Option<String>,
-        items: Result<Vec<tr_data::NewsItem>, String>,
+    // N1a
+    NewsSaved {
+        view: NewsView,
+        items: Result<Vec<tr_data::news_store::Story>, String>,
+        status: String,
     },
+    NewsStatus {
+        view: NewsView,
+        status: String,
+    },
+    // N1a
     OrderBook {
         pane: PaneId,
         symbol: String,
@@ -1028,7 +1051,16 @@ impl CompareCache {
     }
 }
 
+// N1a
+mod news;
+pub use news::View as NewsView;
+// N1a
 struct Shared {
+    // N1a
+    news: news::Service,
+    // N1a
+    // N2
+    edgar_interest: tokio::sync::watch::Sender<(bool, Vec<String>)>,
     provider: Provider,
     /// Shared across scanner panes; opening more panes cannot multiply exchange load.
     scan_slots: tokio::sync::Semaphore,
@@ -1077,6 +1109,13 @@ impl Worker {
     }
 
     pub fn spawn(ctx: egui::Context, provider: Provider) -> anyhow::Result<Self> {
+        // Configure the shared news guard before any worker request can run.
+        let settings = match std::fs::read(data_dir().join("settings.json")) {
+            Ok(bytes) => tr_net::Settings::from_document(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => tr_net::Settings::default(),
+            Err(_) => tr_net::Settings::corrupt(),
+        };
+        tr_net::configure_shared(settings);
         let dir = data_dir();
         std::fs::create_dir_all(&dir)?;
         let db = Db::open(dir.join("congress.sqlite3")).or_else(|e| {
@@ -1095,8 +1134,15 @@ impl Worker {
             .build()?;
         let (tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<Request>();
         let (out, rx) = mpsc::channel();
+        // N2
+        let (edgar_interest, _edgar_rx) = tokio::sync::watch::channel((false, Vec::new()));
         let shared = Arc::new(Shared {
+            // N2
+            edgar_interest,
             provider,
+            // N1a
+            news: Default::default(),
+            // N1a
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_outputs: Default::default(),
@@ -1111,6 +1157,15 @@ impl Worker {
             out,
             ctx,
         });
+
+        // N1a: open/prune once, and run exactly one news loop per worker.
+        let (news_store, memory_only) = news::open_store(&dir.join("news.sqlite3"));
+        *shared.news.store.try_lock().expect("new service") = news_store;
+        *shared.news.memory_only.try_lock().expect("new service") = memory_only;
+        *shared.news.key.try_lock().expect("new service") =
+            tr_broker::secrets::SecretStore::platform_for(&dir, "finnhub").load_text().ok().flatten();
+        rt.spawn(news::run(shared.clone()));
+        // N1a
 
         // Load cached names on the worker even in sample mode; only lookups require a network.
         let s = shared.clone();
@@ -1130,10 +1185,20 @@ impl Worker {
         let s = shared.clone();
         rt.spawn(async move {
             while let Some(req) = req_rx.recv().await {
+                // N1a: serialize subscription changes so an older snapshot cannot resurrect a hidden pane.
+                if matches!(&req, Request::NewsVisible { .. }) {
+                    handle(&s, req).await;
+                    continue;
+                }
+                // N1a
                 let s = s.clone();
                 tokio::spawn(async move { handle(&s, req).await });
             }
         });
+
+        // N2: independent timer, no per-frame polling and no repaint unless the snapshot changes.
+        let s = shared.clone();
+        rt.spawn(edgar_loop(s, _edgar_rx));
 
         // Scheduled congressional disclosure refresh.
         let s = shared.clone();
@@ -1160,6 +1225,67 @@ impl Worker {
 
     pub fn send(&self, req: Request) {
         let _ = self.tx.send(req);
+    }
+}
+
+// N2: the task owns the SQLite connection; charts independently read the same WAL store.
+async fn edgar_loop(s: Arc<Shared>, mut interest: tokio::sync::watch::Receiver<(bool, Vec<String>)>) {
+    let store = match tr_edgar::store::Store::open(data_dir().join("edgar.sqlite3")) {
+        Ok(store) => store,
+        Err(_) => {
+            s.send(Response::Edgar {
+                rows: Default::default(),
+                status: "SEC EDGAR · store unavailable".into(),
+                updated: 0,
+            });
+            return;
+        }
+    };
+    let mut scheduler = tr_edgar::scheduler::Scheduler::new(store, tr_edgar::scheduler::Sec);
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut previous = None;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {},
+            changed = interest.changed() => { if changed.is_err() { return; } },
+        }
+        let (active, symbols) = interest.borrow_and_update().clone();
+        if !active || s.ctx.input(|i| i.viewport().minimized == Some(true)) {
+            continue;
+        }
+        let now = chrono::Utc::now().timestamp();
+        // N2: show persisted history immediately, before a potentially slow guarded refresh.
+        if previous.is_none() {
+            let updated = scheduler.store.number("updated").unwrap_or(0);
+            if updated > 0 {
+                scheduler.status = "SEC EDGAR · updated".into();
+            }
+            if let Ok(rows) = scheduler.store.filings() {
+                let snapshot = (rows, scheduler.status.clone(), updated);
+                s.send(Response::Edgar { rows: Arc::new(snapshot.0.clone()), status: snapshot.1.clone(), updated });
+                previous = Some(snapshot);
+            }
+        }
+        tokio::select! {
+            _ = scheduler.tick(now, true, &symbols) => {},
+            changed = interest.changed() => { if changed.is_err() { return; } else { continue; } },
+        }
+        let rows = match scheduler.store.filings() {
+            Ok(rows) => rows,
+            Err(_) => continue,
+        };
+        let status = if scheduler.status.starts_with("SEC EDGAR · updated") {
+            "SEC EDGAR · updated".into()
+        } else {
+            scheduler.status.clone()
+        };
+        let updated = scheduler.store.number("updated").unwrap_or(0);
+        let snapshot = (rows, status, updated);
+        if previous.as_ref() != Some(&snapshot) {
+            s.send(Response::Edgar { rows: Arc::new(snapshot.0.clone()), status: snapshot.1.clone(), updated });
+            previous = Some(snapshot);
+        }
     }
 }
 
@@ -1625,6 +1751,10 @@ async fn handle_agent(s: &Shared, request: AgentRequest) {
 
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
+        // N2
+        Request::EdgarInterest { active, symbols } => {
+            s.edgar_interest.send_replace((active, symbols));
+        }
         Request::Agent(request) => handle_agent(s, request).await,
         Request::SecurityNames(symbols) => {
             use futures::StreamExt;
@@ -1654,6 +1784,17 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             }
             names.save(&path);
             s.send(Response::SecurityNames(names.clone()));
+        }
+        Request::DataSources { action } => {
+            let changed = !matches!(&action, crate::app::data_sources::Action::Status);
+            let key = s.news.key.lock().await.clone();
+            let reply = crate::app::data_sources::perform(action, key.as_deref()).await;
+            if changed {
+                // N1a: notify the news worker only on key edits, never on a polling timer.
+                *s.news.key.lock().await =
+                    tr_broker::secrets::SecretStore::platform_for(&data_dir(), "finnhub").load_text().ok().flatten();
+            }
+            s.send(Response::DataSources(reply));
         }
         Request::Questrade { handle, action } => {
             let test = async |h: &tr_data::questrade::Questrade| {
@@ -2125,6 +2266,26 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     notice.push_str(&format!(" · import error: {e}"));
                 }
             }
+            // N2: only the local store; a chart request can never trigger an SEC fetch.
+            let edgar_path = data_dir().join("edgar.sqlite3");
+            if edgar_path.exists() {
+                // N2: cache one connection per local store; schema work occurs only at first open.
+                static STORES: std::sync::OnceLock<
+                    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, tr_edgar::store::Store>>,
+                > = std::sync::OnceLock::new();
+                let rows = (|| -> anyhow::Result<_> {
+                    let mut stores =
+                        STORES.get_or_init(Default::default).lock().map_err(|_| anyhow::anyhow!("SEC store lock"))?;
+                    if !stores.contains_key(&edgar_path) {
+                        stores.insert(edgar_path.clone(), tr_edgar::store::Store::open(&edgar_path)?);
+                    }
+                    stores[&edgar_path].chart_filings(&symbol, start, end)
+                })();
+                match rows {
+                    Ok(rows) => events.extend(crate::chart_events::filings(&rows, &symbol, start, end)),
+                    Err(_) => notice.push_str(" · SEC EDGAR store unavailable"),
+                }
+            }
             events.sort_by_key(|e| e.ts);
             events.dedup_by(|a, b| a.ts == b.ts && a.kind == b.kind && a.detail == b.detail);
             s.send(Response::ChartEvents { pane, generation, symbol, start, end, events, notice });
@@ -2283,10 +2444,16 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let chain = s.provider.options(&symbol, expiration).await.map(Box::new).map_err(|e| format!("{e:#}"));
             s.send(Response::Options { pane, symbol, chain });
         }
-        Request::News { pane, symbol } => {
-            let items = s.provider.news(symbol.as_deref()).await.map_err(|e| format!("{e:#}"));
-            s.send(Response::News { pane, symbol, items });
+        // N1a: requests read the store only; visibility controls the background loop.
+        Request::NewsVisible { views, watchlist } => {
+            *s.news.watchlist.lock().await = watchlist;
+            *s.news.views.lock().await = views.clone();
+            for view in views {
+                news::read(s, view).await;
+            }
         }
+        Request::NewsRead(view) => news::read(s, view).await,
+        // N1a
         Request::OrderBook { pane, symbol, depth } => {
             let book = s.provider.order_book(&symbol, depth).await.map_err(|e| format!("{e:#}"));
             s.send(Response::OrderBook { pane, symbol, book });
@@ -3101,7 +3268,12 @@ mod tests {
         let (out, rx) = mpsc::channel();
         (
             Arc::new(Shared {
+                // N2
+                edgar_interest: tokio::sync::watch::channel((false, Vec::new())).0,
                 provider,
+                // N1a
+                news: Default::default(),
+                // N1a
                 scan_slots: tokio::sync::Semaphore::new(4),
                 study_histories: Default::default(),
                 study_outputs: Default::default(),
@@ -4230,8 +4402,15 @@ mod tests {
     #[test]
     fn automatic_refresh_reports_a_changed_route_instead_of_staying_loading() {
         let (out, rx) = mpsc::channel();
+        // N2
+        let (edgar_interest, _edgar_rx) = tokio::sync::watch::channel((false, Vec::new()));
         let shared = Arc::new(Shared {
+            // N2
+            edgar_interest,
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)),
+            // N1a
+            news: Default::default(),
+            // N1a
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_outputs: Default::default(),
@@ -4375,7 +4554,12 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let (out, rx) = mpsc::channel();
         let s = Arc::new(Shared {
+            // N2
+            edgar_interest: tokio::sync::watch::channel((false, Vec::new())).0,
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 20)),
+            // N1a
+            news: Default::default(),
+            // N1a
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_outputs: Default::default(),
@@ -4456,7 +4640,12 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let (out, _rx) = mpsc::channel();
         let s = Shared {
+            // N2
+            edgar_interest: tokio::sync::watch::channel((false, Vec::new())).0,
             provider: Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 400)),
+            // N1a
+            news: Default::default(),
+            // N1a
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_outputs: Default::default(),
@@ -4532,7 +4721,12 @@ mod tests {
         });
         let (out, _rx) = mpsc::channel();
         let s = Shared {
+            // N2
+            edgar_interest: tokio::sync::watch::channel((false, Vec::new())).0,
             provider: fixture.clone(),
+            // N1a
+            news: Default::default(),
+            // N1a
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_outputs: Default::default(),
@@ -4615,7 +4809,12 @@ mod tests {
     fn series_generations_only_move_forward() {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
+            // N2
+            edgar_interest: tokio::sync::watch::channel((false, Vec::new())).0,
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
+            // N1a
+            news: Default::default(),
+            // N1a
             scan_slots: tokio::sync::Semaphore::new(4),
             study_histories: Default::default(),
             study_outputs: Default::default(),

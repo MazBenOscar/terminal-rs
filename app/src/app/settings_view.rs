@@ -20,17 +20,19 @@ pub enum SettingsTab {
     Panels,
     Layouts,
     Brokerage,
+    DataSources,
     Trading,
 }
 
 impl SettingsTab {
-    pub(super) const ALL: [SettingsTab; 7] = [
+    pub(super) const ALL: [SettingsTab; 8] = [
         SettingsTab::Appearance,
         SettingsTab::Themes,
         SettingsTab::Hotkeys,
         SettingsTab::Panels,
         SettingsTab::Layouts,
         SettingsTab::Brokerage,
+        SettingsTab::DataSources,
         SettingsTab::Trading,
     ];
 
@@ -42,6 +44,7 @@ impl SettingsTab {
             SettingsTab::Panels => "Panels",
             SettingsTab::Layouts => "Layouts",
             SettingsTab::Brokerage => "Brokerage",
+            SettingsTab::DataSources => "Data sources",
             SettingsTab::Trading => "Trading",
         }
     }
@@ -130,6 +133,7 @@ impl TerminalApp {
                 SettingsTab::Panels => self.panels_tab(ui, &mut cmds),
                 SettingsTab::Layouts => self.layouts_tab(ui, &mut cmds),
                 SettingsTab::Brokerage => self.brokerage_tab(ui),
+                SettingsTab::DataSources => self.data_sources_tab(ui),
                 SettingsTab::Trading => self.trading_tab(ui, &mut cmds),
             }
         });

@@ -1,0 +1,18 @@
+[package]
+name = "tr-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# N1a: opt-in localhost transport for dependent crates' fixture tests only.
+[features]
+test-support = []
+
+[dependencies]
+reqwest.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

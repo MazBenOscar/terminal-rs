@@ -101,6 +101,22 @@ mod imp {
         Some(super::Chrome { titlebar_height: titlebar, traffic_lights_width: lights })
     }
 
+    // N2: hide/minimize/occlusion must stop external-source schedulers, without a repaint timer.
+    pub unsafe fn window_visible(ns_view: *mut c_void) -> Option<bool> {
+        MainThreadMarker::new()?;
+        if ns_view.is_null() {
+            return None;
+        }
+        // SAFETY: caller guarantees a live main-thread NSView.
+        let view: &NSView = unsafe { &*(ns_view as *const NSView) };
+        let window = view.window()?;
+        Some(
+            window.isVisible()
+                && !window.isMiniaturized()
+                && window.occlusionState().contains(objc2_app_kit::NSWindowOcclusionState::Visible),
+        )
+    }
+
     pub fn accent_color() -> Option<[u8; 3]> {
         MainThreadMarker::new()?;
         let c = NSColor::controlAccentColor();
@@ -111,6 +127,23 @@ mod imp {
 
     pub fn reduce_motion() -> bool {
         NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+    }
+}
+
+// N2
+/// Whether the owning window is visible, non-minimized and unoccluded. Unsupported elsewhere.
+///
+/// # Safety
+/// On macOS, `ns_view` must be a live `NSView*` on the main thread.
+pub unsafe fn window_visible(ns_view: *mut c_void) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { imp::window_visible(ns_view) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ns_view;
+        None
     }
 }
 
