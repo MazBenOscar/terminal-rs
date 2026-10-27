@@ -188,6 +188,7 @@ fn row_columns_omit_linked_symbol_and_include_union_meta() {
     let mut stories = stories();
     stories[0].source = "Reuters".into();
     stories[0].item.tickers = vec!["AAPL US Equity".into(), "MSFT US Equity".into(), "NVDA US Equity".into()];
+    stories[0].subjects = stories[0].item.tickers.clone();
     let mut cluster = Cluster::wire(&stories[0]);
     cluster.sources = vec!["Reuters".into(), "Yahoo".into(), "CNBC".into()];
     let model = row_model(&cluster, Some("AAPL US Equity"), cluster.newest + 12 * 60);
@@ -202,7 +203,7 @@ fn row_columns_omit_linked_symbol_and_include_union_meta() {
     assert!(model.unread);
     cluster.members[0].seen = true;
     assert!(!row_model(&cluster, None, cluster.newest).unread);
-    let single = Cluster::wire(&tr_data::news_store::Story::new(
+    let mut single = Cluster::wire(&tr_data::news_store::Story::new(
         tr_data::NewsItem {
             title: "Only AAPL".into(),
             publisher: "Reuters".into(),
@@ -212,7 +213,47 @@ fn row_columns_omit_linked_symbol_and_include_union_meta() {
         },
         "Reuters",
     ));
+    single.subjects = vec!["AAPL US Equity".into()];
     assert_eq!(row_model(&single, Some("AAPL US Equity"), 2).ticker, None);
+}
+#[test]
+fn subject_display_is_amber_association_fallback_is_muted_and_chart_target_agrees() {
+    let mut s = tr_data::news_store::Story::new(
+        tr_data::NewsItem {
+            title: "Can JFrog Stock Keep Its Lead Over Its Industry?".into(),
+            publisher: "Publisher".into(),
+            link: "https://fixture.test/jfrog".into(),
+            ts: 100,
+            tickers: vec!["MSFT US Equity".into()],
+        },
+        "Publisher",
+    );
+    s.provider = "Finnhub".into();
+    s.subjects = vec!["FROG US Equity".into()];
+    let cluster = Cluster::wire(&s);
+    for linked in [None, Some("MSFT US Equity")] {
+        let model = row_model(&cluster, linked, 101);
+        assert_eq!(model.ticker.as_deref(), Some("FROG US Equity"));
+        assert!(model.ticker_is_subject);
+        assert!(model.extra_tickers.is_empty());
+        assert_eq!(model.about, "About: FROG · Also returned for: MSFT");
+        assert_eq!(chart_ticker(&cluster, linked), model.ticker.as_ref());
+    }
+    s.subjects.clear();
+    let cluster = Cluster::wire(&s);
+    let model = row_model(&cluster, Some("MSFT US Equity"), 101);
+    assert_eq!(model.ticker.as_deref(), Some("MSFT US Equity"));
+    assert!(!model.ticker_is_subject);
+    assert_eq!(model.ticker_hover, "Returned by Finnhub for MSFT; not mentioned in the story");
+    assert_eq!(chart_ticker(&cluster, Some("MSFT US Equity")), model.ticker.as_ref());
+    s.subjects = vec!["BTCUSD Curncy".into(), "FROG US Equity".into(), "NVDA US Equity".into()];
+    s.item.tickers.push("NVDA US Equity".into());
+    let cluster = Cluster::wire(&s);
+    let model = row_model(&cluster, Some("NVDA US Equity"), 101);
+    assert_eq!(model.ticker.as_deref(), Some("BTCUSD Curncy"));
+    assert_eq!(model.extra_tickers, vec!["FROG US Equity"]);
+    assert!(model.meta.contains(" · +1"));
+    assert!(model.about.contains("About: BTCUSD · FROG · NVDA"));
 }
 #[test]
 fn keyboard_reducer_boundaries_actions_escape_and_reordering() {

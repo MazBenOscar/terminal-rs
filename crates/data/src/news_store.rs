@@ -17,6 +17,9 @@ pub struct Story {
     /// Transport provider is separate from the publisher used for story leads.
     #[serde(default)]
     pub provider: String,
+    /// Ordered mentioned securities; associations remain in item.tickers.
+    #[serde(default)]
+    pub subjects: Vec<String>,
     pub summary: String,
     pub category: String,
     #[serde(default)]
@@ -25,6 +28,9 @@ pub struct Story {
     pub seen: bool,
 }
 impl Story {
+    pub fn known_tickers(&self) -> &[String] {
+        if self.subjects.is_empty() { &self.item.tickers } else { &self.subjects }
+    }
     pub fn new(item: NewsItem, source: &str) -> Self {
         let link = normalize_link(&item.link);
         let identity = if link.is_empty() { format!("{source}|{}", item.title) } else { link.clone() };
@@ -35,6 +41,7 @@ impl Story {
             source: source.into(),
             provider_id: String::new(),
             provider: source.into(),
+            subjects: vec![],
             summary: String::new(),
             category: "general".into(),
             tags,
@@ -182,7 +189,16 @@ pub fn whole_word(text: &str, keywords: &str) -> bool {
 pub struct NewsStore {
     db: Connection,
     fts: bool,
+    names: Option<crate::news_intelligence::NameIndex>,
+    edgar: Option<EdgarNames>,
 }
+type CompanyNames = Vec<(u64, String, String)>;
+struct EdgarNames {
+    db: Connection,
+    version: i64,
+    companies: CompanyNames,
+}
+
 impl NewsStore {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Self::init(Connection::open(path)?)
@@ -236,7 +252,13 @@ impl NewsStore {
         if !columns.iter().any(|c| c == "provider") {
             db.execute("ALTER TABLE items ADD COLUMN provider TEXT NOT NULL DEFAULT ''", [])?;
         }
-        db.execute("CREATE INDEX IF NOT EXISTS news_backfill ON items(published DESC) WHERE intelligence=0", [])?;
+        if !columns.iter().any(|c| c == "subjects") {
+            db.execute("ALTER TABLE items ADD COLUMN subjects TEXT NOT NULL DEFAULT '[]'", [])?;
+        }
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS news_subject_backfill ON items(published DESC) WHERE intelligence<2",
+            [],
+        )?;
         let fts = db
             .execute_batch(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS news_fts USING fts5(id UNINDEXED, headline, summary);
@@ -247,14 +269,57 @@ impl NewsStore {
             INSERT INTO news_fts SELECT id,headline,summary FROM items WHERE id NOT IN (SELECT id FROM news_fts);",
             )
             .is_ok();
-        let store = Self { db, fts };
+        let store = Self { db, fts, names: None, edgar: None };
         store.prune(chrono::Utc::now().timestamp())?;
         Ok(store)
+    }
+    /// Called only on the news worker. Missing/unreadable SEC data is optional.
+    /// data_version changes on external commits; only a changed companies map
+    /// rebuilds the index (filing imports do not). No requests or EDGAR writes.
+    pub fn refresh_names(&mut self, path: &std::path::Path) -> Result<()> {
+        if self.edgar.is_none() {
+            if !path.is_file() {
+                return Ok(());
+            }
+            let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            db.busy_timeout(std::time::Duration::from_millis(100))?;
+            self.edgar = Some(EdgarNames { db, version: -1, companies: vec![] });
+        }
+        let source = self.edgar.as_mut().expect("opened above");
+        let version = source.db.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        if source.version == version {
+            return Ok(());
+        }
+        // rowid is SEC insertion order, unlike the filing UI's alphabetical view.
+        let companies: CompanyNames = source
+            .db
+            .prepare("SELECT cik,ticker,title FROM companies ORDER BY rowid")?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if self.names.is_none() || companies != source.companies {
+            let fingerprint: String =
+                Sha1::digest(serde_json::to_vec(&companies)?).iter().map(|b| format!("{b:02x}")).collect();
+            let names = crate::news_intelligence::NameIndex::new(&companies);
+            if self.meta("subject_names")?.as_deref() != Some(&fingerprint) {
+                let tx = self.db.unchecked_transaction()?;
+                tx.execute("UPDATE items SET intelligence=1 WHERE intelligence>=2", [])?;
+                tx.execute("INSERT OR REPLACE INTO meta VALUES('subject_names',?1)", [&fingerprint])?;
+                tx.commit()?;
+            }
+            self.names = Some(names);
+            self.edgar.as_mut().expect("opened above").companies = companies;
+        }
+        self.edgar.as_mut().expect("opened above").version = version;
+        Ok(())
+    }
+    fn names(&self) -> &crate::news_intelligence::NameIndex {
+        self.names.as_ref().unwrap_or_else(|| crate::news_intelligence::default_names())
     }
     pub fn prune(&self, now: i64) -> Result<usize> {
         Ok(self.db.execute("DELETE FROM items WHERE published < ?1 AND bookmark=0", [now - 90 * 86400])?)
     }
     pub fn insert(&mut self, stories: &[Story], now: i64) -> Result<()> {
+        let names = self.names.as_ref().unwrap_or_else(|| crate::news_intelligence::default_names());
         let tx = self.db.transaction()?;
         for story in stories {
             // N1a used the transport source for link-less identities. Keep that
@@ -264,9 +329,14 @@ impl NewsStore {
             let id = canonical.id;
             tx.execute("INSERT OR IGNORE INTO items(id,source,provider_id,url,headline,summary,published,tickers,category,fetched,provider) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![id, story.source, story.provider_id, canonical.item.link, story.item.title, story.summary, story.item.ts, serde_json::to_string(&story.item.tickers)?, story.category, now, story.provider])?;
-            let (raw, title): (String, String) =
-                tx.query_row("SELECT tickers,headline FROM items WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (raw, title, summary): (String, String, String) =
+                tx.query_row("SELECT tickers,headline,summary FROM items WHERE id=?1", [&id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
             let mut tickers: Vec<String> = serde_json::from_str(&raw)?;
+            tickers.extend(story.item.tickers.clone());
+            let subjects = names.subjects(&title, &summary, &tickers);
+            tickers.extend(subjects.clone());
             tickers.extend(crate::news_intelligence::extract_tickers(&title, &[]));
             tickers.extend(crate::news_intelligence::extract_tickers(&story.item.title, &story.item.tickers));
             let tags = crate::news_intelligence::topic_tags(&title);
@@ -275,7 +345,7 @@ impl NewsStore {
             // A company/general duplicate must still reach the default market pane.
             // Preserve general membership if later fetched through a narrower endpoint.
             tx.execute(
-                "UPDATE items SET tickers=?2, tags=?4, intelligence=1,
+                "UPDATE items SET tickers=?2, tags=?4, subjects=?6, intelligence=2,
                 provider=CASE WHEN provider='' THEN source ELSE provider END,
                 source=CASE WHEN provider='' OR source=provider THEN ?5 ELSE source END, category=CASE
                 WHEN category='general' OR ?3='general' THEN 'general'
@@ -285,7 +355,8 @@ impl NewsStore {
                     serde_json::to_string(&tickers)?,
                     story.category,
                     serde_json::to_string(&tags)?,
-                    story.source
+                    story.source,
+                    serde_json::to_string(&subjects)?
                 ],
             )?;
         }
@@ -319,25 +390,27 @@ impl NewsStore {
     }
     /// Bounded lazy migration, executed only by the history worker, never by UI.
     fn backfill(&self, q: &Query) -> Result<()> {
-        let mut stmt = self.db.prepare("SELECT id,headline,tickers FROM items WHERE intelligence=0 AND published>=?1 AND published<=?2 ORDER BY published DESC LIMIT 2000")?;
+        let mut stmt = self.db.prepare("SELECT id,headline,tickers,summary FROM items WHERE intelligence<2 AND published>=?1 AND published<=?2 ORDER BY published DESC LIMIT 2000")?;
         let rows = stmt
             .query_map(params![q.start, q.end], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if rows.is_empty() {
             return Ok(());
         }
         let tx = self.db.unchecked_transaction()?;
-        for (id, title, raw) in rows {
-            let tickers = crate::news_intelligence::extract_tickers(
-                &title,
-                &serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default(),
-            );
+        for (id, title, raw, summary) in rows {
+            let associated = serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default();
+            let subjects = self.names().subjects(&title, &summary, &associated);
+            let mut tickers = crate::news_intelligence::extract_tickers(&title, &associated);
+            tickers.extend(subjects.clone());
+            tickers.sort();
+            tickers.dedup();
             let tags = crate::news_intelligence::topic_tags(&title);
             tx.execute(
-                "UPDATE items SET tickers=?2,tags=?3,intelligence=1,provider=CASE WHEN provider='' THEN source ELSE provider END WHERE id=?1",
-                params![id, serde_json::to_string(&tickers)?, serde_json::to_string(&tags)?],
+                "UPDATE items SET tickers=?2,tags=?3,subjects=?4,intelligence=2,provider=CASE WHEN provider='' THEN source ELSE provider END WHERE id=?1",
+                params![id, serde_json::to_string(&tickers)?, serde_json::to_string(&tags)?, serde_json::to_string(&subjects)?],
             )?;
         }
         tx.commit()?;
@@ -347,7 +420,7 @@ impl NewsStore {
         // Enrichment is optional: read-only disks and transient write failures
         // must never hide otherwise readable saved history.
         let _ = self.backfill(q);
-        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category,tags,seen,provider FROM items WHERE published>=?1 AND published<=?2".to_string();
+        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category,tags,seen,provider,subjects FROM items WHERE published>=?1 AND published<=?2".to_string();
         let search = if self.fts && !q.filters.search.trim().is_empty() {
             sql.push_str(" AND id IN (SELECT id FROM news_fts WHERE news_fts MATCH ?3)");
             let terms = terms(&q.filters.search);
@@ -380,6 +453,7 @@ impl NewsStore {
                     provider_id: r.get(2)?,
                     provider: r.get(11)?,
                     summary: r.get(5)?,
+                    subjects: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
                     category: r.get(8)?,
                     tags: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
                     seen: r.get(10)?,

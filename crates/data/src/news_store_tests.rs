@@ -178,6 +178,104 @@ fn review_today_uses_local_calendar_midnight() {
 }
 
 #[test]
+fn n1b_subject_column_migration_and_user_examples_preserve_scope_and_seen() {
+    let now = chrono::Utc::now().timestamp();
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch("CREATE TABLE items(id TEXT PRIMARY KEY,source TEXT NOT NULL,provider_id TEXT NOT NULL,url TEXT NOT NULL,headline TEXT NOT NULL,summary TEXT NOT NULL,published INTEGER NOT NULL,tickers TEXT NOT NULL,category TEXT NOT NULL,fetched INTEGER NOT NULL,seen INTEGER NOT NULL DEFAULT 0,bookmark INTEGER NOT NULL DEFAULT 0,tags TEXT NOT NULL DEFAULT '[]',intelligence INTEGER NOT NULL DEFAULT 1,provider TEXT NOT NULL DEFAULT 'Finnhub');").unwrap();
+    for (id, title, ticker) in [
+        ("frog", "Can JFrog Stock Keep Its Lead Over Its Industry?", "MSFT US Equity"),
+        ("btc", "Investor Who Called the AI Boom Predicts a Bitcoin Crash", "NVDA US Equity"),
+    ] {
+        connection.execute("INSERT INTO items(id,source,provider_id,url,headline,summary,published,tickers,category,fetched,seen) VALUES(?1,'Publisher','7','',?2,'',?3,?4,'company',?3,1)",
+            params![id, title, now, serde_json::to_string(&[ticker]).unwrap()]).unwrap();
+    }
+    let mut db = NewsStore::init(connection).unwrap();
+    assert_eq!(
+        db.db
+            .query_row("SELECT COUNT(*) FROM items WHERE subjects='[]' AND intelligence=1", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    db.names = Some(crate::news_intelligence::NameIndex::new(&[(1, "FROG".into(), "JFrog Ltd".into())]));
+    for (association, subject) in [("MSFT US Equity", "FROG US Equity"), ("NVDA US Equity", "BTCUSD Curncy")] {
+        let rows = db.query(&Query { symbols: vec![association.into()], ..Default::default() }).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subjects, vec![subject]);
+        assert!(rows[0].item.tickers.contains(&association.into()));
+        assert!(rows[0].item.tickers.contains(&subject.into()));
+        assert!(rows[0].seen);
+        assert_eq!(rows[0].provider, "Finnhub");
+    }
+    let q = Query { symbols: vec!["FROG US Equity".into()], ..Default::default() };
+    assert_eq!(db.query(&q).unwrap().len(), 1, "extracted subjects join association membership");
+    db.db.execute("UPDATE items SET headline='Unmentioned' WHERE id='frog'", []).unwrap();
+    assert_eq!(db.query(&q).unwrap()[0].subjects, vec!["FROG US Equity"], "completed rows are not rescanned");
+}
+#[test]
+fn subject_backfill_is_bounded_and_read_failures_are_optional() {
+    let mut db = NewsStore::memory().unwrap();
+    let items: Vec<_> = (0..2001)
+        .map(|i| story(&format!("https://fixture.test/bound/{i}"), "Bitcoin gains", 100, "", "Reuters"))
+        .collect();
+    db.insert(&items, 101).unwrap();
+    db.db.execute("UPDATE items SET intelligence=1,subjects='[]'", []).unwrap();
+    db.query(&Query::default()).unwrap();
+    assert_eq!(
+        db.db.query_row("SELECT COUNT(*) FROM items WHERE intelligence=1", [], |r| r.get::<_, i64>(0)).unwrap(),
+        1
+    );
+    db.query(&Query::default()).unwrap();
+    assert_eq!(
+        db.db.query_row("SELECT COUNT(*) FROM items WHERE intelligence=1", [], |r| r.get::<_, i64>(0)).unwrap(),
+        0
+    );
+    db.db.execute("UPDATE items SET intelligence=1,subjects='[]'", []).unwrap();
+    db.db.execute_batch("PRAGMA query_only=ON").unwrap();
+    let rows = db.query(&Query::default()).unwrap();
+    assert_eq!(rows.len(), 200);
+    assert!(rows.iter().all(|s| s.subjects.is_empty()));
+}
+#[test]
+fn worker_names_read_only_edgar_map_refresh_and_missing_file() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join(format!(
+        "subject-edgar-{}-{}.sqlite3",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+    ));
+    let mut db = NewsStore::memory().unwrap();
+    db.refresh_names(&path).unwrap();
+    assert!(!path.exists(), "optional read must not create an EDGAR database");
+    let source = Connection::open(&path).unwrap();
+    source.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE companies(ticker TEXT PRIMARY KEY,cik INTEGER,title TEXT); CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
+        INSERT INTO companies VALUES('GOOGL',1,'Alphabet Inc. Class A'),('GOOG',1,'Alphabet Inc. Class C'),('FROG',2,'JFrog Ltd');").unwrap();
+    db.refresh_names(&path).unwrap();
+    assert!(db.edgar.as_ref().unwrap().db.execute("INSERT INTO companies VALUES('BAD',3,'Bad Corp')", []).is_err());
+    let mut s =
+        story("https://fixture.test/local", "JFrog partners with Alphabet Inc.", 100, "MSFT US Equity", "Reuters");
+    s.summary = "Nvidia supplies chips".into();
+    db.insert(&[s], 101).unwrap();
+    let q = Query { symbols: vec!["MSFT US Equity".into()], ..Default::default() };
+    assert_eq!(db.query(&q).unwrap()[0].subjects, vec!["FROG US Equity", "GOOGL US Equity", "NVDA US Equity"]);
+    source.execute("INSERT INTO meta VALUES('filing','new')", []).unwrap();
+    db.refresh_names(&path).unwrap();
+    assert_eq!(
+        db.db.query_row("SELECT intelligence FROM items", [], |r| r.get::<_, i64>(0)).unwrap(),
+        2,
+        "non-company commits do not rebuild"
+    );
+    source.execute("UPDATE companies SET ticker='FROG2' WHERE ticker='FROG'", []).unwrap();
+    db.refresh_names(&path).unwrap();
+    assert_eq!(db.db.query_row("SELECT intelligence FROM items", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    let rows = db.query(&q).unwrap();
+    assert_eq!(rows[0].subjects[0], "FROG2 US Equity");
+    assert!(rows[0].item.tickers.contains(&"FROG US Equity".into()), "association history is retained");
+    drop(db);
+    drop(source);
+    std::fs::remove_file(path).unwrap();
+}
+#[test]
 fn n1a_schema_lazy_backfill_precedes_symbol_filter_and_runs_once() {
     let now = chrono::Utc::now().timestamp();
     let connection = Connection::open_in_memory().unwrap();
@@ -191,7 +289,7 @@ fn n1a_schema_lazy_backfill_precedes_symbol_filter_and_runs_once() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].tags, vec!["M&A"]);
     assert!(rows[0].seen);
-    assert_eq!(db.db.query_row("SELECT intelligence FROM items", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(db.db.query_row("SELECT intelligence FROM items", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
     db.db.execute("UPDATE items SET headline='$MSFT new guidance'", []).unwrap();
     let again = db.query(&q).unwrap();
     assert_eq!(again[0].item.tickers, rows[0].item.tickers, "already migrated rows are not recomputed on each query");

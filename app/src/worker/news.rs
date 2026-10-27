@@ -104,7 +104,11 @@ async fn read_view(s: &Shared, view: View, force: bool) {
     // N1b: hold the store lock through publication, so no pre-seen snapshot
     // can be sent after a completed seen write. UI also overlays local actions
     // on replies which were already in flight before that write.
-    let store_guard = s.news.store.lock().await;
+    let mut store_guard = s.news.store.lock().await;
+    if let Some(store) = store_guard.as_mut() {
+        // Optional, read-only local SEC map; failures never fail saved reads.
+        let _ = store.refresh_names(&data_dir().join("edgar.sqlite3"));
+    }
     let items = match store_guard.as_ref() {
         Some(store) => store.query(&query).map_err(|_| "News store unavailable".into()),
         None => Err("News store unavailable".into()),
@@ -266,6 +270,9 @@ pub(super) async fn run(s: Arc<Shared>) {
     let mut fallback = FallbackState::default();
     loop {
         interval.tick().await;
+        if let Some(store) = s.news.store.lock().await.as_mut() {
+            let _ = store.refresh_names(&data_dir().join("edgar.sqlite3"));
+        }
         let views = s.news.views.lock().await.clone();
         if views.is_empty() {
             continue;

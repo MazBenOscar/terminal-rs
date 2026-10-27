@@ -288,13 +288,40 @@ pub struct RowModel {
     pub full_time: String,
     pub ticker: Option<String>,
     pub extra_tickers: Vec<String>,
+    pub ticker_is_subject: bool,
+    pub ticker_hover: String,
+    pub about: String,
     pub headline: String,
     pub meta: String,
     pub unread: bool,
 }
 pub fn row_model(story: &Cluster, linked: Option<&str>, now: i64) -> RowModel {
     let (time, full_time) = crate::feed_time::feed_time(story.newest, now, false);
-    let tickers: Vec<_> = story.tickers.iter().filter(|t| Some(t.as_str()) != linked).cloned().collect();
+    let ticker_is_subject = !story.subjects.is_empty();
+    let tickers: Vec<_> = if ticker_is_subject {
+        story.subjects.iter().filter(|t| Some(t.as_str()) != linked).cloned().collect()
+    } else {
+        story.tickers.first().cloned().into_iter().collect()
+    };
+    let short = |key: &String| key.split_whitespace().next().unwrap_or(key).to_owned();
+    let about = if story.subjects.is_empty() {
+        "Not identified".into()
+    } else {
+        story.subjects.iter().map(short).collect::<Vec<_>>().join(" · ")
+    };
+    let returned: Vec<_> = story.tickers.iter().filter(|key| !story.subjects.contains(key)).map(short).collect();
+    let about = format!(
+        "About: {about}{}",
+        if returned.is_empty() { String::new() } else { format!(" · Also returned for: {}", returned.join(" · ")) }
+    );
+    let ticker_hover = if ticker_is_subject {
+        about.clone()
+    } else {
+        tickers
+            .first()
+            .map(|key| format!("Returned by {} for {}; not mentioned in the story", story.lead.provider, short(key)))
+            .unwrap_or_default()
+    };
     let mut meta = story.lead.source.clone();
     if story.sources.len() > 1 {
         meta.push_str(&format!(" +{}", story.sources.len() - 1));
@@ -312,6 +339,9 @@ pub fn row_model(story: &Cluster, linked: Option<&str>, now: i64) -> RowModel {
         full_time,
         ticker: tickers.first().cloned(),
         extra_tickers: tickers.into_iter().skip(1).collect(),
+        ticker_is_subject,
+        ticker_hover,
+        about,
         headline: story.lead.item.title.clone(),
         meta,
         unread: story.unread(),
@@ -380,11 +410,15 @@ fn mark_seen(n: &mut NewsPane, story: &Cluster) {
     n.seen_queue = queued.into_iter().collect();
 }
 fn chart_ticker<'a>(story: &'a Cluster, linked: Option<&str>) -> Option<&'a String> {
-    story.tickers.iter().find(|ticker| Some(ticker.as_str()) != linked).or_else(|| story.tickers.first())
+    if story.subjects.is_empty() {
+        story.tickers.first()
+    } else {
+        story.subjects.iter().find(|ticker| Some(ticker.as_str()) != linked).or_else(|| story.subjects.first())
+    }
 }
 /// Readable story preview: a solid-edged card (the pane colour alone blends into charts),
 /// headline first, then source/time/tickers, the summary at a reading width, and the host.
-fn hover_card(title: &egui::Response, story: &Cluster, full_time: &str) {
+fn hover_card(title: &egui::Response, story: &Cluster, model: &RowModel) {
     let summary = story.lead.summary.trim();
     let mut tooltip = egui::Tooltip::for_enabled(title);
     tooltip.popup = tooltip
@@ -402,12 +436,7 @@ fn hover_card(title: &egui::Response, story: &Cluster, full_time: &str) {
             egui::Label::new(RichText::new(&story.lead.item.title).font(ui_font(13.5)).color(theme::text()).strong())
                 .wrap(),
         );
-        let mut meta = vec![story.lead.source.clone(), full_time.to_owned()];
-        if !story.tickers.is_empty() {
-            meta.push(
-                story.tickers.iter().map(|t| t.split_whitespace().next().unwrap_or(t)).collect::<Vec<_>>().join(" "),
-            );
-        }
+        let meta = [story.lead.source.clone(), model.full_time.clone(), model.about.clone()];
         ui.add(egui::Label::new(RichText::new(meta.join(" · ")).font(mono(10.5)).color(theme::muted())).wrap());
         if !summary.is_empty() {
             ui.add_space(dp(2.0));
@@ -907,11 +936,12 @@ pub(super) fn show(
                 egui::Label::new(
                     RichText::new(ticker.split_whitespace().next().unwrap_or(ticker))
                         .font(mono(11.0))
-                        .color(theme::amber()),
+                        .color(if model.ticker_is_subject { theme::amber() } else { theme::muted() }),
                 )
                 .truncate()
                 .sense(egui::Sense::click()),
             );
+            let r = r.on_hover_text(&model.ticker_hover);
             if r.clicked() {
                 actions.push(Action::OpenChart(ticker.clone()));
                 child_clicked = true;
@@ -964,7 +994,7 @@ pub(super) fn show(
             mark_seen(n, story);
             child_clicked = true;
         }
-        hover_card(&title, story, &model.full_time);
+        hover_card(&title, story, model);
         let meta = ui
             .scope_builder(
                 egui::UiBuilder::new().max_rect(meta_rect).layout(egui::Layout::right_to_left(egui::Align::Center)),
@@ -983,7 +1013,7 @@ pub(super) fn show(
                 toggle_expanded(n, story);
             }
         }
-        let meta = meta.on_hover_text(story.tickers.join(", "));
+        let meta = meta.on_hover_text(&model.about);
         if !model.extra_tickers.is_empty() {
             egui::Popup::menu(&meta).show(|ui| {
                 for ticker in &model.extra_tickers {
