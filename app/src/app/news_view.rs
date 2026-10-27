@@ -973,7 +973,8 @@ pub(super) fn show(
             ui.painter().circle_filled(rect.left_center() + egui::vec2(dp(3.0), dp(0.0)), dp(2.0), theme::accent());
         }
         let time_width = ui.fonts_mut(|f| f.glyph_width(&mono(11.0), '0')) * crate::feed_time::WIDTH_CHARS as f32;
-        let ticker_width = if linked.is_some() && model.ticker.is_none() { 0. } else { time_width };
+        // A constant column keeps every headline starting at the same x, ticker or not.
+        let ticker_width = time_width;
         let time_rect =
             egui::Rect::from_min_size(rect.min + egui::vec2(dp(6.0), dp(0.0)), egui::vec2(time_width, rect.height()));
         ui.scope_builder(
@@ -988,16 +989,24 @@ pub(super) fn show(
         );
         let mut child_clicked = false;
         if let Some(ticker) = &model.ticker {
-            let r = ui.put(
-                ticker_rect,
-                egui::Label::new(
-                    RichText::new(ticker.split_whitespace().next().unwrap_or(ticker))
-                        .font(mono(11.0))
-                        .color(if model.ticker_is_subject { theme::amber() } else { theme::muted() }),
+            let r = ui
+                .scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(ticker_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(ticker.split_whitespace().next().unwrap_or(ticker))
+                                    .font(mono(11.0))
+                                    .color(if model.ticker_is_subject { theme::amber() } else { theme::muted() }),
+                            )
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                        )
+                    },
                 )
-                .truncate()
-                .sense(egui::Sense::click()),
-            );
+                .inner;
             let r = r.on_hover_text(&model.ticker_hover);
             if r.clicked() {
                 actions.push(Action::OpenChart(ticker.clone()));
@@ -1051,10 +1060,15 @@ pub(super) fn show(
             egui::TextFormat { font_id: ui_font(13.0), color: base, ..Default::default() },
         );
         // The hover card below replaces egui's elided-text tip, so only one popup ever shows.
-        let title = ui.put(
-            title_rect,
-            egui::Label::new(job).truncate().show_tooltip_when_elided(false).sense(egui::Sense::click()),
-        );
+        // Left-aligned in its column: `ui.put` would centre a headline shorter than the slot.
+        let title = ui
+            .scope_builder(
+                egui::UiBuilder::new().max_rect(title_rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    ui.add(egui::Label::new(job).truncate().show_tooltip_when_elided(false).sense(egui::Sense::click()))
+                },
+            )
+            .inner;
         if title.clicked() {
             open(ui, story);
             mark_seen(n, story);
