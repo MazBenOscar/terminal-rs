@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+ <title>Fixture news</title><id>urn:fixture:news</id><updated>2026-10-26T12:00:00Z</updated>
+ <entry><title>Bitcoin &amp; Ether</title><id>urn:fixture:1</id><updated>2026-10-26T12:00:00Z</updated><published>2026-10-26T11:00:00Z</published><author><name>Fixture Author</name></author><link rel="self" href="https://example.test/api/1"/><link rel="alternate" href="https://example.test/story/1"/></entry>
+ <entry><title>Markets open</title><id>urn:fixture:2</id><updated>2026-10-25T12:00:00Z</updated><link href="https://example.test/story/2"/></entry>
+</feed>

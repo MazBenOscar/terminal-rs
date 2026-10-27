@@ -83,7 +83,15 @@ fn finnhub_request(key: &str) -> reqwest::RequestBuilder {
         Err(_) => request.header("X-Finnhub-Token", "\n"),
     }
 }
-pub async fn perform(action: Action) -> Reply {
+pub async fn perform(action: Action, cached_key: Option<&str>) -> Reply {
+    if matches!(&action, Action::Status) {
+        return Reply {
+            status_only: true,
+            status: tr_net::shared().and_then(|g| g.status()).map_err(|e| e.to_string()),
+            masked_key: cached_key.map(mask).unwrap_or_default(),
+            message: None,
+        };
+    }
     let store = SecretStore::platform_for(&data_dir(), "finnhub");
     perform_with_store(action, &store, tr_net::shared()).await
 }

@@ -129,13 +129,11 @@ impl TerminalApp {
                     self.search_pending = Some((query.clone(), Instant::now()));
                 }
             }
+            // N1a
             PaneKind::News(n) => {
-                let offline = self.provider.eq_ignore_ascii_case("sample");
-                if let Some(refresh) = news(ui, n, offline) {
-                    n.fetched = None;
-                    n.loading = refresh;
-                }
+                actions.extend(super::news_view::show(ui, n, &self.watchlists));
             }
+            // N1a
             PaneKind::Options(o) => {
                 let (a, refetch) = super::options_view::options_chain(ui, o);
                 actions.extend(a);
@@ -895,84 +893,6 @@ impl TerminalApp {
         };
         p.text(at(121.0), Align2::LEFT_CENTER, status, ui_font(10.0), muted());
     }
-}
-
-/// Headlines list. Returns `Some(_)` when a refresh was requested.
-fn news(ui: &mut Ui, n: &mut super::NewsPane, offline: bool) -> Option<bool> {
-    let mut refresh = None;
-    ui.horizontal_wrapped(|ui| {
-        let title = match &n.symbol {
-            Some(s) => format!("{} headlines", tr_data::security(s).key()),
-            None => "Top market headlines".into(),
-        };
-        ui.label(RichText::new(title).font(ui_font(12.5)).color(text()));
-        if n.loading {
-            ui.add(egui::Spinner::new().size(12.0));
-            ui.label(RichText::new("Loading…").font(ui_font(12.0)).color(muted()));
-        }
-        if n.symbol.is_some() && ui.small_button("Top News").on_hover_text("General market headlines").clicked() {
-            n.symbol = None;
-            n.items.clear();
-            refresh = Some(true);
-        }
-        if ui.small_button("Refresh").clicked() {
-            refresh = Some(true);
-        }
-    });
-    ui.add_space(2.0);
-    if let Some(e) = &n.error {
-        ui.label(RichText::new(format!("Could not load news: {e}")).font(ui_font(12.0)).color(theme::down()));
-    }
-    if n.items.is_empty() && !n.loading {
-        let msg = if offline {
-            "No headlines in offline sample mode (TR_PROVIDER=sample)."
-        } else {
-            "No headlines for this security right now."
-        };
-        ui.label(RichText::new(msg).font(ui_font(12.0)).color(muted()));
-    }
-    let now = chrono::Utc::now().timestamp();
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        let w = ui.available_width();
-        for item in &n.items {
-            let age = (now - item.ts).max(0);
-            let when = if age < 3600 {
-                format!("{}m", age / 60)
-            } else if age < 86_400 {
-                format!("{}h", age / 3600)
-            } else {
-                chrono::DateTime::from_timestamp(item.ts, 0).map(|d| d.format("%b %d").to_string()).unwrap_or_default()
-            };
-            let title = ui.painter().layout(item.title.clone(), ui_font(13.0), text(), (w - 70.0).max(80.0));
-            let h = title.size().y + dp(20.0);
-            let (r, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
-            widgets::hover_wash(ui, r, &resp, false);
-            let p = ui.painter();
-            p.text(pos2(r.left() + 6.0, r.top() + 4.0), Align2::LEFT_TOP, &when, mono(11.0), amber());
-            let tpos = pos2(r.left() + 60.0, r.top() + 3.0);
-            let th = title.size().y;
-            p.galley(tpos, title, text());
-            p.text(pos2(tpos.x, tpos.y + th + 2.0), Align2::LEFT_TOP, &item.publisher, ui_font(11.0), muted());
-            if resp.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if resp.clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(&item.link));
-            }
-            resp.on_hover_text(&item.link).context_menu(|ui| {
-                if ui.button("Open in Browser").clicked() {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(&item.link));
-                    ui.close();
-                }
-                if ui.button("Copy Link").clicked() {
-                    ui.ctx().copy_text(item.link.clone());
-                    ui.close();
-                }
-            });
-            p.hline(r.x_range(), r.bottom(), Stroke::new(1.0, theme::border()));
-        }
-    });
-    refresh
 }
 
 /// Bucket sizes offered for a book around `mid`: raw plus three decades of the price scale.

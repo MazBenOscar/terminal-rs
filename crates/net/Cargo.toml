@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+# N1a: opt-in localhost transport for dependent crates' fixture tests only.
+[features]
+test-support = []
+
 [dependencies]
 reqwest.workspace = true
 rusqlite.workspace = true

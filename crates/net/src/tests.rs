@@ -154,7 +154,7 @@ async fn independent_instances_share_pacing_and_daily_cap() {
     assert_ne!(one.config.data_dir, two.config.data_dir);
     assert_eq!(one.config.ledger, two.config.ledger);
     assert_eq!(one.send("finnhub", request()).await.unwrap(), b"{}");
-    assert_eq!(two.send("finnhub", request()).await, Err(Refused::Budget));
+    assert_eq!(two.send("finnhub", request()).await, Err(Refused::Busy));
     assert_eq!(server.hits.load(Ordering::SeqCst), 1);
     assert_eq!(two.status().unwrap()[0].requests_today, 1);
     one.db().unwrap().execute("UPDATE requests SET count=3000", []).unwrap();
@@ -227,7 +227,7 @@ async fn concurrency_lease_covers_body_and_other_instances() {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     age(&two, "finnhub");
-    assert_eq!(two.send("finnhub", request()).await, Err(Refused::Budget));
+    assert_eq!(two.send("finnhub", request()).await, Err(Refused::Busy));
     task.await.unwrap().unwrap();
     assert_eq!(two.send("finnhub", request()).await.unwrap(), b"{}");
 }
@@ -664,12 +664,12 @@ async fn cache_coalesces_expires_and_never_touches_ledger_on_hits() {
     guard.configure(Settings::default());
     let slot = guard.cache.lock().unwrap().values().next().unwrap().clone();
     slot.result.lock().unwrap().as_mut().unwrap().0 = Instant::now() - Duration::from_secs(301);
-    assert_eq!(guard.send("coindesk", feed()).await, Err(Refused::Budget));
+    assert_eq!(guard.send("coindesk", feed()).await, Err(Refused::Busy));
     age(&guard, "coindesk");
     guard.send("coindesk", feed()).await.unwrap();
     assert_eq!(server.hits.load(Ordering::SeqCst), 2);
     guard.set_cache_ttl("coindesk", Duration::ZERO).unwrap();
-    assert_eq!(guard.send("coindesk", feed()).await, Err(Refused::Budget));
+    assert_eq!(guard.send("coindesk", feed()).await, Err(Refused::Busy));
 }
 
 #[tokio::test]

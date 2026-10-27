@@ -20,7 +20,7 @@ Every new external source follows these rules:
 
 | Host | Published limit | Our rate | Concurrency | Daily cap | Poll cadence |
 |---|---|---|---|---|---|
-| finnhub.io (free) | ~60 calls/min | ≤ 20/min | 1 | 3,000 | market news every 5 min; company news per watchlist symbol every 30 min, round-robin |
+| finnhub.io (free) | ~60 calls/min | ≤ 20/min | 1 | 3,000 | general every 5 min; forex/crypto/merger every 15 min only with All-market visible; company interval max(30 min, ceil(US symbols × 24 h / 2,000)), max 2,000 company jobs/day |
 | sec.gov / data.sec.gov | 10 req/s | ≤ 1 req/s | 1 | 1,500 | latest-filings Atom feed every 10 min; per-company JSON only for new hits |
 | query1.finance.yahoo.com | unpublished | unchanged, but via the guard | 1 | 1,000 | fallback only |
 | coindesk.com RSS | unpublished | 1 per 5 min | 1 | 300 | crypto only |
@@ -51,6 +51,14 @@ Hidden window or no visible news/filings pane → no polling (fixes the perf-aud
 - Yahoo/CoinDesk as fallbacks when Finnhub is off. Default scope with no linked symbol: general market news.
 - News pane: scope selector (symbol / watchlist / all), source filter, include/exclude keywords, search over history, date range, pause, ticker chips that open a chart. Layout saves scope and filters.
 - Tests: Finnhub fixtures, cursor handling, ID normalisation, never-blank rules, filters, pane scope.
+
+#### N1a review fixes (2026-10-26)
+- Store the requested market category, not Finnhub's topic label. Resolve related ticker chips only through the local symbol catalogue; skip individual malformed items and nonpositive timestamps.
+- Plan at most 2,576 Finnhub jobs/day with All-market visible (288 general + 288 other categories + 2,000 company). Twenty US symbols plan 1,536/day; 150 plan 2,576/day. Without All-market, these are 1,248 and 2,288/day. Visible linked symbols join the scheduler with priority; non-US/crypto symbol panes retain the guarded Yahoo/CoinDesk path even with a Finnhub key.
+- Fallback watchlists select at most one symbol/minute and one attempt/symbol/hour, sharing one round across visible panes. Completion, not round start, sets the next-round delay. An error consumes only that symbol's slot. Symbol/market panes retain a five-minute cadence, with shared requests cached by the guard. All fallback selections additionally share a rolling 60/hour ceiling; Yahoo's machine-wide 1,000/day cap still applies. Watchlist-only bounds: 480 selections/day for 20 symbols; at most 1,440 for 150 (at most 1,000 Yahoo network requests after the guard).
+- Preserve a bad database as `news.sqlite3.corrupt-<unix>` (and preserve its journals), reopen fresh, otherwise use an in-memory store and show “Saved headlines unavailable”.
+- Today starts at local midnight; FTS and LIKE use matching per-term prefixes; SQL applies filters before LIMIT/OFFSET. Retain existing headlines but explain empty selections, keep pause counts view-local, and show relative update times. Suppress unchanged item replies; status transitions are separate and are not a heartbeat.
+- Window visibility/minimization gates polling, never focus. Load the Finnhub secret at startup and on Settings saves/removals only. Spacing refusal is `Busy`, retried after Finnhub's three-second spacing rather than an hour-long budget backoff.
 
 ### N1b: story intelligence and pane polish (`codex/news-stories`)
 Ideas taken from FinceptTerminal's news module (ideas only; no code is copied):

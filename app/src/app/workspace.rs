@@ -529,7 +529,11 @@ impl TerminalApp {
             }
             PaneKind::News(n) => {
                 if n.symbol.as_deref() != Some(key.as_str()) {
-                    **n = NewsPane::new(Some(key));
+                    // N1a: linking preserves history, scope, filters and pause state.
+                    n.symbol = Some(key);
+                    n.fetched = None;
+                    n.query = None;
+                    // N1a
                 }
             }
             PaneKind::OrderBook(b) => {
@@ -665,7 +669,8 @@ impl TerminalApp {
 
     /// The chart commands act on: the focused one, a visible one, any (revealed), or a new
     /// chart beside the focused pane.
-    fn chart_target(&mut self) -> PaneId {
+    // N1a: shared by the News ticker-chip symbol-open action.
+    pub(super) fn chart_target(&mut self) -> PaneId {
         if self.focused_is_chart() {
             return self.focus;
         }

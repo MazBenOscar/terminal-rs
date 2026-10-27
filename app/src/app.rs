@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tr_chart::drawings::Tool;
 use tr_congress::Trade;
 use tr_congress::db::{Alert, PoliticianSummary};
-use tr_data::{NewsItem, OrderBook, Quote, SearchHit, YieldCurves};
+use tr_data::{OrderBook, Quote, SearchHit, YieldCurves};
 
 use crate::anim;
 use crate::chart_view::ChartState;
@@ -181,20 +181,80 @@ impl OptionsPane {
     }
 }
 
+// N1a
+mod news_view;
 pub struct NewsPane {
-    /// `None` = general market headlines.
     pub symbol: Option<String>,
-    pub items: Vec<NewsItem>,
+    pub items: Vec<tr_data::news_store::Story>,
+    pub filters: tr_data::news_store::Filters,
+    pub paused: bool,
+    pub pending: Vec<tr_data::news_store::Story>,
+    pub status: String,
+    pub updated: Option<Instant>,
     pub error: Option<String>,
     pub loading: bool,
     pub fetched: Option<Instant>,
+    pub query: Option<crate::worker::NewsView>,
 }
-
 impl NewsPane {
     pub fn new(symbol: Option<String>) -> Self {
-        Self { symbol, items: Vec::new(), error: None, loading: true, fetched: None }
+        Self {
+            symbol,
+            items: vec![],
+            filters: Default::default(),
+            paused: false,
+            pending: vec![],
+            status: "Showing saved headlines".into(),
+            updated: None,
+            error: None,
+            loading: true,
+            fetched: None,
+            query: None,
+        }
+    }
+    fn apply(&mut self, items: Vec<tr_data::news_store::Story>) {
+        if items.is_empty() {
+            return;
+        }
+        if self.paused {
+            self.pending = items;
+        } else {
+            self.items = items;
+            self.pending.clear();
+        }
+    }
+    fn empty_message(&self, query: &tr_data::news_store::Query) -> Option<String> {
+        if self.items.iter().any(|story| tr_data::news_store::matches(story, query)) {
+            return None;
+        }
+        let selection = if self.filters.scope == tr_data::news_store::Scope::Symbol {
+            self.symbol.as_deref().unwrap_or("this selection")
+        } else {
+            "this selection"
+        };
+        Some(format!("No saved headlines for {selection} yet"))
+    }
+    fn new_count(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|s| {
+                let visible = self.query.as_ref().is_none_or(|view| {
+                    let days = view.filters.days.clamp(1, 90) as i64;
+                    let now = chrono::Utc::now().timestamp();
+                    let query = tr_data::news_store::Query {
+                        symbols: view.symbols.clone(),
+                        filters: view.filters.clone(),
+                        start: if days == 1 { tr_data::news_store::day_start(now) } else { now - days * 86400 },
+                        ..Default::default()
+                    };
+                    tr_data::news_store::matches(s, &query)
+                });
+                visible && !self.items.iter().any(|old| old.id == s.id)
+            })
+            .count()
     }
 }
+// N1a
 
 pub struct BookPane {
     pub symbol: String,
@@ -330,7 +390,12 @@ impl PaneKind {
             PaneKind::Wei => PaneSettings::Wei,
             PaneKind::Curve => PaneSettings::Curve,
             PaneKind::Search { query } => PaneSettings::Search(query.clone()),
-            PaneKind::News(n) => PaneSettings::News(n.symbol.clone()),
+            // N1a
+            PaneKind::News(n) => PaneSettings::News(
+                (n.symbol.is_some() || n.filters != Default::default())
+                    .then(|| crate::layouts::NewsSettings { symbol: n.symbol.clone(), filters: n.filters.clone() }),
+            ),
+            // N1a
             PaneKind::OrderBook(b) => {
                 PaneSettings::OrderBook { symbol: b.symbol.clone(), depth: b.depth, group: b.group }
             }
@@ -408,7 +473,14 @@ impl PaneKind {
             PaneSettings::Wei => PaneKind::Wei,
             PaneSettings::Curve => PaneKind::Curve,
             PaneSettings::Search(q) => PaneKind::Search { query: q },
-            PaneSettings::News(s) => PaneKind::News(Box::new(NewsPane::new(s))),
+            // N1a
+            PaneSettings::News(s) => {
+                let saved = s.unwrap_or_default();
+                let mut pane = NewsPane::new(saved.symbol);
+                pane.filters = saved.filters;
+                PaneKind::News(Box::new(pane))
+            }
+            // N1a
             PaneSettings::OrderBook { symbol, depth, group } => {
                 PaneKind::OrderBook(Box::new(BookPane::new(&symbol, depth, group)))
             }
@@ -826,6 +898,9 @@ pub struct TerminalApp {
     status: String,
     toasts: Vec<(String, Instant)>,
     alert_toasts: Vec<(Instant, tr_core::price_alerts::Event)>,
+    // N1a
+    news_subscription: Option<(Vec<crate::worker::NewsView>, Vec<String>)>,
+    // N1a
     watchlist_undo: Option<(Instant, Vec<String>, Vec<String>)>,
 
     latest: Vec<Trade>,
@@ -1058,6 +1133,9 @@ impl TerminalApp {
             status: "Ready. Type a ticker and press <GO> (Enter). F1 for help.".into(),
             toasts: Vec::new(),
             alert_toasts: Vec::new(),
+            // N1a
+            news_subscription: None,
+            // N1a
             watchlist_undo: None,
             latest: Vec::new(),
             politicians: Vec::new(),
@@ -1479,7 +1557,19 @@ impl TerminalApp {
         for a in actions {
             match a {
                 Action::Notice(message) => self.toasts.push((message, Instant::now())),
-                Action::OpenChart(s) => self.open_security(&s),
+                // N1a: ticker chips target a linked chart, else the existing chart target (never just News).
+                Action::OpenChart(s) => {
+                    if self.idx(self.focus).is_some_and(|i| {
+                        matches!(self.panes[i].kind, PaneKind::News(_))
+                            && !self.panes[i].link.is_some_and(|link| {
+                                self.panes.iter().any(|p| p.link == Some(link) && matches!(p.kind, PaneKind::Chart(_)))
+                            })
+                    }) {
+                        self.focus = self.chart_target();
+                    }
+                    self.open_security(&s);
+                }
+                // N1a
                 Action::ScanChart { symbol, symbols, definition } => {
                     self.open_security(&symbol);
                     self.with_chart(|c, w| {
@@ -2216,21 +2306,38 @@ impl TerminalApp {
                         }
                     }
                 }
-                Response::News { pane, symbol, items } => {
-                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                // N1a: stale query replies cannot replace a newly selected scope.
+                Response::NewsStatus { view, status } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == view.pane)
                         && let PaneKind::News(n) = &mut p.kind
-                        && n.symbol == symbol
+                        && n.query.as_ref() == Some(&view)
+                    {
+                        if status.contains("updated just now") {
+                            n.updated = Some(Instant::now());
+                        }
+                        n.status = status;
+                    }
+                }
+                Response::NewsSaved { view, items, status } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == view.pane)
+                        && let PaneKind::News(n) = &mut p.kind
+                        && n.query.as_ref() == Some(&view)
                     {
                         n.loading = false;
+                        if status.contains("updated just now") {
+                            n.updated = Some(Instant::now());
+                        }
+                        n.status = status;
                         match items {
                             Ok(items) => {
-                                n.items = items;
+                                n.apply(items);
                                 n.error = None;
                             }
                             Err(e) => n.error = Some(e),
                         }
                     }
                 }
+                // N1a
                 Response::OrderBook { pane, symbol, book } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
                         && let PaneKind::OrderBook(b) = &mut p.kind
@@ -2616,6 +2723,61 @@ impl TerminalApp {
         }
     }
 
+    // N1a: the worker owns timing; UI sends only changed visibility/query snapshots.
+    fn news_periodic(&mut self, visible: &[usize], hidden: bool) {
+        use tr_data::news_store::Scope;
+        let mut views = vec![];
+        if !hidden {
+            for &i in visible {
+                let pane = self.panes[i].id;
+                if let PaneKind::News(n) = &mut self.panes[i].kind {
+                    let symbols = match n.filters.scope {
+                        Scope::Symbol => n.symbol.iter().cloned().collect(),
+                        Scope::Watchlist => self
+                            .watchlists
+                            .iter()
+                            .find(|l| Some(&l.name) == n.filters.watchlist.as_ref())
+                            .map(|l| l.symbols.clone())
+                            .unwrap_or_else(|| self.watchlist.clone()),
+                        Scope::All => vec![],
+                    };
+                    let view =
+                        crate::worker::NewsView { pane, symbol: n.symbol.clone(), filters: n.filters.clone(), symbols };
+                    if n.query.as_ref() != Some(&view) {
+                        n.pending.clear();
+                        n.loading = true;
+                        n.fetched = None;
+                    }
+                    n.query = Some(view.clone());
+                    if n.fetched.is_none() {
+                        n.fetched = Some(Instant::now());
+                        self.worker.send(Request::NewsRead(view.clone()));
+                    }
+                    views.push(view);
+                }
+            }
+        }
+        let mut symbols: Vec<_> = if views.is_empty() {
+            vec![]
+        } else {
+            self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect()
+        };
+        symbols.sort();
+        symbols.dedup();
+        // Linked visible panes are eligible even outside every watchlist, and go first.
+        let mut linked: Vec<_> =
+            views.iter().filter(|v| v.filters.scope == Scope::Symbol).flat_map(|v| v.symbols.iter().cloned()).collect();
+        linked.sort();
+        linked.dedup();
+        symbols.retain(|s| !linked.contains(s));
+        linked.extend(symbols);
+        let next = (views, linked);
+        if self.news_subscription.as_ref() != Some(&next) {
+            self.worker.send(Request::NewsVisible { views: next.0.clone(), watchlist: next.1.clone() });
+            self.news_subscription = Some(next);
+        }
+    }
+    // N1a
     fn periodic(&mut self) {
         if self.agent_demo.is_some() {
             return;
@@ -2644,12 +2806,7 @@ impl TerminalApp {
         for &i in &visible {
             let p = &mut self.panes[i];
             match &mut p.kind {
-                PaneKind::News(n) if n.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) => {
-                    n.loading = true;
-                    n.error = None;
-                    n.fetched = Some(Instant::now());
-                    self.worker.send(Request::News { pane: p.id, symbol: n.symbol.clone() });
-                }
+                // N1a: no per-frame news polling; the worker scheduler owns refreshes.
                 PaneKind::Options(o) if o.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) => {
                     o.fetched = Some(Instant::now());
                     self.worker.send(Request::Options {
@@ -2875,6 +3032,11 @@ impl eframe::App for TerminalApp {
             self.applied_theme = Some(self.themes[ti].clone());
         }
         theme::refresh(&ctx, &self.themes[ti], self.system_accent);
+        // N1a
+        // Focus is not visibility: visible background windows must keep polling.
+        let news_hidden = ctx.input(|i| !i.raw.viewports.values().any(news_view::window_visible));
+        self.news_periodic(&self.visible_panes(), news_hidden);
+        // N1a
         self.periodic();
         self.sync_chart_navigation();
 
@@ -3098,6 +3260,9 @@ impl TerminalApp {
             status: String::new(),
             toasts: Vec::new(),
             alert_toasts: Vec::new(),
+            // N1a
+            news_subscription: None,
+            // N1a
             watchlist_undo: None,
             columns_in_flight: None,
             latest: Vec::new(),

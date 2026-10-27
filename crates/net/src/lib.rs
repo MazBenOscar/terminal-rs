@@ -150,6 +150,8 @@ pub enum Refused {
     NeedsContact,
     #[error("Request budget unavailable")]
     Budget,
+    #[error("Source busy (spacing wait exceeded)")]
+    Busy,
     #[error("Source paused until {until}")]
     Paused { until: i64 },
     #[error("Transport failure")]
@@ -241,7 +243,7 @@ pub struct Guard {
     policies: RwLock<Vec<HostPolicy>>,
     cache: Mutex<HashMap<(String, String), Arc<CacheSlot>>>,
     cooldowns: RwLock<HashMap<String, LocalCooldown>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fixture: Option<reqwest::Url>,
 }
 type FlightResult = (Instant, Result<Vec<u8>, Refused>);
@@ -313,7 +315,7 @@ impl Guard {
             policies: RwLock::new(policies()),
             cache: Mutex::new(HashMap::new()),
             cooldowns: RwLock::new(HashMap::new()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             fixture: None,
         };
         guard.db()?.execute_batch("CREATE TABLE IF NOT EXISTS requests (\"group\" TEXT, day INTEGER, count INTEGER NOT NULL, PRIMARY KEY(\"group\",day));
@@ -336,6 +338,20 @@ impl Guard {
                 altered?;
             }
         }
+        Ok(guard)
+    }
+    /// N1a: dependent-crate fixtures keep real authorization/budgets but send only to loopback.
+    #[cfg(feature = "test-support")]
+    pub fn for_fixture(config: Config, settings: Settings, base: reqwest::Url) -> Result<Self, Refused> {
+        if base.scheme() != "http"
+            || base.host_str() != Some("127.0.0.1")
+            || !base.username().is_empty()
+            || base.password().is_some()
+        {
+            return Err(Refused::InvalidRequest);
+        }
+        let mut guard = Self::new(config, settings)?;
+        guard.fixture = Some(base);
         Ok(guard)
     }
     pub fn set_cache_ttl(&self, group: &str, ttl: Duration) -> Result<(), Refused> {
@@ -577,7 +593,7 @@ impl Guard {
                 match self.reserve_owned(&policy, &owner)? {
                     None => break,
                     Some(wait) if Instant::now() + wait <= deadline => tokio::time::sleep(wait).await,
-                    _ => return Err(Refused::Budget),
+                    _ => return Err(Refused::Busy),
                 }
             }
             let _lease = Lease { guard: self, group, owner };
@@ -586,10 +602,13 @@ impl Guard {
             *request.timeout_mut() = Some(Duration::from_secs(30));
             let original = request.url().clone();
             let replay = request.try_clone();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(base) = &self.fixture {
                 assert_eq!(base.host_str(), Some("127.0.0.1"));
-                *request.url_mut() = base.clone();
+                let mut local = base.clone();
+                local.set_path(original.path());
+                local.set_query(original.query());
+                *request.url_mut() = local;
             }
             let mut response = match self.client.execute(request).await {
                 Ok(r) => r,
