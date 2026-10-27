@@ -1600,6 +1600,9 @@ impl TerminalApp {
                     self.open_panel(PaneKind::Ticker { symbol: s, trades: Vec::new(), loading: true })
                 }
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
+                // N3: an explicit Reload wakes the worker, without resetting durable cadence.
+                Action::ReloadFilings => self.edgar.interest = None,
+                // N3
                 Action::AddToWatchlist(symbol) => {
                     let name = self.watchlists[self.active_watchlist].name.clone();
                     self.add_watchlist_symbol(&name, symbol, None);
@@ -2562,6 +2565,21 @@ impl TerminalApp {
         if other_text_focused {
             return;
         }
+        // N3: feed navigation wins over type-anywhere and unmodified desk hotkeys.
+        if !cmd_focused
+            && self.cmd.is_empty()
+            && self.idx(self.focus).is_some_and(|i| matches!(self.panes[i].kind, PaneKind::Filings(_)))
+            && presses
+                .iter()
+                .any(|(key, modifiers)| *modifiers == Modifiers::NONE && crate::filings_view::owns_key(*key))
+        {
+            ctx.input_mut(|i| {
+                i.events
+                    .retain(|e| !matches!(e, Event::Text(t) if matches!(t.as_str(), "j" | "k" | "c" | "u" | "/" | " ")))
+            });
+            return;
+        }
+        // N3
         if !cmd_focused && self.cmd.is_empty() && self.focused_is_chart() {
             let mut handled = false;
             self.with_chart(|chart, worker| handled = chart.replay_keys(ctx, worker));
@@ -3066,11 +3084,12 @@ impl eframe::App for TerminalApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.agent_logic(ctx);
         self.process_logic();
-        // N2: publish interest only on changes, never an HTTP request per frame.
+        // N3: publish unpaused visible interest only on changes, never per-frame HTTP.
         let active = self.agent_demo.is_none()
             && edgar_window_visible(frame)
             && ctx.input(|i| i.viewport().minimized != Some(true))
-            && self.visible_panes().iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Filings(_)));
+            && self.visible_panes().iter().any(|&i| matches!(&self.panes[i].kind, PaneKind::Filings(f) if !f.paused));
+        // N3
         let mut symbols: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
         symbols.sort();
         symbols.dedup();

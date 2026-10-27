@@ -73,7 +73,9 @@ impl Transport for Sec {
         if let Some(modified) = modified {
             request = request.header(reqwest::header::IF_MODIFIED_SINCE, modified);
         }
-        let (body, metadata) = if url.starts_with("https://data.sec.gov/submissions/") {
+        let (body, metadata) = if url.starts_with("https://data.sec.gov/submissions/")
+            || url.starts_with("https://www.sec.gov/Archives/")
+        {
             guard.send_with_metadata_budget("sec", request, 1200).await?
         } else {
             guard.send_with_metadata("sec", request).await?
@@ -131,6 +133,20 @@ impl<T: Transport> Scheduler<T> {
                     if !self.transport.pending_allowed().unwrap_or(false) {
                         self.status.push_str(" · Company refresh deferred to reserve the feed budget");
                     }
+                    let imported = watched
+                        .keys()
+                        .filter(|cik| self.store.number(&format!("initialized:{cik}")).unwrap_or(0) > 0)
+                        .count();
+                    if imported < watched.len() {
+                        self.status.push_str(&format!(
+                            " · Importing filings: {imported} of {} companies (one a minute while visible).",
+                            watched.len()
+                        ));
+                    }
+                    let backlog = self.insider_backlog(&watched, now).map(|r| r.len()).unwrap_or(0);
+                    if backlog > 0 {
+                        self.status.push_str(&format!(" · Reading insider forms: {backlog} left"));
+                    }
                     let days = sweep_days(watched.len());
                     if days > 1 {
                         self.status
@@ -155,7 +171,16 @@ impl<T: Transport> Scheduler<T> {
                 self.status = e
                     .downcast_ref::<Refused>()
                     .map(refusal_label)
-                    .unwrap_or_else(|| "SEC EDGAR · refresh unavailable (stored filings retained)".into())
+                    .unwrap_or_else(|| "SEC EDGAR · refresh unavailable (stored filings retained)".into());
+                if e.downcast_ref::<Refused>().is_none()
+                    && let Ok(companies) = self.store.companies()
+                {
+                    let backlog =
+                        self.insider_backlog(&watched(&companies, symbols), now).map(|r| r.len()).unwrap_or(0);
+                    if backlog > 0 {
+                        self.status.push_str(&format!(" · Reading insider forms: {backlog} left"));
+                    }
+                }
             }
         }
     }
@@ -244,7 +269,97 @@ impl<T: Transport> Scheduler<T> {
             }
         }
         self.sweep(&watched, now).await?;
+        self.insiders(&watched, now).await?;
         self.store.prune(now)?;
+        Ok(())
+    }
+    fn insider_backlog(&self, watched: &BTreeMap<u64, String>, _now: i64) -> Result<Vec<crate::Filing>> {
+        Ok(self
+            .store
+            .filings()?
+            .into_iter()
+            .filter(|f| {
+                watched.contains_key(&f.cik)
+                    && !f.reporting_owner
+                    && matches!(f.form.as_str(), "4" | "4/A")
+                    && crate::insider::xml_url(f).is_some()
+                    && !self.store.insider_complete(&f.accession).unwrap_or(true)
+                    && self.store.number(&format!("f4:attempts:{}", f.accession)).unwrap_or(3) < 3
+            })
+            .collect())
+    }
+    /// One document per timer turn (deliberately below the four-per-minute ceiling).
+    /// No sleeping worker or catch-up bursts; all pacing/ownership also lives in the shared ledger.
+    async fn insiders(&mut self, watched: &BTreeMap<u64, String>, now: i64) -> Result<()> {
+        if !self.transport.pending_allowed()? || self.store.number("f4:last")? + 15 > now {
+            return Ok(());
+        }
+        let candidates = self.insider_backlog(watched, now)?;
+        for f in candidates {
+            let key = format!("sec:f4:{}", f.accession);
+            let attempts_key = format!("f4:attempts:{}", f.accession);
+            let attempts = self.store.number(&attempts_key)?;
+            if self.store.number(&format!("f4:retry:{}", f.accession))? > now {
+                continue;
+            }
+            // Never reserve an accession when pacing or the daily ceiling prevents a request.
+            let day = chrono::DateTime::from_timestamp(now, 0)
+                .ok_or_else(|| anyhow::anyhow!("Invalid clock"))?
+                .format("%Y%m%d")
+                .to_string();
+            let day_key = format!("sec:f4:day:{day}");
+            if self.store.number(&day_key)? >= 300 {
+                return Ok(());
+            }
+            if !self.claim("sec:f4:pace", 15)? {
+                return Ok(());
+            }
+            // Reserve the shared daily allowance before locking an accession. Contending
+            // instances may waste an allowance, but cannot strand an unfetched form at cap.
+            let count = self.transport.increment_counter(&day_key, self.store.number(&day_key)? + 1)?;
+            self.store.set(&day_key, count)?;
+            if count > 300 {
+                return Ok(());
+            }
+            let slot = if attempts == 0 { key.clone() } else { format!("{key}:attempt:{}", attempts + 1) };
+            if !self.claim(&slot, 30 * DAY)? {
+                if attempts == 0 {
+                    // Another instance owns this immutable document. No local details are
+                    // available; don't advertise an endless backlog or retry its XML.
+                    self.store.set(&attempts_key, 3)?;
+                }
+                continue;
+            }
+            if attempts == 0 && self.transport.increment_counter(&format!("{key}:initial"), 1)? > 1 {
+                // A 30-day lease expiring must not make an already-read form fresh again
+                // in a throwaway data directory. This durable tombstone is never cleared.
+                self.store.set(&attempts_key, 3)?;
+                return Ok(());
+            }
+            let attempts = self.transport.increment_counter(&format!("{key}:attempts"), attempts + 1)?;
+            self.store.set(&attempts_key, attempts)?;
+            if attempts > 3 {
+                continue;
+            }
+            self.store.set("f4:last", now)?;
+            let result = async {
+                let reply = self.transport.get(&crate::insider::xml_url(&f).unwrap(), None, None).await?;
+                let document = crate::insider::parse(&reply.body, f.cik)?;
+                self.store.save_insiders(&f, &document)?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                let backoff = [3600, 21600, 86400][(attempts - 1).min(2) as usize];
+                self.store.set(&format!("f4:retry:{}", f.accession), now + backoff)?;
+                // Per-attempt slots prevent cross-instance duplicate retries. Local deadlines
+                // survive restarts; a fresh data dir cannot reclaim the original 30-day slot.
+                if !matches!(error.downcast_ref::<Refused>(), Some(Refused::Http(_) | Refused::Transport)) {
+                    return Err(error);
+                }
+            }
+            return Ok(());
+        }
         Ok(())
     }
     fn pending(&self, cik: u64) -> Result<bool> {

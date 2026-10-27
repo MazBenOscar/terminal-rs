@@ -39,13 +39,67 @@ pub fn filings(rows: &[tr_edgar::Filing], symbol: &str, start: i64, end: i64) ->
                 },
             )
         })
+        .chain(insiders(rows, symbol, start, end))
         .collect()
+}
+// N3: code P/S lots only, from either table. Joint owners don't multiply chart markers.
+pub fn insiders(rows: &[tr_edgar::Filing], symbol: &str, start: i64, end: i64) -> Vec<ChartEvent> {
+    let mut events = vec![];
+    for f in rows.iter().filter(|f| !f.reporting_owner && f.matches_symbol(symbol)) {
+        let first = f.insiders.first().map(|t| &t.owner);
+        let lots: Vec<_> = f
+            .insiders
+            .iter()
+            .filter(|t| Some(&t.owner) == first && matches!(t.code.as_str(), "P" | "S"))
+            .cloned()
+            .collect();
+        // Group by transaction date, so a filing with several dates marks the actual trade days.
+        let dates: std::collections::BTreeSet<_> = lots.iter().map(|t| t.date.as_str()).collect();
+        for date in dates {
+            let Some(ts) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|d| d.and_utc().timestamp())
+            else {
+                continue;
+            };
+            if ts < start || ts > end {
+                continue;
+            }
+            let daily: Vec<_> = lots.iter().filter(|t| t.date == date).cloned().collect();
+            for g in tr_edgar::insider::aggregate(&daily) {
+                let action = if g.code == "P" { "bought" } else { "sold" };
+                events.push(ChartEvent {
+                    symbol: symbol.into(),
+                    ts,
+                    kind: if g.code == "P" { EventKind::InsiderBuy } else { EventKind::InsiderSell },
+                    detail: format!(
+                        "{} {action} {}",
+                        tr_edgar::insider::short_name(&g.owner.name),
+                        g.value.map(tr_edgar::insider::value).unwrap_or_else(|| "(value unavailable)".into())
+                    ),
+                    source: "SEC EDGAR · local store".into(),
+                });
+            }
+        }
+    }
+    events
 }
 fn bar_index(bars: &[Bar], tf: tr_core::Timeframe, timestamp: i64) -> Option<usize> {
     let bucket = |ts: i64| if tf.is_intraday() { ts.div_euclid(86_400) } else { tf.bucket_start(ts) };
     let target = bucket(timestamp);
     let i = bars.partition_point(|b| bucket(b.ts) < target);
     (i < bars.len() && bucket(bars[i].ts) == target).then_some(i)
+}
+fn appearance(kind: &EventKind) -> (&'static str, egui::Color32) {
+    match kind {
+        EventKind::Earnings => ("E", crate::theme::amber()),
+        EventKind::Dividend => ("D", crate::theme::up()),
+        EventKind::Split => ("S", crate::theme::cyan()),
+        EventKind::Filing => ("F", crate::theme::accent()),
+        EventKind::InsiderBuy => ("▲", crate::theme::up()),
+        EventKind::InsiderSell => ("▼", crate::theme::down()),
+    }
 }
 pub fn paint(
     ui: &mut Ui,
@@ -70,15 +124,11 @@ pub fn paint(
             rect.bottom() - crate::theme::dp(12.) - (*stack).min(5) as f32 * crate::theme::dp(19.),
         );
         *stack += 1;
-        let (letter, color) = match event.kind {
-            EventKind::Earnings => ("E", crate::theme::amber()),
-            EventKind::Dividend => ("D", crate::theme::up()),
-            EventKind::Split => ("S", crate::theme::cyan()),
-            // N2
-            EventKind::Filing => ("F", crate::theme::accent()),
-        };
-        ui.painter().circle_filled(center, crate::theme::dp(8.), crate::theme::card());
-        ui.painter().circle_stroke(center, crate::theme::dp(8.), egui::Stroke::new(1., color));
+        let (letter, color) = appearance(&event.kind);
+        if !matches!(event.kind, EventKind::InsiderBuy | EventKind::InsiderSell) {
+            ui.painter().circle_filled(center, crate::theme::dp(8.), crate::theme::card());
+            ui.painter().circle_stroke(center, crate::theme::dp(8.), egui::Stroke::new(crate::theme::dp(1.), color));
+        }
         ui.painter().text(center, Align2::CENTER_CENTER, letter, crate::theme::mono(10.), color);
         ui.interact(
             Rect::from_center_size(center, egui::vec2(crate::theme::dp(18.), crate::theme::dp(18.))),
@@ -88,7 +138,12 @@ pub fn paint(
         .on_hover_text(format!(
             "{}\n{}\n{}",
             event.detail,
-            chrono::DateTime::from_timestamp(event.ts, 0).map(|d| d.to_rfc3339()).unwrap_or_default(),
+            crate::feed_time::feed_time(
+                event.ts,
+                chrono::Utc::now().timestamp(),
+                matches!(event.kind, EventKind::InsiderBuy | EventKind::InsiderSell)
+            )
+            .1,
             event.source
         ));
     }
@@ -96,6 +151,52 @@ pub fn paint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn insider_markers_map_only_open_market_lots_from_store_at_transaction_date() {
+        let d =
+            tr_edgar::insider::parse(include_bytes!("../../crates/edgar/tests/fixtures/form4_sale_10b5_1.xml"), 320193)
+                .unwrap();
+        let ts =
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let mut store = tr_edgar::store::Store::memory().unwrap();
+        store
+            .replace_companies(&[tr_edgar::Company { cik: 320193, ticker: "AAPL".into(), title: "Apple".into() }])
+            .unwrap();
+        let f = tr_edgar::Filing {
+            cik: 320193,
+            ticker: "AAPL".into(),
+            accession: "sale".into(),
+            form: "4".into(),
+            filed: ts + 2 * 86400,
+            accepted: Some(ts + 2 * 86400 + 3600),
+            ..Default::default()
+        };
+        store.upsert(std::slice::from_ref(&f)).unwrap();
+        store.save_insiders(&f, &d).unwrap();
+        let rows = store.chart_filings("AAPL US Equity", ts, ts + 3600).unwrap();
+        assert_eq!(rows.len(), 1);
+        let e = filings(&rows, "AAPL US Equity", ts, ts + 3600);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].ts, ts);
+        assert_eq!(e[0].kind, EventKind::InsiderSell);
+        assert_eq!(e[0].detail, "Newstead J. sold $828K");
+        assert_eq!(appearance(&EventKind::InsiderBuy), ("▲", crate::theme::up()));
+        assert_eq!(appearance(&EventKind::InsiderSell), ("▼", crate::theme::down()));
+        let mut rows = rows;
+        rows[0].insiders[0].code = "P".into();
+        assert_eq!(insiders(&rows, "AAPL", ts, ts + 3600)[0].kind, EventKind::InsiderBuy);
+        for code in ["A", "M", "F", "G", "C", "J"] {
+            rows[0].insiders[0].code = code.into();
+            assert!(insiders(&rows, "AAPL", ts, ts + 3600).is_empty());
+        }
+        rows[0].insiders[0].code = "P".into();
+        rows[0].insiders[0].derivative = true;
+        assert_eq!(insiders(&rows, "AAPL", ts, ts + 3600)[0].kind, EventKind::InsiderBuy);
+        rows[0].insiders[0].code = "M".into();
+        assert!(insiders(&rows, "AAPL", ts, ts + 3600).is_empty());
+        assert!(insiders(&rows, "MSFT", ts, ts + 3600).is_empty());
+        assert!(insiders(&rows, "AAPL", ts + 1, ts + 3600).is_empty());
+    }
     // N2
     #[test]
     fn filing_events_use_stored_acceptance_items_symbol_and_range() {

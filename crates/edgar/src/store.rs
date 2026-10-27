@@ -52,6 +52,16 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS filings_cik_time ON filings(cik,coalesce(accepted,filed));
             DELETE FROM meta WHERE key LIKE 'body:%'; COMMIT;",
         )?;
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS insider_transactions(
+            accession TEXT NOT NULL, seq INTEGER NOT NULL, cik INTEGER NOT NULL,
+            owner TEXT NOT NULL, owner_cik INTEGER, role TEXT NOT NULL, code TEXT NOT NULL,
+            date TEXT NOT NULL, shares REAL, price REAL, acquired INTEGER, owned_after REAL,
+            direct INTEGER, derivative INTEGER NOT NULL, plan_10b5_1 INTEGER NOT NULL,
+            owner_json TEXT NOT NULL, PRIMARY KEY(accession,seq));
+            CREATE INDEX IF NOT EXISTS insider_cik_date ON insider_transactions(cik,date);
+            CREATE TABLE IF NOT EXISTS insider_documents(accession TEXT PRIMARY KEY,cik INTEGER NOT NULL);",
+        )?;
         Ok(Self { db })
     }
     pub fn get(&self, key: &str) -> Result<Option<String>> {
@@ -148,12 +158,22 @@ impl Store {
             reporting_owner: r.get(11)?,
             from_submissions: r.get(12)?,
             tickers: vec![],
+            insiders: vec![],
+            insider_unavailable: false,
+            insider_parsed: false,
         })
     }
     fn with_tickers(&self, mut rows: Vec<Filing>) -> Result<Vec<Filing>> {
         let companies = self.companies()?;
         for row in &mut rows {
             row.tickers = companies.iter().filter(|c| c.cik == row.cik).map(|c| c.ticker.clone()).collect();
+            row.insiders = self.insider_transactions(&row.accession)?;
+            row.insider_parsed = self.insider_complete(&row.accession)?;
+            row.insider_unavailable = !row.insider_parsed
+                && (self.number(&format!("f4:attempts:{}", row.accession))? >= 3
+                    || (matches!(row.form.as_str(), "4" | "4/A")
+                        && !row.primary_doc.is_empty()
+                        && crate::insider::xml_url(row).is_none()));
         }
         Ok(rows)
     }
@@ -172,8 +192,87 @@ impl Store {
             return Ok(vec![]);
         };
         let mut rows: Vec<Filing> = self.db.prepare("SELECT * FROM filings WHERE cik=?1 AND coalesce(accepted,filed) BETWEEN ?2 AND ?3 AND reporting_owner=0 AND filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER) ORDER BY coalesce(accepted,filed)")?.query_map(params![cik,start,end], Self::row)?.collect::<rusqlite::Result<_>>()?;
-        for row in &mut rows {
-            row.tickers = vec![ticker.clone()];
+        // N3: trade dates can precede acceptance. Use the insider CIK/date index as a
+        // second path rather than incorrectly restricting trades to filing-time range.
+        let dates = chrono::DateTime::from_timestamp(start, 0).zip(chrono::DateTime::from_timestamp(end, 0));
+        if let Some((a, b)) = dates {
+            let accessions = self
+                .db
+                .prepare("SELECT DISTINCT accession FROM insider_transactions WHERE cik=?1 AND date BETWEEN ?2 AND ?3")?
+                .query_map(params![cik, a.format("%Y-%m-%d").to_string(), b.format("%Y-%m-%d").to_string()], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for accession in accessions {
+                if rows.iter().any(|f| f.accession == accession) {
+                    continue;
+                }
+                if let Some(f) = self.db.query_row("SELECT * FROM filings WHERE cik=?1 AND accession=?2 AND reporting_owner=0 AND filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER)",params![cik,accession],Self::row).optional()? { rows.push(f); }
+            }
+        }
+        self.with_tickers(rows)
+    }
+    /// An empty, successfully parsed form is complete too. Never refetch immutable forms.
+    pub fn insider_complete(&self, accession: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row("SELECT 1 FROM insider_documents WHERE accession=?1", [accession], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+    pub fn save_insiders(&mut self, f: &Filing, document: &crate::insider::Document) -> Result<()> {
+        anyhow::ensure!(document.issuer_cik == f.cik && !f.reporting_owner, "Mismatched insider issuer");
+        let tx = self.db.transaction()?;
+        if tx.execute("INSERT OR IGNORE INTO insider_documents VALUES(?1,?2)", params![f.accession, f.cik as i64])? == 0
+        {
+            return Ok(());
+        }
+        for (seq, t) in document.transactions.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO insider_transactions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                params![
+                    f.accession,
+                    seq as i64,
+                    f.cik as i64,
+                    t.owner.name,
+                    t.owner.cik.map(|c| c as i64),
+                    t.owner.role(),
+                    t.code,
+                    t.date,
+                    t.shares,
+                    t.price,
+                    t.acquired,
+                    t.owned_after,
+                    t.direct,
+                    t.derivative,
+                    t.plan_10b5_1,
+                    serde_json::to_string(&t.owner)?
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn insider_transactions(&self, accession: &str) -> Result<Vec<crate::insider::Transaction>> {
+        Ok(self.db.prepare("SELECT owner_json,code,date,shares,price,acquired,owned_after,direct,derivative,plan_10b5_1 FROM insider_transactions WHERE accession=?1 ORDER BY seq")?.query_map([accession], |r| {
+            let owner: String = r.get(0)?;
+            Ok(crate::insider::Transaction { owner: serde_json::from_str(&owner).unwrap_or_default(), code: r.get(1)?, date: r.get(2)?, shares: r.get(3)?, price: r.get(4)?, acquired: r.get(5)?, owned_after: r.get(6)?, direct: r.get(7)?, derivative: r.get(8)?, plan_10b5_1: r.get(9)? })
+        })?.collect::<rusqlite::Result<_>>()?)
+    }
+    /// Date-indexed, store-only reader for analytics. Pane/chart rows also carry these lots.
+    pub fn insiders_for_cik(&self, cik: u64, start: &str, end: &str) -> Result<Vec<crate::insider::Transaction>> {
+        let accessions = self
+            .db
+            .prepare("SELECT DISTINCT accession FROM insider_transactions WHERE cik=?1 AND date BETWEEN ?2 AND ?3")?
+            .query_map(params![cik as i64, start, end], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows = vec![];
+        for accession in accessions {
+            rows.extend(
+                self.insider_transactions(&accession)?
+                    .into_iter()
+                    .filter(|t| t.date.as_str() >= start && t.date.as_str() <= end),
+            );
         }
         Ok(rows)
     }
@@ -189,7 +288,10 @@ impl Store {
             .is_some())
     }
     pub fn prune(&self, now: i64) -> Result<usize> {
-        Ok(self.db.execute("DELETE FROM filings WHERE filed<?1", [now - 90 * 86400])?)
+        let removed = self.db.execute("DELETE FROM filings WHERE filed<?1", [now - 90 * 86400])?;
+        self.db.execute_batch("DELETE FROM insider_transactions WHERE NOT EXISTS(SELECT 1 FROM filings WHERE filings.accession=insider_transactions.accession AND filings.cik=insider_transactions.cik AND reporting_owner=0);
+            DELETE FROM insider_documents WHERE NOT EXISTS(SELECT 1 FROM filings WHERE filings.accession=insider_documents.accession AND filings.cik=insider_documents.cik AND reporting_owner=0);")?;
+        Ok(removed)
     }
 }
 

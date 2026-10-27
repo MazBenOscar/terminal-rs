@@ -1275,11 +1275,14 @@ async fn edgar_loop(s: Arc<Shared>, mut interest: tokio::sync::watch::Receiver<(
             Ok(rows) => rows,
             Err(_) => continue,
         };
+        // N3: retain backlog and deferral information without publishing an age heartbeat.
         let status = if scheduler.status.starts_with("SEC EDGAR · updated") {
-            "SEC EDGAR · updated".into()
+            let suffix = scheduler.status.split_once("m ago").map(|(_, s)| s).unwrap_or("");
+            format!("SEC EDGAR · updated{suffix}")
         } else {
             scheduler.status.clone()
         };
+        // N3
         let updated = scheduler.store.number("updated").unwrap_or(0);
         let snapshot = (rows, status, updated);
         if previous.as_ref() != Some(&snapshot) {

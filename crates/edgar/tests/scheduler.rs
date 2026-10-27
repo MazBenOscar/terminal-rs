@@ -16,6 +16,16 @@ use tr_edgar::{
 };
 use tr_net::{Refused, ResponseMetadata};
 const NOW: i64 = 1_793_145_600; // 2026-10-27 UTC
+// These tests isolate N2 metadata cadence. N3's XML request counts have dedicated tests.
+fn metadata_only_apple() -> Vec<u8> {
+    let mut json: serde_json::Value = serde_json::from_slice(include_bytes!("fixtures/submissions_aapl.json")).unwrap();
+    for form in json["filings"]["recent"]["form"].as_array_mut().unwrap() {
+        if matches!(form.as_str(), Some("4" | "4/A")) {
+            *form = serde_json::json!("3");
+        }
+    }
+    serde_json::to_vec(&json).unwrap()
+}
 struct Fake {
     base: String,
     requests: Arc<Mutex<Vec<String>>>,
@@ -59,7 +69,7 @@ impl Fake {
                         } else if path.starts_with("/cgi-bin/") {
                             include_bytes!("fixtures/current_8k.atom").to_vec()
                         } else if path.contains("CIK0000320193") {
-                            include_bytes!("fixtures/submissions_aapl.json").to_vec()
+                            metadata_only_apple()
                         } else {
                             let cik: u64 = path.split("CIK").nth(1).unwrap().trim_end_matches(".json").parse().unwrap();
                             serde_json::to_vec(&serde_json::json!({"cik":cik,"filings":{"recent":{
@@ -312,10 +322,7 @@ impl Transport for Failing {
             return Err(Refused::Http(404));
         }
         assert!(url.contains("CIK0000320193"), "unexpected request {url}");
-        Ok(Reply {
-            body: include_bytes!("fixtures/submissions_aapl.json").to_vec(),
-            metadata: ResponseMetadata { status: 200, ..Default::default() },
-        })
+        Ok(Reply { body: metadata_only_apple(), metadata: ResponseMetadata { status: 200, ..Default::default() } })
     }
 }
 fn quiet_store() -> Store {

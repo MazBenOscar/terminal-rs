@@ -71,6 +71,9 @@ pub enum EventKind {
     Split,
     /// SEC filing metadata from the local EDGAR store (never fetched on chart load).
     Filing,
+    /// Open-market Form 4 trades from the local EDGAR store.
+    InsiderBuy,
+    InsiderSell,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChartEvent {

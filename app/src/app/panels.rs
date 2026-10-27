@@ -85,6 +85,10 @@ impl TerminalApp {
         let mut child = ui.new_child(UiBuilder::new().max_rect(inner).id_salt(("pane", id)));
         child.set_clip_rect(inner.intersect(ui.clip_rect()));
         let ui = &mut child;
+        // N3: capture pane context before borrowing its settings.
+        let filings_link = self.panes[i].link;
+        let filings_list = if self.watchlists.len() == 1 { self.watchlists[0].name.as_str() } else { "All watchlists" };
+        // N3
         match &mut self.panes[i].kind {
             PaneKind::Feed { filter } => {
                 actions.extend(congress_view::feed(ui, &self.latest, filter, &freshness, watchlists))
@@ -133,7 +137,19 @@ impl TerminalApp {
             // N2
             PaneKind::Filings(settings) => {
                 let watched: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
-                crate::filings_view::show(ui, settings, &self.edgar, &watched);
+                // N3: keyboard focus, link navigation and the existing watchlist action path.
+                actions.extend(crate::filings_view::show(
+                    ui,
+                    settings,
+                    &self.edgar,
+                    &watched,
+                    crate::filings_view::PaneContext {
+                        focused: chart_focused,
+                        link: filings_link,
+                        watchlist_name: filings_list,
+                    },
+                ));
+                // N3
             }
             PaneKind::News(n) => {
                 actions.extend(super::news_view::show(ui, n, &self.watchlists));

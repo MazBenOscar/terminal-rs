@@ -18,14 +18,17 @@ where
     let (Some(time), Some(current)) = (DateTime::from_timestamp(ts, 0), DateTime::from_timestamp(now, 0)) else {
         return ("—".into(), "time unavailable".into());
     };
+    // SEC date-only fields are calendar dates encoded at UTC midnight, not instants.
+    // Preserve their day in western time zones instead of displaying the previous date.
+    let date = time.date_naive();
     let (time, current) = (time.with_timezone(tz), current.with_timezone(tz));
     if date_only {
-        let label = if time.year() == current.year() {
-            time.format("%b %d").to_string()
+        let label = if date.year() == current.year() {
+            date.format("%b %d").to_string()
         } else {
-            time.format("%Y-%m-%d").to_string()
+            date.format("%Y-%m-%d").to_string()
         };
-        return (label, time.format("%a %b %d %Y (date only)").to_string());
+        return (label, date.format("%a %b %d %Y (date only)").to_string());
     }
     let age = now - ts;
     let label = if (0..60).contains(&age) {
@@ -72,6 +75,13 @@ mod tests {
         assert_eq!(full, "Mon Oct 26 2026 23:30 (UTC-04:00)");
     }
 
+    #[test]
+    fn date_only_calendar_day_does_not_shift_west_of_utc() {
+        let west = FixedOffset::west_opt(7 * 3600).unwrap();
+        let midnight =
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 22).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        assert_eq!(feed_time_in(midnight, NOW, true, &west).0, "Oct 22");
+    }
     #[test]
     fn date_only_filings_never_show_a_clock() {
         let utc = FixedOffset::east_opt(0).unwrap();

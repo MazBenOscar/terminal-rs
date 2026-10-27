@@ -4621,6 +4621,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "feed-rs",
+ "quick-xml 0.41.0",
  "reqwest",
  "rusqlite",
  "serde",

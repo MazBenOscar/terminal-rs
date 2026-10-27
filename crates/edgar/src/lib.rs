@@ -1,4 +1,5 @@
 //! Watchlist-only SEC EDGAR metadata. No history pages and no market-wide backfill.
+pub mod insider;
 pub mod scheduler;
 pub mod store;
 
@@ -13,8 +14,14 @@ pub struct Company {
     pub ticker: String,
     pub title: String,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Filing {
+    #[serde(default)]
+    pub insiders: Vec<insider::Transaction>,
+    #[serde(default)]
+    pub insider_unavailable: bool,
+    #[serde(default)]
+    pub insider_parsed: bool,
     pub accession: String,
     pub cik: u64,
     pub ticker: String,
