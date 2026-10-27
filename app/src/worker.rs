@@ -276,6 +276,9 @@ pub enum AgentRequest {
 }
 
 pub enum Request {
+    DataSources {
+        action: crate::app::data_sources::Action,
+    },
     Agent(AgentRequest),
     SecurityNames(Vec<String>),
     WatchlistColumns {
@@ -633,6 +636,7 @@ pub enum Response {
     },
     /// Outcome of a [`QuestradeAction`]: a status line or an error.
     Questrade(Result<String, String>),
+    DataSources(crate::app::data_sources::Reply),
     Scan {
         pane: PaneId,
         generation: u64,
@@ -1077,6 +1081,13 @@ impl Worker {
     }
 
     pub fn spawn(ctx: egui::Context, provider: Provider) -> anyhow::Result<Self> {
+        // Configure the shared news guard before any worker request can run.
+        let settings = match std::fs::read(data_dir().join("settings.json")) {
+            Ok(bytes) => tr_net::Settings::from_document(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => tr_net::Settings::default(),
+            Err(_) => tr_net::Settings::corrupt(),
+        };
+        tr_net::configure_shared(settings);
         let dir = data_dir();
         std::fs::create_dir_all(&dir)?;
         let db = Db::open(dir.join("congress.sqlite3")).or_else(|e| {
@@ -1654,6 +1665,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             }
             names.save(&path);
             s.send(Response::SecurityNames(names.clone()));
+        }
+        Request::DataSources { action } => {
+            s.send(Response::DataSources(crate::app::data_sources::perform(action).await));
         }
         Request::Questrade { handle, action } => {
             let test = async |h: &tr_data::questrade::Questrade| {

@@ -908,6 +908,7 @@ fn news(ui: &mut Ui, n: &mut super::NewsPane, offline: bool) -> Option<bool> {
         ui.label(RichText::new(title).font(ui_font(12.5)).color(text()));
         if n.loading {
             ui.add(egui::Spinner::new().size(12.0));
+            ui.label(RichText::new("Loading…").font(ui_font(12.0)).color(muted()));
         }
         if n.symbol.is_some() && ui.small_button("Top News").on_hover_text("General market headlines").clicked() {
             n.symbol = None;

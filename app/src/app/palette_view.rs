@@ -128,6 +128,7 @@ fn settings_blurb(tab: SettingsTab) -> &'static str {
         SettingsTab::Panels => "Defaults for new charts and order books",
         SettingsTab::Layouts => "Saved layouts and presets",
         SettingsTab::Brokerage => "SnapTrade keys and connected brokerages",
+        SettingsTab::DataSources => "News and filings: Finnhub key, SEC contact, switches and shared budgets",
         SettingsTab::Trading => "Enable trading, order limits and confirmations",
     }
 }

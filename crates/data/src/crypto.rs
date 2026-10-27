@@ -370,7 +370,8 @@ impl CryptoProvider {
 
     /// Crypto headlines from CoinDesk, narrowed to the asset when it is mentioned.
     pub async fn news(&self, sec: &Security) -> Result<Vec<crate::NewsItem>> {
-        let items = crate::rss::parse_rss(&self.get(crate::rss::COINDESK, &[]).await?, "CoinDesk")?;
+        let body = tr_net::shared()?.send("coindesk", self.client.get(crate::rss::COINDESK)).await?;
+        let items = crate::rss::parse_rss(std::str::from_utf8(&body)?, "CoinDesk")?;
         let instrument = resolved_instrument(sec)?;
         let base = instrument.base.as_str();
         let name = sec.name().unwrap_or(base).split(['/', ' ']).next().unwrap_or(base).to_string();

@@ -10,6 +10,7 @@ mod agent_ui;
 mod broker;
 mod chrome;
 mod columns_view;
+pub(crate) mod data_sources;
 mod demo;
 mod demo_harness;
 mod hotkeys_view;
@@ -577,6 +578,8 @@ pub(crate) fn sanitize_watchlists(lists: Vec<NamedWatchlist>) -> Vec<NamedWatchl
 /// App-wide state persisted in `settings.json` (layouts live in their own files).
 #[derive(Serialize, Deserialize)]
 struct Settings {
+    #[serde(default, deserialize_with = "data_sources::deserialize_settings")]
+    data_sources: tr_net::Settings,
     #[serde(default)]
     watchlist: Vec<String>,
     #[serde(default)]
@@ -801,6 +804,7 @@ pub struct TerminalApp {
     rebinding: Option<prefs::Action>,
     hotkey_filter: String,
     settings_tab: SettingsTab,
+    data_sources: data_sources::State,
     io_path: String,
 
     curves: Option<Box<YieldCurves>>,
@@ -1037,6 +1041,7 @@ impl TerminalApp {
             rebinding: None,
             hotkey_filter: String::new(),
             settings_tab: SettingsTab::Appearance,
+            data_sources: data_sources::State::default(),
             io_path: String::new(),
             curves: None,
             last_wei: None,
@@ -1100,8 +1105,15 @@ impl TerminalApp {
             last_chrome_poll: None,
             palette: crate::palette::Palette::load(&data_dir().join("palette.json")),
         };
+        // Do not accidentally re-enable sources when another settings field prevents restoration.
+        app.data_sources = data_sources::State::new(match std::fs::read(settings_path()) {
+            Ok(bytes) => tr_net::Settings::from_document(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => tr_net::Settings::default(),
+            Err(_) => tr_net::Settings::corrupt(),
+        });
         let mut doc = None;
         if let Some(s) = &settings {
+            app.data_sources = data_sources::State::new(s.data_sources.clone());
             (app.watchlists, app.active_watchlist) = s.sanitized_watchlists();
             app.watchlist = app.watchlists[app.active_watchlist].symbols.clone();
             app.sidebar_open = s.sidebar;
@@ -1161,6 +1173,7 @@ impl TerminalApp {
 
     fn settings_json(&self) -> Vec<u8> {
         let s = Settings {
+            data_sources: self.data_sources.settings.clone(),
             watchlist: Vec::new(),
             watchlists: self.watchlists.clone(),
             active_watchlist: self.active_watchlist,
@@ -2237,6 +2250,7 @@ impl TerminalApp {
                     self.on_portfolio(result)
                 }
                 Response::BrokerRegistered(result) => self.on_broker_registered(result),
+                Response::DataSources(reply) => self.data_sources.receive(reply),
                 Response::Questrade(result) => {
                     self.broker.questrade_busy = false;
                     self.broker.questrade_message = Some(match result {
@@ -2631,6 +2645,8 @@ impl TerminalApp {
             let p = &mut self.panes[i];
             match &mut p.kind {
                 PaneKind::News(n) if n.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) => {
+                    n.loading = true;
+                    n.error = None;
                     n.fetched = Some(Instant::now());
                     self.worker.send(Request::News { pane: p.id, symbol: n.symbol.clone() });
                 }
@@ -3065,6 +3081,7 @@ impl TerminalApp {
             rebinding: None,
             hotkey_filter: String::new(),
             settings_tab: SettingsTab::Appearance,
+            data_sources: data_sources::State::default(),
             io_path: String::new(),
             curves: None,
             last_wei: None,
@@ -3176,6 +3193,29 @@ mod tests {
         app.autosave();
         assert!(app.saves.job.is_none());
         assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn data_source_settings_persist_in_app_settings() {
+        let (mut app, log) = autosave_fixture("data-source-settings");
+        let sources = tr_net::Settings {
+            pause_all: true,
+            finnhub: false,
+            sec: false,
+            yahoo_news: false,
+            coindesk: false,
+            sec_contact: "research@example.test".into(),
+            ..Default::default()
+        };
+        app.data_sources.settings = sources.clone();
+        app.save_settings();
+        let writes = log.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0.0, app.settings_file);
+        let restored: Settings = serde_json::from_slice(&writes[0].0.1).unwrap();
+        assert!(restored.data_sources == sources);
+        let legacy: Settings = serde_json::from_str(r#"{"watchlist":[]}"#).unwrap();
+        assert!(legacy.data_sources == tr_net::Settings::default());
     }
 
     #[test]
