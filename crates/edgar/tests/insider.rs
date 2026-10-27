@@ -183,3 +183,79 @@ fn immutable_store_roundtrip_indexed_reader_empty_document_and_pruning() {
     s.save_insiders(&f, &Document { issuer_cik: CIK, ..Default::default() }).unwrap();
     assert!(s.insider_complete("empty").unwrap());
 }
+#[test]
+fn display_roles_entity_names_xml_spacing_and_new_neutral_codes() {
+    let source = SALE.replace("Newstead Jennifer", "Smith &amp; Co");
+    let d = parse(source.as_bytes(), CIK).unwrap();
+    assert_eq!(d.owners[0].name, "Smith & Co");
+    assert_eq!(d.transactions[0].issuer_symbol, "AAPL");
+    assert!(!d.transactions[0].security_title.is_empty());
+    for (title, expected) in
+        [("President", "Pres."), ("EVP", "EVP"), ("SVP", "SVP"), ("Chief Legal Officer", "CLO"), ("See Remarks", "")]
+    {
+        assert_eq!(Owner { is_officer: true, officer_title: title.into(), ..Default::default() }.role(), expected);
+    }
+    for name in ["BERKSHIRE HATHAWAY INC", "Smith & Co", "Newstead Family Trust"] {
+        assert_eq!(Owner { name: name.into(), ..Default::default() }.display_name(), name);
+    }
+    assert_eq!(
+        Owner { name: "Some Holdings".into(), is_ten_percent_owner: true, ..Default::default() }.display_name(),
+        "Some Holdings"
+    );
+    assert_eq!(action("X"), ("Option exercise", Direction::Neutral));
+    assert_eq!(action("D"), ("Disposition to issuer", Direction::Neutral));
+}
+#[test]
+fn acquired_and_disposed_lots_and_share_classes_aggregate_separately() {
+    let t = parse(SALE.as_bytes(), CIK).unwrap().transactions.remove(0);
+    let mut acquired = t.clone();
+    acquired.acquired = Some(true);
+    let mut other_class = t.clone();
+    other_class.security_title = "Class B common".into();
+    assert_eq!(aggregate(&[t, acquired, other_class]).len(), 3);
+}
+#[test]
+fn effective_lots_preserve_distinct_identical_lots_but_dedupe_joint_copies() {
+    let mut t = parse(SALE.as_bytes(), CIK).unwrap().transactions.remove(0);
+    t.lot_id = Some(0);
+    let mut joint = t.clone();
+    joint.owner.cik = Some(42);
+    let mut second = t.clone();
+    second.lot_id = Some(1);
+    let f = Filing {
+        cik: CIK,
+        ticker: "AAPL".into(),
+        accession: "one".into(),
+        form: "4".into(),
+        insiders: vec![t, joint, second],
+        ..Default::default()
+    };
+    assert_eq!(effective_lots(&[f], "AAPL").len(), 2);
+}
+#[test]
+fn amendment_corrections_replace_price_title_and_acquired_disposed_without_double_counting() {
+    let f = Filing {
+        cik: CIK,
+        ticker: "AAPL".into(),
+        accession: "one".into(),
+        form: "4".into(),
+        insiders: parse(SALE.as_bytes(), CIK).unwrap().transactions,
+        ..Default::default()
+    };
+    let mut amended = f.clone();
+    amended.accession = "two".into();
+    amended.form = "4/A".into();
+    amended.insiders[0].price = Some(350.);
+    amended.insiders[0].security_title = "Corrected common stock title".into();
+    amended.insiders[0].acquired = Some(true);
+    let rows = [f, amended];
+    let effective = effective_lots(&rows, "AAPL");
+    assert_eq!(effective.len(), 1);
+    assert_eq!(effective[0].0.accession, "two");
+    assert_eq!(effective[0].1.price, Some(350.));
+}
+#[test]
+fn review_value_rounding_promotes_unit() {
+    assert_eq!(value(999_600.), "$1.0M");
+    assert_eq!(value(999_960_000.), "$1.0B");
+}

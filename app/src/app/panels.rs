@@ -145,6 +145,7 @@ impl TerminalApp {
                     &watched,
                     crate::filings_view::PaneContext {
                         focused: chart_focused,
+                        keyboard_id: egui::Id::new(id),
                         link: filings_link,
                         watchlist_name: filings_list,
                     },

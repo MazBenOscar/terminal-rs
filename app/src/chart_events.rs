@@ -45,13 +45,12 @@ pub fn filings(rows: &[tr_edgar::Filing], symbol: &str, start: i64, end: i64) ->
 // N3: code P/S lots only, from either table. Joint owners don't multiply chart markers.
 pub fn insiders(rows: &[tr_edgar::Filing], symbol: &str, start: i64, end: i64) -> Vec<ChartEvent> {
     let mut events = vec![];
+    let effective = tr_edgar::insider::effective_lots(rows, symbol);
     for f in rows.iter().filter(|f| !f.reporting_owner && f.matches_symbol(symbol)) {
-        let first = f.insiders.first().map(|t| &t.owner);
-        let lots: Vec<_> = f
-            .insiders
+        let lots: Vec<_> = effective
             .iter()
-            .filter(|t| Some(&t.owner) == first && matches!(t.code.as_str(), "P" | "S"))
-            .cloned()
+            .filter(|(filing, t)| filing.accession == f.accession && matches!(t.code.as_str(), "P" | "S"))
+            .map(|(_, t)| (*t).clone())
             .collect();
         // Group by transaction date, so a filing with several dates marks the actual trade days.
         let dates: std::collections::BTreeSet<_> = lots.iter().map(|t| t.date.as_str()).collect();
@@ -75,7 +74,7 @@ pub fn insiders(rows: &[tr_edgar::Filing], symbol: &str, start: i64, end: i64) -
                     kind: if g.code == "P" { EventKind::InsiderBuy } else { EventKind::InsiderSell },
                     detail: format!(
                         "{} {action} {}",
-                        tr_edgar::insider::short_name(&g.owner.name),
+                        g.owner.display_name(),
                         g.value.map(tr_edgar::insider::value).unwrap_or_else(|| "(value unavailable)".into())
                     ),
                     source: "SEC EDGAR · local store".into(),

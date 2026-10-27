@@ -583,6 +583,7 @@ pub enum Response {
         rows: Arc<Vec<tr_edgar::Filing>>,
         status: String,
         updated: i64,
+        flags: tr_edgar::scheduler::StatusFlags,
     },
     SessionHistory {
         history: SessionHistory,
@@ -1237,6 +1238,7 @@ async fn edgar_loop(s: Arc<Shared>, mut interest: tokio::sync::watch::Receiver<(
                 rows: Default::default(),
                 status: "SEC EDGAR · store unavailable".into(),
                 updated: 0,
+                flags: tr_edgar::scheduler::StatusFlags { unavailable: true, ..Default::default() },
             });
             return;
         }
@@ -1244,7 +1246,21 @@ async fn edgar_loop(s: Arc<Shared>, mut interest: tokio::sync::watch::Receiver<(
     let mut scheduler = tr_edgar::scheduler::Scheduler::new(store, tr_edgar::scheduler::Sec);
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut previous = None;
+    // N2: always publish stored history at startup, even for paused/hidden panes.
+    let updated = scheduler.store.number("updated").unwrap_or(0);
+    if updated > 0 {
+        scheduler.status = "SEC EDGAR · updated".into();
+    }
+    let mut previous = scheduler.store.filings().ok().map(|rows| {
+        let rows = Arc::new(rows);
+        s.send(Response::Edgar {
+            rows: rows.clone(),
+            status: scheduler.status.clone(),
+            updated,
+            flags: scheduler.flags,
+        });
+        (rows, scheduler.status.clone(), updated, scheduler.flags)
+    });
     loop {
         tokio::select! {
             _ = tick.tick() => {},
@@ -1255,22 +1271,8 @@ async fn edgar_loop(s: Arc<Shared>, mut interest: tokio::sync::watch::Receiver<(
             continue;
         }
         let now = chrono::Utc::now().timestamp();
-        // N2: show persisted history immediately, before a potentially slow guarded refresh.
-        if previous.is_none() {
-            let updated = scheduler.store.number("updated").unwrap_or(0);
-            if updated > 0 {
-                scheduler.status = "SEC EDGAR · updated".into();
-            }
-            if let Ok(rows) = scheduler.store.filings() {
-                let snapshot = (rows, scheduler.status.clone(), updated);
-                s.send(Response::Edgar { rows: Arc::new(snapshot.0.clone()), status: snapshot.1.clone(), updated });
-                previous = Some(snapshot);
-            }
-        }
-        tokio::select! {
-            _ = scheduler.tick(now, true, &symbols) => {},
-            changed = interest.changed() => { if changed.is_err() { return; } else { continue; } },
-        }
+        // N3: interest changes apply after this tick; never cancel an in-flight document.
+        scheduler.tick(now, true, &symbols).await;
         let rows = match scheduler.store.filings() {
             Ok(rows) => rows,
             Err(_) => continue,
@@ -1284,9 +1286,14 @@ async fn edgar_loop(s: Arc<Shared>, mut interest: tokio::sync::watch::Receiver<(
         };
         // N3
         let updated = scheduler.store.number("updated").unwrap_or(0);
-        let snapshot = (rows, status, updated);
+        let snapshot = (Arc::new(rows), status, updated, scheduler.flags);
         if previous.as_ref() != Some(&snapshot) {
-            s.send(Response::Edgar { rows: Arc::new(snapshot.0.clone()), status: snapshot.1.clone(), updated });
+            s.send(Response::Edgar {
+                rows: snapshot.0.clone(),
+                status: snapshot.1.clone(),
+                updated,
+                flags: snapshot.3,
+            });
             previous = Some(snapshot);
         }
     }

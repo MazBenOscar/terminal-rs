@@ -2124,10 +2124,11 @@ impl TerminalApp {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
                 // N2: shared store snapshot, never clear rows on a failed refresh.
-                Response::Edgar { rows, status, updated } => {
+                Response::Edgar { rows, status, updated, flags } => {
                     self.edgar.rows = rows;
                     self.edgar.status = status;
                     self.edgar.updated = updated;
+                    self.edgar.flags = flags;
                 }
                 Response::WatchlistColumns { revision, cells, computed_at } => {
                     if let Some((cells, computed_at)) = finish_columns_reply(
@@ -2516,7 +2517,7 @@ impl TerminalApp {
         if self.agent_escape(ctx) || (!self.palette.open && self.agent_captures_focus(ctx)) {
             return;
         }
-        let presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
+        let mut presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|e| match e {
@@ -2568,16 +2569,39 @@ impl TerminalApp {
         // N3: feed navigation wins over type-anywhere and unmodified desk hotkeys.
         if !cmd_focused
             && self.cmd.is_empty()
-            && self.idx(self.focus).is_some_and(|i| matches!(self.panes[i].kind, PaneKind::Filings(_)))
-            && presses
-                .iter()
-                .any(|(key, modifiers)| *modifiers == Modifiers::NONE && crate::filings_view::owns_key(*key))
+            && let Some(index) = self.idx(self.focus)
+            && let PaneKind::Filings(settings) = &self.panes[index].kind
         {
+            let handled: Vec<_> = [
+                Key::ArrowUp,
+                Key::ArrowDown,
+                Key::J,
+                Key::K,
+                Key::Enter,
+                Key::Space,
+                Key::C,
+                Key::Slash,
+                Key::Escape,
+                Key::U,
+            ]
+            .into_iter()
+            .filter(|key| crate::filings_view::pane_uses_key(ctx, egui::Id::new(self.focus), settings, *key))
+            .collect();
+            let uses = |key| handled.contains(&key);
+            // Include auto-repeat. Strip only Text paired with a consumed unmodified key;
+            // leave Key events for the pane, and Shift+letters for type-anywhere.
             ctx.input_mut(|i| {
-                i.events
-                    .retain(|e| !matches!(e, Event::Text(t) if matches!(t.as_str(), "j" | "k" | "c" | "u" | "/" | " ")))
+                let mut pane_text = false;
+                i.events.retain(|e| match e {
+                    Event::Key { key, modifiers, pressed: true, .. } => {
+                        pane_text = *modifiers == Modifiers::NONE && uses(*key);
+                        true
+                    }
+                    Event::Text(_) => !pane_text,
+                    _ => true,
+                });
             });
-            return;
+            presses.retain(|(key, modifiers)| *modifiers != Modifiers::NONE || !uses(*key));
         }
         // N3
         if !cmd_focused && self.cmd.is_empty() && self.focused_is_chart() {

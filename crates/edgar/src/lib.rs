@@ -51,8 +51,14 @@ impl Filing {
             filing_url(self.cik, &self.accession, &self.primary_doc)
         }
     }
-    pub fn matches_symbol(&self, symbol: &str) -> bool {
+    pub fn matches_issuer_symbol(&self, symbol: &str) -> bool {
         ticker(symbol).is_some_and(|t| t == self.ticker || self.tickers.contains(&t))
+    }
+    pub fn matches_symbol(&self, symbol: &str) -> bool {
+        self.matches_issuer_symbol(symbol)
+            && (!matches!(self.form.as_str(), "4" | "4/A")
+                || self.insiders.is_empty()
+                || self.insiders.iter().any(|t| t.matches_symbol(self, symbol)))
     }
     pub fn time(&self) -> i64 {
         self.accepted.unwrap_or(self.filed)

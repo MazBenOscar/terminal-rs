@@ -1092,6 +1092,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_held_j_in_filings_does_not_type_into_command_line() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/review-filings-repeat-test");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.execute("CF");
+        assert!(app.idx(app.focus).is_some_and(|i| matches!(app.panes[i].kind, PaneKind::Filings(_))));
+        let ctx = egui::Context::default();
+        for repeat in [false, true, true] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1000.0, 600.0))),
+                    events: vec![
+                        egui::Event::Key {
+                            key: Key::J,
+                            physical_key: None,
+                            pressed: true,
+                            repeat,
+                            modifiers: Modifiers::NONE,
+                        },
+                        egui::Event::Text("j".into()),
+                    ],
+                    ..Default::default()
+                },
+                |_ui| app.hotkeys(&ctx),
+            );
+            output.textures_delta.clear();
+            assert!(app.cmd.is_empty(), "repeat={repeat}: command line captured {:?}", app.cmd);
+        }
+    }
+
+    #[test]
+    fn shifted_filings_letters_go_only_to_command_line() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/filings-shift-test");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.execute("CF");
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Key {
+                        key: Key::J,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: true,
+                        modifiers: Modifiers::SHIFT,
+                    },
+                    egui::Event::Text("J".into()),
+                ],
+                ..Default::default()
+            },
+            |_ui| app.hotkeys(&ctx),
+        );
+        output.textures_delta.clear();
+        assert_eq!(app.cmd, "J");
+    }
+    #[test]
     fn status_bar_keeps_hotkey_and_action_labels() {
         use crate::prefs::Action as A;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/status-keycap-test");

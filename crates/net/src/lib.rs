@@ -405,6 +405,35 @@ impl Guard {
         tx.commit()?;
         Ok(count)
     }
+    /// Refund a consumer reservation when authorization prevented a send.
+    pub fn decrement_counter(&self, key: &str) -> Result<(), Refused> {
+        self.db()?.execute("UPDATE counters SET count=max(0,count-1) WHERE key=?1", [key])?;
+        Ok(())
+    }
+    pub fn counter(&self, key: &str) -> Result<i64, Refused> {
+        Ok(self
+            .db()?
+            .query_row("SELECT count FROM counters WHERE key=?1", [key], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+    pub fn reserve_counter(&self, key: &str, limit: i64) -> Result<bool, Refused> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let count: i64 =
+            tx.query_row("SELECT count FROM counters WHERE key=?1", [key], |r| r.get(0)).optional()?.unwrap_or(0);
+        if count >= limit {
+            return Ok(false);
+        }
+        tx.execute("INSERT INTO counters VALUES(?1,1) ON CONFLICT(key) DO UPDATE SET count=count+1", [key])?;
+        tx.commit()?;
+        Ok(true)
+    }
+    /// Release a consumer slot only when no request was sent. Never used for HTTP failures.
+    pub fn release_slot(&self, key: &str) -> Result<(), Refused> {
+        self.db()?.execute("DELETE FROM slots WHERE key=?1", [key])?;
+        Ok(())
+    }
     pub fn clear_counter(&self, key: &str) -> Result<(), Refused> {
         self.db()?.execute("DELETE FROM counters WHERE key=?1", [key])?;
         Ok(())
@@ -464,7 +493,16 @@ impl Guard {
     fn reserve(&self, policy: &HostPolicy) -> Result<Option<Duration>, Refused> {
         self.reserve_owned(policy, "test-reservation")
     }
+    #[cfg(test)]
     fn reserve_owned(&self, policy: &HostPolicy, owner: &str) -> Result<Option<Duration>, Refused> {
+        self.reserve_with_counter(policy, owner, None)
+    }
+    fn reserve_with_counter(
+        &self,
+        policy: &HostPolicy,
+        owner: &str,
+        counter: Option<(&str, u32)>,
+    ) -> Result<Option<Duration>, Refused> {
         if let Some(pause) = self
             .cooldowns
             .read()
@@ -493,6 +531,19 @@ impl Guard {
         if count >= policy.daily_cap {
             return Err(Refused::Budget);
         }
+        let counter_key = if let Some((prefix, cap)) = counter {
+            // Resolve the UTC day at each actual hop, including a redirect over midnight.
+            let day = chrono::DateTime::from_timestamp_millis(now).ok_or(Refused::Ledger)?;
+            let key = format!("{prefix}{}", day.format("%Y%m%d"));
+            let count: u32 =
+                tx.query_row("SELECT count FROM counters WHERE key=?1", [&key], |r| r.get(0)).optional()?.unwrap_or(0);
+            if count >= cap {
+                return Err(Refused::Budget);
+            }
+            Some(key)
+        } else {
+            None
+        };
         let last: Option<i64> =
             tx.query_row("SELECT at FROM last_request WHERE \"group\"=?1", [policy.group], |r| r.get(0)).optional()?;
         let lease: Option<i64> =
@@ -504,6 +555,9 @@ impl Guard {
             // treating its crash-recovery expiry as the actual queue delay.
             let wait = if lease.is_some_and(|until| until > now) { (next - now).min(50) } else { next - now };
             return Ok(Some(Duration::from_millis(wait as u64)));
+        }
+        if let Some(key) = counter_key {
+            tx.execute("INSERT INTO counters VALUES(?1,1) ON CONFLICT(key) DO UPDATE SET count=count+1", [&key])?;
         }
         tx.execute(
             "INSERT INTO requests VALUES (?1,?2,1) ON CONFLICT(\"group\",day) DO UPDATE SET count=count+1",
@@ -599,11 +653,33 @@ impl Guard {
         request: reqwest::RequestBuilder,
         daily_limit: u32,
     ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
+        self.send_budgeted(group, request, daily_limit, None).await
+    }
+    /// A consumer's additional daily HTTP-hop ceiling, charged atomically with the host
+    /// budget only after pacing/lease acquisition. Cache hits and unsent refusals cost zero.
+    /// The UTC YYYYMMDD suffix is appended to `counter_prefix` at each send reservation.
+    pub async fn send_with_consumer_budget(
+        &self,
+        group: &str,
+        request: reqwest::RequestBuilder,
+        daily_limit: u32,
+        counter_prefix: &str,
+        counter_limit: u32,
+    ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
+        self.send_budgeted(group, request, daily_limit, Some((counter_prefix, counter_limit))).await
+    }
+    async fn send_budgeted(
+        &self,
+        group: &str,
+        request: reqwest::RequestBuilder,
+        daily_limit: u32,
+        counter: Option<(&str, u32)>,
+    ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
         self.identity(group)?;
         let request = request.build().map_err(|_| Refused::InvalidRequest)?;
         let policy = self.policy(group, request.url())?;
         if request.method() != reqwest::Method::GET {
-            return self.send_uncached(group, request, daily_limit).await;
+            return self.send_uncached(group, request, daily_limit, counter).await;
         }
         let key = (group.to_owned(), request.url().to_string());
         let slot = {
@@ -624,7 +700,7 @@ impl Guard {
                 return result.clone();
             }
         }
-        let result = self.send_uncached(group, request, daily_limit).await;
+        let result = self.send_uncached(group, request, daily_limit, counter).await;
         // Failures are only delivered to current waiters, never reused as cached content.
         *slot.result.lock().expect("cache result lock") = Some((Instant::now(), result.clone()));
         slot.generation.fetch_add(1, Ordering::Release);
@@ -663,6 +739,7 @@ impl Guard {
         group: &str,
         mut request: reqwest::Request,
         daily_limit: u32,
+        counter: Option<(&str, u32)>,
     ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
         let max_wait = if group == "yahoo-news" && !self.config.max_wait.is_zero() {
             Duration::from_secs(30)
@@ -681,7 +758,7 @@ impl Guard {
             );
             loop {
                 self.identity(group)?;
-                match self.reserve_owned(&policy, &owner)? {
+                match self.reserve_with_counter(&policy, &owner, counter)? {
                     None => break,
                     Some(wait) if Instant::now() + wait <= deadline => tokio::time::sleep(wait).await,
                     _ => return Err(Refused::Busy),

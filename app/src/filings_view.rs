@@ -83,28 +83,41 @@ impl Settings {
     pub fn new(symbol: Option<String>) -> Self {
         Self { scope: if symbol.is_some() { Scope::Symbol } else { Scope::Watchlist }, symbol, ..Self::default() }
     }
+    #[cfg(test)]
     pub fn matches_at(&self, filing: &Filing, watched: &[String], now: i64) -> bool {
-        let query = self.search.trim().to_ascii_lowercase();
+        self.matches_cached(filing, watched, now, &haystack(filing), &self.search.trim().to_ascii_lowercase())
+    }
+    fn matches_cached(&self, filing: &Filing, watched: &[String], now: i64, text: &str, query: &str) -> bool {
         self.matches(filing, watched)
             && filing.time() >= now - i64::from(self.days) * 86400
-            && (!self.buys_sells_only || filing.insiders.iter().any(|t| matches!(t.code.as_str(), "P" | "S")))
-            && (query.is_empty()
-                || format!(
-                    "{} {} {} {} {}",
-                    filing.ticker,
-                    filing.tickers.join(" "),
-                    filing.form,
-                    filing.detail(),
-                    filing.insiders.iter().map(|t| t.owner.name.as_str()).collect::<Vec<_>>().join(" ")
-                )
-                .to_ascii_lowercase()
-                .contains(&query))
+            && (!self.buys_sells_only
+                || !Form::Insider.matches(&filing.form)
+                || filing.insiders.iter().any(|t| {
+                    matches!(t.code.as_str(), "P" | "S")
+                        && match self.scope {
+                            Scope::Symbol => self.symbol.as_deref().is_some_and(|s| t.matches_symbol(filing, s)),
+                            Scope::Watchlist => watched.iter().any(|s| t.matches_symbol(filing, s)),
+                        }
+                }))
+            && (query.is_empty() || text.contains(query))
     }
     pub fn display_ticker(&self, filing: &Filing, watched: &[String]) -> String {
         let display = if self.scope == Scope::Symbol {
             self.symbol.as_deref().filter(|s| filing.matches_symbol(s)).and_then(tr_edgar::ticker)
         } else {
-            watched.iter().filter(|s| filing.matches_symbol(s)).filter_map(|s| tr_edgar::ticker(s)).min()
+            watched
+                .iter()
+                .filter(|s| {
+                    filing.matches_symbol(s)
+                        && (!self.buys_sells_only
+                            || !Form::Insider.matches(&filing.form)
+                            || filing
+                                .insiders
+                                .iter()
+                                .any(|t| matches!(t.code.as_str(), "P" | "S") && t.matches_symbol(filing, s)))
+                })
+                .filter_map(|s| tr_edgar::ticker(s))
+                .min()
         };
         display.unwrap_or_else(|| filing.ticker.clone())
     }
@@ -121,6 +134,7 @@ pub struct State {
     pub rows: Arc<Vec<Filing>>,
     pub status: String,
     pub updated: i64,
+    pub flags: tr_edgar::scheduler::StatusFlags,
 }
 pub fn safe_url(url: &str) -> bool {
     reqwest::Url::parse(url).is_ok_and(|u| {
@@ -130,8 +144,32 @@ pub fn safe_url(url: &str) -> bool {
             && u.password().is_none()
     })
 }
+fn haystack(f: &Filing) -> String {
+    format!(
+        "{} {} {} {} {}",
+        f.ticker,
+        f.tickers.join(" "),
+        f.form,
+        f.detail(),
+        f.insiders
+            .iter()
+            .map(|t| format!("{} {} {}", t.owner.name, t.security_title, t.issuer_symbol))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+    .to_ascii_lowercase()
+}
 #[derive(Clone, Default)]
 struct Runtime {
+    cache_source: Option<Arc<Vec<Filing>>>,
+    haystacks: Vec<String>,
+    cache_settings: Option<Settings>,
+    cache_watched: Vec<String>,
+    cache_minute: i64,
+    filtered: Vec<usize>,
+    summary: Summary,
+    #[cfg(test)]
+    cache_builds: usize,
     selected: Option<String>,
     expanded: std::collections::BTreeSet<String>,
     read: std::collections::BTreeSet<String>,
@@ -155,7 +193,7 @@ pub fn empty_cause(settings: &Settings, state: &State, watched: &[String]) -> Em
     {
         return EmptyCause::NotTracked;
     }
-    if ["Offline", "Paused", "disabled", "Needs contact", "budget"].iter().any(|s| state.status.contains(s)) {
+    if state.flags.unavailable {
         return EmptyCause::Offline;
     }
     let has_scope = state.rows.iter().any(|f| {
@@ -163,7 +201,7 @@ pub fn empty_cause(settings: &Settings, state: &State, watched: &[String]) -> Em
             && watched.iter().any(|w| f.matches_symbol(w))
             && (settings.scope == Scope::Watchlist || settings.symbol.as_deref().is_some_and(|s| f.matches_symbol(s)))
     });
-    if (state.rows.is_empty() && state.updated == 0) || (!has_scope && state.status.contains("Importing filings:")) {
+    if (state.rows.is_empty() && state.updated == 0) || (!has_scope && state.flags.importing) {
         return EmptyCause::Importing;
     }
     if settings.form != Form::All
@@ -176,7 +214,7 @@ pub fn empty_cause(settings: &Settings, state: &State, watched: &[String]) -> Em
         EmptyCause::NoHistory
     }
 }
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct Summary {
     pub buys: usize,
     pub sells: usize,
@@ -184,44 +222,65 @@ pub struct Summary {
     pub sold: f64,
     pub cluster: bool,
 }
+#[cfg(test)]
 pub fn summary(rows: &[Filing], symbol: &str, now: i64) -> Summary {
+    summarize(rows, symbol, now, 90, |_| true)
+}
+fn summarize(rows: &[Filing], symbol: &str, now: i64, days: u16, include: impl Fn(&Filing) -> bool) -> Summary {
+    use std::collections::BTreeSet;
     let mut s = Summary::default();
-    let mut owners = std::collections::BTreeSet::new();
-    for f in rows.iter().filter(|f| !f.reporting_owner && f.matches_symbol(symbol)) {
-        let first = f.insiders.first().map(|t| &t.owner);
-        for t in &f.insiders {
-            let Some(date) = chrono::NaiveDate::parse_from_str(&t.date, "%Y-%m-%d")
-                .ok()
-                .and_then(|d| d.and_hms_opt(0, 0, 0))
-                .map(|d| d.and_utc().timestamp())
-            else {
-                continue;
-            };
-            if date < now - 90 * 86400 || date > now {
-                continue;
+    let mut buys = BTreeSet::new();
+    let mut sells = BTreeSet::new();
+    let mut purchases = vec![];
+    for (f, t) in tr_edgar::insider::effective_lots(rows, symbol) {
+        if !include(f) {
+            continue;
+        }
+        let Some(date) = chrono::NaiveDate::parse_from_str(&t.date, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|d| d.and_utc().timestamp())
+        else {
+            continue;
+        };
+        if date < now - i64::from(days) * 86400 || date > now {
+            continue;
+        }
+        let amount = t.shares.zip(t.price).map(|(a, b)| a * b).unwrap_or(0.);
+        match t.code.as_str() {
+            "P" => {
+                buys.insert(&f.accession);
+                s.bought += amount;
+                purchases.push((date, tr_edgar::insider::owner_id(&t.owner)));
             }
-            if t.code == "P" && date >= now - 30 * 86400 {
-                owners.insert(t.owner.cik.map_or_else(|| t.owner.name.to_ascii_lowercase(), |c| c.to_string()));
+            "S" => {
+                sells.insert(&f.accession);
+                s.sold += amount;
             }
-            // Joint owners describe the same economic lots; don't multiply their value.
-            if Some(&t.owner) != first {
-                continue;
-            }
-            let amount = t.shares.zip(t.price).map(|(a, b)| a * b).unwrap_or(0.);
-            match t.code.as_str() {
-                "P" => {
-                    s.buys += 1;
-                    s.bought += amount;
-                }
-                "S" => {
-                    s.sells += 1;
-                    s.sold += amount;
-                }
-                _ => {}
-            }
+            _ => {}
         }
     }
-    s.cluster = owners.len() >= 2;
+    s.buys = buys.len();
+    s.sells = sells.len();
+    purchases.sort();
+    // Any rolling 30-day span within the shown window, not just the latest 30 days.
+    let mut left = 0;
+    let mut owners = std::collections::BTreeMap::<&str, usize>::new();
+    for (right, (date, owner)) in purchases.iter().enumerate() {
+        *owners.entry(owner).or_default() += 1;
+        while purchases[left].0 < date - 30 * 86400 {
+            let count = owners.get_mut(purchases[left].1.as_str()).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                owners.remove(purchases[left].1.as_str());
+            }
+            left += 1;
+        }
+        if right > left && owners.len() >= 2 {
+            s.cluster = true;
+            break;
+        }
+    }
     s
 }
 fn text_has_focus(ctx: &egui::Context) -> bool {
@@ -241,6 +300,32 @@ pub fn owns_key(key: egui::Key) -> bool {
             | egui::Key::Escape
             | egui::Key::U
     )
+}
+#[derive(Clone, Copy, Default)]
+struct KeyboardUse {
+    rows: bool,
+    selected: bool,
+}
+pub fn pane_uses_key(ctx: &egui::Context, id: egui::Id, settings: &Settings, key: egui::Key) -> bool {
+    let used = ctx.data_mut(|d| d.get_temp::<KeyboardUse>(id.with("filings-keys"))).unwrap_or_default();
+    match key {
+        egui::Key::ArrowUp | egui::Key::ArrowDown => used.rows,
+        egui::Key::Enter | egui::Key::Space | egui::Key::C => used.selected,
+        egui::Key::Escape => used.selected || !settings.search.is_empty(),
+        _ => owns_key(key),
+    }
+}
+fn consume_exact(ui: &Ui, key: egui::Key) -> bool {
+    ui.input_mut(|i| {
+        let mut consumed = false;
+        i.events.retain(|e| {
+            let take = matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. }
+                if *k == key && *modifiers == egui::Modifiers::NONE);
+            consumed |= take;
+            !take
+        });
+        consumed
+    })
 }
 pub fn move_selection(selected: Option<&str>, ids: &[&str], down: bool) -> Option<String> {
     if ids.is_empty() {
@@ -272,8 +357,12 @@ fn direction(code: &str) -> egui::Color32 {
         _ => theme::text(),
     }
 }
+#[cfg(test)]
 pub fn row_text(f: &Filing, only_open_market: bool) -> (String, String) {
-    use tr_edgar::insider::{aggregate, short_name, value};
+    row_text_for(f, only_open_market, None)
+}
+fn row_text_for(f: &Filing, only_open_market: bool, symbol: Option<&str>) -> (String, String) {
+    use tr_edgar::insider::{aggregate, value};
     if !matches!(f.form.as_str(), "4" | "4/A") {
         return (
             if f.form.starts_with("8-K") {
@@ -318,7 +407,8 @@ pub fn row_text(f: &Filing, only_open_market: bool) -> (String, String) {
         .insiders
         .iter()
         .filter(|t| {
-            (!t.derivative || !has_common || matches!(t.code.as_str(), "P" | "S"))
+            symbol.is_none_or(|s| t.matches_symbol(f, s))
+                && (!t.derivative || !has_common || matches!(t.code.as_str(), "P" | "S"))
                 && (!only_open_market || matches!(t.code.as_str(), "P" | "S"))
         })
         .cloned()
@@ -327,16 +417,25 @@ pub fn row_text(f: &Filing, only_open_market: bool) -> (String, String) {
     let mut text = vec![];
     let mut previous = None;
     let mut total = Some(0.);
-    let first = groups.first().map(|g| &g.owner);
+    let mut has_value = false;
+    let mut seen = std::collections::BTreeSet::new();
+    for t in lots.iter().filter(|t| matches!(t.code.as_str(), "P" | "S")) {
+        if seen.insert(tr_edgar::insider::lot_key(t)) {
+            has_value = true;
+            total = total.zip(t.shares.zip(t.price)).map(|(a, (shares, price))| a + shares * price);
+        }
+    }
     for g in &groups {
         if previous != Some(&g.owner) {
-            text.push(format!("{} ({})", short_name(&g.owner.name), g.owner.role()));
+            let role = g.owner.role();
+            text.push(format!(
+                "{}{}",
+                g.owner.display_name(),
+                if role.is_empty() { String::new() } else { format!(" ({role})") }
+            ));
             previous = Some(&g.owner);
         }
         text.push(g.text());
-        if Some(&g.owner) == first {
-            total = total.zip(g.value).map(|(a, b)| a + b);
-        }
     }
     if !has_common {
         text.push("derivative".into());
@@ -344,7 +443,7 @@ pub fn row_text(f: &Filing, only_open_market: bool) -> (String, String) {
     if lots.iter().any(|t| t.plan_10b5_1) {
         text.push("10b5-1".into());
     }
-    (text.join(" · "), total.filter(|_| !groups.is_empty()).map(value).unwrap_or_else(|| "—".into()))
+    (text.join(" · "), total.filter(|_| has_value).map(value).unwrap_or_else(|| "—".into()))
 }
 fn open(ui: &Ui, f: &Filing) {
     let link = f.link();
@@ -355,6 +454,7 @@ fn open(ui: &Ui, f: &Filing) {
 /// Context supplied by the pane owner, not guessed from widget focus.
 pub struct PaneContext<'a> {
     pub focused: bool,
+    pub keyboard_id: egui::Id,
     pub link: Option<crate::layouts::Link>,
     pub watchlist_name: &'a str,
 }
@@ -375,7 +475,15 @@ pub fn show(
     let mut actions = vec![];
     let now = chrono::Utc::now().timestamp();
     let runtime_id = ui.id().with("filings-runtime");
-    let mut runtime = ui.data_mut(|d| d.get_temp::<Runtime>(runtime_id)).unwrap_or_default();
+    // egui temp reads clone their value: store an Arc, not the growing Runtime collections.
+    let runtime_handle =
+        ui.data_mut(|d| d.get_temp::<Arc<std::sync::Mutex<Runtime>>>(runtime_id)).unwrap_or_else(|| {
+            let handle = Arc::new(std::sync::Mutex::new(Runtime::default()));
+            ui.data_mut(|d| d.insert_temp(runtime_id, handle.clone()));
+            handle
+        });
+    let mut runtime_guard = runtime_handle.lock().expect("filings runtime");
+    let runtime = &mut *runtime_guard;
     let mut focus_search = false;
     ui.spacing_mut().item_spacing = egui::vec2(dp(6.), dp(3.));
     ui.horizontal(|ui| {
@@ -449,7 +557,7 @@ pub fn show(
     let search_id = ui.id().with("filings-search");
     // Keyboard input is processed before the search field, so '/' can focus it this frame.
     if context.focused && !text_has_focus(ui.ctx()) {
-        focus_search = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Slash));
+        focus_search = consume_exact(ui, egui::Key::Slash);
     }
     ui.horizontal(|ui| {
         ui.style_mut().override_font_id = Some(theme::ui_font(10.5));
@@ -515,37 +623,85 @@ pub fn show(
         runtime.paused_rows = None;
     }
     let stored = runtime.paused_rows.clone().unwrap_or_else(|| state.rows.clone());
+    let changed = runtime.cache_source.as_ref().is_none_or(|source| !Arc::ptr_eq(source, &stored));
+    if changed {
+        runtime.haystacks = stored.iter().map(haystack).collect();
+        runtime.cache_source = Some(stored.clone());
+    }
+    if changed
+        || runtime.cache_settings.as_ref() != Some(settings)
+        || runtime.cache_watched != watched
+        || runtime.cache_minute != now / 60
+    {
+        let query = settings.search.trim().to_ascii_lowercase();
+        runtime.filtered = stored
+            .iter()
+            .enumerate()
+            .filter(|(index, f)| settings.matches_cached(f, watched, now, &runtime.haystacks[*index], &query))
+            .map(|(index, _)| index)
+            .collect();
+        runtime
+            .filtered
+            .sort_by_key(|i| (std::cmp::Reverse(stored[*i].time()), std::cmp::Reverse(&stored[*i].accession)));
+        let included: std::collections::BTreeSet<_> =
+            runtime.filtered.iter().map(|i| stored[*i].accession.as_str()).collect();
+        runtime.summary = summarize(&stored, settings.symbol.as_deref().unwrap_or(""), now, settings.days, |f| {
+            included.contains(f.accession.as_str())
+        });
+        runtime.cache_settings = Some(settings.clone());
+        runtime.cache_watched = watched.to_vec();
+        runtime.cache_minute = now / 60;
+        #[cfg(test)]
+        {
+            runtime.cache_builds += 1;
+        }
+    }
     if settings.scope == Scope::Symbol && settings.form == Form::Insider {
-        let s = summary(&stored, settings.symbol.as_deref().unwrap_or(""), now);
+        let s = &runtime.summary;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Insiders 90D").font(theme::mono(10.)).color(theme::muted()));
             ui.label(
-                RichText::new(format!("· {} sells {}", s.sells, tr_edgar::insider::value(s.sold)))
-                    .font(theme::mono(10.))
-                    .color(theme::down()),
+                RichText::new(format!("Insiders {}D", settings.days)).font(theme::mono(10.)).color(theme::muted()),
             );
             ui.label(
-                RichText::new(format!("· {} buys {}", s.buys, tr_edgar::insider::value(s.bought)))
-                    .font(theme::mono(10.))
-                    .color(theme::up()),
+                RichText::new(format!(
+                    "· {} {} {}",
+                    s.sells,
+                    if s.sells == 1 { "sale" } else { "sales" },
+                    tr_edgar::insider::value(s.sold)
+                ))
+                .font(theme::mono(10.))
+                .color(if s.sells == 0 { theme::muted() } else { theme::down() }),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "· {} {} {}",
+                    s.buys,
+                    if s.buys == 1 { "buy" } else { "buys" },
+                    tr_edgar::insider::value(s.bought)
+                ))
+                .font(theme::mono(10.))
+                .color(if s.buys == 0 { theme::muted() } else { theme::up() }),
             );
             if s.cluster {
                 ui.label(RichText::new("Cluster buy").color(theme::amber()));
             }
         });
     }
-    let mut rows: Vec<_> = stored
+    let rows: Vec<_> = runtime
+        .filtered
         .iter()
-        .filter(|f| {
-            settings.matches_at(f, watched, now) && (!settings.unread_only || !runtime.read.contains(&f.accession))
-        })
+        .map(|i| &stored[*i])
+        .filter(|f| !settings.unread_only || !runtime.read.contains(&f.accession))
         .collect();
-    rows.sort_by_key(|f| (std::cmp::Reverse(f.time()), std::cmp::Reverse(&f.accession)));
+    if runtime.selected.as_ref().is_some_and(|id| !rows.iter().any(|f| &f.accession == id)) {
+        runtime.selected = None;
+    }
+    let has_rows = !rows.is_empty();
     let mut scroll_selected = false;
     if context.focused && !text_has_focus(ui.ctx()) {
-        let pressed = |key| ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key));
-        let down = pressed(egui::Key::ArrowDown) || pressed(egui::Key::J);
-        let up = pressed(egui::Key::ArrowUp) || pressed(egui::Key::K);
+        let pressed = |key| consume_exact(ui, key);
+        let down = (!rows.is_empty() && pressed(egui::Key::ArrowDown)) || pressed(egui::Key::J);
+        let up = (!rows.is_empty() && pressed(egui::Key::ArrowUp)) || pressed(egui::Key::K);
         if down || up {
             runtime.selected = move_selection(
                 runtime.selected.as_deref(),
@@ -555,7 +711,7 @@ pub fn show(
             runtime.selected_at = Some(std::time::Instant::now());
             scroll_selected = true;
         }
-        if pressed(egui::Key::Escape) {
+        if (!settings.search.is_empty() || runtime.selected.is_some()) && pressed(egui::Key::Escape) {
             if !settings.search.is_empty() {
                 settings.search.clear();
             } else {
@@ -582,7 +738,8 @@ pub fn show(
         }
     } else if context.focused
         && ui.memory(|m| m.has_focus(search_id))
-        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        && !settings.search.is_empty()
+        && consume_exact(ui, egui::Key::Escape)
     {
         settings.search.clear();
         ui.memory_mut(|m| m.surrender_focus(search_id));
@@ -594,7 +751,11 @@ pub fn show(
     }
     if rows.is_empty() {
         let cause = empty_cause(settings, state, watched);
-        let ticker = settings.symbol.as_deref().and_then(tr_edgar::ticker).unwrap_or_else(|| "this watchlist".into());
+        let ticker = if settings.scope == Scope::Watchlist {
+            context.watchlist_name.to_owned()
+        } else {
+            settings.symbol.as_deref().and_then(tr_edgar::ticker).unwrap_or_else(|| "this symbol".into())
+        };
         let text = match cause {
             EmptyCause::NotTracked => {
                 format!("{ticker} is not on a watchlist. Filings are tracked for watchlist symbols only.")
@@ -605,9 +766,13 @@ pub fn show(
                 .map(|i| state.status[i..].to_owned())
                 .unwrap_or_else(|| "Importing filings (one company a minute while visible).".into()),
             EmptyCause::Filtered => {
-                format!("No {} for {ticker} in the last {} days.", settings.form.label(), settings.days)
+                if settings.form == Form::All {
+                    format!("No filings for {ticker} match these filters.")
+                } else {
+                    format!("No {} for {ticker} in the last {} days.", settings.form.label(), settings.days)
+                }
             }
-            EmptyCause::NoHistory => "No stored filings in this window.".into(),
+            EmptyCause::NoHistory => format!("No stored filings for {ticker} in this window."),
             EmptyCause::Offline => "Stored filings retained while updates are unavailable.".into(),
         };
         ui.label(RichText::new(text).font(theme::ui_font(11.)).color(theme::muted()));
@@ -682,7 +847,7 @@ pub fn show(
             }
             let (time, full_time) = crate::feed_time::feed_time(f.time(), now, f.accepted.is_none());
             let ticker = settings.display_ticker(f, watched);
-            let (text, value) = row_text(f, settings.buys_sells_only);
+            let (text, value) = row_text_for(f, settings.buys_sells_only, Some(&ticker));
             let time_width = ui
                 .painter()
                 .layout_no_wrap("0".repeat(crate::feed_time::WIDTH_CHARS), theme::mono(10.), theme::muted())
@@ -820,7 +985,11 @@ pub fn show(
                                 if f.insiders.is_empty() {
                                     ui.label(RichText::new(&text).font(theme::ui_font(11.)).color(theme::muted()));
                                 }
-                                for t in &f.insiders {
+                                for t in f
+                                    .insiders
+                                    .iter()
+                                    .filter(|t| t.matches_symbol(f, &settings.display_ticker(f, watched)))
+                                {
                                     let date = chrono::NaiveDate::parse_from_str(&t.date, "%Y-%m-%d")
                                         .ok()
                                         .and_then(|d| d.and_hms_opt(0, 0, 0))
@@ -829,7 +998,7 @@ pub fn show(
                                     ui.label(
                                         RichText::new(format!(
                                             "{date} · {} · {} {} @ {} · owned {}{}",
-                                            tr_edgar::insider::short_name(&t.owner.name),
+                                            t.owner.display_name(),
                                             tr_edgar::insider::action(&t.code).0,
                                             t.shares.map(tr_edgar::insider::number).unwrap_or_else(|| "—".into()),
                                             t.price.map(|p| format!("{p:.2}")).unwrap_or_else(|| "—".into()),
@@ -869,7 +1038,12 @@ pub fn show(
         runtime.heights.insert(id, height);
     }
     runtime.ids = ids;
-    ui.data_mut(|d| d.insert_temp(runtime_id, runtime));
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(
+            context.keyboard_id.with("filings-keys"),
+            KeyboardUse { rows: has_rows, selected: runtime.selected.is_some() },
+        )
+    });
     actions
 }
 #[cfg(test)]
@@ -967,7 +1141,11 @@ mod tests {
         let state = State::default();
         assert_eq!(empty_cause(&s, &state, &[]), EmptyCause::NotTracked);
         assert_eq!(empty_cause(&s, &state, &watched), EmptyCause::Importing);
-        let state = State { status: "Offline (test instance)".into(), ..Default::default() };
+        let state = State {
+            status: "Offline (test instance)".into(),
+            flags: tr_edgar::scheduler::StatusFlags { unavailable: true, ..Default::default() },
+            ..Default::default()
+        };
         assert_eq!(empty_cause(&s, &state, &watched), EmptyCause::Offline);
         let state = State { rows: Arc::new(vec![f]), updated: now, ..Default::default() };
         assert_eq!(empty_cause(&s, &state, &watched), EmptyCause::Filtered);
@@ -1056,9 +1234,19 @@ mod tests {
                         &mut settings,
                         &state,
                         &watched,
-                        PaneContext { focused, link: Some(crate::layouts::Link::Orange), watchlist_name: "Main" },
+                        PaneContext {
+                            focused,
+                            keyboard_id: egui::Id::new("test"),
+                            link: Some(crate::layouts::Link::Orange),
+                            watchlist_name: "Main",
+                        },
                     );
-                    runtime = ui.data_mut(|d| d.get_temp::<Runtime>(ui.id().with("filings-runtime"))).unwrap();
+                    runtime = ui
+                        .data_mut(|d| d.get_temp::<Arc<std::sync::Mutex<Runtime>>>(ui.id().with("filings-runtime")))
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .clone();
                 },
             );
             output.textures_delta.clear();
@@ -1149,7 +1337,12 @@ mod tests {
                     &mut settings,
                     &state,
                     &["AAPL US Equity".into()],
-                    PaneContext { focused: false, link: None, watchlist_name: "All watchlists" },
+                    PaneContext {
+                        focused: false,
+                        keyboard_id: egui::Id::new("test"),
+                        link: None,
+                        watchlist_name: "All watchlists",
+                    },
                 );
             });
             delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
@@ -1192,6 +1385,294 @@ mod tests {
         assert!(settings.matches(&filing, &watched));
         filing.reporting_owner = true;
         assert!(!settings.matches(&filing, &watched));
+    }
+    // ---- Review (N3): failing tests for defects found in production-readiness review ----
+    fn review_now() -> i64 {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 27).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp()
+    }
+    #[test]
+    fn review_sale_with_exercise_shows_sale_value() {
+        let mut f = insider_fixture();
+        let mut exercise = f.insiders[0].clone();
+        exercise.code = "M".into();
+        exercise.price = None;
+        exercise.acquired = Some(true);
+        f.insiders.insert(0, exercise);
+        let (text, value) = row_text(&f, false);
+        assert!(text.contains("Sold 2,399 @ 345.00"), "{text}");
+        assert_eq!(value, "$828K");
+    }
+    #[test]
+    fn review_joint_filers_single_purchase_is_not_cluster() {
+        let mut buy = insider_fixture();
+        buy.insiders[0].code = "P".into();
+        let mut joint = buy.insiders[0].clone();
+        joint.owner.name = "Newstead Family Trust".into();
+        joint.owner.cik = Some(99);
+        buy.insiders.push(joint);
+        let s = summary(&[buy], "AAPL US Equity", review_now());
+        assert_eq!(s.buys, 1);
+        assert!(!s.cluster, "one joint filing is one insider purchase, not a cluster");
+    }
+    #[test]
+    fn review_amendment_does_not_double_count_summary() {
+        let sale = insider_fixture();
+        let mut amendment = sale.clone();
+        amendment.accession = "amendment".into();
+        amendment.form = "4/A".into();
+        let s = summary(&[sale, amendment], "AAPL US Equity", review_now());
+        assert_eq!(s.sells, 1);
+        assert_eq!(s.sold, 2399. * 345.);
+    }
+    #[test]
+    fn review_budget_deferral_status_is_not_offline_empty_state() {
+        let watched: Vec<String> = vec!["AAPL US Equity".into()];
+        let mut s = Settings::new(Some(watched[0].clone()));
+        s.form = Form::Current;
+        let state = State {
+            rows: Arc::new(vec![insider_fixture()]),
+            updated: review_now(),
+            status: "SEC EDGAR · updated · Company refresh deferred to reserve the feed budget".into(),
+            ..Default::default()
+        };
+        assert_eq!(empty_cause(&s, &state, &watched), EmptyCause::Filtered);
+    }
+    #[test]
+    fn review_buys_sells_only_keeps_non_insider_forms() {
+        let now = chrono::Utc::now().timestamp();
+        let watched: Vec<String> = vec!["AAPL US Equity".into()];
+        let mut s = Settings::new(Some(watched[0].clone()));
+        s.buys_sells_only = true;
+        let eight = Filing {
+            ticker: "AAPL".into(),
+            form: "8-K".into(),
+            items: "2.02".into(),
+            filed: now,
+            ..Default::default()
+        };
+        assert!(s.matches_at(&eight, &watched, now));
+    }
+    #[test]
+    fn summary_counts_filings_not_lots_and_finds_older_rolling_clusters() {
+        let mut first = insider_fixture();
+        first.insiders[0].code = "P".into();
+        first.insiders[0].date = "2026-08-10".into();
+        let mut lot = first.insiders[0].clone();
+        lot.lot_id = Some(1);
+        first.insiders.push(lot);
+        let mut second = first.clone();
+        second.accession = "second".into();
+        second.insiders.truncate(1);
+        second.insiders[0].date = "2026-08-25".into();
+        second.insiders[0].owner.cik = Some(99);
+        let rows = [first, second];
+        let s = summary(&rows, "AAPL", review_now());
+        assert_eq!(s.buys, 2, "three lots, two filings");
+        assert_eq!(s.bought, 3. * 2399. * 345.);
+        assert!(s.cluster, "older purchases 15 days apart still cluster inside 90D");
+        assert!(!summarize(&rows, "AAPL", review_now(), 30, |_| true).cluster);
+    }
+    #[test]
+    fn share_class_lots_roundtrip_and_filter_rows_summary_and_amended_markers() {
+        let mut f = insider_fixture();
+        f.tickers = vec!["AAPL".into(), "AAPL-B".into()];
+        let mut second = f.insiders[0].clone();
+        second.issuer_symbol = "AAPL-B".into();
+        second.security_title = "Class B common".into();
+        second.shares = Some(10.);
+        second.lot_id = Some(1);
+        f.insiders.push(second);
+        let mut amendment = f.clone();
+        amendment.form = "4/A".into();
+        amendment.accession = "amendment".into();
+        amendment.insiders[0].price = Some(350.);
+        let mut store = tr_edgar::store::Store::memory().unwrap();
+        store
+            .replace_companies(&[
+                tr_edgar::Company { cik: f.cik, ticker: "AAPL".into(), title: String::new() },
+                tr_edgar::Company { cik: f.cik, ticker: "AAPL-B".into(), title: String::new() },
+            ])
+            .unwrap();
+        for row in [&f, &amendment] {
+            store.upsert(std::slice::from_ref(row)).unwrap();
+            store
+                .save_insiders(
+                    row,
+                    &tr_edgar::insider::Document {
+                        issuer_cik: row.cik,
+                        transactions: row.insiders.clone(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let rows = store.filings().unwrap();
+        assert_eq!(rows[0].insiders, f.insiders);
+        assert_eq!(row_text_for(&f, false, Some("AAPL-B")).1, "$3K");
+        assert_eq!(summary(&rows, "AAPL-B", review_now()).sold, 3450.);
+        assert_eq!(summary(&rows, "AAPL", review_now()).sold, 2399. * 350.);
+        for symbol in ["AAPL", "AAPL-B"] {
+            let events = crate::chart_events::insiders(&rows, symbol, 0, review_now());
+            assert_eq!(events.len(), 1, "amendment must replace its original on {symbol}");
+        }
+        let mut mixed = f.clone();
+        mixed.insiders[0].code = "M".into();
+        let watched = vec!["AAPL".into(), "AAPL-B".into()];
+        let mut settings = Settings { buys_sells_only: true, ..Settings::new(Some("AAPL".into())) };
+        assert!(!settings.matches_at(&mixed, &watched, review_now()), "neutral-only class is hidden");
+        settings.symbol = Some("AAPL-B".into());
+        assert!(settings.matches_at(&mixed, &watched, review_now()));
+        settings.scope = Scope::Watchlist;
+        assert!(settings.matches_at(&mixed, &watched, review_now()));
+        assert_eq!(settings.display_ticker(&mixed, &watched), "AAPL-B");
+        assert!(!settings.matches_at(&mixed, &["AAPL".into()], review_now()));
+        f.insiders.truncate(1);
+        assert!(!f.matches_symbol("AAPL-B"));
+        f.insiders[0].issuer_symbol.clear();
+        assert!(f.matches_symbol("AAPL-B"));
+        f.insiders[0].issuer_symbol = "UNKNOWN".into();
+        assert!(f.matches_symbol("AAPL-B"), "unknown XML symbols fall back to CIK classes");
+    }
+    #[test]
+    fn empty_roles_are_omitted_and_non_ps_insider_forms_only_are_hidden() {
+        let mut f = insider_fixture();
+        f.insiders[0].owner = tr_edgar::insider::Owner { name: "Smith & Co".into(), ..Default::default() };
+        assert!(row_text(&f, false).0.starts_with("Smith & Co · Sold"));
+        let s = Settings { buys_sells_only: true, ..Settings::default() };
+        let watched = vec!["AAPL".into()];
+        for form in ["3", "4", "5", "4/A"] {
+            f.form = form.into();
+            for code in ["A", "M", "F", "G", "C", "J", "X", "D"] {
+                f.insiders[0].code = code.into();
+                assert!(!s.matches_at(&f, &watched, chrono::Utc::now().timestamp()));
+            }
+        }
+        for form in ["8-K", "10-K", "SC 13D", "DEF 14A", "S-1"] {
+            f.form = form.into();
+            assert!(s.matches_at(&f, &watched, chrono::Utc::now().timestamp()));
+        }
+    }
+    #[test]
+    fn pane_leaves_unused_escape_enter_arrows_and_shift_keys_in_input() {
+        let ctx = egui::Context::default();
+        let mut settings = Settings::default();
+        let state = State { updated: review_now(), ..Default::default() };
+        let events: Vec<_> = [
+            egui::Key::Escape,
+            egui::Key::Enter,
+            egui::Key::ArrowUp,
+            egui::Key::ArrowDown,
+            egui::Key::J,
+            egui::Key::U,
+            egui::Key::Slash,
+        ]
+        .into_iter()
+        .map(|key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: if matches!(key, egui::Key::J | egui::Key::U | egui::Key::Slash) {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            },
+        })
+        .collect();
+        let mut remaining = vec![];
+        let mut output = ctx.run_ui(egui::RawInput { events: events.clone(), ..Default::default() }, |ui| {
+            show(
+                ui,
+                &mut settings,
+                &state,
+                &[],
+                PaneContext { focused: true, keyboard_id: egui::Id::new("test"), link: None, watchlist_name: "Main" },
+            );
+            remaining = ui.input(|i| i.events.clone());
+        });
+        output.textures_delta.clear();
+        assert_eq!(remaining, events);
+        assert!(!settings.unread_only);
+    }
+    #[test]
+    fn paused_startup_rows_and_runtime_cache_survive_idle_frames_and_invalidate_on_filters() {
+        let ctx = egui::Context::default();
+        let mut settings = Settings { paused: true, ..Settings::new(Some("AAPL".into())) };
+        settings.form = Form::Insider;
+        let state = State { rows: Arc::new(vec![insider_fixture()]), updated: review_now(), ..Default::default() };
+        let mut handles = vec![];
+        let mut buffers = vec![];
+        for frame in 0..4 {
+            if frame == 3 {
+                settings.search = "missing".into();
+            }
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                show(
+                    ui,
+                    &mut settings,
+                    &state,
+                    &["AAPL".into()],
+                    PaneContext {
+                        focused: false,
+                        keyboard_id: egui::Id::new("test"),
+                        link: None,
+                        watchlist_name: "Main",
+                    },
+                );
+                let handle = ui
+                    .data_mut(|d| d.get_temp::<Arc<std::sync::Mutex<Runtime>>>(ui.id().with("filings-runtime")))
+                    .unwrap();
+                {
+                    let runtime = handle.lock().unwrap();
+                    assert_eq!(runtime.paused_rows.as_ref().unwrap().len(), 1);
+                    assert_eq!(runtime.filtered.len(), usize::from(frame < 3));
+                    assert_eq!(runtime.cache_builds, if frame < 3 { 1 } else { 2 });
+                    buffers.push(runtime.haystacks[0].as_ptr());
+                }
+                handles.push(handle);
+            });
+            output.textures_delta.clear();
+        }
+        assert!(handles.windows(2).all(|w| Arc::ptr_eq(&w[0], &w[1])));
+        assert!(buffers.windows(2).all(|w| w[0] == w[1]), "haystacks are snapshot-, not frame-keyed");
+    }
+    #[test]
+    fn all_chip_empty_copy_names_symbol_or_watchlist() {
+        let ctx = egui::Context::default();
+        let mut settings = Settings::new(Some("AAPL".into()));
+        settings.search = "nothing".into();
+        let state = State { rows: Arc::new(vec![insider_fixture()]), updated: review_now(), ..Default::default() };
+        for (scope, expected) in [
+            (Scope::Symbol, "No filings for AAPL match these filters."),
+            (Scope::Watchlist, "No filings for Retirement match these filters."),
+        ] {
+            settings.scope = scope;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600., 900.))),
+                    ..Default::default()
+                },
+                |ui| {
+                    show(
+                        ui,
+                        &mut settings,
+                        &state,
+                        &["AAPL".into()],
+                        PaneContext {
+                            focused: false,
+                            keyboard_id: egui::Id::new("test"),
+                            link: None,
+                            watchlist_name: "Retirement",
+                        },
+                    );
+                },
+            );
+            assert!(
+                output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == expected)),
+                "missing {expected}"
+            );
+            output.textures_delta.clear();
+        }
     }
     #[test]
     fn external_links_are_http_only() {

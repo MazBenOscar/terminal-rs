@@ -751,6 +751,68 @@ async fn different_yahoo_queries_queue_within_thirty_seconds() {
 }
 
 #[tokio::test]
+async fn form4_consumer_counter_counts_redirect_hops_and_is_atomic_across_instances() {
+    let temp = Temp::new();
+    let server = Server::sequence(&[(302, "Location: /final.xml\r\n", ""), (200, "", "<xml/>")], Duration::ZERO);
+    let one = server.attach(temp.guard(false));
+    let two = server.attach(temp.guard(false));
+    for guard in [&one, &two] {
+        guard.configure(Settings { sec_contact: "research@example.test".into(), ..Settings::default() });
+        fast_redirects(guard);
+    }
+    one.set_cache_ttl("sec", Duration::from_secs(60)).unwrap();
+    let request = |name| reqwest::Client::new().get(format!("https://www.sec.gov/Archives/{name}"));
+    let key = format!("sec:f4:day:{}", Utc::now().format("%Y%m%d"));
+    one.db().unwrap().execute("INSERT INTO counters VALUES(?1,298)", [&key]).unwrap();
+    let result = one.send_with_consumer_budget("sec", request("first.xml"), 1200, "sec:f4:day:", 300).await;
+    assert!(result.is_ok());
+    assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+    assert_eq!(one.counter(&key).unwrap(), 300);
+    assert_eq!(
+        two.send_with_consumer_budget("sec", request("other.xml"), 1200, "sec:f4:day:", 300).await.err(),
+        Some(Refused::Budget)
+    );
+    assert_eq!(two.counter(&key).unwrap(), 300);
+    // A cached body does not spend another HTTP allowance.
+    one.send_with_consumer_budget("sec", request("first.xml"), 1200, "sec:f4:day:", 300).await.unwrap();
+    assert_eq!(one.counter(&key).unwrap(), 300);
+    assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+    one.decrement_counter(&key).unwrap();
+    let (a, b) = tokio::join!(
+        one.send_with_consumer_budget("sec", request("a.xml"), 1200, "sec:f4:day:", 300),
+        two.send_with_consumer_budget("sec", request("b.xml"), 1200, "sec:f4:day:", 300)
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    assert_eq!(a.err().or_else(|| b.err()), Some(Refused::Budget));
+    assert_eq!(one.counter(&key).unwrap(), 300);
+    assert_eq!(server.hits.load(Ordering::SeqCst), 3);
+}
+#[tokio::test]
+async fn form4_consumer_counter_ignores_unsent_refusals_but_counts_a_sent_pause() {
+    let temp = Temp::new();
+    let server = Server::new(403, "", "denied");
+    let guard = server.attach(temp.guard(false));
+    let request = || reqwest::Client::new().get("https://www.sec.gov/Archives/form4.xml");
+    let key = format!("sec:f4:day:{}", Utc::now().format("%Y%m%d"));
+    assert_eq!(
+        guard.send_with_consumer_budget("sec", request(), 1200, "sec:f4:day:", 300).await.err(),
+        Some(Refused::NeedsContact)
+    );
+    assert_eq!(guard.counter(&key).unwrap(), 0);
+    guard.configure(Settings { sec_contact: "research@example.test".into(), ..Settings::default() });
+    assert!(matches!(
+        guard.send_with_consumer_budget("sec", request(), 1200, "sec:f4:day:", 300).await,
+        Err(Refused::Paused { .. })
+    ));
+    assert_eq!(guard.counter(&key).unwrap(), 1, "the 403 did reach the server");
+    assert!(matches!(
+        guard.send_with_consumer_budget("sec", request(), 1200, "sec:f4:day:", 300).await,
+        Err(Refused::Paused { .. })
+    ));
+    assert_eq!(guard.counter(&key).unwrap(), 1, "the paused follow-up did not send");
+    assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
 async fn company_budget_ceiling_is_atomic_across_instances_and_leaves_feeds_running() {
     let temp = Temp::new();
     let server = Server::new(200, "", "{}");

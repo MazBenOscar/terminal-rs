@@ -26,7 +26,7 @@ where
         let label = if date.year() == current.year() {
             date.format("%b %d").to_string()
         } else {
-            date.format("%Y-%m-%d").to_string()
+            date.format("%b'%y").to_string()
         };
         return (label, date.format("%a %b %d %Y (date only)").to_string());
     }
@@ -40,7 +40,7 @@ where
     } else if time.year() == current.year() {
         time.format("%b %d").to_string()
     } else {
-        time.format("%Y-%m-%d").to_string()
+        time.format("%b'%y").to_string()
     };
     (label, time.format("%a %b %d %Y %H:%M (UTC%:z)").to_string())
 }
@@ -62,7 +62,13 @@ mod tests {
         assert_eq!(label(NOW - 2 * 3600), "07:00");
         // 22:32 UTC on Oct 22 is 18:32 EDT the same day: shown as a date, never as UTC.
         assert_eq!(label(1_792_708_320), "Oct 22");
-        assert_eq!(label(NOW - 400 * 86400), "2025-09-22");
+        assert_eq!(label(NOW - 400 * 86400), "Sep'25");
+        for date_only in [false, true] {
+            let (label, hover) = feed_time_in(NOW - 400 * 86400, NOW, date_only, &edt);
+            assert_eq!(label, "Sep'25");
+            assert!(label.chars().count() <= WIDTH_CHARS);
+            assert!(hover.contains("2025"));
+        }
         assert_eq!(feed_time_in(NOW + 30, NOW, false, &edt).0, "09:00");
     }
 
