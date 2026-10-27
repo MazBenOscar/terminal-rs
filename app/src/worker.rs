@@ -79,7 +79,169 @@ pub enum QuestradeAction {
     Test,
 }
 
+// A5b-SCAN: cache-only evaluation has no provider calls, even on a cache miss.
+fn scan_snapshot_source(route: &str, tf: Timeframe) -> String {
+    if matches!(tf, Timeframe::H2 | Timeframe::H4) { format!("session-v2:{route}") } else { route.to_owned() }
+}
+
+// Both paths must reject exactly the snapshots a user's scan would refetch.
+fn scan_snapshot_accepted(
+    symbol: &str,
+    tf: Timeframe,
+    limit: usize,
+    bars: &[Bar],
+    fetch: &Fetch,
+    route: &str,
+    now: i64,
+) -> bool {
+    bars.len() >= limit && fetch.source == scan_snapshot_source(route, tf) && scan_snapshot_fresh(symbol, fetch.at, now)
+}
+
+async fn agent_cached_scan(
+    s: &Shared,
+    definition: &ScanDefinition,
+    universe: Universe,
+    cancel: &std::sync::atomic::AtomicBool,
+    directory: &std::path::Path,
+    sort: Option<tr_core::scanner::ScanOperand>,
+) -> Result<AgentScanOutput, String> {
+    use std::io::Read;
+    definition.validate()?;
+    if !universe.requires_bulk() {
+        return Err("Cache-only scans require a US stock universe".into());
+    }
+    let not_cached = || "scan_data_not_cached".to_string();
+    let file = std::fs::File::open(directory).map_err(|_| not_cached())?;
+    let mut bytes = Vec::new();
+    file.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|_| not_cached())?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(not_cached());
+    }
+    let listings: Vec<tr_data::universe::Listing> = serde_json::from_slice(&bytes).map_err(|_| not_cached())?;
+    cached_scan_rows(s, definition, universe, cancel, &listings, chrono::Utc::now().timestamp(), sort).await
+}
+
+async fn cached_scan_rows(
+    s: &Shared,
+    definition: &ScanDefinition,
+    universe: Universe,
+    cancel: &std::sync::atomic::AtomicBool,
+    listings: &[tr_data::universe::Listing],
+    now: i64,
+    sort: Option<tr_core::scanner::ScanOperand>,
+) -> Result<AgentScanOutput, String> {
+    let deadline = tokio::time::Instant::now() + tr_agent_tools::args::scanner::SCAN_DEADLINE;
+    let mut output = AgentScanOutput { rows: Vec::new(), skipped_not_cached: Some(0), partial: false };
+    let symbols: std::collections::BTreeSet<_> =
+        listings.iter().filter(|l| universe.includes(l.venue)).map(|l| l.key()).collect();
+    for symbol in symbols {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) || tokio::time::Instant::now() >= deadline {
+            output.partial = true;
+            break;
+        }
+        let mut set = tr_core::scanner::SeriesSet::new();
+        let mut simulated = false;
+        for tf in definition.timeframes() {
+            let limit = definition.required_bars_for(tf).saturating_mul(3).clamp(300, MAX_SCAN_HISTORY_BARS);
+            let route = s.provider.scan_cache_key(&symbol);
+            // Hold SQLite's shared mutex only for this symbol/timeframe read,
+            // never across evaluation, yielding, or the universe loop.
+            let (bars, fetched) = {
+                let guard = s.scan_store.lock().unwrap();
+                let store = guard.as_ref().ok_or("scan_data_not_cached")?;
+                (store.load(&symbol, tf, limit).ok(), store.fetched(&symbol, tf).ok().flatten())
+            };
+            if let (Some(bars), Some(fetch)) = (bars, fetched)
+                && scan_snapshot_accepted(&symbol, tf, limit, &bars, &fetch, &route, now)
+            {
+                simulated |= fetch.simulated;
+                set.insert(tf, Series::new(&symbol, tf, bars));
+            }
+        }
+        if set.len() != definition.timeframes().len() {
+            *output.skipped_not_cached.as_mut().unwrap() += 1;
+        } else {
+            let ts = set.get(&definition.timeframe).and_then(|s| s.bars.last()).map(|b| b.ts);
+            output.rows.push(ScanRow {
+                symbol,
+                evaluation: Some(agent_scan_evaluate(definition, &set, sort)),
+                ts,
+                simulated,
+                error: None,
+            });
+        }
+        tokio::task::yield_now().await;
+    }
+    if output.rows.is_empty() && !output.partial {
+        return Err("scan_data_not_cached".into());
+    }
+    Ok(output)
+}
+// Sort operands are evaluated by core against the SAME bars, never by an additional fetch.
+// An unavailable sort value sorts last; it does not change the scan outcome.
+fn agent_scan_evaluate(
+    definition: &ScanDefinition,
+    set: &tr_core::scanner::SeriesSet,
+    sort: Option<tr_core::scanner::ScanOperand>,
+) -> ScanEvaluation {
+    let mut evaluation = definition.evaluate_set(set);
+    if let Some(operand) = sort {
+        let probe = ScanDefinition {
+            root: tr_core::scanner::ConditionGroup::comparisons(
+                tr_core::scanner::MatchMode::All,
+                vec![tr_core::scanner::ScanCondition {
+                    left: operand,
+                    right: tr_core::scanner::ScanOperand::Constant(0.),
+                    ..Default::default()
+                }],
+            ),
+            ..definition.clone()
+        };
+        evaluation.conditions.extend(probe.evaluate_set(set).conditions);
+    }
+    evaluation
+}
+// A5b-SCAN: the permit stays with the worker until its futures have stopped.
+pub struct AgentScanPermit(pub Arc<std::sync::atomic::AtomicBool>);
+impl Drop for AgentScanPermit {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+pub struct AgentScanOutput {
+    pub rows: Vec<ScanRow>,
+    pub skipped_not_cached: Option<usize>,
+    pub partial: bool,
+}
+pub fn scan_discovery_failure(universe: Universe, rows: &[ScanRow]) -> Option<&str> {
+    if universe.crypto_venue().is_some() && rows.len() == 1 && rows[0].symbol == universe.label() {
+        rows[0].error.as_deref()
+    } else {
+        None
+    }
+}
+// End A5b-SCAN worker types.
 pub enum AgentRequest {
+    // A5b-SCAN: distinct cache-only request; never routes through the user's US scanner path.
+    ScanCachedUniverse {
+        definition: ScanDefinition,
+        universe: Universe,
+        sort: Option<tr_core::scanner::ScanOperand>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        permit: AgentScanPermit,
+        reply: tokio::sync::oneshot::Sender<Result<AgentScanOutput, String>>,
+    },
+    Scan {
+        definition: ScanDefinition,
+        universe: Universe,
+        symbols: Vec<String>,
+        sort: Option<tr_core::scanner::ScanOperand>,
+        crypto_filter: tr_core::crypto::CryptoUniverseFilter,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        permit: AgentScanPermit,
+        reply: tokio::sync::oneshot::Sender<Result<AgentScanOutput, String>>,
+    },
+    // End A5b-SCAN requests.
     ToolHistory {
         symbol: String,
         tf: Timeframe,
@@ -1345,6 +1507,57 @@ async fn agent_history(
 
 async fn handle_agent(s: &Shared, request: AgentRequest) {
     match request {
+        // A5b-SCAN dispatch: permits release only after cancellation drops fetch futures.
+        AgentRequest::ScanCachedUniverse { definition, universe, sort, cancel, permit, reply } => {
+            let result =
+                agent_cached_scan(s, &definition, universe, &cancel, &data_dir().join("universe.json"), sort).await;
+            drop(permit);
+            let _ = reply.send(result);
+        }
+        AgentRequest::Scan { definition, universe, symbols, sort, crypto_filter, cancel, permit, reply } => {
+            let snapshot = std::sync::Mutex::new(Vec::new());
+            let run = async {
+                if universe == Universe::Watchlist {
+                    scan_recording(
+                        s.provider.clone(),
+                        definition.clone(),
+                        symbols,
+                        Duration::from_secs(15),
+                        Some(&snapshot),
+                        sort,
+                    )
+                    .await
+                } else if universe.crypto_venue().is_some() {
+                    scan_universe_recording(
+                        s,
+                        0,
+                        0,
+                        &definition,
+                        universe,
+                        &crypto_filter,
+                        &cancel,
+                        Some(&snapshot),
+                        sort,
+                    )
+                    .await
+                } else {
+                    Vec::new()
+                }
+            };
+            let stopped = async {
+                while !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            };
+            let (rows, partial) = tokio::select! {
+                rows = run => (rows, cancel.load(std::sync::atomic::Ordering::Relaxed)),
+                () = stopped => (snapshot.lock().unwrap().clone(), true),
+                () = tokio::time::sleep(tr_agent_tools::args::scanner::SCAN_DEADLINE) => (snapshot.lock().unwrap().clone(), true),
+            };
+            drop(permit);
+            let _ = reply.send(Ok(AgentScanOutput { rows, skipped_not_cached: None, partial }));
+        }
+        // End A5b-SCAN dispatch.
         AgentRequest::ToolHistory { symbol, tf, end, limit, options, reply } => {
             let source = chart_options_key(s.provider.as_ref(), &symbol, options);
             let result = agent_history(s, &symbol, tf, end, limit, options).await.and_then(|bars| {
@@ -1355,6 +1568,8 @@ async fn handle_agent(s: &Shared, request: AgentRequest) {
                     bars,
                     session: options.session,
                     instrument: s.provider.crypto_instrument(&symbol),
+                    source: Some(s.provider.name().into()),
+                    simulated: matches!(s.provider.name(), "sample" | "offline").then_some(true),
                     ..Default::default()
                 })
             });
@@ -2093,6 +2308,18 @@ use tr_alerts::condition_observations;
 /// Fetch a snapshot directly from the provider, independently of chart caches/live feeds.
 /// Input order is retained even when fetches complete out of order.
 async fn scan(provider: Provider, definition: ScanDefinition, symbols: Vec<String>, timeout: Duration) -> Vec<ScanRow> {
+    scan_recording(provider, definition, symbols, timeout, None, None).await
+}
+
+// A5b-SCAN: same watchlist implementation, with completed rows retained for interruption.
+async fn scan_recording(
+    provider: Provider,
+    definition: ScanDefinition,
+    symbols: Vec<String>,
+    timeout: Duration,
+    snapshot: Option<&std::sync::Mutex<Vec<ScanRow>>>,
+    sort: Option<tr_core::scanner::ScanOperand>,
+) -> Vec<ScanRow> {
     use futures::StreamExt;
     let mut seen = std::collections::HashSet::new();
     let symbols: Vec<String> = symbols
@@ -2138,7 +2365,7 @@ async fn scan(provider: Provider, definition: ScanDefinition, symbols: Vec<Strin
                     }
                     ScanRow {
                         symbol,
-                        evaluation: Some(definition.evaluate_set(&set)),
+                        evaluation: Some(agent_scan_evaluate(definition, &set, sort)),
                         ts,
                         simulated: history.simulated,
                         error: None,
@@ -2148,7 +2375,18 @@ async fn scan(provider: Provider, definition: ScanDefinition, symbols: Vec<Strin
             }
         }
     });
-    futures::stream::iter(fetches).buffered(4).collect().await
+    // Agent runs use half the user's concurrency, including when they overlap;
+    // do not serialize or otherwise change the user's scanner behaviour.
+    let concurrency = if snapshot.is_some() { 2 } else { 4 };
+    let mut stream = futures::stream::iter(fetches).buffered(concurrency);
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next().await {
+        if let Some(snapshot) = snapshot {
+            snapshot.lock().unwrap().push(row.clone());
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 /// Reuse a fresh snapshot only when its provider and requested coverage match.
@@ -2243,8 +2481,7 @@ async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize)
     let _slot = s.scan_slots.acquire().await.map_err(|_| "Scanner stopped".to_string())?;
     let now = chrono::Utc::now().timestamp();
     let route = s.provider.scan_cache_key(symbol);
-    let source =
-        if matches!(tf, Timeframe::H2 | Timeframe::H4) { format!("session-v2:{route}") } else { route.clone() };
+    let source = scan_snapshot_source(&route, tf);
     let (stored, fetched) = {
         let store = s.scan_store.lock().expect("scan store");
         let store = store.as_ref().ok_or("The scan store could not be opened")?;
@@ -2252,9 +2489,7 @@ async fn universe_history(s: &Shared, symbol: &str, tf: Timeframe, limit: usize)
         (store.load(symbol, tf, limit).map_err(err)?, store.fetched(symbol, tf).map_err(err)?)
     };
     if let Some(f) = &fetched
-        && stored.len() >= limit
-        && f.source == source
-        && scan_snapshot_fresh(symbol, f.at, now)
+        && scan_snapshot_accepted(symbol, tf, limit, &stored, f, &route, now)
     {
         return Ok((stored, f.simulated));
     }
@@ -2319,9 +2554,30 @@ async fn scan_universe(
     crypto_filter: &tr_core::crypto::CryptoUniverseFilter,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Vec<ScanRow> {
+    scan_universe_recording(s, pane, generation, definition, universe, crypto_filter, cancel, None, None).await
+}
+
+// A5b-SCAN: observe the existing universe path without increasing its fetch budget.
+#[allow(clippy::too_many_arguments)]
+async fn scan_universe_recording(
+    s: &Shared,
+    pane: PaneId,
+    generation: u64,
+    definition: &ScanDefinition,
+    universe: Universe,
+    crypto_filter: &tr_core::crypto::CryptoUniverseFilter,
+    cancel: &std::sync::atomic::AtomicBool,
+    snapshot: Option<&std::sync::Mutex<Vec<ScanRow>>>,
+    sort: Option<tr_core::scanner::ScanOperand>,
+) -> Vec<ScanRow> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures::StreamExt;
+    // Recording denotes an agent run: no pane messages or unused 24h fetches.
+    // Half the user's concurrency keeps overlapping agent runs polite without
+    // changing user behaviour or imposing a shared single-scan gate.
+    let agent = snapshot.is_some();
+    let concurrency = if agent { 2 } else { 4 };
     let failed = |error: String| {
         vec![ScanRow {
             symbol: universe.label().into(),
@@ -2361,13 +2617,15 @@ async fn scan_universe(
                 Ok(selected) => selected,
                 Err(e) => return failed(e),
             };
-        s.send(Response::ScanUniverseInfo {
-            pane,
-            generation,
-            available,
-            selected: symbols.len(),
-            fetched_at: catalog.fetched_at,
-        });
+        if !agent {
+            s.send(Response::ScanUniverseInfo {
+                pane,
+                generation,
+                available,
+                selected: symbols.len(),
+                fetched_at: catalog.fetched_at,
+            });
+        }
         if symbols.iter().any(|symbol| {
             s.provider.crypto_instrument(symbol).is_none_or(|instrument| instrument.canonical_ticker() != *symbol)
         }) {
@@ -2389,7 +2647,9 @@ async fn scan_universe(
     };
     let total = symbols.len();
     let done = AtomicUsize::new(0);
-    s.send(Response::ScanProgress { pane, generation, done: 0, total });
+    if !agent {
+        s.send(Response::ScanProgress { pane, generation, done: 0, total });
+    }
     let limit = definition.required_bars().saturating_mul(3).clamp(300, MAX_SCAN_HISTORY_BARS);
     let mut stream = futures::stream::iter(symbols.into_iter().map(|symbol| {
         let done = &done;
@@ -2399,7 +2659,7 @@ async fn scan_universe(
             } else {
                 let history = universe_history(s, &symbol, definition.timeframe, limit);
                 let stats = async {
-                    if universe.crypto_venue().is_some() {
+                    if !agent && universe.crypto_venue().is_some() {
                         let result = tokio::time::timeout(Duration::from_secs(20), s.provider.crypto_stats(&symbol))
                             .await
                             .map_err(|_| "Rolling 24-hour statistics timed out".to_string())
@@ -2431,19 +2691,25 @@ async fn scan_universe(
                                 set.insert(tf, Series::new(symbol.clone(), tf, bars));
                             }
                         }
-                        ScanRow { symbol, evaluation: Some(definition.evaluate_set(&set)), ts, simulated, error: None }
+                        ScanRow {
+                            symbol,
+                            evaluation: Some(agent_scan_evaluate(definition, &set, sort)),
+                            ts,
+                            simulated,
+                            error: None,
+                        }
                     }
                     Err(error) => ScanRow { symbol, evaluation: None, ts: None, simulated: false, error: Some(error) },
                 }
             };
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n.is_multiple_of(25) || n == total {
+            if !agent && (n.is_multiple_of(25) || n == total) {
                 s.send(Response::ScanProgress { pane, generation, done: n, total });
             }
             row
         }
     }))
-    .buffered(4);
+    .buffered(concurrency);
     let mut rows = Vec::with_capacity(total);
     let mut batch = Vec::new();
     loop {
@@ -2456,7 +2722,12 @@ async fn scan_universe(
             () = stopped => break,
             row = stream.next() => match row { Some(row) => row, None => break },
         };
-        batch.push(row.clone());
+        if let Some(snapshot) = snapshot {
+            snapshot.lock().unwrap().push(row.clone());
+        }
+        if !agent {
+            batch.push(row.clone());
+        }
         rows.push(row);
         if batch.len() == 50 {
             s.send(Response::ScanPartial { pane, generation, rows: std::mem::take(&mut batch) });
@@ -2848,6 +3119,310 @@ mod tests {
             rx,
         )
     }
+
+    // A5b-SCAN worker tests: only counting fakes and in-memory bars.
+    #[derive(Default)]
+    struct ScannerFake {
+        calls: std::sync::atomic::AtomicUsize,
+        stats: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for ScannerFake {
+        fn name(&self) -> &str {
+            "scanner-fake"
+        }
+        async fn history(&self, symbol: &str, tf: Timeframe, _: Option<i64>, limit: usize) -> anyhow::Result<Vec<Bar>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if symbol.starts_with("SLOW") {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+            Ok((0..limit).map(|i| Bar::new(i as i64 * tf.seconds(), 10., 10., 10., 10., 1000.)).collect())
+        }
+        async fn search(&self, _: &str) -> anyhow::Result<Vec<SearchHit>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("No listing fetch is allowed")
+        }
+        fn crypto_instrument(&self, symbol: &str) -> Option<tr_core::crypto::CryptoInstrument> {
+            tr_core::crypto::CryptoInstrument::parse(symbol).ok()
+        }
+        async fn crypto_catalog(
+            &self,
+            venue: tr_core::crypto::CryptoVenue,
+        ) -> anyhow::Result<tr_data::crypto_catalog::Catalog> {
+            Ok(tr_data::crypto_catalog::Catalog {
+                venue,
+                fetched_at: chrono::Utc::now().timestamp(),
+                products: ["COINBASE:BTC-USD", "COINBASE:ETH-USD"]
+                    .into_iter()
+                    .map(|s| tr_core::crypto::CryptoInstrument::parse(s).unwrap())
+                    .collect(),
+            })
+        }
+        async fn crypto_stats(&self, _: &str) -> anyhow::Result<tr_data::crypto_catalog::Rolling24h> {
+            self.stats.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("Stats are not needed by agent results")
+        }
+    }
+    fn agent_test_definition() -> ScanDefinition {
+        use tr_core::scanner::*;
+        ScanDefinition {
+            name: "Price positive".into(),
+            timeframe: Timeframe::D1,
+            root: ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![ScanCondition {
+                    left: ScanOperand::Price,
+                    right: ScanOperand::Constant(0.),
+                    ..Default::default()
+                }],
+            ),
+        }
+    }
+    #[tokio::test]
+    async fn agent_cached_scan_mixed_fresh_stale_missing_makes_zero_network_calls() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tr_data::universe::{Listing, Venue};
+        let fake = Arc::new(ScannerFake::default());
+        let (s, _) = backfill_shared(fake.clone());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-26T15:00:00Z").unwrap().timestamp();
+        let listings: Vec<_> = ["FRESH", "STALE", "MISSING"]
+            .into_iter()
+            .map(|name| Listing { symbol: name.into(), name: name.into(), venue: Venue::Nasdaq })
+            .collect();
+        let mut store = ScanStore::open_in_memory().unwrap();
+        for (symbol, at) in [("FRESH US Equity", now - 10), ("STALE US Equity", now - 3600)] {
+            store
+                .store(
+                    symbol,
+                    Timeframe::D1,
+                    &(0..300).map(|i| Bar::new(now - (300 - i) * 86400, 10., 10., 10., 10., 1000.)).collect::<Vec<_>>(),
+                    &Fetch { at, source: tr_data::MarketData::scan_cache_key(fake.as_ref(), symbol), simulated: false },
+                )
+                .unwrap();
+        }
+        *s.scan_store.lock().unwrap() = Some(store);
+        let definition = agent_test_definition();
+        let cancel = AtomicBool::new(false);
+        let result = cached_scan_rows(
+            &s,
+            &definition,
+            Universe::Nasdaq,
+            &cancel,
+            &listings,
+            now,
+            Some(tr_core::scanner::ScanOperand::Volume),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].symbol, "FRESH US Equity");
+        assert_eq!(result.rows[0].evaluation.as_ref().unwrap().outcome, tr_core::scanner::ScanOutcome::Match);
+        assert_eq!(result.skipped_not_cached, Some(2));
+        assert!(!result.partial);
+        let missing = cached_scan_rows(&s, &definition, Universe::Nasdaq, &cancel, &listings[1..], now, None).await;
+        assert!(matches!(missing,Err(e) if e=="scan_data_not_cached"));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            cached_scan_rows(&s, &definition, Universe::Nasdaq, &cancel, &listings, now, None).await.unwrap().partial
+        );
+        assert_eq!(fake.calls.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn agent_watchlist_scan_worker_uses_existing_path_and_same_bars_for_sort() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fake = Arc::new(ScannerFake::default());
+        let (s, _) = backfill_shared(fake.clone());
+        let busy = Arc::new(AtomicBool::new(true));
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle_agent(
+            &s,
+            AgentRequest::Scan {
+                definition: agent_test_definition(),
+                universe: Universe::Watchlist,
+                symbols: vec!["AAPL US Equity".into(), "MSFT US Equity".into()],
+                sort: Some(tr_core::scanner::ScanOperand::Volume),
+                crypto_filter: Default::default(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                permit: AgentScanPermit(busy.clone()),
+                reply,
+            },
+        )
+        .await;
+        let result = receive.await.unwrap().unwrap();
+        assert!(!result.partial);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].evaluation.as_ref().unwrap().conditions.last().unwrap().left, Some(1000.));
+        assert_eq!(fake.calls.load(Ordering::Relaxed), 2, "sort must not fetch another history");
+        assert!(!busy.load(Ordering::Acquire));
+        let over = scan(
+            fake.clone(),
+            agent_test_definition(),
+            (0..201).map(|i| format!("X{i}")).collect(),
+            Duration::from_secs(15),
+        )
+        .await;
+        assert!(over.iter().all(|r| r.error.is_some()));
+        assert_eq!(fake.calls.load(Ordering::Relaxed), 2);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn agent_scan_cancel_and_sixty_second_timeout_preserve_completed_rows() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for interrupt in [true, false] {
+            let fake = Arc::new(ScannerFake::default());
+            let (s, _) = backfill_shared(fake);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let busy = Arc::new(AtomicBool::new(true));
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let mut symbols = vec!["FAST US Equity".into()];
+            symbols.extend((0..40).map(|i| format!("SLOW{i} US Equity")));
+            let request = AgentRequest::Scan {
+                definition: agent_test_definition(),
+                universe: Universe::Watchlist,
+                symbols,
+                sort: None,
+                crypto_filter: Default::default(),
+                cancel: cancel.clone(),
+                permit: AgentScanPermit(busy.clone()),
+                reply,
+            };
+            let start = tokio::time::Instant::now();
+            tokio::join!(handle_agent(&s, request), async {
+                if interrupt {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
+            let result = receive.await.unwrap().unwrap();
+            assert!(result.partial);
+            assert_eq!(result.rows[0].symbol, "FAST US Equity");
+            assert!(result.rows.len() < 41);
+            assert!(!busy.load(Ordering::Acquire));
+            if !interrupt {
+                assert_eq!(start.elapsed(), Duration::from_secs(60));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn review_cached_scan_skips_snapshots_the_user_path_would_refetch() {
+        use std::sync::atomic::AtomicBool;
+        use tr_data::universe::{Listing, Venue};
+        let fake = Arc::new(ScannerFake::default());
+        let (s, _) = backfill_shared(fake.clone());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-26T15:00:00Z").unwrap().timestamp();
+        let listings = vec![Listing { symbol: "LEGACY".into(), name: "Legacy".into(), venue: Venue::Nasdaq }];
+        let bars: Vec<_> = (0..300).map(|i| Bar::new(now - (300 - i) * 4 * 3600, 10., 10., 10., 10., 1000.)).collect();
+        let mut store = ScanStore::open_in_memory().unwrap();
+        // Fresh by time, but written before the session-v2 H4 aggregation: universe_history
+        // rejects it (source != "session-v2:<route>") and would refetch.
+        store
+            .store(
+                "LEGACY US Equity",
+                Timeframe::H4,
+                &bars,
+                &Fetch { at: now - 10, source: "scanner-fake".into(), simulated: false },
+            )
+            .unwrap();
+        *s.scan_store.lock().unwrap() = Some(store);
+        let mut definition = agent_test_definition();
+        definition.timeframe = Timeframe::H4;
+        let result =
+            cached_scan_rows(&s, &definition, Universe::Nasdaq, &AtomicBool::new(false), &listings, now, None).await;
+        assert!(
+            result.as_ref().is_err() || result.as_ref().unwrap().rows.is_empty(),
+            "agent evaluated a snapshot the user's scanner treats as unusable"
+        );
+    }
+    #[tokio::test]
+    async fn cached_scan_counts_rejected_source_coverage_and_freshness_as_skipped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tr_data::universe::{Listing, Venue};
+        for tf in [Timeframe::D1, Timeframe::H2, Timeframe::H4] {
+            let fake = Arc::new(ScannerFake::default());
+            let (s, _) = backfill_shared(fake.clone());
+            let now = chrono::DateTime::parse_from_rfc3339("2026-10-26T15:00:00Z").unwrap().timestamp();
+            let listings: Vec<_> = ["GOOD", "WRONG", "SHORT", "STALE", "LEGACY"]
+                .into_iter()
+                .map(|symbol| Listing { symbol: symbol.into(), name: symbol.into(), venue: Venue::Nasdaq })
+                .collect();
+            let mut definition = agent_test_definition();
+            definition.timeframe = tf;
+            let limit = definition.required_bars_for(tf).saturating_mul(3).clamp(300, MAX_SCAN_HISTORY_BARS);
+            let mut store = ScanStore::open_in_memory().unwrap();
+            for listing in &listings {
+                let symbol = listing.key();
+                let route = tr_data::MarketData::scan_cache_key(fake.as_ref(), &symbol);
+                let mut fetch = Fetch { at: now - 10, source: scan_snapshot_source(&route, tf), simulated: false };
+                let mut len = limit;
+                match listing.symbol.as_str() {
+                    "WRONG" => fetch.source = "other-provider".into(),
+                    "SHORT" => len -= 1,
+                    "STALE" => fetch.at = now - 3600,
+                    "LEGACY" => fetch.source = if tf == Timeframe::D1 { "legacy-provider".into() } else { route },
+                    _ => {}
+                }
+                let bars: Vec<_> = (0..len)
+                    .map(|i| Bar::new(now - (len - i) as i64 * tf.seconds(), 10., 10., 10., 10., 1000.))
+                    .collect();
+                store.store(&symbol, tf, &bars, &fetch).unwrap();
+            }
+            *s.scan_store.lock().unwrap() = Some(store);
+            let output =
+                cached_scan_rows(&s, &definition, Universe::Nasdaq, &AtomicBool::new(false), &listings, now, None)
+                    .await
+                    .unwrap();
+            assert_eq!(output.rows.len(), 1);
+            assert_eq!(output.rows[0].symbol, "GOOD US Equity");
+            assert_eq!(output.skipped_not_cached, Some(4));
+            assert_eq!(fake.calls.load(Ordering::Relaxed), 0);
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn agent_scans_use_half_user_concurrency_without_a_shared_gate() {
+        use std::sync::atomic::Ordering;
+        for (agent, expected) in [(true, 2), (false, 4)] {
+            let fake = Arc::new(ScannerFake::default());
+            let snapshot = std::sync::Mutex::new(Vec::new());
+            let run = scan_recording(
+                fake.clone(),
+                agent_test_definition(),
+                (0..8).map(|i| format!("SLOW{i} US Equity")).collect(),
+                Duration::from_secs(15),
+                agent.then_some(&snapshot),
+                None,
+            );
+            assert!(tokio::time::timeout(Duration::from_millis(1), run).await.is_err());
+            assert_eq!(fake.calls.load(Ordering::Relaxed), expected);
+        }
+    }
+    #[tokio::test]
+    async fn agent_crypto_scan_has_no_pane_messages_or_unused_stats_fetches() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fake = Arc::new(ScannerFake::default());
+        let (s, responses) = backfill_shared(fake.clone());
+        *s.scan_store.lock().unwrap() = Some(ScanStore::open_in_memory().unwrap());
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle_agent(
+            &s,
+            AgentRequest::Scan {
+                definition: agent_test_definition(),
+                universe: Universe::CoinbaseSpot,
+                symbols: Vec::new(),
+                sort: None,
+                crypto_filter: Default::default(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                permit: AgentScanPermit(Arc::new(AtomicBool::new(true))),
+                reply,
+            },
+        )
+        .await;
+        let output = receive.await.unwrap().unwrap();
+        assert_eq!(output.rows.len(), 2);
+        assert!(output.rows.iter().all(|r| r.error.is_none()));
+        assert_eq!(fake.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(fake.stats.load(Ordering::Relaxed), 0);
+        assert!(responses.try_recv().is_err(), "agent scan must not send pane updates");
+    }
+    // End A5b-SCAN worker tests.
 
     #[test]
     fn review_live_gap_requests_authoritative_history() {

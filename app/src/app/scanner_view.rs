@@ -28,9 +28,14 @@ pub struct ScannerPane {
     pub running: bool,
     pub rows: Vec<ScanRow>,
     pub completed: Option<chrono::DateTime<chrono::Utc>>,
+    // A5b-SCAN: mirror the existing UI sort so pane reads use the same order.
+    rolling_sort: std::cell::Cell<Option<bool>>,
+    completed_scan: Option<CompletedScan>,
+    // End A5b-SCAN pane snapshot fields.
     snapshot_symbols: Vec<String>,
     saved: Vec<ScanSettings>,
-    notice: Option<String>,
+    notice: Option<ScanNotice>,
+    save_draft: Option<SaveDraft>,
     pub(super) matches_only: bool,
     pub universe: Universe,
     pub crypto_filter: CryptoUniverseFilter,
@@ -52,6 +57,16 @@ pub struct ScannerPane {
     crypto_stats: std::collections::BTreeMap<String, Result<tr_data::crypto_catalog::Rolling24h, String>>,
 }
 
+enum ScanNotice {
+    Saved(String),
+    Error(String),
+}
+
+struct SaveDraft {
+    name: String,
+    focus: bool,
+}
+
 impl Default for ScannerPane {
     fn default() -> Self {
         Self::new(ScanDefinition::default())
@@ -67,7 +82,7 @@ impl ScannerPane {
         settings.crypto_filter.sanitize();
         let (saved, notice) = match load_saved() {
             Ok(saved) => (saved, None),
-            Err(e) => (Vec::new(), Some(e)),
+            Err(e) => (Vec::new(), Some(ScanNotice::Error(e))),
         };
         Self {
             definition: settings.definition,
@@ -75,9 +90,12 @@ impl ScannerPane {
             running: false,
             rows: Vec::new(),
             completed: None,
+            rolling_sort: Default::default(),
+            completed_scan: None,
             snapshot_symbols: Vec::new(),
             saved,
             notice,
+            save_draft: None,
             matches_only: true,
             universe: settings.universe,
             crypto_filter: settings.crypto_filter,
@@ -115,6 +133,7 @@ impl ScannerPane {
     fn invalidate(&mut self) {
         self.rows.clear();
         self.completed = None;
+        self.completed_scan = None;
         self.previous_matches.clear();
         self.previous_evaluated.clear();
         self.baseline_ready = false;
@@ -145,10 +164,10 @@ impl ScannerPane {
         let completed = chrono::Utc::now();
         self.run_duration = self.started.map_or(chrono::Duration::zero(), |start| completed - start);
         let stopped = self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
-        if self.universe.crypto_venue().is_some() && rows.len() == 1 && rows[0].symbol == self.universe.label() {
+        if let Some(error) = crate::worker::scan_discovery_failure(self.universe, &rows) {
             // Directory failures have no product row. Keep the recovery message
             // visible even when "Show unavailable" is off.
-            self.notice = rows[0].error.clone();
+            self.notice = Some(ScanNotice::Error(error.to_owned()));
         }
         self.entered.clear();
         self.exited.clear();
@@ -167,6 +186,7 @@ impl ScannerPane {
         self.progress = None;
         self.cancel = None;
         self.completed = Some(completed);
+        self.retain_completed_scan();
     }
 
     pub fn set_progress(&mut self, done: usize, total: usize) {
@@ -288,6 +308,175 @@ impl Drop for ScannerPane {
     }
 }
 
+// A5b-SCAN: application-only reads; none of these methods start a scanner or fetch data.
+struct CompletedScan {
+    settings: ScanSettings,
+    rows: Vec<ScanRow>,
+    as_of: chrono::DateTime<chrono::Utc>,
+}
+impl ScannerPane {
+    fn read_settings(&self) -> ScanSettings {
+        ScanSettings {
+            definition: self.definition.clone(),
+            universe: self.universe,
+            refresh: None,
+            crypto_filter: self.crypto_filter.clone(),
+        }
+    }
+    fn read_rows(&self) -> Vec<ScanRow> {
+        let mut rows = self.rows.clone();
+        if self.universe.crypto_venue().is_some()
+            && let Some(descending) = self.rolling_sort.get()
+        {
+            let now = chrono::Utc::now().timestamp();
+            rows.sort_by(|a, b| {
+                rolling_order(
+                    shown_stats(self, &a.symbol, now).and_then(|(s, _)| s.change_percent),
+                    shown_stats(self, &b.symbol, now).and_then(|(s, _)| s.change_percent),
+                    descending,
+                )
+                .then_with(|| a.symbol.cmp(&b.symbol))
+            });
+        }
+        rows
+    }
+    fn retain_completed_scan(&mut self) {
+        if let Some(as_of) = self.completed {
+            self.completed_scan = Some(CompletedScan { settings: self.read_settings(), rows: self.read_rows(), as_of });
+        }
+    }
+}
+impl super::TerminalApp {
+    pub(crate) fn agent_list_scans(&self) -> tr_agent_tools::ToolResult {
+        use serde_json::json;
+        let saved = match load_saved() {
+            Ok(saved) => saved,
+            Err(e) => {
+                return tr_agent_tools::ToolResult::error("scan_library_error", &tr_agent_tools::scrub_text(&e), None);
+            }
+        };
+        let total = saved.len() + self.panes.iter().filter(|p| matches!(p.kind, super::PaneKind::Scanner(_))).count();
+        let mut entries = Vec::new();
+        for s in saved.iter().take(50) {
+            entries.push(json!({"kind":"saved","name":s.definition.name,"universe":s.universe,"timeframe":s.definition.timeframe.to_string(),
+                "summary":scan_summary(&s.definition.root),"refresh":s.refresh}));
+        }
+        for p in &self.panes {
+            if entries.len() >= 50 {
+                break;
+            }
+            if let super::PaneKind::Scanner(s) = &p.kind {
+                let (matched, errors) = scan_counts(&s.rows);
+                entries.push(json!({"kind":"pane","pane_id":p.id,"name":s.definition.name,"universe":s.universe,
+                    "timeframe":s.definition.timeframe.to_string(),"last_run":s.completed,"matched":matched,"scanned":s.rows.len(),"errors":errors}));
+            }
+        }
+        tr_agent_tools::ToolResult::json(json!({"entries":entries,"total":total,"truncated":total>50}))
+    }
+    pub(crate) fn agent_read_scan(&self, args: tr_agent_tools::args::ReadScanResults) -> tr_agent_tools::ToolResult {
+        use serde_json::json;
+        let panes: Vec<_> = self
+            .panes
+            .iter()
+            .filter_map(|p| if let super::PaneKind::Scanner(s) = &p.kind { Some((p.id, s)) } else { None })
+            .collect();
+        let found: Vec<_> = panes
+            .iter()
+            .filter(|(id, s)| {
+                args.pane_id.is_none_or(|wanted| wanted == *id)
+                    && args.name.as_ref().is_none_or(|name| name.eq_ignore_ascii_case(&s.definition.name))
+            })
+            .collect();
+        if found.len() != 1 {
+            let mut result = tr_agent_tools::ToolResult::json(
+                json!({"error":{"code":"scan_not_found","message":"Select one open Scanner pane by pane_id or name",
+                "available":panes.iter().take(50).map(|(id,s)|json!({"pane_id":id,"name":s.definition.name})).collect::<Vec<_>>()}}),
+            );
+            result.success = false;
+            return result;
+        }
+        let (id, s) = found[0];
+        // A running pane's rows belong to the next generation. Never pair those
+        // partial rows (or newly edited settings) with the previous as_of.
+        let (settings, rows, as_of) = if s.running {
+            match &s.completed_scan {
+                Some(snapshot) => (snapshot.settings.clone(), snapshot.rows.clone(), Some(snapshot.as_of)),
+                None => (s.read_settings(), Vec::new(), None),
+            }
+        } else {
+            (s.read_settings(), s.read_rows(), s.completed)
+        };
+        let mut value = crate::agent_bridge::held_scan_result_value(&settings, &rows, args.include);
+        value["pane_id"] = json!(id);
+        value["running"] = json!(s.running);
+        value["computed_at"] = json!(as_of);
+        value["as_of"] = json!(as_of);
+        let success = value["error"].is_null();
+        let mut result = tr_agent_tools::ToolResult::json(value);
+        result.success = success;
+        result
+    }
+    pub(crate) fn agent_scan_settings(
+        &self,
+        args: &tr_agent_tools::args::RunScan,
+    ) -> Result<(ScanSettings, Vec<String>), String> {
+        args.validate()?;
+        let mut settings = if let Some(name) = &args.saved {
+            load_saved()?
+                .into_iter()
+                .find(|s| s.definition.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| format!("Unknown saved scan: {name}"))?
+        } else {
+            ScanSettings::from(args.definition.as_ref().ok_or("Missing definition")?.core()?)
+        };
+        settings.universe = args.universe.core();
+        settings.refresh = None;
+        settings.definition.validate()?;
+        let symbols = if settings.universe == Universe::Watchlist {
+            if let Some(name) = &args.watchlist {
+                self.watchlists
+                    .iter()
+                    .find(|l| l.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| format!("Unknown watchlist: {name}"))?
+                    .symbols
+                    .clone()
+            } else {
+                self.watchlist.clone()
+            }
+        } else {
+            Vec::new()
+        };
+        if symbols.len() > crate::worker::MAX_SCAN_SYMBOLS {
+            return Err("Scan limit is 200 symbols; narrow the watchlist".into());
+        }
+        Ok((settings, symbols.into_iter().map(|s| tr_data::security(&s).key()).collect()))
+    }
+}
+pub(crate) fn scan_summary(group: &ConditionGroup) -> String {
+    let join = if group.mode == MatchMode::All { " AND " } else { " OR " };
+    let text = group
+        .items
+        .iter()
+        .map(|item| match item {
+            ConditionItem::Group(g) => format!("({})", scan_summary(g)),
+            _ => item.label(),
+        })
+        .collect::<Vec<_>>()
+        .join(join);
+    text.chars().take(500).collect()
+}
+pub(crate) fn scan_counts(rows: &[ScanRow]) -> (usize, usize) {
+    (
+        rows.iter().filter(|r| r.evaluation.as_ref().is_some_and(|e| e.outcome == ScanOutcome::Match)).count(),
+        rows.iter()
+            .filter(|r| {
+                r.error.is_some() || r.evaluation.as_ref().is_none_or(|e| e.outcome == ScanOutcome::Unavailable)
+            })
+            .count(),
+    )
+}
+// End A5b-SCAN pane read block.
+
 fn load_saved() -> Result<Vec<ScanSettings>, String> {
     load_saved_at(&data_dir())
 }
@@ -318,18 +507,87 @@ fn load_saved_at(dir: &std::path::Path) -> Result<Vec<ScanSettings>, String> {
     }
 }
 
+fn same_scan_name(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+fn preset_name(name: &str) -> Option<String> {
+    ScanDefinition::presets().into_iter().find(|p| same_scan_name(&p.name, name)).map(|p| p.name)
+}
+
+#[derive(Debug, PartialEq)]
+enum SaveName {
+    Empty,
+    Preset(String),
+    Replace(String),
+    New,
+}
+
+impl SaveName {
+    fn enabled(&self) -> bool {
+        matches!(self, Self::Replace(_) | Self::New)
+    }
+
+    fn button(&self) -> &'static str {
+        if matches!(self, Self::Replace(_)) { "Replace" } else { "Save" }
+    }
+
+    fn hint(&self) -> String {
+        match self {
+            Self::Empty => "Name the scan".into(),
+            Self::Preset(name) => format!("\"{name}\" is a built-in preset. Choose another name."),
+            Self::Replace(name) => format!("Replaces the saved scan \"{name}\"."),
+            Self::New => String::new(),
+        }
+    }
+}
+
+fn validate_save_name(name: &str, saved: &[ScanSettings]) -> SaveName {
+    if name.trim().is_empty() {
+        SaveName::Empty
+    } else if let Some(name) = preset_name(name) {
+        SaveName::Preset(name)
+    } else if let Some(existing) = saved.iter().find(|s| same_scan_name(&s.definition.name, name)) {
+        SaveName::Replace(existing.definition.name.trim().to_owned())
+    } else {
+        SaveName::New
+    }
+}
+
+fn save_name_prefill(name: &str, saved: &[ScanSettings]) -> String {
+    if preset_name(name).is_none() {
+        return name.trim().to_owned();
+    }
+    let base = format!("{} (custom)", name.trim());
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while validate_save_name(&candidate, saved) != SaveName::New {
+        candidate = format!("{base} {suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
+fn saved_scan_label(name: &str) -> String {
+    if preset_name(name).is_some() { format!("{name} (saved)") } else { name.to_owned() }
+}
+
 /// Merge against disk so saving from two scanner panes does not discard the other scan.
 fn save_definition(definition: &ScanSettings) -> Result<Vec<ScanSettings>, String> {
     save_definition_at(definition, &data_dir())
 }
 
 fn save_definition_at(definition: &ScanSettings, dir: &std::path::Path) -> Result<Vec<ScanSettings>, String> {
+    let name = validate_save_name(&definition.definition.name, &[]);
+    if !name.enabled() {
+        return Err(name.hint());
+    }
     definition.definition.validate()?;
     if definition.universe.crypto_venue().is_some() {
         definition.crypto_filter.validate()?;
     }
     let mut saved = load_saved_at(dir)?;
-    saved.retain(|s| !s.definition.name.eq_ignore_ascii_case(definition.definition.name.trim()));
+    saved.retain(|s| !same_scan_name(&s.definition.name, &definition.definition.name));
     let mut definition = definition.clone();
     definition.definition.name = definition.definition.name.trim().into();
     saved.push(definition);
@@ -864,6 +1122,7 @@ pub fn show_named(
                 if !market && pane.snapshot_symbols != symbols {
                     pane.invalidate();
                 }
+                pane.retain_completed_scan();
                 pane.rows.clear();
                 pane.entered.clear();
                 pane.exited.clear();
@@ -897,13 +1156,15 @@ pub fn show_named(
                 }
             }
             if ui.add_enabled(!pane.running && validation.is_none(), egui::Button::new("Save scan")).clicked() {
-                match save_definition(&ScanSettings { definition: pane.definition.clone(), universe: pane.universe, refresh: pane.refresh, crypto_filter: pane.crypto_filter.clone() }) {
-                    Ok(saved) => {
-                        pane.saved = saved;
-                        pane.notice = Some(SAVED_NOTICE.into());
-                    }
-                    Err(e) => pane.notice = Some(e),
+                // Refresh the library before validating replacement names (other panes may save too).
+                match load_saved() {
+                    Ok(saved) => pane.saved = saved,
+                    Err(e) => pane.notice = Some(ScanNotice::Error(e)),
                 }
+                pane.save_draft = Some(SaveDraft {
+                    name: save_name_prefill(&pane.definition.name, &pane.saved),
+                    focus: true,
+                });
             }
             let mut selected = None;
             wrap_group(ui, "load-scan", |ui| {
@@ -921,7 +1182,7 @@ pub fn show_named(
                             ui.label(RichText::new("No saved scans yet").color(muted()));
                         }
                         for saved in &pane.saved {
-                            if ui.selectable_label(false, &saved.definition.name).clicked() {
+                            if ui.selectable_label(false, saved_scan_label(&saved.definition.name)).clicked() {
                                 selected = Some(saved.clone());
                             }
                         }
@@ -929,6 +1190,7 @@ pub fn show_named(
                 });
             });
             if let Some(settings) = selected {
+                pane.save_draft = None;
                 pane.definition = settings.definition;
                 pane.universe = settings.universe;
                 pane.refresh = settings.refresh;
@@ -947,6 +1209,7 @@ pub fn show_named(
                 );
             }
         });
+        save_scan_row(ui, pane, validation.is_none());
         if pane.running && market {
             let (done, total) = pane.progress.unwrap_or((0, 0));
             ui.horizontal(|ui| {
@@ -987,8 +1250,11 @@ pub fn show_named(
             warn(ui, "This version supports up to 200 watchlist symbols. Reduce the list before running.");
         }
         if let Some(notice) = &pane.notice {
-            let color = if notice == SAVED_NOTICE { theme::up() } else { theme::down() };
-            ui.label(RichText::new(notice).color(color));
+            let (message, color) = match notice {
+                ScanNotice::Saved(message) => (message, theme::up()),
+                ScanNotice::Error(message) => (message, theme::down()),
+            };
+            ui.label(RichText::new(message).color(color));
         }
         if let Some(catalog_status) = &pane.catalog_status {
             ui.label(RichText::new(catalog_status).small().color(muted()));
@@ -1078,7 +1344,63 @@ fn compact(v: f64) -> String {
     }
 }
 
-const SAVED_NOTICE: &str = "Scan saved to scans.json";
+fn save_scan_row(ui: &mut Ui, pane: &mut ScannerPane, valid_definition: bool) {
+    let Some(draft) = &mut pane.save_draft else { return };
+    let mut confirm = false;
+    let mut cancel = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Name").color(muted()));
+        let mut field = egui::TextEdit::singleline(&mut draft.name)
+            .id_salt("scan-save-name")
+            .char_limit(100)
+            .desired_width(dp(180.0))
+            .show(ui);
+        if draft.focus {
+            field.response.request_focus();
+            field.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(draft.name.chars().count()),
+            )));
+            field.state.store(ui.ctx(), field.response.id);
+            draft.focus = false;
+        }
+        let name = validate_save_name(&draft.name, &pane.saved);
+        let enabled = name.enabled() && valid_definition && !pane.running;
+        let enter = (field.response.has_focus() || field.response.lost_focus())
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        confirm = ui.add_enabled(enabled, egui::Button::new(name.button()).fill(theme::accent())).clicked()
+            || (enabled && enter);
+        cancel =
+            ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let hint = name.hint();
+        if !hint.is_empty() {
+            ui.label(RichText::new(hint).small().color(muted()));
+        }
+    });
+    if cancel {
+        pane.save_draft = None;
+    } else if confirm {
+        let name = draft.name.trim().to_owned();
+        let replacing = matches!(validate_save_name(&name, &pane.saved), SaveName::Replace(_));
+        let mut settings = ScanSettings {
+            definition: pane.definition.clone(),
+            universe: pane.universe,
+            refresh: pane.refresh,
+            crypto_filter: pane.crypto_filter.clone(),
+        };
+        settings.definition.name = name.clone();
+        match save_definition(&settings) {
+            Ok(saved) => {
+                pane.definition.name = name.clone();
+                pane.saved = saved;
+                let verb = if replacing { "Replaced" } else { "Saved" };
+                pane.notice = Some(ScanNotice::Saved(format!("{verb} \"{name}\"")));
+                pane.save_draft = None;
+            }
+            Err(e) => pane.notice = Some(ScanNotice::Error(e)),
+        }
+    }
+}
 
 fn ready_stats<'a>(pane: &'a ScannerPane, symbol: &str, now: i64) -> Option<&'a tr_data::crypto_catalog::Rolling24h> {
     let ticker = tr_core::Security::parse(symbol)?.ticker;
@@ -1239,8 +1561,7 @@ fn results_rows(
         dp(292.0) + security_width + shift + metrics_width,
     ];
     let now = chrono::Utc::now().timestamp();
-    let sort_id = ui.id().with("crypto-24h-sort");
-    let mut sort = ui.data(|data| data.get_temp::<bool>(sort_id));
+    let mut sort = pane.rolling_sort.get();
     if crypto {
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -1252,7 +1573,7 @@ fn results_rows(
                 .clicked()
             {
                 sort = Some(!sort.unwrap_or(false));
-                ui.data_mut(|data| data.insert_temp(sort_id, sort.unwrap()));
+                pane.rolling_sort.set(sort);
             }
             ui.label(
                 RichText::new("Rolling 24h exchange metrics · volumes use each product's base and quote assets")
@@ -1409,6 +1730,237 @@ fn results_rows(
 mod tests {
     use super::*;
 
+    // A5b-SCAN: pane reads use held rows and the same sort, without dispatching work.
+    #[test]
+    fn agent_read_scan_from_fake_pane_is_sorted_capped_and_lists_available_on_error() {
+        use crate::app::{Pane, PaneKind, TerminalApp};
+        use serde_json::json;
+        use tr_agent_tools::{Content, args::ReadScanResults};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scanner-pane-reads");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.panes.clear();
+        let mut pane = ScannerPane::new(ScanDefinition {
+            name: "Crypto positive".into(),
+            timeframe: Timeframe::D1,
+            root: ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![ScanCondition {
+                    left: ScanOperand::Price,
+                    right: ScanOperand::Constant(0.),
+                    ..Default::default()
+                }],
+            ),
+        });
+        pane.universe = Universe::CoinbaseSpot;
+        pane.completed = Some(chrono::Utc::now());
+        pane.rolling_sort.set(Some(true));
+        for (symbol, change) in [("COINBASE:BTC-USD", 2.), ("COINBASE:ETH-USD", 5.)] {
+            let bars = tr_core::Series::new(symbol, Timeframe::D1, vec![tr_core::Bar::new(86400, 1., 1., 1., 1., 1.)]);
+            pane.rows.push(ScanRow {
+                symbol: symbol.into(),
+                evaluation: Some(pane.definition.evaluate(&bars)),
+                ts: Some(86400),
+                simulated: false,
+                error: None,
+            });
+            let mut stats = crypto_metrics(symbol, chrono::Utc::now().timestamp());
+            stats.change_percent = Some(change);
+            pane.crypto_stats.insert(symbol.into(), Ok(stats));
+        }
+        let computed = pane.completed;
+        app.panes.push(Pane { id: 42, kind: PaneKind::Scanner(Box::new(pane)), link: None, title: None, window: None });
+        let read = app.agent_read_scan(ReadScanResults { pane_id: Some(42), name: None, include: Default::default() });
+        assert!(read.success);
+        let Content::Text(text) = &read.content[0] else { panic!() };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["rows"][0]["symbol"], "COINBASE:ETH-USD Curncy");
+        assert_eq!(value["rows"][0]["values"][0]["left"], 1.);
+        assert_eq!(value["computed_at"], json!(computed));
+        assert_eq!(value["scanned"], 2);
+        assert_eq!(value["matched"], 2);
+        let bad = app.agent_read_scan(ReadScanResults { pane_id: Some(99), name: None, include: Default::default() });
+        assert!(!bad.success);
+        let Content::Text(text) = &bad.content[0] else { panic!() };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["error"]["available"][0]["pane_id"], 42);
+        let PaneKind::Scanner(pane) = &mut app.panes[0].kind else { panic!() };
+        let mut no_match = pane.rows[0].clone();
+        no_match.symbol = "COINBASE:SOL-USD".into();
+        no_match.evaluation.as_mut().unwrap().outcome = ScanOutcome::NoMatch;
+        let mut unavailable = pane.rows[0].clone();
+        unavailable.symbol = "COINBASE:ADA-USD".into();
+        unavailable.evaluation.as_mut().unwrap().outcome = ScanOutcome::Unavailable;
+        unavailable.evaluation.as_mut().unwrap().reason = Some("Insufficient bars".into());
+        pane.rows.extend([no_match, unavailable]);
+        let read = app.agent_read_scan(ReadScanResults { pane_id: Some(42), name: None, include: Default::default() });
+        let Content::Text(text) = &read.content[0] else { panic!() };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["scanned"], 4);
+        assert_eq!(value["matched"], 2);
+        assert_eq!(value["no_match"], 1);
+        assert_eq!(value["unavailable"], 1);
+        assert_eq!(value["rows"].as_array().unwrap().len(), 2);
+        let read = app.agent_read_scan(ReadScanResults {
+            pane_id: Some(42),
+            name: None,
+            include: tr_agent_tools::args::scanner::ScanInclude::All,
+        });
+        let Content::Text(text) = &read.content[0] else { panic!() };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        let outcomes: Vec<_> =
+            value["rows"].as_array().unwrap().iter().map(|r| r["outcome"].as_str().unwrap()).collect();
+        assert!(outcomes.contains(&"no_match"));
+        assert!(outcomes.contains(&"unavailable"));
+        let PaneKind::Scanner(pane) = &mut app.panes[0].kind else { panic!() };
+        pane.rows = vec![pane.rows[0].clone(); 60];
+        let read = app.agent_read_scan(ReadScanResults {
+            pane_id: None,
+            name: Some("Crypto positive".into()),
+            include: Default::default(),
+        });
+        let Content::Text(text) = &read.content[0] else { panic!() };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["rows"].as_array().unwrap().len(), 50);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(app.panes.len(), 1, "read tool must not open a pane");
+    }
+    #[test]
+    fn agent_list_scans_caps_panes_and_run_settings_resolve_active_or_named_watchlist() {
+        use crate::app::{NamedWatchlist, Pane, PaneKind, TerminalApp};
+        use tr_agent_tools::Content;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scanner-pane-list");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.panes.clear();
+        app.watchlists = vec![
+            NamedWatchlist::new("Other".into(), vec!["MSFT".into()]),
+            NamedWatchlist::new("Active".into(), vec!["AAPL".into()]),
+        ];
+        app.active_watchlist = 1;
+        app.watchlist = vec!["AAPL".into()];
+        let mut args:tr_agent_tools::args::RunScan=serde_json::from_value(serde_json::json!({"universe":"watchlist","definition":{"timeframe":"1D","match":"all","conditions":[{"left":"price","op":"above","right":0}]}})).unwrap();
+        assert_eq!(app.agent_scan_settings(&args).unwrap().1, vec!["AAPL US Equity"]);
+        args.watchlist = Some("Other".into());
+        assert_eq!(app.agent_scan_settings(&args).unwrap().1, vec!["MSFT US Equity"]);
+        for id in 1..=60 {
+            app.panes.push(Pane { id, kind: PaneKind::Scanner(Box::default()), link: None, title: None, window: None });
+        }
+        let result = app.agent_list_scans();
+        assert!(result.success);
+        let Content::Text(text) = &result.content[0] else { panic!() };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["entries"].as_array().unwrap().len(), 50);
+        assert_eq!(value["truncated"], true);
+    }
+    #[test]
+    fn review_read_scan_results_returns_matches_beyond_the_first_fifty_rows() {
+        use crate::app::{Pane, PaneKind, TerminalApp};
+        use tr_agent_tools::{Content, args::ReadScanResults};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/review-scanner-pane-matches");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.panes.clear();
+        let mut pane = ScannerPane::new(ScanDefinition {
+            name: "Price above 5".into(),
+            timeframe: Timeframe::D1,
+            root: ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![ScanCondition {
+                    left: ScanOperand::Price,
+                    right: ScanOperand::Constant(5.),
+                    ..Default::default()
+                }],
+            ),
+        });
+        pane.universe = Universe::Nasdaq;
+        pane.completed = Some(chrono::Utc::now());
+        // A market-wide pane holds thousands of rows in scanner (alphabetical) order; the
+        // pane shows matches only by default.
+        for i in 0..80 {
+            let price = if i == 79 { 10. } else { 1. };
+            let symbol = format!("S{i:03} US Equity");
+            let bars = tr_core::Series::new(
+                &symbol,
+                Timeframe::D1,
+                vec![tr_core::Bar::new(86400, price, price, price, price, 1.)],
+            );
+            pane.rows.push(ScanRow {
+                symbol: symbol.clone(),
+                evaluation: Some(pane.definition.evaluate(&bars)),
+                ts: Some(86400),
+                simulated: false,
+                error: None,
+            });
+        }
+        app.panes.push(Pane { id: 7, kind: PaneKind::Scanner(Box::new(pane)), link: None, title: None, window: None });
+        let read = app.agent_read_scan(ReadScanResults { pane_id: Some(7), name: None, include: Default::default() });
+        let Content::Text(text) = &read.content[0] else { panic!() };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["matched"], 1);
+        assert!(
+            value["rows"].as_array().unwrap().iter().any(|r| r["symbol"] == "S079 US Equity"),
+            "the only match is missing from the returned rows"
+        );
+        assert_eq!(value["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(value["no_match"], 79);
+        assert_eq!(value["unavailable"], 0);
+        assert_eq!(value["truncated"], false);
+        let completed_at = value["as_of"].clone();
+        let PaneKind::Scanner(pane) = &mut app.panes[0].kind else { panic!() };
+        pane.retain_completed_scan();
+        let mut next = pane.rows.last().unwrap().clone();
+        next.symbol = "NEXT US Equity".into();
+        pane.rows.clear();
+        pane.running = true;
+        pane.definition.name = "Next generation".into();
+        pane.partial(pane.generation, vec![next.clone()]);
+        let read = app.agent_read_scan(ReadScanResults { pane_id: Some(7), name: None, include: Default::default() });
+        let Content::Text(text) = &read.content[0] else { panic!() };
+        let running: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(running["running"], true);
+        assert_eq!(running["partial"], false);
+        assert_eq!(running["as_of"], completed_at);
+        assert_eq!(running["name"], "Price above 5");
+        assert_eq!(running["scanned"], 80);
+        assert_eq!(running["rows"][0]["symbol"], "S079 US Equity");
+        let PaneKind::Scanner(pane) = &mut app.panes[0].kind else { panic!() };
+        pane.finish(pane.generation, vec![next]);
+        let read = app.agent_read_scan(ReadScanResults { pane_id: Some(7), name: None, include: Default::default() });
+        let Content::Text(text) = &read.content[0] else { panic!() };
+        let finished: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(finished["running"], false);
+        assert_eq!(finished["scanned"], 1);
+        assert_eq!(finished["rows"][0]["symbol"], "NEXT US Equity");
+        assert_eq!(finished["name"], "Next generation");
+    }
+    #[test]
+    fn agent_read_first_running_scan_does_not_expose_partial_rows_as_completed() {
+        use crate::app::{Pane, PaneKind, TerminalApp};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scanner-first-running-read");
+        let mut app = TerminalApp::test_workspace(&root);
+        let mut pane = ScannerPane::default();
+        pane.running = true;
+        pane.rows.push(ScanRow {
+            symbol: "AAPL US Equity".into(),
+            evaluation: None,
+            ts: None,
+            simulated: false,
+            error: Some("Partial".into()),
+        });
+        app.panes =
+            vec![Pane { id: 9, kind: PaneKind::Scanner(Box::new(pane)), link: None, title: None, window: None }];
+        let result = app.agent_read_scan(tr_agent_tools::args::ReadScanResults {
+            pane_id: Some(9),
+            name: None,
+            include: tr_agent_tools::args::scanner::ScanInclude::All,
+        });
+        let tr_agent_tools::Content::Text(text) = &result.content[0] else { panic!() };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["running"], true);
+        assert!(value["as_of"].is_null());
+        assert_eq!(value["scanned"], 0);
+        assert_eq!(value["rows"], serde_json::json!([]));
+    }
+    // End A5b-SCAN pane tests.
+
     fn crypto_metrics(symbol: &str, observed_at: i64) -> tr_data::crypto_catalog::Rolling24h {
         tr_data::crypto_catalog::Rolling24h {
             instrument: tr_core::crypto::CryptoInstrument::parse(symbol).unwrap(),
@@ -1522,13 +2074,13 @@ mod tests {
             }],
         );
         assert!(!pane.show_unavailable);
-        assert!(pane.notice.as_ref().unwrap().contains("retry discovery"));
+        assert!(matches!(&pane.notice, Some(ScanNotice::Error(message)) if message.contains("retry discovery")));
     }
 
     #[test]
     fn invalid_crypto_filter_is_preserved_for_validation_and_cannot_save() {
         let dir = std::env::temp_dir().join(format!("tr-invalid-crypto-filter-{}", std::process::id()));
-        let mut settings = ScanSettings::from(ScanDefinition::default());
+        let mut settings = named_settings("Invalid filter");
         settings.universe = Universe::BinanceSpot;
         settings.crypto_filter.quote = "USD/T".into();
         let pane = ScannerPane::from_settings(settings.clone());
@@ -2407,9 +2959,12 @@ mod tests {
             running: false,
             rows: Vec::new(),
             completed: None,
+            rolling_sort: Default::default(),
+            completed_scan: None,
             snapshot_symbols: Vec::new(),
             saved: Vec::new(),
             notice: None,
+            save_draft: None,
             matches_only: true,
             universe: Universe::Watchlist,
             crypto_filter: Default::default(),
@@ -2511,6 +3066,73 @@ mod tests {
         }
     }
 
+    fn named_settings(name: &str) -> ScanSettings {
+        ScanDefinition { name: name.into(), ..Default::default() }.into()
+    }
+
+    #[test]
+    fn save_name_validation_is_live_trimmed_and_case_insensitive() {
+        let saved = vec![named_settings("My scan"), named_settings(" Volume Thrust ")];
+        for name in ["", "  ", "\t\n"] {
+            let state = validate_save_name(name, &saved);
+            assert_eq!(state, SaveName::Empty);
+            assert!(!state.enabled());
+            assert_eq!(state.hint(), "Name the scan");
+        }
+        for name in ["Volume Thrust", " volume THRUST "] {
+            let state = validate_save_name(name, &saved);
+            assert_eq!(state, SaveName::Preset("Volume Thrust".into()));
+            assert!(!state.enabled());
+            assert_eq!(state.hint(), "\"Volume Thrust\" is a built-in preset. Choose another name.");
+        }
+        let state = validate_save_name("  MY SCAN ", &saved);
+        assert_eq!(state, SaveName::Replace("My scan".into()));
+        assert!(state.enabled());
+        assert_eq!(state.button(), "Replace");
+        assert_eq!(state.hint(), "Replaces the saved scan \"My scan\".");
+        let state = validate_save_name("New scan", &saved);
+        assert_eq!(state, SaveName::New);
+        assert!(state.enabled());
+        assert_eq!(state.button(), "Save");
+        assert!(state.hint().is_empty());
+    }
+
+    #[test]
+    fn preset_save_prefill_avoids_saved_name_collisions() {
+        for preset in ScanDefinition::presets() {
+            assert_eq!(save_name_prefill(&preset.name, &[]), format!("{} (custom)", preset.name));
+        }
+        let saved = vec![named_settings(" volume thrust (CUSTOM) "), named_settings("Volume Thrust (custom) 2")];
+        assert_eq!(save_name_prefill("Volume Thrust", &saved), "Volume Thrust (custom) 3");
+        assert_eq!(save_name_prefill(" My scan ", &[named_settings("My scan")]), "My scan");
+    }
+
+    #[test]
+    fn legacy_preset_saved_label_is_unambiguous() {
+        assert_eq!(saved_scan_label("Volume Thrust"), "Volume Thrust (saved)");
+        assert_eq!(saved_scan_label("volume thrust"), "volume thrust (saved)");
+        assert_eq!(saved_scan_label("My scan"), "My scan");
+    }
+
+    #[test]
+    fn scan_library_rejects_preset_names_without_rewriting_legacy_files() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!(
+            "tr-preset-save-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = serde_json::to_vec(&vec![named_settings("Volume Thrust")]).unwrap();
+        std::fs::write(dir.join("scans.json"), &legacy).unwrap();
+        for preset in ScanDefinition::presets() {
+            let settings = named_settings(&format!(" {} ", preset.name.to_ascii_uppercase()));
+            assert!(save_definition_at(&settings, &dir).unwrap_err().contains("built-in preset"));
+            assert_eq!(std::fs::read(dir.join("scans.json")).unwrap(), legacy);
+        }
+        assert_eq!(load_saved_at(&dir).unwrap()[0].definition.name, "Volume Thrust");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn scan_library_merges_updates_and_preserves_corrupt_files() {
         let dir = std::env::temp_dir().join(format!(
@@ -2527,11 +3149,16 @@ mod tests {
         assert_eq!(save_definition_at(&definition, &dir).unwrap().len(), 1);
         definition.definition.name = "Second".into();
         definition.universe = Universe::Nyse;
-        assert_eq!(save_definition_at(&definition, &dir).unwrap().len(), 2);
+        let before = save_definition_at(&definition, &dir).unwrap();
+        assert_eq!(before.len(), 2);
+        assert_eq!(validate_save_name(" first ", &before), SaveName::Replace("First".into()));
+        let untouched = before.iter().find(|s| s.definition.name == "Second").unwrap().clone();
         definition.definition.name = " first ".into();
         definition.definition.timeframe = Timeframe::W1;
         let saved = save_definition_at(&definition, &dir).unwrap();
         assert_eq!(saved.len(), 2);
+        assert_eq!(saved.iter().filter(|s| same_scan_name(&s.definition.name, "First")).count(), 1);
+        assert!(saved.contains(&untouched));
         assert!(saved.iter().any(|s| s.definition.name == "first"
             && s.definition.timeframe == Timeframe::W1
             && s.universe == Universe::Nyse));

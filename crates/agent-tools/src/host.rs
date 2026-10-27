@@ -24,6 +24,9 @@ pub struct History {
     pub session: Session,
     /// Authoritative source identity; do not infer a venue from an equity ticker.
     pub instrument: Option<CryptoInstrument>,
+    // A5b-MULTI provenance is optional: absence must never be described as live.
+    pub source: Option<String>,
+    pub simulated: Option<bool>,
 }
 
 pub trait DataHost: Send + Sync {
@@ -591,6 +594,8 @@ impl<M: MarketData> DataHost for MarketDataHost<M> {
                 price_basis: self.price_basis,
                 session: self.session,
                 instrument: self.market.crypto_instrument(symbol),
+                source: Some(self.market.name().into()),
+                simulated: matches!(self.market.name(), "sample" | "offline").then_some(true),
             })
         })
     }

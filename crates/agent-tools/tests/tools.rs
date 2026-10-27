@@ -13,6 +13,467 @@ use tr_agent_tools::{
 use tr_core::{AssetClass, Bar, Timeframe, crypto::CryptoInstrument, session::Session};
 use tr_data::{Quote, SearchHit};
 
+// A5b-MULTI offline fixtures and contract tests, separate from scanner tests.
+mod multi_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const DAY: i64 = 86400;
+    struct BatchHost {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        quote_calls: AtomicUsize,
+        history_calls: AtomicUsize,
+        simulated: bool,
+        long: bool,
+        days: Option<i32>,
+        quote_prev_close: f64,
+        // review_: provider timestamp offset for non-crypto bars and optional session.
+        equity_offset: i64,
+        session: Option<Session>,
+    }
+    impl Default for BatchHost {
+        fn default() -> Self {
+            Self {
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                quote_calls: AtomicUsize::new(0),
+                history_calls: AtomicUsize::new(0),
+                simulated: false,
+                long: false,
+                days: None,
+                quote_prev_close: 100.,
+                // Real provider stamps: equity session open vs crypto midnight UTC.
+                equity_offset: 13 * 3600 + 1800,
+                session: None,
+            }
+        }
+    }
+    impl DataHost for BatchHost {
+        fn history<'a>(
+            &'a self,
+            symbol: &'a str,
+            tf: Timeframe,
+            end: Option<i64>,
+            limit: usize,
+        ) -> HostFuture<'a, History> {
+            Box::pin(async move {
+                self.history_calls.fetch_add(1, Ordering::SeqCst);
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                let crypto = symbol.contains("COINBASE");
+                let second = symbol.starts_with("BBB");
+                // Fixed 32 calendar dates: equities have session gaps; BBB has an
+                // extra missing session. Crypto trades every day, with one gap.
+                let mut bars: Vec<_> = (0..self.days.unwrap_or(if self.long { 1800 } else { 32 }))
+                    .filter(|i| if crypto { *i != 9 } else { i % 7 < 5 && (!second || *i != 15) })
+                    .map(|i| {
+                        let close = if crypto {
+                            200. + 3. * f64::from(i) + [0., -5., 4., -2.][i as usize % 4]
+                        } else if second {
+                            80. + f64::from(i) + [0., 4., -2.][i as usize % 3]
+                        } else {
+                            100. + 2. * f64::from(i) + [0., 3., -4., 2.][i as usize % 4]
+                        };
+                        let offset = if crypto { 0 } else { self.equity_offset };
+                        let step = if tf.is_intraday() { tf.seconds() } else { DAY };
+                        Bar::new(START + i64::from(i) * step + offset, close - 1., close + 2., close - 2., close, 100.)
+                    })
+                    .filter(|b| end.is_none_or(|end| b.ts <= end))
+                    .collect();
+                if bars.len() > limit {
+                    bars.drain(..bars.len() - limit);
+                }
+                Ok(History {
+                    bars,
+                    session: self.session.unwrap_or(Session::Provider),
+                    price_basis: PriceBasis::Adjusted,
+                    source: Some("fixed_fixture".into()),
+                    simulated: Some(self.simulated),
+                    instrument: None,
+                })
+            })
+        }
+        fn search<'a>(&'a self, query: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+            Box::pin(async move {
+                if query == "FAIL" {
+                    return Err("offline".into());
+                }
+                let keys = if query == "AMB" {
+                    vec!["AMB US Equity".into(), "AMB Index".into()]
+                } else if query.starts_with("UNKNOWN") {
+                    vec![]
+                } else {
+                    vec![tr_data::security(query).key()]
+                };
+                Ok(keys
+                    .into_iter()
+                    .map(|key| SearchHit {
+                        class: tr_data::security(&key).class,
+                        name: key.clone(),
+                        key,
+                        exchange: None,
+                    })
+                    .collect())
+            })
+        }
+        fn quotes<'a>(&'a self, symbols: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
+            Box::pin(async move {
+                self.quote_calls.fetch_add(1, Ordering::SeqCst);
+                // Reverse response order to ensure identity matching, not zip.
+                Ok(symbols
+                    .iter()
+                    .rev()
+                    .map(|s| Quote {
+                        symbol: s.clone(),
+                        last: 105.,
+                        prev_close: self.quote_prev_close,
+                        ts: NOW - 15,
+                        spark: vec![],
+                        crypto_source: None,
+                        simulated: self.simulated.then_some(true),
+                    })
+                    .collect())
+            })
+        }
+    }
+    impl LiveHost for BatchHost {
+        fn call_live<'a>(&'a self, _: &'a str, _: LiveArgs) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
+            panic!("batch tools must never reach the live/proposal host")
+        }
+    }
+    async fn batch(host: &BatchHost, name: &str, args: Value, now: i64) -> Value {
+        let registry = Registry::new(ToolSet::ReadOnly);
+        let mut budget = CallBudget::default();
+        let mut ctx = CallContext { now, ..CallContext::new(host, host, &mut budget) };
+        let result = registry.call(name, &args.to_string(), &mut ctx).await;
+        assert!(result.success, "{result:?}");
+        value(result)
+    }
+    fn compare_args() -> Value {
+        json!({"symbols":["AAA US Equity","BBB US Equity","COINBASE:BTC-USD Curncy"],"timeframe":"1D"})
+    }
+
+    #[tokio::test]
+    async fn multi_quotes_batch_per_symbol_resolution_and_caps() {
+        let host = BatchHost::default();
+        let output = batch(
+            &host,
+            "get_quotes",
+            json!({"symbols":["AAA US Equity","UNKNOWN","BBB US Equity","AMB","FAIL"]}),
+            NOW,
+        )
+        .await;
+        assert_eq!(host.quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(output["failed"], 3);
+        assert_eq!(output["symbols"][0]["symbol"], "AAA US Equity");
+        assert_eq!(output["symbols"][1]["error"], "unknown_symbol");
+        assert_eq!(output["symbols"][3]["error"], "ambiguous_symbol");
+        assert_eq!(output["symbols"][4]["error"], "search_unavailable");
+        assert_eq!(output["symbols"][2]["change"], 5.);
+        assert!((output["symbols"][2]["change_percent"].as_f64().unwrap() - 5.).abs() < 1e-10);
+        assert_eq!(output["symbols"][2]["freshness"], "recent_timestamp");
+        let mut quote = output["symbols"][0].clone();
+        rounded(&mut quote);
+        assert_eq!(
+            quote,
+            json!({"requested_symbol":"AAA US Equity","symbol":"AAA US Equity","last":105.,
+            "change":5.,"change_percent":5.,"as_of":iso_test(NOW-15),"source":null,"freshness":"recent_timestamp","simulation":"unknown"})
+        );
+        let registry = Registry::new(ToolSet::ReadOnly);
+        for n in [0, 26] {
+            assert!(registry.validate_call("get_quotes", &json!({"symbols":vec!["AAA";n]}).to_string()).is_err());
+        }
+        let output = batch(&host, "get_quotes", json!({"symbols":vec!["AAA US Equity";25]}), NOW).await;
+        assert_eq!(output["symbols"].as_array().unwrap().len(), 25);
+        assert_eq!(host.quote_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn multi_alignment_golden_two_equities_and_crypto_with_gaps() {
+        let host = BatchHost::default();
+        let output = batch(&host, "compare_symbols", compare_args(), NOW).await;
+        assert_eq!(output["version"], 1);
+        assert_eq!(output["bars_used"], 22);
+        assert!(output["alignment_note"].as_str().unwrap().contains("equity session"));
+        assert_eq!(output["dropped_bars"], json!({"AAA US Equity":2,"BBB US Equity":1,"COINBASE:BTC-USD Curncy":9}));
+        let mut metrics: Value = output["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                for key in [
+                    "requested_symbol",
+                    "symbol",
+                    "source",
+                    "session",
+                    "simulated",
+                    "price_basis",
+                    "forming_bar_times",
+                    "finished_bars_available",
+                    "dropped_bars",
+                ] {
+                    r.as_object_mut().unwrap().remove(key);
+                }
+                r
+            })
+            .collect();
+        rounded(&mut metrics);
+        // Versioned, exact 1e-8 golden numbers on fixed non-random OHLC fixtures.
+        assert_eq!(
+            metrics,
+            json!([
+                {"return_percent":64.,"annualised_volatility_percent":65.81044915,"max_drawdown_percent":-4.76190476,
+                 "atr14_percent":4.44313867,"last_finished_close":164.,"correlation":1.,"correlation_reason":null,
+                 "beta":1.,"beta_reason":null,"relative_strength":{"ratio_change_percent":0.,"ratio_slope_sign_20":"flat","slope_reason":null}},
+                {"return_percent":43.75,"annualised_volatility_percent":76.89383445,"max_drawdown_percent":-5.88235294,
+                 "atr14_percent":5.54606382,"last_finished_close":115.,"correlation":0.03857856,"correlation_reason":null,
+                 "beta":0.04507572,"beta_reason":null,"relative_strength":{"ratio_change_percent":-12.34756098,"ratio_slope_sign_20":"negative","slope_reason":null}},
+                {"return_percent":45.5,"annualised_volatility_percent":43.00430697,"max_drawdown_percent":-1.42857143,
+                 "atr14_percent":2.80820816,"last_finished_close":291.,"correlation":-0.75408193,"correlation_reason":null,
+                 "beta":-0.49276021,"beta_reason":null,"relative_strength":{"ratio_change_percent":-11.2804878,"ratio_slope_sign_20":"negative","slope_reason":null}}
+            ])
+        );
+        let mut rank = output["rank"].clone();
+        rounded(&mut rank);
+        assert_eq!(
+            rank,
+            json!([
+                {"rank":1,"symbol":"AAA US Equity","return_percent":64.},
+                {"rank":2,"symbol":"COINBASE:BTC-USD Curncy","return_percent":45.5},
+                {"rank":3,"symbol":"BBB US Equity","return_percent":43.75}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_unknown_middle_overlap_forming_window_and_base_errors() {
+        let host = BatchHost::default();
+        let mut args = compare_args();
+        args["symbols"] = json!(["AAA US Equity", "UNKNOWN", "BBB US Equity"]);
+        let output = batch(&host, "compare_symbols", args.clone(), START + 31 * DAY + 14 * 3600).await;
+        assert_eq!(output["failed"], 1);
+        assert_eq!(output["symbols"][1]["error"], "unknown_symbol");
+        assert!(output["symbols"][2]["return_percent"].is_number());
+        assert_eq!(output["symbols"][0]["forming_bar_times"], json!([iso_test(START + 31 * DAY + 13 * 3600 + 1800)]));
+        assert_eq!(output["window"]["to"], iso_test(START + 30 * DAY));
+        args["lookback"] = json!(10);
+        let short = batch(&host, "compare_symbols", args.clone(), NOW).await;
+        assert_eq!(short["bars_used"], 10);
+        assert_eq!(short["symbols"][0]["correlation_reason"], "insufficient_aligned_returns");
+        assert!(short["symbols"][0]["correlation"].is_null());
+        args["symbols"] = json!(["UNKNOWN", "AAA US Equity", "BBB US Equity"]);
+        let no_base = batch(&host, "compare_symbols", args, NOW).await;
+        assert_eq!(no_base["symbols"][1]["correlation_reason"], "base_unavailable");
+        assert!(no_base["symbols"][1]["relative_strength"].is_null());
+        let mut range = compare_args();
+        range["from"] = json!(START + 10 * DAY);
+        range["to"] = json!(START + 20 * DAY);
+        let output = batch(&host, "compare_symbols", range, NOW).await;
+        assert_eq!(output["window"]["from"], iso_test(START + 10 * DAY));
+        assert_eq!(output["window"]["to"], iso_test(START + 18 * DAY));
+    }
+    fn iso_test(ts: i64) -> String {
+        chrono::DateTime::from_timestamp(ts, 0).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+    }
+
+    #[tokio::test]
+    async fn multi_default_lookback_and_hard_output_cap_apply_to_long_and_date_windows() {
+        let host = BatchHost { long: true, ..Default::default() };
+        let now = START + 2000 * DAY;
+        let mut args = json!({"symbols":["AAA US Equity","BBB US Equity"],"timeframe":"1D"});
+        let output = batch(&host, "compare_symbols", args.clone(), now).await;
+        assert_eq!(output["bars_used"], 120);
+        args["lookback"] = json!(1000);
+        let output = batch(&host, "compare_symbols", args.clone(), now).await;
+        assert_eq!(output["bars_used"], 1000);
+        args.as_object_mut().unwrap().remove("lookback");
+        args["from"] = json!(START);
+        args["to"] = json!(now);
+        let output = batch(&host, "compare_symbols", args, now).await;
+        assert_eq!(output["bars_used"], 1000);
+        assert!(
+            output["warnings"].as_array().unwrap().iter().any(|v| v.as_str().unwrap().contains("date_window_capped"))
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_eight_symbol_concurrency_lookback_and_simulation_contract() {
+        let host = BatchHost { simulated: true, ..Default::default() };
+        let registry = Registry::new(ToolSet::ReadOnly);
+        for args in [
+            json!({"symbols":["AAA"],"timeframe":"1D"}),
+            json!({"symbols":vec!["AAA";9],"timeframe":"1D"}),
+            json!({"symbols":["AAA","BBB"],"timeframe":"1D","lookback":1001}),
+            json!({"symbols":["AAA","BBB"],"timeframe":"1D","lookback":0}),
+            json!({"symbols":["AAA","BBB"],"timeframe":"1D","from":START}),
+            json!({"symbols":["AAA","BBB"],"timeframe":"1D","from":START,"to":NOW,"lookback":100}),
+        ] {
+            assert!(registry.validate_call("compare_symbols", &args.to_string()).is_err(), "{args}");
+        }
+        let symbols: Vec<_> = (0..8).map(|i| format!("EQ{i} US Equity")).collect();
+        let output =
+            batch(&host, "compare_symbols", json!({"symbols":symbols,"timeframe":"1D","lookback":1000}), NOW).await;
+        assert_eq!(host.history_calls.load(Ordering::SeqCst), 8);
+        assert_eq!(host.peak.load(Ordering::SeqCst), 4);
+        assert_eq!(output["symbols"].as_array().unwrap().len(), 8);
+        assert!(output["warnings"].as_array().unwrap().iter().any(|v| v.as_str().unwrap().contains("simulated data")));
+        for preset in [ToolSet::ReadOnly, ToolSet::Edit, ToolSet::Workflows] {
+            for name in ["get_quotes", "compare_symbols"] {
+                let registry = Registry::new(preset);
+                let spec = registry.schemas().iter().find(|s| s.name == name).unwrap();
+                assert_eq!(spec.kind, tr_agent_tools::ToolKind::Data);
+                assert!(!spec.mutating && !spec.needs_confirmation);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_offset_hourly_compare_excludes_forming_and_future_crypto_closes() {
+        let host = BatchHost { equity_offset: 1800, ..Default::default() };
+        let output = batch(
+            &host,
+            "compare_symbols",
+            json!({
+                "symbols":["AAA US Equity","COINBASE:BTC-USD Curncy"],"timeframe":"1H"
+            }),
+            START + 32 * 3600,
+        )
+        .await;
+        // Equity 30:30-31:30 can consume crypto 30:00-31:00, but never
+        // crypto 31:00-32:00. Equity's last 31:30-32:30 bar is still forming.
+        assert_eq!(output["window"]["to"], iso_test(START + 30 * 3600));
+        assert_eq!(output["symbols"][0]["last_finished_close"], 156.);
+        assert_eq!(output["symbols"][1]["last_finished_close"], 294.);
+        assert_eq!(output["symbols"][0]["forming_bar_times"], json!([iso_test(START + 31 * 3600 + 1800)]));
+        assert!(output["alignment_note"].as_str().unwrap().contains("preceding completed"));
+    }
+
+    #[tokio::test]
+    async fn multi_aligned_lookback_overscans_crypto_and_reports_only_window_gaps() {
+        let host = BatchHost { long: true, ..Default::default() };
+        for lookback in [10, 120, 1000] {
+            let mut args = compare_args();
+            args["lookback"] = json!(lookback);
+            let output = batch(&host, "compare_symbols", args, START + 2000 * DAY).await;
+            assert_eq!(output["bars_used"], lookback, "{output}");
+            // BBB's lone missing session and crypto's gap are far before this
+            // trailing window; overscanned leading bars must not count as drops.
+            assert_eq!(output["dropped_bars"]["AAA US Equity"], 0);
+            assert_eq!(output["dropped_bars"]["BBB US Equity"], 0);
+        }
+        let output = batch(
+            &BatchHost::default(),
+            "compare_symbols",
+            json!({"symbols":["AAA US Equity","BBB US Equity"],"timeframe":"1D","lookback":20}),
+            NOW,
+        )
+        .await;
+        assert_eq!(output["bars_used"], 20);
+        assert_eq!(output["dropped_bars"]["AAA US Equity"], 1);
+        assert_eq!(output["dropped_bars"]["BBB US Equity"], 0);
+    }
+
+    #[tokio::test]
+    async fn multi_date_window_warns_only_with_an_extra_finished_bar() {
+        for (days, capped) in [(1400, false), (1407, true)] {
+            let host = BatchHost { days: Some(days), ..Default::default() };
+            let output = batch(
+                &host,
+                "compare_symbols",
+                json!({
+                "symbols":["AAA US Equity","CCC US Equity"],"timeframe":"1D",
+                "from":START,"to":START + 2000 * DAY}),
+                START + 2000 * DAY,
+            )
+            .await;
+            assert_eq!(output["bars_used"], 1000);
+            let warning = output["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("date_window_capped"));
+            assert_eq!(warning, capped, "{output}");
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_quotes_unavailable_previous_close_and_known_simulation() {
+        for previous in [0., f64::NAN] {
+            let host = BatchHost { quote_prev_close: previous, simulated: true, ..Default::default() };
+            let output = batch(&host, "get_quotes", json!({"symbols":["AAA US Equity"]}), NOW).await;
+            let row = &output["symbols"][0];
+            assert_eq!(row["last"], 105.);
+            assert!(row["change"].is_null() && row["change_percent"].is_null(), "{output}");
+            assert_eq!(row["simulation"], "simulated");
+            assert_eq!(output["failed"], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_calendar_classification_applies_to_the_common_series_in_any_order() {
+        for (symbols, factor, note) in [
+            (vec!["US10Y Govt", "CL1 Comdty"], 252., "exchange"),
+            (vec!["EURUSD Curncy", "GBPUSD Curncy"], 260., "FX"),
+            (vec!["COINBASE:BTC-USD Curncy", "EURUSD Curncy"], 260., "FX"),
+            (vec!["EURUSD Curncy", "SPX Index"], 252., "exchange"),
+            (vec!["COINBASE:BTC-USD Curncy", "COINBASE:ETH-USD Curncy"], 365., "crypto UTC"),
+        ] {
+            for reverse in [false, true] {
+                let mut symbols = symbols.clone();
+                if reverse {
+                    symbols.reverse();
+                }
+                let output =
+                    batch(&BatchHost::default(), "compare_symbols", json!({"symbols":symbols,"timeframe":"1D"}), NOW)
+                        .await;
+                assert_eq!(output["annualisation"]["bars_per_year"], factor, "{output}");
+                assert!(output["alignment_note"].as_str().unwrap().contains(note));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn review_mixed_equity_crypto_daily_aligns_real_provider_timestamps() {
+        // Equity daily bars use a session-open stamp (13:30 UTC in US daylight
+        // time; 14:30 in winter), while crypto uses 00:00 UTC. These provider
+        // offsets must not change the 22 common calendar sessions.
+        let host = BatchHost { equity_offset: 13 * 3600 + 1800, ..Default::default() };
+        let output = batch(&host, "compare_symbols", compare_args(), NOW).await;
+        assert_eq!(output["bars_used"], 22, "{output}");
+    }
+
+    #[tokio::test]
+    async fn review_index_only_daily_compare_uses_trading_day_annualisation() {
+        let host = BatchHost::default();
+        let args = json!({"symbols":["SPX Index","NDX Index"],"timeframe":"1D"});
+        let output = batch(&host, "compare_symbols", args, NOW).await;
+        assert!(output["symbols"][0]["error"].is_null(), "{output}");
+        assert_eq!(output["annualisation"]["bars_per_year"], 252.);
+    }
+
+    #[tokio::test]
+    async fn review_extended_session_intraday_annualisation_counts_extended_bars() {
+        let host = BatchHost { session: Some(Session::UsExtended), ..Default::default() };
+        let args = json!({"symbols":["AAA US Equity","BBB US Equity"],"timeframe":"1H"});
+        let output = batch(&host, "compare_symbols", args, NOW).await;
+        assert_eq!(output["annualisation"]["bars_per_year"], 252. * 16.);
+        assert_eq!(output["symbols"][0]["session"], Session::UsExtended.label());
+        let regular = BatchHost { session: Some(Session::UsRegular), ..Default::default() };
+        let output = batch(
+            &regular,
+            "compare_symbols",
+            json!({"symbols":["AAA US Equity","BBB US Equity"],"timeframe":"1H"}),
+            NOW,
+        )
+        .await;
+        assert_eq!(output["annualisation"]["bars_per_year"], 252. * 7.);
+    }
+}
+// End A5b-MULTI fixtures.
+
 const START: i64 = 1_704_067_200;
 const NOW: i64 = START + 95 * 86_400 + 3600;
 
@@ -92,6 +553,8 @@ impl Host {
                 price_basis: PriceBasis::Adjusted,
                 session: Session::Provider,
                 instrument: None,
+                source: None,
+                simulated: None,
             },
             ..Self::default()
         }
@@ -176,7 +639,7 @@ async fn golden_mode(mode: &str) {
 #[test]
 fn schema_snapshots_for_all_presets() {
     for (name, preset, count) in
-        [("read_only", ToolSet::ReadOnly, 9), ("edit", ToolSet::Edit, 16), ("workflows", ToolSet::Workflows, 23)]
+        [("read_only", ToolSet::ReadOnly, 14), ("edit", ToolSet::Edit, 21), ("workflows", ToolSet::Workflows, 28)]
     {
         let registry = Registry::new(preset);
         assert_eq!(registry.schemas().len(), count);
@@ -187,6 +650,7 @@ fn schema_snapshots_for_all_presets() {
             if tool.kind == tr_agent_tools::ToolKind::Live
                 && !tool.name.contains("watchlist")
                 && !tool.name.contains("alert")
+                && !matches!(tool.name.as_str(), "list_scans" | "read_scan_results" | "run_scan")
             {
                 assert!(tool.input_schema["properties"].get("chart_id").is_some());
             }
@@ -194,9 +658,36 @@ fn schema_snapshots_for_all_presets() {
                 assert_eq!(tool.needs_confirmation, tool.mutating);
             }
         }
-        snapshot("snapshots", name, &json!(registry.schemas()));
+        // A5b-SCAN schemas have their own contiguous inline snapshots below, so the
+        // parallel multi-symbol worker can update the historical JSON arrays independently.
+        let historical: Vec<_> = registry
+            .schemas()
+            .iter()
+            .filter(|s| !matches!(s.name.as_str(), "list_scans" | "read_scan_results" | "run_scan"))
+            .collect();
+        snapshot("snapshots", name, &json!(historical));
     }
 }
+
+// A5b-SCAN inline full-schema fingerprint snapshots, independently in EVERY mode.
+// FNV-1a over canonical serde JSON includes descriptions, bounds and nested schema branches.
+#[test]
+fn scanner_schema_snapshots_in_every_tool_set() {
+    for set in [ToolSet::ReadOnly, ToolSet::Edit, ToolSet::Workflows] {
+        let registry = Registry::new(set);
+        let fingerprints: Vec<_> = ["list_scans", "read_scan_results", "run_scan"]
+            .into_iter()
+            .map(|name| {
+                let spec = registry.schemas().iter().find(|s| s.name == name).unwrap();
+                assert!(!spec.mutating && !spec.needs_confirmation);
+                let bytes = serde_json::to_vec(spec).unwrap();
+                bytes.iter().fold(0xcbf29ce484222325_u64, |hash, b| (hash ^ u64::from(*b)).wrapping_mul(0x100000001b3))
+            })
+            .collect();
+        assert_eq!(fingerprints, vec![9073003766203700283, 6375807022164428620, 8576708177699259949]);
+    }
+}
+// End A5b-SCAN snapshot block.
 
 #[test]
 fn committed_fixtures_match_seeded_and_handmade_generators() {
@@ -391,9 +882,16 @@ mod adversarial {
 
     fn examples() -> Vec<(&'static str, Value)> {
         vec![
+            // A5b-SCAN examples.
+            ("list_scans", json!({})),
+            ("read_scan_results", json!({})),
+            ("run_scan", json!({"saved":"Momentum","universe":"watchlist"})),
             ("read_data", json!({"symbol":"X"})),
             ("analyze", json!({"symbol":"X","mode":"trend"})),
             ("find_symbol", json!({"query":"X"})),
+            // A5b-MULTI schema examples.
+            ("get_quotes", json!({"symbols":["X"]})),
+            ("compare_symbols", json!({"symbols":["X","Y"],"timeframe":"1D"})),
             ("read_chart", json!({})),
             ("indicator_values", json!({})),
             ("set_view", json!({"symbol":"X"})),
@@ -427,7 +925,9 @@ mod adversarial {
             };
         }
         parse!(
+            "list_scans" => ListScans, "read_scan_results" => ReadScanResults, "run_scan" => RunScan,
             "read_data" => ReadData, "analyze" => Analyze, "find_symbol" => FindSymbol,
+            "get_quotes" => GetQuotes, "compare_symbols" => CompareSymbols,
             "read_chart" => ReadChart, "indicator_values" => IndicatorValues, "set_view" => SetView,
             "create_drawing" => CreateDrawing, "update_drawing" => UpdateDrawing, "delete_drawing" => DeleteDrawing,
             "add_indicator" => AddIndicator, "remove_indicator" => RemoveIndicator, "compare" => Compare,
@@ -444,6 +944,12 @@ mod adversarial {
     // JSON Schema integers have no implicit signed-64-bit or calendar-year bound.
     // This is deliberately not the registry's private validator reused as an oracle.
     fn schema_accepts(schema: &Value, value: &Value) -> bool {
+        if let Some(branches) = schema["anyOf"].as_array() {
+            return branches.iter().any(|s| schema_accepts(s, value));
+        }
+        if schema["type"] == "null" {
+            return value.is_null();
+        }
         if let Some(choices) = schema["enum"].as_array()
             && !choices.contains(value)
         {
@@ -488,6 +994,18 @@ mod adversarial {
     }
 
     fn assert_schema_shape(schema: &Value) {
+        if let Some(branches) = schema["anyOf"].as_array() {
+            assert_eq!(schema.as_object().unwrap().len(), 1);
+            assert!(!branches.is_empty());
+            for branch in branches {
+                assert_schema_shape(branch);
+            }
+            return;
+        }
+        if schema["type"] == "null" {
+            assert_eq!(schema.as_object().unwrap().len(), 1);
+            return;
+        }
         let kind = if let Some(types) = schema["type"].as_array() {
             assert_eq!(types.len(), 2);
             assert_eq!(types[1], "null");
@@ -516,7 +1034,7 @@ mod adversarial {
                         assert!(v.as_u64().is_some());
                     }
                 }
-                &["type", "items", "minItems", "maxItems"]
+                &["type", "items", "minItems", "maxItems", "description"]
             }
             "string" => {
                 for k in ["minLength", "maxLength"] {
@@ -863,7 +1381,9 @@ mod adversarial {
                 assert_eq!(series.first().unwrap()[0], output[0]["first"]);
                 assert_eq!(series.last().unwrap()[0], output[0]["last"]);
             }
-            if name != "analyze" {
+            // Batch tools project bounded summaries and resolver errors; they do
+            // not forward the fake host's large live result or search labels.
+            if !matches!(name, "analyze" | "get_quotes" | "compare_symbols") {
                 assert_eq!(output[0]["truncated"], true, "{name}");
                 assert!(output[0]["marker"].as_str().unwrap().contains("truncated"));
             }

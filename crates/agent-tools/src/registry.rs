@@ -135,6 +135,14 @@ impl Registry {
         {
             return Err(invalid("from must not exceed to".into(), Some("from")));
         }
+        // A5b-MULTI range contract: bars or a complete date window, never both.
+        if name == "compare_symbols" {
+            let has = |key: &str| value.get(key).is_some_and(|v| !v.is_null());
+            if has("from") != has("to") || has("lookback") && has("from") {
+                return Err(invalid("Supply lookback or both from and to, not both".into(), Some("lookback")));
+            }
+        }
+        // End A5b-MULTI validation.
         if name == "create_alert" {
             if value["kind"] == "close" && value.get("timeframe").is_none_or(Value::is_null) {
                 return Err(invalid("Close alerts require a timeframe".into(), Some("timeframe")));
@@ -171,6 +179,16 @@ impl Registry {
                     Ok(args) => data::find_symbol(ctx.data, args).await,
                     Err(e) => invalid(e.to_string(), None),
                 },
+                // A5b-MULTI data dispatch.
+                "get_quotes" => match serde_json::from_value::<args::GetQuotes>(value) {
+                    Ok(args) => data::multi::get_quotes(ctx.data, args, ctx.now).await,
+                    Err(e) => invalid(e.to_string(), None),
+                },
+                "compare_symbols" => match serde_json::from_value::<args::CompareSymbols>(value) {
+                    Ok(args) => data::multi::compare_symbols(ctx.data, args, ctx.now).await,
+                    Err(e) => invalid(e.to_string(), None),
+                },
+                // End A5b-MULTI dispatch.
                 _ => unreachable!("registered data tool"),
             };
         }
@@ -178,6 +196,18 @@ impl Registry {
             Ok(args) => args,
             Err(e) => return invalid(e.to_string(), None),
         };
+        // A5b-SCAN validation delegates all scan semantics to core.
+        if let LiveArgs::RunScan(a) = &args
+            && let Err(error) = a.validate()
+        {
+            return invalid(error, None);
+        }
+        if let LiveArgs::ReadScanResults(a) = &args
+            && a.pane_id.is_some()
+            && a.name.is_some()
+        {
+            return invalid("Supply pane_id or name, not both".into(), None);
+        }
         if let Err(error) = validate_live(&mut args, ctx.now) {
             return error;
         }
@@ -241,6 +271,17 @@ fn invalid(message: String, field: Option<&str>) -> ToolResult {
 
 fn validate(value: &Value, schema: &Value, path: &str) -> Result<(), ToolResult> {
     let fail = |message: &str| invalid(format!("{path}: {message}"), (!path.is_empty()).then_some(path));
+    // A5b-SCAN operand/definition unions. Every branch remains fail-closed.
+    if let Some(branches) = schema["anyOf"].as_array() {
+        return if branches.iter().any(|branch| validate(value, branch, path).is_ok()) {
+            Ok(())
+        } else {
+            Err(fail("Value does not match any allowed schema variant"))
+        };
+    }
+    if schema["type"] == "null" {
+        return if value.is_null() { Ok(()) } else { Err(fail("Expected null")) };
+    }
     if let Some(choices) = schema["enum"].as_array()
         && !choices.contains(value)
     {
@@ -378,6 +419,18 @@ fn workflow(name: &str) -> bool {
 
 fn catalog() -> Vec<ToolSpec> {
     let data = [
+        // A5b-MULTI catalog block.
+        (
+            "get_quotes",
+            "Read one bounded quote batch for up to 25 resolved symbols; errors are per symbol.",
+            args::GetQuotes::schema(),
+        ),
+        (
+            "compare_symbols",
+            "Compare 2–8 symbols numerically on common finished bars: return, annualised volatility, drawdown, ATR, relative strength, correlation and beta to the first symbol. Does not change the chart.",
+            args::CompareSymbols::schema(),
+        ),
+        // End A5b-MULTI catalog.
         (
             "read_data",
             "Read bounded OHLCV summaries, recent bars and a full-range LTTB close series.",
@@ -427,13 +480,24 @@ fn catalog() -> Vec<ToolSpec> {
             }
             "add_indicator" => ("Add an indicator validated and normalized against the core catalog.", true),
             "remove_indicator" => ("Remove a study instance by id.", true),
-            "compare" => ("Add or remove an instrument comparison.", true),
+            "compare" => ("Adds an overlay to the chart, or removes one; use compare_symbols for numbers.", true),
             "screenshot" => {
                 ("Capture chart PNG only after host consent; fail immediately if the window is hidden.", false)
             }
             "read_user_actions" => {
                 ("Read user drawing and view edit events; labels remain untrusted string data.", false)
             }
+            // A5b-SCAN catalog block: read-only in every mode.
+            "list_scans" => ("List saved scans and open Scanner panes, at most 50 entries.", false),
+            "read_scan_results" => (
+                "Read the last completed results held by an open Scanner pane; no network. At most 50 matched rows by default; include=all also returns non-matches. Counts cover all rows. During a run returns the previous completed snapshot with running=true.",
+                false,
+            ),
+            "run_scan" => (
+                "Run a saved scan or strict definition. US stock universes are cache-only; watchlist and crypto use Scanner limits. One scan at a time; 60 second deadline returns partial results. Pass result symbols unchanged to workflow tools.",
+                false,
+            ),
+            // End A5b-SCAN catalog block.
             "list_watchlists" => ("List at most 50 watchlists and their bounded symbol rows.", false),
             "list_alerts" => ("List at most 50 alerts, optionally filtered by symbol.", false),
             "create_watchlist" => ("Propose a named watchlist; no change until user approval.", true),
@@ -1089,6 +1153,10 @@ mod tests {
         let mut budget = CallBudget::new(30);
         let mut ctx = CallContext { confirmed: true, ..CallContext::new(&Host, &Host, &mut budget) };
         let examples = [
+            // A5b-SCAN global live arguments.
+            ("list_scans", json!({})),
+            ("read_scan_results", json!({})),
+            ("run_scan", json!({"saved":"Momentum","universe":"watchlist"})),
             ("read_chart", json!({})),
             ("indicator_values", json!({"id":"study"})),
             ("set_view", json!({"symbol":"AAPL","timeframe":"1H"})),
@@ -1115,14 +1183,14 @@ mod tests {
         ];
         assert_eq!(examples.len(), registry.schemas().iter().filter(|s| s.kind == ToolKind::Live).count());
         for (name, mut args) in examples {
-            if !workflow(name) {
+            if !workflow(name) && !matches!(name, "list_scans" | "read_scan_results" | "run_scan") {
                 args["chart_id"] = "pinned-chart".into();
             }
             let result = registry.call(name, &args.to_string(), &mut ctx).await;
             assert!(result.success, "{name}: {result:?}");
             let result = value(result);
             assert_eq!(result["tool"], name);
-            if !workflow(name) {
+            if !workflow(name) && !matches!(name, "list_scans" | "read_scan_results" | "run_scan") {
                 assert_eq!(result["args"]["chart_id"], "pinned-chart");
             }
         }

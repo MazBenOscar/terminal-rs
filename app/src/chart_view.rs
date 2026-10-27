@@ -258,6 +258,8 @@ impl Glide {
 struct DrawState {
     tool: Option<Tool>,
     pending: Option<Anchor>,
+    /// Screen-space press origin for a new two-point placement (not an object edit).
+    placement_origin: Option<Pos2>,
     second: Option<Anchor>,
     pattern: drawings::patterns::Placement,
     vertices: Vec<Anchor>,
@@ -3173,7 +3175,9 @@ impl ChartState {
         v.clamp(if self.replay_cutoff.is_some() { self.source_bars.len() } else { len });
         self.viewport = Some(v);
 
-        let changed_by_user = plot_resp.dragged()
+        // Drawing placement/edit drags are not viewport navigation and must not
+        // broadcast a range change to linked charts.
+        let changed_by_user = (self.draw.tool.is_none() && self.draw.drag.is_none() && plot_resp.dragged())
             || time_resp.dragged()
             || ui.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO || i.zoom_delta() != 1.) && plot_resp.hovered()
             || self.glide.is_some();
@@ -5672,10 +5676,40 @@ impl ChartState {
             self.finish_vertices();
         }
 
-        // Placement.
-        if let (Some(tool), true, Some(pos)) =
-            (self.draw.tool, resp.clicked(), resp.interact_pointer_pos().filter(|p| rect.contains(*p)))
+        // A plain two-point gesture starts at the press, not at egui's drag
+        // threshold. Keep click-click placement separate: a drag must not replace
+        // a first anchor that was already placed by a click.
+        if self.draw.tool.is_some_and(|tool| {
+            tool.points() == 2
+                && !matches!(tool, Tool::Brush | Tool::Path | Tool::Text)
+                && drawings::patterns::point_count(tool) == 0
+        }) && self.draw.pending.is_none()
+            && resp.drag_started()
+            && let Some(origin) = ui.input(|i| i.pointer.press_origin()).filter(|p| rect.contains(*p))
         {
+            self.draw.pending = Some(pointer_anchor(self, origin));
+            self.draw.placement_origin = Some(origin);
+        }
+        let placement_origin = self.draw.placement_origin;
+        let finish_drag = resp.drag_stopped()
+            && placement_origin
+                .zip(resp.interact_pointer_pos())
+                .is_some_and(|(origin, pos)| origin.distance(pos) >= theme::dp(3.));
+        // A sub-threshold drag is just the first click, even if egui reports a
+        // click as well. Do not consume the newly pending anchor as a second click.
+        let place_click = resp.clicked() && placement_origin.is_none();
+        if resp.drag_stopped() || resp.clicked() {
+            self.draw.placement_origin = None;
+        }
+
+        // Placement. Clicks and completed placement drags share the same undo,
+        // symbol, selection and tool-reset path below. Drag endpoints are clamped
+        // by pointer_anchor, including releases just outside the price pane.
+        if let (Some(tool), true, Some(pos)) = (
+            self.draw.tool,
+            place_click || finish_drag,
+            resp.interact_pointer_pos().filter(|p| finish_drag || rect.contains(*p)),
+        ) {
             let a = pointer_anchor(self, pos);
             if drawings::patterns::point_count(tool) > 0 {
                 if let Some(mut drawing) = self.draw.pattern.click(tool, a) {
@@ -6941,6 +6975,25 @@ mod tests {
         drawing_frame(ctx, chart, vec![], log)
     }
 
+    fn drag_drawing(
+        ctx: &egui::Context,
+        chart: &mut ChartState,
+        from: Pos2,
+        to: Pos2,
+        log: bool,
+    ) -> Vec<(String, Rect)> {
+        let tool = chart.draw.tool;
+        drawing_frame(ctx, chart, vec![egui::Event::PointerMoved(from)], log);
+        drawing_frame(ctx, chart, vec![pointer_button(from, true)], log);
+        assert_eq!(chart.draw.tool, tool);
+        for pos in [from.lerp(to, 0.5), to] {
+            drawing_frame(ctx, chart, vec![egui::Event::PointerMoved(pos)], log);
+            assert_eq!(chart.draw.tool, tool, "A placement drag must keep its tool until release");
+        }
+        drawing_frame(ctx, chart, vec![pointer_button(to, false)], log);
+        drawing_frame(ctx, chart, vec![], log)
+    }
+
     #[test]
     fn patterns_place_backspace_cancel_edit_last_handle_and_undo_redo() {
         for tool in Tool::ALL.into_iter().filter(|t| drawings::patterns::point_count(*t) > 0) {
@@ -7512,6 +7565,124 @@ mod tests {
             chart.redo_drawings();
             assert!(chart.drawings.is_empty());
         }
+    }
+
+    #[test]
+    fn measure_and_rectangle_drag_place_with_original_anchors_and_undo() {
+        for tool in [Tool::Measure, Tool::Rectangle] {
+            let ctx = egui::Context::default();
+            let mut chart = drawing_chart();
+            chart.start_tool(tool);
+            let labels = drag_drawing(&ctx, &mut chart, pos2(320., 300.), pos2(480., 100.), false);
+            assert_eq!(chart.drawings.len(), 1);
+            let drawing = chart.drawings[0].clone();
+            assert_eq!(drawing.tool, tool);
+            assert_eq!(drawing.symbol.as_deref(), Some(chart.symbol.as_str()));
+            assert_eq!(drawing.a, Anchor { ts: 40 * 86400, price: 125. });
+            assert_eq!(drawing.b, Anchor { ts: 60 * 86400, price: 175. });
+            assert_eq!(chart.draw.selected, Some(0));
+            assert!(chart.draw.tool.is_none() && chart.draw.pending.is_none());
+            if tool == Tool::Measure {
+                assert!(
+                    labels
+                        .iter()
+                        .any(|(s, _)| { s.contains("+50.00 (+40.00%)") && s.contains("20 bars") && s.contains("20d") })
+                );
+            }
+            chart.undo_drawings();
+            assert!(chart.drawings.is_empty());
+            chart.redo_drawings();
+            assert_eq!(chart.drawings, [drawing]);
+        }
+    }
+
+    #[test]
+    fn tiny_measure_drag_keeps_first_point_for_second_click() {
+        for long_press in [false, true] {
+            let ctx = egui::Context::default();
+            let mut chart = drawing_chart();
+            chart.start_tool(Tool::Measure);
+            let from = pos2(320., 300.);
+            let to = from + vec2(1., 1.);
+            if long_press {
+                // Even a tiny gesture can become an egui drag after holding.
+                drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(from)], false);
+                drawing_frame(&ctx, &mut chart, vec![pointer_button(from, true)], false);
+                for _ in 0..8 {
+                    drawing_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(to)], false);
+                    assert_eq!(chart.draw.tool, Some(Tool::Measure));
+                }
+                assert_eq!(chart.draw.placement_origin, Some(from));
+                drawing_frame(&ctx, &mut chart, vec![pointer_button(to, false)], false);
+            } else {
+                drag_drawing(&ctx, &mut chart, from, to, false);
+            }
+            assert!(chart.drawings.is_empty());
+            assert_eq!(chart.draw.tool, Some(Tool::Measure));
+            let first = chart.draw.pending.expect("A tiny drag acts as the first click");
+            assert!(chart.draw.placement_origin.is_none());
+            click_drawing(&ctx, &mut chart, pos2(480., 100.), false);
+            assert_eq!(chart.drawings.len(), 1);
+            assert_eq!(chart.drawings[0].a, first);
+            assert_eq!(chart.drawings[0].b.price, 175.);
+        }
+    }
+
+    #[test]
+    fn plain_two_point_tools_support_drag_without_changing_click_click() {
+        for tool in Tool::ALL.into_iter().filter(|tool| {
+            tool.points() == 2
+                && !matches!(tool, Tool::Brush | Tool::Path | Tool::Text)
+                && drawings::patterns::point_count(*tool) == 0
+        }) {
+            for log in [false, true] {
+                let ctx = egui::Context::default();
+                let mut chart = drawing_chart();
+                chart.start_tool(tool);
+                let from = pos2(320., 300.);
+                let to = pos2(480., 100.);
+                drag_drawing(&ctx, &mut chart, from, to, log);
+                assert_eq!(chart.drawings.len(), 1, "{tool:?}");
+                let dragged = chart.drawings[0].clone();
+                chart.cancel(); // Callout opens its text editor after placement.
+                chart.start_tool(tool);
+                click_drawing(&ctx, &mut chart, from, log);
+                assert_eq!(chart.draw.pending, Some(dragged.a));
+                click_drawing(&ctx, &mut chart, to, log);
+                assert_eq!(chart.drawings.len(), 2, "{tool:?}");
+                assert_eq!(chart.drawings[1].a, dragged.a);
+                assert_eq!(chart.drawings[1].b, dragged.b);
+            }
+        }
+    }
+
+    #[test]
+    fn measure_plot_drag_keeps_tool_and_does_not_pan() {
+        let ctx = egui::Context::default();
+        let mut chart = sample_chart();
+        chart_frame(&ctx, &mut chart, vec![]);
+        chart.start_tool(Tool::Measure);
+        chart.navigation.range = true;
+        chart.manual_scale = chart.current_scale;
+        let manual = chart.manual_scale.unwrap();
+        let from = pos2(320., 300.);
+        let to = pos2(480., 150.);
+        chart_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(from)]);
+        let view = chart.viewport.unwrap();
+        chart_frame(&ctx, &mut chart, vec![pointer_button(from, true)]);
+        for pos in [from.lerp(to, 0.5), to] {
+            chart_frame(&ctx, &mut chart, vec![egui::Event::PointerMoved(pos)]);
+            assert_eq!(chart.draw.tool, Some(Tool::Measure));
+            let current = chart.viewport.unwrap();
+            assert_eq!((current.right, current.bar_px), (view.right, view.bar_px));
+            let scale = chart.manual_scale.unwrap();
+            assert_eq!((scale.lo, scale.hi), (manual.lo, manual.hi));
+            assert!(chart.range_event.is_none(), "Placement must not broadcast viewport navigation");
+        }
+        chart_frame(&ctx, &mut chart, vec![pointer_button(to, false)]);
+        assert_eq!(chart.drawings.len(), 1);
+        let current = chart.viewport.unwrap();
+        assert_eq!((current.right, current.bar_px), (view.right, view.bar_px));
     }
 
     #[test]

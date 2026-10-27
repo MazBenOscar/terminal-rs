@@ -226,6 +226,7 @@ impl TreasuryProvider {
                     ts: last.ts,
                     spark,
                     crypto_source: None,
+                    simulated: Some(false),
                 })
             })
             .collect())

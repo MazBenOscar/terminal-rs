@@ -47,6 +47,8 @@ pub struct AppExecutor {
     worker: mpsc::UnboundedSender<Request>,
     edits: Arc<Mutex<tr_agent_tools::edits::Session>>,
     expected: Arc<Mutex<HashMap<String, (String, String)>>>,
+    // A5b-SCAN session ownership, separate from chart edit/workflow state.
+    scans: Arc<ScanSession>,
 }
 
 pub const fn agent_edit_tools_available() -> bool {
@@ -603,6 +605,7 @@ impl AppExecutor {
             worker: app.worker.sender(),
             edits: Default::default(),
             expected: Default::default(),
+            scans: Default::default(),
         }
     }
 
@@ -611,6 +614,7 @@ impl AppExecutor {
         // of the executor. Reconnect/resume within that bridge retains ownership.
         self.edits = Default::default();
         self.expected = Default::default();
+        self.scans = Default::default();
         let tools = options.tools;
         AgentBridge::start(connector, Arc::new(self), Registry::new(tools), options).await
     }
@@ -637,6 +641,12 @@ impl ToolExecutor for AppExecutor {
     }
     fn cancel(&self, turn: &str) {
         self.queue.cancel(turn);
+        // A5b-SCAN: interrupt the in-flight worker as well as queued UI reads.
+        if let Some((owner, cancel)) = &*self.scans.current.lock().unwrap()
+            && owner == turn
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -829,9 +839,262 @@ impl DataHost for ScopedHost {
         })
     }
 }
+// A5b-SCAN: result shaping and application/worker adapters.
+#[derive(Default)]
+struct ScanSession {
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    current: Mutex<Option<(String, Arc<std::sync::atomic::AtomicBool>)>>,
+}
+struct CancelScanOnDrop(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for CancelScanOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn scan_result_value(
+    settings: &crate::layouts::ScanSettings,
+    rows: &[crate::worker::ScanRow],
+    sort: Option<&tr_agent_tools::args::scanner::Operand>,
+    limit: usize,
+    partial: bool,
+    skipped: Option<usize>,
+) -> Value {
+    scan_result_value_inner(settings, rows, sort, limit, partial, skipped, None)
+}
+
+pub(crate) fn held_scan_result_value(
+    settings: &crate::layouts::ScanSettings,
+    rows: &[crate::worker::ScanRow],
+    include: tr_agent_tools::args::scanner::ScanInclude,
+) -> Value {
+    scan_result_value_inner(settings, rows, None, 50, false, None, Some(include))
+}
+
+fn scan_result_value_inner(
+    settings: &crate::layouts::ScanSettings,
+    rows: &[crate::worker::ScanRow],
+    sort: Option<&tr_agent_tools::args::scanner::Operand>,
+    limit: usize,
+    partial: bool,
+    skipped: Option<usize>,
+    held: Option<tr_agent_tools::args::scanner::ScanInclude>,
+) -> Value {
+    use tr_core::scanner::{ConditionItem, ScanOutcome};
+    let definition = &settings.definition;
+    let leaves = definition.leaves();
+    let is_match = |r: &&crate::worker::ScanRow| {
+        r.error.is_none() && r.evaluation.as_ref().is_some_and(|e| e.outcome == ScanOutcome::Match)
+    };
+    let count = rows.iter().filter(is_match).count();
+    let no_match = rows
+        .iter()
+        .filter(|r| r.error.is_none() && r.evaluation.as_ref().is_some_and(|e| e.outcome == ScanOutcome::NoMatch))
+        .count();
+    let mut selected: Vec<_> =
+        rows.iter().filter(|r| held == Some(tr_agent_tools::args::scanner::ScanInclude::All) || is_match(r)).collect();
+    if let Some(sort) = sort {
+        let operand = sort.core();
+        let value = |row: &crate::worker::ScanRow| {
+            let evaluation = row.evaluation.as_ref()?;
+            if evaluation.conditions.len() > leaves.len() {
+                return evaluation.conditions.last().and_then(|v| v.left);
+            }
+            leaves.iter().zip(&evaluation.conditions).find_map(|(leaf, v)| {
+                if let ConditionItem::Compare(c) = leaf {
+                    if c.left == operand && c.left_bars_ago == 0 {
+                        v.left
+                    } else if c.right == operand && c.right_bars_ago == 0 && c.right_multiplier == 1. {
+                        v.right
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        };
+        selected.sort_by(|a, b| {
+            match (value(a), value(b)) {
+                (Some(a), Some(b)) => b.total_cmp(&a),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            }
+            .then_with(|| a.symbol.cmp(&b.symbol))
+        });
+    }
+    let selected_count = selected.len();
+    let errors: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.error.as_deref().or_else(|| r.evaluation.as_ref().and_then(|e| e.reason.as_deref())))
+        .collect();
+    let output: Vec<_> = selected
+        .into_iter()
+        .take(limit.min(50))
+        .map(|row| {
+            let evaluation = row.evaluation.as_ref();
+            let conditions = evaluation.map(|e| e.conditions.as_slice()).unwrap_or_default();
+            let values: Vec<_> = leaves
+                .iter()
+                .zip(conditions)
+                .map(|(leaf, v)| json!({"condition": leaf.label(), "left": v.left, "right": v.right}))
+                .collect();
+            let outcome = if row.error.is_some() {
+                "unavailable"
+            } else {
+                match evaluation.map(|e| e.outcome) {
+                    Some(ScanOutcome::Match) => "match",
+                    Some(ScanOutcome::NoMatch) => "no_match",
+                    _ => "unavailable",
+                }
+            };
+            let mut value = json!({
+                "symbol": tr_data::security(&row.symbol).key(),
+                "outcome": outcome,
+                "values": values,
+                "last_bar": row.ts,
+                "simulated": row.simulated,
+                "sort_value": if sort.is_some() { conditions.last().and_then(|v| v.left) } else { None },
+            });
+            if held.is_some()
+                && let Some(error) = row.error.as_deref().or_else(|| evaluation.and_then(|e| e.reason.as_deref()))
+            {
+                value["error"] = json!(tr_agent_tools::scrub_text(error).chars().take(500).collect::<String>());
+            }
+            value
+        })
+        .collect();
+    let summary = leaves.iter().map(|l| l.label()).collect::<Vec<_>>().join("; ");
+    let mut result = json!({"name":definition.name,"summary":summary.chars().take(500).collect::<String>(),"universe":settings.universe,"timeframe":definition.timeframe.to_string(),
+        "as_of":chrono::Utc::now(),"scanned":rows.len(),"matched":count,"errors":{"count":errors.len(),"samples":errors.into_iter().take(5).map(|e|tr_agent_tools::scrub_text(e).chars().take(500).collect::<String>()).collect::<Vec<_>>()},
+        "partial":partial,"rows":output,"truncated":selected_count>limit.min(50),"scanner_settings":settings});
+    result["no_match"] = json!(no_match);
+    result["unavailable"] = json!(rows.len() - count - no_match);
+    if let Some(error) = crate::worker::scan_discovery_failure(settings.universe, rows) {
+        result["scanned"] = json!(0);
+        result["unavailable"] = json!(0);
+        result["rows"] = json!([]);
+        result["truncated"] = json!(false);
+        result["error"] = json!({"code":"scan_failed","message":tr_agent_tools::scrub_text(error).chars().take(500).collect::<String>()});
+    }
+    if let Some(skipped) = skipped {
+        result["skipped_not_cached"] = json!(skipped);
+    }
+    // Keep structured totals and canonical row keys instead of falling into the generic
+    // preview cap. Leave space for the read_scan_results pane metadata.
+    while result.to_string().len() > tr_agent_tools::MAX_TEXT_BYTES - 512 {
+        result["truncated"] = json!(true);
+        if result["rows"].as_array_mut().unwrap().pop().is_none() {
+            result.as_object_mut().unwrap().remove("scanner_settings");
+            break;
+        }
+    }
+    result
+}
+impl ScopedHost {
+    async fn scanner_tool(&self, args: LiveArgs) -> ToolResult {
+        if matches!(args, LiveArgs::ListScans(_) | LiveArgs::ReadScanResults(_)) {
+            return match self
+                .job(ChartTarget::Application, move |app| {
+                    let result = match args {
+                        LiveArgs::ListScans(_) => app.agent_list_scans(),
+                        LiveArgs::ReadScanResults(a) => app.agent_read_scan(a),
+                        _ => unreachable!(),
+                    };
+                    AgentReply { success: true, value: serde_json::to_value(result).unwrap() }
+                })
+                .await
+            {
+                Ok(v) => serde_json::from_value(v)
+                    .unwrap_or_else(|_| ToolResult::error("host_error", "Invalid scan pane reply", None)),
+                Err(e) => ToolResult::error("host_error", &tr_agent_tools::scrub_text(&e), None),
+            };
+        }
+        let LiveArgs::RunScan(args) = args else { unreachable!() };
+        if let Err(e) = args.validate() {
+            return ToolResult::error("invalid_arguments", &e, None);
+        }
+        if self.app.scans.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return ToolResult::error("scan_busy", "One agent scan is already running in this session", None);
+        }
+        let permit = crate::worker::AgentScanPermit(self.app.scans.busy.clone());
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *self.app.scans.current.lock().unwrap() = Some((self.call.turn.clone(), cancel.clone()));
+        let _cancel_on_drop = CancelScanOnDrop(cancel.clone());
+        let input = args.clone();
+        let value = match self
+            .job(ChartTarget::Application, move |app| match app.agent_scan_settings(&input) {
+                Ok((settings, symbols)) => {
+                    AgentReply { success: true, value: json!({"settings":settings,"symbols":symbols}) }
+                }
+                Err(e) => AgentReply::error(&tr_agent_tools::scrub_text(&e)),
+            })
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return ToolResult::error("invalid_scan", &tr_agent_tools::scrub_text(&e), None),
+        };
+        let settings: crate::layouts::ScanSettings = match serde_json::from_value(value["settings"].clone()) {
+            Ok(s) => s,
+            Err(_) => return ToolResult::error("host_error", "Invalid scan settings", None),
+        };
+        let symbols: Vec<String> = serde_json::from_value(value["symbols"].clone()).unwrap_or_default();
+        let (reply, receive) = oneshot::channel();
+        let definition = settings.definition.clone();
+        let universe = settings.universe;
+        let sort = args.sort_by.as_ref().map(|o| o.core());
+        let request = if universe.requires_bulk() {
+            AgentRequest::ScanCachedUniverse { definition, universe, sort, cancel, permit, reply }
+        } else {
+            AgentRequest::Scan {
+                definition,
+                universe,
+                symbols,
+                sort,
+                crypto_filter: settings.crypto_filter.clone(),
+                cancel,
+                permit,
+                reply,
+            }
+        };
+        if self.app.worker.send(Request::Agent(request)).is_err() {
+            return ToolResult::error("host_error", "Scanner worker stopped", None);
+        }
+        match receive.await {
+            Ok(Ok(output)) => {
+                let value = scan_result_value(
+                    &settings,
+                    &output.rows,
+                    args.sort_by.as_ref(),
+                    args.limit.unwrap_or(50),
+                    output.partial,
+                    output.skipped_not_cached,
+                );
+                let success = value["error"].is_null();
+                let mut result = ToolResult::json(value);
+                result.success = success;
+                result
+            }
+            Ok(Err(e)) if e == "scan_data_not_cached" => ToolResult::error(
+                "scan_data_not_cached",
+                "Run this universe once in the Scanner tab to cache market data",
+                None,
+            ),
+            Ok(Err(e)) => ToolResult::error("scan_error", &tr_agent_tools::scrub_text(&e), None),
+            Err(_) => ToolResult::error("host_error", "Scanner worker stopped", None),
+        }
+    }
+}
+// End A5b-SCAN bridge block.
+
 impl LiveHost for ScopedHost {
     fn call_live<'a>(&'a self, _: &'a str, args: LiveArgs) -> BridgeFuture<'a, ToolResult> {
         Box::pin(async move {
+            // A5b-SCAN: global tools do not require a pinned/live chart.
+            if matches!(args, LiveArgs::ListScans(_) | LiveArgs::ReadScanResults(_) | LiveArgs::RunScan(_)) {
+                return self.scanner_tool(args).await;
+            }
             if args.name().contains("watchlist") || args.name().contains("alert") {
                 let turn = self.call.turn.clone();
                 return match self
@@ -953,7 +1216,13 @@ mod tests {
     fn host(queue: AgentToolQueue) -> ScopedHost {
         let (worker, _) = mpsc::unbounded_channel();
         ScopedHost {
-            app: AppExecutor { queue, worker, edits: Default::default(), expected: Default::default() },
+            app: AppExecutor {
+                queue,
+                worker,
+                edits: Default::default(),
+                expected: Default::default(),
+                scans: Default::default(),
+            },
             call: ToolCall {
                 turn: "turn".into(),
                 pin: ChartPin { uid: 41, symbol: "AAPL".into(), timeframe: "1D".into(), visible_range: None },
@@ -963,6 +1232,258 @@ mod tests {
             },
         }
     }
+
+    // A5b-SCAN bridge tests (manual queue and worker fakes; never a backend).
+    fn scan_args(universe: &str) -> tr_agent_tools::args::RunScan {
+        serde_json::from_value(json!({"universe":universe,"definition":{"timeframe":"1D","match":"all","conditions":[{"left":"price","op":"above","right":0}]}})).unwrap()
+    }
+    fn scan_row(symbol: &str, price: f64) -> crate::worker::ScanRow {
+        use tr_core::scanner::*;
+        let d = ScanDefinition {
+            root: ConditionGroup::comparisons(
+                MatchMode::All,
+                vec![ScanCondition {
+                    left: ScanOperand::Price,
+                    right: ScanOperand::Constant(0.),
+                    ..Default::default()
+                }],
+            ),
+            ..Default::default()
+        };
+        let s = tr_core::Series::new(
+            symbol,
+            Timeframe::D1,
+            vec![tr_core::Bar::new(86400, price, price, price, price, 100.)],
+        );
+        crate::worker::ScanRow {
+            symbol: symbol.into(),
+            evaluation: Some(d.evaluate(&s)),
+            ts: Some(86400),
+            simulated: false,
+            error: None,
+        }
+    }
+    fn scan_json(result: ToolResult) -> Value {
+        let Content::Text(text) = &result.content[0] else { panic!() };
+        serde_json::from_str(text).unwrap()
+    }
+    #[tokio::test]
+    async fn agent_scan_busy_cancel_and_fake_watchlist_worker_contract() {
+        let queue = AgentToolQueue::new(egui::Context::default());
+        let mut host = host(queue.clone());
+        let (sender, mut receive) = mpsc::unbounded_channel();
+        host.app.worker = sender;
+        let args = scan_args("watchlist");
+        let settings = crate::layouts::ScanSettings::from(args.definition.as_ref().unwrap().core().unwrap());
+        let mut future = Box::pin(host.scanner_tool(LiveArgs::RunScan(args.clone())));
+        assert!(futures::poll!(future.as_mut()).is_pending());
+        let job = queue.pop().unwrap();
+        assert!(matches!(job.chart, ChartTarget::Application));
+        job.reply
+            .send(AgentReply { success: true, value: json!({"settings":settings,"symbols":["AAPL US Equity"]}) })
+            .unwrap();
+        assert!(futures::poll!(future.as_mut()).is_pending());
+        let Request::Agent(AgentRequest::Scan { symbols, cancel, permit, reply, .. }) = receive.recv().await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(symbols, vec!["AAPL US Equity"]);
+        assert_eq!(scan_json(host.scanner_tool(LiveArgs::RunScan(args)).await)["error"]["code"], "scan_busy");
+        host.app.cancel("turn");
+        assert!(cancel.load(Ordering::Relaxed));
+        drop(permit);
+        assert!(
+            reply
+                .send(Ok(crate::worker::AgentScanOutput {
+                    rows: vec![scan_row("AAPL", 10.)],
+                    partial: true,
+                    skipped_not_cached: None
+                }))
+                .is_ok()
+        );
+        let result = scan_json(future.await);
+        assert_eq!(result["partial"], true);
+        assert_eq!(result["rows"][0]["symbol"], "AAPL US Equity");
+        assert_eq!(result["scanned"], 1);
+        assert_eq!(result["matched"], 1);
+        assert!(!host.app.scans.busy.load(Ordering::Acquire));
+    }
+    #[tokio::test]
+    async fn agent_us_scan_dispatch_is_cache_only_and_cache_miss_is_actionable() {
+        let queue = AgentToolQueue::new(egui::Context::default());
+        let mut host = host(queue.clone());
+        let (sender, mut receive) = mpsc::unbounded_channel();
+        host.app.worker = sender;
+        let args = scan_args("nasdaq");
+        let mut settings = crate::layouts::ScanSettings::from(args.definition.as_ref().unwrap().core().unwrap());
+        settings.universe = tr_data::universe::Universe::Nasdaq;
+        let mut future = Box::pin(host.scanner_tool(LiveArgs::RunScan(args)));
+        assert!(futures::poll!(future.as_mut()).is_pending());
+        queue
+            .pop()
+            .unwrap()
+            .reply
+            .send(AgentReply { success: true, value: json!({"settings":settings,"symbols":[]}) })
+            .unwrap();
+        assert!(futures::poll!(future.as_mut()).is_pending());
+        let Request::Agent(AgentRequest::ScanCachedUniverse { permit, reply, .. }) = receive.recv().await.unwrap()
+        else {
+            panic!("must not dispatch a fetching universe scan")
+        };
+        drop(permit);
+        assert!(reply.send(Err("scan_data_not_cached".into())).is_ok());
+        let result = scan_json(future.await);
+        assert_eq!(result["error"]["code"], "scan_data_not_cached");
+        assert_eq!(result["error"]["message"], "Run this universe once in the Scanner tab to cache market data");
+    }
+    #[tokio::test]
+    async fn dropping_agent_scan_future_sets_worker_cancel_flag_and_keeps_busy_until_worker_stops() {
+        let queue = AgentToolQueue::new(egui::Context::default());
+        let mut host = host(queue.clone());
+        let (sender, mut receive) = mpsc::unbounded_channel();
+        host.app.worker = sender;
+        let args = scan_args("watchlist");
+        let settings = crate::layouts::ScanSettings::from(args.definition.as_ref().unwrap().core().unwrap());
+        let mut future = Box::pin(host.scanner_tool(LiveArgs::RunScan(args)));
+        assert!(futures::poll!(future.as_mut()).is_pending());
+        queue
+            .pop()
+            .unwrap()
+            .reply
+            .send(AgentReply { success: true, value: json!({"settings":settings,"symbols":[]}) })
+            .unwrap();
+        assert!(futures::poll!(future.as_mut()).is_pending());
+        let Request::Agent(AgentRequest::Scan { cancel, permit, .. }) = receive.recv().await.unwrap() else { panic!() };
+        drop(future);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(host.app.scans.busy.load(Ordering::Acquire));
+        drop(permit);
+        assert!(!host.app.scans.busy.load(Ordering::Acquire));
+    }
+    #[test]
+    fn scanner_result_caps_scrubs_and_sorts_descending_without_losing_totals() {
+        let args = scan_args("watchlist");
+        let settings = crate::layouts::ScanSettings::from(args.definition.as_ref().unwrap().core().unwrap());
+        let mut rows: Vec<_> = (1..=60).map(|i| scan_row(&format!("X{i} US Equity"), i as f64)).collect();
+        for _ in 0..8 {
+            let mut row = scan_row("ERROR", 1.);
+            row.evaluation = None;
+            row.error =
+                Some("Bearer abcdefghijklmnop password=bad user@example.com https://host.invalid/?token=secret".into());
+            rows.push(row);
+        }
+        let operand = serde_json::from_value(json!("price")).unwrap();
+        let result = scan_result_value(&settings, &rows, Some(&operand), 50, false, Some(4));
+        assert_eq!(result["matched"], 60);
+        assert_eq!(result["scanned"], 68);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["rows"].as_array().unwrap().len(), 50);
+        assert_eq!(result["rows"][0]["symbol"], "X60 US Equity");
+        assert_eq!(result["errors"]["count"], 8);
+        assert_eq!(result["errors"]["samples"].as_array().unwrap().len(), 5);
+        assert!(!result.to_string().contains("abcdefghijklmnop"));
+        assert!(!result.to_string().contains("token=secret"));
+        assert!(result.to_string().len() <= tr_agent_tools::MAX_TEXT_BYTES);
+        let mut heavy = settings.clone();
+        heavy.definition.root.items = vec![heavy.definition.root.items[0].clone(); 32];
+        let mut heavy_rows = rows.clone();
+        for row in &mut heavy_rows {
+            if let Some(evaluation) = &mut row.evaluation {
+                evaluation.conditions = vec![evaluation.conditions[0].clone(); 32];
+            }
+        }
+        let heavy_result = scan_result_value(&heavy, &heavy_rows, None, 50, false, None);
+        assert!(heavy_result.to_string().len() <= tr_agent_tools::MAX_TEXT_BYTES);
+        assert_eq!(heavy_result["matched"], 60);
+        assert_eq!(heavy_result["scanned"], 68);
+        assert_eq!(heavy_result["truncated"], true);
+        assert!(heavy_result["rows"].as_array().unwrap().len() < 50);
+        assert_eq!(heavy_result["rows"][0]["values"].as_array().unwrap().len(), 32);
+    }
+    struct ScanWorkflowFake {
+        symbols: Vec<String>,
+    }
+    impl DataHost for ScanWorkflowFake {
+        fn history<'a>(&'a self, _: &'a str, _: Timeframe, _: Option<i64>, _: usize) -> HostFuture<'a, History> {
+            Box::pin(async { panic!("no history") })
+        }
+        fn quotes<'a>(&'a self, _: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
+            Box::pin(async { panic!("no quotes") })
+        }
+        fn search<'a>(&'a self, _: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+            Box::pin(async {
+                Ok(self
+                    .symbols
+                    .iter()
+                    .map(|key| SearchHit {
+                        key: key.clone(),
+                        name: "Fixture".into(),
+                        class: tr_data::security(key).class,
+                        exchange: None,
+                    })
+                    .collect())
+            })
+        }
+    }
+    impl LiveHost for ScanWorkflowFake {
+        fn call_live<'a>(&'a self, _: &'a str, args: LiveArgs) -> BridgeFuture<'a, ToolResult> {
+            Box::pin(async move { ToolResult::json(json!(args)) })
+        }
+    }
+    #[tokio::test]
+    async fn scanner_row_keys_round_trip_through_the_workflow_validator_unchanged() {
+        let settings = crate::layouts::ScanSettings::from(scan_args("watchlist").definition.unwrap().core().unwrap());
+        let rows = vec![
+            scan_row("AAPL", 1.),
+            scan_row("BRK.B US Equity", 2.),
+            scan_row("BINANCE:BTCUSDT", 3.),
+            scan_row("COINBASE:BTC-USD", 4.),
+        ];
+        let result = scan_result_value(&settings, &rows, None, 50, false, None);
+        let symbols: Vec<_> =
+            result["rows"].as_array().unwrap().iter().map(|r| r["symbol"].as_str().unwrap().to_owned()).collect();
+        let fake = ScanWorkflowFake { symbols: symbols.clone() };
+        let registry = Registry::new(tr_agent_tools::ToolSet::Workflows);
+        let mut budget = CallBudget::default();
+        let mut ctx = CallContext::new(&fake, &fake, &mut budget);
+        let result = registry
+            .call("add_watchlist_symbols", &json!({"watchlist":"Research","symbols":symbols}).to_string(), &mut ctx)
+            .await;
+        assert!(result.success, "{result:?}");
+        assert_eq!(scan_json(result)["args"]["symbols"], json!(symbols));
+        for symbol in symbols {
+            let result = registry
+                .call(
+                    "create_alert",
+                    &json!({"symbol":symbol,"kind":"price","direction":"above","level":20}).to_string(),
+                    &mut ctx,
+                )
+                .await;
+            assert!(result.success, "{result:?}");
+            assert_eq!(scan_json(result)["args"]["symbol"], symbol);
+        }
+    }
+    #[test]
+    fn review_crypto_discovery_failure_is_not_counted_as_a_scanned_symbol() {
+        let mut settings =
+            crate::layouts::ScanSettings::from(scan_args("watchlist").definition.unwrap().core().unwrap());
+        settings.universe = tr_data::universe::Universe::CoinbaseSpot;
+        let failed = crate::worker::ScanRow {
+            symbol: tr_data::universe::Universe::CoinbaseSpot.label().into(),
+            evaluation: None,
+            ts: None,
+            simulated: false,
+            error: Some("Crypto discovery timed out after 30 seconds; api_key=private-fixture-key".into()),
+        };
+        let result = scan_result_value(&settings, &[failed], None, 50, false, None);
+        assert_eq!(result["scanned"], 0, "no product was scanned: {result}");
+        assert_eq!(result["error"]["code"], "scan_failed");
+        assert!(result["error"]["message"].as_str().unwrap().contains("[REDACTED]"));
+        assert!(!result.to_string().contains("private-fixture-key"));
+        assert_eq!(result["rows"], json!([]));
+        assert_eq!(result["unavailable"], 0);
+    }
+    // End A5b-SCAN bridge tests.
 
     #[test]
     fn workflow_reads_and_confirmed_calls_work_without_a_chart_but_never_auto_apply() {

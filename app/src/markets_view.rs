@@ -359,6 +359,7 @@ mod tests {
             ts: 0,
             spark: vec![],
             crypto_source: None,
+            simulated: None,
         };
         assert_eq!(change_text(&Security::parse("US10Y Govt").unwrap(), &q), "+3.0bp");
         let q = Quote {
@@ -368,6 +369,7 @@ mod tests {
             ts: 0,
             spark: vec![],
             crypto_source: None,
+            simulated: None,
         };
         assert_eq!(change_text(&Security::parse("EURUSD Curncy").unwrap(), &q), "+0.0012");
     }
