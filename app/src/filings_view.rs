@@ -306,11 +306,23 @@ struct KeyboardUse {
     rows: bool,
     selected: bool,
 }
+/// Test hook: pretend the pane drew rows without a selection.
+#[cfg(test)]
+pub fn mark_unselected_for_test(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|d| d.insert_temp(id.with("filings-keys"), KeyboardUse { rows: true, selected: false }));
+}
+/// Test hook: pretend the pane drew rows with a selected row.
+#[cfg(test)]
+pub fn mark_selected_for_test(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|d| d.insert_temp(id.with("filings-keys"), KeyboardUse { rows: true, selected: true }));
+}
 pub fn pane_uses_key(ctx: &egui::Context, id: egui::Id, settings: &Settings, key: egui::Key) -> bool {
     let used = ctx.data_mut(|d| d.get_temp::<KeyboardUse>(id.with("filings-keys"))).unwrap_or_default();
     match key {
         egui::Key::ArrowUp | egui::Key::ArrowDown => used.rows,
-        egui::Key::Enter | egui::Key::Space | egui::Key::C => used.selected,
+        egui::Key::Enter | egui::Key::Space | egui::Key::C | egui::Key::J | egui::Key::K | egui::Key::U => {
+            used.selected
+        }
         egui::Key::Escape => used.selected || !settings.search.is_empty(),
         _ => owns_key(key),
     }
@@ -700,8 +712,10 @@ pub fn show(
     let mut scroll_selected = false;
     if context.focused && !text_has_focus(ui.ctx()) {
         let pressed = |key| consume_exact(ui, key);
-        let down = (!rows.is_empty() && pressed(egui::Key::ArrowDown)) || pressed(egui::Key::J);
-        let up = (!rows.is_empty() && pressed(egui::Key::ArrowUp)) || pressed(egui::Key::K);
+        // Letters act only while a row is selected, so type-anywhere keeps them otherwise.
+        let selected = runtime.selected.is_some();
+        let down = (!rows.is_empty() && pressed(egui::Key::ArrowDown)) || (selected && pressed(egui::Key::J));
+        let up = (!rows.is_empty() && pressed(egui::Key::ArrowUp)) || (selected && pressed(egui::Key::K));
         if down || up {
             runtime.selected = move_selection(
                 runtime.selected.as_deref(),
@@ -718,7 +732,7 @@ pub fn show(
                 runtime.selected = None;
             }
         }
-        if pressed(egui::Key::U) {
+        if selected && pressed(egui::Key::U) {
             settings.unread_only = !settings.unread_only;
         }
         if let Some(f) = rows.iter().find(|f| Some(&f.accession) == runtime.selected.as_ref()) {
@@ -1254,7 +1268,9 @@ mod tests {
         };
         render(None, true);
         assert_eq!(render(Some(egui::Key::J), false).2.selected, None);
-        assert_eq!(render(Some(egui::Key::J), true).2.selected.as_deref(), Some("sale"));
+        // No selection: letters belong to type-anywhere; the arrow key starts selection.
+        assert_eq!(render(Some(egui::Key::J), true).2.selected, None);
+        assert_eq!(render(Some(egui::Key::ArrowDown), true).2.selected.as_deref(), Some("sale"));
         assert!(render(Some(egui::Key::Space), true).2.expanded.contains("sale"));
         assert_eq!(
             render(Some(egui::Key::C), true).1,

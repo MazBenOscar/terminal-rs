@@ -765,6 +765,10 @@ pub struct Prefs {
     pub alert_sound: bool,
     #[serde(default)]
     pub desktop_notification: bool,
+    // N1b
+    #[serde(default)]
+    pub keyword_watches: Vec<tr_data::news_intelligence::KeywordWatch>,
+    // N1b
     /// A custom theme built from v2 appearance overrides, for the app to save.
     #[serde(skip)]
     pub migrated_theme: Option<crate::themes::Theme>,
@@ -785,6 +789,9 @@ impl Default for Prefs {
             trading: TradingPrefs::default(),
             alert_sound: false,
             desktop_notification: false,
+            // N1b
+            keyword_watches: vec![],
+            // N1b
             migrated_theme: None,
         }
     }

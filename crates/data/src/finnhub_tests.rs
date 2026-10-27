@@ -6,7 +6,7 @@ fn parsing_mapping_and_incremental_dates() {
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].item.tickers, vec!["AAPL US Equity", "MSFT US Equity"]);
     assert_eq!(items[0].provider_id, "101");
-    assert_eq!(items[0].source, "Finnhub");
+    assert_eq!(items[0].source, "Fixture Wire");
     assert_eq!(items[0].summary, "Revenue rises as services expand.");
     assert_eq!(items[0].item.link, "https://example.test/apple");
     assert!(parse(b"{bad", None).is_err());
@@ -38,6 +38,19 @@ fn cursor_only_advances_and_empty_never_erases() {
         ..Default::default()
     };
     assert_eq!(store.query(&query).unwrap().len(), 2);
+    let provider_query = crate::news_store::Query {
+        filters: crate::news_store::Filters {
+            sources: vec!["Finnhub".into()],
+            scope: crate::news_store::Scope::All,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        store.query(&provider_query).unwrap().len(),
+        2,
+        "N1a provider filters must survive publisher-aware clusters"
+    );
 }
 #[test]
 fn schedule_visible_only_round_robin_and_refusal_backoff() {

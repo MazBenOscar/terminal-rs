@@ -176,3 +176,85 @@ fn review_today_uses_local_calendar_midnight() {
         assert_eq!(local_start.year(), local_now.year());
     }
 }
+
+#[test]
+fn n1a_schema_lazy_backfill_precedes_symbol_filter_and_runs_once() {
+    let now = chrono::Utc::now().timestamp();
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch("CREATE TABLE items(id TEXT PRIMARY KEY,source TEXT NOT NULL,provider_id TEXT NOT NULL,url TEXT NOT NULL,headline TEXT NOT NULL,summary TEXT NOT NULL,published INTEGER NOT NULL,tickers TEXT NOT NULL,category TEXT NOT NULL,fetched INTEGER NOT NULL,seen INTEGER NOT NULL DEFAULT 0,bookmark INTEGER NOT NULL DEFAULT 0);").unwrap();
+    connection.execute("INSERT INTO items VALUES('old','Reuters','','https://fixture.test/old','$NVDA acquired startup','',?1,'[]','general',?1,1,0)",[now]).unwrap();
+    let db = NewsStore::init(connection).unwrap();
+    let before: i64 = db.db.query_row("SELECT intelligence FROM items", [], |r| r.get(0)).unwrap();
+    assert_eq!(before, 0, "opening must not synchronously enrich retained history");
+    let q = Query { symbols: vec!["NVDA US Equity".into()], ..Default::default() };
+    let rows = db.query(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].tags, vec!["M&A"]);
+    assert!(rows[0].seen);
+    assert_eq!(db.db.query_row("SELECT intelligence FROM items", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    db.db.execute("UPDATE items SET headline='$MSFT new guidance'", []).unwrap();
+    let again = db.query(&q).unwrap();
+    assert_eq!(again[0].item.tickers, rows[0].item.tickers, "already migrated rows are not recomputed on each query");
+    assert_eq!(again[0].tags, rows[0].tags);
+}
+#[test]
+fn duplicate_keeps_tags_of_the_retained_headline() {
+    let mut db = NewsStore::memory().unwrap();
+    let a = story("https://fixture.test/a", "Earnings and guidance", 10, "", "Reuters");
+    let b = story("https://fixture.test/a", "Later lawsuit", 20, "", "Yahoo");
+    db.insert(&[a, b], 30).unwrap();
+    let rows = db.query(&Query::default()).unwrap();
+    assert_eq!(rows[0].tags, vec!["Earnings", "Guidance"]);
+}
+#[test]
+fn review_refetch_upgrades_n1a_provider_as_source() {
+    let now = chrono::Utc::now().timestamp();
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch("CREATE TABLE items(id TEXT PRIMARY KEY,source TEXT NOT NULL,provider_id TEXT NOT NULL,url TEXT NOT NULL,headline TEXT NOT NULL,summary TEXT NOT NULL,published INTEGER NOT NULL,tickers TEXT NOT NULL,category TEXT NOT NULL,fetched INTEGER NOT NULL,seen INTEGER NOT NULL DEFAULT 0,bookmark INTEGER NOT NULL DEFAULT 0);").unwrap();
+    let mut fresh = story("https://fixture.test/n1a", "Chipmaker wins contract", now, "", "Reuters");
+    fresh.provider = "Finnhub".into();
+    connection
+        .execute(
+            "INSERT INTO items VALUES(?1,'Finnhub','7','https://fixture.test/n1a','Chipmaker wins contract','',?2,'[]','general',?2,0,0)",
+            params![fresh.id, now],
+        )
+        .unwrap();
+    let mut db = NewsStore::init(connection).unwrap();
+    db.insert(std::slice::from_ref(&fresh), now).unwrap();
+    let rows = db
+        .query(&Query { filters: Filters { scope: Scope::All, ..Default::default() }, ..Default::default() })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].source.as_str(), rows[0].provider.as_str()), ("Reuters", "Finnhub"));
+}
+
+#[test]
+fn backfill_write_failure_does_not_fail_saved_read() {
+    let mut db = NewsStore::memory().unwrap();
+    let item = story("https://fixture.test/readonly", "$NVDA guidance", 100, "", "Reuters");
+    db.insert(&[item], 101).unwrap();
+    db.db.execute("UPDATE items SET intelligence=0,provider=''", []).unwrap();
+    db.db.execute_batch("PRAGMA query_only=ON").unwrap();
+    let rows = db.query(&Query::default()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source, "Reuters");
+}
+
+#[test]
+fn linkless_refetch_keeps_n1a_transport_identity_and_seen() {
+    let mut db = NewsStore::memory().unwrap();
+    let old = story("", "Chipmaker wins contract", 100, "", "Finnhub");
+    db.insert(std::slice::from_ref(&old), 101).unwrap();
+    db.db.execute("UPDATE items SET provider='',intelligence=0", []).unwrap();
+    db.mark_seen(std::slice::from_ref(&old.id)).unwrap();
+    // Backfilling provenance must still allow a later publisher upgrade.
+    assert_eq!(db.query(&Query::default()).unwrap()[0].provider, "Finnhub");
+    let mut fresh = story("", "Chipmaker wins contract", 100, "", "Reuters");
+    fresh.provider = "Finnhub".into();
+    db.insert(&[fresh], 102).unwrap();
+    let rows = db.query(&Query::default()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, old.id);
+    assert!(rows[0].seen);
+    assert_eq!((rows[0].source.as_str(), rows[0].provider.as_str()), ("Reuters", "Finnhub"));
+}

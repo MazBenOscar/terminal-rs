@@ -340,7 +340,10 @@ pub enum Request {
         views: Vec<NewsView>,
         watchlist: Vec<String>,
     },
+    // N1b
     NewsRead(NewsView),
+    NewsSeen(Vec<String>),
+    // N1b
     // N1a
     OrderBook {
         pane: PaneId,
@@ -679,17 +682,19 @@ pub enum Response {
         symbol: String,
         chain: Result<Box<tr_data::OptionChain>, String>,
     },
-    // N1a
+    // N1b: saved reads carry the source update time, not the query completion time.
     NewsSaved {
         view: NewsView,
         items: Result<Vec<tr_data::news_store::Story>, String>,
         status: String,
+        updated: Option<Instant>,
     },
     NewsStatus {
         view: NewsView,
         status: String,
+        updated: Option<Instant>,
     },
-    // N1a
+    // N1b
     OrderBook {
         pane: PaneId,
         symbol: String,
@@ -2462,7 +2467,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 news::read(s, view).await;
             }
         }
+        // N1b
         Request::NewsRead(view) => news::read(s, view).await,
+        Request::NewsSeen(ids) => news::mark_seen(s, ids).await,
+        // N1b
         // N1a
         Request::OrderBook { pane, symbol, depth } => {
             let book = s.provider.order_book(&symbol, depth).await.map_err(|e| format!("{e:#}"));

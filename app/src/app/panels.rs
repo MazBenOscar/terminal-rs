@@ -152,8 +152,28 @@ impl TerminalApp {
                 ));
                 // N3
             }
-            PaneKind::News(n) => {
-                actions.extend(super::news_view::show(ui, n, &self.watchlists));
+            PaneKind::News(_) => {
+                let link = self.panes[i].link;
+                let news_focused = focused && !self.agent_captures_focus(ui.ctx()) && self.cmd.is_empty();
+                let PaneKind::News(n) = &mut self.panes[i].kind else { unreachable!() };
+                actions.extend(super::news_view::show(
+                    ui,
+                    n,
+                    &self.watchlists,
+                    &mut self.prefs.keyword_watches,
+                    news_focused,
+                    link,
+                    self.active_watchlist,
+                ));
+                if !n.seen_queue.is_empty() {
+                    self.worker.send(Request::NewsSeen(std::mem::take(&mut n.seen_queue)));
+                }
+                if std::mem::take(&mut n.interaction.open_data_sources) {
+                    self.settings_tab = super::SettingsTab::DataSources;
+                }
+                if std::mem::take(&mut n.interaction.save_watches) {
+                    self.save_prefs();
+                }
             }
             // N1a
             PaneKind::Options(o) => {

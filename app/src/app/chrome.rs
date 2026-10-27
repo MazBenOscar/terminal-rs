@@ -1098,6 +1098,8 @@ mod tests {
         app.execute("CF");
         assert!(app.idx(app.focus).is_some_and(|i| matches!(app.panes[i].kind, PaneKind::Filings(_))));
         let ctx = egui::Context::default();
+        // With a row selected the pane owns J, including auto-repeat.
+        crate::filings_view::mark_selected_for_test(&ctx, egui::Id::new(app.focus));
         for repeat in [false, true, true] {
             let mut output = ctx.run_ui(
                 egui::RawInput {
@@ -1119,6 +1121,27 @@ mod tests {
             output.textures_delta.clear();
             assert!(app.cmd.is_empty(), "repeat={repeat}: command line captured {:?}", app.cmd);
         }
+        // Without a selection J starts a command (type-anywhere), e.g. JPM.
+        crate::filings_view::mark_unselected_for_test(&ctx, egui::Id::new(app.focus));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1000.0, 600.0))),
+                events: vec![
+                    egui::Event::Key {
+                        key: Key::J,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    },
+                    egui::Event::Text("j".into()),
+                ],
+                ..Default::default()
+            },
+            |_ui| app.hotkeys(&ctx),
+        );
+        output.textures_delta.clear();
+        assert!(!app.cmd.is_empty(), "J without a selection should reach the command line");
     }
 
     #[test]
