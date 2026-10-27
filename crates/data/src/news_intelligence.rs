@@ -123,6 +123,16 @@ pub fn cluster_stats(items: &[Story]) -> (Vec<Cluster>, usize) {
             if item.item.ts - out[i].members[0].item.ts > 86400 {
                 return false;
             }
+            // Compare every member, not just the union: a ticker-less bridge must
+            // not join two companies with disjoint, known ticker sets.
+            if !item.item.tickers.is_empty()
+                && out[i].members.iter().any(|member| {
+                    !member.item.tickers.is_empty()
+                        && !member.item.tickers.iter().any(|t| item.item.tickers.contains(t))
+                })
+            {
+                return false;
+            }
             comparisons += 1;
             similar(&set, &tokens[i], item.category == out[i].members[0].category)
         });
@@ -171,6 +181,7 @@ pub fn extract_tickers(text: &str, provider: &[String]) -> Vec<String> {
         }
         if !cash
             && (shouting
+                || word.len() == 1
                 || matches!(
                     word,
                     "A" | "I"
@@ -240,6 +251,31 @@ pub fn extract_tickers(text: &str, provider: &[String]) -> Vec<String> {
                         | "BUY"
                         | "SELL"
                         | "HOLD"
+                        | "GO"
+                        | "BIG"
+                        | "REAL"
+                        | "OPEN"
+                        | "SO"
+                        | "DO"
+                        | "MOD"
+                        | "LOW"
+                        | "KEY"
+                        | "TRUE"
+                        | "PLAY"
+                        | "LIFE"
+                        | "SEE"
+                        | "FUN"
+                        | "CASH"
+                        | "WELL"
+                        | "CAR"
+                        | "FAST"
+                        | "NICE"
+                        | "BEST"
+                        | "GOOD"
+                        | "HOME"
+                        | "ANY"
+                        | "PEAK"
+                        | "TECH"
                 ))
         {
             continue;
@@ -256,14 +292,14 @@ pub fn topic_tags(text: &str) -> Vec<String> {
     let tokens = words(text);
     [
         ("Earnings", "earnings revenue revenues profit profits quarterly"),
-        ("Guidance", "guidance outlook forecasts forecast"),
-        ("M&A", "acquire acquires acquired acquiring acquisition acquisitions merger mergers takeover buyout"),
+        ("Guidance", "guidance outlook forecasts forecast forecasting forecasted"),
+        ("M&A", "acquire acquires acquired acquiring acquisition acquisitions merge merges merged merging merger mergers takeover takeovers buyout buyouts"),
         ("FDA", "fda clinical drug drugs"),
         ("Macro", "inflation gdp cpi payroll payrolls rates fed recession"),
         ("Crypto", "bitcoin crypto cryptocurrency ethereum blockchain"),
-        ("Analyst", "analyst analysts upgrade upgrades upgraded downgrade downgrades downgraded"),
+        ("Analyst", "analyst analysts upgrade upgrades upgraded upgrading downgrade downgrades downgraded downgrading"),
         ("Insider", "insider insiders"),
-        ("Legal", "lawsuit lawsuits litigation antitrust ban bans banned suing sued"),
+        ("Legal", "sue sues sued suing lawsuit lawsuits litigation antitrust ban bans banned banning"),
     ]
     .into_iter()
     .filter(|(tag, lexicon)| {

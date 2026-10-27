@@ -119,17 +119,34 @@ impl Default for Query {
 }
 /// Apply view filters to a retained snapshot without deleting it on an empty query.
 pub fn matches(story: &Story, q: &Query) -> bool {
+    matches_columns(
+        &format!("{} {}", story.item.title, story.summary),
+        &story.item.tickers,
+        (&story.source, &story.provider),
+        &story.category,
+        story.item.ts,
+        q,
+    )
+}
+// N1b: SQL matching needs no identity hash, URL parsing or topic enrichment.
+fn matches_columns(
+    text: &str,
+    tickers: &[String],
+    provenance: (&str, &str),
+    category: &str,
+    ts: i64,
+    q: &Query,
+) -> bool {
     let f = &q.filters;
-    let text = format!("{} {}", story.item.title, story.summary);
-    story.item.ts >= q.start
-        && story.item.ts <= q.end
+    ts >= q.start
+        && ts <= q.end
         && !(f.scope == Scope::Watchlist && q.symbols.is_empty())
-        && !(f.scope == Scope::Symbol && q.symbols.is_empty() && story.category != "general")
-        && (q.symbols.is_empty() || q.symbols.iter().any(|key| story.item.tickers.contains(key)))
-        && (f.sources.is_empty() || f.sources.contains(&story.source) || f.sources.contains(&story.provider))
-        && (f.include.is_empty() || whole_word(&text, &f.include))
-        && (f.exclude.is_empty() || !whole_word(&text, &f.exclude))
-        && search_matches(&text, &f.search)
+        && !(f.scope == Scope::Symbol && q.symbols.is_empty() && category != "general")
+        && (q.symbols.is_empty() || q.symbols.iter().any(|key| tickers.contains(key)))
+        && (f.sources.is_empty() || f.sources.iter().any(|s| s == provenance.0 || s == provenance.1))
+        && (f.include.is_empty() || whole_word(text, &f.include))
+        && (f.exclude.is_empty() || !whole_word(text, &f.exclude))
+        && search_matches(text, &f.search)
 }
 /// Same token-prefix semantics in FTS, LIKE fallback and the retained view.
 fn terms(text: &str) -> Vec<String> {
@@ -186,20 +203,17 @@ impl NewsStore {
                 let tickers: String = ctx.get(2)?;
                 let provenance: String = ctx.get(3)?;
                 let (source, provider) = provenance.split_once('\0').unwrap_or((&provenance, &provenance));
-                let mut story = Story::new(
-                    NewsItem {
-                        title: ctx.get(0)?,
-                        publisher: String::new(),
-                        link: String::new(),
-                        ts: ctx.get(5)?,
-                        tickers: serde_json::from_str(&tickers).unwrap_or_default(),
-                    },
-                    source,
-                );
-                story.provider = provider.into();
-                story.summary = ctx.get(1)?;
-                story.category = ctx.get(4)?;
-                Ok(matches(&story, &q))
+                let title: String = ctx.get(0)?;
+                let summary: String = ctx.get(1)?;
+                let category: String = ctx.get(4)?;
+                Ok(matches_columns(
+                    &format!("{title} {summary}"),
+                    &serde_json::from_str::<Vec<String>>(&tickers).unwrap_or_default(),
+                    (source, provider),
+                    &category,
+                    ctx.get(5)?,
+                    &q,
+                ))
             },
         )?;
         db.execute_batch(
@@ -243,7 +257,10 @@ impl NewsStore {
     pub fn insert(&mut self, stories: &[Story], now: i64) -> Result<()> {
         let tx = self.db.transaction()?;
         for story in stories {
-            let canonical = Story::new(story.item.clone(), &story.source);
+            // N1a used the transport source for link-less identities. Keep that
+            // fallback even though N1b displays the publisher separately.
+            let identity_source = if story.provider.is_empty() { &story.source } else { &story.provider };
+            let canonical = Story::new(story.item.clone(), identity_source);
             let id = canonical.id;
             tx.execute("INSERT OR IGNORE INTO items(id,source,provider_id,url,headline,summary,published,tickers,category,fetched,provider) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![id, story.source, story.provider_id, canonical.item.link, story.item.title, story.summary, story.item.ts, serde_json::to_string(&story.item.tickers)?, story.category, now, story.provider])?;
@@ -258,10 +275,18 @@ impl NewsStore {
             // A company/general duplicate must still reach the default market pane.
             // Preserve general membership if later fetched through a narrower endpoint.
             tx.execute(
-                "UPDATE items SET tickers=?2, tags=?4, intelligence=1, category=CASE
+                "UPDATE items SET tickers=?2, tags=?4, intelligence=1,
+                provider=CASE WHEN provider='' THEN source ELSE provider END,
+                source=CASE WHEN provider='' OR source=provider THEN ?5 ELSE source END, category=CASE
                 WHEN category='general' OR ?3='general' THEN 'general'
                 WHEN ?3 IN ('forex','crypto','merger') THEN ?3 ELSE category END WHERE id=?1",
-                params![id, serde_json::to_string(&tickers)?, story.category, serde_json::to_string(&tags)?],
+                params![
+                    id,
+                    serde_json::to_string(&tickers)?,
+                    story.category,
+                    serde_json::to_string(&tags)?,
+                    story.source
+                ],
             )?;
         }
         tx.commit()?;
@@ -311,7 +336,7 @@ impl NewsStore {
             );
             let tags = crate::news_intelligence::topic_tags(&title);
             tx.execute(
-                "UPDATE items SET tickers=?2,tags=?3,intelligence=1 WHERE id=?1",
+                "UPDATE items SET tickers=?2,tags=?3,intelligence=1,provider=CASE WHEN provider='' THEN source ELSE provider END WHERE id=?1",
                 params![id, serde_json::to_string(&tickers)?, serde_json::to_string(&tags)?],
             )?;
         }
@@ -319,7 +344,9 @@ impl NewsStore {
         Ok(())
     }
     pub fn query(&self, q: &Query) -> Result<Vec<Story>> {
-        self.backfill(q)?;
+        // Enrichment is optional: read-only disks and transient write failures
+        // must never hide otherwise readable saved history.
+        let _ = self.backfill(q);
         let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category,tags,seen,provider FROM items WHERE published>=?1 AND published<=?2".to_string();
         let search = if self.fts && !q.filters.search.trim().is_empty() {
             sql.push_str(" AND id IN (SELECT id FROM news_fts WHERE news_fts MATCH ?3)");

@@ -137,14 +137,14 @@ impl TerminalApp {
             }
             PaneKind::News(_) => {
                 let link = self.panes[i].link;
+                let news_focused = focused && !self.agent_captures_focus(ui.ctx()) && self.cmd.is_empty();
                 let PaneKind::News(n) = &mut self.panes[i].kind else { unreachable!() };
-                let before = self.prefs.keyword_watches.clone();
                 actions.extend(super::news_view::show(
                     ui,
                     n,
                     &self.watchlists,
                     &mut self.prefs.keyword_watches,
-                    focused,
+                    news_focused,
                     link,
                     self.active_watchlist,
                 ));
@@ -154,7 +154,7 @@ impl TerminalApp {
                 if std::mem::take(&mut n.interaction.open_data_sources) {
                     self.settings_tab = super::SettingsTab::DataSources;
                 }
-                if before != self.prefs.keyword_watches {
+                if std::mem::take(&mut n.interaction.save_watches) {
                     self.save_prefs();
                 }
             }

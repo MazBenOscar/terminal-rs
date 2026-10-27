@@ -206,3 +206,55 @@ fn duplicate_keeps_tags_of_the_retained_headline() {
     let rows = db.query(&Query::default()).unwrap();
     assert_eq!(rows[0].tags, vec!["Earnings", "Guidance"]);
 }
+#[test]
+fn review_refetch_upgrades_n1a_provider_as_source() {
+    let now = chrono::Utc::now().timestamp();
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch("CREATE TABLE items(id TEXT PRIMARY KEY,source TEXT NOT NULL,provider_id TEXT NOT NULL,url TEXT NOT NULL,headline TEXT NOT NULL,summary TEXT NOT NULL,published INTEGER NOT NULL,tickers TEXT NOT NULL,category TEXT NOT NULL,fetched INTEGER NOT NULL,seen INTEGER NOT NULL DEFAULT 0,bookmark INTEGER NOT NULL DEFAULT 0);").unwrap();
+    let mut fresh = story("https://fixture.test/n1a", "Chipmaker wins contract", now, "", "Reuters");
+    fresh.provider = "Finnhub".into();
+    connection
+        .execute(
+            "INSERT INTO items VALUES(?1,'Finnhub','7','https://fixture.test/n1a','Chipmaker wins contract','',?2,'[]','general',?2,0,0)",
+            params![fresh.id, now],
+        )
+        .unwrap();
+    let mut db = NewsStore::init(connection).unwrap();
+    db.insert(std::slice::from_ref(&fresh), now).unwrap();
+    let rows = db
+        .query(&Query { filters: Filters { scope: Scope::All, ..Default::default() }, ..Default::default() })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].source.as_str(), rows[0].provider.as_str()), ("Reuters", "Finnhub"));
+}
+
+#[test]
+fn backfill_write_failure_does_not_fail_saved_read() {
+    let mut db = NewsStore::memory().unwrap();
+    let item = story("https://fixture.test/readonly", "$NVDA guidance", 100, "", "Reuters");
+    db.insert(&[item], 101).unwrap();
+    db.db.execute("UPDATE items SET intelligence=0,provider=''", []).unwrap();
+    db.db.execute_batch("PRAGMA query_only=ON").unwrap();
+    let rows = db.query(&Query::default()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source, "Reuters");
+}
+
+#[test]
+fn linkless_refetch_keeps_n1a_transport_identity_and_seen() {
+    let mut db = NewsStore::memory().unwrap();
+    let old = story("", "Chipmaker wins contract", 100, "", "Finnhub");
+    db.insert(std::slice::from_ref(&old), 101).unwrap();
+    db.db.execute("UPDATE items SET provider='',intelligence=0", []).unwrap();
+    db.mark_seen(std::slice::from_ref(&old.id)).unwrap();
+    // Backfilling provenance must still allow a later publisher upgrade.
+    assert_eq!(db.query(&Query::default()).unwrap()[0].provider, "Finnhub");
+    let mut fresh = story("", "Chipmaker wins contract", 100, "", "Reuters");
+    fresh.provider = "Finnhub".into();
+    db.insert(&[fresh], 102).unwrap();
+    let rows = db.query(&Query::default()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, old.id);
+    assert!(rows[0].seen);
+    assert_eq!((rows[0].source.as_str(), rows[0].provider.as_str()), ("Reuters", "Finnhub"));
+}

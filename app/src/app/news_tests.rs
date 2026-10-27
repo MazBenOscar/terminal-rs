@@ -247,9 +247,11 @@ fn keyboard_reducer_boundaries_actions_escape_and_reordering() {
     reduce(Key::Next, &[], &mut selected, &mut search, &mut unread);
     assert!(selected.is_none());
     for key in [egui::Key::J, egui::Key::K, egui::Key::C, egui::Key::U, egui::Key::Space, egui::Key::Slash] {
-        assert!(owns_key(key));
+        assert!(owns_key(key, true, false));
     }
-    assert!(!owns_key(egui::Key::A));
+    assert!(!owns_key(egui::Key::A, true, false));
+    assert!(!owns_key(egui::Key::J, false, false));
+    assert!(owns_key(egui::Key::ArrowDown, false, false));
 }
 #[test]
 fn empty_causes_prioritize_loading_key_and_filters() {
@@ -359,7 +361,7 @@ fn keyboard_dwell_marks_seen_once_and_text_fields_own_typing() {
     let ctx = egui::Context::default();
     let mut pane = visible_pane();
     ui_frame(&ctx, &mut pane, 600.0, vec![], true);
-    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::J), true);
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::ArrowDown), true);
     let id = pane.interaction.selected.clone().unwrap();
     assert!(pane.items.iter().any(|s| s.id == id && !s.seen));
     pane.interaction.dwell = Some((id.clone(), std::time::Instant::now() - std::time::Duration::from_millis(1100)));
@@ -454,6 +456,7 @@ fn row_body_expands_but_headline_opens_a_safe_link() {
     );
     assert!(pane.interaction.expanded.contains(&id), "title clicks must not also toggle the row body");
     pane.items.iter_mut().find(|s| s.id == id).unwrap().item.link = "javascript:alert(1)".into();
+    pane.item_revision += 1;
     let unsafe_open = click_at(&ctx, &mut pane, position);
     assert!(!unsafe_open.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(_))));
 }
@@ -491,7 +494,9 @@ fn narrow_search_stays_visible_and_feed_keys_do_not_type_into_command_line() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/news-key-ownership");
     let (worker, _requests) = crate::worker::Worker::recording();
     let mut app = TerminalApp::isolated_workspace(&root, worker);
-    let id = app.new_pane(PaneKind::News(Box::new(visible_pane())));
+    let mut news = visible_pane();
+    news.interaction.selected = Some(news.items[0].id.clone());
+    let id = app.new_pane(PaneKind::News(Box::new(news)));
     app.focus = id;
     let ctx = egui::Context::default();
     let mut events = key_event(egui::Key::J);
@@ -499,4 +504,411 @@ fn narrow_search_stays_visible_and_feed_keys_do_not_type_into_command_line() {
     let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| app.hotkeys(ui.ctx()));
     output.textures_delta.clear();
     assert!(app.cmd.is_empty(), "News navigation must bypass type-anywhere");
+}
+fn many_stories(count: usize) -> Vec<tr_data::news_store::Story> {
+    let base = stories()[0].clone();
+    let now = chrono::Utc::now().timestamp();
+    let words = ["chip", "rally", "bank", "oil", "deal", "fed", "court", "drug", "growth", "sales", "probe", "cut"];
+    (0..count)
+        .map(|i| {
+            let mut story = base.clone();
+            story.id = format!("review-{i}");
+            story.item.title =
+                format!("Company{i} {} {} update{i} report{}", words[i % 12], words[(i / 12) % 12], i % 7);
+            story.item.link = format!("https://example.test/review/{i}");
+            story.item.ts = now - (i as i64) * 3800;
+            story
+        })
+        .collect()
+}
+#[test]
+fn review_settled_frame_does_not_recluster_stored_history() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.items = many_stories(2_000);
+    pane.filters.days = 90;
+    for _ in 0..3 {
+        ui_frame(&ctx, &mut pane, 900.0, vec![], false);
+    }
+    let rebuilds = pane.cache.rebuilds;
+    let start = std::time::Instant::now();
+    for _ in 0..5 {
+        ui_frame(&ctx, &mut pane, 900.0, vec![], false);
+    }
+    let frame = start.elapsed() / 5;
+    eprintln!("N1b debug settled frame, 2,000 items: {frame:?}");
+    assert_eq!(pane.cache.rebuilds, rebuilds, "settled frames must not rebuild rows");
+    let start = std::time::Instant::now();
+    for _ in 0..5 {
+        std::hint::black_box(intelligence::clusters(&pane.items));
+    }
+    let clustering = start.elapsed() / 5;
+    // A settled frame with unchanged items must reuse the clustered rows and draw only
+    // the visible rows, so it costs far less than one clustering pass over the history.
+    assert!(frame * 2 < clustering, "settled frame {frame:?} vs one clustering pass {clustering:?}");
+}
+#[test]
+fn review_unread_only_keeps_the_row_being_read() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.display.unread = true;
+    ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::ArrowDown), true);
+    let id = pane.interaction.selected.clone().unwrap();
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Space), true);
+    let (output, _) = ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    assert!(pane.interaction.expanded.contains(&id));
+    assert_eq!(pane.interaction.selected.as_ref(), Some(&id), "the row being read keeps the selection");
+    let summary = pane.items.iter().find(|s| s.id == id).unwrap().summary.clone();
+    assert!(
+        text_shapes(&output).iter().any(|(text, _)| text == &summary),
+        "Space must show the expanded summary, not hide the row"
+    );
+}
+#[test]
+fn review_keyboard_selection_does_not_scroll_visible_rows() {
+    let setup = || {
+        let mut pane = visible_pane();
+        pane.items = many_stories(60);
+        pane.filters.days = 90;
+        pane.display.wire = true;
+        pane
+    };
+    let first_row_y = |output: &egui::FullOutput, title: &str| {
+        text_shapes(output).into_iter().find(|(text, _)| text == title).map(|(_, pos)| pos.y)
+    };
+    let title = setup().items[0].item.title.clone();
+    let ctx = egui::Context::default();
+    let mut pane = setup();
+    ui_frame(&ctx, &mut pane, 900.0, vec![], true);
+    let (initial, _) = ui_frame(&ctx, &mut pane, 900.0, vec![], true);
+    let before = first_row_y(&initial, &title);
+    assert!(before.is_some());
+    for _ in 0..3 {
+        ui_frame(&ctx, &mut pane, 900.0, key_event(egui::Key::ArrowDown), true);
+    }
+    assert_eq!(pane.interaction.selected.as_deref(), Some(pane.items[2].id.as_str()));
+    let mut output = None;
+    for _ in 0..30 {
+        output = Some(ui_frame(&ctx, &mut pane, 900.0, vec![], true).0);
+    }
+    assert_eq!(
+        first_row_y(&output.unwrap(), &title),
+        before,
+        "selecting the third visible row must not scroll the first row out of view"
+    );
+}
+#[test]
+fn review_filters_count_ignores_defined_watches() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    let mut watches = vec![
+        KeywordWatch { name: "Chips".into(), words: "chip".into(), colour: 0 },
+        KeywordWatch { name: "Fed".into(), words: "fed".into(), colour: 1 },
+    ];
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))),
+            ..Default::default()
+        },
+        |ui| {
+            show(ui, &mut pane, &[], &mut watches, false, None, 0);
+        },
+    );
+    output.textures_delta.clear();
+    let labels = text_shapes(&output);
+    assert!(
+        labels.iter().any(|(text, _)| text == "Filters (0)"),
+        "{:?}",
+        labels.iter().map(|l| &l.0).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn cache_invalidates_for_filters_watches_display_and_seen_only_when_changed() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    let mut watches = vec![];
+    let frame = |pane: &mut NewsPane, watches: &mut Vec<KeywordWatch>| {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))),
+                ..Default::default()
+            },
+            |ui| {
+                show(ui, pane, &[], watches, false, None, 0);
+            },
+        );
+        output.textures_delta.clear();
+    };
+    frame(&mut pane, &mut watches);
+    let first = pane.cache.rebuilds;
+    frame(&mut pane, &mut watches);
+    assert_eq!(pane.cache.rebuilds, first);
+    watches.push(KeywordWatch { name: "Earnings".into(), words: "earnings".into(), colour: 2 });
+    frame(&mut pane, &mut watches);
+    assert_eq!(pane.cache.rebuilds, first + 1);
+    pane.display.watch_hits = true;
+    frame(&mut pane, &mut watches);
+    assert_eq!(pane.cache.unread, 1);
+    pane.filters.search = "notpresent".into();
+    frame(&mut pane, &mut watches);
+    assert!(pane.cache.rows.is_empty());
+}
+
+#[test]
+fn unread_counts_displayed_clusters_and_watch_hits() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    let mut duplicate = pane.items[0].clone();
+    duplicate.id = "duplicate".into();
+    pane.items.push(duplicate);
+    ui_frame(&ctx, &mut pane, 600.0, vec![], false);
+    assert_eq!(pane.cache.unread, 2, "three unread items form two story rows");
+    pane.display.wire = true;
+    ui_frame(&ctx, &mut pane, 600.0, vec![], false);
+    assert_eq!(pane.cache.unread, 3);
+    pane.display.watch_hits = true;
+    let mut watches = vec![KeywordWatch { name: "No hits".into(), words: "absent".into(), colour: 0 }];
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        show(ui, &mut pane, &[], &mut watches, false, None, 0);
+    });
+    output.textures_delta.clear();
+    assert_eq!(pane.cache.unread, 0);
+}
+
+#[test]
+fn unread_read_row_survives_seen_reply_but_not_filter_change() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.display.unread = true;
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::ArrowDown), true);
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Space), true);
+    let id = pane.interaction.selected.clone().unwrap();
+    // A stale worker reply cannot undo the local read, nor hide the expansion.
+    let mut stale = pane.items.clone();
+    stale.iter_mut().for_each(|s| s.seen = false);
+    pane.apply(stale);
+    ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    assert!(pane.items.iter().find(|s| s.id == id).unwrap().seen);
+    assert_eq!(pane.interaction.selected.as_ref(), Some(&id));
+    assert!(pane.interaction.expanded.contains(&id));
+    pane.filters.days = 30;
+    ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    assert!(!pane.cache.ids.contains(&id));
+    assert!(pane.interaction.selected.is_none());
+    assert!(pane.interaction.expanded.is_empty());
+}
+
+#[test]
+fn expanded_cluster_survives_lead_change_and_refresh_never_rearms_dwell() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::ArrowDown), true);
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Space), true);
+    let old = pane.interaction.selected.clone().unwrap();
+    pane.interaction.dwell = None;
+    let mut better = pane.items.iter().find(|s| s.id == old).unwrap().clone();
+    better.id = "new-lead".into();
+    better.source = "Reuters".into();
+    better.seen = false;
+    better.item.ts += 1;
+    let mut incoming = pane.items.clone();
+    incoming.push(better);
+    pane.interaction.expanded.insert("gone".into());
+    pane.apply(incoming);
+    ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    assert_eq!(pane.interaction.selected.as_deref(), Some("new-lead"));
+    assert!(pane.interaction.expanded.contains("new-lead"));
+    assert!(pane.interaction.expanded.contains(&old));
+    assert!(!pane.interaction.expanded.contains("gone"));
+    assert!(pane.interaction.dwell.is_none());
+    assert!(!pane.items.iter().find(|s| s.id == "new-lead").unwrap().seen);
+}
+
+#[test]
+fn refresh_preserves_top_row_screen_offset_and_offscreen_keys_scroll() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.items = many_stories(60);
+    pane.filters.days = 90;
+    pane.display.wire = true;
+    for _ in 0..28 {
+        ui_frame(&ctx, &mut pane, 900.0, key_event(egui::Key::ArrowDown), true);
+    }
+    for _ in 0..60 {
+        ui_frame(&ctx, &mut pane, 900.0, vec![], true);
+    }
+    let selected = pane.interaction.selected.clone().unwrap();
+    let (before, _) = ui_frame(&ctx, &mut pane, 900.0, vec![], true);
+    let selected_title = pane.items.iter().find(|s| s.id == selected).unwrap().item.title.clone();
+    assert!(text_shapes(&before).iter().any(|(s, _)| s == &selected_title), "offscreen navigation must reveal its row");
+    let anchor = pane.interaction.anchor.clone().unwrap();
+    let title = pane.items.iter().find(|s| s.id == anchor).unwrap().item.title.clone();
+    let before_y = text_shapes(&before).into_iter().find(|(s, _)| s == &title).unwrap().1.y;
+    let mut incoming = pane.items.clone();
+    let mut fresh = incoming[0].clone();
+    fresh.id = "fresh".into();
+    fresh.item.title = "Fresh unrelated article".into();
+    fresh.item.ts += 1;
+    incoming.insert(0, fresh);
+    pane.apply(incoming);
+    let (after, _) = ui_frame(&ctx, &mut pane, 900.0, vec![], true);
+    let after_y = text_shapes(&after).into_iter().find(|(s, _)| s == &title).unwrap().1.y;
+    assert!((after_y - before_y).abs() < 1.0, "anchor moved from {before_y} to {after_y}");
+}
+
+#[test]
+fn escape_clears_focused_search_then_selection_and_releases_letters() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::ArrowDown), true);
+    let selected = pane.interaction.selected.clone();
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Slash), true);
+    ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    ui_frame(&ctx, &mut pane, 600.0, vec![egui::Event::Text("a".into())], true);
+    assert_eq!(pane.filters.search, "a");
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Escape), true);
+    assert!(pane.filters.search.is_empty());
+    assert_eq!(pane.interaction.selected, selected);
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Escape), true);
+    assert!(pane.interaction.selected.is_none());
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::J), true);
+    assert!(pane.interaction.selected.is_none());
+}
+
+#[test]
+fn clear_filters_preserves_date_range() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.filters.days = 30;
+    pane.filters.search = "notpresent".into();
+    let (output, _) = ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    let position = text_shapes(&output).into_iter().find(|(s, _)| s == "Clear filters").unwrap().1;
+    click_at(&ctx, &mut pane, position + egui::vec2(3.0, 3.0));
+    assert_eq!(pane.filters.days, 30);
+    assert!(pane.filters.search.is_empty());
+}
+
+#[test]
+fn feed_key_capture_is_exact_and_swallows_repeat_text_only_for_owned_keys() {
+    let ctx = egui::Context::default();
+    let mut events = key_event(egui::Key::J);
+    events.push(egui::Event::Text("j".into()));
+    events.push(egui::Event::Key {
+        key: egui::Key::J,
+        physical_key: None,
+        pressed: true,
+        repeat: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    events.push(egui::Event::Text("j".into()));
+    events.push(egui::Event::Key {
+        key: egui::Key::K,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::SHIFT,
+    });
+    events.push(egui::Event::Text("K".into()));
+    let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+        let keys = ui.input_mut(|i| capture_keys(i, true, false));
+        assert_eq!(keys, vec![egui::Key::J, egui::Key::J]);
+        assert_eq!(
+            ui.input(|i| i
+                .events
+                .iter()
+                .filter_map(|e| if let egui::Event::Text(t) = e { Some(t.as_str()) } else { None })
+                .collect::<String>()),
+            "K"
+        );
+    });
+    output.textures_delta.clear();
+    for key in [egui::Key::J, egui::Key::K, egui::Key::C, egui::Key::U, egui::Key::Enter, egui::Key::Space] {
+        assert!(!owns_key(key, false, false));
+    }
+}
+
+#[test]
+fn command_line_receives_unselected_letters_and_blocks_feed_keys_when_nonempty() {
+    use super::super::{PaneKind, TerminalApp};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/news-command-ownership");
+    let (worker, _requests) = crate::worker::Worker::recording();
+    let mut app = TerminalApp::isolated_workspace(&root, worker);
+    let id = app.new_pane(PaneKind::News(Box::new(visible_pane())));
+    app.focus = id;
+    let ctx = egui::Context::default();
+    let mut events = key_event(egui::Key::J);
+    events.push(egui::Event::Text("j".into()));
+    let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| app.hotkeys(ui.ctx()));
+    output.textures_delta.clear();
+    assert_eq!(app.cmd, "J");
+    let mut output = ctx
+        .run_ui(egui::RawInput { events: key_event(egui::Key::ArrowDown), ..Default::default() }, |ui| {
+            app.hotkeys(ui.ctx())
+        });
+    output.textures_delta.clear();
+    let i = app.idx(id).unwrap();
+    let PaneKind::News(n) = &app.panes[i].kind else { panic!() };
+    assert!(n.interaction.pending_keys.is_empty());
+}
+
+#[test]
+fn watch_edits_wait_for_debounce_enter_or_focus_loss() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    let mut buffer = String::new();
+    let input_id = egui::Id::new("watch-save-test");
+    let mut frame = |pane: &mut NewsPane, focused: bool, events| {
+        let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+            let response = ui.add(egui::TextEdit::singleline(&mut buffer).id(input_id));
+            if focused {
+                response.request_focus();
+            } else {
+                response.surrender_focus();
+            }
+            show(ui, pane, &[], &mut vec![], false, None, 0);
+        });
+        output.textures_delta.clear();
+    };
+    pane.interaction.watches_dirty = Some(std::time::Instant::now());
+    frame(&mut pane, true, vec![]);
+    assert!(!pane.interaction.save_watches, "do not save on each keystroke");
+    assert!(pane.interaction.watches_dirty.is_some());
+    pane.interaction.watches_dirty = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    frame(&mut pane, true, vec![]);
+    assert!(std::mem::take(&mut pane.interaction.save_watches));
+    assert!(pane.interaction.watches_dirty.is_none());
+    pane.interaction.watches_dirty = Some(std::time::Instant::now());
+    frame(&mut pane, true, key_event(egui::Key::Enter));
+    assert!(std::mem::take(&mut pane.interaction.save_watches));
+    pane.interaction.watches_dirty = Some(std::time::Instant::now());
+    frame(&mut pane, false, vec![]);
+    assert!(pane.interaction.save_watches);
+}
+
+#[test]
+fn expanded_virtual_rows_use_measured_heights_and_settle_without_repaint() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.items = many_stories(60);
+    pane.filters.days = 90;
+    pane.display.wire = true;
+    ui_frame(&ctx, &mut pane, 900.0, key_event(egui::Key::ArrowDown), true);
+    ui_frame(&ctx, &mut pane, 900.0, key_event(egui::Key::Space), true);
+    // Allow egui's transient scrollbar animation to finish as well.
+    for _ in 0..30 {
+        ui_frame(&ctx, &mut pane, 900.0, vec![], false);
+    }
+    let (output, _) = ui_frame(&ctx, &mut pane, 900.0, vec![], false);
+    let labels = text_shapes(&output);
+    let first_y = labels.iter().find(|(s, _)| s == &pane.items[0].item.title).unwrap().1.y;
+    let second_y = labels.iter().find(|(s, _)| s == &pane.items[1].item.title).unwrap().1.y;
+    assert!((second_y - first_y - pane.cache.rows[0].height).abs() < 1.0);
+    assert!(pane.cache.rows[0].height > dp(22.0));
+    assert!(labels.len() < 160, "only visible rows should be laid out");
+    assert!(output.viewport_output[&egui::ViewportId::ROOT].repaint_delay > std::time::Duration::from_secs(60));
+    let rebuilds = pane.cache.rebuilds;
+    ui_frame(&ctx, &mut pane, 900.0, vec![], false);
+    assert_eq!(pane.cache.rebuilds, rebuilds);
 }

@@ -101,7 +101,11 @@ async fn read_view(s: &Shared, view: View, force: bool) {
         limit: tr_data::news_intelligence::MAX_ITEMS,
         ..Query::default()
     };
-    let items = match s.news.store.lock().await.as_ref() {
+    // N1b: hold the store lock through publication, so no pre-seen snapshot
+    // can be sent after a completed seen write. UI also overlays local actions
+    // on replies which were already in flight before that write.
+    let store_guard = s.news.store.lock().await;
+    let items = match store_guard.as_ref() {
         Some(store) => store.query(&query).map_err(|_| "News store unavailable".into()),
         None => Err("News store unavailable".into()),
     };

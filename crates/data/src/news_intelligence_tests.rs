@@ -20,7 +20,8 @@ fn cross_source_fixture_leads_union_and_order_stability() {
     let mut a = story(1, "Nvidia to acquire chip startup in major deal", 100, "Yahoo");
     a.item.tickers = vec!["NVDA US Equity".into()];
     let mut b = story(2, "Nvidia acquires chip startup: major deal announced", 200, "Reuters");
-    b.item.tickers = vec!["AMD US Equity".into()];
+    // A secondary ticker may be unioned only with an overlapping company set.
+    b.item.tickers = vec!["AMD US Equity".into(), "NVDA US Equity".into()];
     let c = story(3, "Nvidia chip startup deal announced", 250, "Reuters");
     let items = vec![a.clone(), b.clone(), c.clone()];
     let result = clusters(&items);
@@ -187,4 +188,39 @@ fn overlapping_watches_resolve_stably_and_colours_are_clamped() {
     }
     assert_eq!(topic_tags("M&A talks"), vec!["M&A"]);
     assert!(topic_tags("Court trial gives approval to banker").is_empty());
+}
+#[test]
+fn review_single_letter_v_is_not_visa() {
+    for title in ["Economists see a V-shaped recovery in hiring", "Senate debates Title V of the funding bill"] {
+        assert!(extract_tickers(title, &[]).is_empty(), "{title}: {:?}", extract_tickers(title, &[]));
+    }
+    assert_eq!(extract_tickers("$V beats estimates", &[]), vec!["V US Equity"]);
+    for word in [
+        "ALL", "ON", "IT", "NOW", "ARE", "CAN", "GO", "BIG", "REAL", "OPEN", "SO", "HAS", "AN", "AM", "BE", "BY", "AT",
+        "DO", "MOD", "LOW", "KEY", "TRUE", "PLAY", "LIFE", "SEE", "FUN", "CASH", "WELL", "CAR", "FAST", "NICE", "BEST",
+        "GOOD", "HOME", "ANY", "OUT", "PEAK", "TECH",
+    ] {
+        assert!(extract_tickers(&format!("{word} announces a new product today"), &[]).is_empty(), "{word}");
+    }
+}
+#[test]
+fn review_disjoint_ticker_headlines_do_not_cluster() {
+    let mut apple = story(1, "Apple beats quarterly earnings estimates", 100, "Reuters");
+    apple.item.tickers = vec!["AAPL US Equity".into()];
+    let mut microsoft = story(2, "Microsoft beats quarterly earnings estimates", 200, "Reuters");
+    microsoft.item.tickers = vec!["MSFT US Equity".into()];
+    let bridge = story(3, "Companies beat quarterly earnings estimates", 150, "Yahoo");
+    assert_eq!(clusters(&[apple.clone(), microsoft.clone()]).len(), 2);
+    assert_eq!(clusters(&[apple, bridge, microsoft]).len(), 2, "ticker-less bridges must not join disjoint companies");
+}
+#[test]
+fn review_tags_cover_sues_and_merge_inflections() {
+    for (headline, tag) in [
+        ("Musk sues OpenAI over contract", "Legal"),
+        ("Shareholders vow to sue the board", "Legal"),
+        ("Regional lenders agree to merge", "M&A"),
+        ("Two miners merged in all-stock deal", "M&A"),
+    ] {
+        assert!(topic_tags(headline).contains(&tag.to_string()), "{headline}: {:?}", topic_tags(headline));
+    }
 }

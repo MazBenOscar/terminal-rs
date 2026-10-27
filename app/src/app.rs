@@ -200,6 +200,11 @@ pub struct NewsPane {
     pub display: news_view::Display,
     pub interaction: news_view::Interaction,
     pub seen_queue: Vec<String>,
+    // N1b: revisions invalidate presentation once, never by scanning on repaint.
+    pub item_revision: u64,
+    pub cache: news_view::RowCache,
+    pub read_in_view: std::collections::BTreeSet<String>,
+    pub local_seen: std::collections::BTreeSet<String>,
 }
 impl NewsPane {
     pub fn new(symbol: Option<String>) -> Self {
@@ -218,16 +223,39 @@ impl NewsPane {
             display: Default::default(),
             interaction: Default::default(),
             seen_queue: vec![],
+            item_revision: 0,
+            cache: Default::default(),
+            read_in_view: Default::default(),
+            local_seen: Default::default(),
         }
     }
-    fn apply(&mut self, items: Vec<tr_data::news_store::Story>) {
-        if items.is_empty() {
-            return;
+    fn apply(&mut self, mut items: Vec<tr_data::news_store::Story>) {
+        // Seen is monotonic. A reply already in flight before the seen write
+        // cannot undo a user action, including across scope changes.
+        for item in &mut items {
+            item.seen |= self.local_seen.contains(&item.id);
         }
+        self.item_revision = self.item_revision.wrapping_add(1);
         if self.paused {
-            self.pending = items;
+            if !items.is_empty() {
+                self.pending = items;
+            }
         } else {
-            self.items = items;
+            if items.len() != self.items.len()
+                || items.iter().zip(&self.items).any(|(a, b)| {
+                    a.id != b.id
+                        || a.item != b.item
+                        || a.source != b.source
+                        || a.tags != b.tags
+                        || a.summary != b.summary
+                })
+            {
+                self.read_in_view.clear();
+            }
+            // Keep the retained snapshot on empty queries (N1a).
+            if !items.is_empty() {
+                self.items = items;
+            }
             self.pending.clear();
         }
     }
@@ -2521,7 +2549,7 @@ impl TerminalApp {
         if self.agent_escape(ctx) || (!self.palette.open && self.agent_captures_focus(ctx)) {
             return;
         }
-        let presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
+        let mut presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|e| match e {
@@ -2570,13 +2598,18 @@ impl TerminalApp {
         if other_text_focused {
             return;
         }
-        // N1b: feed navigation owns these unmodified keys before type-anywhere.
+        // N1b: consume only feed-owned events; unrelated chords and text still
+        // run through this pass. Repeats must be removed before type-anywhere.
         if !cmd_focused
             && self.cmd.is_empty()
-            && self.idx(self.focus).is_some_and(|i| matches!(self.panes[i].kind, PaneKind::News(_)))
-            && presses.iter().any(|(key, modifiers)| *modifiers == Modifiers::NONE && news_view::owns_key(*key))
+            && let Some(i) = self.idx(self.focus)
+            && let PaneKind::News(n) = &mut self.panes[i].kind
         {
-            return;
+            let keys = ctx.input_mut(|input| {
+                news_view::capture_keys(input, n.interaction.selected.is_some(), !n.filters.search.is_empty())
+            });
+            presses.retain(|(key, modifiers)| *modifiers != Modifiers::NONE || !keys.contains(key));
+            n.interaction.pending_keys.extend(keys);
         }
         // N1b
         if !cmd_focused && self.cmd.is_empty() && self.focused_is_chart() {
