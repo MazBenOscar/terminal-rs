@@ -1,7 +1,8 @@
 //! Member rosters used to resolve party affiliation, which neither disclosure
 //! system publishes. Sources are the official chamber lists:
 //! - House Clerk: <https://clerk.house.gov/xml/lists/MemberData.xml>
-//! - Senate: <https://www.senate.gov/general/contact_information/senators_cfm.xml>
+//! - Senate: historical fixtures only; live senate.gov access is permanently disabled.
+//!   Keep the parser for stored history and a future third-party source.
 
 use std::collections::HashMap;
 

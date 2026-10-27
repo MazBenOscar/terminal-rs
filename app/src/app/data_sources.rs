@@ -156,6 +156,18 @@ fn state_text(status: &tr_net::Status, has_key: bool) -> String {
         "On".into()
     }
 }
+fn source_name(group: &str) -> &str {
+    match group {
+        "finnhub" => "Finnhub",
+        "sec" => "SEC EDGAR",
+        "yahoo-news" => "Yahoo news",
+        "coindesk" => "CoinDesk",
+        "house-disclosures" => "House disclosures",
+        "house-roster" => "House roster",
+        _ => "Unknown source",
+    }
+}
+const SENATE_ROW: &str = "Senate (needs third-party source)";
 fn section(ui: &mut Ui, title: &str) {
     ui.add_space(dp(10.0));
     ui.label(RichText::new(title).font(ui_font(13.5)).color(theme::text()));
@@ -176,6 +188,8 @@ impl TerminalApp {
                 ("SEC EDGAR", &mut self.data_sources.settings.sec),
                 ("Yahoo news", &mut self.data_sources.settings.yahoo_news),
                 ("CoinDesk", &mut self.data_sources.settings.coindesk),
+                ("House disclosures", &mut self.data_sources.settings.house_disclosures),
+                ("House roster", &mut self.data_sources.settings.house_roster),
             ] {
                 changed |= ui.checkbox(enabled, label).changed();
             }
@@ -258,12 +272,7 @@ impl TerminalApp {
             }
             ui.end_row();
             for status in &self.data_sources.status {
-                let name = match status.group {
-                    "finnhub" => "Finnhub",
-                    "sec" => "SEC EDGAR",
-                    "yahoo-news" => "Yahoo news",
-                    _ => "CoinDesk",
-                };
+                let name = source_name(status.group);
                 ui.label(RichText::new(name).font(ui_font(12.0)).color(theme::text()));
                 ui.label(
                     RichText::new(state_text(status, !self.data_sources.masked_key.is_empty()))
@@ -283,7 +292,14 @@ impl TerminalApp {
                 );
                 ui.end_row();
             }
+            ui.add_enabled(false, egui::Label::new(RichText::new(SENATE_ROW).font(ui_font(12.0))))
+                .on_hover_text(tr_congress::refresh::SENATE_PAUSED);
+            ui.label(RichText::new("Disabled permanently").font(mono(11.0)));
+            ui.label("0 / 0");
+            ui.label("—");
+            ui.end_row();
         });
+        ui.label(RichText::new(tr_congress::refresh::SENATE_PAUSED).font(ui_font(12.0)).color(theme::muted()));
         let interval = Duration::from_secs(10);
         if self.data_sources.refresh_delay(interval) == Some(Duration::ZERO) {
             self.source_action(Action::Status);
@@ -346,6 +362,48 @@ mod tests {
         assert!(!settings.sidebar);
         assert!(settings.data_sources.settings_error);
         assert!(tr_net::GROUPS.iter().all(|g| !settings.data_sources.enabled(g)));
+    }
+    #[test]
+    fn congress_rows_have_switches_caps_pause_and_permanent_senate_explanation() {
+        assert_eq!(source_name("house-disclosures"), "House disclosures");
+        assert_eq!(source_name("house-roster"), "House roster");
+        assert_eq!(SENATE_ROW, "Senate (needs third-party source)");
+        assert_eq!(
+            tr_congress::refresh::SENATE_PAUSED,
+            "Senate: paused — needs a third-party source (senate.gov blocked this network)"
+        );
+        let mut settings = tr_net::Settings::default();
+        for (group, cap) in [("house-disclosures", 400), ("house-roster", 20)] {
+            assert!(settings.enabled(group));
+            let policy = tr_net::policies().into_iter().find(|p| p.group == group).unwrap();
+            assert_eq!(policy.daily_cap, cap);
+            let mut status = tr_net::Status {
+                group: policy.group,
+                enabled: true,
+                requests_today: 7,
+                cap,
+                last_request: None,
+                paused_until: None,
+                reason: None,
+                offline: false,
+                needs_contact: false,
+            };
+            assert_eq!(state_text(&status, false), "On");
+            status.paused_until = Some(12345);
+            assert!(state_text(&status, false).starts_with("Paused until "));
+            status.enabled = false;
+            assert_eq!(state_text(&status, false), "Off");
+        }
+        settings.house_disclosures = false;
+        settings.house_roster = false;
+        assert!(!settings.enabled("house-disclosures") && !settings.enabled("house-roster"));
+        settings.house_disclosures = true;
+        settings.house_roster = true;
+        settings.pause_all = true;
+        assert!(!settings.enabled("house-disclosures") && !settings.enabled("house-roster"));
+        assert!(!settings.enabled("senate"));
+        let roundtrip: tr_net::Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(roundtrip.house_disclosures && roundtrip.house_roster && roundtrip.pause_all);
     }
     #[test]
     fn status_text_covers_every_source_state() {

@@ -24,6 +24,9 @@ Every new external source follows these rules:
 | sec.gov / data.sec.gov | 10 req/s | ≤ 1 req/s | 1 | 1,500 | latest-filings Atom feed every 10 min; per-company JSON only for new hits |
 | query1.finance.yahoo.com | unpublished | unchanged, but via the guard | 1 | 1,000 | fallback only |
 | coindesk.com RSS | unpublished | 1 per 5 min | 1 | 300 | crypto only |
+| disclosures-clerk.house.gov | unpublished | ≤ 1 per 3 s | 1 | 400 | current-year index every 30 min; ≤50 new PDFs/run |
+| clerk.house.gov | unpublished | ≤ 1 per 3 s | 1 | 20 | roster cached in process for 24 h |
+| senate.gov and all subdomains | permanently blocked on this network | disabled | 0 | 0 | needs a third-party source |
 
 Hidden window or no visible news/filings pane → no polling (fixes the perf-audit finding for Congress too).
 
@@ -41,7 +44,17 @@ Hidden window or no visible news/filings pane → no polling (fixes the perf-aud
 - Settings → Data sources tab: Finnhub key (Save & Test / Remove), SEC contact email, per-source switches, global kill switch, live status table.
 - Route Yahoo news and CoinDesk RSS through the guard.
 - Tests: ledger shared across two guard instances with different data dirs; `TR_DATA_DIR` without `TR_ALLOW_EXTERNAL` refuses; budget exhaustion; pause persistence and expiry; soft-block detection fixtures.
-- Optional N0b: move Congress onto `tr_net` (its House fetch then also obeys the machine-wide ledger).
+
+### N0b: Congress refresh safety — done (2026-10-27)
+
+- **Senate is structurally off.** `HttpSource` has no Senate search, agreement, roster or PTR request implementation. All live refresh plans omit Senate, including explicit historical plans. `tr_net` permanently returns `Refused::Disabled` for `senate.gov` and every subdomain, including redirects, before transport and regardless of switches or future policies. Senate parsers, fixture ingestion and stored history remain available. The pane/status says: “Senate: paused — needs a third-party source (senate.gov blocked this network)”.
+- **House uses the machine-wide guard exclusively.** `house-disclosures` (disclosures-clerk.house.gov) has ≥3 s spacing, concurrency 1 and 400/day; `house-roster` (clerk.house.gov) has ≥3 s spacing, concurrency 1 and 20/day. Honest `terminal-rs/<version> (personal research; <group>)` identities, refusal markers/statuses, transport streaks and escalating 6/12/24-hour cooldowns are shared across data directories/processes. Invalid PDF/ZIP signatures also pause the disclosure group in the ledger. The old Congress pacer is removed; live refresh ignores the obsolete per-data-dir cooldown table.
+- **Bounded, incremental live discovery.** Only the current-year index is requested. At most 50 newest initial, unseen PTR PDFs are eligible; omitted initial IDs are persisted before downloading, so subsequent runs/restarts do not drain the old index. Stored House/Senate history is not removed. Later refreshes fetch newly discovered filings (plus existing bounded parse-error retries), at most 50/run. Reused sources retain parsed index entries and send ETag/Last-Modified validators; 304 reuses those entries. Successful roster bodies are cached for a day within the shared guard.
+- **Cadence and switches.** Scheduled runs claim `congress:refresh` in the shared ledger for the configured interval. Default live cadence remains 30 minutes; sample defaults to off and explicit zero still disables refresh. Manual REFRESH bypasses cadence only, not budgets/spacing/cooldowns/offline. Settings → Data sources has House disclosures and House roster switches/usage/pause rows and a permanently disabled Senate explanation. Global pause covers both House groups. `TR_DATA_DIR` instances are offline unless `TR_ALLOW_EXTERNAL=1` exactly; re-enabling the production cadence needs no environment override.
+- **Worst-case traffic:** 400 disclosure requests + 20 roster requests = **420 House HTTP attempts per UTC day machine-wide**, including redirects and failed sends. Fresh-directory or manual-refresh churn cannot raise these ceilings; Senate remains **0**. A first live run has at most one index plus 50 PDFs and one roster before redirects, paced by the guard rather than sent in a burst.
+- **Regression coverage:** localhost-only injected Guards and repository-local temporary ledgers; no Senate request construction in live plans/direct entry points, permanent host/redirect deny-list, House index/PDF/roster guard usage and identity, index validators/304, shared pacing/slot/cooldown with expiry, refusal persistence across fresh stores/sources, offline zero sockets, 50-newest first import without later history drain, stored Senate trade visibility, and Data sources/status labels and switches.
+
+Verification: `cargo fmt --all` and `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` passed. The offline locked workspace tests passed with `TR_CONGRESS_REFRESH_MIN=0` forced through Cargo's `--config env.TR_CONGRESS_REFRESH_MIN.value=\"0\"` / `force=true` settings: **1,827 passed, 8 ignored**. All Congress HTTP tests use only `127.0.0.1` fakes; temporary ledgers stay inside this repository. No app/live-host run or release build was performed.
 
 ### N1a: news store and Finnhub (`codex/news-feed`)
 - Finnhub company news (watchlist symbols, incremental `from`) and market news (general, forex, crypto, merger; `minId` cursor).

@@ -1,14 +1,14 @@
-//! Incremental ingest: discover new PTRs on both chambers' official sites,
-//! parse them, normalise into SQLite and raise alerts for tracked politicians.
+//! Incremental House-only live ingest, guarded machine-wide by tr_net.
+//! Senate parsing/fixture ingestion and stored history remain available; no live Senate requests.
 
 use std::fmt;
 use std::future::Future;
+#[cfg(test)]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{Datelike, NaiveDate, Utc};
 use tokio::sync::Mutex;
-use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::db::{Db, FilingRecord, FilingStatus, NewPolitician};
@@ -95,9 +95,15 @@ pub fn refresh_minutes(provider: Option<&str>, configured: Option<&str>) -> u64 
     configured.and_then(|v| v.parse().ok()).unwrap_or(if sample { 0 } else { 30 })
 }
 
-/// Where filings come from. [`HttpSource`] talks to the official sites; tests
-/// substitute fixtures.
+/// Where filings come from. [`HttpSource`] talks only to guarded House hosts;
+/// fixture sources can still ingest both chambers without network access.
+pub const SENATE_PAUSED: &str = "Senate: paused — needs a third-party source (senate.gov blocked this network)";
+
 pub trait Source: Sync {
+    /// Live HTTP has no Senate plan and delegates all pacing/refusals to tr_net.
+    fn guarded_house_only(&self) -> bool {
+        false
+    }
     /// Install persisted pauses before any requests. Live sources also clear run-local refusals.
     fn begin_run(&self, _blocked: &[Site]) -> impl Future<Output = ()> + Send {
         async {}
@@ -112,13 +118,13 @@ pub trait Source: Sync {
 
 #[derive(Debug, Clone)]
 pub struct RefreshConfig {
-    /// House index years overlapping the discovery window.
+    /// Index years for fixture imports. Live HTTP always uses only the current year.
     pub house_years: Vec<i32>,
     /// House discovery lower bound, independent of the Senate window.
     pub house_since: Option<NaiveDate>,
     /// Senate discovery lower bound; also sent to Senate search.
     pub senate_since: Option<NaiveDate>,
-    /// Cap on new filings fetched per chamber per run (keeps first runs polite).
+    /// Cap per run; defaults to 50. Live House plans enforce a hard maximum of 50.
     pub max_new_per_chamber: usize,
     /// Retained for callers; official-site fetches are always sequential.
     pub concurrency: usize,
@@ -147,10 +153,10 @@ impl RefreshConfig {
             (first_run, first_run)
         });
         Self {
-            house_years: (house_since.year()..=today.year()).collect(),
+            house_years: vec![today.year()],
             house_since: Some(house_since),
             senate_since: Some(senate_since),
-            max_new_per_chamber: 200,
+            max_new_per_chamber: 50,
             concurrency: 1,
         }
     }
@@ -186,8 +192,9 @@ impl RefreshReport {
                 .iter()
                 .enumerate()
                 .filter(|(i, label)| {
-                    self.chamber_counts[*i] != (0, 0)
-                        || !self.paused.iter().any(|p| p.starts_with(&format!("{label} source")))
+                    (**label != "Senate" || !self.notes.iter().any(|note| note == SENATE_PAUSED))
+                        && (self.chamber_counts[*i] != (0, 0)
+                            || !self.paused.iter().any(|p| p.starts_with(&format!("{label} source"))))
                 })
                 .map(|(i, label)| {
                     format!("{label}: {} new filings, {} trades", self.chamber_counts[i].0, self.chamber_counts[i].1)
@@ -226,6 +233,10 @@ struct TransportFailures([u8; 3]);
 
 impl TransportFailures {
     fn observe<T>(&mut self, site: Site, result: Result<T>, report: &mut RefreshReport) -> Result<T> {
+        // Guard refusals (including transport streaks) already have machine-wide state.
+        if result.as_ref().is_err_and(|e| e.is::<tr_net::Refused>()) {
+            return result;
+        }
         let count = &mut self.0[site as usize];
         if let Err(e) = &result
             && is_transport(e)
@@ -258,8 +269,12 @@ pub async fn refresh<S: Source>(src: &S, db: &Mutex<Db>, cfg: &RefreshConfig) ->
     let mut report = RefreshReport::default();
     let mut failures = TransportFailures::default();
     let mut incomplete_rosters = Vec::new();
+    let live = src.guarded_house_only();
+    if live {
+        report.notes.push(SENATE_PAUSED.into());
+    }
     let mut blocked = Vec::new();
-    for site in Site::ALL {
+    for site in Site::ALL.into_iter().filter(|_| !live) {
         let (until, _) = db.lock().await.source_cooldown(site.key())?;
         if until > Utc::now().timestamp() {
             blocked.push(site);
@@ -269,7 +284,7 @@ pub async fn refresh<S: Source>(src: &S, db: &Mutex<Db>, cfg: &RefreshConfig) ->
     src.begin_run(&blocked).await;
     let mut house = Vec::new();
     let mut senate = Vec::new();
-    for site in [Site::HouseRoster, Site::Senate] {
+    for site in [Site::HouseRoster, Site::Senate].into_iter().filter(|s| !live || *s != Site::Senate) {
         if blocked.contains(&site) {
             incomplete_rosters.push(site);
             continue;
@@ -278,7 +293,7 @@ pub async fn refresh<S: Source>(src: &S, db: &Mutex<Db>, cfg: &RefreshConfig) ->
             Ok(r) => {
                 house.extend(r.house);
                 senate.extend(r.senate);
-                if site == Site::HouseRoster {
+                if site == Site::HouseRoster && !live {
                     db.lock().await.reset_source(site.key())?;
                 }
             }
@@ -306,7 +321,7 @@ pub async fn refresh<S: Source>(src: &S, db: &Mutex<Db>, cfg: &RefreshConfig) ->
             }
         }
     }
-    for site in [Site::House, Site::Senate] {
+    for site in [Site::House, Site::Senate].into_iter().filter(|s| !live || *s != Site::Senate) {
         if blocked.contains(&site) {
             continue;
         }
@@ -321,7 +336,9 @@ pub async fn refresh<S: Source>(src: &S, db: &Mutex<Db>, cfg: &RefreshConfig) ->
                 let roster_site = if site == Site::House { Site::HouseRoster } else { Site::Senate };
                 if report.errors.len() == errors_before && !incomplete_rosters.contains(&roster_site) {
                     let db = db.lock().await;
-                    db.reset_source(site.key())?;
+                    if !live {
+                        db.reset_source(site.key())?;
+                    }
                     if !capped {
                         let key =
                             if site == Site::House { "last_refresh_date_house" } else { "last_refresh_date_senate" };
@@ -334,7 +351,9 @@ pub async fn refresh<S: Source>(src: &S, db: &Mutex<Db>, cfg: &RefreshConfig) ->
     }
 
     let db = db.lock().await;
-    report.paused = paused_sources(&db)?;
+    if !live {
+        report.paused = paused_sources(&db)?;
+    }
     if blocked.len() > already_blocked {
         warn!("{}", report.paused.join(" · "));
     }
@@ -351,7 +370,14 @@ async fn record_failure(
     error: anyhow::Error,
     blocked: &mut Vec<Site>,
 ) -> Result<()> {
-    if let Some(refusal) = error.downcast_ref::<SiteRefused>() {
+    if let Some(refusal) = error.downcast_ref::<tr_net::Refused>() {
+        let text = match refusal {
+            tr_net::Refused::Paused { until } => pause_text(site, *until),
+            _ => format!("{}: {refusal}", site.label()),
+        };
+        report.paused.push(text);
+        blocked.push(site);
+    } else if let Some(refusal) = error.downcast_ref::<SiteRefused>() {
         if !blocked.contains(&refusal.site) {
             db.lock().await.refuse_source(refusal.site.key(), Utc::now().timestamp(), refusal.retry_after)?;
             blocked.push(refusal.site);
@@ -436,8 +462,13 @@ async fn refresh_house<S: Source>(
 ) -> Result<bool> {
     let known = db.lock().await.known_filing_ids(Chamber::House)?;
     let retries = db.lock().await.retry_filing_ids(Chamber::House)?;
+    let live = src.guarded_house_only();
+    let current_year = Utc::now().year();
+    let years = if live { vec![current_year] } else { cfg.house_years.clone() };
+    let baseline_key = format!("house:skipped-initial:{current_year}");
+    let skipped = db.lock().await.meta(&baseline_key)?;
     let mut todo: Vec<IndexEntry> = Vec::new();
-    for &year in &cfg.house_years {
+    for &year in &years {
         let entries = match failures.observe(Site::House, src.house_index(year).await, report) {
             Ok(entries) => entries,
             Err(e) if e.is::<IndexNotPublished>() => {
@@ -450,21 +481,39 @@ async fn refresh_house<S: Source>(
             e.is_ptr()
                 && (retries.contains(&format!("house:{}", e.doc_id))
                     || (!known.contains(&format!("house:{}", e.doc_id))
-                        && cfg.house_since.is_none_or(|since| e.filing_date.is_some_and(|d| d >= since))))
+                        && ((live && skipped.is_none())
+                            || cfg.house_since.is_none_or(|since| e.filing_date.is_some_and(|d| d >= since)))))
         }));
     }
     let mut seen = std::collections::HashSet::new();
     todo.retain(|entry| seen.insert(entry.doc_id.clone()));
     // Newest first so a capped run still gets the freshest filings.
     todo.sort_by_key(|e| std::cmp::Reverse(e.filing_date));
-    let capped = todo.len() > cfg.max_new_per_chamber.min(200);
+    let limit = cfg.max_new_per_chamber.min(if live { 50 } else { 200 });
+    if live {
+        // Persist the omitted initial index, before downloading anything. Future runs
+        // must not drain that historical backlog, even after cancellation/restart.
+        let omitted: std::collections::HashSet<String> = match skipped {
+            Some(json) => serde_json::from_str(&json).context("House initial baseline")?,
+            None => {
+                let omitted: std::collections::HashSet<_> = todo.iter().skip(limit).map(|e| e.doc_id.clone()).collect();
+                db.lock().await.set_meta(&baseline_key, &serde_json::to_string(&omitted)?)?;
+                omitted
+            }
+        };
+        todo.retain(|e| !omitted.contains(&e.doc_id));
+    }
+    let capped = todo.len() > limit;
     report.capped |= capped;
-    todo.truncate(cfg.max_new_per_chamber.min(200));
+    todo.truncate(limit);
     debug!("house: {} new PTRs to fetch", todo.len());
 
     for entry in todo {
         let parsed = match failures.observe(Site::House, src.house_pdf(&entry).await, report) {
             Err(e) => {
+                if e.is::<tr_net::Refused>() {
+                    return Err(e);
+                }
                 let id = format!("house:{}", entry.doc_id);
                 if retries.contains(&id) {
                     db.lock().await.record_failed_retry(&id)?;
@@ -642,33 +691,6 @@ async fn refresh_senate<S: Source>(
     Ok(capped)
 }
 
-#[derive(Default)]
-struct PaceState {
-    next: Option<Instant>,
-    refused: bool,
-    transport_failures: u8,
-}
-
-#[derive(Default)]
-struct Pacer {
-    state: Mutex<PaceState>,
-}
-
-impl Pacer {
-    // The returned guard is held until the body is read, not just until headers arrive.
-    async fn enter(&self, site: Site) -> Result<tokio::sync::MutexGuard<'_, PaceState>> {
-        let mut state = self.state.lock().await;
-        if state.refused {
-            return Err(SiteRefused { site, retry_after: None }.into());
-        }
-        if let Some(next) = state.next {
-            tokio::time::sleep_until(next).await;
-        }
-        state.next = Some(Instant::now() + Duration::from_secs(1));
-        Ok(state)
-    }
-}
-
 #[derive(Debug)]
 struct IndexNotPublished;
 impl fmt::Display for IndexNotPublished {
@@ -678,27 +700,7 @@ impl fmt::Display for IndexNotPublished {
 }
 impl std::error::Error for IndexNotPublished {}
 
-/// Validate download signatures, not Content-Type (which can be misleading).
-fn check_download(site: Site, url: &str, status: u16, body: &[u8], retry: Option<&str>) -> Result<()> {
-    let path = reqwest::Url::parse(url)?.path().to_ascii_lowercase();
-    if site == Site::House
-        && status == 404
-        && [Utc::now().year(), Utc::now().year() + 1].iter().any(|year| path.ends_with(&format!("/{year}fd.zip")))
-    {
-        return Err(IndexNotPublished.into());
-    }
-    check_response(site, status, body, retry)?;
-    if site == Site::House
-        && (200..300).contains(&status)
-        && ((path.ends_with(".pdf") && !body.starts_with(b"%PDF-"))
-            || (path.ends_with(".zip")
-                && ![b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"].iter().any(|magic| body.starts_with(*magic))))
-    {
-        return Err(SiteRefused { site, retry_after: None }.into());
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn retry_after(value: &str, now: i64) -> Option<i64> {
     value
         .trim()
@@ -709,6 +711,7 @@ fn retry_after(value: &str, now: i64) -> Option<i64> {
         .map(|until| until.min(now.saturating_add(7 * 86400)))
 }
 
+#[cfg(test)]
 fn check_response(site: Site, status: u16, body: &[u8], retry: Option<&str>) -> Result<()> {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
     if matches!(status, 403 | 429 | 503)
@@ -729,225 +732,79 @@ fn check_response(site: Site, status: u16, body: &[u8], retry: Option<&str>) -> 
     Ok(())
 }
 
+#[cfg(test)]
 fn home_csrf(home: &str) -> Result<String> {
     senate::csrf_from_form(home).ok_or_else(|| SiteRefused { site: Site::Senate, retry_after: None }.into())
 }
 
-#[cfg(test)]
-type FixtureResponse = fn(&reqwest::Request) -> Result<(u16, Vec<u8>)>;
-
-/// Live source backed by the official websites.
+/// Live House-only source. No Senate URL or session is constructed here.
+/// The injected guard is used only by localhost tests; production always uses shared().
 pub struct HttpSource {
     client: reqwest::Client,
-    /// CSRF token of an agreed eFD session, established lazily.
-    senate_csrf: Mutex<Option<String>>,
-    pacers: [Pacer; 3],
-    senate_rehandshake: std::sync::atomic::AtomicBool,
-    site_base: Option<(Site, reqwest::Url)>,
+    guard: Option<std::sync::Arc<tr_net::Guard>>,
+    index: Mutex<Option<(i32, Vec<IndexEntry>, tr_net::ResponseMetadata)>>,
     #[cfg(test)]
-    fixture: Option<FixtureResponse>,
-    #[cfg(test)]
-    fixture_hits: std::sync::atomic::AtomicUsize,
+    planned_urls: std::sync::Mutex<Vec<String>>,
 }
 
 impl HttpSource {
     pub fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("terminal-rs/", env!("CARGO_PKG_VERSION"), " (personal STOCK Act disclosure reader)"))
-            .cookie_store(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .timeout(Duration::from_secs(20))
-            .build()?;
         Ok(Self {
-            client,
-            senate_csrf: Mutex::new(None),
-            pacers: Default::default(),
-            senate_rehandshake: Default::default(),
-            site_base: None,
+            client: reqwest::Client::new(),
+            guard: None,
+            index: Mutex::new(None),
             #[cfg(test)]
-            fixture: None,
-            #[cfg(test)]
-            fixture_hits: Default::default(),
+            planned_urls: Default::default(),
         })
     }
 
-    /// Route every request for one logical site to an offline fixture server.
-    /// Redirects are still classified and paced using the logical site.
-    pub fn with_site_base(site: Site, base: &str) -> Result<Self> {
-        let mut source = Self::new()?;
-        source.site_base = Some((site, reqwest::Url::parse(base)?));
-        Ok(source)
-    }
-
-    async fn refuse(&self, site: Site) -> anyhow::Error {
-        self.pacer(site).state.lock().await.refused = true;
-        SiteRefused { site, retry_after: None }.into()
-    }
-
-    fn pacer(&self, site: Site) -> &Pacer {
-        &self.pacers[site as usize]
-    }
-
-    /// All HTTP, including redirects and session handshakes, passes through this gate.
-    async fn request(&self, builder: reqwest::RequestBuilder) -> Result<(Vec<u8>, String)> {
-        let mut request = builder.build()?;
-        for _ in 0..6 {
-            let url = request.url().clone();
-            let site = Site::for_url(url.as_str())?;
-            let mut pace = self.pacer(site).enter(site).await?;
-            let replay = request.try_clone();
-            if let Some((mapped_site, base)) = &self.site_base {
-                // A fake-base source must never fall through to a live host.
-                anyhow::ensure!(*mapped_site == site, "unmapped site in offline source");
-                let mut target = base.clone();
-                target.set_path(url.path());
-                target.set_query(url.query());
-                *request.url_mut() = target;
-            }
-            let (status, retry, location, bytes) = match self.response(request, site).await {
-                Ok(response) => {
-                    pace.transport_failures = 0;
-                    response
-                }
-                Err(e) => {
-                    if is_transport(&e) {
-                        pace.transport_failures += 1;
-                        if pace.transport_failures >= 3 {
-                            pace.refused = true;
-                            return Err(SiteRefused { site, retry_after: None }.into());
-                        }
-                    } else {
-                        pace.transport_failures = 0;
-                    }
-                    pace.refused |= e.is::<SiteRefused>();
-                    return Err(e);
-                }
-            };
-            let checked =
-                check_download(site, url.as_str(), status.as_u16(), &bytes, retry.as_deref()).and_then(|()| {
-                    if site == Site::Senate && url.path().contains("/search/home") && !status.is_redirection() {
-                        home_csrf(&String::from_utf8_lossy(&bytes)).map(|_| ()).map_err(|_| {
-                            SiteRefused {
-                                site,
-                                retry_after: retry.as_deref().and_then(|v| retry_after(v, Utc::now().timestamp())),
-                            }
-                            .into()
-                        })
-                    } else {
-                        Ok(())
-                    }
-                });
-            if let Err(e) = checked {
-                pace.refused |= e.is::<SiteRefused>();
-                return Err(e);
-            }
-            if status.is_redirection() {
-                let next = url.join(location.as_deref().context("redirect without Location")?)?;
-                request = if matches!(status.as_u16(), 307 | 308) {
-                    let mut replay = replay.context("redirect with non-replayable body")?;
-                    *replay.url_mut() = next;
-                    replay
-                } else {
-                    self.client.get(next).header("Referer", url.as_str()).build()?
-                };
-                continue;
-            }
-            return Ok((bytes.to_vec(), url.to_string()));
+    fn guard(&self) -> Result<&tr_net::Guard, tr_net::Refused> {
+        match self.guard.as_deref() {
+            Some(guard) => Ok(guard),
+            None => tr_net::shared(),
         }
-        bail!("too many Congress source redirects")
     }
 
-    /// Raw transport seam: fixture tests exercise the real request gate and session
-    /// logic without opening a socket or contacting any host.
-    async fn response(
-        &self,
-        request: reqwest::Request,
-        site: Site,
-    ) -> Result<(reqwest::StatusCode, Option<String>, Option<String>, Vec<u8>)> {
+    /// A test guard must have a loopback-only transport (Guard::for_fixture).
+    #[cfg(test)]
+    fn with_guard(guard: std::sync::Arc<tr_net::Guard>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            guard: Some(guard),
+            index: Mutex::new(None),
+            planned_urls: Default::default(),
+        }
+    }
+
+    fn request(&self, url: &str) -> Result<(&'static str, reqwest::RequestBuilder)> {
+        // Classify before constructing a RequestBuilder. Unknown and Senate URLs cannot escape.
+        let group = match Site::for_url(url)? {
+            Site::House => "house-disclosures",
+            Site::HouseRoster => "house-roster",
+            Site::Senate => return Err(tr_net::Refused::Disabled.into()),
+        };
         #[cfg(test)]
-        if let Some(fixture) = self.fixture {
-            self.fixture_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let (status, bytes) = fixture(&request)?;
-            return Ok((reqwest::StatusCode::from_u16(status)?, None, None, bytes));
-        }
-        let resp = self.client.execute(request).await?;
-        let status = resp.status();
-        let retry = resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|h| h.to_str().ok()).map(str::to_owned);
-        let location = resp.headers().get(reqwest::header::LOCATION).and_then(|h| h.to_str().ok()).map(str::to_owned);
-        // Do not wait for a challenge body when the status already refuses us.
-        if matches!(status.as_u16(), 403 | 429 | 503) {
-            return Err(SiteRefused {
-                site,
-                retry_after: retry.as_deref().and_then(|v| retry_after(v, Utc::now().timestamp())),
-            }
-            .into());
-        }
-        Ok((status, retry, location, resp.bytes().await?.to_vec()))
+        self.planned_urls.lock().unwrap().push(url.to_owned());
+        Ok((group, self.client.get(url)))
     }
 
     async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        Ok(self.request(self.client.get(url)).await?.0)
-    }
-
-    /// Accept the eFD prohibition agreement and return the session CSRF token.
-    async fn senate_session(&self, force: bool) -> Result<String> {
-        let mut guard = self.senate_csrf.lock().await;
-        if let (Some(tok), false) = (guard.as_ref(), force) {
-            return Ok(tok.clone());
-        }
-        if force && self.senate_rehandshake.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return Err(self.refuse(Site::Senate).await);
-        }
-        let home = self.get_bytes(senate::HOME_URL).await?;
-        let form_tok = home_csrf(&String::from_utf8_lossy(&home))?;
-        let (page, _) = self
-            .request(
-                self.client
-                    .post(senate::HOME_URL)
-                    .header("Referer", senate::HOME_URL)
-                    .form(&[("prohibition_agreement", "1"), ("csrfmiddlewaretoken", form_tok.as_str())]),
-            )
-            .await?;
-        // After agreeing, the search page carries a fresh form token tied to the csrftoken cookie.
-        let page = String::from_utf8_lossy(&page);
-        let tok = senate::csrf_from_form(&page).unwrap_or(form_tok);
-        *guard = Some(tok.clone());
-        Ok(tok)
-    }
-
-    async fn senate_page(&self, csrf: &str, start: u64, since: Option<NaiveDate>) -> Result<senate::SearchPage> {
-        let (bytes, _) = self
-            .request(
-                self.client
-                    .post(senate::DATA_URL)
-                    .header("Referer", senate::SEARCH_URL)
-                    .header("X-CSRFToken", csrf)
-                    .form(&senate::search_form(csrf, start, 100, since)),
-            )
-            .await?;
-        senate::parse_search_json(&String::from_utf8_lossy(&bytes))
+        let (group, request) = self.request(url)?;
+        Ok(self.guard()?.send(group, request).await?)
     }
 }
 
 impl Source for HttpSource {
-    async fn begin_run(&self, blocked: &[Site]) {
-        for site in Site::ALL {
-            let mut state = self.pacer(site).state.lock().await;
-            state.refused = blocked.contains(&site);
-            state.transport_failures = 0;
-        }
-        *self.senate_csrf.lock().await = None;
-        self.senate_rehandshake.store(false, std::sync::atomic::Ordering::SeqCst);
+    fn guarded_house_only(&self) -> bool {
+        true
     }
 
     async fn roster_for(&self, site: Site) -> Result<Roster> {
         match site {
-            Site::Senate => {
-                let bytes = self.get_bytes(roster::SENATE_ROSTER_URL).await?;
-                Ok(Roster::new(vec![], roster::parse_senate_roster(&String::from_utf8_lossy(&bytes))?))
-            }
+            Site::Senate => Err(tr_net::Refused::Disabled.into()),
             Site::HouseRoster => {
+                // The guard caches successful roster bodies for a day in process;
+                // independent processes still share the 20/day ledger ceiling.
                 let bytes = self.get_bytes(roster::HOUSE_ROSTER_URL).await?;
                 Ok(Roster::new(roster::parse_house_roster(&String::from_utf8_lossy(&bytes))?, vec![]))
             }
@@ -956,60 +813,45 @@ impl Source for HttpSource {
     }
 
     async fn house_index(&self, year: i32) -> Result<Vec<IndexEntry>> {
-        let zip = self.get_bytes(&house::index_zip_url(year)).await?;
-        tokio::task::spawn_blocking(move || house::parse_index_zip(&zip)).await?
+        // Even an explicit historical refresh plan cannot backfill live hosts.
+        anyhow::ensure!(year == Utc::now().year(), "Live House discovery is current-year only");
+        let mut cached = self.index.lock().await;
+        let (_, mut request) = self.request(&house::index_zip_url(year))?;
+        if let Some((_, _, meta)) = cached.as_ref().filter(|(y, _, _)| *y == year) {
+            if let Some(etag) = &meta.etag {
+                request = request.header("If-None-Match", etag);
+            }
+            if let Some(modified) = &meta.last_modified {
+                request = request.header("If-Modified-Since", modified);
+            }
+        }
+        let (zip, meta) = match self.guard()?.send_with_metadata("house-disclosures", request).await {
+            Err(tr_net::Refused::Http(404)) => return Err(IndexNotPublished.into()),
+            result => result?,
+        };
+        if meta.status == 304 {
+            return cached
+                .as_ref()
+                .filter(|(y, _, _)| *y == year)
+                .map(|(_, entries, _)| entries.clone())
+                .context("House index 304 without cached entries");
+        }
+        let entries = tokio::task::spawn_blocking(move || house::parse_index_zip(&zip)).await??;
+        *cached = Some((year, entries.clone(), meta));
+        Ok(entries)
     }
 
     async fn house_pdf(&self, entry: &IndexEntry) -> Result<Vec<u8>> {
+        anyhow::ensure!(entry.year == Utc::now().year(), "Live House PDFs are current-year only");
         self.get_bytes(&entry.pdf_url()).await
     }
 
-    async fn senate_reports(&self, since: Option<NaiveDate>) -> Result<Vec<ReportRef>> {
-        let mut csrf = self.senate_session(false).await?;
-        let mut out = Vec::new();
-        let mut start = 0;
-        loop {
-            let page = match self.senate_page(&csrf, start, since).await {
-                Ok(p) => p,
-                // Session expired: agree again once and retry.
-                Err(e) if !e.is::<SiteRefused>() && !is_transport(&e) && (start == 0 || out.is_empty()) => {
-                    csrf = self.senate_session(true).await?;
-                    match self.senate_page(&csrf, start, since).await {
-                        Ok(page) => page,
-                        Err(e) if is_transport(&e) || e.is::<SiteRefused>() => return Err(e),
-                        Err(_) => return Err(self.refuse(Site::Senate).await),
-                    }
-                }
-                Err(e) => return Err(e),
-            };
-            let n = page.reports.len() as u64;
-            out.extend(page.reports);
-            start += n;
-            if n == 0 || start >= page.total {
-                break;
-            }
-        }
-        Ok(out)
+    async fn senate_reports(&self, _: Option<NaiveDate>) -> Result<Vec<ReportRef>> {
+        Err(tr_net::Refused::Disabled.into())
     }
 
-    async fn senate_ptr(&self, report: &ReportRef) -> Result<String> {
-        self.senate_session(false).await?;
-        let (bytes, final_url) =
-            self.request(self.client.get(&report.url).header("Referer", senate::SEARCH_URL)).await?;
-        let valid_ptr = |bytes: Vec<u8>, url: &str| -> Option<String> {
-            let text = String::from_utf8(bytes).ok()?;
-            (!url.contains("/search/home") && senate::parse_ptr_html(&text).is_ok()).then_some(text)
-        };
-        if let Some(text) = valid_ptr(bytes, &final_url) {
-            return Ok(text);
-        }
-        // The budget is shared with search and every PTR for the entire run.
-        self.senate_session(true).await?;
-        let (bytes, url) = self.request(self.client.get(&report.url).header("Referer", senate::SEARCH_URL)).await?;
-        match valid_ptr(bytes, &url) {
-            Some(text) => Ok(text),
-            None => Err(self.refuse(Site::Senate).await),
-        }
+    async fn senate_ptr(&self, _: &ReportRef) -> Result<String> {
+        Err(tr_net::Refused::Disabled.into())
     }
 }
 
@@ -1018,124 +860,286 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
 
-    struct PtrProbe(HttpSource);
-
-    impl Source for PtrProbe {
-        async fn begin_run(&self, blocked: &[Site]) {
-            self.0.begin_run(blocked).await;
-        }
-        async fn roster_for(&self, _: Site) -> Result<Roster> {
-            Ok(Roster::default())
-        }
-        async fn house_index(&self, _: i32) -> Result<Vec<IndexEntry>> {
-            Ok(vec![])
-        }
-        async fn house_pdf(&self, _: &IndexEntry) -> Result<Vec<u8>> {
-            unreachable!()
-        }
-        async fn senate_reports(&self, since: Option<NaiveDate>) -> Result<Vec<ReportRef>> {
-            let mut fake = Fake::new(None);
-            fake.count = 200;
-            fake.senate_reports(since).await
-        }
-        async fn senate_ptr(&self, report: &ReportRef) -> Result<String> {
-            self.0.senate_ptr(report).await
-        }
+    struct LocalServer {
+        base: reqwest::Url,
+        seen: Arc<StdMutex<Vec<String>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
     }
-
-    fn agreement() -> Vec<u8> {
-        b"<html><form><input name=\"csrfmiddlewaretoken\" value=\"fixture-token\"></form></html>".to_vec()
-    }
-
-    fn challenge_response(request: &reqwest::Request) -> Result<(u16, Vec<u8>)> {
-        Ok((
-            200,
-            if request.url().path().contains("/search/home") {
-                agreement()
-            } else {
-                b"<html>Transaction Date: please enable cookies</html>".to_vec()
-            },
-        ))
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn http_soft_block_costs_six_requests_for_two_hundred_ptrs_and_persists_pause() {
-        for fixture in
-            [challenge_response as FixtureResponse, (|_: &reqwest::Request| Ok((200, agreement()))) as FixtureResponse]
-        {
-            let mut http = HttpSource::new().unwrap();
-            http.fixture = Some(fixture);
-            let src = PtrProbe(http);
-            let db = Mutex::new(Db::open_in_memory().unwrap());
-            let r = refresh(&src, &db, &config()).await.unwrap();
-            assert_eq!(src.0.fixture_hits.load(std::sync::atomic::Ordering::SeqCst), 6);
-            assert!(r.paused[0].contains("Senate source paused"));
-            assert_eq!(db.lock().await.source_cooldown(Site::Senate.key()).unwrap().1, 1);
-            refresh(&src, &db, &config()).await.unwrap();
-            assert_eq!(src.0.fixture_hits.load(std::sync::atomic::Ordering::SeqCst), 6);
-            // Even a direct caller cannot continue the queue within the run.
-            assert!(src.0.get_bytes(senate::HOME_URL).await.unwrap_err().is::<SiteRefused>());
+    impl LocalServer {
+        fn new(index_status: u16) -> Self {
+            Self::respond(move |request| {
+                if request.contains("MemberData.xml") {
+                    (200, String::new(), include_bytes!("../tests/fixtures/roster/house_members.xml").to_vec())
+                } else {
+                    (index_status, String::new(), b"not published".to_vec())
+                }
+            })
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn forced_handshake_budget_is_shared_by_search_and_ptrs_and_reset_per_run() {
-        let mut http = HttpSource::new().unwrap();
-        http.fixture = Some(challenge_response);
-        for expected in [2, 4] {
-            http.begin_run(&[]).await;
-            http.senate_session(true).await.unwrap();
-            assert!(http.senate_session(true).await.unwrap_err().is::<SiteRefused>());
-            assert_eq!(http.fixture_hits.load(std::sync::atomic::Ordering::SeqCst), expected);
+        fn respond(handler: impl Fn(&str) -> (u16, String, Vec<u8>) + Send + 'static) -> Self {
+            use std::io::{Read, Write};
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
+            let seen = Arc::new(StdMutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (requests, stopped) = (seen.clone(), stop.clone());
+            let worker = std::thread::spawn(move || {
+                while !stopped.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                            let mut bytes = Vec::new();
+                            let mut buf = [0; 8192];
+                            while !bytes.ends_with(b"\r\n\r\n") {
+                                match stream.read(&mut buf) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                                }
+                            }
+                            let request = String::from_utf8_lossy(&bytes).into_owned();
+                            let (status, headers, body) = handler(&request);
+                            requests.lock().unwrap().push(request);
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(&body);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2))
+                        }
+                        Err(e) => panic!("fixture: {e}"),
+                    }
+                }
+            });
+            Self { base, seen, stop, worker: Some(worker) }
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn house_html_downloads_refuse_and_close_the_http_gate() {
-        for url in [
-            house::index_zip_url(Utc::now().year()),
-            "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/123.pdf".into(),
-        ] {
-            let mut http = HttpSource::new().unwrap();
-            http.fixture = Some(|_| Ok((200, b"<html>Sign in to continue</html>".to_vec())));
-            assert!(http.get_bytes(&url).await.unwrap_err().is::<SiteRefused>());
-            assert!(http.get_bytes(&url).await.unwrap_err().is::<SiteRefused>());
-            assert_eq!(http.fixture_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-        }
-        for (suffix, body) in [("pdf", b"random bytes".as_slice()), ("zip", b"not a zip".as_slice())] {
-            assert!(
-                check_download(
-                    Site::House,
-                    &format!("https://disclosures-clerk.house.gov/test.{suffix}"),
-                    200,
-                    body,
-                    None
-                )
-                .unwrap_err()
-                .is::<SiteRefused>()
-            );
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn unpublished_house_year_is_skipped_with_a_note_not_a_refusal() {
-        let mut src = HttpSource::new().unwrap();
-        src.fixture = Some(|_| Ok((404, b"Not Found".to_vec())));
-        let db = Mutex::new(Db::open_in_memory().unwrap());
-        let mut cfg = config();
-        cfg.house_years = vec![Utc::now().year() + 1];
-        let mut report = RefreshReport::default();
-        refresh_house(&src, &db, &cfg, &Roster::default(), &mut report, &mut TransportFailures::default())
-            .await
+        fn source(&self, path: &std::path::Path, offline: bool) -> HttpSource {
+            let guard = tr_net::Guard::for_fixture(
+                tr_net::Config {
+                    ledger: path.to_owned(),
+                    data_dir: Some(path.with_extension("instance")),
+                    allow_external: !offline,
+                    max_wait: Duration::ZERO,
+                },
+                tr_net::Settings::default(),
+                self.base.clone(),
+            )
             .unwrap();
-        assert!(report.errors.is_empty());
-        assert!(report.summary().contains("not published yet; skipped"));
-        assert!(!src.pacer(Site::House).state.lock().await.refused);
+            HttpSource::with_guard(Arc::new(guard))
+        }
+    }
+    impl Drop for LocalServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+    fn ledger_file() -> TestDbFile {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        TestDbFile(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "guard-test-{}-{}.sqlite3",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )))
+    }
+
+    #[tokio::test]
+    async fn http_all_plans_are_house_only_and_offline_constructs_no_senate_requests() {
+        for offline in [false, true] {
+            let server = LocalServer::new(404);
+            let ledger = ledger_file();
+            let source = server.source(&ledger.0, offline);
+            let db = Mutex::new(Db::open_in_memory().unwrap());
+            for years in [vec![], vec![1999], vec![Utc::now().year()], vec![1999, Utc::now().year(), 2099]] {
+                let mut cfg = config();
+                cfg.house_years = years;
+                cfg.max_new_per_chamber = usize::MAX;
+                let report = refresh(&source, &db, &cfg).await.unwrap();
+                assert!(report.summary().contains(SENATE_PAUSED));
+                assert!(report.errors.is_empty(), "{:?}", report.errors);
+            }
+            assert!(source.roster_for(Site::Senate).await.unwrap_err().is::<tr_net::Refused>());
+            assert!(source.senate_reports(None).await.unwrap_err().is::<tr_net::Refused>());
+            let report = Fake::new(None).senate_reports(None).await.unwrap().remove(0);
+            assert!(source.senate_ptr(&report).await.unwrap_err().is::<tr_net::Refused>());
+            for url in
+                [senate::HOME_URL, roster::SENATE_ROSTER_URL, "https://senate.gov/", "https://future.senate.gov/"]
+            {
+                assert!(source.get_bytes(url).await.is_err());
+            }
+            assert!(source.house_index(1999).await.is_err());
+            let urls = source.planned_urls.lock().unwrap().clone();
+            assert!(!urls.is_empty());
+            for url in urls.iter() {
+                let url = reqwest::Url::parse(url).unwrap();
+                assert!(matches!(url.host_str(), Some("clerk.house.gov" | "disclosures-clerk.house.gov")));
+                if url.path().ends_with("FD.zip") {
+                    assert!(url.path().contains(&Utc::now().year().to_string()));
+                }
+            }
+            let sent = server.seen.lock().unwrap().clone();
+            if offline {
+                assert!(sent.is_empty(), "test data dir must never open a socket");
+            } else {
+                assert_eq!(sent.len(), 2, "one roster and one index; later immediate runs are paced");
+                assert!(sent.iter().all(|r| r.contains("terminal-rs/") && !r.contains("Mozilla")));
+                let status = source.guard().unwrap().status().unwrap();
+                assert_eq!(status.iter().find(|s| s.group == "house-disclosures").unwrap().requests_today, 1);
+                assert_eq!(status.iter().find(|s| s.group == "house-roster").unwrap().requests_today, 1);
+            }
+            // Live sources neither read nor write the obsolete data-dir cooldowns.
+            assert_eq!(db.lock().await.source_cooldown(Site::House.key()).unwrap(), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn http_refusal_is_durable_across_sources_and_new_data_dirs() {
+        let server = LocalServer::new(429);
+        let ledger = ledger_file();
+        let first = server.source(&ledger.0, false);
+        let report = refresh(&first, &Mutex::new(Db::open_in_memory().unwrap()), &config()).await.unwrap();
         assert!(
-            !check_download(Site::House, &house::index_zip_url(2020), 404, b"missing", None)
-                .unwrap_err()
-                .is::<IndexNotPublished>()
+            report.summary().contains("House source paused until"),
+            "{}; hits={:?}",
+            report.summary(),
+            server.seen.lock().unwrap()
         );
+        let second = server.source(&ledger.0, false);
+        let report = refresh(&second, &Mutex::new(Db::open_in_memory().unwrap()), &config()).await.unwrap();
+        assert!(
+            report.summary().contains("House source paused until"),
+            "{}; hits={:?}",
+            report.summary(),
+            server.seen.lock().unwrap()
+        );
+        assert_eq!(server.seen.lock().unwrap().len(), 2, "only first roster + refused index");
+    }
+
+    #[tokio::test]
+    async fn http_index_validators_and_pdf_use_the_guard() {
+        use std::io::Write;
+        let year = Utc::now().year();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(format!("{year}FD.xml"), zip::write::SimpleFileOptions::default()).unwrap();
+        let xml = include_str!("../tests/fixtures/house/2026FD.xml").replace("2026", &year.to_string());
+        zip.write_all(xml.as_bytes()).unwrap();
+        let zip = zip.finish().unwrap().into_inner();
+        let server = LocalServer::respond(move |request| {
+            if request.contains(".pdf ") {
+                (200, String::new(), include_bytes!("../tests/fixtures/house/8221321.pdf").to_vec())
+            } else if request.to_ascii_lowercase().contains("if-none-match: \"index-v1\"") {
+                (304, String::new(), vec![])
+            } else {
+                (200, "ETag: \"index-v1\"\r\nLast-Modified: Tue, 27 Oct 2026 00:00:00 GMT\r\n".into(), zip.clone())
+            }
+        });
+        let ledger = ledger_file();
+        let source = server.source(&ledger.0, false);
+        let entries = source.house_index(year).await.unwrap();
+        assert!(!entries.is_empty());
+        let age = || {
+            rusqlite::Connection::open(&ledger.0).unwrap().execute("UPDATE last_request SET at=0", []).unwrap();
+        };
+        age();
+        assert_eq!(source.house_index(year).await.unwrap(), entries);
+        age();
+        let entry = entries.iter().find(|e| e.is_ptr()).unwrap();
+        assert!(source.house_pdf(entry).await.unwrap().starts_with(b"%PDF-"));
+        let sent = server.seen.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        assert!(sent[1].to_ascii_lowercase().contains("if-none-match: \"index-v1\""));
+        assert!(sent[1].to_ascii_lowercase().contains("if-modified-since:"));
+        assert!(sent[2].contains(".pdf "));
+        assert!(sent.iter().all(|r| r.contains("terminal-rs/") && !r.contains("Mozilla")));
+        assert_eq!(
+            source
+                .guard()
+                .unwrap()
+                .status()
+                .unwrap()
+                .iter()
+                .find(|s| s.group == "house-disclosures")
+                .unwrap()
+                .requests_today,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_senate_trades_remain_visible_while_live_senate_is_paused() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let mut fixtures = Fake::new(None);
+        fixtures.count = 1;
+        refresh(&fixtures, &db, &config()).await.unwrap();
+        let before =
+            db.lock().await.latest_trades(1000).unwrap().into_iter().filter(|t| t.chamber == Chamber::Senate).count();
+        assert!(before > 0);
+        let mut live = Fake::new(None);
+        live.count = 0;
+        let report = refresh(&HousePlan(live), &db, &config()).await.unwrap();
+        assert!(report.summary().contains(SENATE_PAUSED));
+        let after =
+            db.lock().await.latest_trades(1000).unwrap().into_iter().filter(|t| t.chamber == Chamber::Senate).count();
+        assert_eq!(after, before);
+    }
+
+    /// Same production plan, fixture bodies only: a new data directory never drains history.
+    struct HousePlan(Fake);
+    impl Source for HousePlan {
+        fn guarded_house_only(&self) -> bool {
+            true
+        }
+        async fn roster_for(&self, site: Site) -> Result<Roster> {
+            assert_eq!(site, Site::HouseRoster);
+            self.0.roster_for(site).await
+        }
+        async fn house_index(&self, year: i32) -> Result<Vec<IndexEntry>> {
+            assert_eq!(year, Utc::now().year());
+            self.0.house_index(year).await
+        }
+        async fn house_pdf(&self, entry: &IndexEntry) -> Result<Vec<u8>> {
+            self.0.house_pdf(entry).await
+        }
+        async fn senate_reports(&self, _: Option<NaiveDate>) -> Result<Vec<ReportRef>> {
+            panic!("Senate in live plan")
+        }
+        async fn senate_ptr(&self, _: &ReportRef) -> Result<String> {
+            panic!("Senate in live plan")
+        }
+    }
+    #[tokio::test]
+    async fn fresh_live_plan_is_fifty_newest_current_year_and_never_drains_initial_history() {
+        let file = ledger_file();
+        let mut fake = Fake::new(None);
+        fake.count = 250;
+        let src = HousePlan(fake);
+        {
+            let mut db = Db::open(&file.0).unwrap();
+            seed_filing(&mut db, Chamber::Senate, "senate:stored", Utc::now().date_naive());
+            let db = Mutex::new(db);
+            let mut cfg = config();
+            cfg.house_years = vec![1999, Utc::now().year()];
+            cfg.max_new_per_chamber = usize::MAX;
+            let r = refresh(&src, &db, &cfg).await.unwrap();
+            assert_eq!(r.new_filings, 50);
+            assert_eq!(src.0.requests(Site::House, "pdf"), 50);
+            assert!(r.summary().contains(SENATE_PAUSED));
+            assert_eq!(db.lock().await.known_filing_ids(Chamber::Senate).unwrap().len(), 1);
+            let seen = src.0.seen.lock().unwrap();
+            assert_eq!(seen.iter().find(|(site, r)| *site == Site::House && r.starts_with("pdf")).unwrap().1, "pdf:0");
+        }
+        let db = Mutex::new(Db::open(&file.0).unwrap());
+        for _ in 0..2 {
+            let cfg = RefreshConfig::incremental(&*db.lock().await);
+            let r = refresh(&src, &db, &cfg).await.unwrap();
+            assert_eq!(r.new_filings, 0, "omitted initial history must stay omitted after reopen");
+        }
+        assert_eq!(src.0.requests(Site::House, "pdf"), 50);
+        assert_eq!(src.0.requests(Site::Senate, ""), 0);
     }
 
     #[tokio::test]
@@ -1168,20 +1172,6 @@ mod tests {
         }
         refresh(&src, &db, &config()).await.unwrap();
         assert_eq!(src.requests(Site::House, "pdf"), 3);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn http_transport_streak_stops_after_three_and_clears_next_run() {
-        let mut http = HttpSource::new().unwrap();
-        http.fixture = Some(|_| Err(anyhow::anyhow!("error sending request: connection reset by peer")));
-        for run in 1..=2 {
-            http.begin_run(&[]).await;
-            for attempt in 1..=4 {
-                let error = http.get_bytes(senate::HOME_URL).await.unwrap_err();
-                assert_eq!(error.is::<SiteRefused>(), attempt >= 3);
-            }
-            assert_eq!(http.fixture_hits.load(std::sync::atomic::Ordering::SeqCst), 3 * run);
-        }
     }
 
     #[tokio::test]
@@ -1500,63 +1490,27 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn pacer_spaces_starts_and_holds_single_in_flight_through_body() {
-        let pacer = Arc::new(Pacer::default());
-        let first = pacer.enter(Site::Senate).await.unwrap();
-        let start = Instant::now();
-        let p = pacer.clone();
-        let waiting = tokio::spawn(async move {
-            let _guard = p.enter(Site::Senate).await.unwrap();
-            Instant::now()
-        });
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(!waiting.is_finished(), "a slow response must exclude the next request");
-        // Other hosts do not wait on the Senate gate.
-        let house = Pacer::default();
-        let _house = house.enter(Site::House).await.unwrap();
-        drop(first);
-        let second = waiting.await.unwrap();
-        assert!(second.duration_since(start) >= Duration::from_secs(2));
-        let third = pacer.enter(Site::Senate).await.unwrap();
-        assert!(Instant::now().duration_since(second) >= Duration::from_secs(1));
-        drop(third);
-        pacer.state.lock().await.refused = true;
-        assert!(pacer.enter(Site::Senate).await.err().unwrap().is::<SiteRefused>());
-    }
-
     #[tokio::test]
-    async fn first_run_is_ninety_days_capped_at_two_hundred_and_backlog_drains() {
+    async fn default_config_is_current_year_and_fifty_while_fixture_history_stays_importable() {
         let db = Mutex::new(Db::open_in_memory().unwrap());
         let mut src = Fake::new(None);
         src.count = 250;
         let cfg = RefreshConfig::incremental(&*db.lock().await);
         let since = Utc::now().date_naive() - chrono::Duration::days(90);
         assert_eq!(cfg.senate_since, Some(since));
-        assert_eq!(cfg.max_new_per_chamber, 200);
+        assert_eq!(cfg.max_new_per_chamber, 50);
         assert_eq!(cfg.concurrency, 1);
-        assert_eq!(cfg.house_years, (since.year()..=Utc::now().year()).collect::<Vec<_>>());
-        let r = refresh(&src, &db, &cfg).await.unwrap();
-        assert_eq!(r.new_filings, 400);
-        assert_eq!(src.requests(Site::Senate, "ptr"), 200);
-        assert_eq!(src.requests(Site::House, "pdf"), 200);
-        assert_eq!(*src.since.lock().unwrap(), Some(since));
-        {
-            let seen = src.seen.lock().unwrap();
-            let first = seen.iter().find(|(s, r)| *s == Site::Senate && r.starts_with("ptr")).unwrap();
-            assert_eq!(first.1, "ptr:0");
+        assert_eq!(cfg.house_years, vec![Utc::now().year()]);
+        // Fixtures can still import both chambers for parser/history regression coverage.
+        // Live HttpSource additionally omits the initial backlog permanently.
+        for run in 1..=5 {
+            let cfg = RefreshConfig::incremental(&*db.lock().await);
+            let r = refresh(&src, &db, &cfg).await.unwrap();
+            assert_eq!(r.new_filings, 100);
+            assert_eq!(r.capped, run < 5);
+            assert_eq!(src.requests(Site::House, "pdf"), run * 50);
+            assert_eq!(src.requests(Site::Senate, "ptr"), run * 50);
         }
-        assert!(r.capped);
-        for key in ["last_refresh_date_house", "last_refresh_date_senate"] {
-            assert!(db.lock().await.meta(key).unwrap().is_none());
-        }
-        let cfg = RefreshConfig::incremental(&*db.lock().await);
-        assert_eq!(cfg.house_since, Some(since));
-        assert_eq!(cfg.senate_since, Some(since));
-        let r = refresh(&src, &db, &cfg).await.unwrap();
-        assert_eq!(r.new_filings, 100);
-        assert!(!r.capped);
         for key in ["last_refresh_date_house", "last_refresh_date_senate"] {
             assert_eq!(db.lock().await.meta(key).unwrap(), Some(Utc::now().date_naive().to_string()));
         }
@@ -1653,7 +1607,7 @@ mod tests {
         let cfg = RefreshConfig::incremental_at(&db, today);
         assert_eq!(cfg.senate_since, Some(NaiveDate::from_ymd_opt(2027, 1, 24).unwrap()));
         assert!(db.meta("last_refresh_date_house").unwrap().is_none());
-        assert_eq!(cfg.house_years, vec![2026, 2027]);
+        assert_eq!(cfg.house_years, vec![2027]);
         seed_filing(&mut db, Chamber::House, "house:stored", today);
         db.set_meta("last_refresh_date_house", "2027-01-31").unwrap();
         db.set_meta("last_refresh_date_senate", "2026-12-31").unwrap();

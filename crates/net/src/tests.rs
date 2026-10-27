@@ -433,8 +433,8 @@ fn status_and_registry() {
     let temp = Temp::new();
     let guard = temp.guard(false);
     let rows = guard.status().unwrap();
-    assert_eq!(rows.len(), 4);
-    assert_eq!(rows.iter().map(|s| s.cap).collect::<Vec<_>>(), [3000, 1500, 1000, 300]);
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows.iter().map(|s| s.cap).collect::<Vec<_>>(), [3000, 1500, 1000, 300, 400, 20]);
     assert!(rows.iter().all(|s| s.enabled
         && s.requests_today == 0
         && s.last_request.is_none()
@@ -459,6 +459,96 @@ fn status_and_registry() {
     assert!(valid_email("person@example.test"));
     for email in ["", "missing-at", "a@localhost", "a@b.c\r\nInjected", "a@@b.c", "(a)@b.c"] {
         assert!(!valid_email(email));
+    }
+}
+
+#[tokio::test]
+async fn senate_is_permanently_disabled_before_any_transport_or_policy() {
+    let temp = Temp::new();
+    let server = Server::new(200, "", "should not be reached");
+    for offline in [false, true] {
+        let guard = server.attach(temp.guard(offline));
+        // Even a future accidental policy registration must not override the deny-list.
+        guard.policies.write().unwrap().push(HostPolicy {
+            host: "senate.gov",
+            group: "house-disclosures",
+            min_interval: Duration::ZERO,
+            per_minute: 20,
+            daily_cap: 400,
+            concurrency: 1,
+            cache_ttl: Duration::ZERO,
+            user_agent: UserAgent::Research,
+        });
+        for host in ["senate.gov", "efdsearch.senate.gov", "www.senate.gov", "future.senate.gov", "SENATE.GOV."] {
+            for group in ["house-disclosures", "unknown"] {
+                let request = reqwest::Client::new().get(format!("https://{host}/"));
+                assert_eq!(guard.send(group, request).await, Err(Refused::Disabled));
+            }
+        }
+    }
+    assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+    let redirect = Server::new(302, "Location: https://www.senate.gov/\r\n", "");
+    let guard = redirect.attach(temp.guard(false));
+    assert_eq!(
+        guard
+            .send("house-disclosures", reqwest::Client::new().get("https://disclosures-clerk.house.gov/redirect"))
+            .await,
+        Err(Refused::Disabled)
+    );
+    assert_eq!(redirect.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn house_instances_share_pacing_slots_cooldowns_and_switches() {
+    let temp = Temp::new();
+    let server =
+        Server::sequence(&[(200, "", "%PDF-fixture"), (429, "", "refused"), (200, "", "%PDF-fixture")], Duration::ZERO);
+    let a = server.attach(temp.guard(false));
+    let b = server.attach(temp.guard(false));
+    let request = || reqwest::Client::new().get("https://disclosures-clerk.house.gov/new.pdf");
+    assert!(a.claim_slot("congress:refresh", Duration::from_secs(1800)).unwrap());
+    assert!(!b.claim_slot("congress:refresh", Duration::from_secs(1800)).unwrap());
+    assert!(a.send("house-disclosures", request()).await.is_ok());
+    assert_eq!(b.send("house-disclosures", request()).await, Err(Refused::Busy));
+    age(&b, "house-disclosures");
+    assert!(matches!(b.send("house-disclosures", request()).await, Err(Refused::Paused { .. })));
+    assert!(matches!(a.send("house-disclosures", request()).await, Err(Refused::Paused { .. })));
+    let fresh = server.attach(temp.guard(false));
+    assert!(matches!(fresh.send("house-disclosures", request()).await, Err(Refused::Paused { .. })));
+    assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+    fresh.db().unwrap().execute("UPDATE cooldowns SET until=0", []).unwrap();
+    age(&fresh, "house-disclosures");
+    assert!(fresh.send("house-disclosures", request()).await.is_ok());
+    assert_eq!(server.hits.load(Ordering::SeqCst), 3);
+    {
+        let requests = server.requests.lock().unwrap();
+        assert!(requests.iter().all(|r| r.contains("terminal-rs/") && !r.contains("Mozilla")));
+    }
+    let offline = server.attach(temp.guard(true));
+    assert_eq!(offline.send("house-disclosures", request()).await, Err(Refused::Offline));
+    fresh.configure(Settings { pause_all: true, ..Default::default() });
+    for (group, url) in [
+        ("house-disclosures", "https://disclosures-clerk.house.gov/new.pdf"),
+        ("house-roster", "https://clerk.house.gov/xml/lists/MemberData.xml"),
+    ] {
+        assert_eq!(fresh.send(group, reqwest::Client::new().get(url)).await, Err(Refused::Disabled));
+        let policy = policies().into_iter().find(|p| p.group == group).unwrap();
+        assert!(policy.min_interval >= Duration::from_secs(3));
+    }
+    assert_eq!(server.hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn invalid_house_downloads_pause_the_shared_group() {
+    for body in ["<html>Sign in to continue</html>", "not a zip"] {
+        let temp = Temp::new();
+        let server = Server::new(200, "", body);
+        let guard = server.attach(temp.guard(false));
+        let other = server.attach(temp.guard(false));
+        let request = || reqwest::Client::new().get("https://disclosures-clerk.house.gov/2026FD.zip");
+        assert!(matches!(guard.send("house-disclosures", request()).await, Err(Refused::Paused { .. })));
+        assert!(matches!(other.send("house-disclosures", request()).await, Err(Refused::Paused { .. })));
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
     }
 }
 

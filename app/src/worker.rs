@@ -1209,11 +1209,7 @@ impl Worker {
         // Scheduled congressional disclosure refresh.
         let s = shared.clone();
         rt.spawn(async move {
-            if let Ok(paused) = refresh::paused_sources(&*s.db.lock().await)
-                && !paused.is_empty()
-            {
-                s.send(Response::CongressPaused(paused.join(" · ")));
-            }
+            s.send(Response::CongressPaused(refresh::SENATE_PAUSED.into()));
             let minutes = congress_refresh_minutes();
             if minutes == 0 {
                 return;
@@ -1223,7 +1219,7 @@ impl Worker {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                congress_refresh(&s).await;
+                congress_refresh(&s, false).await;
             }
         });
         Ok(Self { tx, rx, _rt: rt })
@@ -1304,11 +1300,27 @@ async fn edgar_loop(s: Arc<Shared>, mut interest: tokio::sync::watch::Receiver<(
     }
 }
 
-async fn congress_refresh(s: &Shared) {
-    if congress_refresh_minutes() == 0 {
+async fn congress_refresh(s: &Shared, manual: bool) {
+    let minutes = congress_refresh_minutes();
+    if minutes == 0 {
         return s.send(Response::Status("Congress refresh disabled".into()));
     }
-    // A single reusable source serialises manual and scheduled runs and preserves pacing.
+    let net = match tr_net::shared() {
+        Ok(net) => net,
+        Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED))),
+    };
+    if let Err(e) = net.check("house-disclosures") {
+        return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED)));
+    }
+    // Manual refresh bypasses cadence only, never the shared request guard.
+    if !manual {
+        match net.claim_slot("congress:refresh", Duration::from_secs(minutes.saturating_mul(60))) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED))),
+        }
+    }
+    // A single reusable source serialises manual and scheduled runs.
     let Ok(mut guard) = s.congress_source.try_lock() else {
         return s.send(Response::Status("Congress refresh already running".into()));
     };
@@ -1319,7 +1331,7 @@ async fn congress_refresh(s: &Shared) {
         }
     }
     let source = guard.as_ref().expect("source initialised");
-    s.send(Response::Status("Refreshing congressional disclosures (Senate eFD + House Clerk)…".into()));
+    s.send(Response::Status(format!("Refreshing House Clerk disclosures… · {}", refresh::SENATE_PAUSED)));
     let cfg = RefreshConfig::incremental(&*s.db.lock().await);
     match refresh::refresh(source, &s.db, &cfg).await {
         Ok(report) => {
@@ -2416,7 +2428,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let _ = db.mark_alerts_seen();
             s.send(Response::Alerts(db.alerts(false, 200).unwrap_or_default()));
         }
-        Request::RefreshCongress => congress_refresh(s).await,
+        Request::RefreshCongress => congress_refresh(s, true).await,
         Request::Forget(pane) => {
             s.series.lock().expect("series lock").remove(&pane);
         }
