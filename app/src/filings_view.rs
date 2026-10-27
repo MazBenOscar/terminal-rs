@@ -122,10 +122,16 @@ pub fn show(ui: &mut Ui, settings: &mut Settings, state: &State, watched: &[Stri
     egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, dp(24.), rows.len(), |ui, range| {
         for i in range {
             let f = rows[i];
-            let filed = f.time_label();
+            let (filed, filed_full) =
+                crate::feed_time::feed_time(f.time(), chrono::Utc::now().timestamp(), f.accepted.is_none());
             let display = settings.display_ticker(f, watched);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(filed).font(theme::mono(10.)).color(theme::muted()));
+                ui.label(
+                    RichText::new(format!("{filed:>width$}", width = crate::feed_time::WIDTH_CHARS))
+                        .font(theme::mono(10.))
+                        .color(theme::muted()),
+                )
+                .on_hover_text(filed_full);
                 ui.label(RichText::new(&display).font(theme::mono(11.)).color(theme::amber()));
                 let detail = f.detail();
                 let response = ui.add(

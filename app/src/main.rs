@@ -31,6 +31,7 @@ mod dock;
 pub mod drawing_history;
 mod drawing_paint;
 pub mod edit_log;
+mod feed_time;
 mod filings_view;
 mod layout;
 mod layouts;
