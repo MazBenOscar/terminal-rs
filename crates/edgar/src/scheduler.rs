@@ -197,20 +197,6 @@ impl<T: Transport> Scheduler<T> {
         if watched.is_empty() {
             return Ok(());
         }
-        // Re-space when companies are added, without resetting a slot on every tick.
-        let signature = watched.keys().map(u64::to_string).collect::<Vec<_>>().join(",");
-        if let Some(previous) = self.store.get("watched")?
-            && previous != signature
-        {
-            for cik in watched.keys() {
-                if !previous.split(',').any(|s| s == cik.to_string()) {
-                    self.store.set(&format!("new:{cik}"), 1)?;
-                }
-            }
-            let soon = (self.store.number("last_import")? + 60).max(now);
-            self.store.set("next_sweep", self.store.number("next_sweep")?.min(soon))?;
-        }
-        self.store.set("watched", signature)?;
         if due(self.store.number("feed_checked")?, now, CYCLE) {
             self.store.set("feed_checked", now)?;
             for form in ["8-K", "4"] {
@@ -283,7 +269,6 @@ impl<T: Transport> Scheduler<T> {
         if !self.claim(&format!("sec:sub:{cik}"), CYCLE)? {
             return Ok(());
         }
-        self.store.remove(&format!("new:{cik}"))?;
         let pending = self.pending(cik)?;
         if pending && !daily {
             let attempts = self.transport.increment_counter(
@@ -385,11 +370,17 @@ impl<T: Transport> Scheduler<T> {
         Ok(())
     }
     async fn sweep(&mut self, watched: &BTreeMap<u64, String>, now: i64) -> Result<()> {
-        let has_new = watched.keys().any(|cik| {
-            self.store.number(&format!("new:{cik}")).unwrap_or(0) != 0
-                && self.store.number(&format!("attempt:{cik}")).unwrap_or(0) == 0
+        // Never-attempted companies (including every company on a fresh install, where no previous
+        // watched signature exists) get their first import a minute apart, not one sweep slot apart.
+        // Once attempted, a failing company follows its backoff and the regular sweep instead.
+        let has_new = watched.keys().any(|&cik| {
+            let number = |key: String| self.store.number(&key).unwrap_or(0);
+            number(format!("attempt:{cik}")) == 0
+                && number(format!("pending_dropped:{cik}")) == 0
+                && self.company_due(cik, now).unwrap_or(false)
         });
-        if (self.store.number("next_sweep")? > now && !has_new) || self.store.number("last_import")? + 144 > now {
+        let gap = if has_new { 60 } else { 144 };
+        if (self.store.number("next_sweep")? > now && !has_new) || self.store.number("last_import")? + gap > now {
             return Ok(());
         }
         let period = sweep_days(watched.len()) * DAY;
@@ -404,7 +395,7 @@ impl<T: Transport> Scheduler<T> {
             if due(self.store.number(&format!("swept:{cik}"))?, now, period)
                 && self.company_due(cik, now)?
                 && self.transport.pending_allowed()?
-                && self.claim("sec:sweep", 144)?
+                && self.claim("sec:sweep", gap)?
                 && self.claim(&format!("sec:sweep:{cik}"), period)?
             {
                 self.transport.clear_counter(&format!("sec:pending:{cik}"))?;

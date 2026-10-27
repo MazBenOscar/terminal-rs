@@ -174,14 +174,18 @@ async fn daily_sweep_spreads_first_run_no_history_pages_and_no_catchup_burst() {
     scheduler.tick(NOW, true, &symbols).await;
     assert_eq!(requests.lock().unwrap().len(), 1);
     assert_eq!(scheduler.store.number("next_sweep").unwrap(), NOW + 43200);
-    scheduler.tick(NOW + 60, true, &symbols).await;
+    // First imports run a minute apart (never a burst), not one 12 h sweep slot apart.
+    scheduler.tick(NOW + 30, true, &symbols).await;
     assert_eq!(requests.lock().unwrap().len(), 1);
-    scheduler.store.set("feed_checked", NOW + 43200).unwrap();
-    scheduler.tick(NOW + 43200, true, &symbols).await;
+    scheduler.tick(NOW + 60, true, &symbols).await;
     assert_eq!(requests.lock().unwrap().len(), 2);
     let apple: Vec<_> = scheduler.store.filings().unwrap().into_iter().filter(|f| f.cik == 320193).collect();
     assert!(!apple.is_empty());
-    assert!(apple.iter().all(|f| f.filed >= NOW + 43200 - 30 * 86400));
+    assert!(apple.iter().all(|f| f.filed >= NOW + 60 - 30 * 86400));
+    // Both imported: the regular sweep waits a full day per company.
+    scheduler.store.set("feed_checked", NOW + 43200).unwrap();
+    scheduler.tick(NOW + 43260, true, &symbols).await;
+    assert_eq!(requests.lock().unwrap().len(), 2);
     // Restart-like long gap: still one sweep, no catch-up for every missed day.
     scheduler.store.set("map_checked", NOW + 5 * 86400).unwrap();
     scheduler.store.set("feed_checked", NOW + 5 * 86400).unwrap();
@@ -508,7 +512,7 @@ async fn added_companies_import_without_bursts_and_large_lists_stretch_the_sweep
     let mut scheduler = Scheduler::new(quiet_store(), fake);
     scheduler.tick(NOW, true, &["AAPL".into()]).await;
     let symbols = vec!["AAPL".into(), "OTHER".into(), "PPTA".into()];
-    for (seconds, count) in [(60, 1), (144, 2), (145, 2), (288, 3)] {
+    for (seconds, count) in [(59, 1), (60, 2), (119, 2), (120, 3), (600, 3)] {
         scheduler.tick(NOW + seconds, true, &symbols).await;
         assert_eq!(requests.lock().unwrap().len(), count);
     }
@@ -651,4 +655,26 @@ async fn review_two_instances_double_feed_polling() {
     second.tick(NOW + 30, true, &symbols).await;
     let feeds = requests.lock().unwrap().iter().filter(|r| r.contains("/cgi-bin/")).count();
     assert!(feeds <= 2, "{feeds} feed requests within one 10-minute cycle across instances");
+}
+
+#[tokio::test]
+async fn first_run_imports_every_watched_company_within_minutes_spaced_a_minute_apart() {
+    // Fresh install: no previous "watched" signature, so no company carries a new: flag.
+    let fake = Fake::new();
+    let requests = fake.requests.clone();
+    let mut scheduler = Scheduler::new(quiet_store(), fake);
+    let symbols = vec!["AAPL US Equity".into(), "PPTA US Equity".into(), "OTHER US Equity".into()];
+    let mut seen: Vec<(i64, usize)> = vec![];
+    for minute in 0..=10 {
+        scheduler.tick(NOW + minute * 60, true, &symbols).await;
+        let count = requests.lock().unwrap().len();
+        if seen.last().map(|s| s.1) != Some(count) {
+            seen.push((minute, count));
+        }
+    }
+    assert_eq!(requests.lock().unwrap().len(), 3, "all three first imports within ten minutes: {seen:?}");
+    assert!(seen.windows(2).all(|w| w[1].0 - w[0].0 >= 1 && w[1].1 - w[0].1 == 1), "never a burst: {seen:?}");
+    for cik in [320193, 1526243, 42] {
+        assert!(scheduler.store.number(&format!("initialized:{cik}")).unwrap() > 0, "CIK {cik} not imported");
+    }
 }
