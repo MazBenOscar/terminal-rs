@@ -85,6 +85,10 @@ impl TerminalApp {
         let mut child = ui.new_child(UiBuilder::new().max_rect(inner).id_salt(("pane", id)));
         child.set_clip_rect(inner.intersect(ui.clip_rect()));
         let ui = &mut child;
+        // N3: capture pane context before borrowing its settings.
+        let filings_link = self.panes[i].link;
+        let filings_list = if self.watchlists.len() == 1 { self.watchlists[0].name.as_str() } else { "All watchlists" };
+        // N3
         match &mut self.panes[i].kind {
             PaneKind::Feed { filter } => {
                 actions.extend(congress_view::feed(ui, &self.latest, filter, &freshness, watchlists))
@@ -133,10 +137,43 @@ impl TerminalApp {
             // N2
             PaneKind::Filings(settings) => {
                 let watched: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
-                crate::filings_view::show(ui, settings, &self.edgar, &watched);
+                // N3: keyboard focus, link navigation and the existing watchlist action path.
+                actions.extend(crate::filings_view::show(
+                    ui,
+                    settings,
+                    &self.edgar,
+                    &watched,
+                    crate::filings_view::PaneContext {
+                        focused: chart_focused,
+                        keyboard_id: egui::Id::new(id),
+                        link: filings_link,
+                        watchlist_name: filings_list,
+                    },
+                ));
+                // N3
             }
-            PaneKind::News(n) => {
-                actions.extend(super::news_view::show(ui, n, &self.watchlists));
+            PaneKind::News(_) => {
+                let link = self.panes[i].link;
+                let news_focused = focused && !self.agent_captures_focus(ui.ctx()) && self.cmd.is_empty();
+                let PaneKind::News(n) = &mut self.panes[i].kind else { unreachable!() };
+                actions.extend(super::news_view::show(
+                    ui,
+                    n,
+                    &self.watchlists,
+                    &mut self.prefs.keyword_watches,
+                    news_focused,
+                    link,
+                    self.active_watchlist,
+                ));
+                if !n.seen_queue.is_empty() {
+                    self.worker.send(Request::NewsSeen(std::mem::take(&mut n.seen_queue)));
+                }
+                if std::mem::take(&mut n.interaction.open_data_sources) {
+                    self.settings_tab = super::SettingsTab::DataSources;
+                }
+                if std::mem::take(&mut n.interaction.save_watches) {
+                    self.save_prefs();
+                }
             }
             // N1a
             PaneKind::Options(o) => {

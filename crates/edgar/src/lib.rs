@@ -1,4 +1,5 @@
 //! Watchlist-only SEC EDGAR metadata. No history pages and no market-wide backfill.
+pub mod insider;
 pub mod scheduler;
 pub mod store;
 
@@ -13,8 +14,14 @@ pub struct Company {
     pub ticker: String,
     pub title: String,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Filing {
+    #[serde(default)]
+    pub insiders: Vec<insider::Transaction>,
+    #[serde(default)]
+    pub insider_unavailable: bool,
+    #[serde(default)]
+    pub insider_parsed: bool,
     pub accession: String,
     pub cik: u64,
     pub ticker: String,
@@ -44,8 +51,14 @@ impl Filing {
             filing_url(self.cik, &self.accession, &self.primary_doc)
         }
     }
-    pub fn matches_symbol(&self, symbol: &str) -> bool {
+    pub fn matches_issuer_symbol(&self, symbol: &str) -> bool {
         ticker(symbol).is_some_and(|t| t == self.ticker || self.tickers.contains(&t))
+    }
+    pub fn matches_symbol(&self, symbol: &str) -> bool {
+        self.matches_issuer_symbol(symbol)
+            && (!matches!(self.form.as_str(), "4" | "4/A")
+                || self.insiders.is_empty()
+                || self.insiders.iter().any(|t| t.matches_symbol(self, symbol)))
     }
     pub fn time(&self) -> i64 {
         self.accepted.unwrap_or(self.filed)

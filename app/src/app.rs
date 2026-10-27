@@ -183,8 +183,8 @@ impl OptionsPane {
     }
 }
 
-// N1a
-mod news_view;
+// N1b
+pub(crate) mod news_view;
 pub struct NewsPane {
     pub symbol: Option<String>,
     pub items: Vec<tr_data::news_store::Story>,
@@ -197,6 +197,14 @@ pub struct NewsPane {
     pub loading: bool,
     pub fetched: Option<Instant>,
     pub query: Option<crate::worker::NewsView>,
+    pub display: news_view::Display,
+    pub interaction: news_view::Interaction,
+    pub seen_queue: Vec<String>,
+    // N1b: revisions invalidate presentation once, never by scanning on repaint.
+    pub item_revision: u64,
+    pub cache: news_view::RowCache,
+    pub read_in_view: std::collections::BTreeSet<String>,
+    pub local_seen: std::collections::BTreeSet<String>,
 }
 impl NewsPane {
     pub fn new(symbol: Option<String>) -> Self {
@@ -212,16 +220,42 @@ impl NewsPane {
             loading: true,
             fetched: None,
             query: None,
+            display: Default::default(),
+            interaction: Default::default(),
+            seen_queue: vec![],
+            item_revision: 0,
+            cache: Default::default(),
+            read_in_view: Default::default(),
+            local_seen: Default::default(),
         }
     }
-    fn apply(&mut self, items: Vec<tr_data::news_store::Story>) {
-        if items.is_empty() {
-            return;
+    fn apply(&mut self, mut items: Vec<tr_data::news_store::Story>) {
+        // Seen is monotonic. A reply already in flight before the seen write
+        // cannot undo a user action, including across scope changes.
+        for item in &mut items {
+            item.seen |= self.local_seen.contains(&item.id);
         }
+        self.item_revision = self.item_revision.wrapping_add(1);
         if self.paused {
-            self.pending = items;
+            if !items.is_empty() {
+                self.pending = items;
+            }
         } else {
-            self.items = items;
+            if items.len() != self.items.len()
+                || items.iter().zip(&self.items).any(|(a, b)| {
+                    a.id != b.id
+                        || a.item != b.item
+                        || a.source != b.source
+                        || a.tags != b.tags
+                        || a.summary != b.summary
+                })
+            {
+                self.read_in_view.clear();
+            }
+            // Keep the retained snapshot on empty queries (N1a).
+            if !items.is_empty() {
+                self.items = items;
+            }
             self.pending.clear();
         }
     }
@@ -256,7 +290,7 @@ impl NewsPane {
             .count()
     }
 }
-// N1a
+// N1b
 
 pub struct BookPane {
     pub symbol: String,
@@ -402,12 +436,17 @@ impl PaneKind {
             PaneKind::Wei => PaneSettings::Wei,
             PaneKind::Curve => PaneSettings::Curve,
             PaneKind::Search { query } => PaneSettings::Search(query.clone()),
-            // N1a
+            // N1b
             PaneKind::News(n) => PaneSettings::News(
-                (n.symbol.is_some() || n.filters != Default::default())
-                    .then(|| crate::layouts::NewsSettings { symbol: n.symbol.clone(), filters: n.filters.clone() }),
+                (n.symbol.is_some() || n.filters != Default::default() || n.display != Default::default()).then(|| {
+                    crate::layouts::NewsSettings {
+                        symbol: n.symbol.clone(),
+                        filters: n.filters.clone(),
+                        display: n.display.clone(),
+                    }
+                }),
             ),
-            // N1a
+            // N1b
             // N2
             PaneKind::Filings(f) => PaneSettings::Filings(f.clone()),
             PaneKind::OrderBook(b) => {
@@ -487,14 +526,15 @@ impl PaneKind {
             PaneSettings::Wei => PaneKind::Wei,
             PaneSettings::Curve => PaneKind::Curve,
             PaneSettings::Search(q) => PaneKind::Search { query: q },
-            // N1a
+            // N1b
             PaneSettings::News(s) => {
                 let saved = s.unwrap_or_default();
                 let mut pane = NewsPane::new(saved.symbol);
                 pane.filters = saved.filters;
+                pane.display = saved.display;
                 PaneKind::News(Box::new(pane))
             }
-            // N1a
+            // N1b
             // N2
             PaneSettings::Filings(f) => PaneKind::Filings(f),
             PaneSettings::OrderBook { symbol, depth, group } => {
@@ -1600,6 +1640,9 @@ impl TerminalApp {
                     self.open_panel(PaneKind::Ticker { symbol: s, trades: Vec::new(), loading: true })
                 }
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
+                // N3: an explicit Reload wakes the worker, without resetting durable cadence.
+                Action::ReloadFilings => self.edgar.interest = None,
+                // N3
                 Action::AddToWatchlist(symbol) => {
                     let name = self.watchlists[self.active_watchlist].name.clone();
                     self.add_watchlist_symbol(&name, symbol, None);
@@ -1693,10 +1736,15 @@ impl TerminalApp {
             }
             // N2
             Command::SymbolFunction(s, Function::Filings) => {
-                self.open_panel(PaneKind::Filings(crate::filings_view::Settings::new(Some(s.clone()))));
+                if !self.retarget_feed(&s, false) {
+                    self.open_panel(PaneKind::Filings(crate::filings_view::Settings::new(Some(s.clone()))));
+                }
+                self.status = format!("{s}: filings");
             }
             Command::SymbolFunction(s, Function::News) => {
-                self.open_panel(PaneKind::News(Box::new(NewsPane::new(Some(s.clone())))));
+                if !self.retarget_feed(&s, true) {
+                    self.open_panel(PaneKind::News(Box::new(NewsPane::new(Some(s.clone())))));
+                }
                 self.status = format!("{s}: news");
             }
             Command::SymbolFunction(s, Function::OrderBook(depth)) => {
@@ -2121,10 +2169,11 @@ impl TerminalApp {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
                 // N2: shared store snapshot, never clear rows on a failed refresh.
-                Response::Edgar { rows, status, updated } => {
+                Response::Edgar { rows, status, updated, flags } => {
                     self.edgar.rows = rows;
                     self.edgar.status = status;
                     self.edgar.updated = updated;
+                    self.edgar.flags = flags;
                 }
                 Response::WatchlistColumns { revision, cells, computed_at } => {
                     if let Some((cells, computed_at)) = finish_columns_reply(
@@ -2340,27 +2389,23 @@ impl TerminalApp {
                         }
                     }
                 }
-                // N1a: stale query replies cannot replace a newly selected scope.
-                Response::NewsStatus { view, status } => {
+                // N1b: stale query replies cannot replace a newly selected scope.
+                Response::NewsStatus { view, status, updated } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == view.pane)
                         && let PaneKind::News(n) = &mut p.kind
                         && n.query.as_ref() == Some(&view)
                     {
-                        if status.contains("updated just now") {
-                            n.updated = Some(Instant::now());
-                        }
+                        n.updated = updated;
                         n.status = status;
                     }
                 }
-                Response::NewsSaved { view, items, status } => {
+                Response::NewsSaved { view, items, status, updated } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == view.pane)
                         && let PaneKind::News(n) = &mut p.kind
                         && n.query.as_ref() == Some(&view)
                     {
                         n.loading = false;
-                        if status.contains("updated just now") {
-                            n.updated = Some(Instant::now());
-                        }
+                        n.updated = updated;
                         n.status = status;
                         match items {
                             Ok(items) => {
@@ -2371,7 +2416,7 @@ impl TerminalApp {
                         }
                     }
                 }
-                // N1a
+                // N1b
                 Response::OrderBook { pane, symbol, book } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
                         && let PaneKind::OrderBook(b) = &mut p.kind
@@ -2513,7 +2558,7 @@ impl TerminalApp {
         if self.agent_escape(ctx) || (!self.palette.open && self.agent_captures_focus(ctx)) {
             return;
         }
-        let presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
+        let mut presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|e| match e {
@@ -2562,6 +2607,58 @@ impl TerminalApp {
         if other_text_focused {
             return;
         }
+        // N3: feed navigation wins over type-anywhere and unmodified desk hotkeys.
+        if !cmd_focused
+            && self.cmd.is_empty()
+            && let Some(index) = self.idx(self.focus)
+            && let PaneKind::Filings(settings) = &self.panes[index].kind
+        {
+            let handled: Vec<_> = [
+                Key::ArrowUp,
+                Key::ArrowDown,
+                Key::J,
+                Key::K,
+                Key::Enter,
+                Key::Space,
+                Key::C,
+                Key::Slash,
+                Key::Escape,
+                Key::U,
+            ]
+            .into_iter()
+            .filter(|key| crate::filings_view::pane_uses_key(ctx, egui::Id::new(self.focus), settings, *key))
+            .collect();
+            let uses = |key| handled.contains(&key);
+            // Include auto-repeat. Strip only Text paired with a consumed unmodified key;
+            // leave Key events for the pane, and Shift+letters for type-anywhere.
+            ctx.input_mut(|i| {
+                let mut pane_text = false;
+                i.events.retain(|e| match e {
+                    Event::Key { key, modifiers, pressed: true, .. } => {
+                        pane_text = *modifiers == Modifiers::NONE && uses(*key);
+                        true
+                    }
+                    Event::Text(_) => !pane_text,
+                    _ => true,
+                });
+            });
+            presses.retain(|(key, modifiers)| *modifiers != Modifiers::NONE || !uses(*key));
+        }
+        // N3
+        // N1b: consume only feed-owned events; unrelated chords and text still
+        // run through this pass. Repeats must be removed before type-anywhere.
+        if !cmd_focused
+            && self.cmd.is_empty()
+            && let Some(i) = self.idx(self.focus)
+            && let PaneKind::News(n) = &mut self.panes[i].kind
+        {
+            let keys = ctx.input_mut(|input| {
+                news_view::capture_keys(input, n.interaction.selected.is_some(), !n.filters.search.is_empty())
+            });
+            presses.retain(|(key, modifiers)| *modifiers != Modifiers::NONE || !keys.contains(key));
+            n.interaction.pending_keys.extend(keys);
+        }
+        // N1b
         if !cmd_focused && self.cmd.is_empty() && self.focused_is_chart() {
             let mut handled = false;
             self.with_chart(|chart, worker| handled = chart.replay_keys(ctx, worker));
@@ -3066,11 +3163,12 @@ impl eframe::App for TerminalApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.agent_logic(ctx);
         self.process_logic();
-        // N2: publish interest only on changes, never an HTTP request per frame.
+        // N3: publish unpaused visible interest only on changes, never per-frame HTTP.
         let active = self.agent_demo.is_none()
             && edgar_window_visible(frame)
             && ctx.input(|i| i.viewport().minimized != Some(true))
-            && self.visible_panes().iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Filings(_)));
+            && self.visible_panes().iter().any(|&i| matches!(&self.panes[i].kind, PaneKind::Filings(f) if !f.paused));
+        // N3
         let mut symbols: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
         symbols.sort();
         symbols.dedup();
@@ -3430,6 +3528,56 @@ mod tests {
         assert_eq!(take_open_urls(&ctx), vec![form4.to_string()]);
         assert!(take_open_urls(&ctx).is_empty());
         assert!(ctx.output(|o| o.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(_)))));
+    }
+
+    #[test]
+    fn bare_ticker_from_a_feed_pane_goes_to_the_chart() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/feed-ticker-routing");
+        let mut app = TerminalApp::test_workspace(&root);
+        let chart_symbol = |app: &TerminalApp| {
+            app.panes.iter().find_map(|p| match &p.kind {
+                PaneKind::Chart(c) => Some(c.symbol.clone()),
+                _ => None,
+            })
+        };
+        for (open, feed_symbol) in [("AAPL N", "news"), ("AAPL CF", "filings")] {
+            app.execute(open);
+            let feed = app.focus;
+            let symbol_of =
+                |app: &TerminalApp| app.idx(feed).and_then(|i| app.panes[i].kind.symbol().map(str::to_owned));
+            let before = symbol_of(&app);
+            app.execute("JPM");
+            assert_eq!(chart_symbol(&app).as_deref(), Some("JPM US Equity"), "{feed_symbol}: chart takes the ticker");
+            assert_eq!(symbol_of(&app), before, "{feed_symbol}: unlinked feed pane keeps its symbol");
+            assert!(matches!(app.panes[app.idx(app.focus).unwrap()].kind, PaneKind::Chart(_)));
+        }
+    }
+
+    #[test]
+    fn ticker_news_and_filings_retarget_the_existing_pane_and_keep_filters() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/feed-retarget");
+        let mut app = TerminalApp::test_workspace(&root);
+        app.execute("AAPL N");
+        let news = app.focus;
+        let index = app.idx(news).unwrap();
+        if let PaneKind::News(n) = &mut app.panes[index].kind {
+            n.filters.search = "earnings".into();
+            n.filters.scope = tr_data::news_store::Scope::All;
+        }
+        let count = app.panes.len();
+        app.execute("MSFT N");
+        assert_eq!(app.panes.len(), count, "no duplicate News pane");
+        assert_eq!(app.focus, news);
+        let PaneKind::News(n) = &app.panes[app.idx(news).unwrap()].kind else { panic!("news pane replaced") };
+        assert_eq!(n.symbol.as_deref(), Some("MSFT US Equity"));
+        assert_eq!(n.filters.search, "earnings");
+        assert_eq!(n.filters.scope, tr_data::news_store::Scope::Symbol);
+        app.execute("AAPL CF");
+        let filings = app.focus;
+        let count = app.panes.len();
+        app.execute("MSFT CF");
+        assert_eq!((app.panes.len(), app.focus), (count, filings));
+        assert_eq!(app.panes[app.idx(filings).unwrap()].kind.symbol(), Some("MSFT US Equity"));
     }
 
     type SaveLog = std::sync::Arc<std::sync::Mutex<Vec<(SaveWrite, std::thread::ThreadId)>>>;

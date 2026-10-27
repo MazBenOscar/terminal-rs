@@ -31,6 +31,20 @@ pub trait Transport: Send + Sync {
     fn clear_counter(&self, _key: &str) -> std::result::Result<(), Refused> {
         Ok(())
     }
+    fn decrement_counter(&self, _key: &str) -> std::result::Result<(), Refused> {
+        Ok(())
+    }
+    fn release_slot(&self, _key: &str) -> std::result::Result<(), Refused> {
+        Ok(())
+    }
+    fn reserve_counter(&self, key: &str, next: i64, limit: i64) -> std::result::Result<bool, Refused> {
+        if self.increment_counter(key, next)? <= limit {
+            Ok(true)
+        } else {
+            self.decrement_counter(key)?;
+            Ok(false)
+        }
+    }
     fn get(
         &self,
         url: &str,
@@ -40,6 +54,21 @@ pub trait Transport: Send + Sync {
 }
 pub struct Sec;
 impl Transport for Sec {
+    fn reserve_counter(&self, key: &str, _next: i64, limit: i64) -> std::result::Result<bool, Refused> {
+        // Production charges the allowance at each actual guarded HTTP hop, not here.
+        Ok(tr_net::shared()?.counter(key)? < limit)
+    }
+    fn decrement_counter(&self, key: &str) -> std::result::Result<(), Refused> {
+        if key.starts_with("sec:f4:day:") {
+            // Never refund an HTTP request that did reach the server (e.g. a 403 pause).
+            Ok(())
+        } else {
+            tr_net::shared()?.decrement_counter(key)
+        }
+    }
+    fn release_slot(&self, key: &str) -> std::result::Result<(), Refused> {
+        tr_net::shared()?.release_slot(key)
+    }
     fn increment_counter(&self, key: &str, _local_next: i64) -> std::result::Result<i64, Refused> {
         tr_net::shared()?.increment_counter(key)
     }
@@ -73,7 +102,9 @@ impl Transport for Sec {
         if let Some(modified) = modified {
             request = request.header(reqwest::header::IF_MODIFIED_SINCE, modified);
         }
-        let (body, metadata) = if url.starts_with("https://data.sec.gov/submissions/") {
+        let (body, metadata) = if url.starts_with("https://www.sec.gov/Archives/") {
+            guard.send_with_consumer_budget("sec", request, 1200, "sec:f4:day:", 300).await?
+        } else if url.starts_with("https://data.sec.gov/submissions/") {
             guard.send_with_metadata_budget("sec", request, 1200).await?
         } else {
             guard.send_with_metadata("sec", request).await?
@@ -93,20 +124,30 @@ pub fn refusal_label(reason: &Refused) -> String {
         _ => reason.to_string(),
     }
 }
+/// Machine-readable snapshot status. Presentation text is never used to infer empty-state causes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatusFlags {
+    pub unavailable: bool,
+    pub importing: bool,
+    pub budget_deferred: bool,
+}
 pub struct Scheduler<T = Sec> {
     pub store: Store,
     transport: T,
     pub status: String,
+    pub flags: StatusFlags,
 }
 impl<T: Transport> Scheduler<T> {
     pub fn new(store: Store, transport: T) -> Self {
-        Self { store, transport, status: "SEC EDGAR · not updated yet".into() }
+        Self { store, transport, status: "SEC EDGAR · not updated yet".into(), flags: StatusFlags::default() }
     }
     pub async fn tick(&mut self, now: i64, active: bool, symbols: &[String]) {
         if !active {
             return;
         }
+        self.flags = StatusFlags::default();
         if self.store.prune(now).is_err() {
+            self.flags.unavailable = true;
             self.status = "SEC EDGAR · store unavailable".into();
             return;
         }
@@ -115,6 +156,8 @@ impl<T: Transport> Scheduler<T> {
             return;
         }
         if let Err(reason) = self.transport.check() {
+            self.flags.budget_deferred = matches!(reason, Refused::Budget | Refused::Busy);
+            self.flags.unavailable = !self.flags.budget_deferred;
             self.status = refusal_label(&reason);
             return;
         }
@@ -129,8 +172,21 @@ impl<T: Transport> Scheduler<T> {
                 if let Ok(companies) = self.store.companies() {
                     let watched = watched(&companies, symbols);
                     if !self.transport.pending_allowed().unwrap_or(false) {
+                        self.flags.budget_deferred = true;
                         self.status.push_str(" · Company refresh deferred to reserve the feed budget");
                     }
+                    let imported = watched
+                        .keys()
+                        .filter(|cik| self.store.number(&format!("initialized:{cik}")).unwrap_or(0) > 0)
+                        .count();
+                    self.flags.importing = imported < watched.len();
+                    if self.flags.importing {
+                        self.status.push_str(&format!(
+                            " · Importing filings: {imported} of {} companies (one a minute while visible).",
+                            watched.len()
+                        ));
+                    }
+                    self.backlog_status(&watched, now);
                     let days = sweep_days(watched.len());
                     if days > 1 {
                         self.status
@@ -152,10 +208,18 @@ impl<T: Transport> Scheduler<T> {
                 }
             }
             Err(e) => {
+                self.flags.budget_deferred =
+                    matches!(e.downcast_ref::<Refused>(), Some(Refused::Budget | Refused::Busy));
+                self.flags.unavailable = !self.flags.budget_deferred;
                 self.status = e
                     .downcast_ref::<Refused>()
                     .map(refusal_label)
-                    .unwrap_or_else(|| "SEC EDGAR · refresh unavailable (stored filings retained)".into())
+                    .unwrap_or_else(|| "SEC EDGAR · refresh unavailable (stored filings retained)".into());
+                if e.downcast_ref::<Refused>().is_none()
+                    && let Ok(companies) = self.store.companies()
+                {
+                    self.backlog_status(&watched(&companies, symbols), now);
+                }
             }
         }
     }
@@ -244,7 +308,121 @@ impl<T: Transport> Scheduler<T> {
             }
         }
         self.sweep(&watched, now).await?;
+        self.insiders(&watched, now).await?;
         self.store.prune(now)?;
+        Ok(())
+    }
+    fn insider_backlog(&self, watched: &BTreeMap<u64, String>) -> Result<Vec<(crate::Filing, i64)>> {
+        Ok(self
+            .store
+            .insider_backlog()?
+            .into_iter()
+            .filter(|(f, _)| watched.contains_key(&f.cik) && crate::insider::xml_url(f).is_some())
+            .collect())
+    }
+    fn backlog_status(&mut self, watched: &BTreeMap<u64, String>, now: i64) {
+        if let Ok(rows) = self.insider_backlog(watched) {
+            let waiting = rows.iter().filter(|(_, retry)| *retry > now).count();
+            let eligible = rows.len() - waiting;
+            if !rows.is_empty() {
+                self.status.push_str(&format!(" · Reading insider forms: {eligible} left"));
+                if waiting > 0 {
+                    self.status.push_str(&format!(" ({waiting} waiting to retry)"));
+                }
+            }
+        }
+    }
+    /// One document per timer turn (deliberately below the four-per-minute ceiling).
+    /// No sleeping worker or catch-up bursts; all pacing/ownership also lives in the shared ledger.
+    async fn insiders(&mut self, watched: &BTreeMap<u64, String>, now: i64) -> Result<()> {
+        if !self.transport.pending_allowed()? {
+            return Ok(());
+        }
+        let candidates = self.insider_backlog(watched)?;
+        for (f, retry) in candidates {
+            let key = format!("sec:f4:{}", f.accession);
+            let attempts_key = format!("f4:attempts:{}", f.accession);
+            let attempts = self.store.number(&attempts_key)?;
+            if retry > now {
+                continue;
+            }
+            // Never reserve an accession when pacing or the daily ceiling prevents a request.
+            let day = chrono::DateTime::from_timestamp(now, 0)
+                .ok_or_else(|| anyhow::anyhow!("Invalid clock"))?
+                .format("%Y%m%d")
+                .to_string();
+            let day_key = format!("sec:f4:day:{day}");
+            if self.store.number(&day_key)? >= 300 {
+                return Ok(());
+            }
+            if !self.claim("sec:f4:pace", 15)? {
+                return Ok(());
+            }
+            let slot = if attempts == 0 { key.clone() } else { format!("{key}:attempt:{}", attempts + 1) };
+            if !self.claim(&slot, 30 * DAY)? {
+                if attempts == 0 {
+                    // Another instance owns this immutable document. No local details are
+                    // available; don't advertise an endless backlog or retry its XML.
+                    self.store.set(&attempts_key, 3)?;
+                }
+                continue;
+            }
+            if attempts == 0 && self.transport.increment_counter(&format!("{key}:initial"), 1)? > 1 {
+                // A 30-day lease expiring must not make an already-read form fresh again
+                // in a throwaway data directory. This durable tombstone is never cleared.
+                self.store.set(&attempts_key, 3)?;
+                return Ok(());
+            }
+            let attempts = self.transport.increment_counter(&format!("{key}:attempts"), attempts + 1)?;
+            self.store.set(&attempts_key, attempts)?;
+            if attempts > 3 {
+                continue;
+            }
+            // Fixtures reserve only after a successful claim, then refund unsent refusals.
+            // Sec preflights here; its guard charges the real counter atomically per HTTP
+            // hop at send time. Never refund that counter for a sent response (403, etc.).
+            if !self.transport.reserve_counter(&day_key, self.store.number(&day_key)? + 1, 300)? {
+                self.refund_form(&key, &slot, &attempts_key, attempts - 1)?;
+                return Ok(());
+            }
+            self.store.set(&day_key, self.store.number(&day_key)? + 1)?;
+            let retry_key = format!("f4:retry:{}", f.accession);
+            // Write ahead of the await: a cancelled request still consumes its attempt and
+            // backs off for an hour. The worker normally lets the whole tick finish.
+            self.store.set(&retry_key, now + 3600)?;
+            let result = self.transport.get(&crate::insider::xml_url(&f).unwrap(), None, None).await;
+            match result {
+                Ok(reply) => {
+                    match crate::insider::parse_document(&reply.body) {
+                        Ok(document) => self.store.save_insiders(&f, &document)?,
+                        Err(_) => self.store.set(&format!("f4:terminal:{}", f.accession), 1)?,
+                    }
+                    // Immutable parse/decode/mismatch results are terminal, not source failures.
+                    self.store.remove(&retry_key)?;
+                }
+                Err(Refused::Http(_) | Refused::Transport) => {
+                    let backoff = [3600, 21600, 86400][(attempts - 1).min(2) as usize];
+                    self.store.set(&retry_key, now + backoff)?;
+                }
+                Err(reason) => {
+                    self.store.remove(&retry_key)?;
+                    self.refund_form(&key, &slot, &attempts_key, attempts - 1)?;
+                    self.transport.decrement_counter(&day_key)?;
+                    self.store.set(&day_key, (self.store.number(&day_key)? - 1).max(0))?;
+                    return Err(reason.into());
+                }
+            }
+            return Ok(());
+        }
+        Ok(())
+    }
+    fn refund_form(&self, key: &str, slot: &str, attempts_key: &str, previous: i64) -> Result<()> {
+        self.transport.decrement_counter(&format!("{key}:attempts"))?;
+        if previous == 0 {
+            self.transport.decrement_counter(&format!("{key}:initial"))?;
+        }
+        self.transport.release_slot(slot)?;
+        self.store.set(attempts_key, previous)?;
         Ok(())
     }
     fn pending(&self, cik: u64) -> Result<bool> {

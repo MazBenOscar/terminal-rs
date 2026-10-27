@@ -14,20 +14,38 @@ pub struct Story {
     pub item: NewsItem,
     pub source: String,
     pub provider_id: String,
+    /// Transport provider is separate from the publisher used for story leads.
+    #[serde(default)]
+    pub provider: String,
+    /// Ordered mentioned securities; associations remain in item.tickers.
+    #[serde(default)]
+    pub subjects: Vec<String>,
     pub summary: String,
     pub category: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub seen: bool,
 }
 impl Story {
+    pub fn known_tickers(&self) -> &[String] {
+        if self.subjects.is_empty() { &self.item.tickers } else { &self.subjects }
+    }
     pub fn new(item: NewsItem, source: &str) -> Self {
         let link = normalize_link(&item.link);
         let identity = if link.is_empty() { format!("{source}|{}", item.title) } else { link.clone() };
+        let tags = crate::news_intelligence::topic_tags(&item.title);
         Self {
             id: Sha1::digest(identity.as_bytes()).iter().map(|b| format!("{b:02x}")).collect(),
             item: NewsItem { link, ..item },
             source: source.into(),
             provider_id: String::new(),
+            provider: source.into(),
+            subjects: vec![],
             summary: String::new(),
             category: "general".into(),
+            tags,
+            seen: false,
         }
     }
 }
@@ -108,17 +126,34 @@ impl Default for Query {
 }
 /// Apply view filters to a retained snapshot without deleting it on an empty query.
 pub fn matches(story: &Story, q: &Query) -> bool {
+    matches_columns(
+        &format!("{} {}", story.item.title, story.summary),
+        &story.item.tickers,
+        (&story.source, &story.provider),
+        &story.category,
+        story.item.ts,
+        q,
+    )
+}
+// N1b: SQL matching needs no identity hash, URL parsing or topic enrichment.
+fn matches_columns(
+    text: &str,
+    tickers: &[String],
+    provenance: (&str, &str),
+    category: &str,
+    ts: i64,
+    q: &Query,
+) -> bool {
     let f = &q.filters;
-    let text = format!("{} {}", story.item.title, story.summary);
-    story.item.ts >= q.start
-        && story.item.ts <= q.end
+    ts >= q.start
+        && ts <= q.end
         && !(f.scope == Scope::Watchlist && q.symbols.is_empty())
-        && !(f.scope == Scope::Symbol && q.symbols.is_empty() && story.category != "general")
-        && (q.symbols.is_empty() || q.symbols.iter().any(|key| story.item.tickers.contains(key)))
-        && (f.sources.is_empty() || f.sources.contains(&story.source))
-        && (f.include.is_empty() || whole_word(&text, &f.include))
-        && (f.exclude.is_empty() || !whole_word(&text, &f.exclude))
-        && search_matches(&text, &f.search)
+        && !(f.scope == Scope::Symbol && q.symbols.is_empty() && category != "general")
+        && (q.symbols.is_empty() || q.symbols.iter().any(|key| tickers.contains(key)))
+        && (f.sources.is_empty() || f.sources.iter().any(|s| s == provenance.0 || s == provenance.1))
+        && (f.include.is_empty() || whole_word(text, &f.include))
+        && (f.exclude.is_empty() || !whole_word(text, &f.exclude))
+        && search_matches(text, &f.search)
 }
 /// Same token-prefix semantics in FTS, LIKE fallback and the retained view.
 fn terms(text: &str) -> Vec<String> {
@@ -154,7 +189,20 @@ pub fn whole_word(text: &str, keywords: &str) -> bool {
 pub struct NewsStore {
     db: Connection,
     fts: bool,
+    names: Option<crate::news_intelligence::NameIndex>,
+    edgar: Option<EdgarNames>,
+    watched: Vec<String>,
+    pending_names: Option<String>,
+    pending_watched: bool,
 }
+type CompanyNames = Vec<(u64, String, String)>;
+struct EdgarNames {
+    db: Connection,
+    version: i64,
+    companies: CompanyNames,
+    signature: (i64, i64),
+}
+
 impl NewsStore {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Self::init(Connection::open(path)?)
@@ -173,19 +221,19 @@ impl NewsStore {
                 let q: Query =
                     serde_json::from_str(&raw).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
                 let tickers: String = ctx.get(2)?;
-                let mut story = Story::new(
-                    NewsItem {
-                        title: ctx.get(0)?,
-                        publisher: String::new(),
-                        link: String::new(),
-                        ts: ctx.get(5)?,
-                        tickers: serde_json::from_str(&tickers).unwrap_or_default(),
-                    },
-                    &ctx.get::<String>(3)?,
-                );
-                story.summary = ctx.get(1)?;
-                story.category = ctx.get(4)?;
-                Ok(matches(&story, &q))
+                let provenance: String = ctx.get(3)?;
+                let (source, provider) = provenance.split_once('\0').unwrap_or((&provenance, &provenance));
+                let title: String = ctx.get(0)?;
+                let summary: String = ctx.get(1)?;
+                let category: String = ctx.get(4)?;
+                Ok(matches_columns(
+                    &format!("{title} {summary}"),
+                    &serde_json::from_str::<Vec<String>>(&tickers).unwrap_or_default(),
+                    (source, provider),
+                    &category,
+                    ctx.get(5)?,
+                    &q,
+                ))
             },
         )?;
         db.execute_batch(
@@ -197,6 +245,24 @@ impl NewsStore {
             CREATE INDEX IF NOT EXISTS news_published ON items(published DESC);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
+        let columns: Vec<String> =
+            db.prepare("PRAGMA table_info(items)")?.query_map([], |r| r.get(1))?.collect::<rusqlite::Result<_>>()?;
+        if !columns.iter().any(|c| c == "tags") {
+            db.execute("ALTER TABLE items ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'", [])?;
+        }
+        if !columns.iter().any(|c| c == "intelligence") {
+            db.execute("ALTER TABLE items ADD COLUMN intelligence INTEGER NOT NULL DEFAULT 0", [])?;
+        }
+        if !columns.iter().any(|c| c == "provider") {
+            db.execute("ALTER TABLE items ADD COLUMN provider TEXT NOT NULL DEFAULT ''", [])?;
+        }
+        if !columns.iter().any(|c| c == "subjects") {
+            db.execute("ALTER TABLE items ADD COLUMN subjects TEXT NOT NULL DEFAULT '[]'", [])?;
+        }
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS news_subject_backfill ON items(published DESC) WHERE intelligence<2",
+            [],
+        )?;
         let fts = db
             .execute_batch(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS news_fts USING fts5(id UNINDEXED, headline, summary);
@@ -207,32 +273,134 @@ impl NewsStore {
             INSERT INTO news_fts SELECT id,headline,summary FROM items WHERE id NOT IN (SELECT id FROM news_fts);",
             )
             .is_ok();
-        let store = Self { db, fts };
+        let store =
+            Self { db, fts, names: None, edgar: None, watched: vec![], pending_names: None, pending_watched: false };
+        if store.meta("subject_matcher")?.as_deref() != Some(crate::news_intelligence::MATCHER_VERSION) {
+            let tx = store.db.unchecked_transaction()?;
+            tx.execute("UPDATE items SET intelligence=1 WHERE intelligence>=2", [])?;
+            tx.execute(
+                "INSERT OR REPLACE INTO meta VALUES('subject_matcher',?1)",
+                [crate::news_intelligence::MATCHER_VERSION],
+            )?;
+            tx.commit()?;
+        }
         store.prune(chrono::Utc::now().timestamp())?;
         Ok(store)
+    }
+    /// Called only on the news worker. Missing/unreadable SEC data is optional.
+    /// data_version changes on external commits; only a changed companies map
+    /// rebuilds the index (filing imports do not). No requests or EDGAR writes.
+    pub fn refresh_names(&mut self, path: &std::path::Path) -> Result<()> {
+        if self.edgar.is_none() {
+            if !path.is_file() {
+                return Ok(());
+            }
+            let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            db.busy_timeout(std::time::Duration::from_millis(100))?;
+            self.edgar = Some(EdgarNames { db, version: -1, companies: vec![], signature: (-1, -1) });
+        }
+        let source = self.edgar.as_mut().expect("opened above");
+        let version = source.db.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        if source.version != version {
+            // Most external commits are filings. Pre-check before loading any Rust company rows.
+            let signature = source.db.query_row("SELECT count(*),coalesce(max(rowid),0) FROM companies", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+            let changed = self.names.is_none() || signature != source.signature
+                // Count/rowid alone cannot detect in-place ticker/title corrections. Compare in
+                // SQLite without reloading companies or rebuilding the index on filing-only commits.
+                || source.db.query_row("SELECT EXISTS(SELECT cik,ticker,title FROM companies EXCEPT SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]'),json_extract(value,'$[2]') FROM json_each(?1))",
+                    [serde_json::to_string(&source.companies)?], |r| r.get::<_, bool>(0))?;
+            if changed {
+                let companies: CompanyNames = source
+                    .db
+                    .prepare("SELECT cik,ticker,title FROM companies ORDER BY cik,ticker")?
+                    .query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let fingerprint: String =
+                    Sha1::digest(serde_json::to_vec(&companies)?).iter().map(|b| format!("{b:02x}")).collect();
+                // Install memory state BEFORE optional writes: a read-only history disk must not
+                // discard the names index or rebuild 10k names on each refresh.
+                self.names = Some(crate::news_intelligence::NameIndex::new(&companies));
+                source.companies = companies;
+                self.pending_names = Some(fingerprint);
+            }
+            source.signature = signature;
+            source.version = version;
+        }
+        if let Some(fingerprint) = self.pending_names.as_ref() {
+            if self.meta("subject_names")?.as_deref() != Some(fingerprint) {
+                let tx = self.db.unchecked_transaction()?;
+                tx.execute("UPDATE items SET intelligence=1 WHERE intelligence>=2", [])?;
+                tx.execute("INSERT OR REPLACE INTO meta VALUES('subject_names',?1)", [fingerprint])?;
+                tx.commit()?;
+            }
+            self.pending_names = None;
+        }
+        Ok(())
+    }
+    /// User watchlists admit bare tickers, but never create scope associations by name.
+    pub fn set_watched(&mut self, watched: &[String]) -> Result<()> {
+        let mut watched = watched.to_vec();
+        watched.sort();
+        watched.dedup();
+        self.watched = watched;
+        let fingerprint = serde_json::to_string(&self.watched)?;
+        if self.meta("subject_watched")?.as_deref() != Some(&fingerprint) {
+            self.pending_watched = true;
+            let tx = self.db.unchecked_transaction()?;
+            tx.execute("UPDATE items SET intelligence=1 WHERE intelligence>=2", [])?;
+            tx.execute("INSERT OR REPLACE INTO meta VALUES('subject_watched',?1)", [&fingerprint])?;
+            tx.commit()?;
+        }
+        self.pending_watched = false;
+        Ok(())
+    }
+    fn names(&self) -> &crate::news_intelligence::NameIndex {
+        self.names.as_ref().unwrap_or_else(|| crate::news_intelligence::default_names())
     }
     pub fn prune(&self, now: i64) -> Result<usize> {
         Ok(self.db.execute("DELETE FROM items WHERE published < ?1 AND bookmark=0", [now - 90 * 86400])?)
     }
     pub fn insert(&mut self, stories: &[Story], now: i64) -> Result<()> {
+        let names = self.names.as_ref().unwrap_or_else(|| crate::news_intelligence::default_names());
         let tx = self.db.transaction()?;
         for story in stories {
-            let canonical = Story::new(story.item.clone(), &story.source);
+            // N1a used the transport source for link-less identities. Keep that
+            // fallback even though N1b displays the publisher separately.
+            let identity_source = if story.provider.is_empty() { &story.source } else { &story.provider };
+            let canonical = Story::new(story.item.clone(), identity_source);
             let id = canonical.id;
-            tx.execute("INSERT OR IGNORE INTO items(id,source,provider_id,url,headline,summary,published,tickers,category,fetched) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![id, story.source, story.provider_id, canonical.item.link, story.item.title, story.summary, story.item.ts, serde_json::to_string(&story.item.tickers)?, story.category, now])?;
-            let raw: String = tx.query_row("SELECT tickers FROM items WHERE id=?1", [&id], |r| r.get(0))?;
+            tx.execute("INSERT OR IGNORE INTO items(id,source,provider_id,url,headline,summary,published,tickers,category,fetched,provider) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![id, story.source, story.provider_id, canonical.item.link, story.item.title, story.summary, story.item.ts, serde_json::to_string(&story.item.tickers)?, story.category, now, story.provider])?;
+            let (raw, title, summary): (String, String, String) =
+                tx.query_row("SELECT tickers,headline,summary FROM items WHERE id=?1", [&id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
             let mut tickers: Vec<String> = serde_json::from_str(&raw)?;
-            tickers.extend(story.item.tickers.iter().cloned());
+            tickers.extend(story.item.tickers.clone());
+            tickers = names.explicit_tickers(&format!("{title} {summary}"), &tickers, &self.watched);
+            tickers.extend(names.explicit_tickers(&story.item.title, &story.item.tickers, &self.watched));
+            let subjects = names.subjects_watched(&title, &summary, &tickers, &self.watched);
+            let tags = crate::news_intelligence::topic_tags(&title);
             tickers.sort();
             tickers.dedup();
             // A company/general duplicate must still reach the default market pane.
             // Preserve general membership if later fetched through a narrower endpoint.
             tx.execute(
-                "UPDATE items SET tickers=?2, category=CASE
+                "UPDATE items SET tickers=?2, tags=?4, subjects=?6, intelligence=2,
+                provider=CASE WHEN provider='' THEN source ELSE provider END,
+                source=CASE WHEN provider='' OR source=provider THEN ?5 ELSE source END, category=CASE
                 WHEN category='general' OR ?3='general' THEN 'general'
                 WHEN ?3 IN ('forex','crypto','merger') THEN ?3 ELSE category END WHERE id=?1",
-                params![id, serde_json::to_string(&tickers)?, story.category],
+                params![
+                    id,
+                    serde_json::to_string(&tickers)?,
+                    story.category,
+                    serde_json::to_string(&tags)?,
+                    story.source,
+                    serde_json::to_string(&subjects)?
+                ],
             )?;
         }
         tx.commit()?;
@@ -255,8 +423,44 @@ impl NewsStore {
             |r| r.get(0),
         )?)
     }
+    pub fn mark_seen(&self, ids: &[String]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        for id in ids {
+            tx.execute("UPDATE items SET seen=1 WHERE id=?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Bounded lazy migration, executed only by the history worker, never by UI.
+    fn backfill(&self, q: &Query) -> Result<()> {
+        let mut stmt = self.db.prepare("SELECT id,headline,tickers,summary FROM items WHERE intelligence<2 AND published>=?1 AND published<=?2 ORDER BY published DESC LIMIT 2000")?;
+        let rows = stmt
+            .query_map(params![q.start, q.end], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.unchecked_transaction()?;
+        for (id, title, raw, summary) in rows {
+            let associated = serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default();
+            let tickers = self.names().explicit_tickers(&format!("{title} {summary}"), &associated, &self.watched);
+            let subjects = self.names().subjects_watched(&title, &summary, &tickers, &self.watched);
+            let tags = crate::news_intelligence::topic_tags(&title);
+            tx.execute(
+                "UPDATE items SET tickers=?2,tags=?3,subjects=?4,intelligence=2,provider=CASE WHEN provider='' THEN source ELSE provider END WHERE id=?1",
+                params![id, serde_json::to_string(&tickers)?, serde_json::to_string(&tags)?, serde_json::to_string(&subjects)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn query(&self, q: &Query) -> Result<Vec<Story>> {
-        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category FROM items WHERE published>=?1 AND published<=?2".to_string();
+        // Enrichment is optional: read-only disks and transient write failures
+        // must never hide otherwise readable saved history.
+        let _ = self.backfill(q);
+        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category,tags,seen,provider,subjects,intelligence FROM items WHERE published>=?1 AND published<=?2".to_string();
         let search = if self.fts && !q.filters.search.trim().is_empty() {
             sql.push_str(" AND id IN (SELECT id FROM news_fts WHERE news_fts MATCH ?3)");
             let terms = terms(&q.filters.search);
@@ -270,7 +474,7 @@ impl NewsStore {
             let first = terms(&q.filters.search).into_iter().next().unwrap_or_default();
             format!("%{}%", first.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
         };
-        sql.push_str(" AND news_matches(headline,summary,tickers,source,category,published,?4) ORDER BY published DESC,id LIMIT ?5 OFFSET ?6");
+        sql.push_str(" AND news_matches(headline,summary,tickers,source||char(0)||provider,category,published,?4) ORDER BY published DESC,id LIMIT ?5 OFFSET ?6");
         let mut stmt = self.db.prepare(&sql)?;
         let rows = stmt.query_map(
             params![
@@ -278,7 +482,7 @@ impl NewsStore {
                 q.end,
                 search,
                 serde_json::to_string(q)?,
-                q.limit.min(1000) as i64,
+                q.limit.min(crate::news_intelligence::MAX_ITEMS) as i64,
                 q.offset.min(i64::MAX as usize) as i64
             ],
             |r| {
@@ -287,8 +491,18 @@ impl NewsStore {
                     id: r.get(0)?,
                     source: r.get(1)?,
                     provider_id: r.get(2)?,
+                    provider: r.get(11)?,
                     summary: r.get(5)?,
+                    // Rows beyond this bounded backfill may still contain old matcher output.
+                    // Prefer a muted association until they have been re-derived.
+                    subjects: if r.get::<_, i64>(13)? < 2 {
+                        vec![]
+                    } else {
+                        serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default()
+                    },
                     category: r.get(8)?,
+                    tags: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+                    seen: r.get(10)?,
                     item: NewsItem {
                         link: r.get(3)?,
                         title: r.get(4)?,
@@ -299,6 +513,19 @@ impl NewsStore {
                 })
             },
         )?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        if self.pending_names.is_some() || self.pending_watched {
+            // Optional invalidation writes can fail on read-only disks. Never display stale
+            // amber chips when the installed in-memory matcher has newer evidence.
+            for story in &mut rows {
+                story.subjects = self.names().subjects_watched(
+                    &story.item.title,
+                    &story.summary,
+                    &story.item.tickers,
+                    &self.watched,
+                );
+            }
+        }
+        Ok(rows)
     }
 }

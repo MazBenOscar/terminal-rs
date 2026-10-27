@@ -79,7 +79,9 @@ Warnings use `amber` text only when the user can act; otherwise `muted`.
 ```
 
 - **Story clusters**: one row per story, the lead headline from the best source; trailing meta "Reuters +4" (four more sources). Expanding lists the member headlines (time, source, headline), indented, muted. A "Stories / Wire" toggle in `⋯` (Stories by default).
-- **Tickers**: provider tickers plus extracted ones (cashtags, then bare uppercase words validated against the symbol catalogue; "shouting" headlines skip bare words). First ticker in the column, the rest as "+N" in meta (hover lists them, click opens a small menu).
+- **Tickers / subjects**: stored `tickers` are associations (queried symbols, provider-related symbols and extracted securities), used for Symbol/Watchlist membership. Ordered `subjects` identify securities actually mentioned, headline first and then summary. The ticker column shows the first subject in amber; `+N` counts other visible subjects. Symbol scope omits the linked ticker only if it is a subject. With no identified subject, show the first association in muted text, with e.g. "Returned by Finnhub for MSFT; not mentioned in the story". Every displayed ticker opens its own chart. Story hover distinguishes "About: FROG · Also returned for: MSFT".
+- **Subject intelligence**: worker-built token/phrase hash maps use the local EDGAR companies table (read-only, optional) plus the catalogue and fixed crypto aliases. Strip legal/share-class suffixes, prefer SEC's first-listed common class, and choose the longest whole phrase. Ambiguous word-names and very short names require stock context, a matching provider association or explicit ticker evidence; distinctive names match directly. Bare uppercase tickers retain the denylist and shouting guard. Crypto uses existing `BTCUSD Curncy`-style keys; Ripple requires crypto context. Cluster ticker-disjointness uses subjects, falling back to associations.
+- **Migration / cost**: `items.subjects` defaults to `[]`; intelligence version 2 backfills at most 2,000 retained rows per worker query before scope filtering. Failed enrichment never fails a saved read. A changed EDGAR companies map invalidates subject enrichment; unrelated filing commits do not rebuild the name index. UI models cache subject/fallback choices and hover metadata on invalidation, never matching names on settled frames.
 - **Topic tags**: at most two, from a fixed whole-word lexicon (Earnings, Guidance, M&A, FDA, Macro, Crypto, Analyst, Insider, Legal); muted text, no colour.
 - **Keyword watches**: managed in the Filters popover (name, words, one colour from a fixed set of 6 theme-safe hues). Matching rows get the gutter stripe; the matched words render in that colour with an underline. A "Watch hits" chip filters to them.
 - **Unread**: a per-item seen flag in the store; the header shows "8 unread" and `u` toggles "Unread only".
@@ -109,3 +111,8 @@ Warnings use `amber` text only when the user can act; otherwise `muted`.
 ## Out of scope here
 
 Visual polish of spacing, density variants and light themes (the polish pass), desktop notifications (N4), sentiment.
+
+## Polish backlog (2026-10-27, from in-app testing)
+
+- **Filings "Load once" for untracked symbols.** Beside "Add to watchlist" in the not-tracked empty state, a "Load once" button makes one guarded submissions request for that company and shows its last 30 days without tracking it. No later refreshes and no Form 4 document reads (those stay watchlist-only). Machine-wide at most once per CIK per 24 h (`claim_slot("sec:once:<cik>", 24 h)`), counted under the 80% reserve; refusals show in the status line.
+- **News header shows a symbol in Market scope** ("Market NVDA"): the effective-symbol label should appear only in Symbol scope (the list name in Watchlist scope, nothing in Market).

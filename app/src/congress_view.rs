@@ -14,6 +14,8 @@ use crate::worker::Profile;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Notice(String),
+    /// N3: reread the local feed through its existing visible worker interest path.
+    ReloadFilings,
     OpenChart(String),
     AddToCompare(String),
     ScanChart {

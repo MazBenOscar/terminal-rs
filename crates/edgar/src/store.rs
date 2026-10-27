@@ -5,6 +5,8 @@ use std::{path::Path, time::Duration};
 
 pub struct Store {
     db: Connection,
+    #[cfg(test)]
+    read_queries: std::cell::Cell<usize>,
 }
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -52,10 +54,38 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS filings_cik_time ON filings(cik,coalesce(accepted,filed));
             DELETE FROM meta WHERE key LIKE 'body:%'; COMMIT;",
         )?;
-        Ok(Self { db })
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS insider_transactions(
+            accession TEXT NOT NULL, seq INTEGER NOT NULL, cik INTEGER NOT NULL,
+            owner TEXT NOT NULL, owner_cik INTEGER, role TEXT NOT NULL, code TEXT NOT NULL,
+            date TEXT NOT NULL, shares REAL, price REAL, acquired INTEGER, owned_after REAL,
+            direct INTEGER, derivative INTEGER NOT NULL, plan_10b5_1 INTEGER NOT NULL,
+            owner_json TEXT NOT NULL, PRIMARY KEY(accession,seq));
+            CREATE INDEX IF NOT EXISTS insider_cik_date ON insider_transactions(cik,date);
+            CREATE TABLE IF NOT EXISTS insider_documents(accession TEXT PRIMARY KEY,cik INTEGER NOT NULL);",
+        )?;
+        let has_json = db
+            .prepare("PRAGMA table_info(insider_transactions)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|c| c == "transaction_json");
+        if !has_json {
+            db.execute_batch("ALTER TABLE insider_transactions ADD COLUMN transaction_json TEXT;")?;
+        }
+        Ok(Self {
+            db,
+            #[cfg(test)]
+            read_queries: Default::default(),
+        })
+    }
+    fn read(&self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'_>> {
+        #[cfg(test)]
+        self.read_queries.set(self.read_queries.get() + 1);
+        self.db.prepare(sql)
     }
     pub fn get(&self, key: &str) -> Result<Option<String>> {
-        Ok(self.db.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0)).optional()?)
+        Ok(self.read("SELECT value FROM meta WHERE key=?1")?.query_row([key], |r| r.get(0)).optional()?)
     }
     pub fn number(&self, key: &str) -> Result<i64> {
         Ok(self.get(key)?.and_then(|s| s.parse().ok()).unwrap_or(0))
@@ -73,8 +103,7 @@ impl Store {
     }
     pub fn companies(&self) -> Result<Vec<Company>> {
         Ok(self
-            .db
-            .prepare("SELECT cik,ticker,title FROM companies ORDER BY ticker")?
+            .read("SELECT cik,ticker,title FROM companies ORDER BY ticker")?
             .query_map([], |r| Ok(Company { cik: r.get::<_, i64>(0)? as u64, ticker: r.get(1)?, title: r.get(2)? }))?
             .collect::<rusqlite::Result<_>>()?)
     }
@@ -148,17 +177,67 @@ impl Store {
             reporting_owner: r.get(11)?,
             from_submissions: r.get(12)?,
             tickers: vec![],
+            insiders: vec![],
+            insider_unavailable: false,
+            insider_parsed: false,
         })
     }
     fn with_tickers(&self, mut rows: Vec<Filing>) -> Result<Vec<Filing>> {
-        let companies = self.companies()?;
+        use std::collections::BTreeMap;
+        let mut tickers: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        for c in self.companies()? {
+            tickers.entry(c.cik).or_default().push(c.ticker);
+        }
+        let documents: BTreeMap<String, u64> = self
+            .read("SELECT accession,cik FROM insider_documents")?
+            .query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let meta: BTreeMap<String, i64> = self
+            .read("SELECT key,CAST(value AS INTEGER) FROM meta WHERE key LIKE 'f4:%'")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut lots: BTreeMap<(String, u64), Vec<crate::insider::Transaction>> = BTreeMap::new();
+        // One batch query for the whole snapshot, including empty documents via the map above.
+        let accessions = serde_json::to_string(&rows.iter().map(|f| f.accession.as_str()).collect::<Vec<_>>())?;
+        let mut query = self.read("SELECT owner_json,code,date,shares,price,acquired,owned_after,direct,derivative,plan_10b5_1,transaction_json,accession,cik FROM insider_transactions WHERE accession IN (SELECT value FROM json_each(?1)) ORDER BY accession,seq")?;
+        for entry in query.query_map([accessions], |r| {
+            Ok((r.get::<_, String>(11)?, r.get::<_, i64>(12)? as u64, Self::transaction_row(r)?))
+        })? {
+            let (accession, cik, t) = entry?;
+            lots.entry((accession, cik)).or_default().push(t);
+        }
         for row in &mut rows {
-            row.tickers = companies.iter().filter(|c| c.cik == row.cik).map(|c| c.ticker.clone()).collect();
+            row.tickers = tickers.get(&row.cik).cloned().unwrap_or_default();
+            row.insiders = lots.get(&(row.accession.clone(), row.cik)).cloned().unwrap_or_default();
+            row.insider_parsed = documents.get(&row.accession) == Some(&row.cik);
+            row.reporting_owner |= documents.get(&row.accession).is_some_and(|cik| *cik != row.cik);
+            row.insider_unavailable = !row.insider_parsed
+                && (meta.get(&format!("f4:attempts:{}", row.accession)).copied().unwrap_or(0) >= 3
+                    || meta.contains_key(&format!("f4:terminal:{}", row.accession))
+                    || (matches!(row.form.as_str(), "4" | "4/A")
+                        && !row.primary_doc.is_empty()
+                        && crate::insider::xml_url(row).is_none()));
         }
         Ok(rows)
     }
+    /// Single SQL backlog query; never hydrate lots or scan the company list for candidates.
+    pub fn insider_backlog(&self) -> Result<Vec<(Filing, i64)>> {
+        Ok(self
+            .read(
+                "SELECT filings.*,CAST(coalesce(retry.value,'0') AS INTEGER) FROM filings
+            LEFT JOIN meta retry ON retry.key='f4:retry:'||accession
+            WHERE reporting_owner=0 AND form IN ('4','4/A') AND primary_doc!=''
+            AND filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER)
+            AND NOT EXISTS(SELECT 1 FROM insider_documents d WHERE d.accession=filings.accession)
+            AND NOT EXISTS(SELECT 1 FROM meta WHERE key='f4:terminal:'||accession)
+            AND CAST(coalesce((SELECT value FROM meta WHERE key='f4:attempts:'||accession),'0') AS INTEGER)<3
+            ORDER BY coalesce(accepted,filed) DESC,accession DESC",
+            )?
+            .query_map([], |r| Ok((Self::row(r)?, r.get(13)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
     pub fn filings(&self) -> Result<Vec<Filing>> {
-        let rows = self.db.prepare("SELECT * FROM filings WHERE filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER) ORDER BY coalesce(accepted,filed) DESC,accession DESC")?.query_map([], Self::row)?.collect::<rusqlite::Result<_>>()?;
+        let rows = self.read("SELECT * FROM filings WHERE filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER) ORDER BY coalesce(accepted,filed) DESC,accession DESC")?.query_map([], Self::row)?.collect::<rusqlite::Result<_>>()?;
         self.with_tickers(rows)
     }
     /// Uses the CIK/time index; chart loads never scan the entire filings store.
@@ -171,9 +250,117 @@ impl Store {
         let Some(cik) = cik else {
             return Ok(vec![]);
         };
-        let mut rows: Vec<Filing> = self.db.prepare("SELECT * FROM filings WHERE cik=?1 AND coalesce(accepted,filed) BETWEEN ?2 AND ?3 AND reporting_owner=0 AND filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER) ORDER BY coalesce(accepted,filed)")?.query_map(params![cik,start,end], Self::row)?.collect::<rusqlite::Result<_>>()?;
-        for row in &mut rows {
-            row.tickers = vec![ticker.clone()];
+        let mut rows: Vec<Filing> = self.read("SELECT * FROM filings WHERE cik=?1 AND coalesce(accepted,filed) BETWEEN ?2 AND ?3 AND reporting_owner=0 AND filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER) ORDER BY coalesce(accepted,filed)")?.query_map(params![cik,start,end], Self::row)?.collect::<rusqlite::Result<_>>()?;
+        // N3: trade dates can precede acceptance. Use the insider CIK/date index as a
+        // second path rather than incorrectly restricting trades to filing-time range.
+        let dates = chrono::DateTime::from_timestamp(start, 0).zip(chrono::DateTime::from_timestamp(end, 0));
+        if let Some((a, b)) = dates {
+            let accessions = self
+                .db
+                .prepare("SELECT DISTINCT accession FROM insider_transactions WHERE cik=?1 AND date BETWEEN ?2 AND ?3")?
+                .query_map(params![cik, a.format("%Y-%m-%d").to_string(), b.format("%Y-%m-%d").to_string()], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for accession in accessions {
+                if rows.iter().any(|f| f.accession == accession) {
+                    continue;
+                }
+                if let Some(f) = self.db.query_row("SELECT * FROM filings WHERE cik=?1 AND accession=?2 AND reporting_owner=0 AND filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER)",params![cik,accession],Self::row).optional()? { rows.push(f); }
+            }
+        }
+        self.with_tickers(rows)
+    }
+    /// An empty, successfully parsed form is complete too. Never refetch immutable forms.
+    pub fn insider_complete(&self, accession: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row("SELECT 1 FROM insider_documents WHERE accession=?1", [accession], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+    pub fn save_insiders(&mut self, f: &Filing, document: &crate::insider::Document) -> Result<()> {
+        // The fetching row may be a reporting owner. Persist once, under the XML issuer.
+        let issuer_cik = document.issuer_cik;
+        let tx = self.db.transaction()?;
+        if tx
+            .execute("INSERT OR IGNORE INTO insider_documents VALUES(?1,?2)", params![f.accession, issuer_cik as i64])?
+            == 0
+        {
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE OR IGNORE filings SET reporting_owner=1 WHERE accession=?1 AND cik!=?2",
+            params![f.accession, issuer_cik as i64],
+        )?;
+        tx.execute(
+            "DELETE FROM filings WHERE accession=?1 AND cik!=?2 AND reporting_owner=0",
+            params![f.accession, issuer_cik as i64],
+        )?;
+        for (seq, t) in document.transactions.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO insider_transactions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                params![
+                    f.accession,
+                    seq as i64,
+                    issuer_cik as i64,
+                    t.owner.name,
+                    t.owner.cik.map(|c| c as i64),
+                    t.owner.role(),
+                    t.code,
+                    t.date,
+                    t.shares,
+                    t.price,
+                    t.acquired,
+                    t.owned_after,
+                    t.direct,
+                    t.derivative,
+                    t.plan_10b5_1,
+                    serde_json::to_string(&t.owner)?,
+                    serde_json::to_string(t)?
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    fn transaction_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::insider::Transaction> {
+        if let Some(json) = r.get::<_, Option<String>>(10)? {
+            return serde_json::from_str(&json)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e)));
+        }
+        let owner: String = r.get(0)?;
+        Ok(crate::insider::Transaction {
+            owner: serde_json::from_str(&owner).unwrap_or_default(),
+            code: r.get(1)?,
+            date: r.get(2)?,
+            shares: r.get(3)?,
+            price: r.get(4)?,
+            acquired: r.get(5)?,
+            owned_after: r.get(6)?,
+            direct: r.get(7)?,
+            derivative: r.get(8)?,
+            plan_10b5_1: r.get(9)?,
+            ..Default::default()
+        })
+    }
+    pub fn insider_transactions(&self, accession: &str) -> Result<Vec<crate::insider::Transaction>> {
+        Ok(self.read("SELECT owner_json,code,date,shares,price,acquired,owned_after,direct,derivative,plan_10b5_1,transaction_json FROM insider_transactions WHERE accession=?1 ORDER BY seq")?
+            .query_map([accession], Self::transaction_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+    /// Date-indexed, store-only reader for analytics. Pane/chart rows also carry these lots.
+    pub fn insiders_for_cik(&self, cik: u64, start: &str, end: &str) -> Result<Vec<crate::insider::Transaction>> {
+        let accessions = self
+            .read("SELECT DISTINCT accession FROM insider_transactions WHERE cik=?1 AND date BETWEEN ?2 AND ?3")?
+            .query_map(params![cik as i64, start, end], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows = vec![];
+        for accession in accessions {
+            rows.extend(
+                self.insider_transactions(&accession)?
+                    .into_iter()
+                    .filter(|t| t.date.as_str() >= start && t.date.as_str() <= end),
+            );
         }
         Ok(rows)
     }
@@ -189,7 +376,10 @@ impl Store {
             .is_some())
     }
     pub fn prune(&self, now: i64) -> Result<usize> {
-        Ok(self.db.execute("DELETE FROM filings WHERE filed<?1", [now - 90 * 86400])?)
+        let removed = self.db.execute("DELETE FROM filings WHERE filed<?1", [now - 90 * 86400])?;
+        self.db.execute_batch("DELETE FROM insider_transactions WHERE NOT EXISTS(SELECT 1 FROM filings WHERE filings.accession=insider_transactions.accession);
+            DELETE FROM insider_documents WHERE NOT EXISTS(SELECT 1 FROM filings WHERE filings.accession=insider_documents.accession);")?;
+        Ok(removed)
     }
 }
 
@@ -237,6 +427,51 @@ mod tests {
         }
         let plans = store.db.prepare("EXPLAIN QUERY PLAN SELECT * FROM filings WHERE cik=?1 AND coalesce(accepted,filed) BETWEEN ?2 AND ?3 AND reporting_owner=0").unwrap().query_map(params![1,90,110],|r|r.get::<_,String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         assert!(plans.iter().any(|s| s.contains("filings_cik_time")), "{plans:?}");
+    }
+    #[test]
+    fn snapshot_300_companies_9000_rows_uses_five_queries_and_one_for_backlog() {
+        let mut store = Store::memory().unwrap();
+        let companies: Vec<_> =
+            (1..=300).map(|cik| Company { cik, ticker: format!("T{cik}"), title: String::new() }).collect();
+        store.replace_companies(&companies).unwrap();
+        let rows: Vec<_> = (0..9000)
+            .map(|i| Filing {
+                accession: format!("acc-{i}"),
+                cik: i % 300 + 1,
+                ticker: format!("T{}", i % 300 + 1),
+                form: "4".into(),
+                filed: 100,
+                primary_doc: "form4.xml".into(),
+                ..Default::default()
+            })
+            .collect();
+        store.upsert(&rows).unwrap();
+        for f in &rows {
+            store
+                .save_insiders(
+                    f,
+                    &crate::insider::Document {
+                        issuer_cik: f.cik,
+                        transactions: vec![crate::insider::Transaction {
+                            shares: Some(10.),
+                            price: Some(20.),
+                            code: "P".into(),
+                            security_title: "Common stock".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        store.read_queries.set(0);
+        let snapshot = store.filings().unwrap();
+        assert_eq!(snapshot.len(), 9000);
+        assert!(snapshot.iter().all(|f| f.insiders.len() == 1 && f.insider_parsed && f.tickers.len() == 1));
+        assert_eq!(store.read_queries.get(), 5, "snapshot must batch all row dependencies");
+        store.read_queries.set(0);
+        assert!(store.insider_backlog().unwrap().is_empty());
+        assert_eq!(store.read_queries.get(), 1);
     }
     #[test]
     fn legacy_store_migrates_and_discards_whole_submissions_bodies() {

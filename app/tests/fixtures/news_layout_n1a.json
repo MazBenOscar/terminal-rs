@@ -1,0 +1,1 @@
+{"version":9,"name":"N1a news","dock":{"type":"tabs","panes":[1,2]},"panes":[{"id":1,"News":{"symbol":"AAPL US Equity","filters":{"scope":"Symbol","watchlist":null,"sources":["Finnhub"],"include":"earnings","exclude":"ban","search":"growth","days":30}},"link":"Blue"},{"id":2,"News":null}]}

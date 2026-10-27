@@ -18,6 +18,7 @@ pub(super) struct Service {
     pub watchlist: Mutex<Vec<String>>,
     pub store: Mutex<Option<NewsStore>>,
     pub status: Mutex<String>,
+    pub updated: Mutex<Option<Instant>>,
     pub key: Mutex<Option<String>>,
     pub memory_only: Mutex<bool>,
     published: Mutex<Vec<Published>>,
@@ -78,6 +79,14 @@ pub(super) fn open_store(path: &std::path::Path) -> (Option<NewsStore>, bool) {
         }
     }
 }
+pub(super) async fn mark_seen(s: &Shared, ids: Vec<String>) {
+    if let Some(store) = s.news.store.lock().await.as_ref()
+        && let Err(error) = store.mark_seen(&ids)
+    {
+        tracing::warn!("cannot save news read state: {error}");
+    }
+    publish(s).await;
+}
 pub(super) async fn read(s: &Shared, view: View) {
     read_view(s, view, true).await;
 }
@@ -85,8 +94,24 @@ async fn read_view(s: &Shared, view: View, force: bool) {
     let now = chrono::Utc::now().timestamp();
     let days = view.filters.days.clamp(1, 90) as i64;
     let start = if days == 1 { tr_data::news_store::day_start(now) } else { now - days * 86400 };
-    let query = Query { symbols: view.symbols.clone(), filters: view.filters.clone(), start, ..Query::default() };
-    let items = match s.news.store.lock().await.as_ref() {
+    let query = Query {
+        symbols: view.symbols.clone(),
+        filters: view.filters.clone(),
+        start,
+        limit: tr_data::news_intelligence::MAX_ITEMS,
+        ..Query::default()
+    };
+    // N1b: hold the store lock through publication, so no pre-seen snapshot
+    // can be sent after a completed seen write. UI also overlays local actions
+    // on replies which were already in flight before that write.
+    let watched = s.news.watchlist.lock().await.clone();
+    let mut store_guard = s.news.store.lock().await;
+    if let Some(store) = store_guard.as_mut() {
+        let _ = store.set_watched(&watched);
+        // Optional, read-only local SEC map; failures never fail saved reads.
+        let _ = store.refresh_names(&data_dir().join("edgar.sqlite3"));
+    }
+    let items = match store_guard.as_ref() {
         Some(store) => store.query(&query).map_err(|_| "News store unavailable".into()),
         None => Err("News store unavailable".into()),
     };
@@ -94,16 +119,23 @@ async fn read_view(s: &Shared, view: View, force: bool) {
     if status.is_empty() {
         status = "Showing saved headlines".into();
     }
+    if view.filters.scope == tr_data::news_store::Scope::Symbol
+        && view.symbol.as_deref().is_some_and(|symbol| finnhub::symbol(symbol).is_some())
+        && s.news.key.lock().await.as_deref().is_none_or(|key| key.trim().is_empty())
+    {
+        status.push_str(" · Company news needs a Finnhub key.");
+    }
     if *s.news.memory_only.lock().await {
         status = format!("Saved headlines unavailable · {status}");
     }
     let (rows_changed, status_changed) = changed(&mut *s.news.published.lock().await, &view, &items, &status, force);
+    let updated = *s.news.updated.lock().await;
     if rows_changed {
-        s.send(Response::NewsSaved { view, items, status });
+        s.send(Response::NewsSaved { view, items, status, updated });
     } else if status_changed {
         // Status transitions (pause/offline/recovery) are separate from item replies.
         // No timestamp-only heartbeat or unchanged list is sent on the five-second tick.
-        s.send(Response::NewsStatus { view, status });
+        s.send(Response::NewsStatus { view, status, updated });
     }
 }
 async fn publish(s: &Shared) {
@@ -115,9 +147,7 @@ async fn publish(s: &Shared) {
 fn refusal_status(error: &tr_net::Refused) -> String {
     match error {
         tr_net::Refused::Paused { until } => {
-            let time = chrono::DateTime::from_timestamp(*until, 0)
-                .map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string())
-                .unwrap_or_default();
+            let time = crate::feed_time::feed_time(*until, chrono::Utc::now().timestamp(), false).0;
             format!("Finnhub paused until {time} — showing saved headlines")
         }
         _ => format!("Finnhub · {error} — showing saved headlines"),
@@ -209,9 +239,13 @@ fn fallback_items(items: Vec<tr_data::NewsItem>, target: Option<&str>) -> Vec<St
             if let Some(symbol) = target {
                 item.tickers.push(symbol.into());
             }
-            let source = if item.publisher.starts_with("CoinDesk") { "CoinDesk" } else { "Yahoo" };
-            let mut story = Story::new(item, source);
-            story.category = if source == "CoinDesk" {
+            let provider = if item.publisher.starts_with("CoinDesk") { "CoinDesk" } else { "Yahoo" };
+            // RSS appends the author after the publisher. Authors are not sources.
+            let publisher = item.publisher.split(" · ").next().unwrap_or_default().trim();
+            let source = if publisher.is_empty() { provider.to_string() } else { publisher.to_string() };
+            let mut story = Story::new(item, &source);
+            story.provider = provider.into();
+            story.category = if provider == "CoinDesk" {
                 "crypto"
             } else if target.is_some() {
                 "company"
@@ -238,6 +272,11 @@ pub(super) async fn run(s: Arc<Shared>) {
     let mut fallback = FallbackState::default();
     loop {
         interval.tick().await;
+        let watched = s.news.watchlist.lock().await.clone();
+        if let Some(store) = s.news.store.lock().await.as_mut() {
+            let _ = store.set_watched(&watched);
+            let _ = store.refresh_names(&data_dir().join("edgar.sqlite3"));
+        }
         let views = s.news.views.lock().await.clone();
         if views.is_empty() {
             continue;
@@ -277,6 +316,7 @@ pub(super) async fn run(s: Arc<Shared>) {
                                 status = "News store write failed — showing saved headlines".into();
                             } else {
                                 status = "Yahoo / CoinDesk · updated just now".into();
+                                *s.news.updated.lock().await = Some(Instant::now());
                             }
                         }
                     }
@@ -325,6 +365,7 @@ pub(super) async fn run(s: Arc<Shared>) {
                     Job::Company(_) => store.insert(&items, now).is_ok(),
                 });
                 if saved {
+                    *s.news.updated.lock().await = Some(Instant::now());
                     let count = symbols.iter().filter(|s| finnhub::symbol(s).is_some()).count();
                     let pacing = finnhub::company_status(count);
                     format!(

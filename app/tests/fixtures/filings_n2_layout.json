@@ -1,0 +1,7 @@
+{
+  "version": 9,
+  "name": "N2 Filings workspace",
+  "dock": {"type": "tabs", "panes": [1], "active": 0},
+  "panes": [{"id": 1, "Filings": {"symbol": "AAPL US Equity", "scope": "Symbol", "form": "Insider"}, "link": "Orange"}],
+  "focus": 1
+}

@@ -53,12 +53,13 @@ impl Link {
     }
 }
 
-// N1a: untagged legacy string support preserves pre-news-store layouts.
+// N1b: untagged legacy string support preserves pre-news-store layouts.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(from = "NewsCompat")]
 pub struct NewsSettings {
     pub symbol: Option<String>,
     pub filters: tr_data::news_store::Filters,
+    pub display: crate::app::news_view::Display,
 }
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -69,13 +70,15 @@ enum NewsCompat {
         symbol: Option<String>,
         #[serde(default)]
         filters: tr_data::news_store::Filters,
+        #[serde(default)]
+        display: crate::app::news_view::Display,
     },
 }
 impl From<NewsCompat> for NewsSettings {
     fn from(value: NewsCompat) -> Self {
         match value {
             NewsCompat::Legacy(symbol) => Self { symbol: Some(symbol), ..Default::default() },
-            NewsCompat::Current { symbol, filters } => Self { symbol, filters },
+            NewsCompat::Current { symbol, filters, display } => Self { symbol, filters, display },
         }
     }
 }
@@ -89,7 +92,7 @@ impl From<&str> for NewsSettings {
         symbol.to_string().into()
     }
 }
-// N1a
+// N1b
 fn default_drawing_tools() -> [tr_chart::drawings::Tool; 5] {
     crate::drawing_toolbar::State::default().last
 }

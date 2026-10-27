@@ -18,6 +18,7 @@ pub mod crypto;
 pub mod crypto_catalog;
 pub mod finnhub;
 pub mod markets;
+pub mod news_intelligence;
 pub mod news_store;
 pub mod questrade;
 pub mod rss;
@@ -71,6 +72,9 @@ pub enum EventKind {
     Split,
     /// SEC filing metadata from the local EDGAR store (never fetched on chart load).
     Filing,
+    /// Open-market Form 4 trades from the local EDGAR store.
+    InsiderBuy,
+    InsiderSell,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChartEvent {

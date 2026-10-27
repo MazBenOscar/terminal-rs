@@ -56,16 +56,18 @@ pub fn parse(bytes: &[u8], company: Option<&str>) -> anyhow::Result<Vec<Story>> 
             }
             tickers.sort();
             tickers.dedup();
+            let source = w.source.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "Finnhub".into());
             let mut story = Story::new(
                 NewsItem {
                     title: w.headline.unwrap_or_default(),
-                    publisher: w.source.unwrap_or_default(),
+                    publisher: source.clone(),
                     link: w.url.unwrap_or_default(),
                     ts: w.datetime,
                     tickers,
                 },
-                "Finnhub",
+                &source,
             );
+            story.provider = "Finnhub".into();
             story.provider_id = w.id.to_string();
             story.summary = w.summary.unwrap_or_default();
             story.category = if company.is_some() { "company" } else { "general" }.into();
