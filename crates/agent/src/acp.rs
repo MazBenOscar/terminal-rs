@@ -16,6 +16,13 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use crate::transcript::{StreamScrubber, scrub_text};
 use crate::{AgentBackend, AgentEvent, BackendState, Model, ThreadOptions, TurnInput};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MimoProfile {
+    #[default]
+    Own,
+    Private,
+}
+
 #[derive(Debug)]
 struct Rejected;
 impl std::fmt::Display for Rejected {
@@ -385,6 +392,8 @@ pub struct AcpBackend {
     busy: Arc<AtomicBool>,
     instructions: Mutex<String>,
     models: Mutex<Vec<Model>>,
+    model_config: Mutex<Option<String>>,
+    preferred_model: Mutex<String>,
     cleaned: Option<Cleanup>,
 }
 struct Workspace(PathBuf);
@@ -496,6 +505,8 @@ impl AcpBackend {
             busy,
             instructions: Default::default(),
             models: Default::default(),
+            model_config: Default::default(),
+            preferred_model: Default::default(),
             cleaned: None,
         }
     }
@@ -513,22 +524,69 @@ impl AcpBackend {
         Ok(result)
     }
     fn update_models(&self, result: &Value) {
+        // Newer OpenCode forks expose models as a select config option instead
+        // of the older session/set_model extension. Session modes are agents
+        // (e.g. build/plan), not models, and must not become model choices.
+        if let Some(config) = result["configOptions"].as_array().and_then(|options| {
+            options
+                .iter()
+                .filter(|option| option["type"] == "select")
+                .find(|option| option["category"] == "model")
+                .or_else(|| {
+                    options.iter().find(|option| {
+                        option["type"] == "select" && option["id"] == "model" && option["category"].is_null()
+                    })
+                })
+        }) && let Some(id) = config["id"].as_str()
+        {
+            let mut models = Vec::new();
+            collect_model_options(&config["options"], &config["currentValue"], &mut models);
+            if !models.is_empty() {
+                *self.models.lock().unwrap() = models;
+                *self.model_config.lock().unwrap() = Some(id.into());
+                return;
+            }
+        }
         if let Some(models) = result["models"]["availableModels"].as_array() {
             *self.models.lock().unwrap() = models
                 .iter()
                 .filter_map(|entry| {
                     let id = entry["modelId"].as_str()?;
-                    Some(Model {
-                        id: id.into(),
-                        model: id.into(),
-                        display_name: entry["name"].as_str().unwrap_or(id).into(),
-                        is_default: result["models"]["currentModelId"] == id,
-                        default_reasoning_effort: String::new(),
-                        supported_reasoning_efforts: Vec::new(),
-                    })
+                    Some(acp_model(id, entry["name"].as_str(), result["models"]["currentModelId"] == id))
                 })
                 .collect();
+            *self.model_config.lock().unwrap() = None;
         }
+    }
+    /// Seeded from saved pane settings after the isolation canary, never from
+    /// provider files. Each subsequent session reapplies this choice if offered.
+    pub fn remember_model(&self, model: String) {
+        *self.preferred_model.lock().unwrap() = model;
+    }
+    pub async fn select_model(&self, model: &str) -> Result<()> {
+        if self.busy.load(Ordering::SeqCst) {
+            bail!("mimo turn is still running; model choice will apply to the next prompt");
+        }
+        self.apply_model(model).await
+    }
+    async fn apply_model(&self, model: &str) -> Result<()> {
+        if model.is_empty() || model == "mimo-default" {
+            return Ok(());
+        }
+        if !self.models.lock().unwrap().iter().any(|entry| entry.id == model) {
+            bail!("The selected mimo model is no longer available");
+        }
+        let session = self.rpc.session.lock().unwrap().clone().context("Start a mimo session first")?;
+        let config = self.model_config.lock().unwrap().clone();
+        let (method, params) = if let Some(config) = config {
+            ("session/set_config_option", json!({"sessionId":session,"configId":config,"value":model}))
+        } else {
+            ("session/set_model", json!({"sessionId":session,"modelId":model}))
+        };
+        let result = self.rpc.request(method, params, Duration::from_secs(30)).await?;
+        self.update_models(&result);
+        self.remember_model(model.into());
+        Ok(())
     }
     pub async fn wait_cleanup(&self) -> Result<()> {
         if let Some(mut cleaned) = self.cleaned.clone() {
@@ -550,7 +608,7 @@ impl AcpBackend {
     pub fn shutdown(&self) {
         self.rpc.stop("mimo backend shut down");
     }
-    pub async fn launch(data: &Path) -> Result<Self> {
+    pub async fn launch(data: &Path, profile: MimoProfile, load_plugins: bool) -> Result<Self> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         let binary = Self::find_binary().context(Self::missing_message())?.canonicalize()?;
         let root = data.join("agent");
@@ -574,39 +632,41 @@ impl AcpBackend {
         let workspace = Workspace(private.clone());
         let cwd = private.join("empty");
         std::fs::DirBuilder::new().mode(0o700).create(&cwd)?;
-        // A separate app-owned login home, never the user's ~/.mimocode. The
-        // launcher checks metadata only; it never opens provider credentials.
-        let home = root.join("mimo-home");
-        if !home.exists() {
-            std::fs::DirBuilder::new().mode(0o700).create(&home)?;
-        }
-        let metadata = std::fs::symlink_metadata(&home)?;
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != unsafe { geteuid() }
-            || metadata.mode() & 0o077 != 0
-        {
-            bail!("mimo login home must be an owned 0700 directory");
-        }
+        let user_home = std::env::var_os("HOME").map(PathBuf::from).context("HOME is unavailable")?.canonicalize()?;
+        let (home, writable) = match profile {
+            MimoProfile::Own => own_shadow_home(&private, &user_home)?,
+            MimoProfile::Private => {
+                // Metadata only: terminal-rs never opens provider credentials.
+                let home = root.join("mimo-home");
+                if !home.exists() {
+                    std::fs::DirBuilder::new().mode(0o700).create(&home)?;
+                }
+                let metadata = std::fs::symlink_metadata(&home)?;
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != unsafe { geteuid() }
+                    || metadata.mode() & 0o077 != 0
+                {
+                    bail!("mimo login home must be an owned 0700 directory");
+                }
+                (home.clone(), vec![home])
+            }
+        };
+        std::fs::DirBuilder::new().mode(0o700).create(private.join("tmp"))?;
         let exe = std::env::current_exe()?;
         let mut command = if cfg!(target_os = "macos") {
-            let user_home =
-                std::env::var_os("HOME").map(PathBuf::from).context("HOME is unavailable")?.canonicalize()?;
-            let profile = sandbox_profile(&private, &home, &binary, &exe, &crate::mcp::socket_path(data), &user_home)?;
+            let profile =
+                sandbox_profile(&private, &writable, &binary, &exe, &crate::mcp::socket_path(data), &user_home)?;
             let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
             command.args(["-p", &profile]).arg(&binary);
             command
         } else {
             bail!("mimo isolation requires macOS sandbox-exec; refusing an unsandboxed child");
         };
+        command.args(acp_arguments(load_plugins));
         command
-            .args(["acp", "--pure"])
             .env_clear()
-            .envs(crate::isolation::scrub_environment(std::env::vars_os(), &private))
-            .env_remove("CODEX_HOME")
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", home.join("config"))
-            .env("XDG_DATA_HOME", home.join("data"))
+            .envs(mimo_environment(std::env::vars_os(), &private, &home, profile))
             // This is a host-selected path, not an inherited secret. The shim must
             // locate precisely the app instance that launched this backend.
             .env("TR_DATA_DIR", data)
@@ -616,7 +676,7 @@ impl AcpBackend {
             .stderr(std::process::Stdio::null());
         use std::os::unix::process::CommandExt;
         command.process_group(0);
-        let mut child = command.spawn().context("Could not start mimo acp --pure")?;
+        let mut child = command.spawn().context("Could not start mimo ACP")?;
         let group = Arc::new(crate::isolation::ProcessGroup::new(child.id()));
         let (read, write) = crate::isolation::stdio_bridge(
             child.stdout.take().context("missing mimo stdout")?,
@@ -682,9 +742,107 @@ impl AcpBackend {
         Ok(())
     }
 }
-fn sandbox_profile(
+fn acp_model(id: &str, name: Option<&str>, current: bool) -> Model {
+    let label = if id.contains('/') {
+        let mut parts = id.splitn(3, '/');
+        let provider = parts.next().unwrap_or_default();
+        let model = parts.next().unwrap_or_default();
+        match parts.next() {
+            Some(variant) => format!("{provider}/{model} · {variant}"),
+            None => id.to_owned(),
+        }
+    } else {
+        name.unwrap_or(id).to_owned()
+    };
+    Model {
+        id: id.into(),
+        model: id.into(),
+        // Provider-qualified IDs disambiguate identical display names across
+        // plans/providers. Preserve them verbatim for ACP model selection.
+        display_name: scrub_text(&label),
+        is_default: current,
+        default_reasoning_effort: String::new(),
+        supported_reasoning_efforts: Vec::new(),
+    }
+}
+
+fn collect_model_options(options: &Value, current: &Value, models: &mut Vec<Model>) {
+    if let Some(options) = options.as_array() {
+        for option in options {
+            if let Some(value) = option["value"].as_str() {
+                models.push(acp_model(value, option["name"].as_str(), current == value));
+            } else {
+                collect_model_options(&option["options"], current, models);
+            }
+        }
+    }
+}
+
+const OWN_DIRECTORIES: [&str; 5] =
+    [".config/mimocode", ".local/share/mimocode", ".cache/mimocode", ".local/state/mimocode", ".mimocode"];
+
+/// Resolve directory metadata only. Missing directories are not granted or created.
+/// Reject redirected roots/ancestors rather than allowing a symlink to widen access.
+fn own_directories(home: &Path) -> Result<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    for relative in OWN_DIRECTORIES {
+        let path = home.join(relative);
+        match path.canonicalize() {
+            Ok(canonical) => {
+                if canonical != path || !canonical.is_dir() {
+                    bail!("mimo setup directories must be unredirected directories: {relative}");
+                }
+                directories.push(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(directories)
+}
+
+/// Present only installed mimo roots to HOME-based discovery. Other probes must
+/// see ENOENT in this per-launch home, not EPERM at the sandboxed real home.
+/// Grants still use real paths because Seatbelt resolves symlinks.
+fn own_shadow_home(private: &Path, user_home: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
+    use std::os::unix::fs::{DirBuilderExt, symlink};
+    let directories = own_directories(user_home)?;
+    let home = private.join("home");
+    for relative in ["", ".config", ".local", ".local/share", ".local/state", ".cache"] {
+        std::fs::DirBuilder::new().mode(0o700).create(home.join(relative))?;
+    }
+    for directory in &directories {
+        symlink(directory, home.join(directory.strip_prefix(user_home)?))?;
+    }
+    Ok((home, directories))
+}
+
+fn acp_arguments(load_plugins: bool) -> Vec<&'static str> {
+    if load_plugins { vec!["acp"] } else { vec!["acp", "--pure"] }
+}
+
+fn mimo_environment(
+    source: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     private: &Path,
     home: &Path,
+    profile: MimoProfile,
+) -> std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    let mut env = crate::isolation::scrub_environment(source, private);
+    env.remove(std::ffi::OsStr::new("CODEX_HOME"));
+    env.insert("HOME".into(), home.as_os_str().to_owned());
+    if profile == MimoProfile::Private {
+        env.insert("XDG_CONFIG_HOME".into(), home.join("config").into_os_string());
+        env.insert("XDG_DATA_HOME".into(), home.join("data").into_os_string());
+    } else {
+        // A writable temp directory without granting the user's shared tmp tree.
+        env.insert("TMPDIR".into(), private.join("tmp").into_os_string());
+    }
+    env
+}
+
+fn sandbox_profile(
+    private: &Path,
+    writable: &[PathBuf],
     binary: &Path,
     executable: &Path,
     socket: &Path,
@@ -700,15 +858,28 @@ fn sandbox_profile(
         user_home.join(".codex"),
         user_home.join(".mimocode"),
         user_home.join("Documents"),
+        user_home.join(".config/opencode"),
+        user_home.join("Library"),
+        user_home.join(".local/share/mimocode"),
+        user_home.join(".local/state/mimocode"),
+        user_home.join(".cache/mimocode"),
+        user_home.join(".config/mimocode"),
     ] {
         if protected.starts_with(install) {
             bail!("mimo install directory would grant access to a protected directory");
         }
     }
+    // A discovered binary must not make a forbidden personal tree readable,
+    // even if it is nested more deeply than the protected root itself.
+    for forbidden in [".config/opencode", ".codex", ".ssh", "Library"] {
+        if install.starts_with(user_home.join(forbidden)) {
+            bail!("mimo install directory is inside a protected directory");
+        }
+    }
     if install.parent().is_none()
         || install == Path::new("/Users")
         || private.starts_with(install)
-        || home.starts_with(install)
+        || writable.iter().any(|path| path.starts_with(install))
         || socket.starts_with(install)
     {
         bail!("mimo install directory would cover private application data");
@@ -721,7 +892,11 @@ fn sandbox_profile(
         .collect::<Result<Vec<_>>>()?
         .join(" ");
     let private = quote(private)?;
-    let home = quote(home)?;
+    let writable = writable
+        .iter()
+        .map(|path| quote(path).map(|path| format!("(subpath {path})")))
+        .collect::<Result<Vec<_>>>()?
+        .join(" ");
     let install = quote(install)?;
     let binary = quote(binary)?;
     let executable = quote(executable)?;
@@ -729,13 +904,16 @@ fn sandbox_profile(
     Ok(format!(
         r#"(version 1)
 (deny default)
-(allow file-read* (subpath {private}) (subpath {home}) (subpath {install}) (literal {executable})
-    (subpath "/System/Library") (subpath "/usr/lib") (subpath "/Library/Apple/System/Library")
+(allow file-read* (subpath {private}) {writable} (subpath {install}) (literal {executable})
+    (subpath "/System/Library") (subpath "/usr") (subpath "/Library/Apple/System/Library")
     (literal "/") (literal "/dev/null") (literal "/dev/urandom") (literal "/private/etc/hosts") (literal "/private/etc/resolv.conf"))
 (allow file-read-metadata {ancestors})
-(allow file-write* (subpath {private}) (subpath {home}))
+(allow file-write* (subpath {private}) {writable})
 (allow file-read* file-write* (literal {socket}))
 (allow network-outbound (literal {socket}) (literal "/private/var/run/mDNSResponder") (remote tcp "*:443"))
+(allow network-bind (local ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))
 (allow process-exec (literal {binary}) (literal {executable}))
 (allow process-fork)
 (allow sysctl-read)
@@ -780,6 +958,10 @@ impl AgentBackend for AcpBackend {
         let session = result["sessionId"].as_str().context("mimo did not return a session id")?.to_owned();
         *self.instructions.lock().unwrap() = opts.base_instructions;
         self.update_models(&result);
+        let preferred = self.preferred_model.lock().unwrap().clone();
+        if self.models.lock().unwrap().iter().any(|model| model.id == preferred) {
+            self.apply_model(&preferred).await?;
+        }
         Ok(session)
     }
     async fn send_turn(&self, input: TurnInput) -> Result<String> {
@@ -801,15 +983,7 @@ impl AgentBackend for AcpBackend {
         if !input.images.is_empty() {
             bail!("mimo image input is not enabled");
         }
-        if input.model != "mimo-default" && self.models.lock().unwrap().iter().any(|m| m.id == input.model) {
-            self.rpc
-                .request(
-                    "session/set_model",
-                    json!({"sessionId":session,"modelId":input.model}),
-                    Duration::from_secs(30),
-                )
-                .await?;
-        }
+        self.apply_model(&input.model).await?;
         let turn = format!("mimo-{}", self.turns.fetch_add(1, Ordering::Relaxed));
         *self.rpc.turn.lock().unwrap() = turn.clone();
         self.rpc.tool_ids.lock().unwrap().clear();

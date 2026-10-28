@@ -22,12 +22,16 @@ impl Backend {
         }
     }
 }
+pub use tr_agent::acp::MimoProfile;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub allow_external: bool,
     pub allow_external_edits: bool,
     pub backend: Backend,
+    pub mimo_profile: MimoProfile,
+    pub mimo_load_plugins: bool,
 }
 
 impl Settings {
