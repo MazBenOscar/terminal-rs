@@ -2733,6 +2733,9 @@ impl ChartState {
         self.mode_badge(ui);
         ui.add_space(6.);
         clicked |= self.chart_actions(ui);
+        if self.show_congress {
+            crate::congress_view::bargo_credit(ui, &self.markers);
+        }
         clicked
     }
 
@@ -6209,7 +6212,7 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
             format!("{} ({}-{})", t.politician, t.party.code(), t.state.as_deref().unwrap_or("??")),
             theme::party_color(t.party),
         ),
-        (format!("{} · {}", t.chamber.as_str(), t.owner.as_deref().unwrap_or("Self")), muted()),
+        (format!("{} · {}", t.chamber.as_str(), t.owner.as_deref().unwrap_or("Unknown")), muted()),
         (
             format!(
                 "{} {}  {}",
@@ -6221,7 +6224,10 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
                     TxType::Other => "OTHER",
                 },
                 t.ticker.as_deref().unwrap_or("-"),
-                t.amount.map(|a| a.to_string()).unwrap_or_else(|| "amount n/a".into())
+                t.amount_range
+                    .clone()
+                    .or_else(|| t.amount.map(|a| a.to_string()))
+                    .unwrap_or_else(|| "amount n/a".into())
             ),
             if t.tx_type.is_buy() { theme::up() } else { theme::down() },
         ),

@@ -203,6 +203,10 @@ pub struct Trade {
     pub tx_date: NaiveDate,
     pub filed_date: NaiveDate,
     pub source_url: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub amount_range: Option<String>,
 }
 
 impl Trade {

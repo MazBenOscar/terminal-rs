@@ -11,6 +11,9 @@ mod broker;
 mod chrome;
 mod columns_view;
 pub(crate) mod data_sources;
+// SENATE-BARGO
+pub(crate) mod bargo;
+// SENATE-BARGO END
 mod demo;
 mod demo_harness;
 mod hotkeys_view;
@@ -2446,6 +2449,15 @@ impl TerminalApp {
                 }
                 Response::BrokerRegistered(result) => self.on_broker_registered(result),
                 Response::DataSources(reply) => self.data_sources.receive(reply),
+                // SENATE-BARGO
+                Response::BargoSettings(reply) => self.data_sources.bargo.receive(reply),
+                Response::BargoUpdated { status, changed } => {
+                    self.data_sources.bargo.congress_status = status;
+                    if changed {
+                        self.refresh_congress_views();
+                    }
+                }
+                // SENATE-BARGO END
                 Response::Questrade(result) => {
                     self.broker.questrade_busy = false;
                     self.broker.questrade_message = Some(match result {
@@ -2519,9 +2531,25 @@ impl TerminalApp {
         if let Some(d) = newest {
             parts.push(format!("newest filing {d}"));
         }
+        // SENATE-BARGO: don't show the legacy pause explanation while the replacement is enabled.
         if !self.congress_status.is_empty() {
-            parts.push(self.congress_status.clone());
+            let status = if self.data_sources.settings.bargo {
+                self.congress_status.replace(tr_congress::refresh::SENATE_PAUSED, "")
+            } else {
+                self.congress_status.clone()
+            };
+            parts.push(status);
         }
+        if self.data_sources.settings.bargo {
+            parts.push(if self.data_sources.bargo.congress_status.is_empty() {
+                "Senate via Bargo · needs key for full history (free window: 3 months)".into()
+            } else {
+                self.data_sources.bargo.congress_status.clone()
+            });
+        } else if !parts.iter().any(|s| s.contains(tr_congress::refresh::SENATE_PAUSED)) {
+            parts.push(tr_congress::refresh::SENATE_PAUSED.into());
+        }
+        // SENATE-BARGO END
         parts.join(" · ")
     }
 

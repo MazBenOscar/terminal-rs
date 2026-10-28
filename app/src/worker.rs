@@ -289,6 +289,9 @@ pub enum Request {
     DataSources {
         action: crate::app::data_sources::Action,
     },
+    // SENATE-BARGO
+    BargoSettings(crate::app::bargo::Action),
+    // SENATE-BARGO END
     Agent(AgentRequest),
     SecurityNames(Vec<String>),
     WatchlistColumns {
@@ -663,6 +666,13 @@ pub enum Response {
     /// Outcome of a [`QuestradeAction`]: a status line or an error.
     Questrade(Result<String, String>),
     DataSources(crate::app::data_sources::Reply),
+    // SENATE-BARGO
+    BargoSettings(crate::app::bargo::Reply),
+    BargoUpdated {
+        status: String,
+        changed: bool,
+    },
+    // SENATE-BARGO END
     Scan {
         pane: PaneId,
         generation: u64,
@@ -1217,10 +1227,56 @@ impl Worker {
         let s = shared.clone();
         rt.spawn(edgar_loop(s, _edgar_rx));
 
+        // SENATE-BARGO: independent of House refusals and its cadence slot.
+        let senate = shared.clone();
+        rt.spawn(async move {
+            if congress_refresh_minutes() == 0 {
+                return;
+            }
+            let _ = crate::app::bargo::key();
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut previous = String::new();
+            loop {
+                tick.tick().await;
+                if !senate.congress_window_visible.load(std::sync::atomic::Ordering::Relaxed)
+                    || senate.ctx.input(|i| i.viewport().minimized == Some(true))
+                {
+                    continue;
+                }
+                let Ok(net) = tr_net::shared() else {
+                    continue;
+                };
+                let key = crate::app::bargo::key();
+                let before = senate.db.lock().await.meta("bargo_updated").ok().flatten();
+                let result = tr_congress::bargo::sync(net, &senate.db, key.as_deref()).await;
+                if let Some(report) = result.as_ref().ok().filter(|report| !report.alerts.is_empty()) {
+                    senate.send(Response::NewAlerts(report.alerts.clone()));
+                }
+                let after = senate.db.lock().await.meta("bargo_updated").ok().flatten();
+                let mut status =
+                    tr_congress::bargo::status(net, after.as_deref().and_then(|s| s.parse().ok()), key.is_some());
+                match result {
+                    Err(error) => status.push_str(&format!(" · {error}")),
+                    Ok(report) => {
+                        if let Some(problem) = report.problem {
+                            status.push_str(&format!(" · {problem}"));
+                        }
+                    }
+                }
+                let changed = before != after;
+                if previous != status || changed {
+                    previous = status.clone();
+                    senate.send(Response::BargoUpdated { status, changed });
+                }
+            }
+        });
+        // SENATE-BARGO END
         // Scheduled congressional disclosure refresh.
         let s = shared.clone();
         rt.spawn(async move {
-            s.send(Response::CongressPaused(refresh::SENATE_PAUSED.into()));
+            // SENATE-BARGO: the Senate loop publishes its own source status.
+            // SENATE-BARGO END
             let minutes = congress_refresh_minutes();
             if minutes == 0 {
                 return;
@@ -1326,6 +1382,7 @@ fn congress_visibility_gates_automatic_but_never_manual_refresh() {
     }
 }
 
+// SENATE-BARGO: House status must not resurrect the disabled-source explanation while Bargo is on.
 async fn congress_refresh(s: &Shared, manual: bool) {
     if !congress_refresh_allowed(
         manual,
@@ -1340,17 +1397,19 @@ async fn congress_refresh(s: &Shared, manual: bool) {
     }
     let net = match tr_net::shared() {
         Ok(net) => net,
-        Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED))),
+        Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · Senate via Bargo: unavailable"))),
     };
+    let updated = s.db.lock().await.meta("bargo_updated").ok().flatten().and_then(|s| s.parse().ok());
+    let senate = tr_congress::bargo::status(net, updated, crate::app::bargo::key().is_some());
     if let Err(e) = net.check("house-disclosures") {
-        return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED)));
+        return s.send(Response::CongressPaused(format!("House: {e} · {senate}")));
     }
     // Manual refresh bypasses cadence only, never the shared request guard.
     if !manual {
         match net.claim_slot("congress:refresh", Duration::from_secs(minutes.saturating_mul(60))) {
             Ok(true) => {}
             Ok(false) => return,
-            Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED))),
+            Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · {senate}"))),
         }
     }
     // A single reusable source serialises manual and scheduled runs.
@@ -1364,10 +1423,12 @@ async fn congress_refresh(s: &Shared, manual: bool) {
         }
     }
     let source = guard.as_ref().expect("source initialised");
-    s.send(Response::Status(format!("Refreshing House Clerk disclosures… · {}", refresh::SENATE_PAUSED)));
+    s.send(Response::Status(format!("Refreshing House Clerk disclosures… · {senate}")));
     let cfg = RefreshConfig::incremental(&*s.db.lock().await);
     match refresh::refresh(source, &s.db, &cfg).await {
-        Ok(report) => {
+        Ok(mut report) => {
+            report.notes.retain(|note| note != refresh::SENATE_PAUSED);
+            report.notes.push(senate);
             if !report.alerts.is_empty() {
                 s.send(Response::NewAlerts(report.alerts.clone()));
             }
@@ -1376,6 +1437,8 @@ async fn congress_refresh(s: &Shared, manual: bool) {
         Err(e) => s.send(Response::Status(format!("congress refresh failed: {e:#}"))),
     }
 }
+
+// SENATE-BARGO END
 
 /// Display line for a stepped series: straight segments between the bars where each new
 /// value first appears. Values hold flat after the last change and gaps (NaN) stay gaps,
@@ -1868,6 +1931,12 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             names.save(&path);
             s.send(Response::SecurityNames(names.clone()));
         }
+        // SENATE-BARGO
+        Request::BargoSettings(action) => {
+            let updated = s.db.lock().await.meta("bargo_updated").ok().flatten().and_then(|s| s.parse().ok());
+            s.send(Response::BargoSettings(crate::app::bargo::perform(action, updated).await));
+        }
+        // SENATE-BARGO END
         Request::DataSources { action } => {
             let changed = !matches!(&action, crate::app::data_sources::Action::Status);
             let key = s.news.key.lock().await.clone();

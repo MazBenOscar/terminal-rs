@@ -9,12 +9,13 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
-pub const GROUPS: [&str; 6] = ["finnhub", "sec", "yahoo-news", "coindesk", "house-disclosures", "house-roster"];
+pub const GROUPS: [&str; 7] =
+    ["finnhub", "sec", "yahoo-news", "coindesk", "house-disclosures", "house-roster", "bargo"];
 
 /// Permanent network prohibition, independent of switches, aliases and future policies.
 fn disabled_host(url: &reqwest::Url) -> bool {
@@ -74,6 +75,7 @@ pub fn policies() -> Vec<HostPolicy> {
         ("www.coindesk.com", "coindesk", 300, 1, 300),
         ("disclosures-clerk.house.gov", "house-disclosures", 3, 20, 400),
         ("clerk.house.gov", "house-roster", 3, 20, 20),
+        ("www.bargo.ai", "bargo", 30, 2, 40),
     ]
     .into_iter()
     .map(|(host, group, seconds, per_minute, daily_cap)| HostPolicy {
@@ -108,6 +110,7 @@ pub struct Settings {
     pub coindesk: bool,
     pub house_disclosures: bool,
     pub house_roster: bool,
+    pub bargo: bool,
     pub sec_contact: String,
     #[serde(skip)]
     pub settings_error: bool,
@@ -122,6 +125,7 @@ impl Default for Settings {
             coindesk: true,
             house_disclosures: true,
             house_roster: true,
+            bargo: true,
             sec_contact: String::new(),
             settings_error: false,
         }
@@ -137,6 +141,7 @@ impl Settings {
             coindesk: false,
             house_disclosures: false,
             house_roster: false,
+            bargo: false,
             settings_error: true,
             ..Self::default()
         }
@@ -162,6 +167,7 @@ impl Settings {
                 "coindesk" => self.coindesk,
                 "house-disclosures" => self.house_disclosures,
                 "house-roster" => self.house_roster,
+                "bargo" => self.bargo,
                 _ => false,
             }
     }
@@ -285,7 +291,16 @@ pub struct ResponseMetadata {
     pub last_modified: Option<String>,
 }
 
+/// Last reported provider allowances, shared across instances; timestamps use UTC seconds.
+#[derive(Clone, Debug, Default)]
+pub struct Remaining {
+    pub at: i64,
+    pub requests: Option<u32>,
+    pub rows: Option<u32>,
+}
+
 pub struct Guard {
+    bargo_keyed: AtomicBool,
     config: Config,
     settings: RwLock<Settings>,
     client: reqwest::Client,
@@ -358,6 +373,7 @@ impl Guard {
             .build()
             .map_err(|_| Refused::Transport)?;
         let guard = Self {
+            bargo_keyed: AtomicBool::new(false),
             config,
             settings: RwLock::new(settings),
             client,
@@ -375,7 +391,9 @@ impl Guard {
         let db = guard.db()?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS slots (key TEXT PRIMARY KEY, at INTEGER NOT NULL, until INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS counters (key TEXT PRIMARY KEY, count INTEGER NOT NULL);",
+             CREATE TABLE IF NOT EXISTS counters (key TEXT PRIMARY KEY, count INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS remaining (\"group\" TEXT PRIMARY KEY, at INTEGER NOT NULL, requests INTEGER, rows INTEGER);
+             CREATE TABLE IF NOT EXISTS row_usage (\"group\" TEXT, day INTEGER, count INTEGER NOT NULL, PRIMARY KEY(\"group\",day));",
         )?;
         let has_owner = |db: &Connection| -> rusqlite::Result<bool> {
             Ok(db
@@ -475,6 +493,52 @@ impl Guard {
         self.db()?.execute("DELETE FROM slots WHERE key=?1", [key])?;
         Ok(())
     }
+    /// Key presence is status only; each send independently enforces the cap from its header.
+    pub fn set_bargo_keyed(&self, keyed: bool) {
+        self.bargo_keyed.store(keyed, Ordering::Relaxed);
+    }
+    /// Conservative remaining row allowance, including reservations when headers are absent.
+    pub fn bargo_allowance(&self, keyed: bool) -> Result<u32, Refused> {
+        let day = Utc::now().timestamp() / 86400;
+        let cap: u32 = if keyed { 1000 } else { 100 };
+        let used: u32 = self
+            .db()?
+            .query_row("SELECT count FROM row_usage WHERE \"group\"='bargo' AND day=?1", [day], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        let mut available = cap.saturating_sub(used);
+        if let Some(remaining) = self.remaining("bargo")?.filter(|r| r.at / 86400 == day) {
+            if remaining.requests.is_some_and(|n| n < 5) {
+                return Ok(0);
+            }
+            if let Some(rows) = remaining.rows {
+                available = available.min(rows);
+            }
+        }
+        if available < if keyed { 200 } else { 20 } {
+            return Ok(0);
+        }
+        Ok(available)
+    }
+    pub fn remaining(&self, group: &str) -> Result<Option<Remaining>, Refused> {
+        Ok(self
+            .db()?
+            .query_row("SELECT at,requests,rows FROM remaining WHERE \"group\"=?1", [group], |r| {
+                Ok(Remaining { at: r.get(0)?, requests: r.get(1)?, rows: r.get(2)? })
+            })
+            .optional()?)
+    }
+    fn record_remaining(&self, group: &str, metadata: &Remaining) -> Result<(), Refused> {
+        if metadata.requests.is_some() || metadata.rows.is_some() {
+            self.db()?.execute(
+                "INSERT INTO remaining VALUES(?1,?2,?3,?4) ON CONFLICT(\"group\") DO UPDATE SET at=excluded.at,
+                 requests=CASE WHEN remaining.at/86400=excluded.at/86400 THEN min(COALESCE(remaining.requests,excluded.requests),COALESCE(excluded.requests,remaining.requests)) ELSE excluded.requests END,
+                 rows=CASE WHEN remaining.at/86400=excluded.at/86400 THEN min(COALESCE(remaining.rows,excluded.rows),COALESCE(excluded.rows,remaining.rows)) ELSE excluded.rows END",
+                params![group, Utc::now().timestamp(), metadata.requests, metadata.rows],
+            )?;
+        }
+        Ok(())
+    }
     pub fn clear_counter(&self, key: &str) -> Result<(), Refused> {
         self.db()?.execute("DELETE FROM counters WHERE key=?1", [key])?;
         Ok(())
@@ -536,13 +600,14 @@ impl Guard {
     }
     #[cfg(test)]
     fn reserve_owned(&self, policy: &HostPolicy, owner: &str) -> Result<Option<Duration>, Refused> {
-        self.reserve_with_counter(policy, owner, None)
+        self.reserve_with_counter(policy, owner, None, None)
     }
     fn reserve_with_counter(
         &self,
         policy: &HostPolicy,
         owner: &str,
         counter: Option<(&str, u32)>,
+        bargo_rows: Option<(u32, bool)>,
     ) -> Result<Option<Duration>, Refused> {
         if let Some(pause) = self
             .cooldowns
@@ -596,6 +661,33 @@ impl Guard {
             // treating its crash-recovery expiry as the actual queue delay.
             let wait = if lease.is_some_and(|until| until > now) { (next - now).min(50) } else { next - now };
             return Ok(Some(Duration::from_millis(wait as u64)));
+        }
+        if let Some((rows, keyed)) = bargo_rows {
+            let remaining: Option<(i64, Option<u32>, Option<u32>)> = tx
+                .query_row("SELECT at,requests,rows FROM remaining WHERE \"group\"=?1", [policy.group], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .optional()?;
+            if remaining.is_some_and(|(at, requests, available)| {
+                at / 86400 == now / 86_400_000
+                    && (requests.is_some_and(|n| n < 5)
+                        || available.is_some_and(|n| n < if keyed { 200 } else { 20 } || n < rows))
+            }) {
+                return Err(Refused::Budget);
+            }
+            let used: u32 = tx
+                .query_row(
+                    "SELECT count FROM row_usage WHERE \"group\"=?1 AND day=?2",
+                    params![policy.group, now / 86_400_000],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if used.saturating_add(rows) > if keyed { 1000 } else { 100 } {
+                return Err(Refused::Budget);
+            }
+            tx.execute("INSERT INTO row_usage VALUES(?1,?2,?3) ON CONFLICT(\"group\",day) DO UPDATE SET count=count+excluded.count",
+                params![policy.group, now/86_400_000, rows])?;
         }
         if let Some(key) = counter_key {
             tx.execute("INSERT INTO counters VALUES(?1,1) ON CONFLICT(key) DO UPDATE SET count=count+1", [&key])?;
@@ -789,7 +881,27 @@ impl Guard {
         daily_limit: u32,
         counter: Option<(&str, u32)>,
     ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
-        let max_wait = if group == "yahoo-news" && !self.config.max_wait.is_zero() {
+        // Bargo's longer spacing still uses one durable reservation per actual send.
+        let keyed = request.headers().contains_key("X-Api-Key");
+        let bargo_rows = if group == "bargo" {
+            let rows = if request.url().path().ends_with("/trades") {
+                request
+                    .url()
+                    .query_pairs()
+                    .find(|(k, _)| k == "limit")
+                    .and_then(|(_, v)| v.parse::<u32>().ok())
+                    .unwrap_or(100)
+                    .min(if keyed { 250 } else { 100 })
+            } else {
+                0
+            };
+            Some((rows, keyed))
+        } else {
+            None
+        };
+        let max_wait = if group == "bargo" && !self.config.max_wait.is_zero() {
+            Duration::from_secs(35)
+        } else if group == "yahoo-news" && !self.config.max_wait.is_zero() {
             Duration::from_secs(30)
         } else {
             self.config.max_wait
@@ -798,6 +910,10 @@ impl Guard {
         for hop in 0..=3 {
             let mut policy = self.policy(group, request.url())?;
             policy.daily_cap = policy.daily_cap.min(daily_limit);
+            if group == "bargo" {
+                self.set_bargo_keyed(keyed);
+                policy.daily_cap = policy.daily_cap.min(if keyed { 40 } else { 10 });
+            }
             let owner = format!(
                 "{}-{}-{}",
                 std::process::id(),
@@ -806,7 +922,7 @@ impl Guard {
             );
             loop {
                 self.identity(group)?;
-                match self.reserve_with_counter(&policy, &owner, counter)? {
+                match self.reserve_with_counter(&policy, &owner, counter, bargo_rows)? {
                     None => break,
                     Some(wait) if Instant::now() + wait <= deadline => tokio::time::sleep(wait).await,
                     _ => return Err(Refused::Busy),
@@ -833,8 +949,33 @@ impl Guard {
             let status = response.status().as_u16();
             let retry =
                 response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).map(str::to_owned);
-            if matches!(status, 403 | 429 | 503) {
-                return Err(self.pause(group, &format!("HTTP {status}"), retry.as_deref())?);
+            let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+            let metadata = ResponseMetadata { status, etag: header("etag"), last_modified: header("last-modified") };
+            self.record_remaining(
+                group,
+                &Remaining {
+                    at: Utc::now().timestamp(),
+                    requests: header("x-ratelimit-remaining").and_then(|v| v.parse().ok()),
+                    rows: header("x-ratelimit-rows-remaining").and_then(|v| v.parse().ok()),
+                },
+            )?;
+            if matches!(status, 403 | 429 | 503) || (group == "bargo" && (status == 401 || status >= 500)) {
+                let retry = if group == "bargo" && status == 429 {
+                    let seconds = retry
+                        .as_deref()
+                        .and_then(|v| retry_after(v, Utc::now().timestamp()))
+                        .unwrap_or(0)
+                        .max((Utc::now().timestamp() / 86400 + 1) * 86400);
+                    Some((seconds - Utc::now().timestamp()).to_string())
+                } else {
+                    retry
+                };
+                let reason = if group == "bargo" && status == 401 {
+                    "Key error (HTTP 401)".to_owned()
+                } else {
+                    format!("HTTP {status}")
+                };
+                return Err(self.pause(group, &reason, retry.as_deref())?);
             }
             if matches!(status, 301 | 302 | 303 | 307 | 308) {
                 let target = response
@@ -882,7 +1023,9 @@ impl Guard {
                         && ![b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"]
                             .iter()
                             .any(|magic| body.starts_with(*magic))));
-            if (html_response(&content_type, &body) && blocked_body(&body)) || house_download_refused || roster_refused
+            if (html_response(&content_type, &body) && (blocked_body(&body) || group == "bargo"))
+                || house_download_refused
+                || roster_refused
             {
                 return Err(self.pause(
                     group,
@@ -893,16 +1036,24 @@ impl Guard {
             if !(200..300).contains(&status) && status != 304 {
                 return Err(Refused::Http(status));
             }
-            let header = |name| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
-            let metadata = ResponseMetadata {
-                status,
-                etag: header(reqwest::header::ETAG),
-                last_modified: header(reqwest::header::LAST_MODIFIED),
-            };
             if status == 304 {
                 body.clear();
             }
             let db = self.db()?;
+            // Refund unused row reservations only for a valid bounded trade page. Errors,
+            // cancellation and malformed bodies retain their conservative full reservation.
+            if let Some((reserved, _)) = bargo_rows.filter(|(rows, _)| *rows > 0) {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
+                    if let Some(rows) =
+                        value.get("trades").and_then(|v| v.as_array()).filter(|r| r.len() <= reserved as usize)
+                    {
+                        db.execute(
+                            "UPDATE row_usage SET count=max(0,count-?1) WHERE \"group\"=?2 AND day=?3",
+                            params![reserved - rows.len() as u32, group, Utc::now().timestamp() / 86400],
+                        )?;
+                    }
+                }
+            }
             db.execute("DELETE FROM transport_failures WHERE \"group\"=?1", [group])?;
             db.execute("DELETE FROM cooldowns WHERE \"group\"=?1", [group])?;
             self.cooldowns.write().expect("cooldown lock").remove(group);
@@ -916,7 +1067,11 @@ impl Guard {
         GROUPS
             .into_iter()
             .map(|group| {
-                let cap = policies().into_iter().find(|p| p.group == group).expect("registered group").daily_cap;
+                let cap = if group == "bargo" && !self.bargo_keyed.load(Ordering::Relaxed) {
+                    10
+                } else {
+                    policies().into_iter().find(|p| p.group == group).expect("registered group").daily_cap
+                };
                 let requests_today = db
                     .query_row(
                         "SELECT count FROM requests WHERE \"group\"=?1 AND day=?2",

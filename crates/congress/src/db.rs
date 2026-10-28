@@ -150,7 +150,7 @@ pub struct Db {
 
 const TRADE_SELECT: &str = "SELECT t.id, t.filing_id, t.politician_id, p.name, p.party, p.chamber, p.state,
         t.ticker, t.asset_name, t.asset_type, t.owner, t.tx_type, t.amount_min, t.amount_max,
-        t.tx_date, t.filed_date, f.url
+        t.tx_date, t.filed_date, f.url, f.source, CASE WHEN f.source='Bargo' THEN t.comment ELSE NULL END
     FROM trades t JOIN politicians p ON p.id = t.politician_id JOIN filings f ON f.id = t.filing_id";
 
 fn date(s: String) -> NaiveDate {
@@ -177,6 +177,8 @@ fn trade_from_row(r: &Row<'_>) -> rusqlite::Result<Trade> {
         tx_date: date(r.get(14)?),
         filed_date: date(r.get(15)?),
         source_url: r.get(16)?,
+        source: r.get(17)?,
+        amount_range: r.get(18)?,
     })
 }
 
@@ -219,6 +221,9 @@ impl Db {
                 ALTER TABLE filings ADD COLUMN first_attempt_at INTEGER NOT NULL DEFAULT 0;
                 UPDATE filings SET first_attempt_at = fetched_at;",
             )?;
+        }
+        if !columns.iter().any(|c| c == "source") {
+            conn.execute_batch("ALTER TABLE filings ADD COLUMN source TEXT NOT NULL DEFAULT 'official'")?;
         }
         Ok(Self { conn })
     }

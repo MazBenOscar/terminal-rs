@@ -1,4 +1,142 @@
 use super::*;
+
+#[tokio::test]
+async fn bargo_local_row_reservations_bound_missing_headers_across_instances() {
+    for (keyed, pages) in [(false, 1), (true, 10)] {
+        let temp = Temp::new();
+        let body = serde_json::json!({"trades": vec![serde_json::json!({}); 100]}).to_string();
+        let server = Server::new(200, "", &body);
+        let first = server.attach(temp.guard(false));
+        let second = server.attach(temp.guard(false));
+        for _ in 0..pages {
+            age(&first, "bargo");
+            first.send("bargo", bargo_request(keyed)).await.unwrap();
+        }
+        age(&second, "bargo");
+        assert_eq!(second.bargo_allowance(keyed).unwrap(), 0);
+        assert_eq!(second.send("bargo", bargo_request(keyed)).await, Err(Refused::Budget));
+        assert_eq!(server.hits.load(Ordering::SeqCst), pages);
+    }
+}
+
+fn bargo_request(keyed: bool) -> reqwest::RequestBuilder {
+    let request =
+        reqwest::Client::new().get("https://www.bargo.ai/free-apis/congress/v1/trades?chamber=senate&limit=100");
+    if keyed { request.header("X-Api-Key", "fixture-secret") } else { request }
+}
+
+#[tokio::test]
+async fn bargo_health_test_is_one_guarded_header_only_get_and_uses_no_rows() {
+    let temp = Temp::new();
+    let server = Server::new(200, "", "{\"status\":\"ok\"}");
+    let guard = server.attach(temp.guard(false));
+    guard
+        .send(
+            "bargo",
+            reqwest::Client::new()
+                .get("https://www.bargo.ai/free-apis/congress/v1/health")
+                .header("X-Api-Key", "fixture-secret"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(guard.bargo_allowance(true).unwrap(), 1000);
+    assert_eq!(guard.status().unwrap().into_iter().find(|s| s.group == "bargo").unwrap().cap, 40);
+    let requests = server.requests.lock().unwrap();
+    assert!(requests[0].starts_with("GET /free-apis/congress/v1/health HTTP/"));
+    assert!(requests[0].to_ascii_lowercase().contains("x-api-key: fixture-secret"));
+    assert!(!requests[0].lines().next().unwrap().contains("fixture-secret"));
+}
+
+#[tokio::test]
+async fn bargo_headers_stop_other_instances_and_preserve_timestamp() {
+    for (headers, keyed) in [
+        ("X-RateLimit-Remaining: 20\r\nX-RateLimit-Rows-Remaining: 199\r\n", true),
+        ("X-RateLimit-Remaining: 20\r\nX-RateLimit-Rows-Remaining: 19\r\n", false),
+        ("X-RateLimit-Remaining: 4\r\nX-RateLimit-Rows-Remaining: 900\r\n", true),
+    ] {
+        let temp = Temp::new();
+        let server = Server::new(200, headers, "{\"trades\":[]}");
+        let first = server.attach(temp.guard(false));
+        first.send("bargo", bargo_request(keyed)).await.unwrap();
+        let second = server.attach(temp.guard(false));
+        age(&second, "bargo");
+        assert_eq!(second.send("bargo", bargo_request(keyed)).await, Err(Refused::Budget));
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+        let remaining = second.remaining("bargo").unwrap().unwrap();
+        assert!((Utc::now().timestamp() - remaining.at).abs() < 5);
+        assert_eq!(second.bargo_allowance(keyed).unwrap(), 0);
+        // Stale headers do not lock out the next UTC day's allowance.
+        second.db().unwrap().execute("UPDATE remaining SET at=at-86400", []).unwrap();
+        assert!(second.bargo_allowance(keyed).unwrap() > 0);
+    }
+}
+
+#[tokio::test]
+async fn bargo_caps_spacing_rows_and_keyless_identity() {
+    let temp = Temp::new();
+    let server = Server::new(200, "", "{\"trades\":[]}");
+    let guard = server.attach(temp.guard(false));
+    let policy = policies().into_iter().find(|p| p.group == "bargo").unwrap();
+    assert_eq!(policy.min_interval, Duration::from_secs(30));
+    assert_eq!(policy.per_minute, 2);
+    assert_eq!(policy.concurrency, 1);
+    guard.send("bargo", bargo_request(false)).await.unwrap();
+    assert_eq!(guard.send("bargo", bargo_request(false)).await, Err(Refused::Busy));
+    let other = server.attach(temp.guard(false));
+    assert_eq!(other.send("bargo", bargo_request(true)).await, Err(Refused::Busy));
+    for (keyed, cap) in [(false, 10), (true, 40)] {
+        age(&guard, "bargo");
+        guard.db().unwrap().execute("UPDATE requests SET count=?1 WHERE \"group\"='bargo'", [cap]).unwrap();
+        assert_eq!(guard.send("bargo", bargo_request(keyed)).await, Err(Refused::Budget));
+        guard.set_bargo_keyed(keyed);
+        assert_eq!(guard.status().unwrap().into_iter().find(|s| s.group == "bargo").unwrap().cap, cap as u32);
+    }
+    assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    let requests = server.requests.lock().unwrap();
+    assert!(requests[0].contains("terminal-rs/"));
+    assert!(!requests[0].contains("Mozilla"));
+    assert!(!requests[0].contains("senate.gov"));
+}
+
+#[tokio::test]
+async fn bargo_errors_pause_without_retry_and_429_reaches_midnight() {
+    for status in [401, 403, 429, 500, 502, 503] {
+        let temp = Temp::new();
+        let server = Server::new(status, "", "{\"error\":\"fixture-secret\"}");
+        let first = server.attach(temp.guard(false));
+        let error = first.send("bargo", bargo_request(true)).await.unwrap_err();
+        let Refused::Paused { until } = error else { panic!("missing pause") };
+        if status == 429 {
+            assert!(until >= (Utc::now().timestamp() / 86400 + 1) * 86400);
+        }
+        let second = server.attach(temp.guard(false));
+        assert!(matches!(second.send("bargo", bargo_request(true)).await, Err(Refused::Paused { .. })));
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+        let state = second.status().unwrap().into_iter().find(|s| s.group == "bargo").unwrap();
+        assert!(!state.reason.as_ref().unwrap().contains("fixture-secret"));
+        if status == 401 {
+            assert!(state.reason.unwrap().contains("Key error"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn bargo_html_offline_and_senate_redirect_are_refused() {
+    let temp = Temp::new();
+    let server = Server::new(200, "Content-Type: text/html\r\n", "<html>Sign in</html>");
+    let offline = server.attach(temp.guard(true));
+    assert_eq!(offline.send("bargo", bargo_request(false)).await, Err(Refused::Offline));
+    assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+    let guard = server.attach(temp.guard(false));
+    assert!(matches!(guard.send("bargo", bargo_request(false)).await, Err(Refused::Paused { .. })));
+    let temp = Temp::new();
+    let server = Server::new(302, "Location: https://efdsearch.senate.gov/search/\r\n", "");
+    let guard = server.attach(temp.guard(false));
+    assert_eq!(guard.send("bargo", bargo_request(false)).await, Err(Refused::Disabled));
+    assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+}
+
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -433,8 +571,8 @@ fn status_and_registry() {
     let temp = Temp::new();
     let guard = temp.guard(false);
     let rows = guard.status().unwrap();
-    assert_eq!(rows.len(), 6);
-    assert_eq!(rows.iter().map(|s| s.cap).collect::<Vec<_>>(), [3000, 1500, 1000, 300, 400, 20]);
+    assert_eq!(rows.len(), GROUPS.len());
+    assert_eq!(rows.iter().map(|s| s.cap).collect::<Vec<_>>(), [3000, 1500, 1000, 300, 400, 20, 10]);
     assert!(rows.iter().all(|s| s.enabled
         && s.requests_today == 0
         && s.last_request.is_none()
