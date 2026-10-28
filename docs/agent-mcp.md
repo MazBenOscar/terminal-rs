@@ -157,7 +157,8 @@ name is `OpenCode`; this does not mean it uses `~/.config/opencode`.
 wire transport. Binary discovery checks PATH, then `~/.mimocode/bin/mimo` metadata.
 terminal-rs checks directory/binary metadata only: it never opens or copies your
 personal provider configuration or credentials. The sandboxed mimo child can
-read and update the selected profile, including its keys and provider-managed data.
+read the selected profile, including its keys and provider-managed data; writes
+are limited to the profile-specific data/state roots described below.
 
 ### Profiles and plugins
 
@@ -191,8 +192,8 @@ Settings › Agent shows these choices when **Backend: mimo** is selected:
   **`<data dir>/agent/mimo-home`**. This does not remove your installed mimo login.
 
 The collapsed **Advanced** section has **Load mimo plugins**, off by default
-(`mimo_load_plugins: false`). Off keeps `mimo acp --pure`; on drops `--pure` and
-runs `mimo acp`. **Providers configured via plugins need this toggle.** Plugins
+(`mimo_load_plugins: false`). Off uses `mimo acp --port <N> --pure`; on drops only
+`--pure`. **Providers configured via plugins need this toggle.** Plugins
 run inside the same sandbox with access to the selected profile's data and keys;
 this is additional code you trust, not an expansion of sandbox permissions.
 Changing profile or this toggle closes the old backend and starts a new
@@ -208,29 +209,48 @@ Its `initialize` response returns `protocolVersion: 1`,
 `agentCapabilities.loadSession: true`. These facts are supplied by the manager;
 this fix did not launch mimo, the app, or any provider or use external networking.
 
-By default the implementation spawns `mimo acp --pure` and uses **JSONL stdio ACP v1**.
+By default the implementation spawns `mimo acp --port <N> --pure` and uses
+**JSONL stdio ACP v1**. `--port` and the selected number are separate argv items.
 The advanced plugin toggle removes only `--pure`, not the sandbox or ACP tripwires.
-The CLI's `--port`/`--hostname` help does not change the verified ACP transport.
 There is **no HTTP/port transport fallback** and no `--no-auth`. mimo (Bun) also
-starts an **internal localhost HTTP server on port 0**, even for stdio ACP. Both
-profiles therefore permit bind/inbound on `localhost:*` and outbound to
-`localhost:*`, not non-loopback listeners. Manager live testing verified that the
-shadow HOME, `/usr` read grant and these localhost rules allow `initialize` and
-`session/new` to succeed. Private-home authentication and qualified MCP tool-title
-formatting still need the manual checks below before calling the whole backend
-production-ready; do not grant broad networking or shell access.
+starts an **internal localhost HTTP server**, even for stdio ACP. Before spawning,
+terminal-rs binds `127.0.0.1:0`, reads the assigned port and drops the listener.
+Both profiles pin bind/inbound/outbound localhost rules to that one nonzero port
+and pass it to mimo; there is no wildcard loopback access. Launch verifies the
+ACP `initialize` handshake. If it fails and the chosen port is now occupied,
+terminal-rs shuts down the failed child, awaits verified cleanup, then retries
+**once** with a different free port and matching sandbox/argv. Unsafe tripwires
+and cleanup failures never trigger a retry; prompts are never replayed.
+
+**Manager-verified live fact (mimo 0.1.16):** the narrowed data/state-only writable
+set, read-only install/config/cache, `/usr/lib` + `/usr/share` read grants and
+single-port localhost rules allow `initialize` and `session/new` to succeed with
+20 models. No live test was run during this implementation. Private-home
+authentication and qualified MCP tool-title formatting still need the manual
+checks below before calling the whole backend production-ready; do not grant
+broad networking or shell access.
 
 ### Isolation and ACP operations
 
 - Fresh empty 0700 workspace: `<data dir>/agent/mimo-<pid>-<nonce>/empty`.
   It is removed after child/process-group cleanup, including launch-error paths.
-- **Own sandbox exposure:** deny-default; read/write subpaths only for these
-  five installed mimo roots, plus the private workspace (including private tmp):
-  - `~/.config/mimocode` (configuration and provider/plugin dependencies)
-  - `~/.local/share/mimocode` (auth, database, storage, logs, snapshots, tool output)
-  - `~/.cache/mimocode` (model catalogue and cached binaries)
-  - `~/.local/state/mimocode` (model selection, key/value state and locks)
-  - `~/.mimocode` (installed mimo binaries/dependencies)
+- **Own sandbox exposure:** deny-default; all five installed mimo roots remain
+  readable, but only **data and state** are writable, in addition to the private
+  workspace (including private tmp):
+  - **Read/write:** `~/.local/share/mimocode` (auth, database, storage, logs,
+    snapshots, tool output)
+  - **Read/write:** `~/.local/state/mimocode` (model selection, key/value state
+    and locks)
+  - **Read-only:** `~/.mimocode` (install tree, including `bin/mimo`)
+  - **Read-only:** `~/.config/mimocode` (configuration, plugins and dependencies)
+  - **Read-only:** `~/.cache/mimocode` (model catalogue and cached binaries/models)
+
+  The read-only roots prevent a manipulated session from persisting changes to
+  mimo's binary, configuration, plugins or cached executables outside the sandbox.
+  Install/update/configuration changes must be made outside the sandbox. Launch
+  also refuses **any writable root containing the mimo binary or its install
+  directory**, including an unusual binary location under data/state or the
+  private workspace/login home.
 
   Roots must exist as directories and canonicalise to those exact paths under
   real canonical HOME. Redirected roots or ancestors are refused, not granted as
@@ -243,7 +263,8 @@ production-ready; do not grant broad networking or shell access.
   `~/Library` via this profile. In particular, `~/Library/Caches` and similar
   speculative compatibility paths remain denied: no extra grant is guessed.
 - **Private sandbox exposure:** the existing private workspace/login-home
-  subpath grants, not the five personal mimo roots. The login home is persistent,
+  subpath grants, not the five personal mimo roots. The app-owned login home stays
+  writable; the binary install tree stays read-only. The login home is persistent,
   owned, non-symlink and owner-only. Provider setup is a deliberate manual step.
 - Environment is cleared, then only PATH, TMPDIR, LANG and safe LC_* locale
   values are retained, with HOME chosen by profile. Own uses a private workspace
@@ -253,15 +274,35 @@ production-ready; do not grant broad networking or shell access.
   passed. Installed configuration is read by mimo itself only in Own mode.
 - Production launch requires macOS `sandbox-exec`; other platforms refuse an
   unsandboxed mimo child. Both profiles allow the read-only binary install tree,
-  exact app executable, system libraries (including read access to all of `/usr`
-  for Bun), DNS, outbound TCP `*:443`, and the exact app Unix socket. Both also
-  include exactly these localhost rules for mimo's internal server:
+  exact app executable, system libraries and shared resources (`/usr/lib` and
+  `/usr/share`, **not** a broad `/usr`, `/usr/local` or `/usr/bin` grant), DNS,
+  outbound TCP `*:443`, and the exact app Unix socket. Both also include exactly
+  these localhost rules for mimo's internal server (`N` is the chosen port,
+  substituted as a decimal number):
 
   ```scheme
-  (allow network-bind (local ip "localhost:*"))
-  (allow network-inbound (local ip "localhost:*"))
-  (allow network-outbound (remote ip "localhost:*"))
+  (allow network-bind (local ip "localhost:N"))
+  (allow network-inbound (local ip "localhost:N"))
+  (allow network-outbound (remote ip "localhost:N"))
   ```
+
+  Both profiles also grant the following **metadata-only** DNS path traversal
+  (merged with private workspace/socket ancestor metadata grants, without duplicates):
+
+  ```scheme
+  (allow file-read-metadata (literal "/var") (literal "/etc") (literal "/tmp") (literal "/private") (literal "/private/var") (literal "/private/var/run") (literal "/private/etc") (literal "/private/tmp"))
+  ```
+
+  `file-read*` includes `(subpath "/private/etc/ssl")` for system TLS certificates.
+  These metadata grants let the macOS resolver traverse the public aliases and
+  canonical paths; without them DNS fails even with HTTPS outbound allowed.
+  They do **not** grant directory contents or broad reads/writes under `/etc`,
+  `/var` or `/tmp`. The existing exact `/private/etc/hosts` and
+  `/private/etc/resolv.conf` reads, `/private/var/run/mDNSResponder` outbound,
+  and the three Mach names `com.apple.dnssd.service`, `com.apple.trustd`, and
+  `com.apple.trustd.agent` remain. The pinned loopback and TCP 443 rules are unchanged.
+  The manager verified this DNS fix with curl and real mimo (including models.dev
+  refresh); implementation verification uses profile-string tests, not live network.
 
   Execution is restricted to mimo and the app shim; no shell, arbitrary
   executable, broad home subtree or non-loopback inbound listener. Broad install
@@ -294,8 +335,9 @@ production-ready; do not grant broad networking or shell access.
   (build/plan) are agent modes, never model choices. Switching uses `session/set_model`, or
   `session/set_config_option` with the reported config ID for config-option agents.
   The last mimo model is saved as pane choice `mimo_model`, independently of the
-  Codex `model`, and reapplied after the canary to each new user session if still
-  offered. An unavailable saved model falls back to the reported current model.
+  Codex `model`, and applied **before the canary prompt** and again to each new
+  user session if still offered. An unavailable or absent saved model falls back
+  to mimo's reported current model.
   If no model metadata is offered the picker shows **mimo default**. No reasoning
   efforts, providers, model IDs or models from local credential files are invented.
   Images are not enabled.
@@ -328,7 +370,17 @@ production-ready; do not grant broad networking or shell access.
   new session ID before routing any following line; late updates from the retired
   canary session are ignored. Actual mimo provenance formatting is not live-verified.
 - Every fresh child runs the directory/shell **canary before Ready**, then starts
-  a separate user session. The existing stream scrubber handles secrets split
+  a separate user session. The canary has a **60-second overall deadline**, including
+  session creation and model selection. ACP `session/update` retry parts appear as
+  scrubbed notices: `mimo: provider unreachable (attempt N) — <message>`, including
+  while readiness is Checking. After **three network-kind retry updates**, readiness
+  sends `session/cancel` and fails with: “mimo could not reach its model provider
+  (network). Check your provider/endpoint in mimo, then retry.” Timeout also cancels
+  and shows a clear error. Readiness failures leave Checking immediately, display
+  the error in the pane (not only a tooltip), and offer **Restart**; nothing is replayed.
+  Normal user turns display retry notices but do not apply the canary retry limit
+  or a prompt deadline: mimo can keep retrying until the user interrupts.
+  The existing stream scrubber handles secrets split
   across text deltas and final partial lines. Raw ACP transcripts are not saved;
   stderr is discarded, not copied into logs. Stop/shutdown kills and reaps the
   process group, tracks descendants while the child is alive, and awaits verified
@@ -340,6 +392,22 @@ read-only/edit policy, regardless of the pane's Codex toolset choice. Their
 host-authored `external-*` provenance/60-second scope is separate from the
 in-app `mimo-*` conversational turn: use the external approval cards and drawing
 provenance; exact conversation-footer undo/trace association is not provided.
+
+### Troubleshooting: provider unreachable
+
+If the pane shows **mimo: provider unreachable**, **Cannot connect to API**, or
+“mimo could not reach its model provider (network)”, check the selected model,
+provider login, and provider/endpoint configuration in mimo outside terminal-rs.
+Own profile uses your installed mimo setup; Private profile uses its separate
+saved login. Custom non-443 endpoints remain blocked by the isolation policy.
+The sandbox must retain the DNS metadata traversal, SSL read, resolver socket,
+and trust-service grants above; allowing TCP 443 alone does not make DNS work.
+Do not broaden the filesystem/network policy or paste credentials into the pane.
+
+Readiness stops after three network retries or its 60-second canary deadline and
+shows an error with **Restart**. Fix the provider setup, then restart to run a fresh
+canary; no prompt is automatically resent. During a normal turn notices are
+informational and mimo may keep retrying; use **Interrupt** to stop it.
 
 ## Manager manual test (not executed during implementation)
 
@@ -543,3 +611,22 @@ approval; the equivalent forced Cargo environment configuration shown above ran
 the full workspace suite successfully (also repeated with `--quiet` to retain
 compact result totals). No app/mimo or release build was run, and no network or
 personal CLI configuration was used.
+
+### MIMO-SANDBOX-TIGHTEN verification
+
+ACP regressions assert the exact Own data/state writable set, read-only
+install/config/cache, writable Private login home, `/usr/lib` + `/usr/share`
+without broader `/usr` grants, and all three localhost rules pinned to the
+selected port without wildcards. They also cover separate `--port`/number argv
+items with plugins on/off, rejection of port zero and writable paths containing
+the binary/install directory, the one-retry limit and unsafe-backend refusal.
+All 32 subsets of existing Own roots still get only their matching readable links
+and data/state write grants. No added test starts mimo or the app.
+
+`cargo fmt --all` and offline/locked workspace Clippy over all targets with
+`-D warnings` pass. The exact environment-prefixed workspace test command required
+runner approval. Using equivalent forced Cargo environment configuration, the
+parallel workspace run encountered unrelated app timing/history-request failures;
+the full serial workspace run passed **2,064 tests, 0 failed, 9 ignored**. The
+35 ACP tests also passed with default test parallelism. No release build, live
+app/mimo launch, network access or personal CLI configuration was used.

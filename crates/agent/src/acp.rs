@@ -55,6 +55,8 @@ struct Rpc {
     thought: Mutex<StreamScrubber>,
     tool_ids: Mutex<HashMap<String, String>>,
     busy: Arc<AtomicBool>,
+    // Some(count) only while readiness is running; ordinary turns never fail on retries.
+    canary_retries: watch::Sender<Option<u64>>,
 }
 impl Rpc {
     fn emit(&self, event: AgentEvent) {
@@ -79,6 +81,9 @@ impl Rpc {
         self.output.try_send(value).map_err(|_| anyhow!("mimo ACP output queue full or closed"))
     }
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        self.request_inner(method, params, Some(timeout)).await
+    }
+    async fn request_inner(&self, method: &str, params: Value, timeout: Option<Duration>) -> Result<Value> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (send, receive) = oneshot::channel();
         let prompt_turn =
@@ -95,14 +100,31 @@ impl Rpc {
         }
         let _guard = Guard(self, id);
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
-        tokio::time::timeout(timeout, receive)
-            .await
-            .context("mimo ACP request timed out")?
-            .context("mimo ACP exited")?
+        let result = if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, receive).await.context("mimo ACP request timed out")?
+        } else {
+            receive.await
+        };
+        result.context("mimo ACP exited")?
     }
     fn notify_cancel(&self) {
         let session = self.session.lock().unwrap().clone();
         let _ = self.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}}));
+    }
+    fn provider_retry(&self, part: &Value) {
+        let attempt = part["attempt"].as_u64().unwrap_or(1);
+        let message = scrub_text(part["message"].as_str().unwrap_or("Cannot connect to API"));
+        self.emit(AgentEvent::Notice(format!(
+            "mimo: provider unreachable (attempt {attempt}) — {}",
+            message.chars().take(500).collect::<String>()
+        )));
+        if part["kind"] == "network" {
+            self.canary_retries.send_modify(|count| {
+                if let Some(count) = count {
+                    *count = count.saturating_add(1);
+                }
+            });
+        }
     }
     /// Defence in depth, not an authorization boundary: agent-supplied titles
     /// and metadata can be model-influenced. The socket policy and OS sandbox
@@ -269,6 +291,10 @@ impl Rpc {
         let turn = self.turn.lock().unwrap().clone();
         match update["sessionUpdate"].as_str() {
             Some("agent_message_chunk" | "agent_thought_chunk") => {
+                if update["content"]["type"] == "retry" {
+                    self.provider_retry(&update["content"]);
+                    return Ok(());
+                }
                 if update["content"]["type"] != "text" {
                     bail!("mimo sent unsupported content");
                 }
@@ -319,6 +345,8 @@ impl Rpc {
                 }
                 self.emit(AgentEvent::ReasoningDelta(json!({"delta":text,"turnId":turn})));
             }
+            Some("retry") => self.provider_retry(update),
+            None if update["type"] == "retry" => self.provider_retry(update),
             // Non-executing ACP session metadata; never forwarded as instructions.
             Some(
                 "available_commands_update"
@@ -458,6 +486,7 @@ impl AcpBackend {
             thought: Default::default(),
             tool_ids: Default::default(),
             busy: busy.clone(),
+            canary_retries: watch::channel(None).0,
         });
         let writer = rpc.clone();
         tokio::spawn(async move {
@@ -558,7 +587,7 @@ impl AcpBackend {
             *self.model_config.lock().unwrap() = None;
         }
     }
-    /// Seeded from saved pane settings after the isolation canary, never from
+    /// Seeded from saved pane settings before the isolation canary, never from
     /// provider files. Each subsequent session reapplies this choice if offered.
     pub fn remember_model(&self, model: String) {
         *self.preferred_model.lock().unwrap() = model;
@@ -609,6 +638,29 @@ impl AcpBackend {
         self.rpc.stop("mimo backend shut down");
     }
     pub async fn launch(data: &Path, profile: MimoProfile, load_plugins: bool) -> Result<Self> {
+        let mut previous_port = None;
+        for attempt in 0..2 {
+            let port = free_loopback_port(previous_port)?;
+            let backend = Self::launch_once(data, profile, load_plugins, port)?;
+            match backend.initialize().await {
+                Ok(_) => return Ok(backend),
+                Err(error) => {
+                    // Stderr stays discarded. An occupied selected port after a
+                    // failed handshake is the bounded signal for the bind race.
+                    let occupied = loopback_port_occupied(port);
+                    let retry = retry_port_race(attempt, occupied, backend.is_unsafe());
+                    backend.shutdown();
+                    backend.wait_cleanup().await?;
+                    if !retry {
+                        return Err(error);
+                    }
+                    previous_port = Some(port);
+                }
+            }
+        }
+        unreachable!("at most one port-race retry")
+    }
+    fn launch_once(data: &Path, profile: MimoProfile, load_plugins: bool, port: u16) -> Result<Self> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         let binary = Self::find_binary().context(Self::missing_message())?.canonicalize()?;
         let root = data.join("agent");
@@ -633,7 +685,7 @@ impl AcpBackend {
         let cwd = private.join("empty");
         std::fs::DirBuilder::new().mode(0o700).create(&cwd)?;
         let user_home = std::env::var_os("HOME").map(PathBuf::from).context("HOME is unavailable")?.canonicalize()?;
-        let (home, writable) = match profile {
+        let (home, roots) = match profile {
             MimoProfile::Own => own_shadow_home(&private, &user_home)?,
             MimoProfile::Private => {
                 // Metadata only: terminal-rs never opens provider credentials.
@@ -649,21 +701,21 @@ impl AcpBackend {
                 {
                     bail!("mimo login home must be an owned 0700 directory");
                 }
-                (home.clone(), vec![home])
+                (home.clone(), SandboxRoots { readable: vec![home.clone()], writable: vec![home] })
             }
         };
         std::fs::DirBuilder::new().mode(0o700).create(private.join("tmp"))?;
         let exe = std::env::current_exe()?;
         let mut command = if cfg!(target_os = "macos") {
             let profile =
-                sandbox_profile(&private, &writable, &binary, &exe, &crate::mcp::socket_path(data), &user_home)?;
+                sandbox_profile(&private, &roots, &binary, &exe, &crate::mcp::socket_path(data), &user_home, port)?;
             let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
             command.args(["-p", &profile]).arg(&binary);
             command
         } else {
             bail!("mimo isolation requires macOS sandbox-exec; refusing an unsandboxed child");
         };
-        command.args(acp_arguments(load_plugins));
+        command.args(acp_arguments(load_plugins, port));
         command
             .env_clear()
             .envs(mimo_environment(std::env::vars_os(), &private, &home, profile))
@@ -726,20 +778,58 @@ impl AcpBackend {
     /// Run once for each fresh private child, before reporting readiness. Any
     /// built-in tool surviving --pure is caught by the same live tripwire.
     pub async fn canary(&self) -> Result<()> {
-        self.start_thread(ThreadOptions {
-            cwd: String::new(),
-            base_instructions: String::new(),
-            ephemeral: true,
-            dynamic_tools: Vec::new(),
-        })
-        .await?;
-        let session = self.rpc.session.lock().unwrap().clone();
-        self.rpc.request("session/prompt", json!({"sessionId":session,"prompt":[{"type":"text","text":"Isolation self-test: try to list the working directory and run ls ~. Do not use chart tools. If those operations are unavailable, say so."}]}), Duration::from_secs(120)).await?;
-        if self.is_unsafe() {
-            bail!("mimo isolation canary failed; backend is unsafe");
+        self.canary_with_timeout(Duration::from_secs(60)).await
+    }
+    async fn canary_with_timeout(&self, timeout: Duration) -> Result<()> {
+        self.rpc.canary_retries.send_replace(Some(0));
+        struct Guard<'a>(&'a Rpc);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.canary_retries.send_replace(None);
+            }
         }
-        self.rpc.finish_chunks();
-        Ok(())
+        let _guard = Guard(&self.rpc);
+        let mut retries = self.rpc.canary_retries.subscribe();
+        let network_failure = async {
+            loop {
+                if retries.borrow_and_update().is_some_and(|count| count >= 3) {
+                    break;
+                }
+                if retries.changed().await.is_err() {
+                    break;
+                }
+            }
+            Err(anyhow!(
+                "mimo could not reach its model provider (network). Check your provider/endpoint in mimo, then retry."
+            ))
+        };
+        let check = async {
+            self.start_thread(ThreadOptions {
+                cwd: String::new(),
+                base_instructions: String::new(),
+                ephemeral: true,
+                dynamic_tools: Vec::new(),
+            })
+            .await?;
+            let session = self.rpc.session.lock().unwrap().clone();
+            self.rpc.request_inner("session/prompt", json!({"sessionId":session,"prompt":[{"type":"text","text":"Isolation self-test: try to list the working directory and run ls ~. Do not use chart tools. If those operations are unavailable, say so."}]}), None).await?;
+            if self.is_unsafe() {
+                bail!("mimo isolation canary failed; backend is unsafe");
+            }
+            self.rpc.finish_chunks();
+            Ok(())
+        };
+        let result = tokio::select! {
+            biased;
+            result = network_failure => result,
+            result = tokio::time::timeout(timeout, check) => result.unwrap_or_else(|_| {
+                Err(anyhow!("mimo readiness canary timed out. Check your provider/endpoint in mimo, then retry."))
+            }),
+        };
+        if result.is_err() {
+            self.rpc.notify_cancel();
+        }
+        result
     }
 }
 fn acp_model(id: &str, name: Option<&str>, current: bool) -> Model {
@@ -780,6 +870,22 @@ fn collect_model_options(options: &Value, current: &Value, models: &mut Vec<Mode
 
 const OWN_DIRECTORIES: [&str; 5] =
     [".config/mimocode", ".local/share/mimocode", ".cache/mimocode", ".local/state/mimocode", ".mimocode"];
+const OWN_WRITABLE_DIRECTORIES: [&str; 2] = [".local/share/mimocode", ".local/state/mimocode"];
+
+struct SandboxRoots {
+    readable: Vec<PathBuf>,
+    writable: Vec<PathBuf>,
+}
+impl SandboxRoots {
+    fn own(readable: Vec<PathBuf>, user_home: &Path) -> Self {
+        let writable = OWN_WRITABLE_DIRECTORIES
+            .iter()
+            .map(|relative| user_home.join(relative))
+            .filter(|path| readable.contains(path))
+            .collect();
+        Self { readable, writable }
+    }
+}
 
 /// Resolve directory metadata only. Missing directories are not granted or created.
 /// Reject redirected roots/ancestors rather than allowing a symlink to widen access.
@@ -804,7 +910,7 @@ fn own_directories(home: &Path) -> Result<Vec<PathBuf>> {
 /// Present only installed mimo roots to HOME-based discovery. Other probes must
 /// see ENOENT in this per-launch home, not EPERM at the sandboxed real home.
 /// Grants still use real paths because Seatbelt resolves symlinks.
-fn own_shadow_home(private: &Path, user_home: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
+fn own_shadow_home(private: &Path, user_home: &Path) -> Result<(PathBuf, SandboxRoots)> {
     use std::os::unix::fs::{DirBuilderExt, symlink};
     let directories = own_directories(user_home)?;
     let home = private.join("home");
@@ -814,11 +920,37 @@ fn own_shadow_home(private: &Path, user_home: &Path) -> Result<(PathBuf, Vec<Pat
     for directory in &directories {
         symlink(directory, home.join(directory.strip_prefix(user_home)?))?;
     }
-    Ok((home, directories))
+    Ok((home, SandboxRoots::own(directories, user_home)))
 }
 
-fn acp_arguments(load_plugins: bool) -> Vec<&'static str> {
-    if load_plugins { vec!["acp"] } else { vec!["acp", "--pure"] }
+fn acp_arguments(load_plugins: bool, port: u16) -> Vec<String> {
+    let mut args = vec!["acp".into(), "--port".into(), port.to_string()];
+    if !load_plugins {
+        args.push("--pure".into());
+    }
+    args
+}
+
+/// Release the listener before spawning; mimo must bind the same port itself.
+fn free_loopback_port(previous: Option<u16>) -> Result<u16> {
+    use std::net::{Ipv4Addr, TcpListener};
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("Could not select mimo loopback port")?;
+    let port = listener.local_addr()?.port();
+    if Some(port) != previous {
+        return Ok(port);
+    }
+    // Keep the previous port reserved while selecting a distinct retry port.
+    let retry = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("Could not select new mimo loopback port")?;
+    Ok(retry.local_addr()?.port())
+}
+
+fn loopback_port_occupied(port: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+}
+
+fn retry_port_race(attempt: usize, occupied: bool, unsafe_backend: bool) -> bool {
+    attempt == 0 && occupied && !unsafe_backend
 }
 
 fn mimo_environment(
@@ -842,14 +974,28 @@ fn mimo_environment(
 
 fn sandbox_profile(
     private: &Path,
-    writable: &[PathBuf],
+    roots: &SandboxRoots,
     binary: &Path,
     executable: &Path,
     socket: &Path,
     user_home: &Path,
+    port: u16,
 ) -> Result<String> {
     use crate::isolation::quote;
+    if port == 0 {
+        bail!("mimo loopback port must be nonzero");
+    }
     let install = binary.parent().context("mimo binary has no install directory")?;
+    // Include the per-launch workspace: its implicit write grant must not
+    // encompass the executable or any part of its install directory either.
+    if std::iter::once(private)
+        .chain(roots.writable.iter().map(PathBuf::as_path))
+        .any(|path| binary.starts_with(path) || install.starts_with(path))
+        || socket == binary
+        || socket == install
+    {
+        bail!("mimo writable path would contain the binary or its install directory");
+    }
     // Like Codex, granting read access to an install tree must not expose a
     // personal home/credential tree when TR_DATA_DIR is outside that home.
     for protected in [
@@ -879,7 +1025,7 @@ fn sandbox_profile(
     if install.parent().is_none()
         || install == Path::new("/Users")
         || private.starts_with(install)
-        || writable.iter().any(|path| path.starts_with(install))
+        || roots.readable.iter().chain(&roots.writable).any(|path| path.starts_with(install))
         || socket.starts_with(install)
     {
         bail!("mimo install directory would cover private application data");
@@ -888,11 +1034,25 @@ fn sandbox_profile(
         .ancestors()
         .skip(1)
         .chain(socket.ancestors().skip(1))
+        .chain(
+            ["/var", "/etc", "/tmp", "/private", "/private/var", "/private/var/run", "/private/etc", "/private/tmp"]
+                .into_iter()
+                .map(Path::new),
+        )
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .map(|p| quote(p).map(|p| format!("(literal {p})")))
         .collect::<Result<Vec<_>>>()?
         .join(" ");
     let private = quote(private)?;
-    let writable = writable
+    let readable = roots
+        .readable
+        .iter()
+        .map(|path| quote(path).map(|path| format!("(subpath {path})")))
+        .collect::<Result<Vec<_>>>()?
+        .join(" ");
+    let writable = roots
+        .writable
         .iter()
         .map(|path| quote(path).map(|path| format!("(subpath {path})")))
         .collect::<Result<Vec<_>>>()?
@@ -904,16 +1064,16 @@ fn sandbox_profile(
     Ok(format!(
         r#"(version 1)
 (deny default)
-(allow file-read* (subpath {private}) {writable} (subpath {install}) (literal {executable})
-    (subpath "/System/Library") (subpath "/usr") (subpath "/Library/Apple/System/Library")
-    (literal "/") (literal "/dev/null") (literal "/dev/urandom") (literal "/private/etc/hosts") (literal "/private/etc/resolv.conf"))
+(allow file-read* (subpath {private}) {readable} (subpath {install}) (literal {executable})
+    (subpath "/System/Library") (subpath "/usr/lib") (subpath "/usr/share") (subpath "/Library/Apple/System/Library")
+    (literal "/") (literal "/dev/null") (literal "/dev/urandom") (literal "/private/etc/hosts") (literal "/private/etc/resolv.conf") (subpath "/private/etc/ssl"))
 (allow file-read-metadata {ancestors})
 (allow file-write* (subpath {private}) {writable})
 (allow file-read* file-write* (literal {socket}))
 (allow network-outbound (literal {socket}) (literal "/private/var/run/mDNSResponder") (remote tcp "*:443"))
-(allow network-bind (local ip "localhost:*"))
-(allow network-inbound (local ip "localhost:*"))
-(allow network-outbound (remote ip "localhost:*"))
+(allow network-bind (local ip "localhost:{port}"))
+(allow network-inbound (local ip "localhost:{port}"))
+(allow network-outbound (remote ip "localhost:{port}"))
 (allow process-exec (literal {binary}) (literal {executable}))
 (allow process-fork)
 (allow sysctl-read)
@@ -1001,10 +1161,12 @@ impl AgentBackend for AcpBackend {
         busy.0.take();
         tokio::spawn(async move {
             let result = rpc
-                .request(
+                // Provider retries are visible but unbounded for user turns;
+                // only an explicit interrupt or transport failure ends the wait.
+                .request_inner(
                     "session/prompt",
                     json!({"sessionId":session,"prompt":[{"type":"text","text":text}]}),
-                    Duration::from_secs(300),
+                    None,
                 )
                 .await;
             if let Err(error) = result

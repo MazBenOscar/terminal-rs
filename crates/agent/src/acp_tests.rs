@@ -128,6 +128,152 @@ async fn canary_uses_fresh_session_and_foreign_attempt_fails_readiness() {
     }
 }
 
+fn retry_update(attempt: u64, kind: &str) -> Value {
+    json!({"jsonrpc":"2.0","method":"session/update","params":{"update":{
+        "sessionUpdate":"agent_message_chunk","content":{"type":"retry","attempt":attempt,
+        "kind":kind,"message":"Cannot connect to API; Bearer fixture-secret"}
+    }}})
+}
+
+#[tokio::test(start_paused = true)]
+async fn user_turn_retries_are_scrubbed_notices_and_continue_until_interrupt() {
+    let (backend, mut read, mut write, killed) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let mut events = backend.events();
+    backend.send_turn(TurnInput::default()).await.unwrap();
+    let prompt = receive(&mut read).await;
+    for attempt in 1..=5 {
+        send(&mut write, retry_update(attempt, "network")).await;
+        let Some(AgentEvent::Notice(message)) = events.recv().await else { panic!("missing retry notice") };
+        assert!(message.contains(&format!("provider unreachable (attempt {attempt})")), "{message}");
+        assert!(message.contains("Cannot connect to API"), "{message}");
+        assert!(!message.contains("fixture-secret"), "{message}");
+    }
+    tokio::time::advance(Duration::from_secs(301)).await;
+    tokio::task::yield_now().await;
+    assert!(!backend.is_closed());
+    assert!(backend.busy.load(Ordering::SeqCst));
+    assert!(!backend.is_unsafe());
+    assert!(!killed.load(Ordering::SeqCst));
+    assert!(backend.rpc.canary_retries.borrow().is_none());
+    backend.interrupt().await.unwrap();
+    assert_eq!(receive(&mut read).await["method"], "session/cancel");
+    send(&mut write, crate::mcp::success(prompt["id"].clone(), json!({"stopReason":"cancelled"}))).await;
+    assert!(matches!(events.recv().await, Some(AgentEvent::Done(_))));
+}
+
+#[tokio::test]
+async fn three_network_retries_fail_canary_and_cancel_without_marking_unsafe() {
+    let (backend, mut read, mut write, killed) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let mut events = backend.events();
+    let server = async {
+        let new = receive(&mut read).await;
+        send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"canary"}))).await;
+        assert_eq!(receive(&mut read).await["method"], "session/prompt");
+        // Other retry kinds remain notices, not network failures; count updates,
+        // not the untrusted attempt number (which can be large or repeated).
+        send(&mut write, retry_update(99, "rate_limit")).await;
+        for _ in 0..3 {
+            send(&mut write, retry_update(1, "network")).await;
+        }
+        assert_eq!(receive(&mut read).await["method"], "session/cancel");
+    };
+    let (result, ()) = tokio::join!(backend.canary(), server);
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "mimo could not reach its model provider (network). Check your provider/endpoint in mimo, then retry."
+    );
+    for _ in 0..4 {
+        assert!(matches!(events.recv().await, Some(AgentEvent::Notice(_))));
+    }
+    assert!(!backend.is_unsafe());
+    assert!(!killed.load(Ordering::SeqCst));
+    assert!(backend.rpc.pending.lock().unwrap().is_empty());
+    assert!(backend.rpc.canary_retries.borrow().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn canary_overall_timeout_covers_session_setup_and_prompt_and_cancels() {
+    for hang_in_setup in [false, true] {
+        let (backend, mut read, mut write, _) = fake();
+        handshake(&backend, &mut read, &mut write).await;
+        let server = async {
+            let new = receive(&mut read).await;
+            assert_eq!(new["method"], "session/new");
+            if !hang_in_setup {
+                send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"canary"}))).await;
+                assert_eq!(receive(&mut read).await["method"], "session/prompt");
+            }
+            assert_eq!(receive(&mut read).await["method"], "session/cancel");
+        };
+        let (result, ()) = tokio::join!(backend.canary_with_timeout(Duration::from_millis(50)), server);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "mimo readiness canary timed out. Check your provider/endpoint in mimo, then retry."
+        );
+        assert!(!backend.is_unsafe());
+        assert!(backend.rpc.pending.lock().unwrap().is_empty());
+        assert!(backend.rpc.canary_retries.borrow().is_none());
+    }
+}
+
+#[tokio::test]
+async fn saved_available_model_is_applied_before_canary_otherwise_current_model_is_used() {
+    for config in [false, true] {
+        for saved in ["provider/saved", "provider/missing", ""] {
+            let (backend, mut read, mut write, _) = fake();
+            backend.remember_model(saved.into());
+            let server = async {
+                let init = receive(&mut read).await;
+                send(&mut write, crate::mcp::success(init["id"].clone(), json!({"protocolVersion":1}))).await;
+                let new = receive(&mut read).await;
+                let metadata = if config {
+                    json!({"sessionId":"canary","configOptions":[{"id":"model","category":"model","type":"select",
+                        "currentValue":"provider/current","options":[{"value":"provider/current"},{"value":"provider/saved"}]}]})
+                } else {
+                    json!({"sessionId":"canary","models":{"currentModelId":"provider/current",
+                        "availableModels":[{"modelId":"provider/current"},{"modelId":"provider/saved"}]}})
+                };
+                send(&mut write, crate::mcp::success(new["id"].clone(), metadata)).await;
+                if saved == "provider/saved" {
+                    let select = receive(&mut read).await;
+                    assert_eq!(select["params"]["sessionId"], "canary");
+                    if config {
+                        assert_eq!(select["method"], "session/set_config_option");
+                        assert_eq!(select["params"]["value"], saved);
+                    } else {
+                        assert_eq!(select["method"], "session/set_model");
+                        assert_eq!(select["params"]["modelId"], saved);
+                    }
+                    send(&mut write, crate::mcp::success(select["id"].clone(), json!({}))).await;
+                }
+                let prompt = receive(&mut read).await;
+                assert_eq!(prompt["method"], "session/prompt");
+                send(&mut write, crate::mcp::success(prompt["id"].clone(), json!({"stopReason":"end_turn"}))).await;
+            };
+            let (result, ()) = tokio::join!(backend.canary(), server);
+            result.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn retry_parts_do_not_bypass_tool_tripwires() {
+    let (backend, mut read, mut write, _) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let mut events = backend.events();
+    send(
+        &mut write,
+        json!({"jsonrpc":"2.0","method":"session/update","params":{"update":{
+            "sessionUpdate":"tool_call","title":"bash","type":"retry","kind":"network"
+        }}}),
+    )
+    .await;
+    assert!(matches!(events.recv().await, Some(AgentEvent::Error(_))));
+    assert!(backend.is_unsafe());
+}
+
 #[tokio::test]
 async fn initialize_models_and_workflow_outcomes_are_used_without_inventing_efforts() {
     let (backend, mut read, mut write, _) = fake();
@@ -473,6 +619,7 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
         thought: Default::default(),
         tool_ids: Default::default(),
         busy: Arc::new(AtomicBool::new(false)),
+        canary_retries: watch::channel(None).0,
     };
     for title in ["terminal-rs/read_chart", "mcp__terminal-rs__read_chart"] {
         assert!(rpc.terminal_tool(&json!({"title":title}), None).is_some());
@@ -482,15 +629,19 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
     }
     let profile = sandbox_profile(
         Path::new("/private/data/agent/mimo"),
-        &[PathBuf::from("/private/data/agent/mimo-home")],
+        &SandboxRoots {
+            readable: vec![PathBuf::from("/private/data/agent/mimo-home")],
+            writable: vec![PathBuf::from("/private/data/agent/mimo-home")],
+        },
         Path::new("/opt/mimo/bin/mimo"),
         Path::new("/app/terminal-rs"),
         Path::new("/private/data/agent/mcp.sock"),
         Path::new("/Users/test"),
+        43123,
     )
     .unwrap();
     assert!(profile.contains("(deny default)"));
-    assert_localhost_and_system_rules(&profile);
+    assert_localhost_and_system_rules(&profile, 43123);
     assert!(!profile.contains("/bin/bash") && !profile.contains("/bin/sh"));
     assert!(profile.contains("(literal \"/private/data/agent/mcp.sock\")"));
     for binary in [
@@ -509,11 +660,15 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
         assert!(
             sandbox_profile(
                 Path::new("/private/data/agent/mimo"),
-                &[PathBuf::from("/private/data/agent/mimo-home")],
+                &SandboxRoots {
+                    readable: vec![PathBuf::from("/private/data/agent/mimo-home")],
+                    writable: vec![PathBuf::from("/private/data/agent/mimo-home")],
+                },
                 Path::new(binary),
                 Path::new("/app/terminal-rs"),
                 Path::new("/private/data/agent/mcp.sock"),
                 Path::new("/Users/test"),
+                43123,
             )
             .is_err(),
             "{binary}"
@@ -521,64 +676,170 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
     }
 }
 
-fn assert_localhost_and_system_rules(profile: &str) {
-    assert!(profile.contains("(subpath \"/usr\")"));
-    assert!(!profile.contains("(subpath \"/usr/lib\")"));
+fn assert_localhost_and_system_rules(profile: &str, port: u16) {
+    let usr_subpaths: Vec<_> = profile
+        .split("(subpath \"")
+        .skip(1)
+        .filter_map(|part| part.split_once("\")").map(|(path, _)| path))
+        .filter(|path| path.starts_with("/usr"))
+        .collect();
+    assert_eq!(usr_subpaths, ["/usr/lib", "/usr/share"]);
+    let metadata = profile.lines().find(|line| line.starts_with("(allow file-read-metadata ")).unwrap();
+    let literals: Vec<_> =
+        metadata.split("(literal \"").skip(1).map(|part| part.split_once("\")").unwrap().0).collect();
+    let unique: HashSet<_> = literals.iter().collect();
+    assert_eq!(literals.len(), unique.len(), "duplicate metadata ancestors: {metadata}");
+    for path in ["/var", "/etc", "/tmp", "/private", "/private/var", "/private/var/run", "/private/etc", "/private/tmp"]
+    {
+        assert_eq!(metadata.matches(&format!("(literal \"{path}\")")).count(), 1, "{metadata}");
+        assert!(!profile.contains(&format!("(subpath \"{path}\")")), "broad system grant: {path}");
+    }
+    assert_eq!(profile.matches("(subpath \"/private/etc/ssl\")").count(), 1);
+    let reads =
+        profile.split_once("(allow file-read* ").unwrap().1.split_once("\n(allow file-read-metadata").unwrap().0;
+    assert!(reads.contains("(subpath \"/private/etc/ssl\")"));
+    assert!(profile.contains("(allow mach-lookup (global-name \"com.apple.dnssd.service\") (global-name \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\"))"));
     let network: Vec<_> = profile.lines().filter(|line| line.starts_with("(allow network-")).collect();
     assert_eq!(
         network,
         [
-            "(allow network-outbound (literal \"/private/data/agent/mcp.sock\") (literal \"/private/var/run/mDNSResponder\") (remote tcp \"*:443\"))",
-            "(allow network-bind (local ip \"localhost:*\"))",
-            "(allow network-inbound (local ip \"localhost:*\"))",
-            "(allow network-outbound (remote ip \"localhost:*\"))",
+            "(allow network-outbound (literal \"/private/data/agent/mcp.sock\") (literal \"/private/var/run/mDNSResponder\") (remote tcp \"*:443\"))".to_owned(),
+            format!("(allow network-bind (local ip \"localhost:{port}\"))"),
+            format!("(allow network-inbound (local ip \"localhost:{port}\"))"),
+            format!("(allow network-outbound (remote ip \"localhost:{port}\"))"),
         ]
     );
+    assert!(!profile.lines().filter(|line| line.contains("localhost:")).any(|line| line.contains('*')));
 }
 
 #[test]
 fn own_and_private_profiles_have_narrow_write_and_read_roots() {
     let user = Path::new("/Users/test");
-    let own: Vec<_> = OWN_DIRECTORIES.iter().map(|relative| user.join(relative)).collect();
-    let private = vec![PathBuf::from("/private/data/agent/mimo-home")];
+    let own_paths: Vec<_> = OWN_DIRECTORIES.iter().map(|relative| user.join(relative)).collect();
+    let own = SandboxRoots::own(own_paths.clone(), user);
+    // Hard-code the expected policy independently of the production constants.
+    assert_eq!(own.writable, [user.join(".local/share/mimocode"), user.join(".local/state/mimocode")]);
+    let private = SandboxRoots {
+        readable: vec![PathBuf::from("/private/data/agent/mimo-home")],
+        writable: vec![PathBuf::from("/private/data/agent/mimo-home")],
+    };
     for (roots, is_own) in [(&own, true), (&private, false)] {
-        let profile = sandbox_profile(
+        for port in [1, 43123, 65535] {
+            let profile = sandbox_profile(
+                Path::new("/private/data/agent/workspace"),
+                roots,
+                Path::new("/Users/test/.mimocode/bin/mimo"),
+                Path::new("/app/terminal-rs"),
+                Path::new("/private/data/agent/mcp.sock"),
+                user,
+                port,
+            )
+            .unwrap();
+            assert!(profile.starts_with("(version 1)\n(deny default)"));
+            let reads = profile.lines().find(|line| line.starts_with("(allow file-read* ")).unwrap();
+            let writes = profile.lines().find(|line| line.starts_with("(allow file-write* ")).unwrap();
+            let expected_writes = if is_own {
+                "(allow file-write* (subpath \"/private/data/agent/workspace\") (subpath \"/Users/test/.local/share/mimocode\") (subpath \"/Users/test/.local/state/mimocode\"))"
+            } else {
+                "(allow file-write* (subpath \"/private/data/agent/workspace\") (subpath \"/private/data/agent/mimo-home\"))"
+            };
+            assert_eq!(writes, expected_writes);
+            for path in &own_paths {
+                let grant = format!("(subpath {})", crate::isolation::quote(path).unwrap());
+                assert_eq!(reads.contains(&grant), is_own);
+                assert_eq!(writes.contains(&grant), is_own && own.writable.contains(path));
+            }
+            let install = "(subpath \"/Users/test/.mimocode/bin\")";
+            assert!(reads.contains(install));
+            assert!(!writes.contains(install));
+            assert_eq!(reads.contains("(subpath \"/private/data/agent/mimo-home\")"), !is_own);
+            assert!(!profile.contains("(subpath \"/Users/test\")"));
+            for forbidden in
+                ["/Users/test/.config/opencode", "/Users/test/.codex", "/Users/test/.ssh", "/Users/test/Library"]
+            {
+                assert!(!profile.contains(forbidden), "{profile}");
+            }
+            assert_localhost_and_system_rules(&profile, port);
+        }
+    }
+}
+
+#[test]
+fn writable_paths_cannot_contain_binary_or_install_directory() {
+    let user = Path::new("/Users/test");
+    for writable in ["/opt", "/opt/mimo", "/opt/mimo/bin", "/opt/mimo/bin/mimo"] {
+        let roots = SandboxRoots { readable: vec![writable.into()], writable: vec![writable.into()] };
+        let error = sandbox_profile(
             Path::new("/private/data/agent/workspace"),
-            roots,
+            &roots,
             Path::new("/opt/mimo/bin/mimo"),
             Path::new("/app/terminal-rs"),
             Path::new("/private/data/agent/mcp.sock"),
             user,
+            43123,
         )
-        .unwrap();
-        assert!(profile.starts_with("(version 1)\n(deny default)"));
-        for path in &own {
-            let grant = format!("(subpath {})", crate::isolation::quote(path).unwrap());
-            assert_eq!(profile.matches(&grant).count(), if is_own { 2 } else { 0 });
-        }
-        assert_eq!(profile.contains("(subpath \"/private/data/agent/mimo-home\")"), !is_own);
-        assert!(profile.contains("(allow file-write* (subpath \"/private/data/agent/workspace\")"));
-        assert!(!profile.contains("(subpath \"/Users/test\")"));
-        for forbidden in
-            ["/Users/test/.config/opencode", "/Users/test/.codex", "/Users/test/.ssh", "/Users/test/Library"]
-        {
-            assert!(!profile.contains(forbidden), "{profile}");
-        }
-        assert_localhost_and_system_rules(&profile);
+        .unwrap_err();
+        assert!(error.to_string().contains("writable path would contain"), "{writable}: {error}");
     }
-    // The normal installed binary tree is read-only in Private; Own additionally
-    // grants its .mimocode root by explicit consent, never the home root.
+    let private = SandboxRoots {
+        readable: vec![PathBuf::from("/private/data/agent/mimo-home")],
+        writable: vec![PathBuf::from("/private/data/agent/mimo-home")],
+    };
+    for binary in ["/private/data/agent/workspace/bin/mimo", "/private/data/agent/mimo-home/bin/mimo"] {
+        assert!(
+            sandbox_profile(
+                Path::new("/private/data/agent/workspace"),
+                &private,
+                Path::new(binary),
+                Path::new("/app/terminal-rs"),
+                Path::new("/private/data/agent/mcp.sock"),
+                user,
+                43123,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("writable path would contain")
+        );
+    }
+    let own = SandboxRoots::own(OWN_DIRECTORIES.map(|relative| user.join(relative)).to_vec(), user);
+    for relative in [".local/share/mimocode/bin/mimo", ".local/state/mimocode/bin/mimo"] {
+        assert!(
+            sandbox_profile(
+                Path::new("/private/data/agent/workspace"),
+                &own,
+                &user.join(relative),
+                Path::new("/app/terminal-rs"),
+                Path::new("/private/data/agent/mcp.sock"),
+                user,
+                43123,
+            )
+            .is_err()
+        );
+    }
     assert!(
         sandbox_profile(
-            Path::new("/private/workspace"),
+            Path::new("/private/data/agent/workspace"),
             &own,
-            Path::new("/Users/test/.mimocode/bin/mimo"),
+            Path::new("/opt/mimo/bin/mimo"),
             Path::new("/app/terminal-rs"),
-            Path::new("/private/mcp.sock"),
-            user
+            Path::new("/private/data/agent/mcp.sock"),
+            user,
+            0,
         )
-        .is_ok()
+        .unwrap_err()
+        .to_string()
+        .contains("port must be nonzero")
     );
+}
+
+#[test]
+fn port_race_retries_once_but_never_retries_an_unsafe_backend() {
+    assert!(retry_port_race(0, true, false));
+    for (attempt, occupied, unsafe_backend) in
+        [(1, true, false), (2, true, false), (0, false, false), (0, true, true), (1, true, true)]
+    {
+        assert!(!retry_port_race(attempt, occupied, unsafe_backend));
+    }
 }
 
 #[test]
@@ -618,8 +879,10 @@ fn own_environment_unsets_xdg_and_plugins_are_opt_in() {
     assert_eq!(private.get(std::ffi::OsStr::new("XDG_DATA_HOME")).unwrap(), "/private/mimo-home/data");
     assert!(!private.contains_key(std::ffi::OsStr::new("XDG_CACHE_HOME")));
     assert!(!private.contains_key(std::ffi::OsStr::new("XDG_STATE_HOME")));
-    assert_eq!(acp_arguments(false), ["acp", "--pure"]);
-    assert_eq!(acp_arguments(true), ["acp"]);
+    for port in [1, 43123, 65535] {
+        assert_eq!(acp_arguments(false, port), ["acp", "--port", &port.to_string(), "--pure"]);
+        assert_eq!(acp_arguments(true, port), ["acp", "--port", &port.to_string()]);
+    }
 }
 
 #[test]
@@ -647,9 +910,16 @@ fn own_shadow_home_links_only_existing_roots_with_private_permissions_and_cleanu
         let private = case.join("workspace");
         std::fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
         let workspace = Workspace(private.clone());
-        let (home, writable) = own_shadow_home(&private, &real).unwrap();
+        let (home, roots) = own_shadow_home(&private, &real).unwrap();
         assert_eq!(home, private.join("home"));
-        assert_eq!(writable, expected);
+        assert_eq!(roots.readable, expected);
+        assert_eq!(
+            roots.writable,
+            [real.join(".local/share/mimocode"), real.join(".local/state/mimocode")]
+                .into_iter()
+                .filter(|path| expected.contains(path))
+                .collect::<Vec<_>>()
+        );
         let env = mimo_environment([], &private, &home, MimoProfile::Own);
         assert_eq!(env.get(std::ffi::OsStr::new("HOME")), Some(&home.clone().into_os_string()));
         assert!(env.keys().all(|key| !key.to_string_lossy().starts_with("XDG_")));

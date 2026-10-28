@@ -431,10 +431,8 @@ async fn owner_acp(
     }
     let client = AcpBackend::launch(&parent, config.mimo_profile, config.mimo_load_plugins).await?;
     let run = async {
-        inbox.state(Onboarding::Checking);
-        client.initialize().await?;
-        client.canary().await?;
         client.remember_model(mimo_model);
+        acp_check(&client, inbox, client.canary()).await?;
         let registry = tr_agent_tools::Registry::new(tools);
         let instructions = tr_agent::bridge::session_instructions(&bridge_options(String::new(), tools), &registry)
             .replace(
@@ -472,6 +470,7 @@ async fn owner_acp(
                                 status:if interrupted {"interrupted"} else {params["turn"]["status"].as_str().unwrap_or("completed")}.into(), calls, interrupt_elapsed:None }));
                             calls = 0; interrupted = false; None
                         }
+                        AgentEvent::Notice(message) => { inbox.push(Event::Notice(message)); None },
                         AgentEvent::Error(reason) => bail!("{reason}"),
                         AgentEvent::Usage(_) | AgentEvent::RateLimits(_) => None,
                     };
@@ -509,11 +508,49 @@ async fn owner_acp(
         }
     };
     let result = tokio::select! { biased; _ = stopping.changed() => Ok(()), result = run => result };
+    // Leave Checking immediately, even while bounded child cleanup is still running.
+    report_acp_failure(inbox, &result, client.is_unsafe());
     client.shutdown();
     tokio::time::timeout(Duration::from_secs(10), client.wait_cleanup())
         .await
         .context("mimo cleanup timed out; restart the app")??;
     classify(result, client.is_unsafe())
+}
+
+fn report_acp_failure(inbox: &Inbox, result: &Result<()>, unsafe_backend: bool) {
+    if let Err(error) = result {
+        inbox.state(Onboarding::Stopped {
+            reason: scrub_text(&format!("{error:#}")).chars().take(400).collect(),
+            unsafe_backend,
+        });
+    }
+}
+
+// Consume canary traffic while it runs, not only after Ready. Canary text/tools
+// stay out of the conversation; provider notices and failures must be visible.
+async fn acp_check(
+    client: &tr_agent::acp::AcpBackend,
+    inbox: &Inbox,
+    check: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    use tr_agent::AgentEvents;
+    inbox.state(Onboarding::Checking);
+    let mut events = client.events();
+    tokio::pin!(check);
+    let result = loop {
+        tokio::select! {
+            biased;
+            event = events.recv() => match event {
+                Some(tr_agent::AgentEvent::Notice(message)) => inbox.push(Event::Notice(message)),
+                Some(tr_agent::AgentEvent::Error(reason)) => break Err(anyhow::anyhow!(reason)),
+                None => break Err(anyhow::anyhow!("mimo ACP event stream closed during readiness")),
+                Some(_) => {},
+            },
+            result = &mut check => break result,
+        }
+    };
+    report_acp_failure(inbox, &result, client.is_unsafe());
+    result
 }
 
 async fn acp_send_turn(
@@ -658,6 +695,92 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tr_agent::transport::{Transport, WireEvent};
+
+    #[tokio::test(start_paused = true)]
+    async fn acp_readiness_notices_and_failures_leave_pane_checking_with_restart() {
+        for network in [true, false] {
+            let (client_io, server_io) = tokio::io::duplex(65536);
+            let (read, write) = tokio::io::split(client_io);
+            let client = tr_agent::acp::AcpBackend::connect(
+                read,
+                write,
+                PathBuf::from("/empty"),
+                PathBuf::from("/app"),
+                Arc::new(|| {}),
+            );
+            let inbox = Inbox {
+                events: Mutex::new(Vec::new()),
+                visible: AtomicBool::new(false),
+                ctx: egui::Context::default(),
+                last_text_wake: Mutex::new(None),
+            };
+            client.remember_model("saved".into());
+            let server = async {
+                let (read, mut write) = tokio::io::split(server_io);
+                let mut read = BufReader::new(read);
+                loop {
+                    let line = tr_agent::mcp::read_line(&mut read).await.unwrap().unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&line).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "initialize" => json!({"protocolVersion":1}),
+                        "session/new" => json!({"sessionId":"canary","models":{"currentModelId":"current",
+                            "availableModels":[{"modelId":"current"},{"modelId":"saved"}]}}),
+                        "session/set_model" => {
+                            assert_eq!(request["params"]["modelId"], "saved");
+                            json!({})
+                        }
+                        "session/prompt" => {
+                            if network {
+                                for attempt in 1..=3 {
+                                    tr_agent::mcp::write_line(
+                                        &mut write,
+                                        &json!({"jsonrpc":"2.0","method":"session/update",
+                                        "params":{"sessionId":"canary","update":{"sessionUpdate":"agent_message_chunk",
+                                            "content":{"type":"retry","attempt":attempt,"kind":"network",
+                                                "message":"Cannot connect to API; Bearer fixture-secret"}}}}),
+                                    )
+                                    .await
+                                    .unwrap();
+                                }
+                            }
+                            continue;
+                        }
+                        "session/cancel" => break,
+                        _ => panic!("unexpected ACP request"),
+                    };
+                    tr_agent::mcp::write_line(&mut write, &tr_agent::mcp::success(request["id"].clone(), result))
+                        .await
+                        .unwrap();
+                }
+            };
+            let (result, ()) = tokio::join!(acp_check(&client, &inbox, client.canary()), server);
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(if network {
+                    "could not reach its model provider (network)"
+                } else {
+                    "canary timed out"
+                }),
+                "{error}"
+            );
+            let posted = std::mem::take(&mut *inbox.events.lock().unwrap());
+            assert_eq!(posted.iter().filter(|e| matches!(e, Event::Notice(_))).count(), if network { 3 } else { 0 });
+            let mut pane = crate::agent_pane::AgentPane::default();
+            for event in posted {
+                match event {
+                    Event::State(state) => pane.transition(state),
+                    Event::Notice(message) => {
+                        assert!(!message.contains("fixture-secret"));
+                        assert_eq!(pane.state, Onboarding::Checking, "notice must arrive before readiness fails");
+                        pane.notice(&message);
+                    }
+                    _ => panic!("unexpected readiness event"),
+                }
+            }
+            assert!(matches!(&pane.state, Onboarding::Stopped { reason, unsafe_backend: false } if reason == &error));
+            assert_eq!(pane.state.primary(), "Restart");
+        }
+    }
 
     #[tokio::test]
     async fn acp_turn_rejection_posts_notice_and_allows_later_turns() {
