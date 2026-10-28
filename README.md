@@ -107,9 +107,64 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   strikes; offline mode shows a flagged simulated chain.
 - **Markets** — `WEI` world markets (Americas/EMEA/Asia-Pacific indices, futures, Treasuries, FX,
   crypto and commodities with sparklines), `GC` US Treasury yield curve (now vs 1M and 1Y ago,
-  2s10s / 3m10y / 5s30s), **news** (`AAPL CN`; Yahoo headlines, CoinDesk for crypto) and
-  **order book** depth (`BTCUSD CRNCY OB`; live Binance book, Coinbase fallback; markets without a
-  free public book show a clearly marked simulation).
+  2s10s / 3m10y / 5s30s) and **order book** depth (`BTCUSD CRNCY OB`; live Binance book, Coinbase
+  fallback; markets without a free public book show a clearly marked simulation).
+- **News** (`N`, `NEWS`, `CN`, `TOP`; `AAPL N`) — **Symbol**, **Watchlist** (active or named list)
+  and **Market** scopes over stored headlines. **Stories** groups related coverage into one row
+  with a source count; expand to see member headlines. **Wire** shows individual headlines
+  (choose in `⋯`). The ticker column is amber for an identified story subject;
+  a muted ticker is only a provider/query association,
+  not a claim that the story mentions that company. Hover distinguishes **About** from
+  **Also returned for**; clicking a displayed ticker charts that ticker.
+  - Topic tags such as Earnings, M&A, FDA and Macro are keyword-based, not sentiment scores.
+    **Filters** offers sources, include/exclude words and named **keyword watches** (words or
+    quoted phrases, with a chosen colour). Watch matches get a gutter stripe and highlighted
+    words; **Watch hits** narrows to them. **Unread** filters the unread dots; opening, expanding
+    or leaving a row keyboard-selected for one second marks it read.
+  - Search stored headlines and summaries, with **Today / 7D / 30D / 90D** ranges (Today starts
+    at local midnight). Hover a headline for the full title, available summary, source, timestamp,
+    subjects/associations and publisher host; opening it uses your browser. `⋯` offers **Reload**
+    (saved history, not a forced network refresh) and **Pause updates** for this pane; **new · Show**
+    reveals arriving saved items. History is retained for 90 days in `news.sqlite3`; an empty or
+    failed fetch does not erase it.
+  - Finnhub uses **your own key** from Settings › Data sources; its free tier is for **personal,
+    non-commercial use**. Without a key, or with Finnhub off, Yahoo news and CoinDesk RSS provide
+    fallbacks; non-US/crypto symbol views keep the fallback route even with a key. These are
+    headlines and metadata, not downloaded full articles. See [Data sources](#data-sources-and-privacy).
+- **SEC filings and insiders** (`CF`, `FILINGS`; `AAPL CF`) — **Symbol** or **Watchlist** scope,
+  tracking SEC companies on **any of your watchlists**, not the whole market. This keeps imports
+  and Form 4 document reads bounded. First company import shows the last **30 days**; subsequent
+  imports and retention cover **90 days** in `edgar.sqlite3`, without fetching older history pages.
+  - Chips: **All · 8-K · 10-K/Q · Insider · 13D/G · Offerings · Proxy**, including amendments.
+    8-K rows decode item codes; Insider includes forms 3/4/5, with transaction detail for **4 and 4/A**.
+    Search, **7D / 30D / 90D**, **Unread**, and **Buys and sells only** narrow the view.
+    Reporting-owner filings stay hidden; rows describe the issuer.
+  - Form 4 rows show owner, role, action, shares, price and value (shares × price, when known).
+    Only open-market **P: Bought** / **S: Sold** get green/red direction colours; awards, option
+    exercises, tax withholding, gifts and conversions are neutral, with no dollar value shown.
+    A reported plan adds **10b5-1**. In **Symbol + Insider**, a summary counts buy/sale filings and
+    their values for the selected window; **Cluster buy** means at least two distinct insiders
+    bought within a rolling 30-day span in that window. Joint-owner lots and amendments are
+    deduplicated in summaries and chart markers.
+  - Hover for full owner names, role/action detail, timestamp, accession and individual lots
+    (transaction date, shares, price and holdings after). Pending Form 4 details say **reading**,
+    **waiting**, **offline**, **paused** (or paused until a time), or **details unavailable**;
+    stored filings remain visible. The header/`⋯` explains contact, import, budget and source status.
+  - For an untracked symbol, **Add to watchlist** enables ongoing tracking. **Load once** instead
+    makes one guarded company-submissions request for its last 30 days, at most **once per company
+    per 24 hours machine-wide**. It needs an already-saved company map, does not start tracking or
+    read Form 4 documents, and still obeys contact, offline, pause and budget rules.
+  - Charts use local stored data: **F** markers for 8-K/10-Q/10-K (and amendments), **▲ / ▼** for
+    open-market insider buys/sells at transaction dates. Hover for details; the chart's events
+    toggle controls these markers. Loading a chart does not fetch filings.
+
+  **Feed keyboard** (focused News/Filings pane, no text field focused): **↑/↓** start or move row
+  selection; **j/k** move, **c** charts the row's ticker, **u** toggles unread, **Space** expands
+  and **Enter** opens the link **only with a row selected**. Otherwise those keys remain available
+  to the command line. **/** focuses search; **Esc** clears search, then selection (in search,
+  Esc clears it and returns focus). Feed row times are local: relative minutes, today's clock,
+  then dates; date-only filings never invent a clock time. Timestamp hover includes the UTC offset
+  when a time is known.
 - **Market data behind a trait** (`tr_data::MarketData`), routed per asset class to free sources:
 
   | Asset class | History | Quotes | Live |
@@ -164,16 +219,19 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
     new PTR you get a toast, an `ALERTS n` badge and an entry in `ALERTS`.
 
 - **Dockable workspace and saved layouts**
-  - Any panel (chart, watchlist, news, order book, world markets, yield curve, options, Congress
-    feed, politicians, alerts, search, settings, help) docks anywhere: drag a tab (or a pane's
+  - Any panel (chart, watchlist, news, filings, order book, world markets, yield curve, options,
+    Congress feed, politicians, alerts, search, settings, help) docks anywhere: drag a tab (or a pane's
     header) onto another pane and drop on the compass (centre adds a tab, arrows split), with a
     ghost preview and a labelled landing highlight, or drag to a window edge. Resize with
     dividers (double-click to equalise), tabs in every pane, grid presets (`LAYOUT 1|2|2H|3|4|6`
     or the toolbar), and pop any pane out into its own native window (close it to dock back).
     Add panels from each pane's **+** menu, `NEW <PANEL>` / `SPLIT [DOWN] <PANEL>` or ⌘1…⌘0.
   - **Link groups**: give panes a colour (`LINK BLUE`, or the tab menu) and one security change
-    drives every linked chart, order book, news, options and per-ticker Congress pane; clicking a
-    row in a linked watchlist or world-markets pane loads it into the group.
+    drives every linked chart, order book, news, filings, options and per-ticker Congress pane;
+    clicking a row in a linked watchlist or world-markets pane loads it into the group.
+    A bare ticker such as `AAPL` loads the chart rather than retargeting a focused News/Filings
+    pane; linked feeds follow. Use `AAPL N` or `AAPL CF` to retarget an existing feed pane in
+    Symbol scope, keeping its filters (a new pane opens if none exists).
   - **Saved layouts**: save, name, rename, duplicate, delete and switch (`LAYOUT <name>`, the
     sidebar list, ⌥1…⌥9); the active layout autosaves and is restored on launch. Each layout is a
     JSON file in `~/Library/Application Support/terminal-rs/layouts` (`$XDG_DATA_HOME` on Linux)
@@ -256,6 +314,82 @@ setup is at the top of the script). The app checks that feed once a day through
 for Updates… or `UPDATE` checks at once. `scripts/check-macos-cross.sh` compiles
 and lints the whole workspace for aarch64-apple-darwin from Linux (zig as the C cross-compiler;
 linking needs the macOS SDK).
+
+## Data sources and privacy
+
+Open **Settings › Data sources** for **Finnhub, SEC EDGAR, Yahoo news, CoinDesk, House disclosures
+and House roster**. Each has an on/off switch and a row showing state, **requests today / cap**,
+last request and any pause deadline/reason. Usage is machine-wide and resets by **UTC day**;
+last-request times in Settings are local. Senate has a permanently disabled explanatory row.
+**Pause all external news and filings** is the global kill switch for these guarded sources,
+including House. It does not stop chart quotes/bars, exchange streams, brokerage traffic or
+an already-started request. Pane-level **Pause updates** freezes that pane's display, not the
+source for other panes.
+
+- **Finnhub key:** masked, with **Save & Test** (one guarded AAPL quote request, no automatic
+  retry) and **Remove**. Stored in the existing secret store under `finnhub`: macOS Keychain,
+  or `<data dir>/secrets/finnhub.json` in the owner-only file backend (`TR_SECRET_STORE=file`
+  selects that backend on macOS). The key goes in a sensitive `X-Finnhub-Token` header, not a
+  URL; it is not written into layouts, preferences or logs. A refused test leaves the key saved.
+  Finnhub free-tier data is for personal, non-commercial use.
+- **SEC contact email:** required before any SEC request. **Save contact** stores it only in
+  local `settings.json`, not the secret store or repository; it is sent to the SEC as part of
+  the identifying User-Agent. Removing it leaves stored filings readable but stops SEC fetching.
+- Source switches and the global pause also live in local `settings.json`. News and filings
+  history are local SQLite stores; opening a headline or filing hands its link to your browser.
+
+## How terminal-rs talks to the internet
+
+News, SEC and House requests go through **one machine-wide guard**, not one limiter per data
+folder. Its ledger is `~/Library/Application Support/terminal-rs-net/ledger.sqlite3` on macOS,
+`$XDG_DATA_HOME/terminal-rs-net/ledger.sqlite3` elsewhere (fallback
+`~/.local/share/terminal-rs-net/ledger.sqlite3`). `TR_NET_LEDGER` is the explicit override;
+`TR_DATA_DIR` never selects or resets the ledger. Invalid ledger paths or initialization failures
+refuse requests rather than bypassing the guard.
+
+The guard shares pacing, budgets, one in-flight request per source group and cooldowns across
+processes and restarts. Aliases in a group share a single cap. **Redirect hops and failed HTTP
+attempts count too**; cache hits and refusals before sending do not.
+
+| Source group (hosts) | Minimum spacing | Daily cap (UTC) | Scheduled work while visible |
+|---|---|---|---|
+| Finnhub (`finnhub.io`) | 3 s (≤20/min) | 3,000 | General: 5 min; forex/crypto/merger: 15 min with Market scope visible; company news: ≥30 min, lengthening with symbol count, ≤2,000 company jobs/day |
+| SEC EDGAR (`www.sec.gov`, `data.sec.gov`, `efts.sec.gov`) | 1 s | 1,500 combined | Two latest feeds (8-K, 4): 10 min; company map: 24 h; paced company sweeps |
+| Yahoo news (`query1.finance.yahoo.com`, `query2.finance.yahoo.com`) | 5 s (≤12/min) | 1,000 combined | Fallback; Symbol/Market: 5 min; watchlists: ≤1 symbol/min and ≤1 attempt/symbol/hour |
+| CoinDesk RSS (`www.coindesk.com`) | 5 min | 300 | Crypto fallback |
+| House disclosures (`disclosures-clerk.house.gov`) | 3 s (≤20/min) | 400 | 30 min by default, bounded incremental PTR discovery |
+| House roster (`clerk.house.gov`) | 3 s (≤20/min) | 20 | Successful roster cached for 24 h |
+| Senate (`senate.gov` and every subdomain) | Denied before transport | 0 | Paused until a third-party source exists |
+
+SEC submissions and Form 4 reads stop at **1,200 total SEC requests today** to reserve feed
+capacity. Form 4 XML has an additional **300 HTTP attempts/day** ceiling and 15-second shared
+pacing. New company imports are separated by at least a minute; routine sweep turns by at least
+144 s (≤600/day). Lists above 600 companies take multiple days per sweep. All fallback-news selections
+also share a rolling 60/hour limit. These are ceilings, not freshness guarantees.
+
+Automatic news/filings polling stops when the window is hidden/minimised or no corresponding
+pane is visible; it does not require keyboard focus. Already-running work may finish. A test or
+throwaway instance with **`TR_DATA_DIR` set is offline for guarded sources unless
+`TR_ALLOW_EXTERNAL=1` exactly**. That opt-in does not bypass limits, switches or cooldowns;
+it is not needed for a normal live launch. This gate is not an all-app network sandbox.
+
+Requests identify terminal-rs honestly: new sources use
+`terminal-rs/<version> (personal research; <group>)`, SEC uses the user's contact in place of the
+group, and Yahoo news retains its legacy self-identifying
+`Mozilla/5.0 (compatible; terminal-rs)` string. There is no browser-identity rotation. A 403/429/503,
+HTML refusal/captcha, three consecutive transport failures, or invalid House document signatures
+pause the group. Cooldowns have a **6 / 12 / 24 h** escalating floor, extended by `Retry-After`
+up to seven days. They persist in the shared ledger; restarting or changing data folders does not
+clear them, and there are no requests during a pause.
+
+**Why these constraints:** repeated fresh-data-directory test launches previously caused a
+senate.gov block on the author's network. Live Senate refresh is removed, and the guard denies
+all senate.gov hosts and redirect targets regardless of switches. Parsers, fixtures and stored
+Senate trades remain usable; live Senate data needs a third-party source. House disclosures and
+the roster use the guard above. **`TR_CONGRESS_REFRESH_MIN` defaults to 30 minutes; positive
+values below 15 clamp to 15, the maximum is seven days, and `0` disables refresh**. Sample mode
+defaults to zero. Scheduled runs claim a shared cadence slot; `REFRESH`/F6 bypasses cadence only,
+never guard rules. See [guard details](docs/analysis/net-guard.md).
 
 ## Brokerage setup (SnapTrade)
 
@@ -370,7 +504,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | Keys | Action |
 |---|---|
 | ⌘K (Ctrl+K) | command palette: fuzzy search over commands, tickers, panels, layouts, themes, settings and actions |
-| F1 · F2 · F3 · F4 · F5 · F6 · F12 | help · Congress feed · politicians · alerts · watchlist · refresh filings · frame timing |
+| F1 · F2 · F3 · F4 · F5 · F6 · F12 | help · Congress feed · politicians · alerts · watchlist · refresh Congress filings · frame timing |
 | F7 · F8 · F9 | brokerage portfolio · positions · orders |
 | Tab · ⇧Tab | next · previous pane |
 | ⌘1 … ⌘0 · ⌘⇧O | new chart, watchlist, news, order book, world markets, yield curve, Congress, politicians, alerts, search pane · options chain |
@@ -384,12 +518,14 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 
 | Command | Action |
 |---|---|
-| `AAPL` · `AAPL US EQUITY <GO>` | load a security in the focused chart |
+| `AAPL` · `AAPL US EQUITY <GO>` | from News/Filings, load the chart rather than retargeting the feed; linked feeds follow |
 | `BTCUSD <CRNCY>` · `EURUSD <CRNCY>` · `US10Y <GOVT>` · `CL1 <CMDTY>` · `SPX <INDEX>` | other asset classes |
 | `5` `1H` `D` `1W` `1M` · `YTD` `5Y` `ALL` | interval · quick range |
 | `RSI` `MACD` `SMA 200` `BB 20 2.5` · `IND` `IND VOLUME` · `CLEAR` | toggle any of the 151 indicators (optional parameters) · indicator picker · remove all |
 | `CMP MSFT` · `LOG` · `CANDLE` `BAR` `LINE` `AREA` | compare · log scale · chart type |
-| `AAPL OMON` · `AAPL CN` · `BTCUSD CRNCY OB` · `WEI` · `GC` · `SECF <query>` | options · news · order book · world markets · yield curve · search |
+| `AAPL OMON` · `BTCUSD CRNCY OB` · `WEI` · `GC` · `SECF <query>` | options · order book · world markets · yield curve · search |
+| `N` / `NEWS` / `CN` / `TOP` · `AAPL N` | news · retarget the existing News pane to AAPL in Symbol scope, preserving filters |
+| `CF` / `FILINGS` · `AAPL CF` | SEC filings and insiders · retarget the existing Filings pane to AAPL in Symbol scope, preserving filters |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
 | `NEW BOOK` · `SPLIT DOWN NEWS` · `POP` · `LINK GREEN` · `TITLE Desk` · `CLOSE` | add, split, pop out, link, rename, close panes |
 | `LAYOUT 4` · `LAYOUT SAVE Macro` · `LAYOUT Macro` · `LAYOUT RENAME Rates` · `LAYOUT DUP` · `LAYOUT DEL` · `LAYOUT EXPORT` | grid preset · saved layouts |
@@ -415,7 +551,10 @@ crates/core     Bar/Series, timeframes, market keys + security catalog, indicato
                 registry (codes, parameters, panes, levels), sample data
 crates/data     MarketData trait; per-class router (Binance/Coinbase, Treasury.gov/FRED, Yahoo,
                 Alpaca, Questrade), websocket live feeds, sample provider with simulated ticks;
-                bar cache, scanner bar store and US symbol directory (universes)
+                bar cache, scanner bar store and US symbol directory (universes),
+                stored news, Finnhub/RSS, story clustering and keyword watches
+crates/net      machine-wide news/SEC/House fetch guard, budgets, cooldowns and source switches
+crates/edgar    watchlist SEC filings, Form 4 parsing, local store and guarded scheduler
 crates/chart    wgpu renderer, LOD pyramids, viewport math, axes, drawings, egui paint callback
 crates/congress House-only guarded refresh; House + historical Senate parsers, rosters, SQLite, alerts, performance
 crates/broker   SnapTrade client (request signing, accounts, balances, positions, orders, activity),
@@ -526,5 +665,6 @@ cargo bench -p tr-core && cargo bench -p tr-chart
   Market-wide scans are only offered with a bulk-capable source (Questrade today).
 - Scanner universes approximate `[type = stock] and [country = us]` by listing venue: US-listed
   common stocks, ADRs excluded by name. Foreign companies with ordinary US listings stay in.
-  Senate eFD terms prohibit using the data for commercial purposes or credit decisions; the terminal
-  accepts the eFD agreement on your behalf for personal research use.
+- Live Senate access is disabled; the terminal does not contact eFD or accept its agreement.
+  Historical Senate data remains subject to the source's use restrictions. Finnhub free-tier
+  news is for personal, non-commercial use.

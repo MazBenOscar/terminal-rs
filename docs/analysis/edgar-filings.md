@@ -1,5 +1,7 @@
 # N2: SEC EDGAR filings
 
+Status: 2026-10-27 — historical N2 implementation snapshot; N2-FIX/N3 supersede some details below. Current code stores parsed 90-day metadata, not whole submissions bodies; cadence is machine-wide, validators remain in the local store, interest changes do not cancel in-flight ticks, and Form 4 parsing plus Load once are implemented. News integration and N4 notifications/agent access remain unshipped. See [implementation notes](news-plan.md#n2-fix-implementation-notes-2026-10-26) and the [README](../../README.md#features) for current behaviour.
+
 ## Boundaries
 
 - `tr-edgar` owns parsing, SQLite metadata and a serialized scheduler. Production requests use only `tr_net::shared()?.send("sec", request)`; the shared SEC profile supplies contact identification, cross-host pacing and the daily budget. No history pages or market-wide backfill.

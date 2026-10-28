@@ -1,6 +1,6 @@
 # News and Filings panes: target design (N1b, N3)
 
-Status: 2026-10-27, from an impeccable critique of the N1a News pane and the N2 Filings pane (live app, Terminal Dark). Planning target for the N1b and N3 builders; a polish pass follows once both land. Follows DESIGN.md ("The Native Trading Desk"): dense rows, monospace data, colour for meaning only, theme roles and `dp()` only.
+Status: 2026-10-27 — historical critique and design target, not a current user guide. N1b/N3 and the Load once/Market-header fixes below are now implemented. The [README](../../README.md#features) describes current controls: row actions j/k/c/u/Space/Enter require a selection, feed times are local (older years use Sep'25), and Reload replaces Read saved. Filings has Symbol/Watchlist only, not Market; N4 remains unshipped. Follows DESIGN.md ("The Native Trading Desk"): dense rows, monospace data, colour for meaning only, theme roles and `dp()` only.
 
 ## What the critique found
 
