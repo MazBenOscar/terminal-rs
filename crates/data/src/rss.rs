@@ -62,6 +62,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_n5a_token_filter_keeps_legitimate_coin_mentions() {
+        let hit = |title: &str, words: &[&str]| {
+            filter_relevant(
+                vec![NewsItem {
+                    title: title.into(),
+                    link: String::new(),
+                    publisher: String::new(),
+                    ts: 0,
+                    tickers: vec![],
+                }],
+                words,
+            )
+            .len()
+        };
+        for (title, words) in [
+            ("BTC/USD hits record", &["BTC", "Bitcoin"][..]),
+            ("Bitcoin's halving explained", &["BTC", "Bitcoin"]),
+            ("#Bitcoin-led rally lifts miners", &["BTC", "Bitcoin"]),
+            ("BITCOIN ETFS see inflows", &["BTC", "Bitcoin"]),
+            ("Ether slides as ETH-USD breaks support", &["ETH", "Ethereum"]),
+            ("Solana’s validators upgrade", &["SOL", "Solana"]),
+            ("Cardano founder speaks", &["ADA", "Cardano"]),
+            ("XRP jumps 10%", &["XRP", "XRP"]),
+            ("1INCH token unlock", &["1INCH", "1inch"]),
+        ] {
+            assert_eq!(hit(title, words), 1, "{title}");
+        }
+        for (title, words) in [
+            ("Canadian banks rally", &["ADA", "Cardano"][..]),
+            ("Insiders sold shares", &["SOL", "Solana"]),
+            ("Ethics probe widens", &["ETH", "Ethereum"]),
+        ] {
+            assert_eq!(hit(title, words), 0, "{title}");
+        }
+    }
+    #[test]
     fn token_exact_coin_filter() {
         for (title, word, count) in [
             ("something", "ETH", 0),

@@ -2671,7 +2671,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         // N1b
         Request::NewsRead(view) => news::read(s, view).await,
         Request::NewsRefresh(view) => news::refresh(s, view).await,
-        Request::NewsBookmark { ids, saved } => news::bookmark(s, ids, saved).await,
+        Request::NewsBookmark { ids, saved } => {
+            let s = Arc::clone(s);
+            tokio::spawn(async move { news::bookmark(&s, ids, saved).await });
+        }
         Request::NewsSeen(ids) => news::mark_seen(s, ids).await,
         Request::FeedConfig { settings, watches, watched } => {
             s.news.local.lock().await.configure(settings, watches, watched)

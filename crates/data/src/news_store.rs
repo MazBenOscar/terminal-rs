@@ -118,7 +118,7 @@ impl Default for Filters {
         }
     }
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Query {
     pub symbols: Vec<String>,
     pub filters: Filters,
@@ -154,8 +154,7 @@ fn matches_columns(
     q: &Query,
 ) -> bool {
     let f = &q.filters;
-    ts >= q.start
-        && ts <= q.end
+    (f.saved || (ts >= q.start && ts <= q.end))
         && !(f.scope == Scope::Watchlist && q.symbols.is_empty())
         && !(f.scope == Scope::Symbol && q.symbols.is_empty() && category != "general")
         && (q.symbols.is_empty() || q.symbols.iter().any(|key| tickers.contains(key)))
@@ -243,6 +242,10 @@ pub mod local {
     }
     pub fn fresh(published: i64, enabled: i64, session: i64, now: i64) -> bool {
         published > enabled.max(session) && published <= now && now - published <= 7200
+    }
+    /// Fetch time is useful for display, but is never evidence of freshness.
+    pub fn fresh_story(story: &super::Story, enabled: i64, session: i64, now: i64) -> bool {
+        !story.inferred_ts && story.item.ts > 0 && fresh(story.item.ts, enabled, session, now)
     }
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -566,9 +569,12 @@ impl NewsStore {
                 ))
             },
         )?;
-        db.execute_batch(
-            "PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY, source TEXT NOT NULL, provider_id TEXT NOT NULL,
+        db.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let migration = db.unchecked_transaction()?;
+        let fts = {
+            let db = &migration;
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY, source TEXT NOT NULL, provider_id TEXT NOT NULL,
             url TEXT NOT NULL, headline TEXT NOT NULL, summary TEXT NOT NULL, published INTEGER NOT NULL,
             tickers TEXT NOT NULL, category TEXT NOT NULL, fetched INTEGER NOT NULL, seen INTEGER NOT NULL DEFAULT 0,
             bookmark INTEGER NOT NULL DEFAULT 0);
@@ -579,59 +585,75 @@ impl NewsStore {
             CREATE TABLE IF NOT EXISTS notification_slots(at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS news_fetches(at INTEGER PRIMARY KEY);
             INSERT OR IGNORE INTO news_fetches SELECT DISTINCT fetched FROM items;",
-        )?;
-        let columns: Vec<String> =
-            db.prepare("PRAGMA table_info(items)")?.query_map([], |r| r.get(1))?.collect::<rusqlite::Result<_>>()?;
-        if !columns.iter().any(|c| c == "tags") {
-            db.execute("ALTER TABLE items ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'", [])?;
-        }
-        if !columns.iter().any(|c| c == "intelligence") {
-            db.execute("ALTER TABLE items ADD COLUMN intelligence INTEGER NOT NULL DEFAULT 0", [])?;
-        }
-        if !columns.iter().any(|c| c == "provider") {
-            db.execute("ALTER TABLE items ADD COLUMN provider TEXT NOT NULL DEFAULT ''", [])?;
-        }
-        if !columns.iter().any(|c| c == "subjects") {
-            db.execute("ALTER TABLE items ADD COLUMN subjects TEXT NOT NULL DEFAULT '[]'", [])?;
-        }
-        if !columns.iter().any(|c| c == "inferred_ts") {
-            db.execute("ALTER TABLE items ADD COLUMN inferred_ts INTEGER NOT NULL DEFAULT 0", [])?;
+            )?;
+            let columns: Vec<String> = db
+                .prepare("PRAGMA table_info(items)")?
+                .query_map([], |r| r.get(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if !columns.iter().any(|c| c == "tags") {
+                db.execute("ALTER TABLE items ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'", [])?;
+            }
+            if !columns.iter().any(|c| c == "intelligence") {
+                db.execute("ALTER TABLE items ADD COLUMN intelligence INTEGER NOT NULL DEFAULT 0", [])?;
+            }
+            if !columns.iter().any(|c| c == "provider") {
+                db.execute("ALTER TABLE items ADD COLUMN provider TEXT NOT NULL DEFAULT ''", [])?;
+            }
+            if !columns.iter().any(|c| c == "subjects") {
+                db.execute("ALTER TABLE items ADD COLUMN subjects TEXT NOT NULL DEFAULT '[]'", [])?;
+            }
+            if !columns.iter().any(|c| c == "inferred_ts") {
+                db.execute("ALTER TABLE items ADD COLUMN inferred_ts INTEGER NOT NULL DEFAULT 0", [])?;
+            }
             db.execute("UPDATE items SET published=fetched,inferred_ts=1 WHERE published<=0", [])?;
-        }
-        let seen_columns: Vec<String> = db
-            .prepare("PRAGMA table_info(notification_seen)")?
-            .query_map([], |r| r.get(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        if !seen_columns.iter().any(|c| c == "at") {
-            db.execute("ALTER TABLE notification_seen ADD COLUMN at INTEGER NOT NULL DEFAULT 0", [])?;
-            db.execute("UPDATE notification_seen SET at=coalesce((SELECT max(published,fetched) FROM items WHERE items.id=notification_seen.id),?1)", [chrono::Utc::now().timestamp()])?;
-        }
-        db.execute_batch("CREATE INDEX IF NOT EXISTS notification_seen_at ON notification_seen(at); CREATE INDEX IF NOT EXISTS notification_seen_id ON notification_seen(id,kind);")?;
-        db.execute(
-            "CREATE INDEX IF NOT EXISTS news_subject_backfill ON items(published DESC) WHERE intelligence<2",
-            [],
-        )?;
-        let fts = db
-            .execute_batch(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS news_fts USING fts5(id UNINDEXED, headline, summary);
+            // Keep the original two-column claim table compatible with older builds.
+            // Early N5a dev databases may still have an `at` column (and an index
+            // named notification_seen_at); leave the column alone, but never use it.
+            db.execute_batch("DROP INDEX IF EXISTS notification_seen_at;
+            CREATE TABLE IF NOT EXISTS notification_seen_at(kind TEXT NOT NULL,id TEXT NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(kind,id));
+            CREATE INDEX IF NOT EXISTS notification_seen_at_time ON notification_seen_at(at);
+            CREATE INDEX IF NOT EXISTS notification_seen_id ON notification_seen(id,kind);")?;
+            // This also backfills claims written by an older binary since our last
+            // open. Unknown claim ages start at migration time, never at zero.
+            db.execute(
+                "INSERT OR IGNORE INTO notification_seen_at(kind,id,at) SELECT kind,id,?1 FROM notification_seen",
+                [chrono::Utc::now().timestamp()],
+            )?;
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS news_subject_backfill ON items(published DESC) WHERE intelligence<2",
+                [],
+            )?;
+            // FTS is optional, but a failed optional setup must not leave a
+            // partially installed trigger set inside the migration transaction.
+            db.execute_batch("SAVEPOINT optional_news_fts;")?;
+            let fts = db
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS news_fts USING fts5(id UNINDEXED, headline, summary);
             CREATE TRIGGER IF NOT EXISTS news_fts_insert AFTER INSERT ON items BEGIN
                 INSERT INTO news_fts VALUES(new.id,new.headline,new.summary); END;
             CREATE TRIGGER IF NOT EXISTS news_fts_delete AFTER DELETE ON items BEGIN
                 DELETE FROM news_fts WHERE id=old.id; END;
             INSERT INTO news_fts SELECT id,headline,summary FROM items WHERE id NOT IN (SELECT id FROM news_fts);",
-            )
-            .is_ok();
+                )
+                .is_ok();
+            if !fts {
+                db.execute_batch("ROLLBACK TO optional_news_fts;")?;
+            }
+            db.execute_batch("RELEASE optional_news_fts;")?;
+            let matcher: Option<String> =
+                db.query_row("SELECT value FROM meta WHERE key='subject_matcher'", [], |r| r.get(0)).optional()?;
+            if matcher.as_deref() != Some(crate::news_intelligence::MATCHER_VERSION) {
+                db.execute("UPDATE items SET intelligence=1 WHERE intelligence>=2", [])?;
+                db.execute(
+                    "INSERT OR REPLACE INTO meta VALUES('subject_matcher',?1)",
+                    [crate::news_intelligence::MATCHER_VERSION],
+                )?;
+            }
+            fts
+        };
+        migration.commit()?;
         let store =
             Self { db, fts, names: None, edgar: None, watched: vec![], pending_names: None, pending_watched: false };
-        if store.meta("subject_matcher")?.as_deref() != Some(crate::news_intelligence::MATCHER_VERSION) {
-            let tx = store.db.unchecked_transaction()?;
-            tx.execute("UPDATE items SET intelligence=1 WHERE intelligence>=2", [])?;
-            tx.execute(
-                "INSERT OR REPLACE INTO meta VALUES('subject_matcher',?1)",
-                [crate::news_intelligence::MATCHER_VERSION],
-            )?;
-            tx.commit()?;
-        }
         store.prune(chrono::Utc::now().timestamp())?;
         Ok(store)
     }
@@ -727,7 +749,11 @@ impl NewsStore {
         let cutoff = now - 90 * 86400;
         let tx = self.db.unchecked_transaction()?;
         let removed = tx.execute("DELETE FROM items WHERE published < ?1 AND bookmark=0", [cutoff])?;
-        tx.execute("DELETE FROM notification_seen WHERE at < ?1", [cutoff])?;
+        tx.execute(
+            "DELETE FROM notification_seen WHERE (kind,id) IN (SELECT kind,id FROM notification_seen_at WHERE at < ?1)",
+            [cutoff],
+        )?;
+        tx.execute("DELETE FROM notification_seen_at WHERE at < ?1", [cutoff])?;
         tx.commit()?;
         Ok(removed)
     }
@@ -808,7 +834,7 @@ impl NewsStore {
     }
     pub fn latest(&self, symbol: &str) -> Result<Option<i64>> {
         Ok(self.db.query_row(
-            "SELECT MAX(published) FROM items,json_each(items.tickers) WHERE json_each.value=?1",
+            "SELECT MAX(published) FROM items,json_each(items.tickers) WHERE json_each.value=?1 AND inferred_ts=0 AND published>0",
             [symbol],
             |r| r.get(0),
         )?)
@@ -822,10 +848,7 @@ impl NewsStore {
             .is_some())
     }
     pub fn claim_notification(&self, kind: &str, id: &str) -> Result<bool> {
-        Ok(self.db.execute(
-            "INSERT OR IGNORE INTO notification_seen(kind,id,at) VALUES(?1,?2,?3)",
-            params![kind, id, chrono::Utc::now().timestamp()],
-        )? == 1)
+        Ok(self.claim_notifications(kind, &[id.to_owned()])? == 1)
     }
     /// Consult any member ever handed to delivery, not just the current 2,000
     /// headline snapshot. The 24h bound is the cluster's own identity window.
@@ -866,10 +889,18 @@ impl NewsStore {
             .collect::<rusqlite::Result<_>>()?)
     }
     pub fn claim_notifications(&self, kind: &str, ids: &[String]) -> Result<usize> {
-        Ok(self.db.execute(
-            "INSERT OR IGNORE INTO notification_seen(kind,id,at) SELECT ?1,value,?3 FROM json_each(?2)",
-            params![kind, serde_json::to_string(ids)?, chrono::Utc::now().timestamp()],
-        )?)
+        let tx = self.db.unchecked_transaction()?;
+        let ids = serde_json::to_string(ids)?;
+        let claimed = tx.execute(
+            "INSERT OR IGNORE INTO notification_seen(kind,id) SELECT ?1,value FROM json_each(?2)",
+            params![kind, ids],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO notification_seen_at(kind,id,at) SELECT ?1,value,?3 FROM json_each(?2)",
+            params![kind, ids, chrono::Utc::now().timestamp()],
+        )?;
+        tx.commit()?;
+        Ok(claimed)
     }
     /// Delivered members are loaded once, including those outside the bounded pane snapshot.
     pub fn delivered_members(&self, start: i64, end: i64) -> Result<Vec<Story>> {
@@ -1034,6 +1065,14 @@ impl NewsStore {
         Ok(())
     }
     pub fn query(&self, q: &Query) -> Result<Vec<Story>> {
+        // Bookmarks outlive retention and the pane's day window. Apply this to
+        // SQL, matcher and enrichment alike, keeping the normal sort and limit.
+        let mut query = q.clone();
+        if query.filters.saved {
+            query.start = i64::MIN;
+            query.end = i64::MAX;
+        }
+        let q = &query;
         // Enrichment is optional: read-only disks and transient write failures
         // must never hide otherwise readable saved history.
         let _ = self.backfill(q);

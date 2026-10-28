@@ -91,9 +91,12 @@ impl LocalState {
     }
 }
 
-async fn blocking<T: Send + 'static>(s: &Arc<Shared>, work: impl FnOnce(&Shared) -> T + Send + 'static) -> T {
+async fn blocking<T: Send + 'static>(
+    s: &Arc<Shared>,
+    work: impl FnOnce(&Shared) -> T + Send + 'static,
+) -> anyhow::Result<T> {
     let s = Arc::clone(s);
-    tokio::task::spawn_blocking(move || work(&s)).await.expect("news blocking worker panicked")
+    tokio::task::spawn_blocking(move || work(&s)).await.map_err(anyhow::Error::from)
 }
 
 pub(super) async fn local_read(
@@ -106,6 +109,7 @@ pub(super) async fn local_read(
     let filing_symbols = if symbols.is_empty() { s.news.local.lock().await.watched.clone() } else { symbols.to_vec() };
     let filings = blocking(s, move |s| s.news.local.blocking_lock().saved_filings(now))
         .await
+        .map_err(|_| "Saved filings unavailable")?
         .map_err(|_| "Saved filings unavailable")?;
     match args {
         tr_agent_tools::args::LiveArgs::ReadNews(a) => {
@@ -143,7 +147,8 @@ pub(super) async fn local_read(
                     .query(&query)
                     .map_err(|_| "Saved headlines unavailable")
             })
-            .await?;
+            .await
+            .map_err(|_| "Saved headlines unavailable")??;
             let metadata = serde_json::json!({"filings":tr_edgar::local_metadata(&filings,&filing_symbols,start,now,&[]),
                 "insider_summary":tr_edgar::local_insider_summary(&filings,&filing_symbols,start,now)});
             serde_json::to_value(local::digest(
@@ -203,7 +208,7 @@ async fn local_tick(s: &Arc<Shared>) -> anyhow::Result<()> {
     if !tick_enabled(visible, &s.news.local.lock().await.settings) {
         return Ok(());
     }
-    blocking(s, local_tick_blocking).await
+    blocking(s, local_tick_blocking).await?
 }
 fn local_tick_blocking(s: &Shared) -> anyhow::Result<()> {
     let mut state = {
@@ -413,7 +418,7 @@ impl LocalState {
             // Pane highlighting intentionally matches titles only, not summaries.
             let eligible = self.settings.enabled
                 && self.settings.keywords
-                && local::fresh(story.item.ts, self.since[2], self.session, now)
+                && local::fresh_story(story, self.since[2], self.session, now)
                 && self.watches.iter().any(|w| w.notify && tr_data::news_intelligence::watch_matches(story, &w.words));
             if eligible {
                 notices.push(Notice::news(format!("Keyword watch · {}", story.item.title), "keyword", &story.id));
@@ -435,7 +440,7 @@ impl LocalState {
                 && self.settings.breaking
                 && !blocked
                 && c.subjects.iter().any(|t| self.watched.contains(t))
-                && c.members.iter().all(|m| local::fresh(m.item.ts, self.since[3], self.session, now))
+                && c.members.iter().all(|m| local::fresh_story(m, self.since[3], self.session, now))
             {
                 if delivered.iter().any(|old| tr_data::news_intelligence::same_cluster(old, &c.lead)) {
                     propagated.extend(c.member_ids.clone());
@@ -619,7 +624,7 @@ pub(super) fn open_store(path: &std::path::Path) -> (Option<NewsStore>, bool) {
     }
 }
 pub(super) async fn mark_seen(s: &Arc<Shared>, ids: Vec<String>) {
-    blocking(s, move |s| {
+    let result = blocking(s, move |s| {
         if let Some(store) = s.news.store.blocking_lock().as_ref()
             && let Err(error) = store.mark_seen(&ids)
         {
@@ -627,6 +632,9 @@ pub(super) async fn mark_seen(s: &Arc<Shared>, ids: Vec<String>) {
         }
     })
     .await;
+    if let Err(error) = result {
+        tracing::warn!("cannot save news read state: {error}");
+    }
     publish(s).await;
 }
 pub(super) async fn bookmark(s: &Arc<Shared>, ids: Vec<String>, saved: bool) {
@@ -639,7 +647,8 @@ pub(super) async fn bookmark(s: &Arc<Shared>, ids: Vec<String>, saved: bool) {
             .ok_or_else(|| anyhow::anyhow!("News store unavailable"))?
             .set_bookmark(&write_ids, saved)
     })
-    .await;
+    .await
+    .and_then(|result| result);
     let failed = result.is_err();
     s.send(Response::NewsBookmark {
         ids,
@@ -676,7 +685,9 @@ async fn read_view(s: &Arc<Shared>, view: View, force: bool) {
         }
         *latest = view.generation;
     }
-    blocking(s, move |s| read_view_blocking(s, view, force)).await;
+    if let Err(error) = blocking(s, move |s| read_view_blocking(s, view, force)).await {
+        tracing::warn!("cannot read saved news: {error}");
+    }
 }
 fn read_view_blocking(s: &Shared, view: View, force: bool) {
     let now = chrono::Utc::now().timestamp();
@@ -708,12 +719,7 @@ fn read_view_blocking(s: &Shared, view: View, force: bool) {
         return;
     }
     let mut published = s.news.published.blocking_lock();
-    let old = published.iter().find(|old| {
-        old.view.pane == view.pane
-            && old.view.symbol == view.symbol
-            && old.view.filters.scope == view.filters.scope
-            && old.view.symbols == view.symbols
-    });
+    let old = published.iter().find(|old| same_view(&old.view, &view));
     let mut status = old.map(|old| old.status.clone()).unwrap_or_else(|| "Showing saved headlines".into());
     let updated = old.and_then(|old| old.updated);
     status = status
@@ -749,9 +755,12 @@ pub(super) async fn publish(s: &Arc<Shared>) {
         read_view(s, view, false).await;
     }
 }
+fn same_view(a: &View, b: &View) -> bool {
+    a.pane == b.pane && a.symbol == b.symbol && a.filters == b.filters && a.symbols == b.symbols
+}
 async fn source_status(s: &Shared, views: &[View], status: String, success: bool) {
     let mut published = s.news.published.lock().await;
-    for record in published.iter_mut().filter(|record| views.contains(&record.view)) {
+    for record in published.iter_mut().filter(|record| views.iter().any(|view| same_view(view, &record.view))) {
         let scope = record.view.symbol.as_deref().unwrap_or(match record.view.filters.scope {
             tr_data::news_store::Scope::Watchlist => "Watchlist",
             _ => "Market",
@@ -765,6 +774,24 @@ async fn source_status(s: &Shared, views: &[View], status: String, success: bool
             status: record.status.clone(),
             updated: record.updated,
         });
+    }
+}
+async fn resolve_refreshes(s: &Shared, requested: &[View], served: &[View]) {
+    let unserved: Vec<_> =
+        requested.iter().filter(|view| !served.iter().any(|done| same_view(view, done))).cloned().collect();
+    source_status(s, &unserved, "No refreshable source for this view".into(), false).await;
+}
+fn has_finnhub_job(view: &View) -> bool {
+    use tr_data::news_store::Scope;
+    view.filters.scope == Scope::All
+        || (view.filters.scope == Scope::Symbol && view.symbol.is_none())
+        || view.symbols.iter().any(|symbol| finnhub::symbol(symbol).is_some())
+}
+fn fallback_source(target: Option<&str>) -> &'static str {
+    if target.and_then(Security::parse).is_some_and(|security| security.class == tr_core::AssetClass::Crypto) {
+        "CoinDesk"
+    } else {
+        "Yahoo"
     }
 }
 fn refusal_status(error: &tr_net::Refused) -> String {
@@ -910,18 +937,8 @@ pub(super) async fn run(s: Arc<Shared>) {
     loop {
         tokio::select! { _ = interval.tick() => {}, _ = s.news.wake.notified() => {} }
         let refreshes = std::mem::take(&mut *s.news.refresh.lock().await);
-        for view in refreshes {
-            if schedule.backoff_until > chrono::Utc::now().timestamp() {
-                let until =
-                    crate::feed_time::feed_time(schedule.backoff_until, chrono::Utc::now().timestamp(), false).0;
-                source_status(
-                    &s,
-                    std::slice::from_ref(&view),
-                    format!("Refresh deferred · Finnhub paused until {until} — guard cooldown/budgets unchanged"),
-                    false,
-                )
-                .await;
-            }
+        let mut served = Vec::new();
+        for view in &refreshes {
             schedule.refresh(
                 &view.symbols,
                 view.filters.scope == tr_data::news_store::Scope::All
@@ -942,18 +959,25 @@ pub(super) async fn run(s: Arc<Shared>) {
         }
         let views = s.news.views.lock().await.clone();
         if views.is_empty() {
+            resolve_refreshes(&s, &refreshes, &served).await;
             continue;
         }
         let now = chrono::Utc::now().timestamp();
         let key = s.news.key.lock().await.clone();
-        let guard = match blocking(&s, |_| tr_net::shared()).await {
+        let guard = match blocking(&s, |_| tr_net::shared()).await.unwrap_or(Err(tr_net::Refused::Ledger)) {
             Ok(guard) => guard,
             Err(error) => {
                 if now >= schedule.backoff_until {
                     schedule.refused(now, &error);
-                    source_status(&s, &views, refusal_status(&error), false).await;
                     publish(&s).await;
                 }
+                source_status(
+                    &s,
+                    &refreshes,
+                    format!("News sources unavailable · {error} — showing saved headlines"),
+                    false,
+                )
+                .await;
                 continue;
             }
         };
@@ -964,7 +988,8 @@ pub(super) async fn run(s: Arc<Shared>) {
                 .and_then(|rows| rows.into_iter().find(|r| r.group == "finnhub"))
                 .is_some_and(|r| r.enabled)
         })
-        .await;
+        .await
+        .unwrap_or(false);
         let fallback_all = use_fallback(enabled, key.as_deref());
         let routed = fallback_views(&views, fallback_all);
         let targets = fallback_targets(&routed, now, &mut fallback);
@@ -983,6 +1008,7 @@ pub(super) async fn run(s: Arc<Shared>) {
                 if s.news.views.lock().await.is_empty() {
                     break;
                 }
+                let source = fallback_source(target.as_deref());
                 let status = match s.provider.news(target.as_deref()).await {
                     Ok(items) => {
                         let stories = fallback_items(items, target.as_deref());
@@ -1004,22 +1030,31 @@ pub(super) async fn run(s: Arc<Shared>) {
                             Ok(())
                         })
                         .await
+                        .and_then(|result| result)
                         .is_ok();
                         if success {
-                            "Yahoo / CoinDesk · updated just now"
+                            format!("{source} · updated just now")
                         } else {
-                            "News store write failed — showing saved headlines"
+                            format!("{source} · News store write failed — showing saved headlines")
                         }
-                        .into()
                     }
-                    Err(error) => format!("Yahoo / CoinDesk unavailable · {error} — showing saved headlines"),
+                    Err(error) => format!("{source} unavailable · {error} — showing saved headlines"),
                 };
                 source_status(&s, &affected, status, success).await;
+                served.extend(affected);
             }
             publish(&s).await;
         }
         if fallback_all {
+            resolve_refreshes(&s, &refreshes, &served).await;
             continue;
+        }
+        // Finnhub's cooldown must not label Yahoo/CoinDesk-routed panes paused.
+        if schedule.backoff_until > now {
+            let until = crate::feed_time::feed_time(schedule.backoff_until, now, false).0;
+            let paused: Vec<_> = refreshes.iter().filter(|view| has_finnhub_job(view)).cloned().collect();
+            source_status(&s, &paused, format!("Finnhub paused until {until} — showing saved headlines"), false).await;
+            served.extend(paused);
         }
         let symbols = s.news.watchlist.lock().await.clone();
         let priority: Vec<_> = views
@@ -1029,11 +1064,14 @@ pub(super) async fn run(s: Arc<Shared>) {
             .collect();
         let all_market = views.iter().any(|v| v.filters.scope == tr_data::news_store::Scope::All);
         let Some(job) = schedule.next_for_views(now, true, all_market, &symbols, &priority) else {
+            resolve_refreshes(&s, &refreshes, &served).await;
             continue;
         };
         let token = key.as_deref().unwrap_or_default();
         let bounds_job = job.clone();
-        let saved_bounds = blocking(&s, move |s| bounds(s.news.store.blocking_lock().as_ref(), &bounds_job)).await;
+        let saved_bounds = blocking(&s, move |s| bounds(s.news.store.blocking_lock().as_ref(), &bounds_job))
+            .await
+            .and_then(|result| result);
         let affected: Vec<_> = views
             .iter()
             .filter(|view| match &job {
@@ -1051,6 +1089,8 @@ pub(super) async fn run(s: Arc<Shared>) {
             // A broken store/cursor must not silently become a fresh history request.
             schedule.refused(now, &tr_net::Refused::Ledger);
             source_status(&s, &affected, "News cursor unavailable — showing saved headlines".into(), false).await;
+            served.extend(affected);
+            resolve_refreshes(&s, &refreshes, &served).await;
             publish(&s).await;
             continue;
         };
@@ -1076,7 +1116,8 @@ pub(super) async fn run(s: Arc<Shared>) {
                         }
                     })
                 })
-                .await;
+                .await
+                .unwrap_or(false);
                 if saved {
                     success = true;
                     let count = symbols.iter().filter(|s| finnhub::symbol(s).is_some()).count();
@@ -1095,6 +1136,8 @@ pub(super) async fn run(s: Arc<Shared>) {
             }
         };
         source_status(&s, &affected, status, success).await;
+        served.extend(affected);
+        resolve_refreshes(&s, &refreshes, &served).await;
         publish(&s).await;
     }
 }
@@ -1132,7 +1175,7 @@ mod tests {
         let (s, _) = fixture_shared();
         local_tick(&s).await.unwrap(); // No store: this can succeed only if gated.
         let runtime_thread = std::thread::current().id();
-        let worker_thread = blocking(&s, |_| std::thread::current().id()).await;
+        let worker_thread = blocking(&s, |_| std::thread::current().id()).await.unwrap();
         assert_ne!(runtime_thread, worker_thread);
     }
     #[tokio::test]
@@ -1698,6 +1741,181 @@ mod tests {
         assert!(rows.iter().all(|s| s.source == "CoinDesk" && s.category == "crypto"));
         store.insert(&fallback_items(vec![], Some("BTCUSD Curncy")), 1).unwrap();
         assert_eq!(store.query(&query).unwrap().len(), 5);
+    }
+    #[tokio::test]
+    async fn n5a_blocking_panic_returns_error_and_worker_remains_usable() {
+        let (s, _) = fixture_shared();
+        let result = blocking(&s, |_| -> () { panic!("fixture blocking panic") }).await;
+        assert!(result.is_err());
+        assert_eq!(blocking(&s, |_| 42).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn n5a_bookmark_dispatch_returns_before_store_write_then_replies() {
+        let (s, rx) = fixture_shared();
+        let item = n4_story("bookmark-dispatch", 150, "Fixture");
+        let mut store = NewsStore::memory().unwrap();
+        store.insert(std::slice::from_ref(&item), 200).unwrap();
+        let mut locked = s.news.store.lock().await;
+        *locked = Some(store);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            super::super::handle(&s, Request::NewsBookmark { ids: vec![item.id.clone()], saved: true }),
+        )
+        .await
+        .expect("dispatcher must not wait for the store lock");
+        assert!(
+            !rx.try_iter().any(|reply| matches!(reply, Response::NewsBookmark { .. })),
+            "reply waits for the write"
+        );
+        drop(locked);
+        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(reply @ Response::NewsBookmark { .. }) = rx.try_recv() {
+                    break reply;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(reply, Response::NewsBookmark { saved: true, error: None, .. }));
+        assert!(s.news.store.lock().await.as_ref().unwrap().query(&Query::default()).unwrap()[0].bookmark);
+    }
+
+    #[tokio::test]
+    async fn n5a_source_status_matches_latest_generation_not_other_views() {
+        use tr_data::news_store::Scope;
+        let (s, rx) = fixture_shared();
+        let old = view(Scope::Symbol, &["AAPL US Equity"]);
+        let mut latest = old.clone();
+        latest.generation += 1;
+        read(&s, latest.clone()).await;
+        source_status(&s, std::slice::from_ref(&old), "Yahoo result".into(), true).await;
+        source_status(&s, std::slice::from_ref(&old), "Newest result".into(), false).await;
+        {
+            let published = s.news.published.lock().await;
+            let record = &published[0];
+            assert_eq!(record.view.generation, latest.generation);
+            assert!(record.status.contains("Newest result"));
+            assert!(record.updated.is_some());
+        }
+        let mut different = old.clone();
+        different.filters.search = "different".into();
+        source_status(&s, &[different], "Wrong view".into(), false).await;
+        assert!(!s.news.published.lock().await[0].status.contains("Wrong view"));
+        assert!(rx.try_iter().any(|reply| matches!(reply, Response::NewsStatus { view, status, .. } if view.generation == latest.generation && status.contains("Newest result"))));
+    }
+
+    #[tokio::test]
+    async fn n5a_refresh_resolves_served_and_unserved_panes_and_names_routed_source() {
+        use tr_data::news_store::Scope;
+        let (s, _) = fixture_shared();
+        let served = view(Scope::Symbol, &["BTCUSD Crypto"]);
+        let mut unserved = view(Scope::Watchlist, &[]);
+        unserved.pane = served.pane + 1;
+        refresh(&s, served.clone()).await;
+        refresh(&s, unserved.clone()).await;
+        source_status(&s, std::slice::from_ref(&served), "CoinDesk paused — showing saved headlines".into(), false)
+            .await;
+        resolve_refreshes(&s, &[served.clone(), unserved.clone()], std::slice::from_ref(&served)).await;
+        let published = s.news.published.lock().await;
+        assert!(published.iter().find(|r| r.view.pane == served.pane).unwrap().status.contains("CoinDesk paused"));
+        assert!(
+            published
+                .iter()
+                .find(|r| r.view.pane == unserved.pane)
+                .unwrap()
+                .status
+                .contains("No refreshable source for this view")
+        );
+        assert!(published.iter().all(|r| !r.status.contains("Refresh requested")));
+        assert_eq!(fallback_source(Some("BTCUSD Crypto")), "CoinDesk");
+        assert_eq!(fallback_source(Some("AAPL US Equity")), "Yahoo");
+        assert_eq!(fallback_source(None), "Yahoo");
+        assert!(!has_finnhub_job(&served));
+        assert!(has_finnhub_job(&view(Scope::Symbol, &["AAPL US Equity"])));
+    }
+
+    #[test]
+    fn n5a_inferred_stories_never_notify_keywords_or_breaking() {
+        let store = NewsStore::memory().unwrap();
+        let state = n4_state();
+        let mut rows: Vec<_> =
+            (0..4).map(|i| n4_story(&format!("inferred-{i}"), 150, &format!("Publisher {i}"))).collect();
+        assert!(
+            !state.news_alerts(&store, &rows, 200).unwrap().is_empty(),
+            "real timestamps provide a positive control"
+        );
+        for row in &mut rows {
+            row.inferred_ts = true;
+        }
+        assert!(
+            state.news_alerts(&store, &rows, 200).unwrap().is_empty(),
+            "neither keyword nor breaking notices may use inferred freshness"
+        );
+    }
+
+    /// A10: saved stories are exempt from the 90-day prune, but the Saved filter is
+    /// still bounded by the pane's day window (default 7, max 90), so a story saved
+    /// last week silently disappears from "Saved" and one older than 90 days can
+    /// never be shown again.
+    #[tokio::test]
+    async fn review_n5a_saved_filter_shows_story_saved_before_the_day_window() {
+        use tr_data::news_store::Scope;
+        let (s, rx) = fixture_shared();
+        let now = chrono::Utc::now().timestamp();
+        let mut store = NewsStore::memory().unwrap();
+        let old = Story::new(
+            tr_data::NewsItem {
+                title: "Saved research piece".into(),
+                link: "https://fixture.invalid/saved-old".into(),
+                publisher: "Fixture".into(),
+                ts: now - 10 * 86400,
+                tickers: vec![],
+            },
+            "Fixture",
+        );
+        let mut ancient = old.clone();
+        ancient.id = "ancient-saved".into();
+        ancient.item.link = "https://fixture.invalid/saved-ancient".into();
+        ancient.item.ts = now - 120 * 86400;
+        // insert canonicalizes identity from the URL
+        ancient.id = Story::new(ancient.item.clone(), "Fixture").id;
+        let mut unsaved = old.clone();
+        unsaved.item.link = "https://fixture.invalid/unsaved-recent".into();
+        unsaved.item.ts = now;
+        store.insert(&[old.clone(), ancient.clone(), unsaved], now).unwrap();
+        store.set_bookmark(&[old.id.clone(), ancient.id.clone()], true).unwrap();
+        store.prune(now).unwrap();
+        *s.news.store.lock().await = Some(store);
+        let mut v = view(Scope::All, &[]);
+        v.filters.saved = true;
+        read(&s, v).await;
+        let rows = rx
+            .try_iter()
+            .find_map(|r| match r {
+                Response::NewsSaved { items, .. } => Some(items.unwrap()),
+                _ => None,
+            })
+            .expect("a saved read replies");
+        assert!(rows.iter().any(|story| story.id == old.id), "story saved 10 days ago is missing from Saved");
+        assert_eq!(
+            rows.iter().map(|story| &story.id).collect::<Vec<_>>(),
+            [&old.id, &ancient.id],
+            "Saved includes >90-day bookmarks, newest first, and excludes unsaved items"
+        );
+        let q = Query {
+            start: now,
+            end: now,
+            limit: 1,
+            filters: Filters { saved: true, scope: Scope::All, ..Default::default() },
+            ..Default::default()
+        };
+        let store = s.news.store.lock().await;
+        let limited = store.as_ref().unwrap().query(&q).unwrap();
+        assert_eq!(limited.len(), 1, "Saved retains the usual query limit");
+        assert_eq!(limited[0].id, old.id);
     }
 }
 
