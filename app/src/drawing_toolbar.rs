@@ -479,7 +479,7 @@ pub fn separator(ui: &Ui, rect: Rect) {
     ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1., theme::border()));
 }
 
-impl super::ChartState {
+impl crate::chart_view::ChartState {
     fn any_hidden(&self) -> bool {
         self.drawings_hidden || self.indicators_hidden || self.positions_orders_hidden
     }
@@ -521,12 +521,12 @@ impl super::ChartState {
             let (icon, active, hint) = if let Some(tool) = tool {
                 (
                     widgets::tool_icon(tool),
-                    self.draw.tool == Some(tool),
+                    self.active_drawing_tool() == Some(tool),
                     format!("{} · {}", CATEGORIES[if slot == 10 { 5 } else { slot - 1 }].title, Self::tool_hint(tool)),
                 )
             } else {
                 match slot {
-                    0 => (Icon::Crosshair, self.draw.tool.is_none(), "Crosshair".into()),
+                    0 => (Icon::Crosshair, self.active_drawing_tool().is_none(), "Crosshair".into()),
                     6 => (Icon::Magnet, self.magnet, "Magnet".into()),
                     7 => (if self.any_hidden() { Icon::EyeOff } else { Icon::Eye }, self.any_hidden(), "Hide".into()),
                     8 => (Icon::Trash, false, "Remove all drawings (undo with Cmd+Z)".into()),
@@ -727,7 +727,7 @@ impl super::ChartState {
                                 r,
                                 (self.id, "favorite", tool),
                                 widgets::tool_icon(tool),
-                                self.draw.tool == Some(tool),
+                                self.active_drawing_tool() == Some(tool),
                                 &Self::tool_hint(tool),
                             )
                             .clicked()

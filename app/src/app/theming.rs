@@ -10,7 +10,7 @@ use crate::themes::{self, SYSTEM, Theme};
 
 impl TerminalApp {
     /// Index of the theme currently in effect.
-    pub(super) fn active_theme_index(&self, ctx: &egui::Context) -> usize {
+    pub(super) fn active_theme_index(&mut self, ctx: &egui::Context) -> usize {
         let a = &self.prefs.appearance;
         let name = if a.theme.eq_ignore_ascii_case(SYSTEM) {
             match ctx.system_theme() {
@@ -19,8 +19,43 @@ impl TerminalApp {
             }
         } else {
             &a.theme
+        }
+        .clone();
+        self.saved_theme_index(&name)
+    }
+
+    /// Saved names use exact, case-insensitive matching, never command prefix matching.
+    /// Builtins always start with the default, Terminal Dark.
+    fn saved_theme_index(&mut self, name: &str) -> usize {
+        if let Some(index) = self.themes.iter().position(|t| t.name.eq_ignore_ascii_case(name)) {
+            return index;
+        }
+        if self.unknown_themes.insert(name.to_ascii_lowercase()) {
+            self.status = format!("Unknown theme '{name}', using {}", self.themes[0].name);
+        }
+        0
+    }
+
+    pub(super) fn restore_theme(&mut self, name: &str) {
+        if name.eq_ignore_ascii_case(SYSTEM) {
+            self.select_theme(SYSTEM);
+            return;
+        }
+        let Some(index) = self.themes.iter().position(|t| t.name.eq_ignore_ascii_case(name)) else {
+            // Keep the user's theme and the layout's name, so restoring the theme file later
+            // brings the layout's look back.
+            if self.unknown_themes.insert(name.to_ascii_lowercase()) {
+                self.status = format!("Unknown theme '{name}', keeping {}", self.prefs.appearance.theme);
+            }
+            self.unresolved_layout_theme = Some(name.to_string());
+            return;
         };
-        self.themes.iter().position(|t| t.name.eq_ignore_ascii_case(name)).unwrap_or(0)
+        self.unresolved_layout_theme = None;
+        let resolved = self.themes[index].name.clone();
+        if self.prefs.appearance.theme != resolved {
+            self.prefs.appearance.theme = resolved;
+            self.save_prefs();
+        }
     }
 
     /// Selection names in cycling order: System, then every theme.
@@ -38,6 +73,7 @@ impl TerminalApp {
                 None => return false,
             }
         };
+        self.unresolved_layout_theme = None;
         self.prefs.appearance.theme = resolved.clone();
         self.save_prefs();
         self.status = format!("Theme: {resolved}");
@@ -160,6 +196,68 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use crate::themes::{builtins, find, unique_name};
+
+    fn app(label: &str) -> super::TerminalApp {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/theme-fallback-tests").join(label);
+        super::TerminalApp::test_workspace(&root)
+    }
+
+    #[test]
+    fn unknown_preference_falls_back_and_reports_only_once() {
+        let mut app = app("prefs");
+        let ctx = egui::Context::default();
+        app.prefs.appearance.theme = "Missing palette".into();
+        assert_eq!(app.active_theme_index(&ctx), 0);
+        assert_eq!(app.status, "Unknown theme 'Missing palette', using Terminal Dark");
+        app.status = "Another status".into();
+        assert_eq!(app.active_theme_index(&ctx), 0);
+        assert_eq!(app.status, "Another status");
+        app.prefs.appearance.theme = "terminal light".into();
+        let index = app.active_theme_index(&ctx);
+        assert_eq!(app.themes[index].name, "Terminal Light");
+    }
+
+    #[test]
+    fn unknown_system_variant_reports_fallback_once() {
+        let mut app = app("system");
+        app.prefs.appearance.theme = crate::themes::SYSTEM.into();
+        app.prefs.appearance.dark_theme = "Missing dark".into();
+        let ctx = egui::Context::default();
+        assert_eq!(app.active_theme_index(&ctx), 0);
+        assert_eq!(app.status, "Unknown theme 'Missing dark', using Terminal Dark");
+        app.status.clear();
+        assert_eq!(app.active_theme_index(&ctx), 0);
+        assert!(app.status.is_empty());
+    }
+
+    #[test]
+    fn unknown_layout_theme_keeps_prefs_and_layout_name_and_reports_once() {
+        let mut app = app("layout");
+        app.prefs.appearance.theme = "Terminal Light".into();
+        let mut doc = app.current_doc();
+        doc.theme = Some("Missing layout theme".into());
+        app.apply_doc(doc.clone());
+        assert_eq!(app.prefs.appearance.theme, "Terminal Light");
+        assert_eq!(app.status, "Unknown theme 'Missing layout theme', keeping Terminal Light");
+        assert_eq!(app.current_doc().theme.as_deref(), Some("Missing layout theme"));
+        app.status = "Another status".into();
+        app.apply_doc(doc);
+        assert_eq!(app.status, "Another status");
+        assert!(app.select_theme("Terminal Dark"));
+        assert_eq!(app.current_doc().theme.as_deref(), Some("Terminal Dark"));
+    }
+
+    #[test]
+    fn switching_layout_keeps_unknown_theme_notice_in_status() {
+        let mut app = app("switch");
+        let mut doc = app.current_doc();
+        doc.name = "Unknown-theme layout".into();
+        doc.theme = Some("Gone".into());
+        app.store.save(&doc).unwrap();
+        app.switch_layout(&doc.name);
+        let theme = app.prefs.appearance.theme.clone();
+        assert_eq!(app.status, format!("Unknown theme 'Gone', keeping {theme}"));
+    }
 
     #[test]
     fn copies_of_builtins_get_unique_names() {

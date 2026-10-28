@@ -887,7 +887,9 @@ impl TerminalApp {
                 .collect(),
             focus: ids.get(&self.focus).copied(),
             sidebar_side: Some(self.prefs.appearance.sidebar_side),
-            theme: self.layout_theme.then(|| self.prefs.appearance.theme.clone()),
+            theme: self
+                .layout_theme
+                .then(|| self.unresolved_layout_theme.clone().unwrap_or_else(|| self.prefs.appearance.theme.clone())),
         }
     }
 
@@ -961,11 +963,9 @@ impl TerminalApp {
         }
         doc.dock.remap(&|id| map.get(&id).copied());
         self.layout_theme = doc.theme.is_some();
-        if let Some(name) = doc.theme.as_deref()
-            && !name.eq_ignore_ascii_case(&self.prefs.appearance.theme)
-            && (name.eq_ignore_ascii_case(crate::themes::SYSTEM) || crate::themes::find(&self.themes, name).is_some())
-        {
-            self.select_theme(name);
+        self.unresolved_layout_theme = None;
+        if let Some(name) = doc.theme.as_deref() {
+            self.restore_theme(name);
         }
         if let Some(side) = doc.sidebar_side
             && side != self.prefs.appearance.sidebar_side
@@ -1007,9 +1007,12 @@ impl TerminalApp {
         self.save_layout();
         match self.store.load(name) {
             Ok(doc) => {
+                let notices = self.unknown_themes.len();
                 self.apply_doc(doc);
                 self.save_settings();
-                self.status = format!("Layout {:?}", self.layout_name);
+                if self.unknown_themes.len() == notices {
+                    self.status = format!("Layout {:?}", self.layout_name);
+                }
             }
             Err(e) => self.status = format!("{e:#}"),
         }
@@ -1050,6 +1053,7 @@ impl TerminalApp {
             "THEME" => {
                 self.layout_theme =
                     !matches!(words.get(1).map(|w| w.to_ascii_uppercase()).as_deref(), Some("OFF" | "NO"));
+                self.unresolved_layout_theme = None;
                 self.save_layout();
                 self.status = if self.layout_theme {
                     format!("Layout {:?} now switches to theme {:?}", self.layout_name, self.prefs.appearance.theme)

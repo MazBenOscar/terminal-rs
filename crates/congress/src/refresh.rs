@@ -377,7 +377,10 @@ pub async fn refresh<S: Source>(src: &S, db: &Mutex<Db>, cfg: &RefreshConfig) ->
     }
     // The legacy last_refresh_date is intentionally left untouched.
     db.set_meta("last_refresh_summary", &report.summary())?;
-    info!("congress refresh: {}", report.summary());
+    // Senate comes from Bargo on its own schedule; this log covers House only.
+    let summary = report.summary();
+    let house = summary.replace(&format!(" · {SENATE_PAUSED}"), "").replace(SENATE_PAUSED, "");
+    info!("House refresh: {house}");
     Ok(report)
 }
 
