@@ -246,6 +246,63 @@ fn mimo_settings_show_profile_radios_and_hide_plugins_in_collapsed_advanced() {
 }
 
 #[test]
+fn registered_mimo_socket_labels_suppress_notices_without_widening_policy() {
+    use tr_agent::mcp::{MimoClientLabel, is_mimo_turn, source_for_turn};
+    let temp = Temp::new();
+    let mut app = TerminalApp::test_workspace(&temp.0);
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let launch = MimoClientLabel::register();
+    let stale = MimoClientLabel::register();
+    let stale_token = stale.token().to_owned();
+    drop(stale);
+    runtime.block_on(async {
+        async fn connect(data: &Path, token: &str) -> BufReader<UnixStream> {
+            let mut stream = BufReader::new(UnixStream::connect(socket_path(data)).await.unwrap());
+            write_line(stream.get_mut(), &json!({"jsonrpc":"2.0","id":0,"method":"terminal-rs/client","params":{"client":token}})).await.unwrap();
+            let line = tokio::time::timeout(Duration::from_secs(2), read_line(&mut stream)).await.unwrap().unwrap().unwrap();
+            let reply: Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(reply["result"], json!({}));
+            stream
+        }
+        app.agent_config.allow_external = true;
+        app.external_agent_logic();
+        let mut mimo = connect(&temp.0, launch.token()).await;
+        let refused = call(&mut app, &mut mimo, 1, "create_watchlist", json!({"name":"No bypass"})).await;
+        assert!(refused.to_string().contains("tool_disabled"));
+        assert!(app.agent_pane.workflows.proposals.is_empty());
+        app.external_agent = None;
+        app.external_attempted = false;
+        app.agent_config.allow_external_edits = true;
+        app.external_agent_logic();
+        let mut mimo = connect(&temp.0, launch.token()).await;
+        let proposed = call(&mut app, &mut mimo, 1, "create_watchlist", json!({"name":"mimo approval"})).await;
+        assert_eq!(proposed["result"]["isError"], false);
+        let proposal = app.agent_pane.workflows.proposals[0].clone();
+        assert!(is_mimo_turn(&proposal.turn));
+        assert_eq!(source_for_turn(&proposal.turn), "mimo");
+        assert!(proposal.summary.starts_with("mimo · "));
+        assert!(app.watchlists.iter().all(|w| w.name != "mimo approval"), "mimo still needs user approval");
+        assert!(!app.agent_pane.blocks.iter().any(|b| matches!(b, crate::agent_pane::RenderedBlock::Notice(s) if s.contains("External agent"))));
+        app.confirm_workflows(&proposal.turn, true);
+        assert!(app.watchlists.iter().any(|w| w.name == "mimo approval"));
+        for token in ["mimo-forged-prefix", stale_token.as_str()] {
+            let mut outside = connect(&temp.0, token).await;
+            let result = call(&mut app, &mut outside, 1, "create_watchlist", json!({"name":"Outside approval"})).await;
+            assert_eq!(result["result"]["isError"], false);
+            let proposal = app.agent_pane.workflows.proposals.last().unwrap();
+            assert!(!is_mimo_turn(&proposal.turn));
+            assert!(proposal.summary.starts_with("External agent · "));
+        }
+        assert!(app.agent_pane.blocks.iter().any(|b| matches!(b, crate::agent_pane::RenderedBlock::Notice(s) if s.contains("External agent: tool request received through MCP"))));
+        assert_eq!(source_for_turn("external-mimo-1:2"), "mimo", "rotation retains drawing label");
+        assert_eq!(source_for_turn("external-1:2"), "External agent");
+        assert_eq!(source_for_turn("ordinary-turn"), "Agent");
+        app.agent_config.allow_external = false;
+        app.external_agent_logic();
+    });
+}
+
+#[test]
 fn real_app_socket_readonly_budget_and_workflow_approval_share_ui_queue() {
     let temp = Temp::new();
     let mut app = TerminalApp::test_workspace(&temp.0);

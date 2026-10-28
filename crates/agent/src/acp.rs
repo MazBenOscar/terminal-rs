@@ -54,6 +54,7 @@ struct Rpc {
     retired_sessions: Mutex<HashSet<String>>,
     turn: Mutex<String>,
     text: Mutex<StreamScrubber>,
+    message_segment: AtomicU64,
     thought: Mutex<StreamScrubber>,
     tool_ids: Mutex<HashMap<String, String>>,
     busy: Arc<AtomicBool>,
@@ -339,7 +340,7 @@ impl Rpc {
                     self.text.lock().unwrap().push(text)?
                 };
                 if !safe.is_empty() {
-                    let value = json!({"delta":safe,"turnId":turn,"itemId":if thought {"thought"} else {"message"}});
+                    let value = json!({"delta":safe,"turnId":turn,"itemId":if thought {"thought".to_owned()} else {self.message_id()}});
                     self.emit(if thought { AgentEvent::ReasoningDelta(value) } else { AgentEvent::TextDelta(value) });
                 }
             }
@@ -350,6 +351,10 @@ impl Rpc {
                 };
                 let id = update["toolCallId"].as_str().context("missing ACP tool id")?.to_owned();
                 self.tool_ids.lock().unwrap().insert(id.clone(), tool);
+                // Flush even an unterminated line before reserving the tool row.
+                // ACP has no message item IDs: each tool boundary ends a segment.
+                self.finish_chunks();
+                self.message_segment.fetch_add(1, Ordering::Relaxed);
                 self.emit(AgentEvent::ToolStarted(json!({"turnId":turn,"item":{"type":"dynamicToolCall","id":id,"tool":scrub_text(update["title"].as_str().unwrap_or_default())}})));
             }
             Some("tool_call_update") => {
@@ -382,7 +387,10 @@ impl Rpc {
             None if update["type"] == "retry" => self.provider_retry(update),
             // Non-executing ACP session metadata; never forwarded as instructions.
             Some(
-                "available_commands_update"
+                // The pane owns the optimistic user row. ACP may echo the
+                // entire context-enriched prompt; neither display nor reject it.
+                "user_message_chunk"
+                | "available_commands_update"
                 | "current_mode_update"
                 | "config_option_update"
                 | "session_info_update"
@@ -392,12 +400,15 @@ impl Rpc {
         }
         Ok(())
     }
+    fn message_id(&self) -> String {
+        format!("{}-message-{}", self.turn.lock().unwrap(), self.message_segment.load(Ordering::Relaxed))
+    }
     fn finish_chunks(&self) {
         let turn = self.turn.lock().unwrap().clone();
         let text = self.text.lock().unwrap().finish();
         let thought = self.thought.lock().unwrap().finish();
         if !text.is_empty() {
-            self.emit(AgentEvent::TextDelta(json!({"delta":text,"turnId":turn,"itemId":"message"})));
+            self.emit(AgentEvent::TextDelta(json!({"delta":text,"turnId":turn,"itemId":self.message_id()})));
         }
         if !thought.is_empty() {
             self.emit(AgentEvent::ReasoningDelta(json!({"delta":thought,"turnId":turn,"itemId":"thought"})));
@@ -455,6 +466,7 @@ pub struct AcpBackend {
     model_config: Mutex<Option<String>>,
     preferred_model: Mutex<String>,
     cleaned: Option<Cleanup>,
+    _mcp_label: Option<crate::mcp::MimoClientLabel>,
 }
 struct Workspace(PathBuf);
 impl Drop for Workspace {
@@ -515,6 +527,7 @@ impl AcpBackend {
             retired_sessions: Default::default(),
             turn: Default::default(),
             text: Default::default(),
+            message_segment: AtomicU64::new(0),
             thought: Default::default(),
             tool_ids: Default::default(),
             busy: busy.clone(),
@@ -568,6 +581,7 @@ impl AcpBackend {
             model_config: Default::default(),
             preferred_model: Default::default(),
             cleaned: None,
+            _mcp_label: None,
         }
     }
     pub async fn initialize(&self) -> Result<Value> {
@@ -748,12 +762,13 @@ impl AcpBackend {
         } else {
             bail!("mimo isolation requires macOS sandbox-exec; refusing an unsandboxed child");
         };
+        let mcp_label = crate::mcp::MimoClientLabel::register();
         command.args(acp_arguments(profile, load_plugins, port));
         command
             .env_clear()
             .envs(mimo_environment(std::env::vars_os(), &private, &home, profile))
             // Configure MCP before mimo builds its startup reminder/tool catalogue.
-            .env("MIMOCODE_CONFIG_CONTENT", terminal_mcp_config(&exe, data).to_string())
+            .env("MIMOCODE_CONFIG_CONTENT", terminal_mcp_config(&exe, data, mcp_label.token()).to_string())
             // This is a host-selected path, not an inherited secret. The shim must
             // locate precisely the app instance that launched this backend.
             .env("TR_DATA_DIR", data)
@@ -773,6 +788,7 @@ impl AcpBackend {
         let mut backend = Self::connect(read, write, cwd, exe, Arc::new(move || killer.kill()));
         let (finished, cleaned) = watch::channel(None);
         backend.cleaned = Some(cleaned);
+        backend._mcp_label = Some(mcp_label);
         let rpc = backend.rpc.clone();
         std::thread::spawn(move || {
             loop {
@@ -1048,7 +1064,7 @@ const MIMO_BUILTIN_TOOLS: &[&str] = &[
     "exec",
 ];
 
-fn terminal_mcp_config(executable: &Path, data: &Path) -> Value {
+fn terminal_mcp_config(executable: &Path, data: &Path, client: &str) -> Value {
     let mut tools = serde_json::Map::new();
     tools.insert("*".into(), json!(false));
     for name in MIMO_BUILTIN_TOOLS {
@@ -1057,7 +1073,7 @@ fn terminal_mcp_config(executable: &Path, data: &Path) -> Value {
     tools.insert("terminal-rs_*".into(), json!(true));
     json!({
         "mcp":{"terminal-rs":{"type":"local","command":[executable,"mcp-stdio"],
-            "environment":{"TR_DATA_DIR":data}}},
+            "environment":{"TR_DATA_DIR":data,"TR_MCP_CLIENT":client}}},
         "tools": tools,
         "permission":{"bash":"deny","edit":"deny","webfetch":"deny","read":"deny","external_directory":"deny"},
     })

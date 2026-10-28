@@ -77,6 +77,47 @@ async fn round_trip<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     reply
 }
 
+#[tokio::test]
+async fn proxy_handshake_forwards_label_on_each_connection_and_cannot_relabel_midstream() {
+    let temp = Temp::new();
+    let path = socket_path(&temp.0);
+    std::fs::create_dir(temp.0.join("agent")).unwrap();
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let client = MimoClientLabel::register();
+    let token = client.token().to_owned();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests = seen.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let requests = requests.clone();
+            let handler: ToolHandler = Arc::new(move |request| {
+                requests.lock().unwrap().push(request);
+                Box::pin(async { Ok(json!({})) })
+            });
+            let (read, write) = stream.into_split();
+            serve_app(read, write, handler).await.unwrap();
+        }
+    });
+    let mut proxy = Proxy { path, client: Some(token.clone()), stream: None, next: 0 };
+    assert!(proxy.call("tools/list", json!({})).await.unwrap().is_ok());
+    assert!(proxy.call("terminal-rs/client", json!({"client":"other"})).await.unwrap().is_err());
+    proxy.stream = None; // Reconnect must identify the new connection too.
+    assert!(proxy.call("tools/list", json!({})).await.unwrap().is_ok());
+    drop(proxy);
+    server.await.unwrap();
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    for pair in requests.chunks(2) {
+        assert_eq!(pair[0]["method"], "terminal-rs/client");
+        assert_eq!(pair[0]["params"]["client"], token);
+        assert_eq!(pair[1]["method"], "tools/list");
+    }
+    assert!(is_mimo_client(&token));
+    drop(client);
+    assert!(!is_mimo_client(&token));
+}
+
 #[test]
 fn socket_path_limit_counts_bytes_and_reserves_the_trailing_nul() {
     use std::os::unix::ffi::OsStrExt;

@@ -99,13 +99,56 @@ async fn handshake_mcp_entry_streamed_chunks_tools_plan_and_models() {
     assert!(!killed.load(Ordering::SeqCst));
 }
 
+#[tokio::test]
+async fn echoed_user_chunks_are_ignored_and_tool_boundaries_split_text_without_final_replay() {
+    let (backend, _read, _write, killed) = fake();
+    // Route directly for deterministic inspection of every emitted event.
+    *backend.rpc.turn.lock().unwrap() = "mimo-test".into();
+    let mut events = backend.rpc.events.subscribe();
+    for update in [
+        json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"What's the trend?"}}),
+        json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Reading bars.\nKeep these separated."}}),
+        json!({"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"terminal-rs_read_chart","kind":"other"}),
+        json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Verdict: up\n80,799.51"}}),
+    ] {
+        backend.rpc.route(json!({"jsonrpc":"2.0","method":"session/update","params":{"update":update}})).await.unwrap();
+    }
+    backend.rpc.finish_chunks();
+    backend.rpc.finish_chunks(); // A second flush must emit nothing.
+    let mut messages = Vec::<(String, String)>::new();
+    let mut order = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            AgentEvent::TextDelta(v) => {
+                order.push("text");
+                let id = v["itemId"].as_str().unwrap().to_owned();
+                let delta = v["delta"].as_str().unwrap();
+                if let Some((_, text)) = messages.iter_mut().find(|(key, _)| *key == id) {
+                    text.push_str(delta);
+                } else {
+                    messages.push((id, delta.into()));
+                }
+            }
+            AgentEvent::ToolStarted(_) => order.push("tool"),
+            _ => panic!("user echoes must neither display nor stop the backend"),
+        }
+    }
+    assert_eq!(order, ["text", "text", "tool", "text", "text"]);
+    assert_eq!(messages.len(), 2);
+    assert_ne!(messages[0].0, messages[1].0);
+    assert_eq!(messages[0].1, "Reading bars.\nKeep these separated.");
+    assert_eq!(messages[1].1, "Verdict: up\n80,799.51");
+    assert!(!killed.load(Ordering::SeqCst));
+    assert!(!backend.is_unsafe());
+}
+
 #[test]
 fn child_config_has_one_eager_mcp_server_and_fixed_switches_in_both_profiles() {
-    let config = terminal_mcp_config(Path::new("/app/terminal-rs"), Path::new("/canonical/data"));
+    let config = terminal_mcp_config(Path::new("/app/terminal-rs"), Path::new("/canonical/data"), "mimo-launch-token");
     assert_eq!(
         config["mcp"],
         json!({"terminal-rs":{"type":"local","command":["/app/terminal-rs","mcp-stdio"],
-            "environment":{"TR_DATA_DIR":"/canonical/data"}}})
+            "environment":{"TR_DATA_DIR":"/canonical/data","TR_MCP_CLIENT":"mimo-launch-token"}}})
     );
     // Only terminal-rs tools: every built-in is off and its permission denied.
     assert_eq!(config["tools"]["*"], json!(false));
@@ -702,6 +745,7 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
         retired_sessions: Default::default(),
         turn: Default::default(),
         text: Default::default(),
+        message_segment: AtomicU64::new(0),
         thought: Default::default(),
         tool_ids: Default::default(),
         busy: Arc::new(AtomicBool::new(false)),

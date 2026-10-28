@@ -46,7 +46,7 @@ const MIMO_PRIVACY_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "What the agent can change",
-        "mimo uses Settings › Agent's external MCP policy, read-only by default. Enabling external chart edits permits chart edits and workflow proposals; watchlist and alert writes still require your approval. Its socket calls are labelled External agent, separately from conversation turns.",
+        "mimo uses Settings › Agent's external MCP policy, read-only by default. Enabling external chart edits permits chart edits and workflow proposals; watchlist and alert writes still require your approval. Its socket calls and approvals are labelled mimo; outside MCP clients are labelled External agent.",
     ),
     (
         "What is stored on this Mac",
@@ -1077,7 +1077,7 @@ impl AgentPane {
                     .map(|p| p.turn.clone())
                     .collect();
                 for turn in external {
-                    ui.label("External agent");
+                    ui.label(tr_agent::mcp::source_for_turn(&turn));
                     self.confirmation_card(ui, &turn, &mut actions);
                 }
                 if !self.acknowledged {

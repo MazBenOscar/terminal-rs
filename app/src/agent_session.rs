@@ -700,6 +700,148 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tr_agent::transport::{Transport, WireEvent};
 
+    #[tokio::test]
+    async fn mimo_echo_and_segmented_stream_render_one_prompt_and_two_replies() {
+        use crate::agent_pane::{AgentPane, Prompt, RenderedBlock};
+        use tr_agent::{AgentEvent, AgentEvents};
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let (read, write) = tokio::io::split(client_io);
+        let client = tr_agent::acp::AcpBackend::connect(
+            read,
+            write,
+            PathBuf::from("/empty"),
+            PathBuf::from("/app"),
+            Arc::new(|| {}),
+        );
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server_io);
+            let mut read = BufReader::new(read);
+            loop {
+                let line = tr_agent::mcp::read_line(&mut read).await.unwrap().unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&line).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "initialize" => json!({"protocolVersion":1}),
+                    "session/new" => json!({"sessionId":"session"}),
+                    "session/prompt" => {
+                        for update in [
+                            json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"What's the trend?"}}),
+                            json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Keep these separated."}}),
+                            json!({"sessionUpdate":"tool_call","toolCallId":"read","title":"terminal-rs_read_chart","kind":"other"}),
+                            json!({"sessionUpdate":"tool_call_update","toolCallId":"read","status":"completed"}),
+                            json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Verdict: up\n80,799.51"}}),
+                        ] {
+                            tr_agent::mcp::write_line(&mut write, &json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session","update":update}})).await.unwrap();
+                        }
+                        json!({"stopReason":"end_turn"})
+                    }
+                    _ => panic!("unexpected ACP request"),
+                };
+                tr_agent::mcp::write_line(&mut write, &tr_agent::mcp::success(request["id"].clone(), result))
+                    .await
+                    .unwrap();
+                if request["method"] == "session/prompt" {
+                    // Keep the fake child alive through Done consumption.
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        client
+            .start_thread(tr_agent::ThreadOptions {
+                cwd: String::new(),
+                base_instructions: String::new(),
+                ephemeral: true,
+                dynamic_tools: vec![],
+            })
+            .await
+            .unwrap();
+        let mut events = client.events();
+        let mut pane = AgentPane::default();
+        pane.transition(Onboarding::Ready);
+        pane.start_prompt(Prompt { text: "What's the trend?".into(), requires_tools: false }).unwrap();
+        let turn = client
+            .send_turn(tr_agent::TurnInput { text: "What's the trend?".into(), ..Default::default() })
+            .await
+            .unwrap();
+        pane.event(BridgeEvent::Started { turn: turn.clone() });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (method, params) = match events.recv().await.unwrap() {
+                    AgentEvent::TextDelta(v) => ("item/agentMessage/delta", v),
+                    AgentEvent::ToolStarted(v) => ("item/started", v),
+                    AgentEvent::ToolFinished(v) => ("item/completed", v),
+                    AgentEvent::Done(_) => break,
+                    e => panic!("unexpected event: {e:?}"),
+                };
+                pane.event(
+                    project(BridgeEvent::Wire(WireEvent::Notification { method: method.into(), params })).unwrap(),
+                );
+            }
+        })
+        .await
+        .unwrap();
+        pane.event(BridgeEvent::Completed { turn, status: "completed".into(), calls: 1, interrupt_elapsed: None });
+        assert_eq!(pane.turns.len(), 1);
+        assert_eq!(pane.blocks.iter().filter(|b| matches!(b, RenderedBlock::Prompt(_))).count(), 1);
+        let replies: Vec<_> = pane
+            .blocks
+            .iter()
+            .filter_map(|b| if let RenderedBlock::Reply(blocks) = b { Some(blocks.clone()) } else { None })
+            .collect();
+        assert_eq!(
+            replies,
+            [
+                crate::agent_markdown::parse("Keep these separated."),
+                crate::agent_markdown::parse("Verdict: up\n80,799.51")
+            ]
+        );
+        assert!(matches!(&pane.blocks[2], RenderedBlock::Tool(_)));
+        pane.backend = "mimo";
+        pane.acknowledged = true;
+        pane.disclosure = false;
+        for width in [240.0, 360.0, 660.0] {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 900.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    pane.show(ui, "No chart pinned", egui::Id::new("mimo-test"));
+                },
+            );
+            let mut rows = Vec::new();
+            fn collect(shape: &egui::Shape, rows: &mut Vec<(String, egui::Rect)>) {
+                match shape {
+                    egui::Shape::Text(t)
+                        if ["What's the trend?", "Keep these separated.", "Verdict: up 80,799.51"]
+                            .contains(&t.galley.text()) =>
+                    {
+                        rows.push((t.galley.text().into(), t.galley.rect.translate(t.pos.to_vec2())));
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for s in shapes {
+                            collect(s, rows);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for shape in &output.shapes {
+                collect(&shape.shape, &mut rows);
+            }
+            output.textures_delta.clear();
+            assert_eq!(
+                rows.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>(),
+                ["What's the trend?", "Keep these separated.", "Verdict: up 80,799.51"]
+            );
+            assert!(
+                rows.windows(2).all(|pair| pair[0].1.bottom() <= pair[1].1.top()),
+                "message rectangles must not overlap"
+            );
+        }
+        server.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn acp_readiness_notices_and_failures_leave_pane_checking_with_restart() {
         for failure in ["network", "timeout", "model"] {

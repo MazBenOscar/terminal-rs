@@ -114,6 +114,14 @@ impl ExternalServer {
                 let registry = registry.clone();
                 let state = state.clone();
                 Box::pin(async move {
+                    if request["method"] == "terminal-rs/client" {
+                        let mut state = state.lock().await;
+                        if request["params"]["client"].as_str().is_some_and(tr_agent::mcp::is_mimo_client) {
+                            state.turn = format!("external-mimo-{id}:0");
+                        }
+                        // Labels only: registry and policy are deliberately unchanged.
+                        return Ok(serde_json::json!({}));
+                    }
                     if request["method"] == "tools/list" {
                         let mut schemas = tr_agent::mcp::schemas(&registry);
                         schemas["tools"].as_array_mut().unwrap().push(serde_json::json!({

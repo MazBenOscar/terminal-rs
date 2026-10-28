@@ -210,14 +210,14 @@ pub fn wrapped_job(text: &str, width: f32, font: egui::FontId, color: Color32) -
 }
 
 pub fn wrapped(ui: &mut Ui, text: &str, color: Color32) -> egui::Response {
-    let mut job = rich_job(&[Span::Text(text.into())], ui.available_width(), 13.0, false);
+    let mut job = rich_job(&[Span::Text(text.into())], ui.available_width(), 13.0);
     for section in &mut job.sections {
         section.format.color = color;
     }
     ui.add(egui::Label::new(job).wrap())
 }
 
-fn rich_job(spans: &[Span], width: f32, size: f32, bold_only: bool) -> LayoutJob {
+fn rich_job(spans: &[Span], width: f32, size: f32) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = width.max(1.0);
     for span in spans {
@@ -230,19 +230,28 @@ fn rich_job(spans: &[Span], width: f32, size: f32, bold_only: bool) -> LayoutJob
         };
         // Prose figures share the body font and kerning; mono is only for code
         // and aligned contexts such as table cells, never individual prose tokens.
-        append_run(&mut job, &text, size, bold, italic, code, bold_only);
+        append_run(&mut job, &text, size, bold, italic, code);
     }
     job
 }
 
-fn append_run(job: &mut LayoutJob, text: &str, size: f32, bold: bool, italic: bool, code: bool, bold_only: bool) {
+/// Bold weight on the variable system font (SF Pro). One shaped run, one paint;
+/// on a non-variable fallback face the coordinate is ignored and text stays regular.
+const BOLD_WEIGHT: f32 = 680.0;
+
+fn append_run(job: &mut LayoutJob, text: &str, size: f32, bold: bool, italic: bool, code: bool) {
     job.append(
         text,
         0.0,
         TextFormat {
             font_id: if code { theme::mono(size) } else { theme::body_font(size) },
-            color: if bold_only && !bold { Color32::TRANSPARENT } else { theme::text() },
-            background: if code && !bold_only { theme::control() } else { Color32::TRANSPARENT },
+            color: theme::text(),
+            background: if code { theme::control() } else { Color32::TRANSPARENT },
+            coords: if bold && !code {
+                egui::epaint::text::VariationCoords::new([(b"wght", BOLD_WEIGHT)])
+            } else {
+                Default::default()
+            },
             italics: italic,
             ..Default::default()
         },
@@ -251,15 +260,14 @@ fn append_run(job: &mut LayoutJob, text: &str, size: f32, bold: bool, italic: bo
 
 fn rich(ui: &mut Ui, spans: &[Span], size: f32) {
     let width = ui.available_width();
-    let galley = ui.fonts_mut(|f| f.layout_job(rich_job(spans, width, size, false)));
+    let galley = ui.fonts_mut(|f| f.layout_job(rich_job(spans, width, size)));
     let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
     ui.painter().galley(rect.min, galley, theme::text());
-    // Synthetic bold: a second, fractionally offset ink pass on bold runs only.
-    // RichText::strong changes colour in egui; it does not change font weight.
-    if spans.iter().any(|s| matches!(s, Span::Bold(_))) {
-        let ink = ui.fonts_mut(|f| f.layout_job(rich_job(spans, width, size, true)));
-        ui.painter().galley(rect.min + egui::vec2(dp(1.0) * 0.35, 0.0), ink, theme::text());
-    }
+    // One layout and one ink pass. Re-laying out a transparent-mask copy for
+    // synthetic bold can change shaping at span boundaries and double-paint
+    // glyphs at different positions (especially in mixed emphasis/numbers).
+    // Keep semantic emphasis in the parsed spans; never simulate font weight
+    // with a second, independently shaped galley.
 }
 
 pub fn show(ui: &mut Ui, blocks: &[DisplayBlock]) {
@@ -397,17 +405,55 @@ mod tests {
         let tokens: Vec<_> = numeric_tokens(text).into_iter().map(|r| &text[r]).collect();
         assert_eq!(tokens, ["62,400", "$68,200", "56.8", "+2.4%", "13:42", "14"]);
         assert_eq!(numeric_tokens("€ café 値 -2.0%").len(), 1);
-        let job = rich_job(&inline("Support **$62,400**, rising."), 360.0, 13.0, false);
+        let job = rich_job(&inline("Support **$62,400**, rising."), 360.0, 13.0);
         assert!(job.sections.iter().all(|s| s.format.font_id.family == egui::FontFamily::Proportional));
         assert!(job.sections.iter().all(|s| s.format.extra_letter_spacing == 0.0));
-        let prose = rich_job(&inline("At **$62,400** by 20:00; `RSI(14)`"), 360.0, 13.0, false);
+        let prose = rich_job(&inline("At **$62,400** by 20:00; `RSI(14)`"), 360.0, 13.0);
         for section in &prose.sections {
             let code = &prose.text[section.byte_range.start.0..section.byte_range.end.0] == "RSI(14)";
             assert_eq!(section.format.font_id.family == egui::FontFamily::Monospace, code);
         }
-        let ink = rich_job(&inline("a **bold** b"), 360.0, 13.0, true);
-        assert!(ink.sections.iter().any(|s| s.format.color == Color32::TRANSPARENT));
-        assert!(ink.sections.iter().any(|s| s.format.color == theme::text()));
+        assert!(prose.sections.iter().all(|s| s.format.color == theme::text()));
+        // Bold is a real weight on the same face, not a second painted copy.
+        let bold = rich_job(&inline("a **bold** b"), 360.0, 13.0);
+        let weighted: Vec<_> = bold
+            .sections
+            .iter()
+            .filter(|s| s.format.coords != Default::default())
+            .map(|s| &bold.text[s.byte_range.start.0..s.byte_range.end.0])
+            .collect();
+        assert_eq!(weighted, ["bold"]);
+    }
+
+    #[test]
+    fn mixed_emphasis_and_figures_have_one_ink_pass_at_all_pane_widths() {
+        for width in [240.0, 360.0, 660.0] {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 800.0))),
+                    ..Default::default()
+                },
+                |ui| show(ui, &prepare(&parse("**Verdict:** trend is **up**, at **80,799.51**."))),
+            );
+            let mut text = Vec::new();
+            fn collect(shape: &egui::Shape, text: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(t) => text.push(t.galley.text().into()),
+                    egui::Shape::Vec(shapes) => {
+                        for s in shapes {
+                            collect(s, text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for shape in &mut output.shapes {
+                collect(&shape.shape, &mut text);
+            }
+            output.textures_delta.clear();
+            assert_eq!(text, ["Verdict: trend is up, at 80,799.51."]);
+        }
     }
 
     #[test]
