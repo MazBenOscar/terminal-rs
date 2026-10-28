@@ -4,6 +4,7 @@ mod tests;
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -14,7 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const GROUPS: [&str; 6] = ["finnhub", "sec", "yahoo-news", "coindesk", "house-disclosures", "house-roster"];
+pub const GROUPS: [&str; 7] =
+    ["finnhub", "sec", "yahoo-news", "coindesk", "house-disclosures", "house-roster", "bargo"];
 
 /// Permanent network prohibition, independent of switches, aliases and future policies.
 fn disabled_host(url: &reqwest::Url) -> bool {
@@ -74,6 +76,7 @@ pub fn policies() -> Vec<HostPolicy> {
         ("www.coindesk.com", "coindesk", 300, 1, 300),
         ("disclosures-clerk.house.gov", "house-disclosures", 3, 20, 400),
         ("clerk.house.gov", "house-roster", 3, 20, 20),
+        ("www.bargo.ai", "bargo", 30, 2, 40),
     ]
     .into_iter()
     .map(|(host, group, seconds, per_minute, daily_cap)| HostPolicy {
@@ -108,6 +111,9 @@ pub struct Settings {
     pub coindesk: bool,
     pub house_disclosures: bool,
     pub house_roster: bool,
+    pub bargo: bool,
+    /// Explicit opt-in: legacy `bargo: true` alone must not enable keyless traffic.
+    pub bargo_keyless: bool,
     pub sec_contact: String,
     #[serde(skip)]
     pub settings_error: bool,
@@ -122,6 +128,8 @@ impl Default for Settings {
             coindesk: true,
             house_disclosures: true,
             house_roster: true,
+            bargo: false,
+            bargo_keyless: false,
             sec_contact: String::new(),
             settings_error: false,
         }
@@ -137,9 +145,21 @@ impl Settings {
             coindesk: false,
             house_disclosures: false,
             house_roster: false,
+            bargo: false,
             settings_error: true,
             ..Self::default()
         }
+    }
+    /// Resolve secret-store presence before starting any worker. A missing switch defaults on
+    /// only with a key; a legacy enabled switch without the new opt-in never enables keyless.
+    pub fn resolve_bargo(&mut self, document: Option<&[u8]>, has_key: bool) {
+        if self.settings_error {
+            return;
+        }
+        let explicit = document
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .and_then(|doc| doc.get("data_sources")?.get("bargo")?.as_bool());
+        self.bargo = explicit.unwrap_or(has_key) && (has_key || self.bargo_keyless);
     }
     /// Missing legacy section is supported; malformed settings always fail closed.
     pub fn from_document(bytes: &[u8]) -> Self {
@@ -162,6 +182,7 @@ impl Settings {
                 "coindesk" => self.coindesk,
                 "house-disclosures" => self.house_disclosures,
                 "house-roster" => self.house_roster,
+                "bargo" => self.bargo,
                 _ => false,
             }
     }
@@ -285,7 +306,17 @@ pub struct ResponseMetadata {
     pub last_modified: Option<String>,
 }
 
+/// Last reported provider allowances, shared across instances; timestamps use UTC seconds.
+#[derive(Clone, Debug, Default)]
+pub struct Remaining {
+    pub at: i64,
+    pub requests: Option<u32>,
+    pub rows: Option<u32>,
+}
+
 pub struct Guard {
+    // SENATE-BARGO: only fingerprints enter the guard/ledger, never credential values.
+    bargo_bucket: RwLock<String>,
     config: Config,
     settings: RwLock<Settings>,
     client: reqwest::Client,
@@ -294,6 +325,31 @@ pub struct Guard {
     cooldowns: RwLock<HashMap<String, LocalCooldown>>,
     #[cfg(any(test, feature = "test-support"))]
     fixture: Option<reqwest::Url>,
+}
+fn fingerprint(value: &[u8]) -> String {
+    Sha1::digest(value).iter().map(|b| format!("{b:02x}")).collect()
+}
+fn bargo_bucket(key: Option<&str>) -> String {
+    key.filter(|k| !k.is_empty())
+        .map_or_else(|| "bargo:keyless".into(), |key| format!("bargo:key:{}", fingerprint(key.as_bytes())))
+}
+fn sensitive_fingerprint(request: &reqwest::Request) -> String {
+    let mut headers: Vec<_> = request
+        .headers()
+        .iter()
+        .filter(|(name, value)| {
+            value.is_sensitive() || matches!(name.as_str(), "x-api-key" | "authorization" | "x-finnhub-token")
+        })
+        .map(|(name, value)| (name.as_str(), value.as_bytes()))
+        .collect();
+    headers.sort();
+    let mut digest = Sha1::new();
+    for (name, value) in headers {
+        digest.update(name.as_bytes());
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 type FlightResult = (Instant, Result<(Vec<u8>, ResponseMetadata), Refused>);
 #[derive(Default)]
@@ -358,6 +414,7 @@ impl Guard {
             .build()
             .map_err(|_| Refused::Transport)?;
         let guard = Self {
+            bargo_bucket: RwLock::new(bargo_bucket(None)),
             config,
             settings: RwLock::new(settings),
             client,
@@ -375,7 +432,10 @@ impl Guard {
         let db = guard.db()?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS slots (key TEXT PRIMARY KEY, at INTEGER NOT NULL, until INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS counters (key TEXT PRIMARY KEY, count INTEGER NOT NULL);",
+             CREATE TABLE IF NOT EXISTS counters (key TEXT PRIMARY KEY, count INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS bargo_sweeps (day INTEGER PRIMARY KEY, attempts INTEGER NOT NULL, retry_at INTEGER NOT NULL, reason TEXT);
+             CREATE TABLE IF NOT EXISTS remaining (\"group\" TEXT PRIMARY KEY, at INTEGER NOT NULL, requests INTEGER, rows INTEGER);
+             CREATE TABLE IF NOT EXISTS row_usage (\"group\" TEXT, day INTEGER, count INTEGER NOT NULL, PRIMARY KEY(\"group\",day));",
         )?;
         let has_owner = |db: &Connection| -> rusqlite::Result<bool> {
             Ok(db
@@ -475,6 +535,153 @@ impl Guard {
         self.db()?.execute("DELETE FROM slots WHERE key=?1", [key])?;
         Ok(())
     }
+    /// Status follows the currently stored key; each send derives its own bucket independently.
+    pub fn set_bargo_key(&self, key: Option<&str>) {
+        *self.bargo_bucket.write().expect("Bargo bucket lock") = bargo_bucket(key);
+    }
+    /// Conservative 90% allowance, independent for keyless and each key fingerprint.
+    pub fn bargo_allowance(&self, key: Option<&str>) -> Result<u32, Refused> {
+        let bucket = bargo_bucket(key);
+        let keyed = key.is_some_and(|k| !k.is_empty());
+        let day = Utc::now().timestamp() / 86400;
+        let db = self.db()?;
+        let used: u32 = db
+            .query_row("SELECT count FROM row_usage WHERE \"group\"=?1 AND day=?2", params![bucket, day], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        let requests: u32 = db
+            .query_row("SELECT count FROM requests WHERE \"group\"=?1 AND day=?2", params![bucket, day], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        if requests >= if keyed { 40 } else { 10 } {
+            return Ok(0);
+        }
+        let mut available = (if keyed { 900u32 } else { 90 }).saturating_sub(used);
+        if let Some(remaining) = self.remaining(&bucket)?.filter(|r| r.at / 86400 == day) {
+            if remaining.requests.is_some_and(|n| n <= if keyed { 10 } else { 3 }) {
+                return Ok(0);
+            }
+            if let Some(rows) = remaining.rows {
+                available = available.min(rows.saturating_sub(if keyed { 100 } else { 10 }));
+            }
+        }
+        Ok(available)
+    }
+    /// A saved key lifts only an authentication pause. Other sources and other causes stay paused.
+    pub fn bargo_key_saved(&self, key: &str) -> Result<(), Refused> {
+        self.set_bargo_key(Some(key));
+        let mut local = self.cooldowns.write().expect("cooldown lock");
+        let db = self.db()?;
+        let cleared =
+            db.execute("DELETE FROM cooldowns WHERE \"group\"='bargo' AND reason='Key error (HTTP 401)'", [])?;
+        let local_auth = local.get("bargo").is_some_and(|p| p.reason == "Key error (HTTP 401)");
+        if local_auth {
+            local.remove("bargo");
+        }
+        if cleared > 0 || local_auth {
+            // An authentication deferral may retry with the replacement key, without resetting
+            // any request/row counters, other pause causes, or the daily attempt bound.
+            db.execute(
+                "UPDATE bargo_sweeps SET retry_at=0,reason=NULL WHERE day=?1",
+                [Utc::now().timestamp() / 86400],
+            )?;
+        }
+        Ok(())
+    }
+    /// Daily UTC sweep before polls, with a durable crash lease and at most eight attempts/day.
+    /// A deferred attempt is not a completed 24-hour slot; only finish_bargo_sweep completes it.
+    pub fn claim_bargo_run(&self, initial: bool) -> Result<Option<bool>, Refused> {
+        if let Err(error) = self.check("bargo") {
+            if error != Refused::Budget {
+                return Err(error);
+            }
+        }
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = Utc::now().timestamp_millis();
+        let day = now / 86_400_000;
+        let completed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM slots WHERE key='bargo:sweep' AND at/86400000=?1 AND until>?2)",
+            params![day, now],
+            |r| r.get(0),
+        )?;
+        let state: Option<(u32, i64, Option<String>)> = tx
+            .query_row("SELECT attempts,retry_at,reason FROM bargo_sweeps WHERE day=?1", [day], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        if !completed && state.as_ref().is_none_or(|(attempts, retry, _)| *attempts < 8 && now >= *retry) {
+            tx.execute("INSERT INTO bargo_sweeps VALUES(?1,1,?2,NULL) ON CONFLICT(day) DO UPDATE SET attempts=attempts+1,retry_at=excluded.retry_at,reason=NULL",
+                params![day, now+900_000])?;
+            // A sweep replaces a poll, and polls remain suppressed for three hours after it ran.
+            tx.execute("INSERT INTO slots VALUES('bargo:poll',?1,?2) ON CONFLICT(key) DO UPDATE SET at=excluded.at,until=excluded.until",
+                params![now, now+10_800_000])?;
+            tx.commit()?;
+            return Ok(Some(true));
+        }
+        // A crashed/in-flight sweep has not yet run or recorded a deferral. No polls may pass it.
+        let mut deferred = state.as_ref().is_some_and(|(_, _, reason)| reason.is_some());
+        if !completed
+            && state
+                .as_ref()
+                .is_some_and(|(attempts, retry, reason)| *attempts >= 8 && now >= *retry && reason.is_none())
+        {
+            tx.execute("UPDATE bargo_sweeps SET reason='Senate sweep deferred: interrupted; daily retry bound reached' WHERE day=?1", [day])?;
+            deferred = true;
+        }
+        tx.commit()?;
+        if initial || (!completed && !deferred) {
+            return Ok(None);
+        }
+        Ok(self.claim_slot("bargo:poll", Duration::from_secs(10800))?.then_some(false))
+    }
+    pub fn finish_bargo_sweep(&self, reason: Option<&str>) -> Result<(), Refused> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = Utc::now().timestamp_millis();
+        tx.execute(
+            "UPDATE bargo_sweeps SET reason=?2,retry_at=?3 WHERE day=?1",
+            params![now / 86_400_000, reason, if reason.is_some() { now + 900_000 } else { now }],
+        )?;
+        tx.execute("INSERT INTO slots VALUES('bargo:poll',?1,?2) ON CONFLICT(key) DO UPDATE SET at=excluded.at,until=excluded.until",
+            params![now, now+10_800_000])?;
+        if reason.is_none() {
+            tx.execute("INSERT INTO slots VALUES('bargo:sweep',?1,?2) ON CONFLICT(key) DO UPDATE SET at=excluded.at,until=excluded.until",
+                params![now, (now/86_400_000+1)*86_400_000])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn bargo_sweep_reason(&self) -> Result<Option<String>, Refused> {
+        Ok(self
+            .db()?
+            .query_row("SELECT reason FROM bargo_sweeps WHERE day=?1", [Utc::now().timestamp() / 86400], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten())
+    }
+    pub fn remaining(&self, group: &str) -> Result<Option<Remaining>, Refused> {
+        let bucket = self.bargo_bucket.read().expect("Bargo bucket lock").clone();
+        let group = if group == "bargo" { bucket.as_str() } else { group };
+        Ok(self
+            .db()?
+            .query_row("SELECT at,requests,rows FROM remaining WHERE \"group\"=?1", [group], |r| {
+                Ok(Remaining { at: r.get(0)?, requests: r.get(1)?, rows: r.get(2)? })
+            })
+            .optional()?)
+    }
+    fn record_remaining(&self, group: &str, metadata: &Remaining) -> Result<(), Refused> {
+        if metadata.requests.is_some() || metadata.rows.is_some() {
+            self.db()?.execute(
+                "INSERT INTO remaining VALUES(?1,?2,?3,?4) ON CONFLICT(\"group\") DO UPDATE SET at=excluded.at,
+                 requests=CASE WHEN remaining.at/86400=excluded.at/86400 THEN min(COALESCE(remaining.requests,excluded.requests),COALESCE(excluded.requests,remaining.requests)) ELSE excluded.requests END,
+                 rows=CASE WHEN remaining.at/86400=excluded.at/86400 THEN min(COALESCE(remaining.rows,excluded.rows),COALESCE(excluded.rows,remaining.rows)) ELSE excluded.rows END",
+                params![group, Utc::now().timestamp(), metadata.requests, metadata.rows],
+            )?;
+        }
+        Ok(())
+    }
     pub fn clear_counter(&self, key: &str) -> Result<(), Refused> {
         self.db()?.execute("DELETE FROM counters WHERE key=?1", [key])?;
         Ok(())
@@ -507,6 +714,12 @@ impl Guard {
     fn offline(&self) -> bool {
         self.config.data_dir.is_some() && !self.config.allow_external
     }
+    fn bargo_mode_allowed(&self, keyed: bool) -> Result<(), Refused> {
+        if !keyed && !self.settings.read().expect("settings lock").bargo_keyless {
+            return Err(Refused::Disabled);
+        }
+        Ok(())
+    }
     fn identity(&self, group: &str) -> Result<String, Refused> {
         if self.offline() {
             return Err(Refused::Offline);
@@ -536,13 +749,14 @@ impl Guard {
     }
     #[cfg(test)]
     fn reserve_owned(&self, policy: &HostPolicy, owner: &str) -> Result<Option<Duration>, Refused> {
-        self.reserve_with_counter(policy, owner, None)
+        self.reserve_with_counter(policy, owner, None, None)
     }
     fn reserve_with_counter(
         &self,
         policy: &HostPolicy,
         owner: &str,
         counter: Option<(&str, u32)>,
+        bargo_rows: Option<(u32, bool, &str)>,
     ) -> Result<Option<Duration>, Refused> {
         if let Some(pause) = self
             .cooldowns
@@ -561,10 +775,11 @@ impl Guard {
         if let Some(until) = paused.filter(|u| *u > now / 1000) {
             return Err(Refused::Paused { until });
         }
+        let usage_group = bargo_rows.map_or(policy.group, |(_, _, bucket)| bucket);
         let count: u32 = tx
             .query_row(
                 "SELECT count FROM requests WHERE \"group\"=?1 AND day=?2",
-                params![policy.group, now / 86_400_000],
+                params![usage_group, now / 86_400_000],
                 |r| r.get(0),
             )
             .optional()?
@@ -597,12 +812,45 @@ impl Guard {
             let wait = if lease.is_some_and(|until| until > now) { (next - now).min(50) } else { next - now };
             return Ok(Some(Duration::from_millis(wait as u64)));
         }
+        if let Some((rows, keyed, bucket)) = bargo_rows {
+            self.bargo_mode_allowed(keyed)?;
+            let remaining: Option<(i64, Option<u32>, Option<u32>)> = tx
+                .query_row("SELECT at,requests,rows FROM remaining WHERE \"group\"=?1", [bucket], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .optional()?;
+            if remaining.is_some_and(|(at, requests, available)| {
+                at / 86400 == now / 86_400_000
+                    && (requests.is_some_and(|n| n <= if keyed { 10 } else { 3 })
+                        || (rows > 0
+                            && available.is_some_and(|n| n.saturating_sub(if keyed { 100 } else { 10 }) < rows)))
+            }) {
+                return Err(Refused::Budget);
+            }
+            let used: u32 = tx
+                .query_row(
+                    "SELECT count FROM row_usage WHERE \"group\"=?1 AND day=?2",
+                    params![bucket, now / 86_400_000],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            // /health costs no rows, even after the row allowance has been consumed.
+            if rows > 0 && used.saturating_add(rows) > if keyed { 900 } else { 90 } {
+                return Err(Refused::Budget);
+            }
+            tx.execute("INSERT INTO row_usage VALUES(?1,?2,?3) ON CONFLICT(\"group\",day) DO UPDATE SET count=count+excluded.count",
+                params![bucket, now/86_400_000, rows])?;
+            // Account for sends even when subsequent responses omit headers.
+            tx.execute("UPDATE remaining SET requests=max(0,requests-1),rows=max(0,rows-?2) WHERE \"group\"=?1 AND at/86400=?3",
+                params![bucket, rows, now/86_400_000])?;
+        }
         if let Some(key) = counter_key {
             tx.execute("INSERT INTO counters VALUES(?1,1) ON CONFLICT(key) DO UPDATE SET count=count+1", [&key])?;
         }
         tx.execute(
             "INSERT INTO requests VALUES (?1,?2,1) ON CONFLICT(\"group\",day) DO UPDATE SET count=count+1",
-            params![policy.group, now / 86_400_000],
+            params![usage_group, now / 86_400_000],
         )?;
         tx.execute(
             "INSERT INTO last_request VALUES (?1,?2) ON CONFLICT(\"group\") DO UPDATE SET at=excluded.at",
@@ -722,11 +970,16 @@ impl Guard {
             return Err(Refused::Disabled);
         }
         self.identity(group)?;
+        if group == "bargo" {
+            let key = request.headers().get("X-Api-Key").and_then(|v| v.to_str().ok());
+            self.bargo_mode_allowed(key.is_some_and(|k| !k.is_empty()))?;
+            self.set_bargo_key(key);
+        }
         let policy = self.policy(group, request.url())?;
         if request.method() != reqwest::Method::GET {
             return self.send_uncached(group, request, daily_limit, counter).await;
         }
-        let key = (group.to_owned(), request.url().to_string());
+        let key = (group.to_owned(), format!("{}#{}", request.url(), sensitive_fingerprint(&request)));
         let slot = {
             let mut cache = self.cache.lock().expect("cache lock");
             // Bound memory without evicting in-flight slots.
@@ -754,6 +1007,9 @@ impl Guard {
     /// Preflight without reserving budget or making a connection.
     pub fn check(&self, group: &str) -> Result<(), Refused> {
         self.identity(group)?;
+        if group == "bargo" {
+            self.bargo_mode_allowed(*self.bargo_bucket.read().expect("Bargo bucket lock") != "bargo:keyless")?;
+        }
         let status = self.status()?.into_iter().find(|s| s.group == group).ok_or(Refused::UnknownHost)?;
         if let Some(until) = status.paused_until {
             return Err(Refused::Paused { until });
@@ -789,7 +1045,29 @@ impl Guard {
         daily_limit: u32,
         counter: Option<(&str, u32)>,
     ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
-        let max_wait = if group == "yahoo-news" && !self.config.max_wait.is_zero() {
+        // Bargo's longer spacing still uses one durable reservation per actual send.
+        let key = request.headers().get("X-Api-Key").and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let keyed = key.as_ref().is_some_and(|k| !k.is_empty());
+        let bucket = bargo_bucket(key.as_deref());
+        let bargo_rows = if group == "bargo" {
+            let rows = if request.url().path().ends_with("/trades") {
+                request
+                    .url()
+                    .query_pairs()
+                    .find(|(k, _)| k == "limit")
+                    .and_then(|(_, v)| v.parse::<u32>().ok())
+                    .unwrap_or(100)
+                    .min(if keyed { 250 } else { 100 })
+            } else {
+                0
+            };
+            Some((rows, keyed, bucket.as_str()))
+        } else {
+            None
+        };
+        let max_wait = if group == "bargo" && !self.config.max_wait.is_zero() {
+            Duration::from_secs(35)
+        } else if group == "yahoo-news" && !self.config.max_wait.is_zero() {
             Duration::from_secs(30)
         } else {
             self.config.max_wait
@@ -798,6 +1076,10 @@ impl Guard {
         for hop in 0..=3 {
             let mut policy = self.policy(group, request.url())?;
             policy.daily_cap = policy.daily_cap.min(daily_limit);
+            if group == "bargo" {
+                self.set_bargo_key(key.as_deref());
+                policy.daily_cap = policy.daily_cap.min(if keyed { 40 } else { 10 });
+            }
             let owner = format!(
                 "{}-{}-{}",
                 std::process::id(),
@@ -806,7 +1088,7 @@ impl Guard {
             );
             loop {
                 self.identity(group)?;
-                match self.reserve_with_counter(&policy, &owner, counter)? {
+                match self.reserve_with_counter(&policy, &owner, counter, bargo_rows)? {
                     None => break,
                     Some(wait) if Instant::now() + wait <= deadline => tokio::time::sleep(wait).await,
                     _ => return Err(Refused::Busy),
@@ -833,8 +1115,33 @@ impl Guard {
             let status = response.status().as_u16();
             let retry =
                 response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).map(str::to_owned);
-            if matches!(status, 403 | 429 | 503) {
-                return Err(self.pause(group, &format!("HTTP {status}"), retry.as_deref())?);
+            let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+            let metadata = ResponseMetadata { status, etag: header("etag"), last_modified: header("last-modified") };
+            self.record_remaining(
+                if group == "bargo" { &bucket } else { group },
+                &Remaining {
+                    at: Utc::now().timestamp(),
+                    requests: header("x-ratelimit-remaining").and_then(|v| v.parse().ok()),
+                    rows: header("x-ratelimit-rows-remaining").and_then(|v| v.parse().ok()),
+                },
+            )?;
+            if matches!(status, 403 | 429 | 503) || (group == "bargo" && (status == 401 || status >= 500)) {
+                let retry = if group == "bargo" && status == 429 {
+                    let seconds = retry
+                        .as_deref()
+                        .and_then(|v| retry_after(v, Utc::now().timestamp()))
+                        .unwrap_or(0)
+                        .max((Utc::now().timestamp() / 86400 + 1) * 86400);
+                    Some((seconds - Utc::now().timestamp()).to_string())
+                } else {
+                    retry
+                };
+                let reason = if group == "bargo" && status == 401 {
+                    "Key error (HTTP 401)".to_owned()
+                } else {
+                    format!("HTTP {status}")
+                };
+                return Err(self.pause(group, &reason, retry.as_deref())?);
             }
             if matches!(status, 301 | 302 | 303 | 307 | 308) {
                 let target = response
@@ -882,7 +1189,9 @@ impl Guard {
                         && ![b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"]
                             .iter()
                             .any(|magic| body.starts_with(*magic))));
-            if (html_response(&content_type, &body) && blocked_body(&body)) || house_download_refused || roster_refused
+            if (html_response(&content_type, &body) && (blocked_body(&body) || group == "bargo"))
+                || house_download_refused
+                || roster_refused
             {
                 return Err(self.pause(
                     group,
@@ -893,16 +1202,24 @@ impl Guard {
             if !(200..300).contains(&status) && status != 304 {
                 return Err(Refused::Http(status));
             }
-            let header = |name| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
-            let metadata = ResponseMetadata {
-                status,
-                etag: header(reqwest::header::ETAG),
-                last_modified: header(reqwest::header::LAST_MODIFIED),
-            };
             if status == 304 {
                 body.clear();
             }
             let db = self.db()?;
+            // Refund unused row reservations only for a valid bounded trade page. Errors,
+            // cancellation and malformed bodies retain their conservative full reservation.
+            if let Some((reserved, _, bucket)) = bargo_rows.filter(|(rows, _, _)| *rows > 0) {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
+                    if let Some(rows) =
+                        value.get("trades").and_then(|v| v.as_array()).filter(|r| r.len() <= reserved as usize)
+                    {
+                        db.execute(
+                            "UPDATE row_usage SET count=max(0,count-?1) WHERE \"group\"=?2 AND day=?3",
+                            params![reserved - rows.len() as u32, bucket, Utc::now().timestamp() / 86400],
+                        )?;
+                    }
+                }
+            }
             db.execute("DELETE FROM transport_failures WHERE \"group\"=?1", [group])?;
             db.execute("DELETE FROM cooldowns WHERE \"group\"=?1", [group])?;
             self.cooldowns.write().expect("cooldown lock").remove(group);
@@ -916,11 +1233,17 @@ impl Guard {
         GROUPS
             .into_iter()
             .map(|group| {
-                let cap = policies().into_iter().find(|p| p.group == group).expect("registered group").daily_cap;
+                let bucket = self.bargo_bucket.read().expect("Bargo bucket lock").clone();
+                let usage_group = if group == "bargo" { bucket.as_str() } else { group };
+                let cap = if group == "bargo" && bucket == "bargo:keyless" {
+                    10
+                } else {
+                    policies().into_iter().find(|p| p.group == group).expect("registered group").daily_cap
+                };
                 let requests_today = db
                     .query_row(
                         "SELECT count FROM requests WHERE \"group\"=?1 AND day=?2",
-                        params![group, Utc::now().timestamp() / 86400],
+                        params![usage_group, Utc::now().timestamp() / 86400],
                         |r| r.get(0),
                     )
                     .optional()?
@@ -942,7 +1265,8 @@ impl Guard {
                     .or(paused);
                 Ok(Status {
                     group,
-                    enabled: settings.enabled(group),
+                    enabled: settings.enabled(group)
+                        && (group != "bargo" || bucket != "bargo:keyless" || settings.bargo_keyless),
                     requests_today,
                     cap,
                     last_request,

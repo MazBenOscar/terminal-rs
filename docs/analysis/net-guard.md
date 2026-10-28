@@ -2,6 +2,24 @@
 
 `tr_net::shared()` is used by Yahoo **news**, CoinDesk RSS, Finnhub news/Save & Test, EDGAR and Congress **House-only** refresh. Quotes, bars and exchange traffic are unchanged. N0b permanently prohibits `senate.gov` and **all** subdomains (including `efdsearch.senate.gov` and `www.senate.gov`): direct requests and redirect targets return `Refused::Disabled` before any target socket, independent of switches, offline mode or future host-policy registrations. Senate parsers/fixtures and stored history remain available; live Senate needs a third-party source.
 
+## Senate via Bargo (SENATE-BARGO)
+
+The app now adds the third-party `bargo` policy (`www.bargo.ai`), without changing the permanent
+senate.gov prohibition described above. It has ≥30 s spacing, ≤2/minute, one in-flight request,
+and per-send header-authorized ceilings of 40/day keyed or 10/day keyless. Status key presence is
+not authorization: each send derives its own cap from the X-Api-Key header. The ledger's generic
+`remaining` table persists X-RateLimit-Remaining / X-RateLimit-Rows-Remaining with a UTC timestamp;
+values only decrease within a UTC day. `row_usage` atomically reserves a full requested trade page,
+with short valid-page refunds, bounding trade rows to 1,000/day keyed or 100/day keyless even when
+headers are missing. Reservations are not refunded for errors, cancellation or malformed pages.
+Calls require the full page allowance and stop below 5 requests or 200/20 rows respectively.
+
+401 records a key-error pause; all Bargo 5xx and HTML pages pause too. A Bargo 429 floor reaches
+at least the next UTC midnight, in addition to ordinary escalation/Retry-After. Sweep/poll cadence
+is claimed in the same machine-wide slots table. The optional secret account is `bargo`, header
+only and sensitive; Settings Save & Test uses one `/health` call (availability, not key validity).
+Tests inject only localhost transports and repository-local ledgers, never live Bargo or Senate.
+
 ## Ledger and environment
 
 Default ledger on this macOS account:

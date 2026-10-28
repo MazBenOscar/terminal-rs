@@ -36,6 +36,7 @@ tr-macos.workspace = true
 raw-window-handle = "0.6"
 
 [dev-dependencies]
+tr-net = { workspace = true, features = ["test-support"] }
 async-trait = "0.1"
 # A5b-SCAN: advance the scan deadline deterministically without real providers.
 tokio = { workspace = true, features = ["test-util"] }

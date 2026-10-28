@@ -294,6 +294,9 @@ pub enum Request {
     DataSources {
         action: crate::app::data_sources::Action,
     },
+    // SENATE-BARGO
+    BargoSettings(crate::app::bargo::Action),
+    // SENATE-BARGO END
     Agent(AgentRequest),
     SecurityNames(Vec<String>),
     WatchlistColumns {
@@ -674,6 +677,13 @@ pub enum Response {
     /// Outcome of a [`QuestradeAction`]: a status line or an error.
     Questrade(Result<String, String>),
     DataSources(crate::app::data_sources::Reply),
+    // SENATE-BARGO
+    BargoSettings(crate::app::bargo::Reply),
+    BargoUpdated {
+        status: String,
+        changed: bool,
+    },
+    // SENATE-BARGO END
     Scan {
         pane: PaneId,
         generation: u64,
@@ -1146,12 +1156,18 @@ impl Worker {
 
     pub fn spawn(ctx: egui::Context, provider: Provider) -> anyhow::Result<Self> {
         // Configure the shared news guard before any worker request can run.
-        let settings = match std::fs::read(data_dir().join("settings.json")) {
-            Ok(bytes) => tr_net::Settings::from_document(&bytes),
+        let document = std::fs::read(data_dir().join("settings.json"));
+        let mut settings = match &document {
+            Ok(bytes) => tr_net::Settings::from_document(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => tr_net::Settings::default(),
             Err(_) => tr_net::Settings::corrupt(),
         };
+        let key = crate::app::bargo::key();
+        settings.resolve_bargo(document.as_ref().ok().map(Vec::as_slice), key.is_some());
         tr_net::configure_shared(settings);
+        if let Ok(net) = tr_net::shared() {
+            net.set_bargo_key(key.as_deref());
+        }
         let dir = data_dir();
         std::fs::create_dir_all(&dir)?;
         let db = Db::open(dir.join("congress.sqlite3")).or_else(|e| {
@@ -1237,10 +1253,28 @@ impl Worker {
         let s = shared.clone();
         rt.spawn(edgar_loop(s, _edgar_rx));
 
+        // SENATE-BARGO: independent of House refusals and its cadence slot.
+        let senate = shared.clone();
+        rt.spawn(async move {
+            let _ = crate::app::bargo::key();
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut previous = String::new();
+            loop {
+                tick.tick().await;
+                let visible = congress_refresh_minutes() != 0
+                    && senate.congress_window_visible.load(std::sync::atomic::Ordering::Relaxed)
+                    && !senate.ctx.input(|i| i.viewport().minimized == Some(true));
+                let key = crate::app::bargo::key();
+                bargo_refresh(&senate, tr_net::shared(), key.as_deref(), visible, &mut previous).await;
+            }
+        });
+        // SENATE-BARGO END
         // Scheduled congressional disclosure refresh.
         let s = shared.clone();
         rt.spawn(async move {
-            s.send(Response::CongressPaused(refresh::SENATE_PAUSED.into()));
+            // SENATE-BARGO: the Senate loop publishes its own source status.
+            // SENATE-BARGO END
             let minutes = congress_refresh_minutes();
             if minutes == 0 {
                 return;
@@ -1260,6 +1294,53 @@ impl Worker {
         let _ = self.tx.send(req);
     }
 }
+
+// SENATE-BARGO: publish local status even when hidden, minimized, disabled, or unable to open the ledger.
+async fn bargo_refresh(
+    s: &Shared,
+    net: Result<&tr_net::Guard, tr_net::Refused>,
+    key: Option<&str>,
+    visible: bool,
+    previous: &mut String,
+) {
+    let net = match net {
+        Ok(net) => net,
+        Err(error) => {
+            let status = format!("Senate via Bargo · {error}");
+            if *previous != status {
+                *previous = status.clone();
+                s.send(Response::BargoUpdated { status, changed: false });
+            }
+            return;
+        }
+    };
+    let before = s.db.lock().await.meta("bargo_updated").ok().flatten();
+    net.set_bargo_key(key);
+    // This is the sole request boundary: a hidden pane only reads the local DB and guard.
+    let result = if visible {
+        tr_congress::bargo::sync(net, &s.db, key).await
+    } else {
+        Ok(tr_congress::bargo::SyncReport::default())
+    };
+    if let Some(report) = result.as_ref().ok().filter(|report| !report.alerts.is_empty()) {
+        s.send(Response::NewAlerts(report.alerts.clone()));
+    }
+    let after = s.db.lock().await.meta("bargo_updated").ok().flatten();
+    let mut status = tr_congress::bargo::status(net, after.as_deref().and_then(|s| s.parse().ok()), key.is_some());
+    let problem = match result {
+        Err(error) => Some(error.to_string()),
+        Ok(report) => report.problem,
+    };
+    if let Some(problem) = problem.filter(|p| !status.contains(p)) {
+        status.push_str(&format!(" · {problem}"));
+    }
+    let changed = before != after;
+    if *previous != status || changed {
+        *previous = status.clone();
+        s.send(Response::BargoUpdated { status, changed });
+    }
+}
+// SENATE-BARGO END
 
 // N2: the task owns the SQLite connection; charts independently read the same WAL store.
 async fn edgar_loop(s: Arc<Shared>, mut interest: tokio::sync::watch::Receiver<(bool, Vec<String>)>) {
@@ -1346,6 +1427,7 @@ fn congress_visibility_gates_automatic_but_never_manual_refresh() {
     }
 }
 
+// SENATE-BARGO: House status must not resurrect the disabled-source explanation while Bargo is on.
 async fn congress_refresh(s: &Shared, manual: bool) {
     if !congress_refresh_allowed(
         manual,
@@ -1360,17 +1442,19 @@ async fn congress_refresh(s: &Shared, manual: bool) {
     }
     let net = match tr_net::shared() {
         Ok(net) => net,
-        Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED))),
+        Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · Senate via Bargo: unavailable"))),
     };
+    let updated = s.db.lock().await.meta("bargo_updated").ok().flatten().and_then(|s| s.parse().ok());
+    let senate = tr_congress::bargo::status(net, updated, crate::app::bargo::key().is_some());
     if let Err(e) = net.check("house-disclosures") {
-        return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED)));
+        return s.send(Response::CongressPaused(format!("House: {e} · {senate}")));
     }
     // Manual refresh bypasses cadence only, never the shared request guard.
     if !manual {
         match net.claim_slot("congress:refresh", Duration::from_secs(minutes.saturating_mul(60))) {
             Ok(true) => {}
             Ok(false) => return,
-            Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED))),
+            Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · {senate}"))),
         }
     }
     // A single reusable source serialises manual and scheduled runs.
@@ -1384,10 +1468,12 @@ async fn congress_refresh(s: &Shared, manual: bool) {
         }
     }
     let source = guard.as_ref().expect("source initialised");
-    s.send(Response::Status(format!("Refreshing House Clerk disclosures… · {}", refresh::SENATE_PAUSED)));
+    s.send(Response::Status(format!("Refreshing House Clerk disclosures… · {senate}")));
     let cfg = RefreshConfig::incremental(&*s.db.lock().await);
     match refresh::refresh(source, &s.db, &cfg).await {
-        Ok(report) => {
+        Ok(mut report) => {
+            report.notes.retain(|note| note != refresh::SENATE_PAUSED);
+            report.notes.push(senate);
             if !report.alerts.is_empty() {
                 s.send(Response::NewAlerts(report.alerts.clone()));
             }
@@ -1396,6 +1482,8 @@ async fn congress_refresh(s: &Shared, manual: bool) {
         Err(e) => s.send(Response::Status(format!("congress refresh failed: {e:#}"))),
     }
 }
+
+// SENATE-BARGO END
 
 /// Display line for a stepped series: straight segments between the bars where each new
 /// value first appears. Values hold flat after the last change and gaps (NaN) stay gaps,
@@ -1892,6 +1980,12 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             names.save(&path);
             s.send(Response::SecurityNames(names.clone()));
         }
+        // SENATE-BARGO
+        Request::BargoSettings(action) => {
+            let updated = s.db.lock().await.meta("bargo_updated").ok().flatten().and_then(|s| s.parse().ok());
+            s.send(Response::BargoSettings(crate::app::bargo::perform(action, updated).await));
+        }
+        // SENATE-BARGO END
         Request::DataSources { action } => {
             let changed = !matches!(&action, crate::app::data_sources::Action::Status);
             let key = s.news.key.lock().await.clone();
@@ -3429,6 +3523,47 @@ mod tests {
             rx,
         )
     }
+
+    // SENATE-BARGO: no global guard or secret store in this fixture.
+    #[tokio::test]
+    async fn bargo_hidden_worker_publishes_keyed_status_without_requests_and_deduplicates() {
+        let (s, rx) = backfill_shared(Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)));
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../target/test-data/bargo-hidden-{}", std::process::id()));
+        let guard = tr_net::Guard::for_fixture(
+            tr_net::Config {
+                ledger: root.join("ledger.sqlite3"),
+                data_dir: Some(root.join("instance")),
+                allow_external: true,
+                max_wait: Duration::ZERO,
+            },
+            tr_net::Settings { bargo: true, ..Default::default() },
+            "http://127.0.0.1:9/".parse().unwrap(),
+        )
+        .unwrap();
+        let mut previous = String::new();
+        bargo_refresh(&s, Ok(&guard), Some("fixture-secret"), false, &mut previous).await;
+        let Response::BargoUpdated { status, changed } = rx.try_recv().unwrap() else {
+            panic!("missing source status");
+        };
+        assert!(status.contains("waiting for daily sweep"));
+        assert!(!status.contains("needs key"));
+        assert!(!changed);
+        assert!(s.db.lock().await.meta("bargo_initialized").unwrap().is_none());
+        assert_eq!(guard.status().unwrap().into_iter().find(|s| s.group == "bargo").unwrap().requests_today, 0);
+        bargo_refresh(&s, Ok(&guard), Some("fixture-secret"), false, &mut previous).await;
+        assert!(rx.try_recv().is_err());
+        bargo_refresh(&s, Ok(&guard), None, false, &mut previous).await;
+        assert!(matches!(rx.try_recv().unwrap(), Response::BargoUpdated { .. }));
+        bargo_refresh(&s, Err(tr_net::Refused::Ledger), None, false, &mut previous).await;
+        let Response::BargoUpdated { status, .. } = rx.try_recv().unwrap() else {
+            panic!("missing ledger status");
+        };
+        assert!(status.contains("ledger unavailable"));
+        drop(guard);
+        let _ = std::fs::remove_dir_all(root);
+    }
+    // SENATE-BARGO END
 
     // A5b-SCAN worker tests: only counting fakes and in-memory bars.
     #[derive(Default)]

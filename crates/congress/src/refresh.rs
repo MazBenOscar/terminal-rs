@@ -1,5 +1,5 @@
-//! Incremental House-only live ingest, guarded machine-wide by tr_net.
-//! Senate parsing/fixture ingestion and stored history remain available; no live Senate requests.
+//! Incremental official-site House ingest, guarded machine-wide by tr_net.
+//! No live senate.gov requests. Senate's third-party ingest lives in [`crate::bargo`].
 
 use std::fmt;
 use std::future::Future;

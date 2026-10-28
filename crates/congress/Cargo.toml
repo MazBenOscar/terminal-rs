@@ -21,6 +21,7 @@ quick-xml = { version = "0.42", features = ["serialize"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 pdf-extract = "0.12"
 futures = "0.3"
+sha1 = "0.11"
 
 [dev-dependencies]
 tr-net = { path = "../net", features = ["test-support"] }
