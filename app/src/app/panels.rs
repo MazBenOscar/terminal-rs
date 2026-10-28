@@ -21,6 +21,18 @@ struct WatchRowLayout {
     show_name: bool,
     extra: usize,
     stale: bool,
+    visible_columns: usize,
+}
+
+/// Base columns in logical points: keep Security + Last, drop % before Change.
+fn watch_visible_columns(width: f32) -> usize {
+    if width >= 360.0 {
+        4
+    } else if width >= 280.0 {
+        3
+    } else {
+        2
+    }
 }
 
 /// Use security precision for price-like values and two decimals for other indicators.
@@ -425,12 +437,21 @@ impl TerminalApp {
             crate::security_names::show_column(w, self.watch_columns.columns.len(), self.watch_columns.show_name);
         let name_width = if show_name { dp(150.0) } else { 0.0 };
         let base = if extra == 0 { 1.0 } else { (dp(380.0) / (w - name_width)).max(0.45) };
-        let mut cols = vec![0.0, 0.34 * base, 0.58 * base, 0.79 * base, base];
+        let visible_columns = watch_visible_columns(w / dp(1.0));
+        let mut cols = match visible_columns {
+            2 => vec![0.0, 0.45, 1.0, 1.0, 1.0],
+            3 => vec![0.0, 0.38, 0.70, 1.0, 1.0],
+            _ => vec![0.0, 0.34 * base, 0.58 * base, 0.79 * base, base],
+        };
         for i in 0..extra {
             cols.push(base + (1.0 - base) * (i + 1) as f32 / extra as f32);
         }
         let col = |r: Rect, k: usize| {
-            r.left() + 8.0 + (r.width() - 16.0 - name_width) * cols[k] + if k > 0 { name_width } else { 0.0 }
+            let padding = dp(8.0).min(r.width().max(0.0) / 2.0);
+            r.left()
+                + padding
+                + (r.width() - 2.0 * padding - name_width).max(0.0) * cols[k]
+                + if k > 0 { name_width } else { 0.0 }
         };
         let name_left = col(hdr, 1) - name_width;
         if show_name {
@@ -466,7 +487,14 @@ impl TerminalApp {
         let mut headers = vec!["Security".to_string(), "Last".into(), "Change".into(), "%".into()];
         headers.extend(self.watch_columns.columns.iter().take(extra).map(|c| c.title.clone()));
         for (index, title) in headers.iter().enumerate() {
+            if (visible_columns..4).contains(&index) {
+                continue;
+            }
             let k = if index == 0 { 0 } else { index + 1 };
+            let left = if index == 0 { hdr.left() } else { col(hdr, k - 1) };
+            let right = if index == 0 { name_left } else { col(hdr, k) };
+            let hit = Rect::from_min_max(pos2(left, hdr.top()), pos2(right, hdr.bottom()));
+            let p = p.with_clip_rect(hit.intersect(ui.clip_rect()));
             let suffix = match self.watch_sort {
                 Some((active, descending)) if active == index => {
                     if descending {
@@ -485,9 +513,6 @@ impl TerminalApp {
                 ui_font(11.5),
                 muted(),
             );
-            let left = if index == 0 { hdr.left() } else { col(hdr, k - 1) };
-            let right = if index == 0 { name_left } else { col(hdr, k) };
-            let hit = Rect::from_min_max(pos2(left, hdr.top()), pos2(right, hdr.bottom()));
             let response = ui.interact(hit, ui.id().with(("watch-header", index)), Sense::click());
             response.context_menu(|ui| {
                 if ui.button("Edit columns…").clicked() {
@@ -504,14 +529,15 @@ impl TerminalApp {
             }
         }
         let hidden = self.watch_columns.columns.len() - extra;
-        if hidden > 0 {
-            p.text(
-                pos2(col(hdr, 0) + dp(95.0), hdr.center().y),
-                Align2::LEFT_CENTER,
-                format!("+{hidden}"),
-                ui_font(11.0),
-                muted(),
-            );
+        if hidden > 0 && w >= dp(380.0) {
+            p.with_clip_rect(Rect::from_min_max(hdr.min, pos2(name_left, hdr.bottom())).intersect(ui.clip_rect()))
+                .text(
+                    pos2(col(hdr, 0) + dp(95.0), hdr.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("+{hidden}"),
+                    ui_font(11.0),
+                    muted(),
+                );
         }
         let items = self.watchlists[self.active_watchlist].items();
         let order = self.watch_display_order(&items);
@@ -521,6 +547,7 @@ impl TerminalApp {
             name_left,
             show_name,
             extra,
+            visible_columns,
             stale: chrono::Utc::now().timestamp() - self.columns_computed_at > 180,
         };
         let height = (ui.available_height() - if details { dp(134.0) } else { 0.0 }).max(row_h);
@@ -672,7 +699,11 @@ impl TerminalApp {
         let Item::Symbol(s) = item else { return };
         let WatchRowLayout { name_width, name_left, show_name, extra, stale, .. } = *layout;
         let col = |r: Rect, k: usize| {
-            r.left() + 8.0 + (r.width() - 16.0 - name_width) * layout.cols[k] + if k > 0 { name_width } else { 0.0 }
+            let padding = dp(8.0).min(r.width().max(0.0) / 2.0);
+            r.left()
+                + padding
+                + (r.width() - 2.0 * padding - name_width).max(0.0) * layout.cols[k]
+                + if k > 0 { name_width } else { 0.0 }
         };
         let sec = tr_data::security(s);
         widgets::hover_wash(ui, r, &resp, self.watch_selected.as_ref() == Some(s));
@@ -681,7 +712,9 @@ impl TerminalApp {
         // Crypto pairs use the type column too: BASE/QUOTE must keep its quote
         // asset visible (USD and USDT are different markets), and "Curncy" adds nothing.
         let crypto_pair = crypto.is_some();
-        let ticker_width = if crypto_pair { 114.0 } else { 70.0 };
+        let symbol_rect = Rect::from_min_max(r.min, pos2(name_left, r.bottom())).intersect(ui.clip_rect());
+        let symbol_painter = p.with_clip_rect(symbol_rect);
+        let ticker_width = (if crypto_pair { 114.0_f32 } else { 70.0 }).min((name_left - col(r, 0)).max(0.0));
         let ticker = crate::security_names::ticker(&sec, false);
         let mut job = egui::text::LayoutJob::simple_singleline(ticker, mono(12.5), amber());
         job.wrap.max_width = ticker_width;
@@ -689,9 +722,9 @@ impl TerminalApp {
         job.wrap.break_anywhere = true;
         job.wrap.overflow_character = Some('…');
         let galley = p.layout_job(job);
-        p.galley(pos2(col(r, 0), r.center().y - galley.size().y / 2.0), galley, amber());
+        symbol_painter.galley(pos2(col(r, 0), r.center().y - galley.size().y / 2.0), galley, amber());
         if !crypto_pair {
-            p.text(
+            symbol_painter.text(
                 pos2(col(r, 0) + 74.0, r.center().y),
                 Align2::LEFT_CENTER,
                 sec.class.yellow_key().label(),
@@ -720,34 +753,38 @@ impl TerminalApp {
             let hit = Rect::from_min_max(pos2(name_left, r.top()), pos2(name_left + name_width - dp(6.0), r.bottom()));
             crate::security_names::paint(ui, hit, name.unwrap_or(""), ("watch-name", s));
         }
+        let cell_rect = |k| {
+            Rect::from_min_max(pos2(col(r, k - 1) + dp(3.0), r.top()), pos2(col(r, k), r.bottom()))
+                .intersect(ui.clip_rect())
+        };
         match self.quotes.get(s) {
             Some(q) => {
                 let c = if q.change() >= 0.0 { theme::up() } else { theme::down() };
                 let d = sec.decimals(q.last);
-                p.text(
-                    pos2(col(r, 2), r.center().y),
-                    Align2::RIGHT_CENTER,
-                    format!("{:.d$}", q.last),
-                    mono(12.5),
-                    text(),
-                );
-                p.text(
-                    pos2(col(r, 3), r.center().y),
-                    Align2::RIGHT_CENTER,
-                    markets_view::change_text(&sec, q),
-                    mono(12.5),
-                    c,
-                );
-                p.text(
-                    pos2(col(r, 4), r.center().y),
-                    Align2::RIGHT_CENTER,
-                    format!("{:+.2}%", q.change_pct()),
-                    mono(12.5),
-                    c,
-                );
+                let values = [
+                    (format!("{:.d$}", q.last), text()),
+                    (markets_view::change_text(&sec, q), c),
+                    (format!("{:+.2}%", q.change_pct()), c),
+                ];
+                for (index, (label, color)) in values.iter().take(layout.visible_columns - 1).enumerate() {
+                    let k = index + 2;
+                    p.with_clip_rect(cell_rect(k)).text(
+                        pos2(col(r, k), r.center().y),
+                        Align2::RIGHT_CENTER,
+                        label,
+                        mono(12.5),
+                        *color,
+                    );
+                }
             }
             None => {
-                p.text(pos2(col(r, 4), r.center().y), Align2::RIGHT_CENTER, "…", mono(12.5), muted());
+                p.with_clip_rect(cell_rect(2)).text(
+                    pos2(col(r, 2), r.center().y),
+                    Align2::RIGHT_CENTER,
+                    "…",
+                    mono(12.5),
+                    muted(),
+                );
             }
         }
         for index in 0..extra {
@@ -762,7 +799,7 @@ impl TerminalApp {
                 Some(Cell::Unavailable(reason)) => ("—".into(), muted(), Some(reason.as_str())),
                 None => ("—".into(), muted(), Some("Awaiting history")),
             };
-            p.text(
+            p.with_clip_rect(cell_rect(index + 5)).text(
                 pos2(col(r, index + 5), r.center().y),
                 Align2::RIGHT_CENTER,
                 label,
@@ -1120,6 +1157,13 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_columns_drop_percent_then_change_at_width_boundaries() {
+        for (width, expected) in [(0.0, 2), (100.0, 2), (279.9, 2), (280.0, 3), (359.9, 3), (360.0, 4), (800.0, 4)] {
+            assert_eq!(watch_visible_columns(width), expected, "width {width}");
+        }
+    }
 
     #[test]
     fn switching_watchlists_updates_panel_rows_and_column_snapshot() {

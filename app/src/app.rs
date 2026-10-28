@@ -924,6 +924,10 @@ pub struct TerminalApp {
     themes: Vec<crate::themes::Theme>,
     theme_store: crate::themes::ThemeStore,
     applied_theme: Option<crate::themes::Theme>,
+    /// Missing saved names already reported this session (never repeat on repaint/restore).
+    unknown_themes: std::collections::HashSet<String>,
+    /// A layout's theme name that matched no installed theme; saved back unchanged.
+    unresolved_layout_theme: Option<String>,
     /// Theme selected in the editor.
     editing_theme: String,
     /// Custom themes edited but not yet written (saved once editing pauses).
@@ -1171,6 +1175,8 @@ impl TerminalApp {
             themes,
             theme_store,
             applied_theme: None,
+            unknown_themes: Default::default(),
+            unresolved_layout_theme: None,
             dirty_themes: Vec::new(),
             themes_changed_at: None,
             renaming_theme: None,
@@ -1351,7 +1357,7 @@ impl TerminalApp {
             return;
         }
         self.send_feed_config();
-        if let Err(e) = self.prefs.save(&prefs_path()) {
+        if let Err(e) = self.prefs.save(&self.settings_file.with_file_name("prefs.json")) {
             self.status = format!("Could not save preferences: {e}");
         }
     }
@@ -3537,9 +3543,11 @@ impl TerminalApp {
             settings_file: root.join("settings.json"),
             renaming_layout: None,
             editing_theme: String::new(),
-            themes: Vec::new(),
+            themes: crate::themes::builtins(),
             theme_store: crate::themes::ThemeStore::new(root.join("themes")),
             applied_theme: None,
+            unknown_themes: Default::default(),
+            unresolved_layout_theme: None,
             dirty_themes: Vec::new(),
             themes_changed_at: None,
             renaming_theme: None,

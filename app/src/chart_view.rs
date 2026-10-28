@@ -1,9 +1,6 @@
 //! Chart pane: GPU-rendered price/volume/indicator panes with egui-drawn axes, legend,
 //! crosshair, drawings and congressional trade markers.
 
-#[path = "drawing_toolbar.rs"]
-pub(crate) mod drawing_toolbar;
-
 use std::sync::Arc;
 
 use egui::{
@@ -403,7 +400,7 @@ pub struct ChartState {
     pub indicators_hidden: bool,
     pub positions_orders_hidden: bool,
     pub drawing_toolbar: crate::drawing_toolbar::State,
-    favorites_plot: Rect,
+    pub(crate) favorites_plot: Rect,
     pub show_volume: bool,
     pub show_congress: bool,
     pub indicators: Vec<IndicatorSpec>,
@@ -427,7 +424,7 @@ pub struct ChartState {
     view_revision: u64,
     view_source: Option<Arc<Vec<Bar>>>,
     view_config: (Option<i64>, Option<u64>),
-    replay_cutoff: Option<i64>,
+    pub(crate) replay_cutoff: Option<i64>,
     replay_play: bool,
     replay_speed: usize,
     replay_reanchor: bool,
@@ -1180,7 +1177,11 @@ impl ChartState {
         self.request_compare(w);
     }
 
-    fn toggle_quick_tool(&mut self, tool: Tool) {
+    pub(crate) fn active_drawing_tool(&self) -> Option<Tool> {
+        self.draw.tool
+    }
+
+    pub(crate) fn toggle_quick_tool(&mut self, tool: Tool) {
         if self.draw.tool == Some(tool) {
             self.cancel();
         } else {
@@ -1407,7 +1408,7 @@ impl ChartState {
         }
     }
 
-    fn remember_drawings(&mut self) {
+    pub(crate) fn remember_drawings(&mut self) {
         self.finish_drawing_edit();
         self.drawing_ids.repair(&mut self.drawings);
         self.pending_drawing_edit = Some(self.drawings.clone());
@@ -4854,7 +4855,7 @@ impl ChartState {
         });
     }
 
-    fn tool_shortcut(tool: Tool) -> &'static str {
+    pub(crate) fn tool_shortcut(tool: Tool) -> &'static str {
         match tool {
             Tool::Trendline => "Alt+T",
             Tool::Horizontal => "Alt+H",
@@ -4928,7 +4929,7 @@ impl ChartState {
     }
 
     /// Shared with the favorites layout so every legend line reserves its height.
-    fn legend_bottom(&self, price: Rect, rows: &[crate::chart_legend::Row]) -> f32 {
+    pub(crate) fn legend_bottom(&self, price: Rect, rows: &[crate::chart_legend::Row]) -> f32 {
         let hidden = study_groups(&self.built).iter().filter(|(key, _)| key.is_some()).count() > MAX_SUB_PANES;
         Self::legend_study_bottom(price, rows)
             + 14.

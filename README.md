@@ -99,6 +99,23 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   The Draw menu and command palette also offer `MEASURE` (price, %, bars and elapsed time),
   `RECT` / `ZONE`, directional `RAY`, three-point `CHANNEL` and multiline `NOTE`.
   See [drawing tools and layout compatibility](docs/chart-drawing-tools.md).
+- **Chart agent** (`AGENT`, `NEW AGENT`) — a dockable conversation through your local Codex CLI
+  and ChatGPT account, with chart-reading tools and controlled chart edits. The pane shows tool
+  activity and edit results; chart analysis uses loaded bars, not a screenshot's approximate prices.
+  - **Levels v2** separates major/minor swings, forms support/resistance zones no wider than
+    **0.6 ATR**, reports swing and respected-close touches, and marks `recommended` zones (in-play,
+    nearest major on each side, then score). Trendlines need **at least three touches**; broken
+    lines stay out of active results and are available separately as historical lines.
+  - Drawings made with `analysis_ref` use the analysis's **exact time/price coordinates**, not
+    rounded prices from the reply. Replacement is per kind, symbol and timeframe: new agent zones
+    replace its own zones, not its lines or your drawings. Manual edits transfer ownership to you.
+    Analysis drawing caps are **six zones and two lines per role**; hidden drawings produce a notice
+    rather than silently enabling them. Venue-qualified crypto aliases resolve as the same instrument
+    for analysis references and drawings; distinct instruments remain distinct.
+  - `read_news` and `read_filings` read **local stored data only**, without fetching news, filings
+    or full articles. Headlines and filing metadata are **untrusted data**, never instructions to
+    the agent. News reads cover at most 168 hours / 50 stories; filing reads at most 90 days /
+    50 filings. The News pane's **Copy digest** uses the same deterministic local digest builder.
 - **Options** (`AAPL OMON`, ⌘⇧O) — full chains from Yahoo for US equities, ETFs and indices
   (SPX via ^SPX): every expiration, calls and puts by strike with bid/ask/last, change, volume,
   open interest and IV, plus Black-Scholes greeks (Δ, Γ, Θ/day, vega) from each contract's IV, the
@@ -126,6 +143,22 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
     (saved history, not a forced network refresh) and **Pause updates** for this pane; **new · Show**
     reveals arriving saved items. History is retained for 90 days in `news.sqlite3`; an empty or
     failed fetch does not erase it.
+  - **Copy digest** (in `⋯`) copies a local digest grouped by topic and subject, with timestamps,
+    source counts, tickers, filing metadata and insider totals where available; it downloads no
+    articles. Unusual headline-volume banners compare the **current local hour** with the
+    **14-day same-hour median**, requiring at least **three active days** of stored coverage,
+    five headlines and a robust median/MAD score of at least three. These are local headline counts,
+    not market trading volume; dismissing a banner lasts for that hour.
+  - **Settings › Panels › Alerts** has a feed-notification master switch, sound, per-type switches
+    for watchlist filings, insider purchases/cluster buys, keyword watches, breaking stories
+    (four sources within 60 minutes) and unusual headline volume, plus local **quiet hours**.
+    All types default off; keywords also need **Notify** on that watch. Delivery is **fresh-only**:
+    after the session/type-enable watermark and within two hours, never an initial import or
+    Load once backlog. At most **six desktop notifications per ten minutes**, including overflow
+    summaries; quiet hours retain history without a catch-up burst. The **Alerts › News / Filings**
+    tab keeps local history. The app must be running: filing/insider alerts keep polling watchlist
+    companies **without a Filings pane while the window is visible**; the price-alert daemon does
+    not fetch feeds. Source switches, contact requirements and guard budgets still apply.
   - Finnhub uses **your own key** from Settings › Data sources; its free tier is for **personal,
     non-commercial use**. Without a key, or with Finnhub off, Yahoo news and CoinDesk RSS provide
     fallbacks; non-US/crypto symbol views keep the fallback route even with a key. These are
@@ -182,16 +215,18 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   - Live House ingest uses the **House Clerk** (disclosures-clerk.house.gov: current-year `{year}FD.zip`
     XML index, PTR PDFs parsed with pure-Rust text extraction). Scanned paper filings are detected
     and recorded as such. **Senate trades come via [Bargo](https://www.bargo.ai/free-apis/congress)**,
-    with an optional free key in Settings → Data sources → Senate (Bargo). Keyless mode works with
-    lower budgets. All senate.gov hosts remain permanently denied before transport; Bargo's
+    with an optional free key in **Settings › Data sources › Bargo (Senate)**. Keyless mode is
+    **opt-in**, with lower budgets (see [network safety](#network-safety-senate-via-bargo)). All senate.gov hosts remain permanently denied before transport; Bargo's
     `filing_portal` is never requested, stored or linked. Existing eFD history is retained and deduplicated.
     Party comes only from stored roster history; unknown party/owner are never guessed.
-  - Senate performs one machine-wide daily 60-day transaction-date sweep (to catch late disclosures),
-    plus a first-page 10-day light poll at most every three hours while visible. The initial import is
-    only that bounded sweep, with no backlog alerts. Subsequent tracked-politician alerts require
-    a first-seen disclosure no more than two days old. Free Bargo data covers the last three months,
-    not unlimited history. `/members` adds no party information or state beyond trades, so it is not fetched.
-    Amount labels preserve Bargo's disclosed range. Visible credit: **Senate data: Bargo (bargo.ai)**;
+  - Senate performs a machine-wide daily **60-day transaction-date sweep** to catch late disclosures;
+    the **first successful keyed sweep for each key covers 90 days**. The sweep comes before
+    first-page **seven-day light polls**, at most every **three hours while visible**. The initial
+    import is only that bounded sweep, with no backlog alerts. Subsequent tracked-politician alerts
+    require a first-seen disclosure no more than two days old. Free Bargo data covers the last three
+    months, not unlimited history, and **lags official filings**. `/members` adds no party information
+    or state beyond trades, so it is not fetched. Amount labels preserve Bargo's disclosed range.
+    Visible credit: **[Senate data: Bargo (bargo.ai)](https://www.bargo.ai/free-apis/congress)**;
     Bargo's terms prohibit raw-record redistribution.
   - Normalises politician, party, chamber, state, ticker, buy/sell, amount range, transaction date
     and filed date into SQLite. The live House roster is clerk.house.gov `MemberData.xml`;
@@ -341,6 +376,10 @@ source for other panes.
   selects that backend on macOS). The key goes in a sensitive `X-Finnhub-Token` header, not a
   URL; it is not written into layouts, preferences or logs. A refused test leaves the key saved.
   Finnhub free-tier data is for personal, non-commercial use.
+- **Bargo (Senate):** optional masked key with **Save & Test** and **Remove**, stored in the
+  existing secret store under account `bargo`, never layouts or preferences. With no key, turn
+  on the row's **keyless** mode explicitly; it is off by default. Health testing and key handling
+  are described under [Senate network safety](#network-safety-senate-via-bargo).
 - **SEC contact email:** required before any SEC request. **Save contact** stores it only in
   local `settings.json`, not the secret store or repository; it is sent to the SEC as part of
   the identifying User-Agent. Removing it leaves stored filings readable but stops SEC fetching.
@@ -349,7 +388,7 @@ source for other panes.
 
 ## How terminal-rs talks to the internet
 
-News, SEC and House requests go through **one machine-wide guard**, not one limiter per data
+News, SEC, House and Bargo requests go through **one machine-wide guard**, not one limiter per data
 folder. Its ledger is `~/Library/Application Support/terminal-rs-net/ledger.sqlite3` on macOS,
 `$XDG_DATA_HOME/terminal-rs-net/ledger.sqlite3` elsewhere (fallback
 `~/.local/share/terminal-rs-net/ledger.sqlite3`). `TR_NET_LEDGER` is the explicit override;
@@ -377,8 +416,9 @@ pacing. New company imports are separated by at least a minute; routine sweep tu
 144 s (≤600/day). Lists above 600 companies take multiple days per sweep. All fallback-news selections
 also share a rolling 60/hour limit. These are ceilings, not freshness guarantees.
 
-Automatic news/filings polling stops when the window is hidden/minimised or no corresponding
-pane is visible; it does not require keyboard focus. Already-running work may finish. A test or
+Automatic news/filings polling stops when the window is hidden/minimised; it does not require
+keyboard focus. Normally it also needs a corresponding visible pane, but enabled filing/insider
+notifications keep SEC watchlist monitoring active without a Filings pane. Already-running work may finish. A test or
 throwaway instance with **`TR_DATA_DIR` set is offline for guarded sources unless
 `TR_ALLOW_EXTERNAL=1` exactly**. That opt-in does not bypass limits, switches or cooldowns;
 it is not needed for a normal live launch. This gate is not an all-app network sandbox.
@@ -393,7 +433,7 @@ up to seven days. They persist in the shared ledger; restarting or changing data
 clear them, and there are no requests during a pause.
 
 **Why these constraints:** repeated fresh-data-directory test launches previously caused a
-senate.gov block on the author's network. Live Senate refresh is removed, and the guard denies
+senate.gov block on the author's network. Direct senate.gov refresh is removed, and the guard denies
 all senate.gov hosts and redirect targets regardless of switches. Parsers, fixtures and stored
 Senate trades remain usable; live Senate data now comes from Bargo. House disclosures and
 the roster use the guard above. **`TR_CONGRESS_REFRESH_MIN` defaults to 30 minutes; positive
@@ -405,19 +445,23 @@ never guard rules. See [guard details](docs/analysis/net-guard.md).
 
 Bargo uses the same machine-wide SQLite guard ledger as House/news/SEC, outside `TR_DATA_DIR`.
 Its `www.bargo.ai` policy allows one in-flight request, at least **30 seconds** between sends,
-no more than **2/minute**, and at most **40 HTTP attempts/day with a key or 10/day keyless**.
-These ceilings include health tests, failed sends and redirect hops. Row reservations additionally
-bound trade responses to **1,000 rows/day keyed or 100/day keyless**, even without quota headers;
-short valid pages refund unused reservations. Reported request/row balances and timestamps persist
-across instances. Runs stop below 5 requests remaining, or below 200 rows keyed / 20 keyless;
-requests also require enough allowance for the entire requested page. A small remaining allowance
-can shorten a light-poll page; sweep page sizes remain 250 keyed / 100 keyless.
+no more than **2/minute**, and at most **40 HTTP attempts / 900 trade rows per UTC day keyed**
+or **10 attempts / 90 rows keyless**. Request ceilings include health tests, failed sends and
+redirect hops; `/health` uses no rows. Row reservations enforce the allowance even without quota
+headers; short valid pages refund unused reservations. Counters and sweep slots are machine-wide
+per key fingerprint (keyless has its own bucket); pacing and cooldowns remain shared.
+Reported request/row balances and timestamps persist across instances. When today's quota headers
+are available, sends stop at **10 requests remaining keyed / 3 keyless**, and trade requests reserve
+**100 remaining rows keyed / 10 keyless** as headroom. Every page must fit the resulting allowance.
+Sweep pages start at up to 250 keyed / 100 keyless, shrinking the first page to fit and keeping that
+width throughout pagination. Light polls request one page of 100 keyed / 50 keyless and defer if
+it cannot fit. A deferred sweep is not marked complete; bounded retries precede light polls.
 
 401 (key error), 403, 429, 5xx and HTML challenge pages pause the source without retries. A 429
 pauses until at least the next UTC midnight, also respecting the guard's escalating cooldown and
 `Retry-After`. Senate's original blocked-site explanation appears only when Bargo is off. The
-optional key is stored under secret-store account `bargo` and sent **only in a sensitive X-Api-Key
-header**, never a URL. Save & Test sends one guarded `/health` request (health checks availability,
+key is sent **only in a sensitive X-Api-Key header**, never a URL (storage is described in
+[Data sources](#data-sources-and-privacy)). Save & Test sends one guarded `/health` request (health checks availability,
 not key validity). No application launch or real-host request is needed for tests: the supplied
 Bargo fixtures and 127.0.0.1 fakes cover ingest, pacing, budgets, pauses and attribution.
 
@@ -695,6 +739,6 @@ cargo bench -p tr-core && cargo bench -p tr-chart
   Market-wide scans are only offered with a bulk-capable source (Questrade today).
 - Scanner universes approximate `[type = stock] and [country = us]` by listing venue: US-listed
   common stocks, ADRs excluded by name. Foreign companies with ordinary US listings stay in.
-- Live Senate access is disabled; the terminal does not contact eFD or accept its agreement.
+- The terminal does not contact senate.gov/eFD or accept its agreement; live Senate data comes from Bargo (optional key).
   Historical Senate data remains subject to the source's use restrictions. Finnhub free-tier
   news is for personal, non-commercial use.
