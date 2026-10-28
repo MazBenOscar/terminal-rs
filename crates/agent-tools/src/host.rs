@@ -103,6 +103,8 @@ pub mod edits {
         "pin_changed",
         "turn_object_limit",
         "chart_object_limit",
+        "analysis_mismatch",
+        "analysis_drawing_limit",
         "data_loading_timeout",
         "provider_error",
     ];
@@ -174,6 +176,7 @@ pub mod edits {
         known: HashMap<String, HashSet<u64>>,
         created: HashMap<String, usize>,
         study_ids: HashMap<u64, HashSet<u32>>,
+        analysis_created: HashMap<(String, &'static str), usize>,
     }
 
     impl Session {
@@ -250,6 +253,14 @@ pub mod edits {
             self.observe(chart);
             match args {
                 LiveArgs::CreateDrawing(a) => {
+                    if a.analysis_ref.is_some()
+                        && tr_data::security(&a.symbol).key() != tr_data::security(chart.symbol).key()
+                    {
+                        return Err(error(
+                            "analysis_mismatch",
+                            "Analysis symbol differs from the current chart; re-run analyze for this chart",
+                        ));
+                    }
                     check_symbol(chart, &a.symbol)?;
                     let tool = match a.kind {
                         args::DrawingKind::Horizontal => Tool::Horizontal,
@@ -265,7 +276,6 @@ pub mod edits {
                             "zone_role requires kind=rectangle; omit zone_role for lines or text",
                         ));
                     }
-                    let points = drawing_anchors(chart, &a.anchors, tool, a.analysis_ref.is_some())?;
                     let source_timeframe = a
                         .source_timeframe
                         .as_deref()
@@ -275,6 +285,31 @@ pub mod edits {
                             error("invalid_args", "source_timeframe must be a supported Timeframe (e.g. 1W, 4H)")
                         })?
                         .unwrap_or(chart.timeframe);
+                    if a.analysis_ref.is_some() && source_timeframe != chart.timeframe {
+                        return Err(error(
+                            "analysis_mismatch",
+                            "Analysis timeframe differs from the current chart; re-run analyze on the current timeframe",
+                        ));
+                    }
+                    let points = drawing_anchors(chart, &a.anchors, tool, a.analysis_ref.is_some())?;
+                    let analysis_kind = if a.zone_role.is_some() {
+                        "zones"
+                    } else if points.last().unwrap().price > points[0].price {
+                        "rising_support"
+                    } else {
+                        "falling_resistance"
+                    };
+                    if a.analysis_ref.is_some() {
+                        let limit = if analysis_kind == "zones" { 6 } else { 2 };
+                        if self.analysis_created.get(&(turn.into(), analysis_kind)).copied().unwrap_or_default()
+                            >= limit
+                        {
+                            return Err(error(
+                                "analysis_drawing_limit",
+                                "This turn has enough analysis drawings (6 zones and 2 lines per role maximum); please summarize the drawings already added",
+                            ));
+                        }
+                    }
                     let mut drawing = Drawing::new(tool, points[0], *points.last().unwrap());
                     drawing.symbol = Some(chart.symbol.into());
                     drawing.all_symbols = a.all_symbols;
@@ -300,17 +335,23 @@ pub mod edits {
                                 && d.turn_id.as_deref() != Some(turn)
                                 && d.symbol.as_deref() == Some(chart.symbol)
                                 && d.source_timeframe == Some(source_timeframe)
-                                && (d.zone_role.is_some()
-                                    || d.technical_analysis
-                                    || (matches!(d.tool, Tool::Ray | Tool::Trendline)
-                                        && ["support", "resistance", "trend"]
-                                            .iter()
-                                            .any(|word| d.text.to_ascii_lowercase().contains(word)))))
+                                && if tool == Tool::Rectangle {
+                                    d.tool == Tool::Rectangle && (d.zone_role.is_some() || d.technical_analysis)
+                                } else {
+                                    matches!(d.tool, Tool::Ray | Tool::Trendline)
+                                        && (d.technical_analysis
+                                            || ["support", "resistance", "trend"]
+                                                .iter()
+                                                .any(|word| d.text.to_ascii_lowercase().contains(word)))
+                                })
                         });
                     }
                     self.can_create(&Chart { drawings: &next, ..*chart }, turn)?;
                     next.push(drawing);
                     self.own(chart.uid, format!("drawing:{id}"), turn);
+                    if a.analysis_ref.is_some() {
+                        *self.analysis_created.entry((turn.into(), analysis_kind)).or_default() += 1;
+                    }
                     Ok(Plan::Drawings(next, id))
                 }
                 LiveArgs::UpdateDrawing(a) => {
@@ -694,7 +735,7 @@ mod tests {
             panic!()
         };
         assert!(!next.iter().any(|d| d.id == old.id));
-        assert_eq!(next.len(), 4, "prior labeled rays are replaced even at the 100-object limit");
+        assert_eq!(next.len(), 100, "zone replacement must retain prior trendlines, even at the object limit");
         for d in [kept, h4, other] {
             assert!(next.contains(&d));
         }
@@ -705,6 +746,68 @@ mod tests {
             panic!()
         };
         assert!(next2.iter().any(|d| d.id == id), "same-turn drawings must not replace one another");
+        let mut line = zone_args("rising support");
+        line.kind = args::DrawingKind::Ray;
+        line.zone_role = None;
+        line.analysis_ref = Some(args::AnalysisRef { analysis_id: "test".into(), item_id: "line-0".into() });
+        let Plan::Drawings(next3, _) =
+            session.plan(&Chart { drawings: &next2, ..chart }, "lines", LiveArgs::CreateDrawing(line)).unwrap()
+        else {
+            panic!()
+        };
+        assert!(next3.iter().any(|d| d.id == id), "line replacement preserves prior zones");
+        assert_eq!(next3.iter().filter(|d| d.tool == Tool::Ray).count(), 1, "legacy lines are replaced by lines only");
+    }
+
+    #[test]
+    fn analysis_refs_enforce_current_chart_and_per_turn_caps() {
+        let bars = [Bar::new(86400, 10., 12., 8., 11., 1.), Bar::new(172800, 10., 12., 8., 11., 1.)];
+        let chart = Chart {
+            uid: 1,
+            symbol: "AAA US Equity",
+            timeframe: Timeframe::D1,
+            price_decimals: 2,
+            bars: &bars,
+            drawings: &[],
+            indicators: &[],
+            comparisons: &[],
+        };
+        let mut session = Session::default();
+        let mut zone = zone_args("support");
+        zone.analysis_ref = Some(args::AnalysisRef { analysis_id: "cached".into(), item_id: "zone-0".into() });
+        zone.source_timeframe = Some("4H".into());
+        let error = session.plan(&chart, "turn", LiveArgs::CreateDrawing(zone.clone())).err().unwrap();
+        assert!(format!("{error:?}").contains("re-run analyze"));
+        zone.source_timeframe = Some("1D".into());
+        zone.symbol = "BBB".into();
+        let error = session.plan(&chart, "turn", LiveArgs::CreateDrawing(zone.clone())).err().unwrap();
+        assert!(format!("{error:?}").contains("re-run analyze"));
+        zone.symbol = "AAA".into();
+        let mut drawings = vec![];
+        for _ in 0..6 {
+            let Plan::Drawings(next, _) = session
+                .plan(&Chart { drawings: &drawings, ..chart }, "turn", LiveArgs::CreateDrawing(zone.clone()))
+                .unwrap()
+            else {
+                panic!()
+            };
+            drawings = next;
+        }
+        assert!(session.plan(&chart, "turn", LiveArgs::CreateDrawing(zone.clone())).is_err());
+        for rising in [true, false] {
+            let mut line = zone.clone();
+            line.kind = args::DrawingKind::Ray;
+            line.zone_role = None;
+            if !rising {
+                line.anchors[0].price = 12.;
+                line.anchors[1].price = 8.;
+            }
+            for _ in 0..2 {
+                assert!(session.plan(&chart, "turn", LiveArgs::CreateDrawing(line.clone())).is_ok());
+            }
+            assert!(session.plan(&chart, "turn", LiveArgs::CreateDrawing(line)).is_err());
+        }
+        assert!(session.plan(&chart, "next", LiveArgs::CreateDrawing(zone)).is_ok());
     }
 
     #[test]

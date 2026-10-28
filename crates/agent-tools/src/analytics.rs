@@ -32,7 +32,7 @@ pub mod precision {
             .enumerate()
             .map(|(i, &v)| {
                 let fallback = mean(&ranges[i.saturating_sub(13)..=i]);
-                (if v.is_finite() { v } else { fallback }).max(bars[i].close.abs() * 1e-8).max(1e-8)
+                (if v.is_finite() { v } else { fallback }).max(bars[i].close.abs() * 1e-12)
             })
             .collect()
     }
@@ -43,7 +43,9 @@ pub mod precision {
         if bars.is_empty() {
             return vec![];
         }
-        let o = Ohlcv::new(bars);
+        // The final candle is still forming and cannot confirm a swing.
+        let confirmed = &bars[..bars.len() - 1];
+        let o = Ohlcv::new(confirmed);
         let atr = atrs(bars);
         let (highs, lows) = indicators::fractals(&o, 2);
         let (major_highs, major_lows) = indicators::fractals(&o, 5);
@@ -53,12 +55,12 @@ pub mod precision {
         {
             for (i, &price) in values.iter().enumerate().filter(|(_, p)| p.is_finite()) {
                 let left = (0..i).rev().find(|&j| opposite[j].is_finite());
-                let right = (i + 1..bars.len()).find(|&j| opposite[j].is_finite());
+                let right = (i + 1..confirmed.len()).find(|&j| opposite[j].is_finite());
                 let prominence = left
                     .zip(right)
                     .map_or(0., |(l, r)| (price - opposite[l]).abs().min((price - opposite[r]).abs()) / atr[i]);
                 let is_major = major[i].is_finite() && prominence >= 1.5;
-                let confirmation = if is_major { (i + 5).max(right.unwrap()) } else { i + 2 };
+                let confirmation = if is_major { (i + 5).max(right.unwrap() + 2) } else { i + 2 };
                 out.push(Swing {
                     index: i,
                     time: bars[i].ts,
@@ -94,15 +96,16 @@ pub mod precision {
         pub in_play: bool,
         pub trimmed: bool,
         pub score: f64,
+        pub recommended: bool,
     }
 
-    fn role(low: f64, high: f64, close: f64) -> &'static str {
-        if low > close {
-            "resistance"
-        } else if high < close {
-            "support"
-        } else {
+    fn role(low: f64, high: f64, close: f64, atr: f64) -> &'static str {
+        if close - low >= 0.1 * atr && high - close >= 0.1 * atr {
             "in_play"
+        } else if close < (low + high) / 2. {
+            "resistance"
+        } else {
+            "support"
         }
     }
 
@@ -156,9 +159,13 @@ pub mod precision {
             let body = bodies[bodies.len() / 2].clamp(median - tolerance, median + tolerance);
             let low = prices[(prices.len() - 1) / 4].min(body) - tolerance / 2.;
             let high = prices[(prices.len() - 1) * 3 / 4].max(body) + tolerance / 2.;
-            let width = (high - low).min(cap);
-            let center = ((low + high) / 2.).clamp(median - cap / 2., median + cap / 2.);
-            (center - width / 2., center + width / 2.)
+            if high - low <= cap {
+                (low, high)
+            } else {
+                // Trim to the densest observed swing window, with median tie-breaking.
+                let (l, h, _) = capped_zone_bounds(&prices, median, tolerance / 2., cap);
+                (l, h)
+            }
         };
         // Merge overlapping rectangles before counting/ranking; recompute bounds
         // from all touch intervals, rather than inflating with repeated padding.
@@ -177,20 +184,8 @@ pub mod precision {
                 let low = groups[i].1.min(next.1);
                 let high = groups[i].2.max(next.2);
                 groups[i].0.extend(next.0);
-                let (mut l, mut h) = if high - low <= cap { (low, high) } else { bounds(&groups[i].0) };
-                // Merging must not erase an actually touched in-play range.
-                // Trim away from the last close first, never move a containing
-                // zone to one side of it just because older swings outnumber it.
-                if low <= close && close <= high {
-                    if l > close {
-                        l = close;
-                        h = (l + cap).min(high);
-                    }
-                    if h < close {
-                        h = close;
-                        l = (h - cap).max(low);
-                    }
-                }
+                // Bounds depend only on observed reactions, never the last close.
+                let (l, h) = if high - low <= cap { (low, high) } else { bounds(&groups[i].0) };
                 groups[i].1 = l;
                 groups[i].2 = h;
                 i = i.saturating_sub(1);
@@ -235,9 +230,10 @@ pub mod precision {
             let prominence = g.iter().map(|s| s.prominence).fold(0., f64::max);
             let major = g.iter().any(|s| s.strength == "major");
             let volume = mean(&indices.iter().map(|&i| bars[i].volume).collect::<Vec<_>>()) / avg_volume;
-            let side = role(low, high, close);
+            let side = role(low, high, close, last_atr);
             zones.push(Zone {
                 item_id: String::new(),
+                recommended: false,
                 price: (low + high) / 2.,
                 zone_width: high - low,
                 low,
@@ -295,6 +291,27 @@ pub mod precision {
                 }
             }
         }
+        // Recommend exactly the host's six-zone allowance: in-play, nearest
+        // major on each side, then highest score among the remaining candidates.
+        let mut recommended: Vec<usize> = selected.iter().copied().filter(|&i| zones[i].in_play).collect();
+        for side in ["support", "resistance"] {
+            if let Some(&i) = selected.iter().find(|&&i| zones[i].role == side && zones[i].strength == "major") {
+                recommended.push(i);
+            }
+        }
+        let mut by_score = selected.clone();
+        by_score.sort_by(|&a, &b| zones[b].score.total_cmp(&zones[a].score).then(a.cmp(&b)));
+        for i in by_score {
+            if recommended.len() >= 6 {
+                break;
+            }
+            if !recommended.contains(&i) {
+                recommended.push(i);
+            }
+        }
+        for i in recommended {
+            zones[i].recommended = true;
+        }
         selected.sort_unstable();
         selected
             .into_iter()
@@ -319,10 +336,11 @@ pub mod precision {
         pub kind: &'static str,
         pub score: f64,
         pub closes_beyond: usize,
+        pub post_touch_closes_beyond: usize,
     }
 
-    fn line_price(a: &Swing, b: &Swing, ts: i64) -> f64 {
-        a.price + (b.price - a.price) * (ts - a.time) as f64 / (b.time - a.time) as f64
+    fn line_price(a: &Swing, b: &Swing, index: usize) -> f64 {
+        a.price + (b.price - a.price) * (index as f64 - a.index as f64) / (b.index as f64 - a.index as f64)
     }
     fn beyond(close: f64, line: f64, tolerance: f64, support: bool) -> bool {
         if support { close < line - tolerance } else { close > line + tolerance }
@@ -340,7 +358,7 @@ pub mod precision {
         }
         let touches: Vec<_> = points
             .iter()
-            .filter(|p| (p.price - line_price(a, b, p.time)).abs() <= 0.35 * atr[p.index])
+            .filter(|p| (p.price - line_price(a, b, p.index)).abs() <= 0.35 * atr[p.index])
             .cloned()
             .collect();
         if touches.len() < 3 {
@@ -353,25 +371,28 @@ pub mod precision {
         }
         // Re-anchor on the extreme exact swing points and revalidate ALL claimed
         // touches and closes against that final, drawn line (not the candidate).
-        if touches.iter().any(|p| (p.price - line_price(first, last, p.time)).abs() > 0.35 * atr[p.index]) {
+        if touches.iter().any(|p| (p.price - line_price(first, last, p.index)).abs() > 0.35 * atr[p.index]) {
             return None;
         }
         if (support && last.price <= first.price) || (!support && last.price >= first.price) {
             return None;
         }
         let closes_beyond = (first.index..=last.index)
-            .filter(|&i| beyond(bars[i].close, line_price(first, last, bars[i].ts), 0., support))
+            .filter(|&i| beyond(bars[i].close, line_price(first, last, i), 0., support))
             .count();
         if closes_beyond > 2 {
             return None;
         }
         let end = bars.last().unwrap();
-        let projected_price = line_price(first, last, end.ts);
-        let step = bars.windows(2).last().map_or(1, |w| w[1].ts - w[0].ts);
+        let projected_price = line_price(first, last, bars.len() - 1);
+        let post_touch_closes_beyond = (last.index + 1..bars.len())
+            .filter(|&i| beyond(bars[i].close, line_price(first, last, i), 0.35 * atr[i], support))
+            .count();
         let residual =
-            touches.iter().map(|p| (p.price - line_price(first, last, p.time)).abs() / atr[p.index]).sum::<f64>()
+            touches.iter().map(|p| (p.price - line_price(first, last, p.index)).abs() / atr[p.index]).sum::<f64>()
                 / touches.len() as f64;
-        let broken = beyond(end.close, projected_price, 0.35 * atr[bars.len() - 1], support);
+        let broken =
+            post_touch_closes_beyond > 1 || beyond(end.close, projected_price, 0.35 * atr[bars.len() - 1], support);
         // A 20%-of-window half-life makes old touched lines fade continuously.
         // Broken lines remain auditable but rank below comparable active lines.
         let recency = 2_f64.powf(-((bars.len() - 1 - last.index) as f64) / (bars.len() as f64 * 0.2));
@@ -383,17 +404,23 @@ pub mod precision {
             role: if support { "rising_support" } else { "falling_resistance" },
             anchors: vec![first.clone(), last.clone()],
             projected_price,
-            projected_price_plus_10: line_price(first, last, end.ts + 10 * step),
+            projected_price_plus_10: line_price(first, last, bars.len() - 1 + 10),
             broken,
-            kind: if touches.len() >= 4 { "solid" } else { "dashed" },
+            kind: if !broken && touches.len() >= 4 { "solid" } else { "dashed" },
             score,
             touches,
             closes_beyond,
+            post_touch_closes_beyond,
         })
     }
     pub fn trendlines(bars: &[Bar]) -> Vec<Trendline> {
+        trendline_sets(bars).0
+    }
+
+    /// Historical lines are auditable but never mixed into the active list.
+    pub fn trendline_sets(bars: &[Bar]) -> (Vec<Trendline>, Vec<Trendline>) {
         if bars.is_empty() {
-            return vec![];
+            return (vec![], vec![]);
         }
         let atr = atrs(bars);
         let swings = swings(bars);
@@ -416,23 +443,31 @@ pub mod precision {
             });
             let mut selected: Vec<Trendline> = Vec::new();
             for line in candidates {
-                if selected
-                    .iter()
-                    .any(|s| s.anchors[0].index == line.anchors[0].index && s.anchors[1].index == line.anchors[1].index)
-                {
+                let slope = |l: &Trendline| {
+                    (l.anchors[1].price - l.anchors[0].price) / (l.anchors[1].index - l.anchors[0].index) as f64
+                };
+                if selected.iter().any(|s| {
+                    let shared = s.touches.iter().filter(|t| line.touches.iter().any(|u| t.index == u.index)).count();
+                    shared >= 2
+                        || ((s.projected_price - line.projected_price).abs() < 0.5 * atr[bars.len() - 1]
+                            && (slope(s) - slope(&line)).abs() * 10. < 0.5 * atr[bars.len() - 1])
+                }) {
                     continue;
                 }
-                selected.push(line);
-                if selected.len() == 2 {
-                    break;
+                if selected.iter().filter(|s| s.broken == line.broken).count() < 2 {
+                    selected.push(line);
                 }
             }
             out.extend(selected);
         }
-        for (i, line) in out.iter_mut().enumerate() {
+        let (mut active, mut historical): (Vec<_>, Vec<_>) = out.into_iter().partition(|l| !l.broken);
+        for (i, line) in active.iter_mut().enumerate() {
             line.item_id = format!("line-{i}");
         }
-        out
+        for (i, line) in historical.iter_mut().enumerate() {
+            line.item_id = format!("historical-line-{i}");
+        }
+        (active, historical)
     }
 
     #[cfg(test)]
@@ -492,6 +527,72 @@ pub mod precision {
             assert!(validate_line(&bars, &atr, &stale, &stale[0], &stale[2], true).is_none());
         }
         #[test]
+        fn post_touch_breaks_survive_recovery_and_one_breach_is_allowed() {
+            let (mut bars, points) = rising();
+            let atr = vec![10.; bars.len()];
+            bars[46].close = 100.;
+            let validate = |bars: &[Bar]| validate_line(bars, &atr, &points, &points[0], &points[3], true).unwrap();
+            assert!(!validate(&bars).broken, "one tolerated historical breach, last close recovered");
+            bars[47].close = 100.;
+            let line = validate(&bars);
+            assert!(line.broken, "two breaches break even after recovery");
+            assert_eq!(line.post_touch_closes_beyond, 2);
+            assert_eq!(line.kind, "dashed");
+            bars[46].close = 150.;
+            bars[47].close = 150.;
+            bars[49].close = 100.;
+            assert!(validate(&bars).broken, "a final-close breach always breaks");
+            bars[49].close = 149. - 3.49;
+            assert!(!validate(&bars).broken, "0.35 ATR is the breach tolerance");
+        }
+
+        #[test]
+        fn plateaus_and_opposite_confirmation_exclude_the_forming_bar() {
+            let bars: Vec<_> = [10., 11., 15., 15., 11., 10., 9., 10.]
+                .into_iter()
+                .enumerate()
+                .map(|(i, p)| Bar::new(i as i64, p, p + 1., p - 1., p, 1.))
+                .collect();
+            let points = swings(&bars);
+            assert!(points.iter().any(|s| s.role == "high" && s.index == 2));
+            assert!(!points.iter().any(|s| s.index == 3));
+            assert!(!points.iter().any(|s| s.index + 2 >= bars.len() - 1));
+            let bars = super::super::tests::btc_fixture();
+            let points = swings(&bars);
+            for s in points.iter().filter(|s| s.strength == "major") {
+                let opposite = points.iter().find(|o| o.index > s.index && o.role != s.role).unwrap();
+                assert!(s.confirmed_at >= bars[opposite.index + 2].ts);
+                assert!(s.confirmed_at < bars.last().unwrap().ts);
+            }
+        }
+
+        #[test]
+        fn recommendations_reserve_in_play_and_nearest_majors_then_score() {
+            let bars = super::super::tests::btc_fixture();
+            let zones = levels(&bars);
+            assert_eq!(zones.iter().filter(|z| z.recommended).count(), 6);
+            for side in ["support", "resistance"] {
+                assert!(zones.iter().find(|z| z.role == side && z.strength == "major").unwrap().recommended);
+            }
+            assert_eq!(role(99., 101., 100., 2.), "in_play");
+            assert_eq!(role(99., 101., 99.1, 2.), "resistance");
+            assert_eq!(role(99., 101., 100.9, 2.), "support");
+            assert!(zones.iter().filter(|z| z.in_play).all(|z| z.recommended));
+            let reserved = |z: &Zone| {
+                z.in_play
+                    || ["support", "resistance"].iter().any(|&side| {
+                        zones
+                            .iter()
+                            .find(|z| z.role == side && z.strength == "major")
+                            .is_some_and(|r| r.item_id == z.item_id)
+                    })
+            };
+            for z in zones.iter().filter(|z| z.recommended && !reserved(z)) {
+                assert!(zones.iter().filter(|z| !z.recommended).all(|other| other.score <= z.score));
+            }
+        }
+
+        #[test]
         fn clusters_are_scaled_capped_deduplicated_and_count_distinct_bars() {
             let bars = tr_core::sample::generate("PRECISION", Timeframe::D1, 400, 1_700_000_000);
             let zones = levels(&bars);
@@ -501,7 +602,7 @@ pub mod precision {
                 assert!(z.low < z.high && z.high - z.low <= 0.6 * atr.last().unwrap() + 1e-9);
                 assert_eq!(z.touches, z.swing_touches + z.respected_closes);
                 assert!(z.first_touch_ts <= z.last_touch_ts);
-                assert_eq!(z.role, role(z.low, z.high, bars.last().unwrap().close));
+                assert_eq!(z.role, role(z.low, z.high, bars.last().unwrap().close, *atr.last().unwrap()));
             }
             for (i, z) in zones.iter().enumerate() {
                 for other in &zones[i + 1..] {
@@ -795,8 +896,8 @@ pub(crate) fn analyze(
         }
         Mode::Trend => trend(bars, &o)?,
         Mode::Trendlines => {
-            let lines = precision::trendlines(bars);
-            for line in &lines {
+            let (lines, historical) = precision::trendline_sets(bars);
+            for line in lines.iter().chain(&historical) {
                 for number in [line.projected_price, line.projected_price_plus_10, line.score] {
                     finite(number, "trendlines")?;
                 }
@@ -804,7 +905,7 @@ pub(crate) fn analyze(
                     finite(touch.prominence, "trendlines.touches.prominence")?;
                 }
             }
-            json!({"trendlines":lines})
+            json!({"trendlines":lines,"historical":historical})
         }
         Mode::Levels => {
             let session_key = |ts| {
@@ -938,8 +1039,11 @@ mod tests {
     use super::*;
 
     pub(super) fn btc_fixture() -> Vec<Bar> {
-        include_str!("../tests/fixtures/btcusd_coinbase_1D.csv")
-            .lines()
+        parse_fixture(include_str!("../tests/fixtures/btcusd_coinbase_1D.csv"))
+    }
+
+    fn parse_fixture(csv: &str) -> Vec<Bar> {
+        csv.lines()
             .skip(1)
             .filter(|l| !l.is_empty())
             .map(|l| {
@@ -956,6 +1060,67 @@ mod tests {
             .collect()
     }
 
+    fn print_fixture_tables(tf: &str, bars: &[Bar]) {
+        let date = |ts| chrono::DateTime::from_timestamp(ts, 0).unwrap().format("%Y-%m-%d %H:%M").to_string();
+        println!(
+            "FIXTURE {tf} bars={} last={} close={:.2}",
+            bars.len(),
+            date(bars.last().unwrap().ts),
+            bars.last().unwrap().close
+        );
+        for z in precision::levels(bars) {
+            println!(
+                "FIXTURE_ZONE | {tf} | {} | {} / {} | {:.2}–{:.2} | {}+{}={} | {:.4} | {} | {} |",
+                z.item_id,
+                z.role,
+                z.strength,
+                z.low,
+                z.high,
+                z.swing_touches,
+                z.respected_closes,
+                z.touches,
+                z.score,
+                z.trimmed,
+                z.recommended
+            );
+        }
+        let (active, historical) = precision::trendline_sets(bars);
+        for (state, lines) in [("active", active), ("historical", historical)] {
+            for l in lines {
+                println!(
+                    "FIXTURE_LINE | {tf} | {state} | {} | {} | {} {:.2} → {} {:.2} | {} / {} | {:.2} | {:.2} | {} |",
+                    l.item_id,
+                    l.role,
+                    date(l.anchors[0].time),
+                    l.anchors[0].price,
+                    date(l.anchors[1].time),
+                    l.anchors[1].price,
+                    l.touches.len(),
+                    l.kind,
+                    l.projected_price,
+                    l.projected_price_plus_10,
+                    l.post_touch_closes_beyond
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn precision_h4_fixture_report() {
+        let all = parse_fixture(include_str!("../tests/fixtures/btcusd_coinbase_4H.csv"));
+        let bars = &all[all.len().saturating_sub(1000)..];
+        print_fixture_tables("4H", bars);
+        let zones = precision::levels(bars);
+        assert_eq!(zones.iter().filter(|z| z.recommended).count(), zones.len().min(6));
+        let atr = *indicators::atr(&Ohlcv::new(bars), 14).last().unwrap();
+        let close = bars.last().unwrap().close;
+        let in_play = zones.iter().find(|z| z.in_play).unwrap();
+        assert!(in_play.recommended && close - in_play.low >= 0.1 * atr && in_play.high - close >= 0.1 * atr);
+        let value = analyze(bars, Timeframe::H4, Session::Provider, Mode::Trendlines, 10).unwrap();
+        assert!(value["trendlines"].as_array().unwrap().iter().all(|l| l["broken"] == false));
+        assert!(value["historical"].as_array().unwrap().iter().all(|l| l["broken"] == true));
+    }
+
     #[test]
     fn precision_btc_fixture_report_and_reference_comparison() {
         let bars = btc_fixture();
@@ -969,8 +1134,7 @@ mod tests {
             bars[0].ts,
             bars.last().unwrap().ts
         );
-        println!("ZONES {}", serde_json::to_string_pretty(&zones).unwrap());
-        println!("LINES {}", serde_json::to_string_pretty(&lines).unwrap());
+        print_fixture_tables("D1", &bars);
         let date = |ts| chrono::DateTime::from_timestamp(ts, 0).unwrap().format("%Y-%m-%d").to_string();
         for z in &zones {
             println!(
@@ -1009,7 +1173,9 @@ mod tests {
         for (low, high, side, major) in [
             (84450., 85250., "resistance", true),
             (82150., 82900., "resistance", false),
-            (80000., 80900., "in_play", false),
+            // Touch-derived capped bounds are below the close, not an in-play
+            // band fabricated by pinning its high edge to the current price.
+            (80000., 80900., "support", false),
             (76400., 77150., "support", true),
         ] {
             assert!(
@@ -1151,3 +1317,7 @@ mod tests {
         assert_eq!(lttb(&bars[..1], 300).len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "review_a3e_tests.rs"]
+mod review_a3e_tests;

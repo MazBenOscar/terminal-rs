@@ -183,7 +183,12 @@ mod answer_instruction_tests {
             "zone_role to support (theme up role) or resistance (theme down role)",
             "low-alpha fill",
             "source_timeframe as the analyze/read_data timeframe (the current chart timeframe unless explicitly requested otherwise)",
-            "broken=true lines as historical/broken",
+            "separate historical list contains broken=true lines",
+            "recommended=true",
+            "Use only the active trendlines list by default",
+            "labelled (broken) and dashed",
+            "Replacement is per kind",
+            "User-edited agent drawings are user-owned",
             "in_play zone(s) plus the nearest zone on each side at minimum",
             "Say in text which zone price is in",
             "one short clarifying question with 3-5 concrete options",
@@ -927,7 +932,7 @@ fn session_instructions(options: &BridgeOptions, registry: &Registry) -> String 
     let edits_enabled = registry.schemas().iter().any(|tool| tool.name == "create_drawing");
     let mode_instructions = if edits_enabled {
         concat!(
-            "For support/resistance or trendline requests, first read_chart and read_data on the chart's CURRENT timeframe. Never reuse another timeframe's zones unless the user explicitly asks. Run analyze levels version=2 AND analyze trendlines on that same history/timeframe. For zones draw labeled rectangles, not single lines: returned low and high bounds, first_touch_ts to last bar, extend_right=true. Always use analysis_ref {analysis_id,item_id}; the host fills exact coordinates, kind, labels and style. Avoid the 'coordinates not from analysis' warning; never estimate anchors. Draw at most 6 zones, reserving nearest MAJOR each side and in-play, then strongest others. Draw at most 2 rising support and 2 falling resistance rays using returned anchors, solid/dashed from kind. Treat broken=true lines as historical/broken, never as active support or resistance. The host replaces the agent's own prior S/R drawings for the same symbol/timeframe, undoably, without removing user drawings. Reply with drawn level ranges and touch counts. If tool results report drawings_hidden=true or chart_visible=false, explicitly say drawings were added but are not visible and direct the user to Show drawings; never say 'Already drawn' without this disclosure. ",
+            "For support/resistance or trendline requests, first read_chart and read_data on the chart's CURRENT timeframe. Never reuse another timeframe's zones unless the user explicitly asks. Run analyze levels version=2 AND analyze trendlines on that same history/timeframe. For zones draw labeled rectangles, not single lines: returned low and high bounds, first_touch_ts to last bar, extend_right=true. Always use analysis_ref {analysis_id,item_id}; the host fills exact coordinates, kind, labels and style. Avoid the 'coordinates not from analysis' warning; never estimate anchors. Draw at most 6 zones: use those marked recommended=true (in-play, nearest MAJOR each side, then highest scores). Draw at most 2 rising support and 2 falling resistance rays using returned anchors, solid/dashed from kind. Use only the active trendlines list by default. The separate historical list contains broken=true lines: draw these only on explicit user request, labelled (broken) and dashed, never as active support or resistance. The host enforces per-turn caps and rejects references from another symbol/timeframe: re-run analyze on the current chart after a mismatch. Replacement is per kind (lines replace lines, zones replace zones) for the same symbol/timeframe, undoably. User-edited agent drawings are user-owned and never replaced. Reply with drawn level ranges and touch counts. If tool results report drawings_hidden=true or chart_visible=false, explicitly say drawings were added but are not visible and direct the user to Show drawings; never say 'Already drawn' without this disclosure. ",
             "Set zone_role to support (theme up role) or resistance (theme down role); rectangles use the existing low-alpha fill. Pass source_timeframe as the analyze/read_data timeframe (the current chart timeframe unless explicitly requested otherwise); labels use that source timeframe in compact form (W1, D1, H4, H1, M15). Draw the in_play zone(s) plus the nearest zone on each side at minimum when available. Say in text which zone price is in, or that it is between zones.",
             "If the request is ambiguous about symbols or scope, make no chart edits in that turn."
         )

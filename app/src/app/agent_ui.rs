@@ -803,6 +803,17 @@ impl TerminalApp {
             self.pinned_agent_chart = None;
         }
         self.agent_pane.settings.pinned_chart = self.pinned_agent_chart;
+        let visible = self.visible_panes();
+        let charts: Vec<_> = self
+            .panes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, pane)| match &pane.kind {
+                PaneKind::Chart(chart) => Some((chart.uid, chart.drawings_hidden, visible.contains(&i))),
+                _ => None,
+            })
+            .collect();
+        self.agent_pane.refresh_drawing_visibility(&charts);
         self.refresh_agent_undo();
         self.send_next_agent_prompt();
     }

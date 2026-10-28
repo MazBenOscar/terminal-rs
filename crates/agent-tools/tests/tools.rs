@@ -894,6 +894,23 @@ async fn precision_real_d1_h4_contracts_lookback_versions_and_caps() {
             assert_eq!(output["timeframe"], tf);
             assert_eq!(output["bar_range"]["count"], expected_default);
             assert_eq!(output["last_bar_ts"], last.ts);
+            if mode == "swings" {
+                for key in ["swings", "highs", "lows"] {
+                    assert!(
+                        output[key].as_array().unwrap().iter().all(|s| s["confirmed_at"].as_i64().unwrap() < last.ts)
+                    );
+                }
+            }
+            if mode == "trendlines" {
+                assert!(output["trendlines"].as_array().unwrap().iter().all(|l| l["broken"] == false));
+                assert!(
+                    output["historical"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|l| l["broken"] == true && l["kind"] == "dashed")
+                );
+            }
             if output["truncated"] != true {
                 assert!(output["analysis_id"].is_string());
             } else {

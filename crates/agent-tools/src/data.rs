@@ -761,6 +761,15 @@ pub(crate) async fn analyze(host: &dyn DataHost, args: Analyze, now: i64) -> Too
                         return error;
                     }
                 }
+                for (key, role) in [("highs", "high"), ("lows", "low")] {
+                    value[key] = json!(
+                        swings
+                            .iter()
+                            .filter(|s| s.role == role)
+                            .map(|s| json!({"time":s.time,"price":s.price,"confirmed_at":s.confirmed_at}))
+                            .collect::<Vec<_>>()
+                    );
+                }
                 value["swings"] = json!(swings);
             }
             _ => {}
@@ -804,8 +813,8 @@ pub(crate) async fn analyze(host: &dyn DataHost, args: Analyze, now: i64) -> Too
             }
             reduced = true;
         }
-        if let Some(lines) = value["trendlines"].as_array_mut() {
-            for line in lines {
+        for key in ["trendlines", "historical"] {
+            for line in value[key].as_array_mut().into_iter().flatten() {
                 let count = line["touches"].as_array().map_or(0, Vec::len);
                 if count > 2 {
                     if line["touch_count"].is_null() {

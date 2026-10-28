@@ -617,6 +617,24 @@ impl AgentPane {
         }
     }
 
+    /// Reconcile retained notices with live chart state, regardless of which
+    /// toolbar, tab switch or pane-close path changed visibility.
+    pub(crate) fn refresh_drawing_visibility(&mut self, charts: &[(u64, bool, bool)]) {
+        for block in &mut self.blocks {
+            let RenderedBlock::Tool(trace) = block else { continue };
+            let Some(uid) = trace.target_args["_drawing_visibility"]["uid"].as_u64() else { continue };
+            let state = charts.iter().find(|&&(id, _, _)| id == uid);
+            match state {
+                None | Some((_, false, true)) => {
+                    trace.target_args.as_object_mut().unwrap().remove("_drawing_visibility");
+                }
+                Some((_, hidden, _)) => {
+                    trace.target_args["_drawing_visibility"]["hidden"] = (*hidden).into();
+                }
+            }
+        }
+    }
+
     pub fn notice(&mut self, text: &str) {
         self.notice_levels.insert(self.blocks.len(), notice_severity(text));
         self.blocks.push(RenderedBlock::Notice(scrub_text(text)));
@@ -3076,6 +3094,29 @@ mod polish_tests {
             pane.drawings_shown(42);
             let output = render(&ctx, dp(1000.), vec![], |ui| pane.conversation(ui, &mut actions));
             assert!(!texts(&output).iter().any(|(s, _)| s == notice));
+        }
+    }
+
+    #[test]
+    fn drawing_notice_reconciles_toolbar_tab_and_closed_pane_paths() {
+        use serde_json::json;
+        for charts in [vec![(42, false, true)], vec![]] {
+            let mut pane = AgentPane::default();
+            let trace = session_tool_trace(
+                "create_drawing",
+                json!({}),
+                json!({"chart_uid":42,"drawings_added":1,"drawings_hidden":true,"chart_visible":false}),
+            );
+            pane.blocks.push(RenderedBlock::Tool(trace));
+            pane.refresh_drawing_visibility(&[(42, true, true)]);
+            let RenderedBlock::Tool(trace) = &pane.blocks[0] else { panic!() };
+            assert!(trace.target_args["_drawing_visibility"].is_object());
+            pane.refresh_drawing_visibility(&[(42, false, false)]);
+            let RenderedBlock::Tool(trace) = &pane.blocks[0] else { panic!() };
+            assert_eq!(trace.target_args["_drawing_visibility"]["hidden"], false);
+            pane.refresh_drawing_visibility(&charts);
+            let RenderedBlock::Tool(trace) = &pane.blocks[0] else { panic!() };
+            assert!(trace.target_args["_drawing_visibility"].is_null());
         }
     }
 

@@ -1447,7 +1447,9 @@ impl ChartState {
         let (author, turn) = self.pending_drawing_origin.clone();
         self.drawing_ids.repair(&mut self.drawings);
         for drawing in &mut self.drawings {
-            if !before.iter().any(|old| old.id == drawing.id) {
+            let old = before.iter().find(|old| old.id == drawing.id);
+            if old.is_none() || (author == tr_chart::drawings::Author::User && old.is_some_and(|old| old != drawing)) {
+                // Any real user edit (move, text, style, etc.) claims the object.
                 drawing.created_by = author;
                 drawing.turn_id = turn.clone();
             }
@@ -10092,6 +10094,8 @@ mod tests {
         let protected = chart.drawings[0].id;
         chart.edit_drawings(Author::User, None, |drawings| drawings[0].text = "user edit".into());
         let user_edit = chart.drawings[0].clone();
+        assert_eq!(user_edit.created_by, Author::User, "editing an agent drawing transfers ownership");
+        assert!(user_edit.turn_id.is_none());
         chart.edit_drawings(Author::Agent, Some("turn".into()), |drawings| drawings[1].width = 3.);
         chart.edit_drawings(Author::User, None, |drawings| drawings.push(Drawing::new(Tool::Arrow, anchor, anchor)));
         let user_added = chart.drawings[2].clone();
