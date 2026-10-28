@@ -745,6 +745,7 @@ impl ScopedHost {
                     .call
                     .turn
                     .strip_prefix("external-")
+                    .filter(|_| !tr_agent::mcp::is_mimo_turn(&self.call.turn))
                     .map(|id| format!("external-{}", id.split(':').next().unwrap_or(id)));
                 move |app| {
                     if let Some(connection) = connection {

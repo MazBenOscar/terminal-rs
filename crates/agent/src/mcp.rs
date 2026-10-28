@@ -15,6 +15,46 @@ pub const MAX_LINE: usize = 1024 * 1024;
 pub const UNAVAILABLE: &str = "terminal-rs is not running or external agents are disabled (Settings › Agent)";
 pub const SOURCE: &str = "External agent";
 
+// Presentation only. Registration never changes the socket's registry, budgets,
+// consent, peer checks, or edit policy. Do not use this identity to authorize tools.
+static MIMO_CLIENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+pub struct MimoClientLabel(String);
+impl MimoClientLabel {
+    pub fn register() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let token =
+            format!("mimo-{}-{nonce}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        MIMO_CLIENTS.lock().unwrap().push(token.clone());
+        Self(token)
+    }
+    pub fn token(&self) -> &str {
+        &self.0
+    }
+}
+impl Drop for MimoClientLabel {
+    fn drop(&mut self) {
+        MIMO_CLIENTS.lock().unwrap().retain(|token| token != &self.0);
+    }
+}
+pub fn is_mimo_client(token: &str) -> bool {
+    MIMO_CLIENTS.lock().unwrap().iter().any(|known| known == token)
+}
+/// Keep socket turns in the external lifecycle namespace, but label the app's
+/// registered child distinctly. These IDs are host-created, never client IDs.
+pub fn is_mimo_turn(turn: &str) -> bool {
+    turn.starts_with("external-mimo-")
+}
+pub fn source_for_turn(turn: &str) -> &'static str {
+    if is_mimo_turn(turn) {
+        "mimo"
+    } else if turn.starts_with("external-") {
+        SOURCE
+    } else {
+        "Agent"
+    }
+}
+
 #[cfg(test)]
 #[path = "mcp_tests.rs"]
 mod tests;
@@ -150,6 +190,7 @@ pub async fn serve_app<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let mut reader = BufReader::new(read);
     let mut calls = VecDeque::new();
+    let mut first = true;
     loop {
         let line = match read_line(&mut reader).await {
             Ok(Some(line)) => line,
@@ -171,7 +212,12 @@ pub async fn serve_app<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             write_line(&mut write, &error(id, -32600, "Invalid request")).await?;
             continue;
         }
+        // Optional shim handshake; old/outside clients can still start with
+        // tools/list or tools/call. Identity cannot change after the first RPC.
+        let hello = first && value["method"] == "terminal-rs/client";
+        first = false;
         let reply = match value["method"].as_str() {
+            Some("terminal-rs/client") if hello => success(id, handler(value).await?),
             Some("tools/call") if !valid_tool_params(&value) => {
                 error(id, -32602, "Expected tool name and object arguments")
             }
@@ -213,6 +259,7 @@ impl Drop for TaskAbort {
 
 struct Proxy {
     path: PathBuf,
+    client: Option<String>,
     stream: Option<BufReader<UnixStream>>,
     next: u64,
 }
@@ -220,7 +267,21 @@ impl Proxy {
     async fn call(&mut self, method: &str, params: Value) -> Option<std::result::Result<Value, Value>> {
         let result = tokio::time::timeout(Duration::from_secs(85), async {
             if self.stream.is_none() {
-                self.stream = Some(BufReader::new(UnixStream::connect(&self.path).await?));
+                let mut stream = BufReader::new(UnixStream::connect(&self.path).await?);
+                if let Some(client) = &self.client {
+                    write_line(
+                        stream.get_mut(),
+                        &json!({"jsonrpc":"2.0","id":0,
+                        "method":"terminal-rs/client","params":{"client":client}}),
+                    )
+                    .await?;
+                    let line = read_line(&mut stream).await?.ok_or_else(|| anyhow::anyhow!("app socket closed"))?;
+                    let reply: Value = serde_json::from_slice(&line)?;
+                    if reply["id"] != 0 || reply.get("result").is_none() || reply.get("error").is_some() {
+                        bail!("invalid app socket handshake");
+                    }
+                }
+                self.stream = Some(stream);
             }
             let stream = self.stream.as_mut().expect("connected stream");
             self.next += 1;
@@ -256,7 +317,7 @@ pub async fn serve_stdio<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     validate_socket_path(&path)?;
     let mut read = BufReader::new(read);
-    let mut proxy = Proxy { path, stream: None, next: 0 };
+    let mut proxy = Proxy { path, client: std::env::var("TR_MCP_CLIENT").ok(), stream: None, next: 0 };
     let mut initialized = false;
     loop {
         let line = match read_line(&mut read).await {

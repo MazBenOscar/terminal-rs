@@ -5846,11 +5846,7 @@ impl ChartState {
         let mut tags = Vec::new();
         for (d, selected, shapes) in prepared {
             if d.agent_highlight() {
-                let source = if d.turn_id.as_deref().is_some_and(|t| t.starts_with("external-")) {
-                    "External agent"
-                } else {
-                    "Agent"
-                };
+                let source = tr_agent::mcp::source_for_turn(d.turn_id.as_deref().unwrap_or_default());
                 let size = p.layout_no_wrap(source.into(), mono(9.), theme::muted()).size();
                 let preferred = if d.tool == Tool::Rectangle {
                     shapes.iter().find_map(|(shape, _)| {

@@ -366,7 +366,11 @@ impl TerminalApp {
         if self.agent_pane.workflows.proposals.iter().filter(|p| p.turn == turn).count() >= 10 {
             return ToolResult::error("proposal_limit", "At most 10 proposals per turn", None);
         }
-        let summary = if turn.starts_with("external-") { format!("External agent · {summary}") } else { summary };
+        let summary = if turn.starts_with("external-") {
+            format!("{} · {summary}", tr_agent::mcp::source_for_turn(turn))
+        } else {
+            summary
+        };
         let user_owned = matches!(&args, UpdateAlert(_) | DeleteAlert(_))
             && before["agent_turn"]
                 .as_str()
