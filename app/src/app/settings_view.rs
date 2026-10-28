@@ -228,7 +228,14 @@ impl TerminalApp {
         }
         row(ui, "Layouts", |ui| {
             let mut on = self.layout_theme;
-            if ui.checkbox(&mut on, format!("Save the theme with layout {:?}", self.layout_name)).changed() {
+            if ui
+                .checkbox(&mut on, format!("Save and restore the theme with layout {:?}", self.layout_name))
+                .on_hover_text(
+                    "Loading this layout, including at startup, replaces the global theme preference. \
+                     Turn this off to keep the global theme when this layout loads.",
+                )
+                .changed()
+            {
                 self.layout_theme = on;
                 self.save_layout();
             }
