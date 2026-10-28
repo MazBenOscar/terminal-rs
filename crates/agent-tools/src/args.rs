@@ -34,6 +34,11 @@ fn optional_schema<T: OptionalArgument>(mut schema: Value) -> Value {
 }
 
 macro_rules! field_schema {
+    (NewsScope) => { json!({"type":"string","enum":["symbol","watchlist","market"],"default":"market"}) };
+    (Hours) => { json!({"type":"integer","minimum":1,"maximum":168,"default":24}) };
+    (Days) => { json!({"type":"integer","minimum":1,"maximum":90,"default":30}) };
+    (NewsLimit) => { json!({"type":"integer","minimum":1,"maximum":50,"default":20}) };
+    (Forms) => { json!({"type":"array","maxItems":20,"items":{"type":"string","minLength":1,"maxLength":20}}) };
     (String) => { json!({"type":"string", "minLength":1, "maxLength":2048, "pattern":"\\S"}) };
     (f64) => { json!({"type":"number"}) };
     (AlertLevel) => { json!({"type":"number", "minimum":0, "maximum":1e15}) };
@@ -606,7 +611,13 @@ macro_rules! live_args {
     };
 }
 
+args!(ReadNews {} { symbol: Option<String> => String, watchlist: Option<String> => Name,
+    scope: Option<String> => NewsScope, hours: Option<u32> => Hours, limit: Option<usize> => NewsLimit,
+    query: Option<String> => String, include_summary: bool => bool });
+args!(ReadFilings { symbol: String => String } { days: Option<u32> => Days, forms: Vec<String> => Forms });
+
 live_args!(
+    ReadNews(ReadNews) => "read_news", ReadFilings(ReadFilings) => "read_filings",
     // A5b-SCAN live tools.
     ListScans(ListScans) => "list_scans", ReadScanResults(ReadScanResults) => "read_scan_results", RunScan(RunScan) => "run_scan",
     ReadChart(ReadChart) => "read_chart", IndicatorValues(IndicatorValues) => "indicator_values",

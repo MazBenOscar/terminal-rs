@@ -62,6 +62,8 @@ pub struct State {
     last_poll: Option<Instant>,
     pub simulated: bool,
     pub congress_tab: bool,
+    pub feed_tab: bool,
+    pub feed_events: Vec<String>,
     history: bool,
     monitor: HashMap<String, String>,
     editor: Option<Draft>,
@@ -89,6 +91,8 @@ impl State {
             last_poll: None,
             simulated,
             congress_tab: false,
+            feed_tab: false,
+            feed_events: vec![],
             history: false,
             monitor: HashMap::new(),
             editor: None,
@@ -318,6 +322,7 @@ impl State {
                 self.changed(true);
             }
             Action::Manage => {
+                self.feed_tab = false;
                 self.congress_tab = false;
                 self.history = false;
             }

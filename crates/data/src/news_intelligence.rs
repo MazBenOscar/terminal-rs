@@ -984,6 +984,8 @@ pub struct KeywordWatch {
     pub words: String,
     #[serde(deserialize_with = "colour_index")]
     pub colour: u8,
+    /// Desktop delivery is opt-in independently of highlighting.
+    pub notify: bool,
 }
 fn colour_index<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
     Ok(u8::deserialize(d)?.min(5))

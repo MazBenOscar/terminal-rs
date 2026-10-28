@@ -639,7 +639,7 @@ async fn golden_mode(mode: &str) {
 #[test]
 fn schema_snapshots_for_all_presets() {
     for (name, preset, count) in
-        [("read_only", ToolSet::ReadOnly, 14), ("edit", ToolSet::Edit, 21), ("workflows", ToolSet::Workflows, 28)]
+        [("read_only", ToolSet::ReadOnly, 16), ("edit", ToolSet::Edit, 23), ("workflows", ToolSet::Workflows, 30)]
     {
         let registry = Registry::new(preset);
         assert_eq!(registry.schemas().len(), count);
@@ -650,7 +650,10 @@ fn schema_snapshots_for_all_presets() {
             if tool.kind == tr_agent_tools::ToolKind::Live
                 && !tool.name.contains("watchlist")
                 && !tool.name.contains("alert")
-                && !matches!(tool.name.as_str(), "list_scans" | "read_scan_results" | "run_scan")
+                && !matches!(
+                    tool.name.as_str(),
+                    "list_scans" | "read_scan_results" | "run_scan" | "read_news" | "read_filings"
+                )
             {
                 assert!(tool.input_schema["properties"].get("chart_id").is_some());
             }
@@ -658,12 +661,17 @@ fn schema_snapshots_for_all_presets() {
                 assert_eq!(tool.needs_confirmation, tool.mutating);
             }
         }
-        // A5b-SCAN schemas have their own contiguous inline snapshots below, so the
-        // parallel multi-symbol worker can update the historical JSON arrays independently.
+        // Scanner and local news/filings schemas have independent inline snapshots
+        // below; historical JSON arrays retain their existing coverage.
         let historical: Vec<_> = registry
             .schemas()
             .iter()
-            .filter(|s| !matches!(s.name.as_str(), "list_scans" | "read_scan_results" | "run_scan"))
+            .filter(|s| {
+                !matches!(
+                    s.name.as_str(),
+                    "list_scans" | "read_scan_results" | "run_scan" | "read_news" | "read_filings"
+                )
+            })
             .collect();
         snapshot("snapshots", name, &json!(historical));
     }
@@ -688,6 +696,24 @@ fn scanner_schema_snapshots_in_every_tool_set() {
     }
 }
 // End A5b-SCAN snapshot block.
+
+#[test]
+fn n4_local_schema_snapshots_in_every_tool_set() {
+    for set in [ToolSet::ReadOnly, ToolSet::Edit, ToolSet::Workflows] {
+        let registry = Registry::new(set);
+        let fingerprints: Vec<_> = ["read_news", "read_filings"]
+            .into_iter()
+            .map(|name| {
+                let spec = registry.schemas().iter().find(|s| s.name == name).unwrap();
+                assert!(!spec.mutating && !spec.needs_confirmation);
+                assert!(spec.description.contains("headlines and filing metadata from local storage"));
+                let bytes = serde_json::to_vec(spec).unwrap();
+                bytes.iter().fold(0xcbf29ce484222325_u64, |hash, b| (hash ^ u64::from(*b)).wrapping_mul(0x100000001b3))
+            })
+            .collect();
+        assert_eq!(fingerprints, vec![6436309003559462467, 3292272878261166452]);
+    }
+}
 
 #[test]
 fn committed_fixtures_match_seeded_and_handmade_generators() {
@@ -882,6 +908,8 @@ mod adversarial {
 
     fn examples() -> Vec<(&'static str, Value)> {
         vec![
+            ("read_news", json!({"scope":"market","include_summary":false})),
+            ("read_filings", json!({"symbol":"NVDA","days":90,"forms":["8-K","4"]})),
             // A5b-SCAN examples.
             ("list_scans", json!({})),
             ("read_scan_results", json!({})),
@@ -925,6 +953,7 @@ mod adversarial {
             };
         }
         parse!(
+            "read_news" => ReadNews, "read_filings" => ReadFilings,
             "list_scans" => ListScans, "read_scan_results" => ReadScanResults, "run_scan" => RunScan,
             "read_data" => ReadData, "analyze" => Analyze, "find_symbol" => FindSymbol,
             "get_quotes" => GetQuotes, "compare_symbols" => CompareSymbols,

@@ -109,11 +109,42 @@ impl TerminalApp {
             PaneKind::Alerts => {
                 ui.horizontal_wrapped(|ui| {
                     let unread = self.price_alerts.unread();
-                    ui.selectable_value(&mut self.price_alerts.congress_tab, false, format!("Price alerts ({unread})"));
-                    ui.selectable_value(&mut self.price_alerts.congress_tab, true, "Congress filings");
+                    if ui
+                        .selectable_label(
+                            !self.price_alerts.feed_tab && !self.price_alerts.congress_tab,
+                            format!("Price alerts ({unread})"),
+                        )
+                        .clicked()
+                    {
+                        self.price_alerts.feed_tab = false;
+                        self.price_alerts.congress_tab = false;
+                    }
+                    if ui
+                        .selectable_label(
+                            !self.price_alerts.feed_tab && self.price_alerts.congress_tab,
+                            "Congress filings",
+                        )
+                        .clicked()
+                    {
+                        self.price_alerts.feed_tab = false;
+                        self.price_alerts.congress_tab = true;
+                    }
+                    if ui.selectable_label(self.price_alerts.feed_tab, "News / Filings").clicked() {
+                        self.price_alerts.feed_tab = true;
+                    }
                 });
                 ui.separator();
-                if self.price_alerts.congress_tab {
+                if self.price_alerts.feed_tab {
+                    ui.label(egui::RichText::new("Saved feed alerts · app must be running · headlines and filing metadata from local storage").color(crate::theme::muted()));
+                    egui::ScrollArea::vertical().id_salt("feed-alert-history").show(ui, |ui| {
+                        if self.price_alerts.feed_events.is_empty() {
+                            ui.label("No feed alerts yet. Enable types in Settings › Panels › Alerts.");
+                        }
+                        for body in &self.price_alerts.feed_events {
+                            ui.label(egui::RichText::new(body).color(crate::theme::text()));
+                        }
+                    });
+                } else if self.price_alerts.congress_tab {
                     let (a, seen) = congress_view::alerts(ui, &self.alerts);
                     actions.extend(a);
                     if seen {
@@ -165,6 +196,11 @@ impl TerminalApp {
                     link,
                     self.active_watchlist,
                 ));
+                if std::mem::take(&mut n.interaction.copy_digest)
+                    && let Some(view) = &n.query
+                {
+                    self.worker.send(Request::CopyDigest(view.clone()));
+                }
                 if !n.seen_queue.is_empty() {
                     self.worker.send(Request::NewsSeen(std::mem::take(&mut n.seen_queue)));
                 }

@@ -592,7 +592,29 @@ impl TerminalApp {
     fn panels_tab(&mut self, ui: &mut Ui, cmds: &mut Vec<SettingsCmd>) {
         section(ui, "Alerts");
         let sound = ui.checkbox(&mut self.prefs.alert_sound, "Alert sound").changed();
-        let notification = ui.checkbox(&mut self.prefs.desktop_notification, "Desktop notification").changed();
+        let notification =
+            ui.checkbox(&mut self.prefs.desktop_notification, "Desktop notification (price alerts)").changed();
+        section(ui, "Notifications");
+        let n = &mut self.prefs.feed_notifications;
+        let mut feed = ui.checkbox(&mut n.filings, "Watchlist filings (8-K, 10-K/Q, 13D/G)").changed();
+        feed |= ui.checkbox(&mut n.insiders, "Insider purchases / Cluster buy").changed();
+        ui.horizontal(|ui| {
+            ui.label("Minimum purchase value");
+            feed |= ui.add(egui::DragValue::new(&mut n.insider_min).range(0.0..=1e12).prefix("$")).changed();
+        });
+        feed |= ui.checkbox(&mut n.keywords, "Keyword watches (Notify enabled per watch)").changed();
+        feed |= ui.checkbox(&mut n.breaking, "Breaking stories (4 sources within 60 min)").changed();
+        feed |= ui.checkbox(&mut n.volume, "Unusual headline volume notifications").changed();
+        ui.horizontal(|ui| {
+            ui.label("Quiet hours (local, 0–23; equal disables)");
+            feed |= ui.add(egui::DragValue::new(&mut n.quiet_start).range(0..=23)).changed();
+            ui.label("to");
+            feed |= ui.add(egui::DragValue::new(&mut n.quiet_end).range(0..=23)).changed();
+        });
+        ui.label(RichText::new("Fresh local items only · max 6 desktop notifications / 10 min · feed alerts require the app running; the price-alert daemon does not fetch news.").color(muted()));
+        if feed {
+            cmds.push(SettingsCmd::SavePrefs);
+        }
         let id = egui::Id::new("alert-daemon-install-error");
         let mut enabled = tr_alerts::launch::installed();
         if ui

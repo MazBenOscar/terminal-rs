@@ -129,8 +129,32 @@ impl Store {
         Ok(self.db.query_row("SELECT 1 FROM filings WHERE accession=?1", [acc], |_| Ok(())).optional()?.is_some())
     }
     /// A feed placeholder must never erase richer submissions metadata.
+    pub fn claim_notification(&self, kind: &str, id: &str) -> Result<bool> {
+        self.db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS notification_seen(kind TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(kind,id));",
+        )?;
+        Ok(self.db.execute("INSERT OR IGNORE INTO notification_seen VALUES(?1,?2)", params![kind, id])? == 1)
+    }
     pub fn upsert(&mut self, filings: &[Filing]) -> Result<()> {
+        self.db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS notification_seen(kind TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(kind,id));",
+        )?;
         let tx = self.db.transaction()?;
+        let mut initial = std::collections::BTreeSet::new();
+        for f in filings {
+            let key = format!("notification:seed:{}", f.cik);
+            if tx.query_row("SELECT 1 FROM meta WHERE key=?1", [&key], |_| Ok(())).optional()?.is_none() {
+                initial.insert(f.cik);
+            }
+        }
+        // Load once identities stay suppressed even if tracking later promotes
+        // their transient rows before the local alert worker observes them.
+        for f in filings.iter().filter(|f| initial.contains(&f.cik) || !f.transient_symbol.is_empty()) {
+            for kind in ["filing", "insider"] {
+                tx.execute("INSERT OR IGNORE INTO notification_seen VALUES(?1,?2)", params![kind, f.accession])?;
+            }
+            tx.execute("INSERT OR IGNORE INTO meta VALUES(?1,'1')", [format!("notification:seed:{}", f.cik)])?;
+        }
         for f in filings {
             // Submissions do not label ownership roles. Preserve a known Reporting feed role
             // instead of manufacturing an Issuer row for the very same company/accession.
@@ -256,6 +280,12 @@ impl Store {
             )?
             .query_map([], |r| Ok((Self::row(r)?, r.get(14)?)))?
             .collect::<rusqlite::Result<_>>()?)
+    }
+    /// Saved metadata for offline research, independent of the pane's first-import window.
+    pub fn local_filings(&self, start: i64, end: i64) -> Result<Vec<Filing>> {
+        let rows = self.read("SELECT * FROM filings WHERE coalesce(accepted,filed) BETWEEN ?1 AND ?2 ORDER BY coalesce(accepted,filed) DESC,accession")?
+            .query_map(params![start,end],Self::row)?.collect::<rusqlite::Result<_>>()?;
+        self.with_tickers(rows)
     }
     pub fn filings(&self) -> Result<Vec<Filing>> {
         let rows = self.read("SELECT * FROM filings WHERE transient_symbol!='' OR filed>=CAST(coalesce((SELECT value FROM meta WHERE key='window:'||filings.cik),'0') AS INTEGER) ORDER BY coalesce(accepted,filed) DESC,accession DESC")?.query_map([], Self::row)?.collect::<rusqlite::Result<_>>()?;
@@ -407,6 +437,123 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn n4_first_import_is_suppressed_and_claims_survive_reopening() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data/n4-edgar");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!(
+            "{}.sqlite3",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let initial = Filing { cik: 1, accession: "initial".into(), form: "8-K".into(), ..Default::default() };
+        {
+            let mut db = Store::open(&path).unwrap();
+            db.upsert(std::slice::from_ref(&initial)).unwrap();
+            assert!(!db.claim_notification("filing", "initial").unwrap());
+            assert!(!db.claim_notification("insider", "initial").unwrap());
+            let next = Filing { accession: "next".into(), ..initial.clone() };
+            db.upsert(&[next]).unwrap();
+            assert!(db.claim_notification("filing", "next").unwrap());
+        }
+        let db = Store::open(&path).unwrap();
+        assert!(!db.claim_notification("filing", "next").unwrap());
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn n4_load_once_stays_suppressed_after_same_session_promotion() {
+        let mut db = Store::memory().unwrap();
+        db.upsert(&[Filing { cik: 1, accession: "seed".into(), ..Default::default() }]).unwrap();
+        let mut once =
+            Filing { cik: 1, accession: "once".into(), transient_symbol: "NVDA".into(), ..Default::default() };
+        db.upsert(std::slice::from_ref(&once)).unwrap();
+        once.transient_symbol.clear();
+        once.from_submissions = true;
+        db.upsert(&[once]).unwrap();
+        assert!(!db.claim_notification("filing", "once").unwrap());
+        assert!(!db.claim_notification("insider", "once").unwrap());
+    }
+    fn purchase(accession: &str, owner: u64, date: &str, value: f64) -> Filing {
+        Filing {
+            cik: 1,
+            ticker: "NVDA".into(),
+            accession: accession.into(),
+            form: "4".into(),
+            insiders: vec![crate::insider::Transaction {
+                owner: crate::insider::Owner { name: format!("Owner {owner}"), cik: Some(owner), ..Default::default() },
+                code: "P".into(),
+                date: date.into(),
+                shares: Some(100.),
+                price: Some(value / 100.),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn n4_insider_threshold_and_distinct_owner_thirty_day_cluster() {
+        let a = purchase("a", 1, "2026-10-27", 100_000.);
+        assert_eq!(crate::insider_buy(std::slice::from_ref(&a), &a, "NVDA", 100_000.), Some((100_000., false)));
+        let small = purchase("b", 2, "2026-09-27", 10_000.);
+        assert!(crate::insider_buy(std::slice::from_ref(&small), &small, "NVDA", 100_000.).is_none());
+        let latest = purchase("c", 1, "2026-10-27", 10_000.);
+        assert_eq!(
+            crate::insider_buy(&[small.clone(), latest.clone()], &latest, "NVDA", 100_000.),
+            Some((10_000., true))
+        );
+        let old = purchase("old", 2, "2026-09-26", 10_000.);
+        assert!(crate::insider_buy(&[old, latest.clone()], &latest, "NVDA", 100_000.).is_none());
+        let same = purchase("same", 1, "2026-10-01", 10_000.);
+        assert!(crate::insider_buy(&[same, latest.clone()], &latest, "NVDA", 100_000.).is_none());
+        let mut sale = latest.clone();
+        sale.insiders[0].code = "S".into();
+        assert!(crate::insider_buy(&[small, sale.clone()], &sale, "NVDA", 0.).is_none());
+    }
+    #[test]
+    fn n4_clusters_preserve_joint_owners_without_duplicate_economics_or_superseded_buys() {
+        let mut joint = purchase("joint", 1, "2026-10-27", 10_000.);
+        let mut second = joint.insiders[0].clone();
+        second.owner.cik = Some(2);
+        joint.insiders.push(second);
+        assert_eq!(crate::insider_buy(std::slice::from_ref(&joint), &joint, "NVDA", 100_000.), Some((10_000., true)));
+        let end = chrono::NaiveDate::from_ymd_opt(2026, 10, 27)
+            .unwrap()
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let summary = crate::local_insider_summary(std::slice::from_ref(&joint), &["NVDA".into()], end - 86400, end);
+        assert_eq!(summary[0]["buy_value"], 10_000.);
+        assert_eq!(summary[0]["cluster_buy"], true);
+
+        let old = purchase("old", 2, "2026-10-01", 10_000.);
+        let mut amendment = old.clone();
+        amendment.accession = "amended".into();
+        amendment.form = "4/A".into();
+        amendment.insiders[0].price = Some(0.);
+        let latest = purchase("latest", 1, "2026-10-27", 10_000.);
+        let rows = [old, amendment, latest.clone()];
+        assert!(crate::insider_buy(&rows, &latest, "NVDA", 100_000.).is_none());
+        assert_eq!(crate::local_insider_summary(&rows, &["NVDA".into()], end - 86400, end)[0]["cluster_buy"], false);
+    }
+    #[test]
+    fn n4_metadata_decodes_items_and_includes_saved_form_four_lines() {
+        let mut f = purchase("a", 1, "2026-10-27", 100_000.);
+        f.filed = 100;
+        let eight = Filing {
+            accession: "b".into(),
+            cik: 1,
+            ticker: "NVDA".into(),
+            form: "8-K".into(),
+            items: "2.02,9.01".into(),
+            filed: 100,
+            ..Default::default()
+        };
+        let result = crate::local_metadata(&[f, eight], &["NVDA US Equity".into()], 0, 200, &[]);
+        assert_eq!(result[0]["insiders"][0]["code_label"], "Bought");
+        assert_eq!(result[0]["insiders"][0]["value"], 100_000.);
+        assert!(result[1]["items"].as_str().unwrap().contains("Results of Operations"));
+    }
     #[test]
     fn transient_rows_are_symbol_only_never_documents_and_promote_on_tracking() {
         let mut store = Store::memory().unwrap();

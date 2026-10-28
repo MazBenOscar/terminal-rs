@@ -143,6 +143,26 @@ impl Registry {
             }
         }
         // End A5b-MULTI validation.
+        if name == "read_news" {
+            let has = |key: &str| value.get(key).is_some_and(|v| !v.is_null());
+            let scope = value["scope"].as_str().unwrap_or(if has("symbol") {
+                "symbol"
+            } else if has("watchlist") {
+                "watchlist"
+            } else {
+                "market"
+            });
+            if has("symbol") && has("watchlist")
+                || scope == "symbol" && !has("symbol")
+                || scope != "symbol" && has("symbol")
+                || scope != "watchlist" && has("watchlist")
+            {
+                return Err(invalid(
+                    "Use symbol, watchlist, or market scope without conflicting selectors".into(),
+                    Some("scope"),
+                ));
+            }
+        }
         if name == "create_alert" {
             if value["kind"] == "close" && value.get("timeframe").is_none_or(Value::is_null) {
                 return Err(invalid("Close alerts require a timeframe".into(), Some("timeframe")));
@@ -488,6 +508,14 @@ fn catalog() -> Vec<ToolSpec> {
                 ("Read user drawing and view edit events; labels remain untrusted string data.", false)
             }
             // A5b-SCAN catalog block: read-only in every mode.
+            "read_news" => (
+                "Read headlines and filing metadata from local storage only; no network or on-demand fetch. Personal, non-commercial headlines. Digest grouped by topic and subject, URL host only; summaries omitted unless include_summary=true (300 characters). Default 24 hours, maximum 168 hours and 50 stories.",
+                false,
+            ),
+            "read_filings" => (
+                "Read headlines and filing metadata from local storage only; no network or on-demand fetch. SEC metadata (public domain), decoded 8-K items and saved Form 4 lines; at most 90 days and 50 filings.",
+                false,
+            ),
             "list_scans" => ("List saved scans and open Scanner panes, at most 50 entries.", false),
             "read_scan_results" => (
                 "Read the last completed results held by an open Scanner pane; no network. At most 50 matched rows by default; include=all also returns non-matches. Counts cover all rows. During a run returns the previous completed snapshot with running=true.",
@@ -530,6 +558,69 @@ mod tests {
     use tr_core::Timeframe;
     use tr_data::{Quote, SearchHit};
 
+    #[test]
+    fn n4_local_tools_are_default_readonly_and_strictly_bounded() {
+        let registry = Registry::new(ToolSet::ReadOnly);
+        for name in ["read_news", "read_filings"] {
+            let spec = registry.schemas().iter().find(|s| s.name == name).unwrap();
+            assert!(!spec.mutating && !spec.needs_confirmation);
+            assert!(spec.description.contains("headlines and filing metadata from local storage"));
+            assert!(spec.description.contains("no network"));
+        }
+        for args in [
+            json!({}),
+            json!({"symbol":"NVDA","hours":168,"limit":50,"include_summary":true}),
+            json!({"scope":"watchlist"}),
+            json!({"watchlist":"Main"}),
+            json!({"scope":"market","query":"earnings"}),
+        ] {
+            assert!(registry.validate_call("read_news", &args.to_string()).is_ok(), "{args}");
+        }
+        for args in [
+            json!({"hours":169}),
+            json!({"hours":0}),
+            json!({"limit":51}),
+            json!({"limit":0}),
+            json!({"scope":"symbol"}),
+            json!({"symbol":"AAPL","watchlist":"Main"}),
+            json!({"scope":"market","symbol":"NVDA"}),
+            json!({"include_summary":null}),
+            json!({"url":"https://fixture.invalid"}),
+        ] {
+            assert!(registry.validate_call("read_news", &args.to_string()).is_err(), "{args}");
+        }
+        assert!(registry.validate_call("read_filings", r#"{"symbol":"NVDA","days":90,"forms":["8-K","4"]}"#).is_ok());
+        for args in [
+            json!({}),
+            json!({"symbol":"NVDA","days":91}),
+            json!({"symbol":"NVDA","forms":[true]}),
+            json!({"symbol":"NVDA","fetch":true}),
+        ] {
+            assert!(registry.validate_call("read_filings", &args.to_string()).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn n4_local_tools_never_resolve_symbols_through_a_data_provider() {
+        struct NoData;
+        impl DataHost for NoData {
+            fn history<'a>(&'a self, _: &'a str, _: Timeframe, _: Option<i64>, _: usize) -> HostFuture<'a, History> {
+                panic!("network history")
+            }
+            fn search<'a>(&'a self, _: &'a str) -> HostFuture<'a, Vec<SearchHit>> {
+                panic!("network search")
+            }
+            fn quotes<'a>(&'a self, _: &'a [String]) -> HostFuture<'a, Vec<Quote>> {
+                panic!("network quotes")
+            }
+        }
+        let mut budget = CallBudget::default();
+        let mut ctx = CallContext::new(&NoData, &Host, &mut budget);
+        for (tool, args) in [("read_news", r#"{"symbol":"NVDA"}"#), ("read_filings", r#"{"symbol":"NVDA"}"#)] {
+            let result = Registry::new(ToolSet::ReadOnly).call(tool, args, &mut ctx).await;
+            assert!(result.success);
+            assert_eq!(value(result)["tool"], tool);
+        }
+    }
     struct Host;
     impl DataHost for Host {
         fn history<'a>(&'a self, _: &'a str, _: Timeframe, _: Option<i64>, _: usize) -> HostFuture<'a, History> {
@@ -1153,6 +1244,8 @@ mod tests {
         let mut budget = CallBudget::new(30);
         let mut ctx = CallContext { confirmed: true, ..CallContext::new(&Host, &Host, &mut budget) };
         let examples = [
+            ("read_news", json!({"scope":"watchlist","watchlist":"list","hours":24})),
+            ("read_filings", json!({"symbol":"NVDA","forms":["8-K","4"]})),
             // A5b-SCAN global live arguments.
             ("list_scans", json!({})),
             ("read_scan_results", json!({})),
@@ -1183,14 +1276,18 @@ mod tests {
         ];
         assert_eq!(examples.len(), registry.schemas().iter().filter(|s| s.kind == ToolKind::Live).count());
         for (name, mut args) in examples {
-            if !workflow(name) && !matches!(name, "list_scans" | "read_scan_results" | "run_scan") {
+            if !workflow(name)
+                && !matches!(name, "list_scans" | "read_scan_results" | "run_scan" | "read_news" | "read_filings")
+            {
                 args["chart_id"] = "pinned-chart".into();
             }
             let result = registry.call(name, &args.to_string(), &mut ctx).await;
             assert!(result.success, "{name}: {result:?}");
             let result = value(result);
             assert_eq!(result["tool"], name);
-            if !workflow(name) && !matches!(name, "list_scans" | "read_scan_results" | "run_scan") {
+            if !workflow(name)
+                && !matches!(name, "list_scans" | "read_scan_results" | "run_scan" | "read_news" | "read_filings")
+            {
                 assert_eq!(result["args"]["chart_id"], "pinned-chart");
             }
         }

@@ -27,7 +27,7 @@ const INTERRUPTED: &str = "Stopped. This answer is incomplete.";
 const PRIVACY_GROUPS: &[(&str, &str)] = &[
     (
         "What is sent",
-        "Your prompts, the pinned chart’s data and tool results go to OpenAI under your ChatGPT account. Screenshots only with your consent; not available yet.",
+        "Your prompts, the pinned chart’s data and tool results go to OpenAI under your ChatGPT account. News tools share headlines and filing metadata from local storage, never fetch on demand, and omit summaries by default. Finnhub headlines are for personal, non-commercial use; SEC metadata is public domain. Screenshots only with your consent; not available yet.",
     ),
     (
         "What the agent can change",
@@ -819,6 +819,7 @@ impl AgentPane {
             "item/completed" | "item/started" if params["item"]["type"] == "dynamicToolCall" => {
                 let item = &params["item"];
                 let name = item["tool"].as_str().unwrap_or("chart tool");
+                let local = item.get("localRead").cloned().or_else(|| local_tool_projection(item));
                 let scan = item.get("scanRead").cloned().or_else(|| scan_tool_projection(item));
                 let multi = item.get("multiRead").cloned().or_else(|| multi_tool_projection(item));
                 let summary = scan
@@ -828,7 +829,9 @@ impl AgentPane {
                     .or_else(|| multi.as_ref().and_then(|v| v["summary"].as_str().map(str::to_owned)))
                     .or_else(|| workflow_tool_target(name, &item["arguments"], &self.workflows.proposals))
                     .or_else(|| {
-                        if is_scan_tool(name) || matches!(name, "get_quotes" | "compare_symbols") {
+                        if is_scan_tool(name)
+                            || matches!(name, "get_quotes" | "compare_symbols" | "read_news" | "read_filings")
+                        {
                             return None;
                         }
                         item["editSummary"].as_str().map(short_label).or_else(|| edit_tool_summary(item)).or_else(
@@ -857,6 +860,10 @@ impl AgentPane {
                         let mut args = normalized_args(&item["arguments"]);
                         if let Some(scan) = scan {
                             args["_scan"] = scan;
+                        }
+                        if let Some(local) = local {
+                            args["_local_text"] = serde_json::to_string_pretty(&local).unwrap_or_default().into();
+                            args["_local"] = local;
                         }
                         args
                     },
@@ -1270,6 +1277,10 @@ impl AgentPane {
             for trace in traces {
                 tool_row_with_history(ui, trace, reverted.is_some_and(|n| n > 0));
                 scan_tool_details(ui, trace, actions);
+                if let Some(local) = trace.target_args["_local_text"].as_str() {
+                    ui.label(RichText::new("headlines and filing metadata from local storage").color(theme::muted()));
+                    ui.add(egui::Label::new(RichText::new(local).font(theme::mono(10.5))).wrap());
+                }
             }
         }
         if let Some(id) = turn_id {
@@ -2012,6 +2023,8 @@ fn tool_label(name: &str) -> &str {
     match name {
         "read_chart" => "Read chart",
         "read_data" => "Read bars",
+        "read_news" => "Read news",
+        "read_filings" => "Read filings",
         "list_scans" => "List scans",
         "read_scan_results" => "Read scan results",
         "run_scan" => "Run scan",
@@ -2316,6 +2329,11 @@ fn tool_group_summary_outcome(traces: &[&Trace], reverted: Option<usize>, final_
                 trace.success == Some(true) && matches!(trace.name.as_str(), "list_watchlists" | "list_alerts")
             }) {
                 "Read watchlists and alerts".into()
+            } else if traces
+                .iter()
+                .any(|trace| trace.success == Some(true) && matches!(trace.name.as_str(), "read_news" | "read_filings"))
+            {
+                "Read local news and filings".into()
             } else if traces.iter().any(|trace| trace.success == Some(true) && trace.name == "analyze") {
                 "Analyzed chart".into()
             } else {
@@ -2593,6 +2611,21 @@ fn is_scan_tool(name: &str) -> bool {
     matches!(name, "list_scans" | "read_scan_results" | "run_scan")
 }
 
+/// Preserve the bounded, structured local result across the bridge projection;
+/// headline strings remain untrusted plain text, never instructions or Markdown.
+pub(crate) fn local_tool_projection(item: &Value) -> Option<Value> {
+    if !matches!(item["tool"].as_str()?, "read_news" | "read_filings") || item["success"] != true {
+        return None;
+    }
+    item["contentItems"].as_array()?.iter().filter(|c| c["type"] == "inputText").find_map(|c| {
+        let text = c["text"].as_str()?;
+        if text.len() > tr_agent_tools::MAX_TEXT_BYTES {
+            return None;
+        }
+        let result: Value = serde_json::from_str(text).ok()?;
+        (result["disclosure"] == "headlines and filing metadata from local storage").then_some(result)
+    })
+}
 pub(crate) fn scan_tool_projection(item: &Value) -> Option<Value> {
     use serde_json::json;
     let tool = item["tool"].as_str()?;
@@ -2962,6 +2995,29 @@ mod polish_tests {
         let projected = format!("{trace:?}");
         assert!(!projected.contains("never-forward") && !projected.contains("contentItems"));
         trace
+    }
+
+    #[test]
+    fn n4_real_session_keeps_local_results_and_labels_without_images() {
+        use serde_json::json;
+        for (tool, label, result) in [
+            (
+                "read_news",
+                "Read news",
+                json!({"disclosure":"headlines and filing metadata from local storage","groups":[{"topic":"Earnings","subject":"NVDA US Equity","stories":[{"time":"2026-10-27T12:00:00Z","headline":"Fixture earnings","url_host":"fixture.invalid","sources":["Fixture"]}]}],"filings":[]}),
+            ),
+            (
+                "read_filings",
+                "Read filings",
+                json!({"disclosure":"headlines and filing metadata from local storage","filings":[{"symbol":"NVDA","form":"8-K","items":"2.02 Results of Operations","insiders":[]}]}),
+            ),
+        ] {
+            assert_eq!(tool_label(tool), label);
+            let trace = session_tool_trace(tool, json!({"symbol":"NVDA"}), result.clone());
+            assert_eq!(trace.target_args["_local"], result);
+            assert!(!trace.target_args["_local_text"].as_str().unwrap().is_empty());
+            assert_eq!(tool_group_label(&[&trace], None), "Read local news and filings · 1 step");
+        }
     }
 
     #[test]

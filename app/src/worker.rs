@@ -222,6 +222,11 @@ pub fn scan_discovery_failure(universe: Universe, rows: &[ScanRow]) -> Option<&s
 }
 // End A5b-SCAN worker types.
 pub enum AgentRequest {
+    LocalNews {
+        args: tr_agent_tools::args::LiveArgs,
+        symbols: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
     // A5b-SCAN: distinct cache-only request; never routes through the user's US scanner path.
     ScanCachedUniverse {
         definition: ScanDefinition,
@@ -348,6 +353,12 @@ pub enum Request {
     // N1b
     NewsRead(NewsView),
     NewsSeen(Vec<String>),
+    FeedConfig {
+        settings: tr_data::news_store::local::Notifications,
+        watches: Vec<tr_data::news_intelligence::KeywordWatch>,
+        watched: Vec<String>,
+    },
+    CopyDigest(NewsView),
     // N1b
     // N1a
     OrderBook {
@@ -692,6 +703,15 @@ pub enum Response {
         chain: Result<Box<tr_data::OptionChain>, String>,
     },
     // N1b: saved reads carry the source update time, not the query completion time.
+    FeedNotices {
+        desktop: Vec<String>,
+        history: Vec<String>,
+    },
+    NewsVolume(Vec<tr_data::news_store::local::Volume>),
+    DigestText {
+        pane: PaneId,
+        text: Result<String, String>,
+    },
     NewsSaved {
         view: NewsView,
         items: Result<Vec<tr_data::news_store::Story>, String>,
@@ -1694,6 +1714,10 @@ async fn agent_history(
 async fn handle_agent(s: &Shared, request: AgentRequest) {
     match request {
         // A5b-SCAN dispatch: permits release only after cancellation drops fetch futures.
+        AgentRequest::LocalNews { args, symbols, reply } => {
+            let result = news::local_read(s, &args, &symbols).await;
+            let _ = reply.send(result);
+        }
         AgentRequest::ScanCachedUniverse { definition, universe, sort, cancel, permit, reply } => {
             let result =
                 agent_cached_scan(s, &definition, universe, &cancel, &data_dir().join("universe.json"), sort).await;
@@ -2538,6 +2562,33 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         // N1b
         Request::NewsRead(view) => news::read(s, view).await,
         Request::NewsSeen(ids) => news::mark_seen(s, ids).await,
+        Request::FeedConfig { settings, watches, watched } => {
+            s.news.local.lock().await.configure(settings, watches, watched)
+        }
+        Request::CopyDigest(view) => {
+            let args = tr_agent_tools::args::LiveArgs::ReadNews(tr_agent_tools::args::ReadNews {
+                symbol: None,
+                watchlist: None,
+                scope: Some(
+                    match view.filters.scope {
+                        tr_data::news_store::Scope::Symbol => "symbol",
+                        tr_data::news_store::Scope::Watchlist => "watchlist",
+                        tr_data::news_store::Scope::All => "market",
+                    }
+                    .into(),
+                ),
+                hours: Some(24),
+                limit: Some(50),
+                query: None,
+                include_summary: false,
+            });
+            let result = news::local_read(s, &args, &view.symbols).await.and_then(|v| {
+                serde_json::from_value::<tr_data::news_store::local::Digest>(v)
+                    .map(|d| d.markdown())
+                    .map_err(|e| e.to_string())
+            });
+            s.send(Response::DigestText { pane: view.pane, text: result });
+        }
         // N1b
         // N1a
         Request::OrderBook { pane, symbol, depth } => {

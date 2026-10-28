@@ -1301,6 +1301,25 @@ mod tests {
     // End A5b-MULTI transport test.
 
     #[tokio::test]
+    async fn n4_local_news_reads_round_trip_in_default_readonly_without_confirmation() {
+        let calls = vec![
+            call("read_news", json!({"scope":"market","hours":168,"limit":50})),
+            call("read_news", json!({"symbol":"NVDA","include_summary":true})),
+            call("read_filings", json!({"symbol":"NVDA","days":90,"forms":["8-K","4"]})),
+        ];
+        let connector = FakeConnector::new(vec![(Script::Calls(calls), false)]);
+        let mut bridge = bridge(connector.clone(), executor()).await;
+        bridge.send(turn()).await.unwrap();
+        assert!(matches!(finish(&mut bridge).await, BridgeEvent::Completed { calls: 3, .. }));
+        let replies = connector.replies.lock().unwrap();
+        assert!(replies.iter().all(|v| v["success"] == true), "{replies:?}");
+        for (reply, name) in replies.iter().zip(["read_news", "read_news", "read_filings"]) {
+            let value: Value = serde_json::from_str(reply["contentItems"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(value["tool"], name);
+        }
+    }
+
+    #[tokio::test]
     async fn every_readonly_tool_uses_chart_namespace_with_registry_specs_and_pin() {
         let calls = vec![
             call("analyze", json!({"symbol":"AAPL US Equity","mode":"trend","limit":30})),
@@ -1311,8 +1330,9 @@ mod tests {
             call("read_user_actions", json!({})),
             call("screenshot", json!({})),
         ];
-        // Workflow reads (+2), scanner reads (+3) and multi-symbol reads (+2) have separate round-trip tests.
-        assert_eq!(calls.len() + 7, Registry::new(ToolSet::ReadOnly).schemas().len());
+        // Workflow (+2), scanner (+3), multi-symbol (+2), and local news/filings (+2)
+        // reads have separate round-trip tests.
+        assert_eq!(calls.len() + 9, Registry::new(ToolSet::ReadOnly).schemas().len());
         let connector = FakeConnector::new(vec![(Script::Calls(calls), false)]);
         let mut bridge = bridge(connector.clone(), executor()).await;
         bridge.send(turn()).await.unwrap();

@@ -369,7 +369,12 @@ fn expansion_marks_every_member_seen_and_queues_one_write_per_item() {
 fn watches_are_global_prefs_with_legacy_defaults_and_roundtrip() {
     let mut prefs: crate::prefs::Prefs = serde_json::from_str("{}").unwrap();
     assert!(prefs.keyword_watches.is_empty());
-    prefs.keyword_watches.push(KeywordWatch { name: "Chips".into(), words: "NVDA \"AI chip\"".into(), colour: 5 });
+    prefs.keyword_watches.push(KeywordWatch {
+        name: "Chips".into(),
+        words: "NVDA \"AI chip\"".into(),
+        colour: 5,
+        notify: false,
+    });
     assert_eq!(serde_json::from_str::<crate::prefs::Prefs>(&serde_json::to_string(&prefs).unwrap()).unwrap(), prefs);
 }
 
@@ -733,8 +738,8 @@ fn review_filters_count_ignores_defined_watches() {
     let ctx = egui::Context::default();
     let mut pane = visible_pane();
     let mut watches = vec![
-        KeywordWatch { name: "Chips".into(), words: "chip".into(), colour: 0 },
-        KeywordWatch { name: "Fed".into(), words: "fed".into(), colour: 1 },
+        KeywordWatch { name: "Chips".into(), words: "chip".into(), colour: 0, notify: false },
+        KeywordWatch { name: "Fed".into(), words: "fed".into(), colour: 1, notify: false },
     ];
     let mut output = ctx.run_ui(
         egui::RawInput {
@@ -775,7 +780,7 @@ fn cache_invalidates_for_filters_watches_display_and_seen_only_when_changed() {
     let first = pane.cache.rebuilds;
     frame(&mut pane, &mut watches);
     assert_eq!(pane.cache.rebuilds, first);
-    watches.push(KeywordWatch { name: "Earnings".into(), words: "earnings".into(), colour: 2 });
+    watches.push(KeywordWatch { name: "Earnings".into(), words: "earnings".into(), colour: 2, notify: false });
     frame(&mut pane, &mut watches);
     assert_eq!(pane.cache.rebuilds, first + 1);
     pane.display.watch_hits = true;
@@ -799,7 +804,7 @@ fn unread_counts_displayed_clusters_and_watch_hits() {
     ui_frame(&ctx, &mut pane, 600.0, vec![], false);
     assert_eq!(pane.cache.unread, 3);
     pane.display.watch_hits = true;
-    let mut watches = vec![KeywordWatch { name: "No hits".into(), words: "absent".into(), colour: 0 }];
+    let mut watches = vec![KeywordWatch { name: "No hits".into(), words: "absent".into(), colour: 0, notify: false }];
     let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
         show(ui, &mut pane, &[], &mut watches, false, None, 0);
     });

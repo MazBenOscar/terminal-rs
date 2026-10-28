@@ -240,10 +240,13 @@ pub fn lot_key(t: &Transaction) -> String {
         |id| id.to_string(),
     )
 }
-/// Shared economics for summary and chart: amendments supersede originals, joint lots count once.
-/// Keep borrowed lots; this work runs on snapshot/filter changes, not per paint.
-pub fn effective_lots<'a>(rows: &'a [crate::Filing], symbol: &str) -> Vec<(&'a crate::Filing, &'a Transaction)> {
-    use std::collections::{BTreeMap, BTreeSet};
+/// Amendment-aware owner rows. Unlike economic lots, every joint owner is kept
+/// so cluster detection counts people without multiplying the purchase value.
+pub fn effective_transactions<'a>(
+    rows: &'a [crate::Filing],
+    symbol: &str,
+) -> Vec<(&'a crate::Filing, &'a Transaction)> {
+    use std::collections::BTreeMap;
     let mut amendments = BTreeMap::new();
     for f in rows.iter().filter(|f| !f.reporting_owner && f.form == "4/A") {
         for t in &f.insiders {
@@ -252,7 +255,6 @@ pub fn effective_lots<'a>(rows: &'a [crate::Filing], symbol: &str) -> Vec<(&'a c
             *entry = (*entry).max(rank);
         }
     }
-    let mut seen = BTreeSet::new();
     let mut result = vec![];
     for f in rows.iter().filter(|f| !f.reporting_owner && f.matches_symbol(symbol)) {
         for t in &f.insiders {
@@ -264,12 +266,19 @@ pub fn effective_lots<'a>(rows: &'a [crate::Filing], symbol: &str) -> Vec<(&'a c
             {
                 continue;
             }
-            if seen.insert((f.accession.as_str(), lot_key(t))) {
-                result.push((f, t));
-            }
+            result.push((f, t));
         }
     }
     result
+}
+/// Shared economics for summary and chart: amendments supersede originals, joint lots count once.
+/// Keep borrowed lots; this work runs on snapshot/filter changes, not per paint.
+pub fn effective_lots<'a>(rows: &'a [crate::Filing], symbol: &str) -> Vec<(&'a crate::Filing, &'a Transaction)> {
+    let mut seen = std::collections::BTreeSet::new();
+    effective_transactions(rows, symbol)
+        .into_iter()
+        .filter(|(f, t)| seen.insert((f.accession.as_str(), lot_key(t))))
+        .collect()
 }
 /// Strip only SEC's leading renderer directory. Reject unsafe/non-XML paths.
 pub fn xml_url(f: &crate::Filing) -> Option<String> {

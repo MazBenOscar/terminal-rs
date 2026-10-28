@@ -1332,10 +1332,18 @@ impl TerminalApp {
         self.save_sync(vec![write]);
     }
 
+    fn send_feed_config(&self) {
+        self.worker.send(Request::FeedConfig {
+            settings: self.prefs.feed_notifications.clone(),
+            watches: self.prefs.keyword_watches.clone(),
+            watched: self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect(),
+        });
+    }
     fn save_prefs(&mut self) {
         if self.agent_demo.is_some() {
             return;
         }
+        self.send_feed_config();
         if let Err(e) = self.prefs.save(&prefs_path()) {
             self.status = format!("Could not save preferences: {e}");
         }
@@ -2398,6 +2406,32 @@ impl TerminalApp {
                         }
                     }
                 }
+                Response::FeedNotices { desktop, history } => {
+                    self.price_alerts.feed_events = history;
+                    for body in desktop {
+                        crate::alert_delivery::spawn(
+                            crate::alert_delivery::notification_command("Terminal · News", &body),
+                            0,
+                        );
+                    }
+                }
+                Response::NewsVolume(volumes) => {
+                    for pane in &mut self.panes {
+                        if let PaneKind::News(n) = &mut pane.kind {
+                            n.interaction.volumes = volumes.clone();
+                        }
+                    }
+                }
+                Response::DigestText { pane, text } => match text {
+                    Ok(text) => {
+                        if let Some(PaneKind::News(n)) =
+                            self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        {
+                            n.interaction.digest_text = Some(text);
+                        }
+                    }
+                    Err(e) => self.status = e,
+                },
                 // N1b: stale query replies cannot replace a newly selected scope.
                 Response::NewsStatus { view, status, updated } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == view.pane)
@@ -2897,11 +2931,7 @@ impl TerminalApp {
                 }
             }
         }
-        let mut symbols: Vec<_> = if views.is_empty() {
-            vec![]
-        } else {
-            self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect()
-        };
+        let mut symbols: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
         symbols.sort();
         symbols.dedup();
         // Linked visible panes are eligible even outside every watchlist, and go first.
@@ -2914,6 +2944,7 @@ impl TerminalApp {
         let next = (views, linked);
         if self.news_subscription.as_ref() != Some(&next) {
             self.worker.send(Request::NewsVisible { views: next.0.clone(), watchlist: next.1.clone() });
+            self.send_feed_config();
             self.news_subscription = Some(next);
         }
     }

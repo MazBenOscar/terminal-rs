@@ -186,6 +186,227 @@ pub fn whole_word(text: &str, keywords: &str) -> bool {
         .any(|k| words.iter().any(|w| w == &k.to_lowercase()))
 }
 
+/// Offline N4 primitives shared by the worker, clipboard and agent.
+pub mod local {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    pub const DISCLOSURE: &str = "headlines and filing metadata from local storage";
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct Notifications {
+        pub filings: bool,
+        pub insiders: bool,
+        pub keywords: bool,
+        pub breaking: bool,
+        pub volume: bool,
+        pub insider_min: f64,
+        /// Local clock hours, start inclusive/end exclusive; equal means disabled.
+        pub quiet_start: u32,
+        pub quiet_end: u32,
+    }
+    impl Default for Notifications {
+        fn default() -> Self {
+            Self {
+                filings: false,
+                insiders: false,
+                keywords: false,
+                breaking: false,
+                volume: false,
+                insider_min: 100_000.,
+                quiet_start: 0,
+                quiet_end: 0,
+            }
+        }
+    }
+    pub fn quiet(start: u32, end: u32, hour: u32) -> bool {
+        if start == end {
+            false
+        } else if start < end {
+            (start..end).contains(&hour)
+        } else {
+            hour >= start || hour < end
+        }
+    }
+    pub fn fresh(published: i64, enabled: i64, session: i64, now: i64) -> bool {
+        published > enabled.max(session) && published <= now && now - published <= 7200
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct Volume {
+        pub key: String,
+        pub hour: i64,
+        pub count: u32,
+        pub usual: f64,
+        pub z: f64,
+    }
+    fn median(values: &mut [f64]) -> f64 {
+        values.sort_by(f64::total_cmp);
+        let n = values.len();
+        if n.is_multiple_of(2) { (values[n / 2 - 1] + values[n / 2]) / 2. } else { values[n / 2] }
+    }
+    /// Same UTC hour on up to 14 previous days. Missing hours AFTER coverage began
+    /// are zero, not missing history. Robust z uses MAD with a one-story floor.
+    pub fn volume_flag(key: &str, hour: i64, count: u32, history: &[(i64, u32)], coverage: i64) -> Option<Volume> {
+        let mut baseline: Vec<f64> = (1..=14)
+            .filter_map(|day| {
+                let h = hour - day * 86400;
+                (h >= coverage).then(|| history.iter().find(|(at, _)| *at == h).map_or(0., |(_, n)| f64::from(*n)))
+            })
+            .collect();
+        if baseline.len() < 3 || count < 5 {
+            return None;
+        }
+        let usual = median(&mut baseline);
+        let mut deviations: Vec<_> = baseline.iter().map(|n| (n - usual).abs()).collect();
+        let scale = (1.4826 * median(&mut deviations)).max(1.);
+        let z = (f64::from(count) - usual) / scale;
+        (z >= 3.).then(|| Volume { key: key.into(), hour, count, usual, z })
+    }
+    pub fn anomalies(items: &[Story], watched: &[String], now: i64, coverage: i64) -> Vec<Volume> {
+        let hour = now.div_euclid(3600) * 3600;
+        let mut counts: BTreeMap<String, BTreeMap<i64, u32>> = BTreeMap::new();
+        for item in items.iter().filter(|s| s.item.ts <= now) {
+            let h = item.item.ts.div_euclid(3600) * 3600;
+            let keys: BTreeSet<_> = item
+                .tags
+                .iter()
+                .map(|t| format!("Topic: {t}"))
+                .chain(item.item.tickers.iter().filter(|s| watched.contains(s)).cloned())
+                .collect();
+            for key in keys {
+                *counts.entry(key).or_default().entry(h).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .filter_map(|(key, hours)| {
+                volume_flag(
+                    &key,
+                    hour,
+                    *hours.get(&hour).unwrap_or(&0),
+                    &hours.into_iter().collect::<Vec<_>>(),
+                    coverage,
+                )
+            })
+            .collect()
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct DigestStory {
+        pub id: String,
+        pub time: String,
+        pub headline: String,
+        pub sources: Vec<String>,
+        pub source_count: usize,
+        pub subjects: Vec<String>,
+        pub tickers: Vec<String>,
+        pub tags: Vec<String>,
+        pub url_host: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub summary: Option<String>,
+    }
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct DigestGroup {
+        pub topic: String,
+        pub subject: String,
+        pub stories: Vec<DigestStory>,
+    }
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct Digest {
+        pub disclosure: String,
+        pub scope: String,
+        pub from: String,
+        pub to: String,
+        pub groups: Vec<DigestGroup>,
+        pub filings: serde_json::Value,
+        pub insider_summary: serde_json::Value,
+    }
+    pub fn iso(ts: i64) -> String {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_default()
+    }
+    /// Deterministic grouping: topic then first subject, recent stories first;
+    /// stable IDs break ties. Associations are never passed off as subjects.
+    pub fn digest(
+        items: &[Story],
+        scope: &str,
+        start: i64,
+        end: i64,
+        limit: usize,
+        include_summary: bool,
+        filings: serde_json::Value,
+    ) -> Digest {
+        let items: Vec<_> = items.iter().filter(|s| (start..=end).contains(&s.item.ts)).cloned().collect();
+        let mut stories = crate::news_intelligence::clusters(&items);
+        stories.sort_by(|a, b| b.newest.cmp(&a.newest).then(a.member_ids[0].cmp(&b.member_ids[0])));
+        let mut groups: BTreeMap<(String, String), Vec<DigestStory>> = BTreeMap::new();
+        for c in stories.into_iter().take(limit.min(50)) {
+            let topic = c.tags.first().cloned().unwrap_or_else(|| "Other".into());
+            let subject = c.subjects.first().cloned().unwrap_or_else(|| "Market".into());
+            let url_host = reqwest::Url::parse(&c.lead.item.link)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+                .unwrap_or_default();
+            groups.entry((topic, subject)).or_default().push(DigestStory {
+                id: c.member_ids[0].clone(),
+                time: iso(c.newest),
+                headline: c.lead.item.title,
+                source_count: c.sources.len(),
+                sources: c.sources,
+                subjects: c.subjects,
+                tickers: c.tickers,
+                tags: c.tags,
+                url_host,
+                summary: include_summary.then(|| c.lead.summary.chars().take(300).collect()),
+            });
+        }
+        Digest {
+            disclosure: DISCLOSURE.into(),
+            scope: scope.into(),
+            from: iso(start),
+            to: iso(end),
+            groups: groups
+                .into_iter()
+                .map(|((topic, subject), stories)| DigestGroup { topic, subject, stories })
+                .collect(),
+            insider_summary: filings.get("insider_summary").cloned().unwrap_or_else(|| serde_json::json!([])),
+            filings: filings.get("filings").cloned().unwrap_or(filings),
+        }
+    }
+    impl Digest {
+        pub fn markdown(&self) -> String {
+            let mut text =
+                format!("# News digest — {}\n{} → {}\n{}\n", self.scope, self.from, self.to, self.disclosure);
+            for group in &self.groups {
+                text.push_str(&format!("\n## {} · {}\n", group.topic, group.subject));
+                for s in &group.stories {
+                    text.push_str(&format!(
+                        "- {} · {} source(s) · {} [{}]\n",
+                        s.time,
+                        s.source_count,
+                        s.headline,
+                        s.tickers.join(", ")
+                    ));
+                }
+            }
+            if let Some(rows) = self.filings.as_array() {
+                text.push_str("\n## Filings and insiders\n");
+                for row in rows {
+                    text.push_str(&format!("- {row}\n"));
+                }
+            }
+            if let Some(rows) = self.insider_summary.as_array() {
+                for row in rows {
+                    text.push_str(&format!("- Insider summary: {row}\n"));
+                }
+            }
+            text
+        }
+    }
+}
+
 pub struct NewsStore {
     db: Connection,
     fts: bool,
@@ -362,7 +583,26 @@ impl NewsStore {
     pub fn prune(&self, now: i64) -> Result<usize> {
         Ok(self.db.execute("DELETE FROM items WHERE published < ?1 AND bookmark=0", [now - 90 * 86400])?)
     }
+    pub fn suppress_import(&self, stories: &[Story]) -> Result<()> {
+        for story in stories {
+            let identity_source = if story.provider.is_empty() { &story.source } else { &story.provider };
+            let canonical = Story::new(story.item.clone(), identity_source);
+            self.claim_notification("keyword", &canonical.id)?;
+            self.claim_notification("breaking-block", &canonical.id)?;
+        }
+        Ok(())
+    }
+    pub fn notification_blocked(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row("SELECT 1 FROM notification_seen WHERE kind='breaking-block' AND id=?1", [id], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
     pub fn insert(&mut self, stories: &[Story], now: i64) -> Result<()> {
+        if self.db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))? == 0 {
+            self.suppress_import(stories)?;
+        }
         let names = self.names.as_ref().unwrap_or_else(|| crate::news_intelligence::default_names());
         let tx = self.db.transaction()?;
         for story in stories {
@@ -422,6 +662,110 @@ impl NewsStore {
             [symbol],
             |r| r.get(0),
         )?)
+    }
+    /// N4 claims are independent of read state and survive retagging/restarts.
+    pub fn claim_notification(&self, kind: &str, id: &str) -> Result<bool> {
+        self.db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS notification_seen(kind TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(kind,id));",
+        )?;
+        Ok(self.db.execute("INSERT OR IGNORE INTO notification_seen VALUES(?1,?2)", params![kind, id])? == 1)
+    }
+    /// Persist every member, so a better lead, late earlier member or cluster
+    /// merge cannot manufacture a second identity after the threshold was met.
+    pub fn claim_cluster(&self, ids: &[String]) -> Result<bool> {
+        self.db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS notification_seen(kind TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(kind,id));",
+        )?;
+        let tx = self.db.unchecked_transaction()?;
+        let mut first = true;
+        for id in ids {
+            if tx.execute("INSERT OR IGNORE INTO notification_seen VALUES('breaking-member',?1)", [id])? == 0 {
+                first = false;
+            }
+        }
+        tx.commit()?;
+        Ok(first)
+    }
+    /// Claim before delivery: a crash can lose a notification, never replay it.
+    /// Overflow occupies its own rate slot, so summaries cannot exceed six/10m.
+    pub fn deliver_notifications(
+        &self,
+        messages: &[String],
+        now: i64,
+        quiet: bool,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        self.db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS notification_history(at INTEGER NOT NULL,body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS notification_slots(at INTEGER NOT NULL);",
+        )?;
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("DELETE FROM notification_slots WHERE at<=?1", [now - 600])?;
+        let used: i64 = tx.query_row("SELECT count(*) FROM notification_slots", [], |r| r.get(0))?;
+        let available = (6 - used).max(0) as usize;
+        let mut pending: usize = tx
+            .query_row("SELECT value FROM meta WHERE key='notification:overflow'", [], |r| r.get::<_, String>(0))
+            .optional()?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut desktop = vec![];
+        for body in messages {
+            tx.execute("INSERT INTO notification_history VALUES(?1,?2)", params![now, body])?;
+        }
+        if quiet {
+            pending = 0;
+        } else if pending == 0 && messages.len() <= available {
+            desktop.extend_from_slice(messages);
+        } else if available > 0 {
+            let individual = if pending == 0 { available.saturating_sub(1).min(messages.len()) } else { 0 };
+            desktop.extend_from_slice(&messages[..individual]);
+            desktop.push(format!("+{} more in News", pending + messages.len() - individual));
+            pending = 0;
+        } else {
+            pending += messages.len();
+        }
+        for _ in &desktop {
+            tx.execute("INSERT INTO notification_slots VALUES(?1)", [now])?;
+        }
+        tx.execute(
+            "INSERT INTO meta VALUES('notification:overflow',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [pending.to_string()],
+        )?;
+        tx.execute("DELETE FROM notification_history WHERE rowid NOT IN (SELECT rowid FROM notification_history ORDER BY rowid DESC LIMIT 200)", [])?;
+        let history = tx
+            .prepare("SELECT body FROM notification_history ORDER BY rowid DESC")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        tx.commit()?;
+        Ok((desktop, history))
+    }
+    /// SQL aggregation, not the UI's bounded headline snapshot, supplies coverage
+    /// and all hourly buckets. Missing buckets after the first stored item are zero.
+    pub fn volume_anomalies(&self, watched: &[String], now: i64) -> Result<Vec<local::Volume>> {
+        let coverage: Option<i64> = self.db.query_row("SELECT min(published) FROM items", [], |r| r.get(0))?;
+        let Some(coverage) = coverage else { return Ok(vec![]) };
+        let coverage = coverage.div_euclid(3600) * 3600;
+        let hour = now.div_euclid(3600) * 3600;
+        let mut counts = std::collections::BTreeMap::<String, Vec<(i64, u32)>>::new();
+        for (column, topic) in [("tags", true), ("tickers", false)] {
+            let sql = format!(
+                "SELECT j.value,(published/3600)*3600,count(DISTINCT items.id) FROM items,json_each(items.{column}) j WHERE published>=?1 AND published<=?2 GROUP BY j.value,published/3600"
+            );
+            for row in self.db.prepare(&sql)?.query_map(params![hour - 14 * 86400, now], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, u32>(2)?))
+            })? {
+                let (key, h, n) = row?;
+                if topic || watched.contains(&key) {
+                    counts.entry(if topic { format!("Topic: {key}") } else { key }).or_default().push((h, n));
+                }
+            }
+        }
+        Ok(counts
+            .into_iter()
+            .filter_map(|(key, history)| {
+                let n = history.iter().find(|(h, _)| *h == hour).map_or(0, |(_, n)| *n);
+                local::volume_flag(&key, hour, n, &history, coverage)
+            })
+            .collect())
     }
     pub fn mark_seen(&self, ids: &[String]) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;

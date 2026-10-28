@@ -1088,9 +1088,56 @@ impl ScopedHost {
 }
 // End A5b-SCAN bridge block.
 
+fn local_news_result(mut value: Value) -> ToolResult {
+    while value.to_string().len() > tr_agent_tools::MAX_TEXT_BYTES {
+        value["truncated"] = json!(true);
+        let removed = value
+            .get_mut("groups")
+            .and_then(Value::as_array_mut)
+            .and_then(|groups| groups.last_mut())
+            .and_then(|g| g["stories"].as_array_mut())
+            .and_then(Vec::pop)
+            .is_some();
+        if removed {
+            if value["groups"]
+                .as_array()
+                .and_then(|g| g.last())
+                .is_some_and(|g| g["stories"].as_array().is_some_and(Vec::is_empty))
+            {
+                value["groups"].as_array_mut().unwrap().pop();
+            }
+        } else if value.get_mut("filings").and_then(Value::as_array_mut).and_then(Vec::pop).is_none()
+            && value.get_mut("insider_summary").and_then(Value::as_array_mut).and_then(Vec::pop).is_none()
+        {
+            break;
+        }
+    }
+    ToolResult::json(value)
+}
 impl LiveHost for ScopedHost {
     fn call_live<'a>(&'a self, _: &'a str, args: LiveArgs) -> BridgeFuture<'a, ToolResult> {
         Box::pin(async move {
+            if matches!(args, LiveArgs::ReadNews(_) | LiveArgs::ReadFilings(_)) {
+                let input = args.clone();
+                let symbols = match self
+                    .job(ChartTarget::Application, move |app| match app.agent_news_symbols(&input) {
+                        Ok(symbols) => AgentReply { success: true, value: json!(symbols) },
+                        Err(e) => AgentReply::error(&e),
+                    })
+                    .await
+                {
+                    Ok(v) => serde_json::from_value::<Vec<String>>(v).unwrap_or_default(),
+                    Err(e) => return ToolResult::error("invalid_args", &e, None),
+                };
+                let (reply, receive) = oneshot::channel();
+                return match self
+                    .worker(Request::Agent(AgentRequest::LocalNews { args, symbols, reply }), receive)
+                    .await
+                {
+                    Ok(value) => local_news_result(value),
+                    Err(e) => ToolResult::error("local_storage_unavailable", &tr_agent_tools::scrub_text(&e), None),
+                };
+            }
             // A5b-SCAN: global tools do not require a pinned/live chart.
             if matches!(args, LiveArgs::ListScans(_) | LiveArgs::ReadScanResults(_) | LiveArgs::RunScan(_)) {
                 return self.scanner_tool(args).await;
@@ -1231,6 +1278,62 @@ mod tests {
                 confirmed: false,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn n4_local_bridge_routes_without_a_chart_or_provider() {
+        let queue = AgentToolQueue::new(egui::Context::default());
+        let mut host = host(queue.clone());
+        let (sender, mut receive) = mpsc::unbounded_channel();
+        host.app.worker = sender;
+        for args in [
+            LiveArgs::ReadNews(serde_json::from_value(json!({"symbol":"NVDA","include_summary":false})).unwrap()),
+            LiveArgs::ReadFilings(serde_json::from_value(json!({"symbol":"NVDA","forms":["8-K","4"]})).unwrap()),
+        ] {
+            let name = args.name();
+            let mut future = Box::pin(host.call_live(name, args));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            let job = queue.pop().unwrap();
+            assert!(matches!(job.chart, ChartTarget::Application));
+            job.reply.send(AgentReply { success: true, value: json!(["NVDA US Equity"]) }).unwrap();
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            let Request::Agent(AgentRequest::LocalNews { args, symbols, reply }) = receive.recv().await.unwrap() else {
+                panic!("local tool must not dispatch provider history, search or quotes")
+            };
+            assert_eq!(args.name(), name);
+            assert_eq!(symbols, ["NVDA US Equity"]);
+            reply.send(Ok(json!({"disclosure":tr_data::news_store::local::DISCLOSURE,"filings":[]}))).unwrap();
+            let value = scan_json(future.await);
+            assert_eq!(value["disclosure"], tr_data::news_store::local::DISCLOSURE);
+            assert!(receive.try_recv().is_err());
+        }
+        let args = LiveArgs::ReadNews(serde_json::from_value(json!({"watchlist":"Missing"})).unwrap());
+        let mut future = Box::pin(host.call_live("read_news", args));
+        assert!(futures::poll!(future.as_mut()).is_pending());
+        queue.pop().unwrap().reply.send(AgentReply::error("Unknown watchlist")).unwrap();
+        let result = future.await;
+        assert!(!result.success);
+        assert_eq!(scan_json(result)["error"]["code"], "invalid_args");
+        assert!(receive.try_recv().is_err());
+    }
+
+    #[test]
+    fn n4_local_result_cap_retains_disclosure_and_structured_shape() {
+        let value = json!({"disclosure":tr_data::news_store::local::DISCLOSURE,
+            "groups":[{"topic":"Earnings","subject":"NVDA US Equity",
+                "stories":vec![json!({"headline":"é".repeat(2000)});50]}],
+            "filings":vec![json!({"form":"8-K","items":"Results".repeat(100)});50],
+            "insider_summary":vec![json!({"symbol":"NVDA US Equity","buys":2});500]});
+        let result = local_news_result(value);
+        let tr_agent_tools::Content::Text(text) = &result.content[0] else { panic!() };
+        assert!(text.len() <= tr_agent_tools::MAX_TEXT_BYTES);
+        let value: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["disclosure"], tr_data::news_store::local::DISCLOSURE);
+        assert!(value["groups"].is_array());
+        assert!(value["filings"].is_array());
+        assert!(value["insider_summary"].is_array());
+        assert!(value.get("preview").is_none());
     }
 
     // A5b-SCAN bridge tests (manual queue and worker fakes; never a backend).

@@ -37,6 +37,10 @@ pub struct Interaction {
     pub watches_dirty: Option<std::time::Instant>,
     pub save_watches: bool,
     pub pending_keys: Vec<egui::Key>,
+    pub copy_digest: bool,
+    pub digest_text: Option<String>,
+    pub volumes: Vec<tr_data::news_store::local::Volume>,
+    pub dismissed_volume: Option<i64>,
 }
 // N1b: all history-sized work happens only on invalidation. Models, ranges,
 // metadata and unread counts are reused by settled frames.
@@ -536,6 +540,9 @@ fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narro
                 ui.add(egui::TextEdit::singleline(&mut watch.words).hint_text("Words").desired_width(dp(210.0)));
             changed |= response.changed();
             finished |= response.lost_focus();
+            let response = ui.checkbox(&mut watch.notify, "Notify");
+            changed |= response.changed();
+            finished |= response.changed();
             ui.horizontal(|ui| {
                 for colour in 0..6 {
                     let response = crate::feed_time::icon_button(
@@ -589,6 +596,43 @@ pub(super) fn show(
     link: Option<crate::layouts::Link>,
     active_watchlist: usize,
 ) -> Vec<Action> {
+    if let Some(text) = n.interaction.digest_text.take() {
+        ui.ctx().copy_text(text);
+    }
+    if n.filters.scope != Scope::All {
+        let symbols = n.query.as_ref().map(|q| q.symbols.as_slice()).unwrap_or_default();
+        if let Some(v) = n
+            .interaction
+            .volumes
+            .iter()
+            .filter(|v| {
+                v.hour != n.interaction.dismissed_volume.unwrap_or(-1)
+                    && (v.key.starts_with("Topic: ") || symbols.contains(&v.key))
+            })
+            .min_by_key(|v| v.key.starts_with("Topic: "))
+        {
+            let hour = v.hour;
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Unusual volume: {} {} stories this hour (usual {})",
+                        if v.key.starts_with("Topic: ") {
+                            &v.key
+                        } else {
+                            v.key.split_whitespace().next().unwrap_or(&v.key)
+                        },
+                        v.count,
+                        v.usual
+                    ))
+                    .font(ui_font(10.5))
+                    .color(theme::muted()),
+                );
+                if ui.small_button("Dismiss").clicked() {
+                    n.interaction.dismissed_volume = Some(hour);
+                }
+            });
+        }
+    }
     let before = n.filters.clone();
     let mut actions = vec![];
     let now = chrono::Utc::now().timestamp();
@@ -626,6 +670,14 @@ pub(super) fn show(
                 egui::Popup::menu(&more).show(|ui| {
                     ui.add(egui::Label::new(&status).wrap());
                     ui.separator();
+                    if ui
+                        .button("Copy digest")
+                        .on_hover_text("Copy a 24-hour digest from local headlines and filing metadata")
+                        .clicked()
+                    {
+                        n.interaction.copy_digest = true;
+                        ui.close();
+                    }
                     if ui.button("Reload").on_hover_text("Reload saved history; source pacing is unchanged").clicked() {
                         n.fetched = None;
                         n.read_in_view.clear();
