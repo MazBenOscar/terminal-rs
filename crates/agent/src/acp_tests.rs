@@ -733,6 +733,15 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
     }
     assert!(rpc.terminal_tool(&json!({"title":"terminal-rs_read_chart","kind":"other","rawInput":{"name":"an ordinary argument"},"_meta":null}), None).is_some());
     assert!(rpc.terminal_tool(&json!({"title":"terminal-rs_read_chart","kind":"other","rawInput":{"serverName":"foreign","name":"read_chart"},"_meta":null}), None).is_none());
+    // Live mimo 0.1.16: the final update for an approved call has an empty title
+    // and repeats the call's arguments; it keeps the approved identity.
+    let completed = json!({"title":"","kind":"other","status":"completed","rawInput":{"name":"an argument"},"rawOutput":{},"content":[]});
+    assert_eq!(rpc.terminal_tool(&completed, Some("read_chart")).as_deref(), Some("read_chart"));
+    // Without an approved ID an empty title is never a terminal-rs tool,
+    // and an update may not switch to another tool or an unsafe kind.
+    assert!(rpc.terminal_tool(&completed, None).is_none());
+    assert!(rpc.terminal_tool(&json!({"title":"terminal-rs_bash","kind":"other"}), Some("read_chart")).is_none());
+    assert!(rpc.terminal_tool(&json!({"title":"","kind":"execute"}), Some("read_chart")).is_none());
     let profile = sandbox_profile(
         Path::new("/private/data/agent/mimo"),
         &SandboxRoots {

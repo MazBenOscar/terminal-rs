@@ -141,7 +141,10 @@ impl Rpc {
                 .iter()
                 .find_map(|prefix| title.strip_prefix(prefix).map(str::to_owned))
         };
-        let (name, qualified) = if let Some(title) = call.get("title") {
+        // mimo's final "completed" update carries an empty title; for an
+        // already-approved ID that means "unchanged", not a different tool.
+        let blank_update = expected.is_some() && call.get("title").is_some_and(|title| title == "");
+        let (name, qualified) = if let Some(title) = call.get("title").filter(|_| !blank_update) {
             let title = title.as_str()?;
             match qualified_name(title) {
                 Some(name) => (name, true),
@@ -167,7 +170,7 @@ impl Rpc {
                 // workflow's `name` argument must not be mistaken for a tool.
                 if index == 1
                     && std::ptr::eq(fields, source)
-                    && call["title"].as_str().is_some_and(|title| title.starts_with("terminal-rs_"))
+                    && (blank_update || call["title"].as_str().is_some_and(|title| title.starts_with("terminal-rs_")))
                     && !["serverName", "server_name", "server"].iter().any(|key| fields.get(key).is_some())
                 {
                     continue;
