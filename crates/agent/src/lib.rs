@@ -8,9 +8,11 @@ extern crate self as tr_agent;
 #[path = "../examples/agent_bridge.rs"]
 mod sample_driver_tests;
 
+pub mod acp;
 pub mod bridge;
 pub mod codex;
 pub mod isolation;
+pub mod mcp;
 pub mod transcript;
 pub mod transport;
 

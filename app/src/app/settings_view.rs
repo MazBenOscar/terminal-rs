@@ -108,10 +108,11 @@ pub enum SettingsTab {
     Brokerage,
     DataSources,
     Trading,
+    Agent,
 }
 
 impl SettingsTab {
-    pub(super) const ALL: [SettingsTab; 8] = [
+    pub(super) const ALL: [SettingsTab; 9] = [
         SettingsTab::Appearance,
         SettingsTab::Themes,
         SettingsTab::Hotkeys,
@@ -120,6 +121,7 @@ impl SettingsTab {
         SettingsTab::Brokerage,
         SettingsTab::DataSources,
         SettingsTab::Trading,
+        SettingsTab::Agent,
     ];
 
     pub(super) fn label(self) -> &'static str {
@@ -132,6 +134,7 @@ impl SettingsTab {
             SettingsTab::Brokerage => "Brokerage",
             SettingsTab::DataSources => "Data sources",
             SettingsTab::Trading => "Trading",
+            SettingsTab::Agent => "Agent",
         }
     }
 }
@@ -221,6 +224,7 @@ impl TerminalApp {
                 SettingsTab::Brokerage => self.brokerage_tab(ui),
                 SettingsTab::DataSources => self.data_sources_tab(ui),
                 SettingsTab::Trading => self.trading_tab(ui, &mut cmds),
+                SettingsTab::Agent => self.agent_settings_panel(ui),
             }
         });
         cmds

@@ -130,6 +130,7 @@ fn settings_blurb(tab: SettingsTab) -> &'static str {
         SettingsTab::Brokerage => "SnapTrade keys and connected brokerages",
         SettingsTab::DataSources => "News and filings: Finnhub key, SEC contact, switches and shared budgets",
         SettingsTab::Trading => "Enable trading, order limits and confirmations",
+        SettingsTab::Agent => "Codex or mimo backend; external MCP access and read-only policy",
     }
 }
 

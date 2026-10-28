@@ -1,4 +1,7 @@
 //! App-thread integration. No bridge future owns or locks the app.
+#[cfg(test)]
+#[path = "../agent_mcp_tests.rs"]
+mod external_tests;
 use super::{PaneKind, TerminalApp};
 use crate::agent_bridge::AppExecutor;
 use crate::agent_pane::{self, Action, Onboarding, Settings};
@@ -45,6 +48,82 @@ fn pane_id(id: PaneId) -> egui::Id {
 }
 
 impl TerminalApp {
+    pub(super) fn agent_settings_panel(&mut self, ui: &mut egui::Ui) {
+        use crate::agent_mcp::Backend;
+        ui.heading("Agent");
+        let old = self.agent_config.clone();
+        ui.checkbox(&mut self.agent_config.allow_external, "Allow external agents (MCP)");
+        ui.add_enabled_ui(self.agent_config.allow_external, |ui| {
+            ui.checkbox(&mut self.agent_config.allow_external_edits, "Allow chart edits from external agents");
+        });
+        ui.label("Off by default. External clients can read chart and market data only while enabled. Writes still use the same validation and approval cards. Pin a chart in the Agent pane.");
+        ui.horizontal(|ui| {
+            ui.label("Backend:");
+            ui.selectable_value(&mut self.agent_config.backend, Backend::Codex, "Codex");
+            ui.selectable_value(&mut self.agent_config.backend, Backend::Mimo, "mimo");
+        });
+        ui.label("mimo uses the MCP switch and its read-only/edit policy above. Switching backend starts a new conversation. mimo uses ACP over stdio. Private-home authentication and sandbox/tool compatibility require manual verification; no personal credentials or CLI configuration are inherited.");
+        if old != self.agent_config {
+            self.apply_agent_settings(&old);
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn apply_agent_settings(&mut self, old: &crate::agent_mcp::Settings) {
+        if old.backend != self.agent_config.backend {
+            let settings = self.agent_pane.settings.clone();
+            self.agent_pane.session = None;
+            self.agent_pane = Default::default();
+            self.agent_pane.settings = settings;
+            self.agent_pane.initialized = true;
+            self.agent_pane.backend = self.agent_config.backend.label();
+            self.agent_pane.notice("Backend changed; a new thread will start. No prompt was replayed.");
+        }
+        // Closing the listener cancels accepted peers and queued UI work,
+        // including calls that were accepted with the old write policy.
+        self.external_agent = None;
+        self.external_attempted = false;
+        self.save_settings();
+    }
+
+    fn external_agent_logic(&mut self) {
+        if !self.external_startup_checked {
+            self.external_startup_checked = true;
+            if !self.agent_config.allow_external {
+                let data = self.settings_file.parent().unwrap_or(std::path::Path::new("."));
+                // Refusal leaves live listeners and ambiguous paths untouched.
+                let _ = tr_agent::mcp::cleanup_stale_socket(data);
+            }
+        }
+        if !self.agent_config.allow_external || self.agent_demo.is_some() {
+            self.external_agent = None;
+            self.external_attempted = false;
+            return;
+        }
+        let pin = AppExecutor::pin(self);
+        if let Some(server) = &self.external_agent {
+            *server.pin.lock().unwrap() = pin;
+        } else if !self.external_attempted {
+            self.external_attempted = true;
+            let data = self.settings_file.parent().unwrap_or(std::path::Path::new("."));
+            match crate::agent_mcp::ExternalServer::start(
+                data,
+                AppExecutor::new(self),
+                pin,
+                self.agent_config.allow_external_edits,
+            ) {
+                Ok(server) => self.external_agent = Some(server),
+                Err(error) => {
+                    if let Some(error) = error.downcast_ref::<tr_agent::mcp::SocketPathTooLong>() {
+                        self.agent_pane.notice(&error.to_string());
+                    } else {
+                        self.agent_pane.notice("External agent: could not open the private MCP socket. Check directory ownership or another live listener; toggle MCP to retry.");
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn agent_news_symbols(&self, args: &tr_agent_tools::args::LiveArgs) -> Result<Vec<String>, String> {
         use tr_agent_tools::args::LiveArgs;
         let symbol = match args {
@@ -262,6 +341,7 @@ impl TerminalApp {
         if self.agent_pane.workflows.proposals.iter().filter(|p| p.turn == turn).count() >= 10 {
             return ToolResult::error("proposal_limit", "At most 10 proposals per turn", None);
         }
+        let summary = if turn.starts_with("external-") { format!("External agent · {summary}") } else { summary };
         let user_owned = matches!(&args, UpdateAlert(_) | DeleteAlert(_))
             && before["agent_turn"]
                 .as_str()
@@ -553,11 +633,15 @@ impl TerminalApp {
                     .into(),
                 );
             }
-            self.agent_pane.workflows.context.push(WorkflowResult::Confirmation {
-                proposal_id: proposal.id,
-                status: result,
-                summary: decided.decision_summary(),
-            });
+            // External clients (including mimo) read their decisions on their
+            // own MCP connection; never steer or seed the in-app conversation.
+            if !turn.starts_with("external-") {
+                self.agent_pane.workflows.context.push(WorkflowResult::Confirmation {
+                    proposal_id: proposal.id,
+                    status: result,
+                    summary: decided.decision_summary(),
+                });
+            }
         }
         if self.agent_pane.running
             && self.agent_pane.workflows.context.len() > context_start
@@ -722,11 +806,13 @@ impl TerminalApp {
             .workflows
             .undone
             .insert(turn.into(), (chrono::Local::now().timestamp(), !summary.skipped.is_empty()));
-        self.agent_pane.workflows.context.push(tr_agent::codex::WorkflowResult::Undo {
-            turn: turn.into(),
-            reverted: summary.reverted,
-            kept: summary.skipped.clone(),
-        });
+        if !turn.starts_with("external-") {
+            self.agent_pane.workflows.context.push(tr_agent::codex::WorkflowResult::Undo {
+                turn: turn.into(),
+                reverted: summary.reverted,
+                kept: summary.skipped.clone(),
+            });
+        }
     }
 
     fn initialize_agent_choices(&mut self) {
@@ -760,6 +846,8 @@ impl TerminalApp {
 
     pub(super) fn agent_logic(&mut self, ctx: &egui::Context) {
         self.initialize_agent_choices();
+        self.external_agent_logic();
+        self.agent_pane.backend = self.agent_config.backend.label();
         self.agent_pane.workflows.expire(std::time::Instant::now(), None);
         if let Some(chart) = self.idx(self.focus).and_then(|i| match &self.panes[i].kind {
             PaneKind::Chart(chart) => Some(chart.uid),
@@ -867,11 +955,23 @@ impl TerminalApp {
         if self.agent_demo.is_some() {
             return;
         }
+        if self.agent_config.backend == crate::agent_mcp::Backend::Mimo && !self.agent_config.allow_external {
+            self.agent_pane.notice("mimo requires Allow external agents (MCP) in Settings › Agent. Chart edits remain off unless separately enabled.");
+            return;
+        }
         let Some(tools) = self.agent_pane.prepare_session_start() else { return };
+        // Codex's per-pane preset is not mimo's policy: its tools are served by
+        // the external socket. Keep the instructions/schema aligned with it.
+        let tools = self.agent_config.session_tools(tools);
         self.agent_pane.workflows.reset();
         self.agent_pane.session = None;
-        self.agent_pane.session =
-            Some(Session::start(ctx.clone(), AppExecutor::new(self), tr_alerts::data_dir(), tools));
+        self.agent_pane.session = Some(Session::start(
+            ctx.clone(),
+            AppExecutor::new(self),
+            tr_alerts::data_dir(),
+            tools,
+            self.agent_config.backend,
+        ));
     }
 
     fn refresh_agent_undo(&mut self) {

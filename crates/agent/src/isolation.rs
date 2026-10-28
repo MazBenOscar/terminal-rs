@@ -638,7 +638,7 @@ impl PrivateHome {
     }
 }
 
-fn quote(path: &Path) -> Result<String> {
+pub(crate) fn quote(path: &Path) -> Result<String> {
     let text = path.to_str().context("sandbox paths must be UTF-8")?;
     if !path.is_absolute()
         || text.chars().any(char::is_control)
@@ -773,20 +773,20 @@ fn process_table() -> Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-struct ProcessGroup {
+pub(crate) struct ProcessGroup {
     pid: std::sync::atomic::AtomicU32,
     descendants: std::sync::Mutex<std::collections::BTreeSet<u32>>,
     findings: std::sync::Mutex<Vec<String>>,
 }
 impl ProcessGroup {
-    fn new(pid: u32) -> Self {
+    pub(crate) fn new(pid: u32) -> Self {
         Self {
             pid: std::sync::atomic::AtomicU32::new(pid),
             descendants: Default::default(),
             findings: Default::default(),
         }
     }
-    fn refresh(&self) {
+    pub(crate) fn refresh(&self) {
         let pid = self.pid.load(std::sync::atomic::Ordering::SeqCst);
         if pid == 0 {
             return;
@@ -810,7 +810,7 @@ impl ProcessGroup {
             }
         }
     }
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         #[cfg(unix)]
         {
             unsafe extern "C" {
@@ -852,7 +852,7 @@ impl ProcessGroup {
             }
         }
     }
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         let findings = self.findings.lock().unwrap();
         if !findings.is_empty() {
             bail!("{}", findings.join("; "));
@@ -1059,7 +1059,7 @@ pub async fn spawn_session(
 type WriteAck = tokio::sync::oneshot::Receiver<std::io::Result<()>>;
 type WritePacket = (Vec<u8>, tokio::sync::oneshot::Sender<std::io::Result<()>>);
 
-struct ChildWriter {
+pub(crate) struct ChildWriter {
     sender: std::sync::mpsc::SyncSender<WritePacket>,
     pending: Option<WriteAck>,
 }
@@ -1125,7 +1125,7 @@ fn child_writer(mut stdin: impl std::io::Write + Send + 'static) -> ChildWriter 
     ChildWriter { sender, pending: None }
 }
 
-fn stdio_bridge(
+pub(crate) fn stdio_bridge(
     mut stdout: std::process::ChildStdout,
     stdin: std::process::ChildStdin,
 ) -> (tokio::io::DuplexStream, ChildWriter) {
