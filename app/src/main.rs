@@ -61,9 +61,14 @@ fn main() -> eframe::Result {
         }
         demo_error("Data directory unavailable".into())
     })?;
-    // SAFETY: startup is single-threaded and there are no environment readers yet.
-    unsafe {
-        std::env::set_var("TR_DATA_DIR", &data);
+    // Only canonicalize an explicit TR_DATA_DIR: setting it when the user did not
+    // would make the network guard treat the real app as an offline test instance.
+    // The default data dir is already absolute; the mimo child gets it explicitly.
+    if std::env::var_os("TR_DATA_DIR").is_some() {
+        // SAFETY: startup is single-threaded and there are no environment readers yet.
+        unsafe {
+            std::env::set_var("TR_DATA_DIR", &data);
+        }
     }
     if stdio {
         let result =
