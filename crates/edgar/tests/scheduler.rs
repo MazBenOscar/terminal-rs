@@ -665,6 +665,76 @@ async fn review_two_instances_double_feed_polling() {
 }
 
 #[tokio::test]
+async fn load_once_is_one_request_and_two_guards_share_the_24_hour_slot() {
+    let fake = Arc::new(Fake::new());
+    let requests = fake.requests.clone();
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../target/test-data/edgar/once-{}-{}.sqlite3",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+    ));
+    let guard = || {
+        tr_net::Guard::new(
+            tr_net::Config { ledger: path.clone(), data_dir: None, allow_external: false, max_wait: Duration::ZERO },
+            tr_net::Settings::default(),
+        )
+        .unwrap()
+    };
+    let mut first = Scheduler::new(store(), SharedFake(fake.clone(), guard()));
+    let mut second = Scheduler::new(store(), SharedFake(fake, guard()));
+    first.load_once(NOW, "AAPL US Equity").await;
+    assert!(first.status.contains("Loaded once"), "{}", first.status);
+    let rows = first.store.filings().unwrap();
+    assert!(!rows.is_empty());
+    assert!(rows.iter().all(|f| f.transient_symbol == "AAPL" && f.filed >= NOW - 30 * 86400));
+    assert!(rows.iter().all(|f| !f.insider_queued));
+    assert!(first.store.insider_backlog().unwrap().is_empty());
+    for key in ["initialized:320193", "attempt:320193", "window:320193", "watched", "feed_checked"] {
+        assert_eq!(first.store.number(key).unwrap(), 0, "one-shot must not start tracking: {key}");
+    }
+    first.load_once(NOW + 1, "AAPL US Equity").await;
+    second.load_once(NOW + 2, "AAPL US Equity").await;
+    assert!(first.status.contains("24 hours"));
+    assert!(second.status.contains("24 hours"));
+    assert!(second.store.filings().unwrap().is_empty());
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "no feeds, company map, history pages or Form 4 reads");
+    assert!(requests[0].contains("/submissions/CIK0000320193.json"));
+}
+
+#[tokio::test]
+async fn load_once_keeps_form4_metadata_without_queueing_document_reads() {
+    let transport = Scripted::new(vec![include_bytes!("fixtures/submissions_aapl.json").to_vec()]);
+    let mut scheduler = Scheduler::new(store(), transport);
+    scheduler.load_once(NOW, "AAPL US Equity").await;
+    assert!(scheduler.status.contains("Loaded once"), "{}", scheduler.status);
+    let rows = scheduler.store.filings().unwrap();
+    assert!(rows.iter().any(|f| f.form == "4"));
+    assert!(rows.iter().all(|f| f.insiders.is_empty() && !f.insider_queued));
+    assert!(scheduler.store.insider_backlog().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn load_once_refuses_offline_contact_and_reserved_budget_without_requests() {
+    for refusal in [Refused::Offline, Refused::NeedsContact] {
+        let mut fake = Fake::new();
+        fake.refused = Some(refusal);
+        let requests = fake.requests.clone();
+        let mut scheduler = Scheduler::new(store(), fake);
+        scheduler.load_once(NOW, "AAPL US Equity").await;
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(scheduler.status.contains("Load once:"));
+        assert!(!scheduler.status.contains("Loaded once"));
+    }
+    let mut transport = Scripted::new(vec![]);
+    transport.pending_allowed = false;
+    let mut scheduler = Scheduler::new(store(), transport);
+    scheduler.load_once(NOW, "AAPL US Equity").await;
+    assert!(scheduler.status.contains("reserved feed budget"));
+    assert!(scheduler.store.filings().unwrap().is_empty()); // Scripted panics on any unexpected get.
+}
+
+#[tokio::test]
 async fn first_run_imports_every_watched_company_within_minutes_spaced_a_minute_apart() {
     // Fresh install: no previous "watched" signature, so no company carries a new: flag.
     let fake = Fake::new();

@@ -22,6 +22,13 @@ pub struct Filing {
     pub insider_unavailable: bool,
     #[serde(default)]
     pub insider_parsed: bool,
+    #[serde(default)]
+    pub insider_queued: bool,
+    #[serde(default)]
+    pub insider_retry: i64,
+    /// One-shot rows belong to this symbol only, never the watchlist feed.
+    #[serde(default)]
+    pub transient_symbol: String,
     pub accession: String,
     pub cik: u64,
     pub ticker: String,
@@ -52,7 +59,13 @@ impl Filing {
         }
     }
     pub fn matches_issuer_symbol(&self, symbol: &str) -> bool {
-        ticker(symbol).is_some_and(|t| t == self.ticker || self.tickers.contains(&t))
+        ticker(symbol).is_some_and(|t| {
+            if self.transient_symbol.is_empty() {
+                t == self.ticker || self.tickers.contains(&t)
+            } else {
+                t == self.transient_symbol
+            }
+        })
     }
     pub fn matches_symbol(&self, symbol: &str) -> bool {
         self.matches_issuer_symbol(symbol)

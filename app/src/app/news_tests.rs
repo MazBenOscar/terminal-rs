@@ -195,11 +195,18 @@ fn row_columns_omit_linked_symbol_and_include_union_meta() {
     assert_eq!(model.id, stories[0].id);
     assert_eq!(model.time, "12m");
     assert!(model.full_time.contains("UTC"));
-    assert_eq!(model.ticker.as_deref(), Some("MSFT US Equity"));
+    assert_eq!(model.ticker, None, "a later subject must not replace the linked first subject");
     assert_eq!(chart_ticker(&cluster, Some("AAPL US Equity"), &[]).map(String::as_str), Some("MSFT US Equity"));
-    assert_eq!(model.extra_tickers, vec!["NVDA US Equity"]);
-    assert!(model.meta.starts_with("Reuters +2 · +1"));
+    assert!(model.extra_tickers.is_empty());
+    assert!(model.meta.starts_with("Reuters +2"));
+    let preceding = row_model(&cluster, Some("MSFT US Equity"), cluster.newest);
+    assert_eq!(preceding.ticker.as_deref(), Some("AAPL US Equity"));
+    assert!(preceding.extra_tickers.is_empty());
     assert!(model.meta.contains("Earnings"));
+    assert_eq!(&model.meta_steps[1..], &["Reuters +2", "Reuters +2", "Reuters", ""]);
+    let unlinked = row_model(&cluster, None, cluster.newest);
+    assert!(unlinked.meta_steps[0].contains("Earnings"));
+    assert_eq!(&unlinked.meta_steps[1..], &["Reuters +2 · +2", "Reuters +2", "Reuters", ""]);
     assert!(model.unread);
     cluster.members[0].seen = true;
     assert!(!row_model(&cluster, None, cluster.newest).unread);
@@ -414,6 +421,44 @@ fn visible_pane() -> NewsPane {
     }
     pane
 }
+#[test]
+fn header_scope_labels_and_vector_overflow_survive_340pt() {
+    for scope in [Scope::All, Scope::Symbol, Scope::Watchlist] {
+        let ctx = egui::Context::default();
+        let mut pane = visible_pane();
+        pane.symbol = Some("AAPL US Equity".into());
+        pane.filters.scope = scope.clone();
+        pane.status = "Finnhub · updated now · A very long diagnostic with 216 pending rows".into();
+        let lists =
+            [NamedWatchlist { name: "Core list".into(), symbols: vec!["AAPL US Equity".into()], ..Default::default() }];
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(340., 400.))),
+                ..Default::default()
+            },
+            |ui| {
+                show(ui, &mut pane, &lists, &mut vec![], true, None, 0);
+            },
+        );
+        let labels = text_shapes(&output);
+        let header: Vec<_> = labels.iter().filter(|(_, p)| p.y < dp(25.)).map(|(s, _)| s.as_str()).collect();
+        assert_eq!(header.contains(&"AAPL"), scope == Scope::Symbol, "{header:?}");
+        assert_eq!(header.contains(&"Core list"), scope == Scope::Watchlist, "{header:?}");
+        assert!(labels.iter().any(|(s, p)| s.starts_with("Unread ") && p.y >= dp(20.)));
+        let dots = output
+            .shapes
+            .iter()
+            .filter(|shape| {
+                matches!(&shape.shape,
+                    egui::Shape::Circle(c) if c.center.x > 310. && c.center.x < 340. && c.center.y < dp(25.)
+                )
+            })
+            .count();
+        assert_eq!(dots, 3, "overflow must remain painted at the right edge");
+        output.textures_delta.clear();
+    }
+}
+
 #[test]
 fn feed_chrome_stays_two_lines_and_rows_are_dense_at_narrow_widths() {
     for width in [320.0, 359.0, 360.0, 600.0] {

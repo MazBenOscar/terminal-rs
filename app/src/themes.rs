@@ -302,7 +302,7 @@ fn bloomberg() -> Theme {
             border: Hex::rgba(255, 176, 0, 46),
             grid: Hex::rgb(26, 20, 6),
             text: Hex::rgb(255, 176, 0),
-            muted: Hex::rgb(160, 112, 24),
+            muted: Hex::rgb(170, 122, 34),
             highlight: Hex::rgb(255, 214, 102),
             highlight_dim: Hex::rgb(170, 130, 40),
             info: Hex::rgb(96, 200, 255),
@@ -371,8 +371,6 @@ fn high_contrast() -> Theme {
 // Solarized by Ethan Schoonover: base and accent tones.
 const S_BASE03: Hex = Hex::rgb(0x00, 0x2b, 0x36);
 const S_BASE02: Hex = Hex::rgb(0x07, 0x36, 0x42);
-const S_BASE00: Hex = Hex::rgb(0x65, 0x7b, 0x83);
-const S_BASE0: Hex = Hex::rgb(0x83, 0x94, 0x96);
 const S_BASE1: Hex = Hex::rgb(0x93, 0xa1, 0xa1);
 const S_BASE2: Hex = Hex::rgb(0xee, 0xe8, 0xd5);
 const S_BASE3: Hex = Hex::rgb(0xfd, 0xf6, 0xe3);
@@ -397,7 +395,7 @@ fn solarized_dark() -> Theme {
             border: Hex::rgba(0x93, 0xa1, 0xa1, 40),
             grid: Hex::rgb(0x0a, 0x3a, 0x46),
             text: Hex::rgb(0xd0, 0xd8, 0xd8),
-            muted: S_BASE0,
+            muted: S_BASE1,
             highlight: S_YELLOW,
             highlight_dim: Hex::rgb(0x7d, 0x5f, 0x00),
             info: S_CYAN,
@@ -429,14 +427,14 @@ fn solarized_light() -> Theme {
             border: Hex::rgba(0x58, 0x6e, 0x75, 46),
             grid: Hex::rgb(0xf0, 0xea, 0xd6),
             text: Hex::rgb(0x07, 0x36, 0x42),
-            muted: S_BASE00,
+            muted: Hex::rgb(0x54, 0x69, 0x70),
             highlight: Hex::rgb(0x9a, 0x6f, 0x00),
             highlight_dim: S_BASE1,
             info: S_CYAN,
             control: Hex::rgba(0x58, 0x6e, 0x75, 22),
             control_hover: Hex::rgba(0x58, 0x6e, 0x75, 38),
             accent: Some(S_BLUE),
-            up: S_GREEN,
+            up: Hex::rgb(0x80, 0x94, 0x00),
             down: S_RED,
             candle_up: S_GREEN,
             candle_down: S_RED,
@@ -462,7 +460,7 @@ fn nord() -> Theme {
             border: Hex::rgba(0xd8, 0xde, 0xe9, 30),
             grid: Hex::rgb(0x31, 0x37, 0x44),
             text: Hex::rgb(0xec, 0xef, 0xf4),
-            muted: Hex::rgb(0x9a, 0xa5, 0xb8),
+            muted: Hex::rgb(0xa8, 0xb2, 0xc3),
             highlight: Hex::rgb(0xeb, 0xcb, 0x8b),
             highlight_dim: Hex::rgb(0xa8, 0x91, 0x63),
             info: Hex::rgb(0x88, 0xc0, 0xd0),
@@ -502,7 +500,7 @@ fn monokai() -> Theme {
             border: Hex::rgba(0xf8, 0xf8, 0xf2, 28),
             grid: Hex::rgb(0x2c, 0x2d, 0x27),
             text: Hex::rgb(0xf8, 0xf8, 0xf2),
-            muted: Hex::rgb(0x90, 0x8c, 0x76),
+            muted: Hex::rgb(0xae, 0xa9, 0x94),
             highlight: Hex::rgb(0xe6, 0xdb, 0x74),
             highlight_dim: Hex::rgb(0xa0, 0x98, 0x50),
             info: Hex::rgb(0x66, 0xd9, 0xef),
@@ -542,7 +540,7 @@ fn midnight_violet() -> Theme {
             border: Hex::rgba(0xc8, 0xb4, 0xff, 22),
             grid: Hex::rgb(0x17, 0x1d, 0x2b),
             text: Hex::rgb(0xe2, 0xda, 0xf0),
-            muted: Hex::rgb(0x7a, 0x68, 0x90),
+            muted: Hex::rgb(0x9b, 0x87, 0xb0),
             highlight: Hex::rgb(0xb0, 0x7a, 0xe0),
             highlight_dim: Hex::rgb(0x7c, 0x4f, 0xae),
             info: Hex::rgb(0x4a, 0x82, 0xd8),
@@ -582,7 +580,7 @@ fn catppuccin_mocha() -> Theme {
             border: Hex::rgba(0xcd, 0xd6, 0xf4, 28),
             grid: Hex::rgb(0x25, 0x25, 0x36),
             text: Hex::rgb(0xcd, 0xd6, 0xf4),
-            muted: Hex::rgb(0x7f, 0x84, 0x9c),
+            muted: Hex::rgb(0xa6, 0xad, 0xc8),
             highlight: Hex::rgb(0xf9, 0xe2, 0xaf),
             highlight_dim: Hex::rgb(0xa9, 0x9a, 0x78),
             info: Hex::rgb(0x74, 0xc7, 0xec),
@@ -621,14 +619,14 @@ fn catppuccin_latte() -> Theme {
             border: Hex::rgba(0x4c, 0x4f, 0x69, 40),
             grid: Hex::rgb(0xe3, 0xe6, 0xec),
             text: Hex::rgb(0x4c, 0x4f, 0x69),
-            muted: Hex::rgb(0x6c, 0x6f, 0x85),
-            highlight: Hex::rgb(0xfe, 0x64, 0x0b),
+            muted: Hex::rgb(0x62, 0x65, 0x79),
+            highlight: Hex::rgb(0xce, 0x4f, 0x09),
             highlight_dim: Hex::rgb(0xdf, 0x8e, 0x1d),
             info: Hex::rgb(0x20, 0x9f, 0xb5),
             control: Hex::rgba(0x4c, 0x4f, 0x69, 18),
             control_hover: Hex::rgba(0x4c, 0x4f, 0x69, 32),
             accent: Some(Hex::rgb(0x88, 0x39, 0xef)),
-            up: Hex::rgb(0x40, 0xa0, 0x2b),
+            up: Hex::rgb(0x3e, 0x9c, 0x2a),
             down: Hex::rgb(0xd2, 0x0f, 0x39),
             candle_up: Hex::rgb(0x40, 0xa0, 0x2b),
             candle_down: Hex::rgb(0xd2, 0x0f, 0x39),
@@ -701,8 +699,8 @@ fn rose_pine_dawn() -> Theme {
             border: Hex::rgba(0x46, 0x42, 0x61, 36),
             grid: Hex::rgb(0xf4, 0xed, 0xe8),
             text: Hex::rgb(0x46, 0x42, 0x61),
-            muted: Hex::rgb(0x79, 0x75, 0x93),
-            highlight: Hex::rgb(0xea, 0x9d, 0x34),
+            muted: Hex::rgb(0x69, 0x65, 0x80),
+            highlight: Hex::rgb(0xb7, 0x77, 0x1b),
             highlight_dim: Hex::rgb(0xd7, 0x82, 0x7e),
             info: Hex::rgb(0x90, 0x7a, 0xa9),
             control: Hex::rgba(0x46, 0x42, 0x61, 18),
@@ -741,7 +739,7 @@ fn tokyo_night() -> Theme {
             border: Hex::rgba(0xc0, 0xca, 0xf5, 26),
             grid: Hex::rgb(0x1f, 0x23, 0x35),
             text: Hex::rgb(0xc0, 0xca, 0xf5),
-            muted: Hex::rgb(0x73, 0x7a, 0xa2),
+            muted: Hex::rgb(0x90, 0x99, 0xbf),
             highlight: Hex::rgb(0xe0, 0xaf, 0x68),
             highlight_dim: Hex::rgb(0xa0, 0x7d, 0x4c),
             info: Hex::rgb(0x7d, 0xcf, 0xff),
@@ -781,7 +779,7 @@ fn dracula() -> Theme {
             border: Hex::rgba(0xf8, 0xf8, 0xf2, 26),
             grid: Hex::rgb(0x2e, 0x30, 0x3e),
             text: Hex::rgb(0xf8, 0xf8, 0xf2),
-            muted: Hex::rgb(0x62, 0x72, 0xa4),
+            muted: Hex::rgb(0x95, 0xa2, 0xc7),
             highlight: Hex::rgb(0xf1, 0xfa, 0x8c),
             highlight_dim: Hex::rgb(0xa8, 0xae, 0x62),
             info: Hex::rgb(0x8b, 0xe9, 0xfd),
@@ -821,7 +819,7 @@ fn everforest_dark() -> Theme {
             border: Hex::rgba(0xd3, 0xc6, 0xaa, 28),
             grid: Hex::rgb(0x31, 0x3a, 0x3f),
             text: Hex::rgb(0xd3, 0xc6, 0xaa),
-            muted: Hex::rgb(0x85, 0x92, 0x89),
+            muted: Hex::rgb(0xa1, 0xad, 0xa3),
             highlight: Hex::rgb(0xdb, 0xbc, 0x7f),
             highlight_dim: Hex::rgb(0xa0, 0x8a, 0x5c),
             info: Hex::rgb(0x7f, 0xbb, 0xb3),
@@ -860,14 +858,14 @@ fn everforest_light() -> Theme {
             border: Hex::rgba(0x5c, 0x6a, 0x72, 40),
             grid: Hex::rgb(0xf4, 0xf0, 0xd9),
             text: Hex::rgb(0x5c, 0x6a, 0x72),
-            muted: Hex::rgb(0x93, 0x9f, 0x91),
-            highlight: Hex::rgb(0xf5, 0x7d, 0x26),
+            muted: Hex::rgb(0x61, 0x6e, 0x62),
+            highlight: Hex::rgb(0xcf, 0x64, 0x15),
             highlight_dim: Hex::rgb(0xdf, 0xa0, 0x00),
             info: Hex::rgb(0x3a, 0x94, 0xc5),
             control: Hex::rgba(0x5c, 0x6a, 0x72, 18),
             control_hover: Hex::rgba(0x5c, 0x6a, 0x72, 32),
             accent: Some(Hex::rgb(0x35, 0xa7, 0x7c)),
-            up: Hex::rgb(0x8d, 0xa1, 0x01),
+            up: Hex::rgb(0x81, 0x93, 0x00),
             down: Hex::rgb(0xf8, 0x55, 0x52),
             candle_up: Hex::rgb(0x8d, 0xa1, 0x01),
             candle_down: Hex::rgb(0xf8, 0x55, 0x52),
@@ -900,7 +898,7 @@ fn gruvbox_dark() -> Theme {
             border: Hex::rgba(0xeb, 0xdb, 0xb2, 28),
             grid: Hex::rgb(0x32, 0x30, 0x2f),
             text: Hex::rgb(0xeb, 0xdb, 0xb2),
-            muted: Hex::rgb(0x92, 0x83, 0x74),
+            muted: Hex::rgb(0xb0, 0xa1, 0x8f),
             highlight: Hex::rgb(0xfa, 0xbd, 0x2f),
             highlight_dim: Hex::rgb(0xd7, 0x99, 0x21),
             info: Hex::rgb(0x83, 0xa5, 0x98),
@@ -939,7 +937,7 @@ fn gruvbox_light() -> Theme {
             border: Hex::rgba(0x3c, 0x38, 0x36, 40),
             grid: Hex::rgb(0xf4, 0xe8, 0xc1),
             text: Hex::rgb(0x3c, 0x38, 0x36),
-            muted: Hex::rgb(0x7c, 0x6f, 0x64),
+            muted: Hex::rgb(0x6b, 0x5f, 0x55),
             highlight: Hex::rgb(0xb5, 0x76, 0x14),
             highlight_dim: Hex::rgb(0xd7, 0x99, 0x21),
             info: Hex::rgb(0x07, 0x66, 0x78),
@@ -1121,6 +1119,40 @@ mod tests {
 
     fn lum(c: Color32) -> f32 {
         0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32
+    }
+
+    #[test]
+    fn feed_roles_meet_wcag_contrast_in_every_builtin() {
+        let lum = |c: Color32| {
+            let channel = |v: u8| {
+                let v = f64::from(v) / 255.;
+                if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+        };
+        let ratio = |a, b| {
+            let (a, b) = (lum(a), lum(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        let mut failures = vec![];
+        for t in builtins() {
+            let p = t.palette(crate::theme::DEFAULT_ACCENT);
+            for (name, fg) in [("text", p.text), ("muted", p.muted)] {
+                for (surface, bg) in [("card", p.card), ("header", p.card_header)] {
+                    let r = ratio(fg, bg);
+                    if r < 4.5 {
+                        failures.push(format!("{} {name}/{surface}: {r:.2}", t.name));
+                    }
+                }
+            }
+            for (name, fg) in [("up", p.up), ("down", p.down), ("amber", p.amber)] {
+                let r = ratio(fg, p.card);
+                if r < 3. {
+                    failures.push(format!("{} {name}/card: {r:.2}", t.name));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

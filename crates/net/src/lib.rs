@@ -14,8 +14,35 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const GROUPS: [&str; 4] = ["finnhub", "sec", "yahoo-news", "coindesk"];
+pub const GROUPS: [&str; 6] = ["finnhub", "sec", "yahoo-news", "coindesk", "house-disclosures", "house-roster"];
+
+/// Permanent network prohibition, independent of switches, aliases and future policies.
+fn disabled_host(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        let host = host.trim_end_matches('.');
+        host == "senate.gov" || host.ends_with(".senate.gov")
+    })
+}
 const BODY_CAP: usize = 8 * 1024 * 1024;
+
+fn trim_signature_prefix(mut bytes: &[u8]) -> &[u8] {
+    loop {
+        bytes = bytes.trim_ascii_start();
+        match bytes.strip_prefix(b"\xef\xbb\xbf") {
+            Some(rest) => bytes = rest,
+            None => return bytes,
+        }
+    }
+}
+
+fn house_roster_signature(bytes: &[u8]) -> bool {
+    let mut text = String::from_utf8_lossy(bytes);
+    if text.starts_with("<?xml") {
+        let Some((_, rest)) = text.split_once("?>") else { return false };
+        text = std::borrow::Cow::Owned(rest.trim_start().to_owned());
+    }
+    text.strip_prefix("<MemberData").is_some_and(|rest| rest.starts_with(['>', '/', ' ', '\t', '\r', '\n']))
+}
 
 #[derive(Clone, Debug)]
 pub struct HostPolicy {
@@ -45,6 +72,8 @@ pub fn policies() -> Vec<HostPolicy> {
         ("query1.finance.yahoo.com", "yahoo-news", 5, 12, 1000),
         ("query2.finance.yahoo.com", "yahoo-news", 5, 12, 1000),
         ("www.coindesk.com", "coindesk", 300, 1, 300),
+        ("disclosures-clerk.house.gov", "house-disclosures", 3, 20, 400),
+        ("clerk.house.gov", "house-roster", 3, 20, 20),
     ]
     .into_iter()
     .map(|(host, group, seconds, per_minute, daily_cap)| HostPolicy {
@@ -54,7 +83,11 @@ pub fn policies() -> Vec<HostPolicy> {
         per_minute,
         daily_cap,
         concurrency: 1,
-        cache_ttl: if matches!(group, "coindesk" | "yahoo-news") { Duration::from_secs(300) } else { Duration::ZERO },
+        cache_ttl: match group {
+            "coindesk" | "yahoo-news" => Duration::from_secs(300),
+            "house-roster" => Duration::from_secs(86400),
+            _ => Duration::ZERO,
+        },
         user_agent: match group {
             "yahoo-news" => UserAgent::YahooLegacy,
             "sec" => UserAgent::SecContact,
@@ -73,6 +106,8 @@ pub struct Settings {
     pub sec: bool,
     pub yahoo_news: bool,
     pub coindesk: bool,
+    pub house_disclosures: bool,
+    pub house_roster: bool,
     pub sec_contact: String,
     #[serde(skip)]
     pub settings_error: bool,
@@ -85,6 +120,8 @@ impl Default for Settings {
             sec: true,
             yahoo_news: true,
             coindesk: true,
+            house_disclosures: true,
+            house_roster: true,
             sec_contact: String::new(),
             settings_error: false,
         }
@@ -98,6 +135,8 @@ impl Settings {
             sec: false,
             yahoo_news: false,
             coindesk: false,
+            house_disclosures: false,
+            house_roster: false,
             settings_error: true,
             ..Self::default()
         }
@@ -121,6 +160,8 @@ impl Settings {
                 "sec" => self.sec,
                 "yahoo-news" => self.yahoo_news,
                 "coindesk" => self.coindesk,
+                "house-disclosures" => self.house_disclosures,
+                "house-roster" => self.house_roster,
                 _ => false,
             }
     }
@@ -675,8 +716,12 @@ impl Guard {
         daily_limit: u32,
         counter: Option<(&str, u32)>,
     ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
-        self.identity(group)?;
         let request = request.build().map_err(|_| Refused::InvalidRequest)?;
+        // This prohibition takes precedence even over offline/unknown-group errors.
+        if disabled_host(request.url()) {
+            return Err(Refused::Disabled);
+        }
+        self.identity(group)?;
         let policy = self.policy(group, request.url())?;
         if request.method() != reqwest::Method::GET {
             return self.send_uncached(group, request, daily_limit, counter).await;
@@ -719,6 +764,9 @@ impl Guard {
         Ok(())
     }
     fn policy(&self, group: &str, url: &reqwest::Url) -> Result<HostPolicy, Refused> {
+        if disabled_host(url) {
+            return Err(Refused::Disabled);
+        }
         if url.scheme() != "https"
             || url.port_or_known_default() != Some(443)
             || !url.username().is_empty()
@@ -795,6 +843,9 @@ impl Guard {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| original.join(v).ok())
                     .ok_or_else(|| Refused::Redirect("<invalid>".into()))?;
+                if disabled_host(&target) {
+                    return Err(Refused::Disabled);
+                }
                 if hop == 3 || self.policy(group, &target).is_err() {
                     return Err(Refused::Redirect(target.host_str().unwrap_or("<none>").to_owned()));
                 }
@@ -820,8 +871,24 @@ impl Guard {
                 }
                 body.extend_from_slice(&chunk);
             }
-            if html_response(&content_type, &body) && blocked_body(&body) {
-                return Err(self.pause(group, "Access denied / captcha", retry.as_deref())?);
+            // Signatures ignore the whitespace / UTF-8 BOM sometimes prepended by the Clerk.
+            let signature = trim_signature_prefix(&body);
+            let roster_refused =
+                group == "house-roster" && (200..300).contains(&status) && !house_roster_signature(signature);
+            let house_download_refused = group == "house-disclosures"
+                && (200..300).contains(&status)
+                && ((original.path().ends_with(".pdf") && !signature.starts_with(b"%PDF-"))
+                    || (original.path().ends_with(".zip")
+                        && ![b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"]
+                            .iter()
+                            .any(|magic| body.starts_with(*magic))));
+            if (html_response(&content_type, &body) && blocked_body(&body)) || house_download_refused || roster_refused
+            {
+                return Err(self.pause(
+                    group,
+                    "Access denied / captcha or invalid disclosure download",
+                    retry.as_deref(),
+                )?);
             }
             if !(200..300).contains(&status) && status != 304 {
                 return Err(Refused::Http(status));

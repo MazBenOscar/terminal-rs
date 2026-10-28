@@ -4576,6 +4576,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tr-net",
  "tracing",
  "tracing-subscriber",
  "zip",

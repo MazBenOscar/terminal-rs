@@ -89,7 +89,9 @@ impl Settings {
     }
     fn matches_cached(&self, filing: &Filing, watched: &[String], now: i64, text: &str, query: &str) -> bool {
         self.matches(filing, watched)
-            && filing.time() >= now - i64::from(self.days) * 86400
+            && filing.time()
+                >= now
+                    - i64::from(if filing.transient_symbol.is_empty() { self.days } else { self.days.min(30) }) * 86400
             && (!self.buys_sells_only
                 || !Form::Insider.matches(&filing.form)
                 || filing.insiders.iter().any(|t| {
@@ -123,7 +125,11 @@ impl Settings {
     }
     pub fn matches(&self, filing: &Filing, watched: &[String]) -> bool {
         !filing.reporting_owner
-            && watched.iter().any(|s| filing.matches_symbol(s))
+            && if filing.transient_symbol.is_empty() {
+                watched.iter().any(|s| filing.matches_symbol(s))
+            } else {
+                self.scope == Scope::Symbol && self.symbol.as_deref().is_some_and(|s| filing.matches_symbol(s))
+            }
             && self.form.matches(&filing.form)
             && (self.scope == Scope::Watchlist || self.symbol.as_deref().is_some_and(|s| filing.matches_symbol(s)))
     }
@@ -163,6 +169,9 @@ fn haystack(f: &Filing) -> String {
 struct Runtime {
     cache_source: Option<Arc<Vec<Filing>>>,
     haystacks: Vec<String>,
+    row_models: std::collections::BTreeMap<String, (String, String)>,
+    unread: usize,
+    cache_read_len: usize,
     cache_settings: Option<Settings>,
     cache_watched: Vec<String>,
     cache_minute: i64,
@@ -179,6 +188,64 @@ struct Runtime {
     heights: std::collections::BTreeMap<String, f32>,
     anchor: Option<(String, f32)>,
 }
+impl Runtime {
+    fn update(&mut self, settings: &Settings, state: &State, watched: &[String], now: i64) -> Arc<Vec<Filing>> {
+        if settings.paused {
+            if self.paused_rows.is_none() {
+                self.paused_rows = Some(state.rows.clone());
+            }
+        } else {
+            self.paused_rows = None;
+        }
+        let stored = self.paused_rows.clone().unwrap_or_else(|| state.rows.clone());
+        let changed = self.cache_source.as_ref().is_none_or(|source| !Arc::ptr_eq(source, &stored));
+        if changed {
+            self.haystacks = stored.iter().map(haystack).collect();
+            self.cache_source = Some(stored.clone());
+        }
+        let rebuild = changed
+            || self.cache_settings.as_ref() != Some(settings)
+            || self.cache_watched != watched
+            || self.cache_minute != now / 60;
+        if rebuild {
+            let query = settings.search.trim().to_ascii_lowercase();
+            self.filtered = stored
+                .iter()
+                .enumerate()
+                .filter(|(index, f)| settings.matches_cached(f, watched, now, &self.haystacks[*index], &query))
+                .map(|(index, _)| index)
+                .collect();
+            self.filtered
+                .sort_by_key(|i| (std::cmp::Reverse(stored[*i].time()), std::cmp::Reverse(&stored[*i].accession)));
+            let included: std::collections::BTreeSet<_> =
+                self.filtered.iter().map(|i| stored[*i].accession.as_str()).collect();
+            self.summary = summarize(&stored, settings.symbol.as_deref().unwrap_or(""), now, settings.days, |f| {
+                included.contains(f.accession.as_str())
+            });
+            self.row_models = stored
+                .iter()
+                .map(|f| {
+                    (
+                        f.accession.clone(),
+                        row_text_for(f, settings.buys_sells_only, Some(&settings.display_ticker(f, watched))),
+                    )
+                })
+                .collect();
+            self.cache_settings = Some(settings.clone());
+            self.cache_watched = watched.to_vec();
+            self.cache_minute = now / 60;
+            #[cfg(test)]
+            {
+                self.cache_builds += 1;
+            }
+        }
+        if rebuild || self.cache_read_len != self.read.len() {
+            self.unread = self.filtered.iter().filter(|i| !self.read.contains(&stored[**i].accession)).count();
+            self.cache_read_len = self.read.len();
+        }
+        stored
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmptyCause {
     NotTracked,
@@ -190,6 +257,10 @@ pub enum EmptyCause {
 pub fn empty_cause(settings: &Settings, state: &State, watched: &[String]) -> EmptyCause {
     if settings.scope == Scope::Symbol
         && settings.symbol.as_ref().is_some_and(|s| !watched.iter().any(|w| tr_edgar::ticker(w) == tr_edgar::ticker(s)))
+        && !state
+            .rows
+            .iter()
+            .any(|f| !f.transient_symbol.is_empty() && settings.symbol.as_deref().is_some_and(|s| f.matches_symbol(s)))
     {
         return EmptyCause::NotTracked;
     }
@@ -404,14 +475,13 @@ fn row_text_for(f: &Filing, only_open_market: bool, symbol: Option<&str>) -> (St
     if f.insiders.is_empty() {
         return (
             if f.insider_parsed {
-                "No reported transactions"
-            } else if f.insider_unavailable {
-                "details unavailable"
+                "No reported transactions".into()
+            } else if f.description.is_empty() || f.description.eq_ignore_ascii_case("FORM 4") {
+                "Form 4 · Statement of changes in ownership".into()
             } else {
-                "Reading insider form…"
-            }
-            .into(),
-            "—".into(),
+                format!("Form 4 · {}", f.description)
+            },
+            String::new(),
         );
     }
     let has_common = f.insiders.iter().any(|t| !t.derivative);
@@ -457,6 +527,144 @@ fn row_text_for(f: &Filing, only_open_market: bool, symbol: Option<&str>) -> (St
     }
     (text.join(" · "), total.filter(|_| has_value).map(value).unwrap_or_else(|| "—".into()))
 }
+fn detail_state(f: &Filing, state: &State, paused: bool, now: i64) -> String {
+    if !matches!(f.form.as_str(), "4" | "4/A") || f.insider_parsed || !f.insiders.is_empty() {
+        return String::new();
+    }
+    if f.insider_unavailable {
+        return "details unavailable".into();
+    }
+    if let Some(until) = state.flags.paused_until {
+        return chrono::DateTime::from_timestamp(until, 0)
+            .map(|d| format!("paused until {}", d.with_timezone(&chrono::Local).format("%H:%M")))
+            .unwrap_or_else(|| "paused".into());
+    }
+    if state.flags.unavailable {
+        return "offline".into();
+    }
+    if paused {
+        return "paused".into();
+    }
+    let active = state
+        .interest
+        .as_ref()
+        .is_some_and(|(active, symbols)| *active && symbols.iter().any(|symbol| f.matches_symbol(symbol)));
+    if active
+        && state.flags.details_active
+        && !state.flags.budget_deferred
+        && f.insider_queued
+        && f.insider_retry <= now
+    {
+        "reading"
+    } else {
+        "waiting"
+    }
+    .into()
+}
+
+/// Prose is one UI-font run; transaction figures, including their spaces and @,
+/// are one mono run. Never switch fonts at every whitespace boundary.
+fn row_job(text: &str, base: egui::Color32, insider: bool) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    for (i, part) in text.split(" · ").enumerate() {
+        if i > 0 {
+            job.append(
+                " · ",
+                dp(0.),
+                egui::TextFormat { font_id: theme::ui_font(12.), color: base, ..Default::default() },
+            );
+        }
+        let action = insider
+            .then(|| {
+                ["P", "S", "A", "M", "F", "G", "C", "J"].into_iter().find_map(|code| {
+                    let word = tr_edgar::insider::action(code).0;
+                    part.strip_prefix(word).filter(|tail| tail.starts_with(' ')).map(|tail| (word, code, tail))
+                })
+            })
+            .flatten();
+        if let Some((word, code, figures)) = action {
+            job.append(
+                word,
+                dp(0.),
+                egui::TextFormat {
+                    font_id: theme::ui_font(12.),
+                    color: if matches!(code, "P" | "S") { direction(code) } else { base },
+                    ..Default::default()
+                },
+            );
+            job.append(
+                figures,
+                dp(0.),
+                egui::TextFormat { font_id: theme::mono(12.), color: base, ..Default::default() },
+            );
+        } else {
+            job.append(
+                part,
+                dp(0.),
+                egui::TextFormat { font_id: theme::ui_font(12.), color: base, ..Default::default() },
+            );
+        }
+    }
+    job
+}
+
+fn hover_card(response: &egui::Response, f: &Filing, text: &str, state_tag: &str, full_time: &str) {
+    crate::feed_time::tooltip(response).show(|ui| {
+        ui.spacing_mut().item_spacing.y = dp(4.);
+        let owners = f
+            .insiders
+            .iter()
+            .map(|t| t.owner.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.add(
+            egui::Label::new(
+                RichText::new(if owners.is_empty() { text } else { &owners })
+                    .font(theme::ui_font(13.5))
+                    .color(theme::text())
+                    .strong(),
+            )
+            .wrap(),
+        );
+        if !owners.is_empty() {
+            ui.add(egui::Label::new(row_job(text, theme::text(), true)).wrap());
+        }
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("{} · {} · {}", f.form, full_time, f.accession))
+                    .font(theme::mono(10.5))
+                    .color(theme::muted()),
+            )
+            .wrap(),
+        );
+        if !state_tag.is_empty() {
+            ui.label(RichText::new(state_tag).font(theme::ui_font(10.5)).color(theme::muted()));
+        }
+        for t in &f.insiders {
+            let lot = format!(
+                "{} · {} · {} {} @ {} · owned {}",
+                t.owner.name,
+                t.date,
+                tr_edgar::insider::action(&t.code).0,
+                t.shares.map(tr_edgar::insider::number).unwrap_or_else(|| "—".into()),
+                t.price.map(|p| format!("{p:.2}")).unwrap_or_else(|| "—".into()),
+                t.owned_after.map(tr_edgar::insider::number).unwrap_or_else(|| "—".into())
+            );
+            ui.add(egui::Label::new(row_job(&lot, theme::muted(), true)).wrap());
+        }
+        if let Some(host) = reqwest::Url::parse(&f.link()).ok().and_then(|u| u.host_str().map(str::to_owned)) {
+            ui.add_space(dp(2.));
+            ui.label(
+                RichText::new(format!("{} · click to open", host.trim_start_matches("www.")))
+                    .font(theme::ui_font(10.5))
+                    .color(theme::muted()),
+            );
+        }
+    });
+}
+
 fn open(ui: &Ui, f: &Filing) {
     let link = f.link();
     if safe_url(&link) {
@@ -477,6 +685,27 @@ fn chart_action(ticker: &str, link: Option<crate::layouts::Link>) -> crate::cong
         |l| crate::congress_view::Action::LinkedSymbol(l, key.clone()),
     )
 }
+fn untracked_actions(ui: &mut Ui, settings: &mut Settings, actions: &mut Vec<crate::congress_view::Action>) {
+    ui.horizontal(|ui| {
+        if ui.button("Add to watchlist").clicked()
+            && let Some(s) = &settings.symbol
+        {
+            actions.push(crate::congress_view::Action::AddToWatchlist(s.clone()));
+        }
+        if ui
+            .button("Load once")
+            .on_hover_text(
+                "Last 30 days, without tracking or insider document reads. At most once per company per 24 hours.",
+            )
+            .clicked()
+            && let Some(s) = &settings.symbol
+        {
+            settings.days = 30;
+            actions.push(crate::congress_view::Action::LoadFilingsOnce(s.clone()));
+        }
+    });
+}
+
 pub fn show(
     ui: &mut Ui,
     settings: &mut Settings,
@@ -496,69 +725,117 @@ pub fn show(
         });
     let mut runtime_guard = runtime_handle.lock().expect("filings runtime");
     let runtime = &mut *runtime_guard;
+    runtime.update(settings, state, watched, now);
     let mut focus_search = false;
     ui.spacing_mut().item_spacing = egui::vec2(dp(6.), dp(3.));
+    let status = if settings.paused {
+        "Updates paused".into()
+    } else if state.status.starts_with("SEC EDGAR · updated") {
+        let suffix = state
+            .status
+            .split_once(" · ")
+            .and_then(|(_, s)| s.split_once(" · "))
+            .map(|(_, s)| format!(" · {s}"))
+            .unwrap_or_default();
+        let (age, _) = crate::feed_time::feed_time(state.updated, now, false);
+        format!("SEC EDGAR · {age}{suffix}")
+    } else if state.status.is_empty() {
+        "SEC EDGAR · waiting for worker".into()
+    } else {
+        state.status.clone()
+    };
     ui.horizontal(|ui| {
-        ui.selectable_value(&mut settings.scope, Scope::Symbol, "Symbol");
-        ui.selectable_value(&mut settings.scope, Scope::Watchlist, "Watchlist");
-        let symbol = if settings.scope == Scope::Symbol {
-            settings.symbol.as_deref().and_then(tr_edgar::ticker).unwrap_or_default()
-        } else {
-            context.watchlist_name.into()
-        };
-        ui.label(RichText::new(symbol).font(theme::mono(11.)).color(theme::amber()));
-        if let Some(link) = context.link {
-            let color = match link {
-                crate::layouts::Link::Red => theme::down(),
-                crate::layouts::Link::Orange => theme::amber(),
-                crate::layouts::Link::Green => theme::up(),
-                crate::layouts::Link::Blue => theme::accent(),
-                crate::layouts::Link::Purple => theme::series(4),
-            };
-            ui.label(RichText::new("●").color(color)).on_hover_text(format!("{} link group", link.label()));
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.menu_button("⋯", |ui| {
-                ui.checkbox(&mut settings.paused, "Pause updates");
-                if ui.button("Reload").clicked() {
-                    runtime.paused_rows = None;
-                    settings.paused = false;
-                    actions.push(crate::congress_view::Action::ReloadFilings);
-                    ui.close();
-                }
-                ui.label(
-                    RichText::new("SEC EDGAR · public filings. Watchlist symbols only; no market-wide data.")
-                        .color(theme::muted()),
+        ui.style_mut().override_font_id = Some(theme::ui_font(10.5));
+        ui.spacing_mut().button_padding = egui::vec2(dp(4.), dp(2.));
+        ui.spacing_mut().item_spacing.x = dp(2.);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), dp(20.)),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                let more = crate::feed_time::icon_button(ui, crate::widgets::Icon::More, "Filings options");
+                egui::Popup::menu(&more).show(|ui| {
+                    ui.add(egui::Label::new(&status).wrap());
+                    ui.separator();
+                    if settings.scope == Scope::Symbol
+                        && settings
+                            .symbol
+                            .as_ref()
+                            .is_some_and(|s| !watched.iter().any(|w| tr_edgar::ticker(w) == tr_edgar::ticker(s)))
+                    {
+                        untracked_actions(ui, settings, &mut actions);
+                    }
+                    ui.checkbox(&mut settings.paused, "Pause updates");
+                    if ui.button("Reload").clicked() {
+                        runtime.paused_rows = None;
+                        settings.paused = false;
+                        actions.push(crate::congress_view::Action::ReloadFilings);
+                        ui.close();
+                    }
+                    ui.label(
+                        RichText::new("SEC EDGAR · public filings. Watchlist symbols only; no market-wide data.")
+                            .color(theme::muted()),
+                    );
+                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), dp(20.)),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.selectable_value(&mut settings.scope, Scope::Symbol, "Symbol");
+                        ui.selectable_value(&mut settings.scope, Scope::Watchlist, "Watchlist");
+                        let symbol = if settings.scope == Scope::Symbol {
+                            settings.symbol.as_deref().and_then(tr_edgar::ticker).unwrap_or_default()
+                        } else {
+                            context.watchlist_name.into()
+                        };
+                        let label_width = ui
+                            .painter()
+                            .layout_no_wrap(symbol.clone(), theme::mono(11.), theme::amber())
+                            .size()
+                            .x
+                            .min(dp(100.))
+                            .min(ui.available_width() * 0.55);
+                        ui.add_sized(
+                            egui::vec2(label_width, dp(20.)),
+                            egui::Label::new(RichText::new(&symbol).font(theme::mono(11.)).color(theme::amber()))
+                                .truncate(),
+                        )
+                        .on_hover_text(symbol);
+                        if let Some(link) = context.link.filter(|_| settings.scope == Scope::Symbol) {
+                            let color = match link {
+                                crate::layouts::Link::Red => theme::down(),
+                                crate::layouts::Link::Orange => theme::amber(),
+                                crate::layouts::Link::Green => theme::up(),
+                                crate::layouts::Link::Blue => theme::accent(),
+                                crate::layouts::Link::Purple => theme::series(4),
+                            };
+                            crate::feed_time::dot(ui, color).on_hover_text(format!("{} link group", link.label()));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if settings.paused
+                                && let Some(saved) = &runtime.paused_rows
+                            {
+                                let old: std::collections::BTreeSet<_> =
+                                    saved.iter().map(|f| f.accession.as_str()).collect();
+                                let new = state.rows.iter().filter(|f| !old.contains(f.accession.as_str())).count();
+                                if new > 0 && ui.button(format!("{new} new · Show")).clicked() {
+                                    settings.paused = false;
+                                    runtime.paused_rows = None;
+                                }
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(crate::feed_time::compact_status(&status))
+                                        .font(theme::ui_font(10.5))
+                                        .color(theme::muted()),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&status);
+                        });
+                    },
                 );
-            });
-            if settings.paused
-                && let Some(saved) = &runtime.paused_rows
-            {
-                let old: std::collections::BTreeSet<_> = saved.iter().map(|f| f.accession.as_str()).collect();
-                let new = state.rows.iter().filter(|f| !old.contains(f.accession.as_str())).count();
-                if new > 0 && ui.button(format!("{new} new · Show")).clicked() {
-                    settings.paused = false;
-                    runtime.paused_rows = None;
-                }
-            }
-            let status = if settings.paused {
-                "Updates paused".into()
-            } else if state.status.starts_with("SEC EDGAR · updated") {
-                let suffix = state
-                    .status
-                    .split_once(" · ")
-                    .and_then(|(_, s)| s.split_once(" · "))
-                    .map(|(_, s)| format!(" · {s}"))
-                    .unwrap_or_default();
-                let (age, _) = crate::feed_time::feed_time(state.updated, now, false);
-                format!("SEC EDGAR · {age}{suffix}")
-            } else if state.status.is_empty() {
-                "SEC EDGAR · waiting for worker".into()
-            } else {
-                state.status.clone()
-            };
-            ui.add(egui::Label::new(RichText::new(status).font(theme::ui_font(10.5)).color(theme::muted())).truncate());
-        });
+            },
+        );
     });
     // Fold before controls would clip, including when larger theme fonts need more room.
     let chips_width = Form::ALL
@@ -578,13 +855,15 @@ pub fn show(
         for days in [7, 30, 90] {
             ui.selectable_value(&mut settings.days, days, format!("{days}D"));
         }
+        ui.toggle_value(&mut settings.unread_only, format!("Unread {}", runtime.unread))
+            .on_hover_text("Unread only (u)");
         if !narrow {
             for form in Form::ALL {
                 ui.selectable_value(&mut settings.form, form, form.label());
             }
         }
         if narrow {
-            let response = ui.button("⌕").on_hover_text("Search (/)");
+            let response = crate::feed_time::icon_button(ui, crate::widgets::Icon::Search, "Search (/)");
             if focus_search && !response.clicked() {
                 egui::Popup::toggle_id(ui.ctx(), egui::Popup::default_response_id(&response));
             }
@@ -627,47 +906,7 @@ pub fn show(
     if focus_search && narrow {
         ui.memory_mut(|m| m.request_focus(search_id));
     }
-    if settings.paused {
-        if runtime.paused_rows.is_none() {
-            runtime.paused_rows = Some(state.rows.clone());
-        }
-    } else {
-        runtime.paused_rows = None;
-    }
-    let stored = runtime.paused_rows.clone().unwrap_or_else(|| state.rows.clone());
-    let changed = runtime.cache_source.as_ref().is_none_or(|source| !Arc::ptr_eq(source, &stored));
-    if changed {
-        runtime.haystacks = stored.iter().map(haystack).collect();
-        runtime.cache_source = Some(stored.clone());
-    }
-    if changed
-        || runtime.cache_settings.as_ref() != Some(settings)
-        || runtime.cache_watched != watched
-        || runtime.cache_minute != now / 60
-    {
-        let query = settings.search.trim().to_ascii_lowercase();
-        runtime.filtered = stored
-            .iter()
-            .enumerate()
-            .filter(|(index, f)| settings.matches_cached(f, watched, now, &runtime.haystacks[*index], &query))
-            .map(|(index, _)| index)
-            .collect();
-        runtime
-            .filtered
-            .sort_by_key(|i| (std::cmp::Reverse(stored[*i].time()), std::cmp::Reverse(&stored[*i].accession)));
-        let included: std::collections::BTreeSet<_> =
-            runtime.filtered.iter().map(|i| stored[*i].accession.as_str()).collect();
-        runtime.summary = summarize(&stored, settings.symbol.as_deref().unwrap_or(""), now, settings.days, |f| {
-            included.contains(f.accession.as_str())
-        });
-        runtime.cache_settings = Some(settings.clone());
-        runtime.cache_watched = watched.to_vec();
-        runtime.cache_minute = now / 60;
-        #[cfg(test)]
-        {
-            runtime.cache_builds += 1;
-        }
-    }
+    let stored = runtime.update(settings, state, watched, now);
     if settings.scope == Scope::Symbol && settings.form == Form::Insider {
         let s = &runtime.summary;
         ui.horizontal(|ui| {
@@ -790,11 +1029,8 @@ pub fn show(
             EmptyCause::Offline => "Stored filings retained while updates are unavailable.".into(),
         };
         ui.label(RichText::new(text).font(theme::ui_font(11.)).color(theme::muted()));
-        if cause == EmptyCause::NotTracked
-            && ui.button("Add to watchlist").clicked()
-            && let Some(s) = &settings.symbol
-        {
-            actions.push(crate::congress_view::Action::AddToWatchlist(s.clone()));
+        if cause == EmptyCause::NotTracked {
+            untracked_actions(ui, settings, &mut actions);
         }
         let clear_all = settings.form == Form::All;
         if cause == EmptyCause::Filtered
@@ -850,7 +1086,15 @@ pub fn show(
                 ui.painter().rect_filled(
                     rect,
                     dp(2.),
-                    if selected { theme::accent().linear_multiply(0.16) } else { theme::control_hover() },
+                    if selected { theme::accent_wash() } else { theme::control_hover() },
+                );
+            }
+            if selected && context.focused {
+                ui.painter().rect_stroke(
+                    rect.shrink(dp(0.5)),
+                    dp(2.),
+                    egui::Stroke::new(dp(1.), theme::accent()),
+                    egui::StrokeKind::Inside,
                 );
             }
             if selected && scroll_selected {
@@ -861,7 +1105,8 @@ pub fn show(
             }
             let (time, full_time) = crate::feed_time::feed_time(f.time(), now, f.accepted.is_none());
             let ticker = settings.display_ticker(f, watched);
-            let (text, value) = row_text_for(f, settings.buys_sells_only, Some(&ticker));
+            let (text, value) = &runtime.row_models[&f.accession];
+            let state_tag = detail_state(f, state, settings.paused, now);
             let time_width = ui
                 .painter()
                 .layout_no_wrap("0".repeat(crate::feed_time::WIDTH_CHARS), theme::mono(10.), theme::muted())
@@ -869,7 +1114,7 @@ pub fn show(
                 .x;
             let ticker_width = ui.painter().layout_no_wrap("000000".into(), theme::mono(11.), theme::amber()).size().x;
             let form_width = ui.painter().layout_no_wrap("00000".into(), theme::mono(10.), theme::muted()).size().x;
-            let time_right = rect.left() + dp(6.) + time_width;
+            let time_right = rect.left() + dp(10.) + time_width;
             let ticker_left = time_right + dp(6.);
             let form_left = ticker_left + if settings.scope == Scope::Symbol { 0. } else { ticker_width + dp(6.) };
             let main_left = form_left + form_width + dp(6.);
@@ -882,7 +1127,8 @@ pub fn show(
                 theme::muted(),
             );
             let time_rect = egui::Rect::from_min_max(rect.min, egui::pos2(time_right, rect.bottom()));
-            ui.interact(time_rect, ui.id().with((&f.accession, "time")), egui::Sense::hover()).on_hover_text(full_time);
+            ui.interact(time_rect, ui.id().with((&f.accession, "time")), egui::Sense::hover())
+                .on_hover_text(&full_time);
             if settings.scope != Scope::Symbol {
                 let r =
                     egui::Rect::from_min_max(egui::pos2(ticker_left, rect.top()), egui::pos2(form_left, rect.bottom()));
@@ -904,50 +1150,23 @@ pub fn show(
                 theme::mono(10.),
                 theme::muted(),
             );
-            let value_width = if value.is_empty() { 0. } else { dp(76.) };
+            let budget = crate::feed_time::tail_budget(rect.width(), rect.right() - main_left);
+            let tail = if state_tag.is_empty() { value.as_str() } else { state_tag.as_str() };
+            let tail_font = if state_tag.is_empty() { theme::mono(10.) } else { theme::ui_font(10.5) };
+            let measured = ui.painter().layout_no_wrap(tail.into(), tail_font.clone(), theme::muted()).size().x;
+            let cap = ui.painter().layout_no_wrap("0".repeat(9), theme::mono(10.), theme::muted()).size().x;
+            let value_width = if state_tag.is_empty() { measured.min(cap) } else { measured }.min(budget);
+            let value_gap = if value_width > 0. { dp(6.) } else { 0. };
             let main_rect = egui::Rect::from_min_max(
                 egui::pos2(main_left, rect.top()),
-                egui::pos2((rect.right() - value_width).max(main_left), rect.bottom()),
+                egui::pos2((rect.right() - value_width - value_gap).max(main_left), rect.bottom()),
             );
-            let mut job = egui::text::LayoutJob::default();
-            // Only action words P/S carry direction; owner/role/plan stay neutral.
-            let mut remaining = text.as_str();
-            while !remaining.is_empty() {
-                let next = [("Bought", "P"), ("Sold", "S")]
-                    .into_iter()
-                    .filter(|(_, code)| {
-                        matches!(f.form.as_str(), "4" | "4/A") && f.insiders.iter().any(|t| t.code == *code)
-                    })
-                    .filter_map(|(word, code)| {
-                        let at = if remaining.starts_with(&format!("{word} ")) {
-                            Some(0)
-                        } else {
-                            remaining.find(&format!(" · {word} ")).map(|i| i + " · ".len())
-                        };
-                        at.map(|i| (i, word, code))
-                    })
-                    .min_by_key(|(i, _, _)| *i);
-                let (piece, code, rest) = if let Some((i, word, code)) = next {
-                    if i > 0 {
-                        (&remaining[..i], "", &remaining[i..])
-                    } else {
-                        (&remaining[..word.len()], code, &remaining[word.len()..])
-                    }
-                } else {
-                    (remaining, "", "")
-                };
-                let color = if code.is_empty() {
-                    if runtime.read.contains(&f.accession) { theme::muted() } else { theme::text() }
-                } else {
-                    direction(code)
-                };
-                for token in piece.split_inclusive(char::is_whitespace) {
-                    let font_id =
-                        if token.chars().any(|c| c.is_ascii_digit()) { theme::mono(12.) } else { theme::ui_font(12.) };
-                    job.append(token, 0., egui::TextFormat { font_id, color, ..Default::default() });
-                }
-                remaining = rest;
-            }
+            let base = if runtime.read.contains(&f.accession) || (!state_tag.is_empty() && f.insiders.is_empty()) {
+                theme::muted()
+            } else {
+                theme::text()
+            };
+            let mut job = row_job(text, base, matches!(f.form.as_str(), "4" | "4/A"));
             job.wrap.max_width = main_rect.width();
             job.wrap.max_rows = 1;
             job.wrap.break_anywhere = true;
@@ -957,13 +1176,18 @@ pub fn show(
                 galley,
                 theme::text(),
             );
-            ui.painter().text(
-                egui::pos2(rect.right(), rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                value,
-                theme::mono(10.),
-                theme::muted(),
-            );
+            if value_width > 0. {
+                let tail_rect = egui::Rect::from_min_max(egui::pos2(rect.right() - value_width, rect.top()), rect.max);
+                let mut tail_job = egui::text::LayoutJob::simple_singleline(tail.into(), tail_font, theme::muted());
+                tail_job.wrap.max_width = value_width;
+                tail_job.wrap.max_rows = 1;
+                let galley = ui.painter().layout_job(tail_job);
+                ui.painter().with_clip_rect(tail_rect).galley(
+                    egui::pos2(rect.right() - galley.size().x, rect.center().y - galley.size().y / 2.),
+                    galley,
+                    theme::muted(),
+                );
+            }
             let title = ui.interact(main_rect, ui.id().with((&f.accession, "title")), egui::Sense::click());
             if title.clicked() {
                 open(ui, f);
@@ -977,18 +1201,7 @@ pub fn show(
                 }
                 runtime.read.insert(f.accession.clone());
             }
-            title.on_hover_text(format!(
-                "{text}\n{}\n{}\n{}",
-                f.insiders
-                    .iter()
-                    .map(|t| t.owner.name.as_str())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                f.accession,
-                f.link()
-            ));
+            hover_card(&title, f, text, &state_tag, &full_time);
             if runtime.expanded.contains(&f.accession) {
                 ui.horizontal(|ui| {
                     ui.add_space(main_left - rect.left());
@@ -997,7 +1210,7 @@ pub fn show(
                             ui,
                             |ui| {
                                 if f.insiders.is_empty() {
-                                    ui.label(RichText::new(&text).font(theme::ui_font(11.)).color(theme::muted()));
+                                    ui.label(RichText::new(text).font(theme::ui_font(11.)).color(theme::muted()));
                                 }
                                 for t in f
                                     .insiders
@@ -1081,6 +1294,203 @@ mod tests {
         }
     }
     #[test]
+    fn form4_tags_only_report_reading_for_an_active_queued_accession() {
+        let mut f = Filing { ticker: "AAPL".into(), form: "4".into(), insider_queued: true, ..Default::default() };
+        let mut state = State {
+            interest: Some((true, vec!["AAPL US Equity".into()])),
+            flags: tr_edgar::scheduler::StatusFlags { details_active: true, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(detail_state(&f, &state, false, 100), "reading");
+        f.insider_queued = false;
+        assert_eq!(detail_state(&f, &state, false, 100), "waiting");
+        f.insider_queued = true;
+        f.insider_retry = 101;
+        assert_eq!(detail_state(&f, &state, false, 100), "waiting");
+        f.insider_retry = 0;
+        assert_eq!(detail_state(&f, &state, true, 100), "paused");
+        state.flags.unavailable = true;
+        assert_eq!(detail_state(&f, &state, false, 100), "offline");
+        state.flags.paused_until = Some(200);
+        let local = chrono::DateTime::from_timestamp(200, 0).unwrap().with_timezone(&chrono::Local);
+        assert_eq!(detail_state(&f, &state, false, 100), format!("paused until {}", local.format("%H:%M")));
+        f.insider_unavailable = true;
+        assert_eq!(detail_state(&f, &state, false, 100), "details unavailable");
+        f.insider_parsed = true;
+        assert!(detail_state(&f, &state, false, 100).is_empty());
+    }
+
+    #[test]
+    fn owner_prose_and_directional_actions_use_ui_font_figures_use_mono() {
+        let text = "Newstead J. (SVP, GC) · Sold 2,399 @ 345.00 · 10b5-1";
+        let job = row_job(text, theme::text(), true);
+        assert_eq!(job.text, text);
+        let section = |s: &str| {
+            job.sections
+                .iter()
+                .find(|part| job.text[part.byte_range.start.0..part.byte_range.end.0].starts_with(s))
+                .unwrap()
+        };
+        assert_eq!(section("Newstead J. (SVP, GC)").format.font_id.family, egui::FontFamily::Proportional);
+        assert_eq!(section("Sold").format.color, theme::down());
+        assert_eq!(section(" 2,399 @ 345.00").format.font_id.family, egui::FontFamily::Monospace);
+        let job = row_job("Owner · Bought 10 @ 20.00", theme::text(), true);
+        assert!(
+            job.sections
+                .iter()
+                .any(|s| &job.text[s.byte_range.start.0..s.byte_range.end.0] == "Bought"
+                    && s.format.color == theme::up())
+        );
+    }
+
+    #[test]
+    fn one_shot_rows_are_untracked_symbol_only_and_unread_is_ready_on_first_frame() {
+        let now = chrono::Utc::now().timestamp();
+        let row = Filing {
+            accession: "once".into(),
+            ticker: "AAPL".into(),
+            form: "8-K".into(),
+            filed: now,
+            transient_symbol: "AAPL".into(),
+            ..Default::default()
+        };
+        let state = State { rows: Arc::new(vec![row.clone()]), ..Default::default() };
+        let mut settings = Settings::new(Some("AAPL US Equity".into()));
+        assert!(settings.matches_at(&row, &[], now));
+        assert_ne!(empty_cause(&settings, &state, &[]), EmptyCause::NotTracked);
+        let mut runtime = Runtime::default();
+        runtime.update(&settings, &state, &[], now);
+        assert_eq!(runtime.unread, 1);
+        runtime.read.insert("once".into());
+        runtime.update(&settings, &state, &[], now);
+        assert_eq!(runtime.unread, 0);
+        assert_eq!(runtime.cache_builds, 1);
+        settings.scope = Scope::Watchlist;
+        assert!(!settings.matches_at(&row, &["AAPL US Equity".into()], now));
+        settings.scope = Scope::Symbol;
+        settings.symbol = Some("MSFT US Equity".into());
+        assert!(!settings.matches_at(&row, &[], now));
+        settings.symbol = Some("AAPL US Equity".into());
+        settings.days = 90;
+        assert!(!settings.matches_at(&Filing { filed: now - 31 * 86400, ..row }, &[], now));
+    }
+
+    #[test]
+    fn narrow_header_preserves_overflow_unread_and_separated_row_columns() {
+        for scope in [Scope::Symbol, Scope::Watchlist] {
+            let ctx = egui::Context::default();
+            let row = Filing {
+                accession: "current".into(),
+                ticker: "AAPL".into(),
+                form: "8-K".into(),
+                filed: chrono::Utc::now().timestamp(),
+                items: "2.02,9.01".into(),
+                ..Default::default()
+            };
+            let state = State {
+                rows: Arc::new(vec![row]),
+                status: "SEC EDGAR · updated now · Reading insider forms: 216 left".into(),
+                ..Default::default()
+            };
+            let mut settings = Settings::new(Some("AAPL US Equity".into()));
+            settings.scope = scope;
+            let mut measured = 0.;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(340., 400.))),
+                    ..Default::default()
+                },
+                |ui| {
+                    show(
+                        ui,
+                        &mut settings,
+                        &state,
+                        &["AAPL US Equity".into()],
+                        PaneContext {
+                            focused: true,
+                            keyboard_id: egui::Id::new("test"),
+                            link: None,
+                            watchlist_name: "Retirement with a long name",
+                        },
+                    );
+                    measured = ui.min_rect().width();
+                },
+            );
+            assert!(measured <= 341., "header must not grow the pane: {measured}");
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            assert!(text.iter().any(|t| t.galley.job.text == "Unread 1" && t.pos.y >= dp(20.)));
+            let form = text.iter().find(|t| t.galley.job.text == "8-K").unwrap();
+            let main = text.iter().find(|t| t.galley.job.text.starts_with("Results of operations")).unwrap();
+            assert!(main.pos.x >= form.pos.x + form.galley.size().x + dp(6.));
+            if scope == Scope::Watchlist {
+                let ticker = text.iter().find(|t| t.galley.job.text == "AAPL").unwrap();
+                assert!(form.pos.x >= ticker.pos.x + ticker.galley.size().x + dp(6.));
+            }
+            let dots = output
+                .shapes
+                .iter()
+                .filter(|s| {
+                    matches!(&s.shape, egui::Shape::Circle(c)
+                if c.center.x > 310. && c.center.x < 340. && c.center.y < dp(25.))
+                })
+                .count();
+            assert_eq!(dots, 3);
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn form4_hover_card_has_solid_edges_full_owner_and_transaction_lots() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| {
+            s.interaction.tooltip_delay = 0.;
+            s.interaction.tooltip_grace_time = 0.;
+        });
+        let filing = insider_fixture();
+        let text = row_text(&filing, false).0;
+        let mut found_lot = false;
+        let mut found_edge = false;
+        for frame in 0..4 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600., 400.))),
+                    time: Some(frame as f64),
+                    events: vec![egui::Event::PointerMoved(egui::pos2(50., 10.))],
+                    ..Default::default()
+                },
+                |ui| {
+                    let (_, response) = ui.allocate_exact_size(egui::vec2(200., 22.), egui::Sense::hover());
+                    hover_card(&response, &filing, &text, "", "27 Oct 2026 12:00 UTC");
+                },
+            );
+            found_lot |= output.shapes.iter().any(|s| {
+                matches!(&s.shape, egui::Shape::Text(t)
+                if t.galley.job.text.contains("Sold 2,399 @ 345.00 · owned"))
+            });
+            fn solid_edge(shape: &egui::Shape) -> bool {
+                match shape {
+                    egui::Shape::Vec(shapes) => shapes.iter().any(solid_edge),
+                    egui::Shape::Rect(r) => {
+                        r.fill == theme::card() && r.stroke.color == theme::muted() && r.stroke.width == dp(1.)
+                    }
+                    _ => false,
+                }
+            }
+            found_edge |= output.shapes.iter().any(|s| solid_edge(&s.shape));
+            output.textures_delta.clear();
+        }
+        assert!(found_lot, "hover card must include the individual transaction");
+        assert!(found_edge, "hover card must have a solid visible edge");
+    }
+
+    #[test]
     fn current_n2_layout_fixture_loads_with_30_day_defaults() {
         let doc =
             crate::layouts::LayoutDoc::from_json(include_bytes!("../tests/fixtures/filings_n2_layout.json")).unwrap();
@@ -1122,7 +1532,8 @@ mod tests {
         let mut empty = f.clone();
         empty.insiders.clear();
         empty.insider_unavailable = true;
-        assert_eq!(row_text(&empty, false).0, "details unavailable");
+        assert!(row_text(&empty, false).0.starts_with("Form 4 · "));
+        assert_eq!(detail_state(&empty, &State::default(), false, 0), "details unavailable");
         empty.insider_unavailable = false;
         empty.insider_parsed = true;
         assert_eq!(row_text(&empty, false).0, "No reported transactions");

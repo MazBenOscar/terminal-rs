@@ -612,10 +612,16 @@ impl TerminalApp {
         let (r, resp) = row;
         if let Item::Section { name, collapsed } = item {
             widgets::hover_wash(ui, r, &resp, false);
+            widgets::draw_icon(
+                ui.painter(),
+                Rect::from_center_size(pos2(r.left() + dp(12.0), r.center().y), vec2(dp(12.0), dp(12.0))),
+                if *collapsed { widgets::Icon::ChevronRight } else { widgets::Icon::ChevronDown },
+                muted(),
+            );
             ui.painter().text(
-                pos2(r.left() + dp(8.0), r.center().y),
+                pos2(r.left() + dp(26.0), r.center().y),
                 Align2::LEFT_CENTER,
-                format!("{}  {}", if *collapsed { "▸" } else { "▾" }, name.to_uppercase()),
+                name.to_uppercase(),
                 ui_font(11.0),
                 muted(),
             );
@@ -1250,7 +1256,7 @@ mod tests {
     #[test]
     fn section_headers_render_in_order_and_click_collapse_persists() {
         let mut app = sections_app();
-        click_ui("▾  TECH", |ui| {
+        click_ui("TECH", |ui| {
             app.watchlist(ui);
         });
         assert!(app.watchlists[0].sections[0].collapsed);
@@ -1260,8 +1266,8 @@ mod tests {
             app.watchlist(ui);
         });
         let texts = labels(&output);
-        let tech = texts.iter().position(|s| s == "▸  TECH").unwrap();
-        let macro_row = texts.iter().position(|s| s == "▾  MACRO").unwrap();
+        let tech = texts.iter().position(|s| s == "TECH").unwrap();
+        let macro_row = texts.iter().position(|s| s == "MACRO").unwrap();
         assert!(tech < macro_row);
         assert!(!texts.iter().any(|s| s == "NVDA" || s == "AAPL"));
         assert!(texts.iter().any(|s| s == "SPY"));
@@ -1623,7 +1629,7 @@ mod tests {
     fn remove_first_header_keeps_ungrouped_symbols_and_collapsed_symbols_reappear() {
         let mut app = sections_app();
         // SPY is ungrouped; collapse Tech so NVDA/AAPL are hidden.
-        click_ui("▾  TECH", |ui| {
+        click_ui("TECH", |ui| {
             app.watchlist(ui);
         });
         let texts = labels(&ui_frame(&egui::Context::default(), Vec::new(), &mut |ui| {
@@ -1644,7 +1650,7 @@ mod tests {
     #[test]
     fn sort_stays_inside_each_section_when_an_earlier_section_is_collapsed() {
         let mut app = sections_app();
-        click_ui("▾  TECH", |ui| {
+        click_ui("TECH", |ui| {
             app.watchlist(ui);
         });
         let items = app.watchlists[0].items();
@@ -1655,8 +1661,8 @@ mod tests {
         let texts = labels(&ui_frame(&egui::Context::default(), Vec::new(), &mut |ui| {
             app.watchlist(ui);
         }));
-        assert!(texts.iter().position(|s| s == "SPY") < texts.iter().position(|s| s == "▸  TECH"));
-        assert!(texts.iter().position(|s| s == "▸  TECH") < texts.iter().position(|s| s == "▾  MACRO"));
+        assert!(texts.iter().position(|s| s == "SPY") < texts.iter().position(|s| s == "TECH"));
+        assert!(texts.iter().position(|s| s == "TECH") < texts.iter().position(|s| s == "MACRO"));
         assert!(!texts.iter().any(|s| s == "NVDA" || s == "AAPL"));
         // Expanding restores the sorted Tech block without letting it escape the section.
         app.collapse_watch_sections(false);
@@ -1791,7 +1797,7 @@ mod tests {
         let names: Vec<&str> = app.watchlists[0].sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["Macro", "Macro"], "section names need not be unique");
         // Both headers still collapse independently.
-        click_ui("▾  MACRO", |ui| {
+        click_ui("MACRO", |ui| {
             app.watchlist(ui);
         });
         assert!(app.watchlists[0].sections[0].collapsed);
@@ -2091,5 +2097,62 @@ mod tests {
         click_ui("Remove section", |ui| app.watch_section_menu(ui, 1, "Tech"));
         save_entry(&mut app, "MSFT");
         assert_eq!(app.watchlist.last(), Some(&key("MSFT")));
+    }
+
+    #[test]
+    fn add_dialog_is_dropped_when_the_active_watchlist_switches() {
+        let mut app = sections_app();
+        click_ui("+", |ui| {
+            app.watchlist(ui);
+        });
+        assert!(app.symbol_search.is_some());
+        app.create_watchlist("Other".into(), vec![key("MSFT")]).unwrap();
+        assert!(
+            app.symbol_search.is_none(),
+            "a target dialog must not survive a list switch and insert into the wrong list"
+        );
+        assert_eq!(app.watchlist, vec![key("MSFT")]);
+    }
+
+    #[test]
+    fn search_mode_dialog_survives_list_switch_and_still_opens_charts() {
+        let mut app = sections_app();
+        app.apply(super::super::command::Function::Search("MSFT".into()));
+        assert!(app.symbol_search.as_ref().unwrap().target.is_none());
+        app.create_watchlist("Other".into(), vec![key("AAPL")]).unwrap();
+        assert!(app.symbol_search.is_some(), "chart search is not bound to a watchlist and may stay open");
+        save_entry(&mut app, "MSFT");
+        assert!(
+            app.panes.iter().any(|p| matches!(&p.kind, super::super::PaneKind::Chart(c) if c.symbol == key("MSFT")))
+        );
+    }
+
+    #[test]
+    fn trash_remove_then_re_add_restores_the_symbol() {
+        let mut app = sections_app();
+        let aapl = key("AAPL");
+        click_ui("Add symbol", |ui| app.watch_symbol_menu(ui, 3, &aapl, &mut Vec::new()));
+        save_entry(&mut app, "MSFT");
+        assert_eq!(app.watchlist.iter().filter(|s| **s == key("MSFT")).count(), 1);
+        // Present rows show 🗑; activating the row again is the remove action.
+        save_entry(&mut app, "MSFT");
+        assert!(symbol_pos(&app.watchlists[0].items(), &key("MSFT")).is_none());
+        // Re-adding must restore exactly one copy (the row anchor may have been removed).
+        save_entry(&mut app, "MSFT");
+        assert_eq!(app.watchlist.iter().filter(|s| **s == key("MSFT")).count(), 1);
+    }
+
+    #[test]
+    fn adding_the_same_symbol_twice_never_leaves_duplicates() {
+        let mut app = sections_app();
+        click_ui("+", |ui| {
+            app.watchlist(ui);
+        });
+        save_entry(&mut app, "MSFT");
+        save_entry(&mut app, "MSFT");
+        assert!(
+            app.watchlist.iter().filter(|s| **s == key("MSFT")).count() <= 1,
+            "a repeated add must never duplicate the row"
+        );
     }
 }

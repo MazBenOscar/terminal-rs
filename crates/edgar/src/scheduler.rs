@@ -130,6 +130,8 @@ pub struct StatusFlags {
     pub unavailable: bool,
     pub importing: bool,
     pub budget_deferred: bool,
+    pub details_active: bool,
+    pub paused_until: Option<i64>,
 }
 pub struct Scheduler<T = Sec> {
     pub store: Store,
@@ -140,6 +142,52 @@ pub struct Scheduler<T = Sec> {
 impl<T: Transport> Scheduler<T> {
     pub fn new(store: Store, transport: T) -> Self {
         Self { store, transport, status: "SEC EDGAR · not updated yet".into(), flags: StatusFlags::default() }
+    }
+    /// Exactly one guarded submissions request, with no map fetch, tracking, history pages
+    /// or document work. The machine ledger, not this scheduler/store, owns the 24h slot.
+    pub async fn load_once(&mut self, now: i64, symbol: &str) {
+        self.flags = StatusFlags::default();
+        let result = self.once(now, symbol).await;
+        if let Err(error) = &result
+            && let Some(reason) = error.downcast_ref::<Refused>()
+        {
+            self.flags.budget_deferred = matches!(reason, Refused::Budget | Refused::Busy);
+            self.flags.unavailable = !self.flags.budget_deferred;
+            self.flags.paused_until = if let Refused::Paused { until } = reason { Some(*until) } else { None };
+        }
+        self.status = match result {
+            Ok(count) => format!("SEC EDGAR · Loaded once: {count} filings · last 30 days · not tracked"),
+            Err(e) => format!(
+                "SEC EDGAR · Load once: {}",
+                e.downcast_ref::<Refused>().map(refusal_label).unwrap_or_else(|| e.to_string())
+            ),
+        };
+    }
+    async fn once(&mut self, now: i64, symbol: &str) -> Result<usize> {
+        self.transport.check()?;
+        if !self.transport.pending_allowed()? {
+            self.flags.budget_deferred = true;
+            anyhow::bail!("waiting: reserved feed budget");
+        }
+        let ticker = crate::ticker(symbol).ok_or_else(|| anyhow::anyhow!("No SEC company for this symbol"))?;
+        let company = self
+            .store
+            .companies()?
+            .into_iter()
+            .find(|c| c.ticker == ticker)
+            .ok_or_else(|| anyhow::anyhow!("Company map not saved yet; add to watchlist to import"))?;
+        anyhow::ensure!(self.claim(&format!("sec:once:{}", company.cik), DAY)?, "Already loaded within 24 hours");
+        let reply = self
+            .transport
+            .get(&format!("https://data.sec.gov/submissions/CIK{:010}.json", company.cik), None, None)
+            .await?;
+        let mut rows = parse_submissions(&reply.body, company.cik, &ticker, now - 30 * DAY)?;
+        for row in &mut rows {
+            row.transient_symbol = ticker.clone();
+        }
+        self.store.upsert(&rows)?;
+        self.store.prune(now)?;
+        Ok(rows.len())
     }
     pub async fn tick(&mut self, now: i64, active: bool, symbols: &[String]) {
         if !active {
@@ -158,9 +206,11 @@ impl<T: Transport> Scheduler<T> {
         if let Err(reason) = self.transport.check() {
             self.flags.budget_deferred = matches!(reason, Refused::Budget | Refused::Busy);
             self.flags.unavailable = !self.flags.budget_deferred;
+            self.flags.paused_until = if let Refused::Paused { until } = reason { Some(until) } else { None };
             self.status = refusal_label(&reason);
             return;
         }
+        self.flags.details_active = self.transport.pending_allowed().unwrap_or(false);
         match self.run(now, symbols).await {
             Ok(()) => {
                 let updated = self.store.number("updated").unwrap_or(0);
@@ -211,6 +261,11 @@ impl<T: Transport> Scheduler<T> {
                 self.flags.budget_deferred =
                     matches!(e.downcast_ref::<Refused>(), Some(Refused::Budget | Refused::Busy));
                 self.flags.unavailable = !self.flags.budget_deferred;
+                self.flags.details_active = false;
+                self.flags.paused_until = match e.downcast_ref::<Refused>() {
+                    Some(Refused::Paused { until }) => Some(*until),
+                    _ => None,
+                };
                 self.status = e
                     .downcast_ref::<Refused>()
                     .map(refusal_label)

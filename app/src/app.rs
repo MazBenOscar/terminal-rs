@@ -884,6 +884,7 @@ pub struct Drag {
 pub struct TerminalApp {
     // N2
     edgar: crate::filings_view::State,
+    congress_window_visible: Option<bool>,
     drawing_ids: crate::drawing_history::SharedDrawingIds,
     pub agent_queue: crate::agent_queue::AgentToolQueue,
     pub pinned_agent_chart: Option<u64>,
@@ -1133,6 +1134,7 @@ impl TerminalApp {
         let mut app = Self {
             // N2
             edgar: Default::default(),
+            congress_window_visible: None,
             drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(ctx.clone()),
             pinned_agent_chart: None,
@@ -1642,6 +1644,9 @@ impl TerminalApp {
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
                 // N3: an explicit Reload wakes the worker, without resetting durable cadence.
                 Action::ReloadFilings => self.edgar.interest = None,
+                Action::LoadFilingsOnce(symbol) => {
+                    self.worker.send(Request::EdgarOnce { symbol });
+                }
                 // N3
                 Action::AddToWatchlist(symbol) => {
                     let name = self.watchlists[self.active_watchlist].name.clone();
@@ -2168,6 +2173,10 @@ impl TerminalApp {
     fn drain(&mut self) {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
+                Response::EdgarStatus { status, flags } => {
+                    self.edgar.status = status;
+                    self.edgar.flags = flags;
+                }
                 // N2: shared store snapshot, never clear rows on a failed refresh.
                 Response::Edgar { rows, status, updated, flags } => {
                     self.edgar.rows = rows;
@@ -2505,7 +2514,7 @@ impl TerminalApp {
             }
             None if self.congress_status.contains("source paused until") => {}
             None if minutes == 0 => parts.push("Congress refresh disabled".into()),
-            None => parts.push("checking Senate eFD + House Clerk…".into()),
+            None => parts.push("checking House Clerk…".into()),
         }
         if let Some(d) = newest {
             parts.push(format!("newest filing {d}"));
@@ -3164,18 +3173,20 @@ impl eframe::App for TerminalApp {
         self.agent_logic(ctx);
         self.process_logic();
         // N3: publish unpaused visible interest only on changes, never per-frame HTTP.
-        let active = self.agent_demo.is_none()
+        let window_visible = self.agent_demo.is_none()
             && edgar_window_visible(frame)
-            && ctx.input(|i| i.viewport().minimized != Some(true))
+            && ctx.input(|i| i.viewport().minimized != Some(true));
+        let active = window_visible
             && self.visible_panes().iter().any(|&i| matches!(&self.panes[i].kind, PaneKind::Filings(f) if !f.paused));
         // N3
         let mut symbols: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
         symbols.sort();
         symbols.dedup();
         let interest = (active, symbols);
-        if self.edgar.interest.as_ref() != Some(&interest) {
-            self.worker.send(Request::EdgarInterest { active, symbols: interest.1.clone() });
+        if self.edgar.interest.as_ref() != Some(&interest) || self.congress_window_visible != Some(window_visible) {
+            self.worker.send(Request::EdgarInterest { active, symbols: interest.1.clone(), window_visible });
             self.edgar.interest = Some(interest);
+            self.congress_window_visible = Some(window_visible);
         }
 
         self.populate_agent_demo(ctx);
@@ -3395,6 +3406,7 @@ impl TerminalApp {
         Self {
             // N2
             edgar: Default::default(),
+            congress_window_visible: None,
             drawing_ids: Default::default(),
             agent_queue: crate::agent_queue::AgentToolQueue::new(egui::Context::default()),
             pinned_agent_chart: None,

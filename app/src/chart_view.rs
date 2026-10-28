@@ -6099,7 +6099,7 @@ impl WatchlistTarget {
     }
 
     fn label(&self) -> String {
-        format!("{}{}{}", if self.contains { "✓ " } else { "" }, self.name, if self.active { " (active)" } else { "" })
+        format!("{}{}", self.name, if self.active { " (active)" } else { "" })
     }
 }
 
@@ -6136,11 +6136,13 @@ pub(crate) fn watchlist_destinations(ui: &mut Ui, symbol: &str, targets: &[Watch
     let mut out = Vec::new();
     ui.set_min_width(180.0);
     for list in targets {
-        if ui
-            .add_enabled(!list.contains, egui::Button::new(list.label()))
-            .on_disabled_hover_text("Already in this watchlist")
-            .clicked()
-        {
+        let response = if list.contains {
+            // egui paints the checkmark as a vector; it is not in our UI fonts.
+            ui.add_enabled(false, egui::Checkbox::new(&mut true, list.label()))
+        } else {
+            ui.button(list.label())
+        };
+        if response.on_disabled_hover_text("Already in this watchlist").clicked() {
             out.push(Action::AddToNamedWatchlist { list: list.name.clone(), symbol: symbol.into() });
             ui.close();
         }
@@ -8823,8 +8825,8 @@ mod tests {
         click(&mut chart, "Add to watchlist");
         let texts = ui_frame(&ctx, vec![], |ui| chart.context_menu(ui, &worker));
         assert!(texts.iter().any(|(text, _)| text == "Main (active)"));
-        assert!(texts.iter().any(|(text, _)| text == "✓ Tech"), "lists holding the symbol are marked");
-        click(&mut chart, "✓ Tech");
+        assert!(texts.iter().any(|(text, _)| text == "Tech"), "lists holding the symbol are marked");
+        click(&mut chart, "Tech");
         assert!(chart.actions.is_empty(), "a list that already has the symbol is disabled");
         if !ui_frame(&ctx, vec![], |ui| chart.context_menu(ui, &worker)).iter().any(|(text, _)| text == "Crypto") {
             click(&mut chart, "Add to watchlist");
@@ -10671,7 +10673,7 @@ mod tests {
             WatchSection { name: "Spot".into(), collapsed: false, at: 0 },
         ];
         let targets = WatchlistTarget::for_symbol(&lists, 1, key);
-        assert_eq!(targets.iter().map(WatchlistTarget::label).collect::<Vec<_>>(), ["✓ Main", "Crypto (active)"]);
+        assert_eq!(targets.iter().map(WatchlistTarget::label).collect::<Vec<_>>(), ["Main", "Crypto (active)"]);
         assert!(targets[0].contains && !targets[1].contains);
         assert!(WatchlistTarget::for_symbol(&lists, 1, &format!("{key} Curncy"))[0].contains);
         assert_eq!(
@@ -10711,7 +10713,7 @@ mod tests {
         let targets = WatchlistTarget::for_symbol(&lists, 0, key);
         let ctx = egui::Context::default();
         let menu = |ui: &mut Ui| watchlist_destinations(ui, key, &targets);
-        assert!(click_watchlist_choice(&ctx, "✓ Main (active)", menu).is_empty());
+        assert!(click_watchlist_choice(&ctx, "Main (active)", menu).is_empty());
         assert!(click_watchlist_choice(&ctx, "Main sections", menu).is_empty());
         let texts = ui_frame(&ctx, vec![], |ui| {
             watchlist_destinations(ui, key, &targets);
@@ -10778,7 +10780,7 @@ mod tests {
             menu(ui);
         });
         assert!(!texts.iter().any(|(text, _)| text == "Other"));
-        assert!(texts.iter().any(|(text, _)| text == "✓ Main (active)"));
+        assert!(texts.iter().any(|(text, _)| text == "Main (active)"));
     }
 
     #[test]

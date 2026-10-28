@@ -306,6 +306,91 @@ pub fn refresh(ctx: &egui::Context, t: &crate::themes::Theme, system_accent: Col
 mod tests {
     use super::*;
 
+    /// Audit string/char literals across the app, not comments. Supported symbols
+    /// stay: egui's bundled fallback is the portable minimum on every platform.
+    #[test]
+    fn ui_symbol_literals_have_bundled_glyphs_in_both_families() {
+        fn scan(dir: &std::path::Path, found: &mut std::collections::BTreeMap<char, Vec<String>>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    scan(&path, found);
+                    continue;
+                }
+                if path.extension().is_none_or(|s| s != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                // The denylist covers controls that have regressed in UI fonts.
+                // Escapes here keep the auditor from finding its own denylist.
+                let deny = [
+                    '\u{22ef}', '\u{2315}', '\u{2610}', '\u{25b8}', '\u{25be}', '\u{2713}', '\u{2715}', '\u{2691}',
+                    '\u{2605}', '\u{2026}',
+                ];
+                for (line_no, line) in text.lines().enumerate() {
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    let mut quoted = false;
+                    let mut escaped = false;
+                    for c in line.chars() {
+                        if escaped {
+                            escaped = false;
+                            continue;
+                        }
+                        if c == '\\' {
+                            escaped = true;
+                            continue;
+                        }
+                        if c == '"' {
+                            quoted = !quoted;
+                            continue;
+                        }
+                        if quoted && deny.contains(&c) {
+                            found.entry(c).or_default().push(format!("{}:{}", path.display(), line_no + 1));
+                        }
+                    }
+                }
+            }
+        }
+        let mut found = std::collections::BTreeMap::new();
+        scan(&std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"), &mut found);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let mut missing = vec![];
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            for family in [FontFamily::Proportional, FontFamily::Monospace] {
+                let id = FontId::new(13., family.clone());
+                ui.fonts_mut(|fonts| {
+                    // egui 0.36's has_glyph compares face keys, falsely rejecting
+                    // valid glyphs in the replacement character's face (notably
+                    // Hack). Resolve the actual atlas glyph too: an unsupported
+                    // scalar has exactly the same UV rectangle as the replacement.
+                    let replacement = fonts.layout_no_wrap("\u{10ffff}".into(), id.clone(), Color32::WHITE);
+                    let missing_uv = replacement.rows[0].glyphs[0].uv_rect;
+                    let mut supported = |c: char| {
+                        fonts.has_glyph(&id, c) || {
+                            let glyph = fonts.layout_no_wrap(c.to_string(), id.clone(), Color32::WHITE);
+                            glyph.rows[0].glyphs[0].uv_rect != missing_uv
+                        }
+                    };
+                    for (c, locations) in &found {
+                        if !supported(*c) {
+                            missing.push(format!("{c:?} {family:?}: {}", locations.join(", ")));
+                        }
+                    }
+                    // Covered punctuation should remain typographic, not ASCII.
+                    for c in ['A', '·', '—', '\u{2026}', '›'] {
+                        assert!(supported(c), "punctuation {c:?} {family:?}");
+                    }
+                    assert!(!supported('\u{10ffff}'));
+                });
+            }
+        });
+        out.textures_delta.clear();
+        assert!(missing.is_empty(), "Unsupported UI literals:\n{}", missing.join("\n"));
+    }
+
     #[test]
     fn comparisons_do_not_clash_with_studies() {
         let original = palette();

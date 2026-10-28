@@ -195,13 +195,17 @@ fn rank(hit: &SearchHit, query: &str) -> Option<(u8, u8, u8, usize)> {
     let sec = tr_data::security(&hit.key);
     let ticker = sec.ticker.to_uppercase();
     let crypto = sec.crypto_instrument().ok();
-    let query = if crypto.is_some() && venue.is_some() { pair.as_str() } else { query };
+    // Pair separators are presentation, not part of the match. A USD prefix
+    // also discovers USDT/USDC instruments without conflating their identities.
+    let query = if crypto.is_some() { pair.as_str() } else { query };
     let native = crypto.as_ref().map_or(ticker.as_str(), |c| c.native_symbol.as_str());
     let name = hit.name.to_uppercase();
     let pair_match = crypto.as_ref().is_some_and(|c| format!("{}{}", c.base, c.quote) == pair);
     let rank = if query.is_empty() || ticker == query || native == query || pair_match {
         0
-    } else if native.starts_with(query) {
+    } else if native.starts_with(query)
+        || crypto.as_ref().is_some_and(|c| format!("{}{}", c.base, c.quote).starts_with(query))
+    {
         1
     } else if crypto.as_ref().is_some_and(|c| c.base == query) {
         2
@@ -1798,6 +1802,30 @@ mod tests {
     }
 
     #[test]
+    fn review_slash_pair_keeps_both_usd_and_usdt_venues() {
+        let mut dialog = xrp();
+        dialog.query = "xrp/usd".into();
+        for key in ["COINBASE:XRP-USD", "BINANCE:XRPUSDT"] {
+            assert!(has_key(&dialog.results(), key), "missing {key}");
+        }
+    }
+
+    #[test]
+    fn review_space_pair_keeps_both_usd_and_usdt_venues() {
+        let mut dialog = xrp();
+        dialog.query = "xrp usd".into();
+        for key in ["COINBASE:XRP-USD", "BINANCE:XRPUSDT"] {
+            assert!(has_key(&dialog.results(), key), "missing {key}");
+        }
+    }
+
+    #[test]
+    fn review_full_key_finds_aapl_not_just_any_instrument() {
+        let dialog = Dialog::new("AAPL US Equity".into(), None);
+        assert_eq!(dialog.results().first().map(|h| h.key.as_str()), Some("AAPL US Equity"));
+    }
+
+    #[test]
     fn full_market_key_query_finds_the_instrument() {
         for query in ["AAPL US Equity", "msft us equity", "SPX Index"] {
             let dialog = Dialog::new(query.into(), Some(Target::Append));
@@ -1808,5 +1836,215 @@ mod tests {
                 hits.iter().map(|h| &h.key).collect::<Vec<_>>()
             );
         }
+    }
+
+    fn hit_list(pairs: &[(&str, &str)]) -> Vec<SearchHit> {
+        pairs.iter().map(|(t, n)| hit(t, n)).collect()
+    }
+
+    #[test]
+    fn empty_and_whitespace_queries_browse_catalog_without_search_request() {
+        for query in ["", "   ", "\t\n"] {
+            let mut dialog = Dialog::new(query.into(), Some(Target::Append));
+            for (venue, key) in [(CryptoVenue::Binance, "BINANCE:XRPUSDT"), (CryptoVenue::Coinbase, "COINBASE:XRP-USD")]
+            {
+                dialog.catalog(venue, Ok(vec![CryptoInstrument::parse(key).unwrap()]));
+            }
+            let hits = dialog.results();
+            assert!(has_key(&hits, "COINBASE:XRP-USD"), "{query:?} should still browse crypto pairs");
+            assert!(hits.iter().any(|h| h.key == "AAPL US Equity"), "{query:?} should still browse builtins");
+            dialog.pending = Some(Instant::now() - Duration::from_millis(300));
+            let requests = dialog.requests();
+            assert!(
+                !requests.iter().any(|r| matches!(r, crate::worker::Request::Search(_))),
+                "{query:?} must not fire a network search (got {} requests)",
+                requests.len()
+            );
+        }
+    }
+
+    #[test]
+    fn very_long_query_never_panics_and_matches_nothing() {
+        let long = "X".repeat(10_000);
+        let mut dialog = Dialog::new(long.clone(), Some(Target::Append));
+        dialog.catalog(CryptoVenue::Binance, Ok(vec![CryptoInstrument::parse("BINANCE:XRPUSDT").unwrap()]));
+        dialog.network(&long, &[hit("X", "Very long")]);
+        assert!(dialog.results().is_empty());
+        dialog.pending = Some(Instant::now() - Duration::from_millis(300));
+        let requests = dialog.requests();
+        assert!(
+            requests.iter().any(|r| matches!(r, crate::worker::Request::Search(_))),
+            "a non-empty query must still issue a Search request"
+        );
+    }
+
+    #[test]
+    fn lowercase_and_padded_query_match_like_canonical_case() {
+        for query in ["xrp", "Xrp", "  xrp  ", "xRp"] {
+            let mut dialog = Dialog::new(query.into(), Some(Target::Append));
+            for (venue, key) in [(CryptoVenue::Binance, "BINANCE:XRPUSDT"), (CryptoVenue::Coinbase, "COINBASE:XRP-USD")]
+            {
+                dialog.catalog(venue, Ok(vec![CryptoInstrument::parse(key).unwrap()]));
+            }
+            let hits = dialog.results();
+            assert!(has_key(&hits, "COINBASE:XRP-USD"), "{query:?} must surface the Coinbase pair");
+            assert!(has_key(&hits, "BINANCE:XRPUSDT"), "{query:?} must surface the Binance pair");
+        }
+    }
+
+    #[test]
+    fn hyphen_pair_and_qualified_venue_queries_match_exact_instruments() {
+        let mut dialog = xrp();
+        dialog.query = "XRP-USD".into();
+        assert!(has_key(&dialog.results(), "COINBASE:XRP-USD"));
+        dialog.query = "BINANCE:XRPUSDT".into();
+        assert!(has_key(&dialog.results(), "BINANCE:XRPUSDT"));
+        dialog.query = "binance:xrpusdt".into();
+        assert!(has_key(&dialog.results(), "BINANCE:XRPUSDT"));
+    }
+
+    #[test]
+    fn name_phrase_queries_with_spaces_match_by_substring() {
+        let dialog = Dialog::new("apple inc".into(), Some(Target::Append));
+        let hits = dialog.results();
+        assert!(
+            hits.iter().any(|h| h.key == "AAPL US Equity"),
+            "got {:?}",
+            hits.iter().map(|h| &h.key).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn category_change_clears_source_and_kind_filters_that_would_hide_everything() {
+        let mut dialog = xrp();
+        dialog.category = Some(AssetClass::Crypto);
+        dialog.source = "Binance".into();
+        dialog.kind = "spot crypto".into();
+        assert_eq!(dialog.results().len(), 1);
+        // Click the Stocks chip in the real UI; leftover source/kind filters must clear.
+        let ctx = egui::Context::default();
+        frame(&mut dialog, &ctx, None, false, &[]);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0))),
+                ..Default::default()
+            },
+            |ui| {
+                dialog.show(ui.ctx(), &[]);
+            },
+        );
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "Stocks" => Some(t.pos + t.galley.size() / 2.0),
+                _ => None,
+            })
+            .unwrap();
+        output.textures_delta.clear();
+        for pressed in [true, false] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0))),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    dialog.show(ui.ctx(), &[]);
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert_eq!(dialog.category, Some(AssetClass::Equity));
+        assert!(dialog.source.is_empty(), "category click must clear a leftover source filter");
+        assert!(dialog.kind.is_empty(), "category click must clear a leftover type filter");
+        let hits = dialog.results();
+        assert!(!hits.is_empty(), "stocks must be visible again after the category switch");
+        assert!(hits.iter().all(|h| h.class == AssetClass::Equity));
+    }
+
+    #[test]
+    fn keyboard_selection_is_clamped_after_filters_shrink_the_list() {
+        let mut dialog = Dialog::new("ZZKEY".into(), Some(Target::Append));
+        dialog.network("ZZKEY", &(0..20).map(|i| hit(&format!("ZZKEY{i}"), "Test")).collect::<Vec<_>>());
+        let ctx = egui::Context::default();
+        frame(&mut dialog, &ctx, None, false, &[]);
+        for _ in 0..10 {
+            frame(&mut dialog, &ctx, Some(egui::Key::ArrowDown), false, &[]);
+        }
+        assert!(dialog.selected >= 10);
+        // A source filter that matches nothing must not leave the highlight out of range.
+        dialog.source = "NYSE".into();
+        let (out, _) = frame(&mut dialog, &ctx, Some(egui::Key::Enter), false, &[]);
+        assert!(out.key.is_none(), "Enter on an empty filtered list must not add anything");
+        // Shrinking to two rows must clamp the highlight before the next Enter.
+        dialog.source = "NASDAQ".into();
+        dialog.network("ZZKEY", &hit_list(&[("ZZKEY0", "A"), ("ZZKEY1", "B")]));
+        let (out, _) = frame(&mut dialog, &ctx, Some(egui::Key::Enter), false, &[]);
+        let key = out.key.expect("Enter must pick one of the two remaining rows");
+        assert!(key.starts_with("ZZKEY"), "clamped selection picked {key}");
+    }
+
+    #[test]
+    fn search_mode_enter_with_no_results_keeps_the_dialog_open() {
+        let mut dialog = Dialog::new("ZZZNOSUCHSYMBOL".into(), None);
+        let ctx = egui::Context::default();
+        frame(&mut dialog, &ctx, None, false, &[]);
+        let (out, labels) = frame(&mut dialog, &ctx, Some(egui::Key::Enter), false, &[]);
+        assert!(out.key.is_none());
+        assert!(!out.close, "Enter with nothing to open must not dismiss the dialog");
+        assert!(labels.iter().any(|s| s == "Symbol search"), "dialog chrome still rendered: {labels:?}");
+    }
+
+    #[test]
+    fn shift_enter_with_no_results_does_not_close_or_add() {
+        let mut dialog = Dialog::new("ZZZNOSUCHSYMBOL".into(), Some(Target::Append));
+        let ctx = egui::Context::default();
+        frame(&mut dialog, &ctx, None, false, &[]);
+        let (out, _) = frame(&mut dialog, &ctx, Some(egui::Key::Enter), true, &[]);
+        assert!(out.key.is_none());
+        assert!(!out.close);
+    }
+
+    #[test]
+    fn debounced_search_query_round_trips_through_the_stale_check() {
+        let mut dialog = Dialog::new("  XRP  ".into(), None);
+        dialog.pending = Some(Instant::now() - Duration::from_millis(300));
+        let requests = dialog.requests();
+        let Some(q) = requests.iter().find_map(|r| match r {
+            crate::worker::Request::Search(q) => Some(q.clone()),
+            _ => None,
+        }) else {
+            panic!("expected a Search request among {} requests", requests.len());
+        };
+        // Whitespace-padded input must still produce a response the dialog accepts.
+        dialog.network(&q, &[hit("XRP", "Exact ticker")]);
+        assert!(
+            dialog.results().iter().any(|h| h.key == "XRP US Equity"),
+            "response for {q:?} must not be treated as stale"
+        );
+    }
+
+    #[test]
+    fn adding_the_same_symbol_twice_never_duplicates_the_list() {
+        let mut items = Vec::new();
+        let mut target = Target::Append;
+        let key = "BINANCE:XRPUSDT Curncy".to_string();
+        assert!(target.insert(&mut items, &key));
+        assert!(!target.insert(&mut items, &key), "second insert of the same canonical key must be rejected");
+        assert_eq!(items.len(), 1);
+        // Alternate spellings of the same instrument must also collide.
+        assert!(!target.insert(&mut items, "XRPUSDT Curncy"));
+        assert!(!target.insert(&mut items, "binance:xrpusdt"));
+        assert!(!target.insert(&mut items, "BINANCE:XRPUSDT"));
+        assert_eq!(items.len(), 1);
     }
 }

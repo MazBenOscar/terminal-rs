@@ -276,10 +276,15 @@ pub enum AgentRequest {
 }
 
 pub enum Request {
+    EdgarOnce {
+        symbol: String,
+    },
     // N2
     EdgarInterest {
         active: bool,
         symbols: Vec<String>,
+        /// Native window visibility, independent of whether a Filings pane is open.
+        window_visible: bool,
     },
     DataSources {
         action: crate::app::data_sources::Action,
@@ -581,6 +586,10 @@ pub struct Profile {
 }
 
 pub enum Response {
+    EdgarStatus {
+        status: String,
+        flags: tr_edgar::scheduler::StatusFlags,
+    },
     // N2
     Edgar {
         rows: Arc<Vec<tr_edgar::Filing>>,
@@ -1082,6 +1091,7 @@ struct Shared {
     scan_store: std::sync::Mutex<Option<ScanStore>>,
     db: Mutex<Db>,
     congress_source: Mutex<Option<HttpSource>>,
+    congress_window_visible: std::sync::atomic::AtomicBool,
     out: mpsc::Sender<Response>,
     ctx: egui::Context,
 }
@@ -1160,6 +1170,7 @@ impl Worker {
             scan_store: std::sync::Mutex::new(scan_store),
             db: Mutex::new(db),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx,
         });
@@ -1192,7 +1203,7 @@ impl Worker {
         rt.spawn(async move {
             while let Some(req) = req_rx.recv().await {
                 // N1a: serialize subscription changes so an older snapshot cannot resurrect a hidden pane.
-                if matches!(&req, Request::NewsVisible { .. }) {
+                if matches!(&req, Request::NewsVisible { .. } | Request::EdgarInterest { .. }) {
                     handle(&s, req).await;
                     continue;
                 }
@@ -1209,11 +1220,7 @@ impl Worker {
         // Scheduled congressional disclosure refresh.
         let s = shared.clone();
         rt.spawn(async move {
-            if let Ok(paused) = refresh::paused_sources(&*s.db.lock().await)
-                && !paused.is_empty()
-            {
-                s.send(Response::CongressPaused(paused.join(" · ")));
-            }
+            s.send(Response::CongressPaused(refresh::SENATE_PAUSED.into()));
             let minutes = congress_refresh_minutes();
             if minutes == 0 {
                 return;
@@ -1223,7 +1230,7 @@ impl Worker {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                congress_refresh(&s).await;
+                congress_refresh(&s, false).await;
             }
         });
         Ok(Self { tx, rx, _rt: rt })
@@ -1304,11 +1311,49 @@ async fn edgar_loop(s: Arc<Shared>, mut interest: tokio::sync::watch::Receiver<(
     }
 }
 
-async fn congress_refresh(s: &Shared) {
-    if congress_refresh_minutes() == 0 {
+fn congress_refresh_allowed(manual: bool, visible: bool, minimised: bool) -> bool {
+    manual || (visible && !minimised)
+}
+
+#[cfg(test)]
+#[test]
+fn congress_visibility_gates_automatic_but_never_manual_refresh() {
+    for visible in [false, true] {
+        for minimised in [false, true] {
+            assert_eq!(congress_refresh_allowed(false, visible, minimised), visible && !minimised);
+            assert!(congress_refresh_allowed(true, visible, minimised));
+        }
+    }
+}
+
+async fn congress_refresh(s: &Shared, manual: bool) {
+    if !congress_refresh_allowed(
+        manual,
+        s.congress_window_visible.load(std::sync::atomic::Ordering::Relaxed),
+        s.ctx.input(|i| i.viewport().minimized == Some(true)),
+    ) {
+        return;
+    }
+    let minutes = congress_refresh_minutes();
+    if minutes == 0 {
         return s.send(Response::Status("Congress refresh disabled".into()));
     }
-    // A single reusable source serialises manual and scheduled runs and preserves pacing.
+    let net = match tr_net::shared() {
+        Ok(net) => net,
+        Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED))),
+    };
+    if let Err(e) = net.check("house-disclosures") {
+        return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED)));
+    }
+    // Manual refresh bypasses cadence only, never the shared request guard.
+    if !manual {
+        match net.claim_slot("congress:refresh", Duration::from_secs(minutes.saturating_mul(60))) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => return s.send(Response::CongressPaused(format!("House: {e} · {}", refresh::SENATE_PAUSED))),
+        }
+    }
+    // A single reusable source serialises manual and scheduled runs.
     let Ok(mut guard) = s.congress_source.try_lock() else {
         return s.send(Response::Status("Congress refresh already running".into()));
     };
@@ -1319,7 +1364,7 @@ async fn congress_refresh(s: &Shared) {
         }
     }
     let source = guard.as_ref().expect("source initialised");
-    s.send(Response::Status("Refreshing congressional disclosures (Senate eFD + House Clerk)…".into()));
+    s.send(Response::Status(format!("Refreshing House Clerk disclosures… · {}", refresh::SENATE_PAUSED)));
     let cfg = RefreshConfig::incremental(&*s.db.lock().await);
     match refresh::refresh(source, &s.db, &cfg).await {
         Ok(report) => {
@@ -1767,7 +1812,30 @@ async fn handle_agent(s: &Shared, request: AgentRequest) {
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
         // N2
-        Request::EdgarInterest { active, symbols } => {
+        Request::EdgarOnce { symbol } => match tr_edgar::store::Store::open(data_dir().join("edgar.sqlite3")) {
+            Ok(store) => {
+                let mut scheduler = tr_edgar::scheduler::Scheduler::new(store, tr_edgar::scheduler::Sec);
+                scheduler.load_once(chrono::Utc::now().timestamp(), &symbol).await;
+                match scheduler.store.filings() {
+                    Ok(rows) => s.send(Response::Edgar {
+                        rows: Arc::new(rows),
+                        status: scheduler.status,
+                        updated: scheduler.store.number("updated").unwrap_or(0),
+                        flags: scheduler.flags,
+                    }),
+                    Err(_) => s.send(Response::EdgarStatus {
+                        status: "SEC EDGAR · Load once: store unavailable".into(),
+                        flags: tr_edgar::scheduler::StatusFlags { unavailable: true, ..Default::default() },
+                    }),
+                }
+            }
+            Err(_) => s.send(Response::EdgarStatus {
+                status: "SEC EDGAR · Load once: store unavailable".into(),
+                flags: tr_edgar::scheduler::StatusFlags { unavailable: true, ..Default::default() },
+            }),
+        },
+        Request::EdgarInterest { active, symbols, window_visible } => {
+            s.congress_window_visible.store(window_visible, std::sync::atomic::Ordering::Relaxed);
             s.edgar_interest.send_replace((active, symbols));
         }
         Request::Agent(request) => handle_agent(s, request).await,
@@ -2416,7 +2484,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let _ = db.mark_alerts_seen();
             s.send(Response::Alerts(db.alerts(false, 200).unwrap_or_default()));
         }
-        Request::RefreshCongress => congress_refresh(s).await,
+        Request::RefreshCongress => congress_refresh(s, true).await,
         Request::Forget(pane) => {
             s.series.lock().expect("series lock").remove(&pane);
         }
@@ -3303,6 +3371,7 @@ mod tests {
                 scan_store: std::sync::Mutex::new(None),
                 db: Mutex::new(Db::open_in_memory().unwrap()),
                 congress_source: Mutex::new(None),
+                congress_window_visible: std::sync::atomic::AtomicBool::new(false),
                 out,
                 ctx: egui::Context::default(),
             }),
@@ -4440,6 +4509,7 @@ mod tests {
             scan_store: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx: egui::Context::default(),
         });
@@ -4589,6 +4659,7 @@ mod tests {
             scan_store: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx: egui::Context::default(),
         });
@@ -4675,6 +4746,7 @@ mod tests {
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx: egui::Context::default(),
         };
@@ -4756,6 +4828,7 @@ mod tests {
             scan_store: std::sync::Mutex::new(Some(ScanStore::open_in_memory().unwrap())),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx: egui::Context::default(),
         };
@@ -4844,6 +4917,7 @@ mod tests {
             scan_store: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             congress_source: Mutex::new(None),
+            congress_window_visible: std::sync::atomic::AtomicBool::new(false),
             out,
             ctx: egui::Context::default(),
         };
