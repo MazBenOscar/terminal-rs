@@ -1,6 +1,6 @@
 # News, filings and insider trades: implementation plan
 
-Status: approved 2026-10-26. Sources: Finnhub free tier (user's key) and SEC EDGAR. Yahoo and CoinDesk stay as fallbacks. No paid sources.
+Status: 2026-10-27 — N0/N0b, N1a/N1b, N2 and N3 are implemented, including feed routing and Filings Load once. The phase bullets below preserve the original plan; implementation notes and the [README](../../README.md#features) describe shipped scope (two SEC feeds: 8-K and 4; insiders in Filings, no News/8-K integration). N4 notifications, anomalies, digest and agent read_news/read_filings remain unshipped here. Sources: Finnhub free tier (user's key), SEC EDGAR, and guarded Yahoo/CoinDesk fallbacks; no paid sources.
 
 ## Lessons from senate.gov (non-negotiable rules)
 
