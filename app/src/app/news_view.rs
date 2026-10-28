@@ -31,6 +31,7 @@ pub struct Interaction {
     pub scroll_to: Option<String>,
     pub focus_search: bool,
     pub search_open: bool,
+    pub source_filter: String,
     pub open_data_sources: bool,
     pub anchor_offset: f32,
     pub restore_anchor: bool,
@@ -490,6 +491,81 @@ fn chips(ui: &mut Ui, display: &mut Display, unread: usize) {
     ui.toggle_value(&mut display.unread, format!("Unread {unread}")).on_hover_text("Unread only (u)");
     ui.toggle_value(&mut display.watch_hits, "Watch hits");
 }
+/// Shared by the pane footer and Help, including the parallel Save story action.
+pub(super) const NEWS_SHORTCUTS: &[(&str, &str)] = &[
+    ("↓/j", "Next story"),
+    ("↑/k", "Previous story"),
+    ("Enter", "Open story"),
+    ("Space", "Expand/collapse story"),
+    ("C", "Chart story"),
+    ("/", "Search"),
+    ("U", "Unread only"),
+    ("S", "Save story"),
+    ("Esc", "Clear search / selection"),
+];
+
+fn key_legend_width(ui: &Ui) -> f32 {
+    NEWS_SHORTCUTS
+        .iter()
+        .map(|(key, action)| {
+            ui.painter().layout_no_wrap((*key).into(), mono(10.0), theme::text()).size().x
+                + ui.painter().layout_no_wrap((*action).into(), ui_font(10.5), theme::muted()).size().x
+                + dp(24.0) // Key padding and inter-item spacing, including a trailing gap.
+        })
+        .sum()
+}
+
+fn key_legend(ui: &mut Ui) {
+    // Only shown when the complete line fits. No scrolling/animation or repaint timer:
+    // compact panes keep their two-line chrome; the same bindings remain in Help.
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = dp(4.0);
+        for (key, action) in NEWS_SHORTCUTS {
+            let galley = ui.painter().layout_no_wrap((*key).into(), mono(10.0), theme::text());
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(galley.size().x + dp(8.0), dp(18.0)), egui::Sense::hover());
+            ui.painter().rect_filled(rect, dp(4.0), theme::control());
+            ui.painter().rect_stroke(
+                rect,
+                dp(4.0),
+                egui::Stroke::new(dp(1.0), theme::border()),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().galley(
+                egui::pos2(rect.left() + dp(4.0), rect.center().y - galley.size().y / 2.0),
+                galley,
+                theme::text(),
+            );
+            ui.add(egui::Label::new(RichText::new(*action).font(ui_font(10.5)).color(theme::muted())).extend());
+            ui.add_space(dp(4.0));
+        }
+    });
+}
+
+fn source_matches(source: &str, filter: &str) -> bool {
+    source.to_lowercase().contains(&filter.trim().to_lowercase())
+}
+
+fn active_filter_summary(n: &NewsPane) -> String {
+    let mut parts = vec![];
+    if !n.filters.sources.is_empty() {
+        parts.push(format!("Sources: {}", n.filters.sources.join(", ")));
+    }
+    if !n.filters.include.trim().is_empty() {
+        parts.push(format!("Include any: {}", n.filters.include.trim()));
+    }
+    if !n.filters.exclude.trim().is_empty() {
+        parts.push(format!("Exclude any: {}", n.filters.exclude.trim()));
+    }
+    if n.display.unread {
+        parts.push("Unread only".into());
+    }
+    if n.display.watch_hits {
+        parts.push("Watch hits".into());
+    }
+    parts.join(" · ")
+}
+
 fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narrow: bool, unread: usize) {
     let mut changed = false;
     let mut finished = false;
@@ -504,23 +580,52 @@ fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narro
         .chain(n.filters.sources.iter().cloned())
         .filter(|s| !s.is_empty())
         .collect();
+    ui.add(
+        egui::TextEdit::singleline(&mut n.interaction.source_filter)
+            .hint_text("Filter sources (contains, ignoring case)")
+            .desired_width(dp(260.0)),
+    );
+    let matching: Vec<_> = sources.iter().filter(|s| source_matches(s, &n.interaction.source_filter)).collect();
+    ui.label(
+        RichText::new(format!("{} of {} sources match", matching.len(), sources.len()))
+            .font(mono(10.5))
+            .color(theme::muted()),
+    );
     if ui.selectable_label(n.filters.sources.is_empty(), "All sources").clicked() {
         n.filters.sources.clear();
     }
-    for source in sources {
-        let selected = n.filters.sources.contains(&source);
-        if ui.selectable_label(selected, &source).clicked() {
-            if selected {
-                n.filters.sources.retain(|s| s != &source);
-            } else {
-                n.filters.sources.push(source);
+    egui::ScrollArea::vertical().id_salt("news-filter-sources").max_height(dp(140.0)).show(ui, |ui| {
+        for source in matching {
+            let selected = n.filters.sources.contains(source);
+            if ui.selectable_label(selected, source).clicked() {
+                if selected {
+                    n.filters.sources.retain(|s| s != source);
+                } else {
+                    n.filters.sources.push(source.clone());
+                }
             }
         }
-    }
+    });
+    ui.label("Include words (any)");
     ui.add(
-        egui::TextEdit::singleline(&mut n.filters.include).hint_text("Include words (any)").desired_width(dp(210.0)),
+        egui::TextEdit::singleline(&mut n.filters.include)
+            .hint_text("Any whole word; case-insensitive, not a phrase")
+            .desired_width(dp(260.0)),
     );
-    ui.add(egui::TextEdit::singleline(&mut n.filters.exclude).hint_text("Exclude words").desired_width(dp(210.0)));
+    ui.label("Exclude words");
+    ui.add(
+        egui::TextEdit::singleline(&mut n.filters.exclude)
+            .hint_text("Reject any whole word; case-insensitive, not a phrase")
+            .desired_width(dp(260.0)),
+    );
+    ui.add(
+        egui::Label::new(
+            RichText::new("Separate words with spaces or punctuation; quotes do not make phrases.")
+                .font(ui_font(10.5))
+                .color(theme::muted()),
+        )
+        .wrap(),
+    );
     ui.label("Keyword watches · words or \"quoted phrases\"");
     let mut delete = None;
     for (i, watch) in watches.iter_mut().enumerate() {
@@ -768,9 +873,14 @@ pub(super) fn show(
             + usize::from(!n.filters.exclude.is_empty())
             + usize::from(narrow && n.display.unread)
             + usize::from(narrow && n.display.watch_hits);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.menu_button(format!("Filters ({count})"), |ui| filters(ui, n, watches, narrow, unread));
-            if narrow && !n.interaction.search_open && n.filters.search.is_empty() {
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            let filter_label = format!("Filters ({count})");
+            let filter_width =
+                ui.painter().layout_no_wrap(filter_label.clone(), ui_font(10.5), theme::text()).size().x + dp(12.0);
+            // The Watch hits chip appears at 360pt, but that does not guarantee
+            // enough room for an editable search field beside Filters.
+            let compact_search = narrow || ui.available_width() < filter_width + dp(60.0);
+            if compact_search && !n.interaction.search_open && n.filters.search.is_empty() {
                 if crate::feed_time::icon_button(ui, crate::widgets::Icon::Search, "Search (/)").clicked() {
                     n.interaction.search_open = true;
                     n.interaction.focus_search = true;
@@ -779,7 +889,9 @@ pub(super) fn show(
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut n.filters.search)
                         .hint_text("Search")
-                        .desired_width(ui.available_width().max(dp(30.0))),
+                        // Leave room for the field margins and gap before Filters,
+                        // including when search is explicitly opened in a compact pane.
+                        .desired_width((ui.available_width() - filter_width - dp(12.0)).clamp(0.0, dp(210.0))),
                 );
                 if n.interaction.focus_search {
                     response.request_focus();
@@ -797,8 +909,14 @@ pub(super) fn show(
                     n.interaction.search_open = false;
                 }
             }
+            ui.menu_button(filter_label, |ui| filters(ui, n, watches, narrow, unread));
         });
     });
+    let summary = active_filter_summary(n);
+    if !summary.is_empty() {
+        ui.add(egui::Label::new(RichText::new(&summary).font(ui_font(10.5)).color(theme::muted())).truncate())
+            .on_hover_text(summary);
+    }
     cache.update(n, watches, &watched, now);
     let ids = &cache.ids;
     let rows = &cache.rows;
@@ -1012,14 +1130,15 @@ pub(super) fn show(
                 dp(0.0),
                 watch_colour(colour),
             );
-        } else if model.unread {
-            ui.painter().circle_filled(rect.left_center() + egui::vec2(dp(3.0), dp(0.0)), dp(2.0), theme::accent());
+        }
+        if model.unread {
+            ui.painter().circle_filled(rect.left_center() + egui::vec2(dp(7.0), dp(0.0)), dp(2.0), theme::accent());
         }
         let time_width = ui.fonts_mut(|f| f.glyph_width(&mono(11.0), '0')) * crate::feed_time::WIDTH_CHARS as f32;
         // A constant column keeps every headline starting at the same x, ticker or not.
         let ticker_width = time_width;
         let time_rect =
-            egui::Rect::from_min_size(rect.min + egui::vec2(dp(6.0), dp(0.0)), egui::vec2(time_width, rect.height()));
+            egui::Rect::from_min_size(rect.min + egui::vec2(dp(12.0), dp(0.0)), egui::vec2(time_width, rect.height()));
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(time_rect).layout(egui::Layout::right_to_left(egui::Align::Center)),
             |ui| ui.add(egui::Label::new(RichText::new(&model.time).font(mono(11.0)).color(theme::muted())).truncate()),
@@ -1207,7 +1326,11 @@ pub(super) fn show(
     // Collapsed rows use egui's fixed-height virtual list. Expanded rows retain
     // measured heights and virtualise by prefix offsets rather than lying about
     // their height to show_rows.
-    let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+    let show_legend = ui.available_height() >= dp(160.0) && ui.available_width() >= key_legend_width(ui);
+    let footer_height = if show_legend { dp(28.0) } else { 0.0 };
+    let mut area = egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height((ui.available_height() - footer_height).max(0.0));
     let offsets = &cache.offsets;
     let row_y = |index: usize| if expanded { offsets[index] } else { index as f32 * dp(22.0) };
     if restore && let Some(index) = cache.ids.iter().position(|id| Some(id) == anchor.as_ref()) {
@@ -1271,6 +1394,9 @@ pub(super) fn show(
         cache.layout_dirty = true;
         // One layout correction, not an idle repaint loop.
         ui.ctx().request_repaint();
+    }
+    if show_legend {
+        key_legend(ui);
     }
     n.cache = cache;
     if before != n.filters {
