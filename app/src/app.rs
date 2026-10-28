@@ -709,6 +709,8 @@ pub(crate) fn sanitize_watchlists(lists: Vec<NamedWatchlist>) -> Vec<NamedWatchl
 /// App-wide state persisted in `settings.json` (layouts live in their own files).
 #[derive(Serialize, Deserialize)]
 struct Settings {
+    #[serde(default)]
+    agent: crate::agent_mcp::Settings,
     #[serde(default, deserialize_with = "data_sources::deserialize_settings")]
     data_sources: tr_net::Settings,
     #[serde(default)]
@@ -892,6 +894,10 @@ pub struct TerminalApp {
     pub agent_queue: crate::agent_queue::AgentToolQueue,
     pub pinned_agent_chart: Option<u64>,
     pub(crate) agent_pane: crate::agent_pane::AgentPane,
+    agent_config: crate::agent_mcp::Settings,
+    external_agent: Option<crate::agent_mcp::ExternalServer>,
+    external_attempted: bool,
+    external_startup_checked: bool,
     agent_demo: Option<crate::agent_demo::Demo>,
     agent_turns: Vec<String>,
     agent_save_pending: bool,
@@ -1142,6 +1148,10 @@ impl TerminalApp {
             agent_queue: crate::agent_queue::AgentToolQueue::new(ctx.clone()),
             pinned_agent_chart: None,
             agent_pane: crate::agent_pane::AgentPane::default(),
+            agent_config: Default::default(),
+            external_agent: None,
+            external_attempted: false,
+            external_startup_checked: false,
             agent_demo: None,
             agent_turns: Vec::new(),
             agent_save_pending: false,
@@ -1295,6 +1305,7 @@ impl TerminalApp {
         if let Ok(bytes) = std::fs::read(&app.settings_file) {
             app.saves.written.insert(app.settings_file.clone(), bytes);
         }
+        app.agent_config = settings.as_ref().map(|s| s.agent.clone()).unwrap_or_default();
         app.apply_doc(doc);
         if !app.store.exists(&app.layout_name) {
             app.save_layout();
@@ -1320,6 +1331,7 @@ impl TerminalApp {
 
     fn settings_json(&self) -> Vec<u8> {
         let s = Settings {
+            agent: self.agent_config.clone(),
             data_sources: self.data_sources.settings.clone(),
             watchlist: Vec::new(),
             watchlists: self.watchlists.clone(),
@@ -3481,6 +3493,7 @@ impl eframe::App for TerminalApp {
         }
         // Drop signals shutdown and waits at most 1.5 s; any remaining cleanup
         // stays with the detached owner instead of blocking the UI's exit/save.
+        self.external_agent = None;
         self.agent_pane.workflows.reset();
         self.agent_pane.session = None;
         self.exit_save();
@@ -3508,6 +3521,10 @@ impl TerminalApp {
             agent_queue: crate::agent_queue::AgentToolQueue::new(egui::Context::default()),
             pinned_agent_chart: None,
             agent_pane: crate::agent_pane::AgentPane::default(),
+            agent_config: Default::default(),
+            external_agent: None,
+            external_attempted: false,
+            external_startup_checked: false,
             agent_demo: None,
             agent_turns: Vec::new(),
             agent_save_pending: false,

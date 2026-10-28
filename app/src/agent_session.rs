@@ -152,7 +152,13 @@ impl Drop for Session {
     }
 }
 impl Session {
-    pub fn start(ctx: egui::Context, executor: AppExecutor, parent: PathBuf, tools: tr_agent_tools::ToolSet) -> Self {
+    pub fn start(
+        ctx: egui::Context,
+        executor: AppExecutor,
+        parent: PathBuf,
+        tools: tr_agent_tools::ToolSet,
+        backend: crate::agent_mcp::Backend,
+    ) -> Self {
         let (sender, receive) = mpsc::unbounded_channel();
         let (shutdown, stopping) = watch::channel(());
         let (finished, completion) = std::sync::mpsc::channel();
@@ -170,7 +176,11 @@ impl Session {
                     return Ok(());
                 }
                 let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-                runtime.block_on(owner(receive, stopping, &background, executor, parent, tools))
+                if backend == crate::agent_mcp::Backend::Mimo {
+                    runtime.block_on(owner_acp(receive, stopping, &background, parent, tools))
+                } else {
+                    runtime.block_on(owner(receive, stopping, &background, executor, parent, tools))
+                }
             };
             if let Err(error) = run() {
                 background.state(failure_state(error));
@@ -401,6 +411,119 @@ async fn owner(
     result.map_err(|error| version_at_path(error, &binary))
 }
 
+async fn owner_acp(
+    mut receive: mpsc::UnboundedReceiver<Command>,
+    mut stopping: watch::Receiver<()>,
+    inbox: &Inbox,
+    parent: PathBuf,
+    tools: tr_agent_tools::ToolSet,
+) -> Result<()> {
+    use tr_agent::acp::AcpBackend;
+    use tr_agent::transport::WireEvent;
+    use tr_agent::{AgentEvent, AgentEvents, ThreadOptions};
+    if AcpBackend::find_binary().is_none() {
+        inbox.state(Onboarding::Stopped { reason: AcpBackend::missing_message().into(), unsafe_backend: false });
+        return Ok(());
+    }
+    let client = AcpBackend::launch(&parent).await?;
+    let run = async {
+        inbox.state(Onboarding::Checking);
+        client.initialize().await?;
+        client.canary().await?;
+        let registry = tr_agent_tools::Registry::new(tools);
+        let instructions = tr_agent::bridge::session_instructions(&bridge_options(String::new(), tools), &registry)
+            .replace(
+                "Never use shell, filesystem, web, MCP, code execution or delegation.",
+                "Use only terminal-rs MCP tools; never use shell, filesystem, web, code execution or delegation.",
+            );
+        client
+            .start_thread(ThreadOptions {
+                cwd: String::new(),
+                base_instructions: instructions,
+                ephemeral: true,
+                dynamic_tools: tr_agent::bridge::dynamic_tools(&registry),
+            })
+            .await?;
+        inbox.push(Event::Models(client.list_models().await?));
+        inbox.state(Onboarding::Ready);
+        let mut events = client.events();
+        let mut calls = 0;
+        let mut interrupted = false;
+        let mut workflow_results = Vec::new();
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else { bail!("mimo ACP event stream closed"); };
+                    let packet = match event {
+                        AgentEvent::TextDelta(params) => Some(("item/agentMessage/delta",params)),
+                        AgentEvent::ReasoningDelta(params) => Some(("item/reasoning/textDelta",params)),
+                        AgentEvent::ToolStarted(params) => { calls += 1; Some(("item/started",params)) },
+                        AgentEvent::ToolFinished(params) => Some(("item/completed",params)),
+                        AgentEvent::Done(params) => {
+                            if let Some(reason) = params["error"].as_str() {
+                                inbox.push(Event::Notice(scrub_text(reason)));
+                            }
+                            inbox.push(Event::Bridge(BridgeEvent::Completed { turn:params["turnId"].as_str().unwrap_or_default().into(),
+                                status:if interrupted {"interrupted"} else {params["turn"]["status"].as_str().unwrap_or("completed")}.into(), calls, interrupt_elapsed:None }));
+                            calls = 0; interrupted = false; None
+                        }
+                        AgentEvent::Error(reason) => bail!("{reason}"),
+                        AgentEvent::Usage(_) | AgentEvent::RateLimits(_) => None,
+                    };
+                    if let Some((method,params)) = packet {
+                        let event = BridgeEvent::Wire(WireEvent::Notification {method:method.into(),params});
+                        if let Some(event) = project(event) { inbox.push(Event::Bridge(event)); }
+                    }
+                }
+                command = receive.recv() => match command {
+                    Some(Command::Turn(mut turn)) => {
+                        workflow_results.append(&mut turn.input.workflow_results);
+                        turn.input.workflow_results = workflow_results.clone();
+                        match acp_send_turn(&client, inbox, turn.input).await? {
+                            Some(id) => {
+                                workflow_results.clear();
+                                inbox.push(Event::Bridge(BridgeEvent::Started {turn:id}));
+                            }
+                            None => continue,
+                        }
+                    }
+                    Some(Command::Interrupt) => { interrupted = true; client.interrupt().await?; }
+                    Some(Command::RefreshLimits) => inbox.state(Onboarding::Ready),
+                    Some(Command::WorkflowResults(mut results)) => {
+                        workflow_results.append(&mut results);
+                        inbox.push(Event::Notice("Workflow outcomes will accompany your next mimo prompt; no prompt was replayed.".into()));
+                    }
+                    Some(_) => {}, None => return Ok(()),
+                }
+            }
+        }
+    };
+    let result = tokio::select! { biased; _ = stopping.changed() => Ok(()), result = run => result };
+    client.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), client.wait_cleanup())
+        .await
+        .context("mimo cleanup timed out; restart the app")??;
+    classify(result, client.is_unsafe())
+}
+
+async fn acp_send_turn(
+    client: &tr_agent::acp::AcpBackend,
+    inbox: &Inbox,
+    input: tr_agent::TurnInput,
+) -> Result<Option<String>> {
+    match client.send_turn(input).await {
+        Ok(id) => Ok(Some(id)),
+        Err(error) if client.is_closed() || client.is_unsafe() => Err(error),
+        Err(error) => {
+            inbox.push(Event::Notice(scrub_text(&error.to_string())));
+            // Clear the optimistic UI running state and pause queued prompts,
+            // just like Codex recovery, without restarting or replaying a turn.
+            inbox.push(Event::Bridge(BridgeEvent::Recovered(tr_agent::bridge::Recovery::Resumed)));
+            Ok(None)
+        }
+    }
+}
+
 async fn deliver_workflow_results(
     client: &CodexAppServer,
     undelivered: &mut Vec<tr_agent::codex::WorkflowResult>,
@@ -525,6 +648,84 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tr_agent::transport::{Transport, WireEvent};
+
+    #[tokio::test]
+    async fn acp_turn_rejection_posts_notice_and_allows_later_turns() {
+        use tr_agent::acp::AcpBackend;
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let (read, write) = tokio::io::split(client_io);
+        let client = AcpBackend::connect(read, write, PathBuf::from("/empty"), PathBuf::from("/app"), Arc::new(|| {}));
+        let inbox = Inbox {
+            events: Mutex::new(Vec::new()),
+            visible: AtomicBool::new(false),
+            ctx: egui::Context::default(),
+            last_text_wake: Mutex::new(None),
+        };
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server_io);
+            let mut read = BufReader::new(read);
+            let mut rejected = false;
+            loop {
+                let Some(line) = tr_agent::mcp::read_line(&mut read).await.unwrap() else {
+                    return;
+                };
+                let request: serde_json::Value = serde_json::from_slice(&line).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "initialize" => json!({"protocolVersion":1}),
+                    "session/new" => json!({"sessionId":"test","models":{"availableModels":[{"modelId":"model"}]}}),
+                    "session/set_model" if !rejected => {
+                        rejected = true;
+                        tr_agent::mcp::write_line(
+                            &mut write,
+                            &tr_agent::mcp::error(request["id"].clone(), -32602, "rejected"),
+                        )
+                        .await
+                        .unwrap();
+                        continue;
+                    }
+                    "session/set_model" => json!({}),
+                    "session/prompt" => {
+                        // Leave the turn running until shutdown for the busy-turn assertion.
+                        continue;
+                    }
+                    _ => panic!("unexpected ACP request"),
+                };
+                tr_agent::mcp::write_line(&mut write, &tr_agent::mcp::success(request["id"].clone(), result))
+                    .await
+                    .unwrap();
+            }
+        });
+        client
+            .start_thread(tr_agent::ThreadOptions {
+                cwd: String::new(),
+                base_instructions: String::new(),
+                ephemeral: true,
+                dynamic_tools: vec![],
+            })
+            .await
+            .unwrap();
+        let input = || tr_agent::TurnInput { model: "model".into(), text: "next".into(), ..Default::default() };
+        assert!(acp_send_turn(&client, &inbox, input()).await.unwrap().is_none());
+        assert!(!client.is_closed());
+        assert!(acp_send_turn(&client, &inbox, input()).await.unwrap().is_some());
+        assert!(acp_send_turn(&client, &inbox, input()).await.unwrap().is_none());
+        let posted = std::mem::take(&mut *inbox.events.lock().unwrap());
+        assert_eq!(posted.iter().filter(|e| matches!(e, Event::Notice(_))).count(), 2);
+        assert_eq!(posted.iter().filter(|e| matches!(e, Event::Bridge(BridgeEvent::Recovered(_)))).count(), 2);
+        let mut pane = crate::agent_pane::AgentPane::default();
+        pane.running = true;
+        for event in posted {
+            match event {
+                Event::Notice(reason) => pane.error_notice(&reason),
+                Event::Bridge(event) => pane.event(event),
+                _ => panic!("a recoverable failure must not stop onboarding"),
+            }
+        }
+        assert!(!pane.running, "a rejected start must clear optimistic UI state");
+        client.shutdown();
+        assert!(acp_send_turn(&client, &inbox, input()).await.is_err());
+        server.abort();
+    }
 
     #[test]
     fn review_bridge_executor_timeout_outlasts_scan_deadline() {

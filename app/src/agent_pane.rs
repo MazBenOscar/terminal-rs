@@ -39,6 +39,21 @@ const PRIVACY_GROUPS: &[(&str, &str)] = &[
     ),
 ];
 
+const MIMO_PRIVACY_GROUPS: &[(&str, &str)] = &[
+    (
+        "What is sent",
+        "Your prompts, chart data, tool results and the startup isolation self-test go to the provider configured in mimo's private home. This may be MiniMax (China-hosted), not your ChatGPT account. Review that provider's terms and data licence before continuing. News tools share local headlines and filing metadata, omit summaries by default, and never fetch on demand. Screenshots are disabled.",
+    ),
+    (
+        "What the agent can change",
+        "mimo uses Settings › Agent's external MCP policy, read-only by default. Enabling external chart edits permits chart edits and workflow proposals; watchlist and alert writes still require your approval. Its socket calls are labelled External agent, separately from conversation turns.",
+    ),
+    (
+        "What is stored on this Mac",
+        "mimo uses a separate persistent private login home under the app data directory, never your personal CLI home. Its empty workspaces are removed after child cleanup. Provider-managed login/session data can remain in that private home; terminal-rs does not save raw ACP transcripts. Layouts contain choices, not conversations or sign-in details.",
+    ),
+];
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolsMode {
     #[default]
@@ -405,6 +420,7 @@ impl DataBasis {
 }
 
 pub struct AgentPane {
+    pub backend: &'static str,
     pub settings: Settings,
     pub workflows: crate::agent_bridge::Workflows,
     pub proposal_focus: HashMap<egui::Id, String>,
@@ -446,11 +462,13 @@ pub struct AgentPane {
     queue_paused: bool,
     retryable: bool,
     notice_levels: HashMap<usize, Severity>,
+    external_notices: HashMap<String, (Instant, usize, usize)>,
     pub expanded_tools: std::collections::HashSet<usize>,
 }
 impl Default for AgentPane {
     fn default() -> Self {
         Self {
+            backend: "Codex",
             settings: Settings::default(),
             workflows: Default::default(),
             proposal_focus: Default::default(),
@@ -487,6 +505,7 @@ impl Default for AgentPane {
             queue_paused: false,
             retryable: false,
             notice_levels: HashMap::new(),
+            external_notices: HashMap::new(),
             expanded_tools: Default::default(),
         }
     }
@@ -632,6 +651,23 @@ impl AgentPane {
                     trace.target_args["_drawing_visibility"]["hidden"] = (*hidden).into();
                 }
             }
+        }
+    }
+
+    pub(crate) fn external_notice(&mut self, connection: &str, now: Instant) {
+        self.external_notices
+            .retain(|_, (start, _, _)| now.saturating_duration_since(*start) < Duration::from_secs(30));
+        let prefix = format!("External agent: tool request received through MCP ({connection})");
+        if let Some((_, index, count)) = self.external_notices.get_mut(connection) {
+            *count += 1;
+            if let Some(RenderedBlock::Notice(text)) = self.blocks.get_mut(*index)
+                && text.starts_with(&prefix)
+            {
+                *text = format!("{prefix} · {count} requests");
+            }
+        } else {
+            self.notice(&format!("{prefix} · 1 request"));
+            self.external_notices.insert(connection.into(), (now, self.blocks.len() - 1, 1));
         }
     }
 
@@ -997,7 +1033,8 @@ impl AgentPane {
                 ui.set_max_width(ui.available_width());
                 if self.disclosure || !self.acknowledged {
                     agent_markdown::wrapped(ui, "Privacy", theme::text());
-                    for (heading, body) in PRIVACY_GROUPS {
+                    let groups = if self.backend == "mimo" { MIMO_PRIVACY_GROUPS } else { PRIVACY_GROUPS };
+                    for (heading, body) in groups {
                         ui.label(RichText::new(*heading).font(theme::ui_font(10.5)).color(theme::text()));
                         agent_markdown::wrapped(ui, body, theme::text());
                     }
@@ -1006,6 +1043,17 @@ impl AgentPane {
                         self.disclosure = false;
                     }
                     ui.add_space(dp(6.0));
+                }
+                let external: std::collections::BTreeSet<_> = self
+                    .workflows
+                    .proposals
+                    .iter()
+                    .filter(|p| p.turn.starts_with("external-"))
+                    .map(|p| p.turn.clone())
+                    .collect();
+                for turn in external {
+                    ui.label("External agent");
+                    self.confirmation_card(ui, &turn, &mut actions);
                 }
                 if !self.acknowledged {
                     return;
@@ -1056,7 +1104,16 @@ impl AgentPane {
 
     fn onboarding(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
         agent_markdown::show(ui, &[agent_markdown::DisplayBlock::Heading(2, self.state.title().into())]);
-        let response = agent_markdown::wrapped(ui, &self.state.description(), theme::text());
+        let description = if self.backend == "mimo" {
+            match self.state {
+                Onboarding::Dormant => "Uses mimo's private provider account, not ChatGPT. Chart tools use the external MCP policy in Settings › Agent.".into(),
+                Onboarding::Checking => "Checking ACP and running the isolation canary with your configured provider before readiness.".into(),
+                _ => self.state.description(),
+            }
+        } else {
+            self.state.description()
+        };
+        let response = agent_markdown::wrapped(ui, &description, theme::text());
         match &self.state {
             Onboarding::ToolsUnavailable { reason } | Onboarding::Stopped { reason, .. } => {
                 response.on_hover_text(reason);
@@ -1069,7 +1126,15 @@ impl AgentPane {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(dp(14.0), dp(18.0)), egui::Sense::hover());
                 // Static, drawn activity: progress follows events, never an idle animation timer.
                 widgets::draw_icon(ui.painter(), rect, Icon::Running, readable(theme::muted()));
-                agent_markdown::wrapped(ui, CHECKING_STATUS, theme::text());
+                agent_markdown::wrapped(
+                    ui,
+                    if self.backend == "mimo" {
+                        "Checking mimo ACP and its isolation canary…"
+                    } else {
+                        CHECKING_STATUS
+                    },
+                    theme::text(),
+                );
             });
         }
         if self.state == Onboarding::Checking {
@@ -1574,6 +1639,7 @@ impl AgentPane {
             Onboarding::Unsupported { .. } => "Install a supported Codex version, then check again before sending.",
             Onboarding::SignedOut => "Sign in with ChatGPT before sending a prompt.",
             Onboarding::SigningIn => "Finish signing in before sending a prompt.",
+            Onboarding::Checking if self.backend == "mimo" => "Wait for mimo ACP and its isolation canary to finish.",
             Onboarding::Checking => "Wait for Codex, account and chart-tool checks to finish.",
             Onboarding::RateLimited { .. } => "Wait for the usage limit to reset, then check limits.",
             Onboarding::Stopped { unsafe_backend: true, .. } => "Close this unsafe session and start a new one.",
@@ -1707,17 +1773,26 @@ impl AgentPane {
     fn header(&mut self, ui: &mut Ui, pin_label: &str, actions: &mut Vec<Action>) {
         self.settings.select_defaults(&self.models);
         let model = self.models.iter().find(|m| m.id == self.settings.model);
-        let model_label = format!(
-            "{} · {}",
-            model.map_or("Model", |m| m.display_name.as_str()),
-            if self.settings.effort.is_empty() { "effort" } else { &self.settings.effort }
-        );
+        let model_label = if self.backend == "mimo" {
+            format!("mimo · {}", model.map_or("mimo default", |m| m.display_name.as_str()))
+        } else {
+            format!(
+                "{} · {} · {}",
+                self.backend,
+                model.map_or("Model", |m| m.display_name.as_str()),
+                if self.settings.effort.is_empty() { "effort" } else { &self.settings.effort }
+            )
+        };
         let pin_label = pin_label.trim_start_matches("Pinned: ");
         let width_of = |text: &str| {
             ui.painter().layout_no_wrap(text.into(), theme::ui_font(10.5), theme::text()).size().x + dp(12.0)
         };
         let model_width = width_of(&model_label) + dp(16.0);
-        let mode_width = width_of("Read only") + width_of("Chart edits");
+        let mode_width = if self.backend == "mimo" {
+            width_of("MCP policy")
+        } else {
+            width_of("Read only") + width_of("Chart edits")
+        };
         let style_width = width_of(self.settings.response_style.label()) + dp(16.0);
         let status_width = width_of(self.status()) + dp(8.0);
         let more_width = dp(22.0);
@@ -1807,7 +1882,9 @@ impl AgentPane {
                 self.settings.effort.clear();
             }
             self.settings.select_defaults(&self.models);
-            if let Some(model) = self.models.iter().find(|m| m.id == self.settings.model) {
+            if let Some(model) = self.models.iter().find(|m| m.id == self.settings.model)
+                && !model.supported_reasoning_efforts.is_empty()
+            {
                 ui.separator();
                 ui.menu_button("Reasoning effort", |ui| {
                     for effort in &model.supported_reasoning_efforts {
@@ -1834,6 +1911,11 @@ impl AgentPane {
     }
 
     fn mode_switch(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        if self.backend == "mimo" {
+            ui.label(RichText::new("MCP policy").font(theme::ui_font(10.5)))
+                .on_hover_text("mimo uses the external MCP read-only/edit policy in Settings › Agent, not Codex's per-pane toolset. Workflow writes still require approval.");
+            return;
+        }
         let available = crate::agent_bridge::agent_edit_tools_available();
         let group = egui::Frame::new()
             .fill(theme::control())
@@ -1911,7 +1993,7 @@ impl AgentPane {
         let response = response.on_hover_text("Agent menu");
         egui::Popup::menu(&response).show(|ui| {
             ui.menu_button("Backend", |ui| {
-                ui.selectable_label(true, "Codex").on_hover_text("Runs locally in a sandbox");
+                ui.selectable_label(true, self.backend).on_hover_text("Backend is selected in Settings › Agent");
             });
             if control(ui, "Privacy info").clicked() {
                 self.disclosure = !self.disclosure;

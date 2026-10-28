@@ -927,7 +927,7 @@ fn watch_turn(dispatch: &Arc<Dispatch>, client: Arc<CodexAppServer>) {
     });
 }
 
-fn session_instructions(options: &BridgeOptions, registry: &Registry) -> String {
+pub fn session_instructions(options: &BridgeOptions, registry: &Registry) -> String {
     // Use the tools actually exposed to this session, not a UI mode or requested opt-in.
     let edits_enabled = registry.schemas().iter().any(|tool| tool.name == "create_drawing");
     let mode_instructions = if edits_enabled {

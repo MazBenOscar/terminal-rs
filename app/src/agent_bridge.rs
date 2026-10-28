@@ -428,11 +428,13 @@ impl Workflows {
                 && (now >= proposal.deadline || turn.is_some_and(|t| t == proposal.turn))
             {
                 proposal.expire();
-                self.context.push(tr_agent::codex::WorkflowResult::Confirmation {
-                    proposal_id: proposal.id,
-                    status: tr_agent::codex::WorkflowStatus::Expired,
-                    summary: proposal.decision_summary(),
-                });
+                if !proposal.turn.starts_with("external-") {
+                    self.context.push(tr_agent::codex::WorkflowResult::Confirmation {
+                        proposal_id: proposal.id,
+                        status: tr_agent::codex::WorkflowStatus::Expired,
+                        summary: proposal.decision_summary(),
+                    });
+                }
             }
         }
     }
@@ -608,6 +610,41 @@ impl TerminalApp {
     }
 }
 impl AppExecutor {
+    pub async fn external_outcomes(&self, turn: &str, proposal_id: Option<u64>) -> ToolResult {
+        let prefix = format!("{}:", turn.split(':').next().unwrap_or(turn));
+        let host = ScopedHost {
+            app: self.clone(),
+            call: ToolCall {
+                turn: turn.into(),
+                pin: ChartPin { uid: 0, symbol: String::new(), timeframe: String::new(), visible_range: None },
+                name: "read_proposal_outcomes".into(),
+                arguments: "{}".into(),
+                confirmed: false,
+            },
+        };
+        match host.job(ChartTarget::Application, move |app| {
+            let workflows = &mut app.agent_pane.workflows;
+            workflows.expire(Instant::now(), None);
+            let rows: Vec<_> = workflows.proposals.iter().rev()
+                .filter(|p| p.turn.starts_with(&prefix) && proposal_id.is_none_or(|id| p.id == id))
+                .take(32)
+                .map(|p| json!({"proposal_id":p.id,"turn":p.turn,
+                    "status":match p.status {
+                        ProposalStatus::Pending => "pending", ProposalStatus::Approved => "approved",
+                        ProposalStatus::Declined => "declined", ProposalStatus::Expired => "expired",
+                        ProposalStatus::Failed(_) => "failed",
+                    },
+                    "summary":tr_agent::transcript::scrub_text(&if p.status == ProposalStatus::Pending { p.summary.clone() }
+                        else if p.symbols.is_empty() { p.outcome_summary() } else { p.decision_summary() }).chars().take(2000).collect::<String>(),
+                    "undone":workflows.undone.contains_key(&p.turn)}))
+                .collect();
+            AgentReply { success: true, value: json!({"proposals":rows}) }
+        }).await {
+            Ok(value) => ToolResult::json(value),
+            Err(error) => ToolResult::error("host_error", &error, None),
+        }
+    }
+
     pub fn new(app: &TerminalApp) -> Self {
         Self {
             queue: app.agent_queue.clone(),
@@ -649,7 +686,15 @@ impl ToolExecutor for AppExecutor {
             ctx.confirmed = host.call.confirmed;
             ctx.analyses = {
                 let mut turns = self.analyses.lock().unwrap();
-                turns.retain(|turn, _| turn == &host.call.turn);
+                // The in-app backend owns one active turn; preserve its original
+                // next-turn eviction. External peers each own their own turn and
+                // explicitly release it on disconnect/rotation instead.
+                if !host.call.turn.starts_with("external-") {
+                    turns.retain(|turn, _| turn.starts_with("external-") || turn == &host.call.turn);
+                }
+                if turns.len() >= 64 && !turns.contains_key(&host.call.turn) {
+                    return ToolResult::error("session_limit", "Too many active analysis sessions", None);
+                }
                 turns.entry(host.call.turn.clone()).or_default().clone()
             };
             registry.call(&host.call.name, &host.call.arguments, &mut ctx).await
@@ -657,6 +702,8 @@ impl ToolExecutor for AppExecutor {
     }
     fn cancel(&self, turn: &str) {
         self.queue.cancel(turn);
+        self.analyses.lock().unwrap().remove(turn);
+        self.expected.lock().unwrap().remove(turn);
         // A5b-SCAN: interrupt the in-flight worker as well as queued UI reads.
         if let Some((owner, cancel)) = &*self.scans.current.lock().unwrap()
             && owner == turn
@@ -693,7 +740,19 @@ impl ScopedHost {
             turn: self.call.turn.clone(),
             chart,
             deadline: Instant::now() + UI_TIMEOUT,
-            run: Box::new(run),
+            run: Box::new({
+                let connection = self
+                    .call
+                    .turn
+                    .strip_prefix("external-")
+                    .map(|id| format!("external-{}", id.split(':').next().unwrap_or(id)));
+                move |app| {
+                    if let Some(connection) = connection {
+                        app.agent_pane.external_notice(&connection, Instant::now());
+                    }
+                    run(app)
+                }
+            }),
             reply,
         });
         let result = tokio::time::timeout(UI_TIMEOUT, receive)

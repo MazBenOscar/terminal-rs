@@ -5845,7 +5845,12 @@ impl ChartState {
         let mut tags = Vec::new();
         for (d, selected, shapes) in prepared {
             if d.agent_highlight() {
-                let size = p.layout_no_wrap("Agent".into(), mono(9.), theme::muted()).size();
+                let source = if d.turn_id.as_deref().is_some_and(|t| t.starts_with("external-")) {
+                    "External agent"
+                } else {
+                    "Agent"
+                };
+                let size = p.layout_no_wrap(source.into(), mono(9.), theme::muted()).size();
                 let preferred = if d.tool == Tool::Rectangle {
                     shapes.iter().find_map(|(shape, _)| {
                         if let drawings::Shape::Rect(a, b) = shape {
@@ -5865,7 +5870,7 @@ impl ChartState {
                     preferred.and_then(|(area, at)| crate::drawing_paint::provenance_rect(area, at, size, &occupied))
                 {
                     occupied.push(tag);
-                    tags.push(tag);
+                    tags.push((tag, source));
                 }
             }
             let color = if selected { amber() } else { crate::drawing_paint::drawing_color(&d) };
@@ -5887,8 +5892,8 @@ impl ChartState {
                 shapes,
             );
         }
-        for tag in tags {
-            p.text(tag.min, Align2::LEFT_TOP, "Agent", mono(9.), theme::muted());
+        for (tag, source) in tags {
+            p.text(tag.min, Align2::LEFT_TOP, source, mono(9.), theme::muted());
         }
     }
 

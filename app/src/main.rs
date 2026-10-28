@@ -4,6 +4,7 @@
 pub use app::agent_bridge;
 mod agent_demo;
 mod agent_markdown;
+mod agent_mcp;
 mod agent_pane;
 pub mod agent_queue;
 mod agent_session;
@@ -51,6 +52,35 @@ pub mod worker;
 use std::time::Instant;
 
 fn main() -> eframe::Result {
+    let stdio = std::env::args_os().nth(1).is_some_and(|arg| arg == "mcp-stdio");
+    // Before runtimes, tracing, providers or eframe: all consumers (including
+    // sandbox grants and the child shim's cwd) see one absolute canonical path.
+    let data = tr_agent::mcp::canonical_data_dir(&tr_alerts::data_dir()).map_err(|_| {
+        if stdio {
+            eprintln!("terminal-rs MCP stdio stopped: data directory unavailable");
+        }
+        demo_error("Data directory unavailable".into())
+    })?;
+    // SAFETY: startup is single-threaded and there are no environment readers yet.
+    unsafe {
+        std::env::set_var("TR_DATA_DIR", &data);
+    }
+    if stdio {
+        let result =
+            tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(anyhow::Error::from).and_then(
+                |runtime| {
+                    runtime.block_on(tr_agent::mcp::serve_stdio(
+                        tokio::io::stdin(),
+                        tokio::io::stdout(),
+                        tr_agent::mcp::socket_path(&data),
+                    ))
+                },
+            );
+        if result.is_err() {
+            eprintln!("terminal-rs MCP stdio stopped: protocol I/O failed");
+        }
+        return result.map_err(|_| demo_error("MCP stdio I/O failed".into()));
+    }
     let demo = agent_demo::Config::from_env().map_err(demo_error)?;
     let shot_requested = demo.as_ref().is_some_and(|demo| demo.shot.is_some());
     let outcome: agent_demo::Outcome = Default::default();

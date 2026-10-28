@@ -1,6 +1,8 @@
 # Agentic charts implementation plan
 
-Status: design approved for implementation, 2026-10-22. No code has been written yet.
+Status: A0–A5 implementation reports are below. A4 code and offline tests are
+implemented (2026-10-28); live mimo transport/authentication and client acceptance
+remain manager gates, not verified results. Original design approved 2026-10-22.
 Phases are numbered A0–A5 (renamed from P0–P5 so they do not collide with the
 performance programme P1–P6). See "Integration review" at the end for prerequisites
 and ordering against the existing backlog.
@@ -18,6 +20,26 @@ The design comes from four sources:
 - Three reviews: a Claude architect review, a Codex self-review and a final review by Claude Fable 5.1.
 
 Each phase lands on its own feature branch, following the existing workflow.
+
+## Status after A4 (2026-10-28)
+
+- Implemented: opt-in 0700/0600 Unix tool socket with same-UID checks, shared
+  registry/UI host, read-only default, connection limits and External agent labels.
+  The headless `mcp-stdio` JSONL shim supports both requested MCP protocol versions.
+- Implemented: isolated mimo `AcpBackend`, ACP v1 initialization/session/prompt/
+  cancellation, exact terminal-rs tool permission checks, stream scrubbing and
+  pre-readiness canary. Backend selection starts a fresh conversation; Codex
+  remains the default and retains its existing wire path.
+- Offline tests cover the real app queue plus fake MCP/ACP peers; verification,
+  security details and the manager's exact manual commands are in
+  [`docs/agent-mcp.md`](../agent-mcp.md).
+- **Not live-verified:** the installed `mimo acp --help` advertises loopback and
+  ephemeral-port flags, but does not identify the ACP wire transport. Only help
+  commands were permitted here. The backend implements the specified JSONL stdio
+  contract; no port fallback is guessed. If this mimo is port-only, that adapter
+  remains unimplemented. Authentication, actual MCP tool provenance and Claude/
+  mimo acceptance remain manager gates. Do not weaken isolation to bypass them.
+- No new crate, release build, app launch, network access or README change.
 
 ## A3E-FIX reviewer follow-up (2026-10-27)
 
@@ -771,8 +793,9 @@ Acceptance criteria:
 
 Work:
 
-- A `terminal-rs mcp-stdio` subcommand using `rmcp`, bridging to the app over a 0600
-  Unix socket. The read-only toolset is the default.
+- A `terminal-rs mcp-stdio` subcommand using hand-rolled JSON-RPC with the existing
+  serde/serde_json/tokio dependencies (no offline `rmcp` dependency), bridging to
+  the app over a 0600 Unix socket. The read-only toolset is the default.
 - An `AcpBackend` for `mimo acp`. `session/new` passes `mcpServers` and `cwd`.
 - Lock mimo down with `--pure` and permissions denying bash, edit and webfetch.
 
