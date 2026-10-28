@@ -101,11 +101,21 @@ async fn handshake_mcp_entry_streamed_chunks_tools_plan_and_models() {
 
 #[test]
 fn child_config_has_one_eager_mcp_server_and_fixed_switches_in_both_profiles() {
+    let config = terminal_mcp_config(Path::new("/app/terminal-rs"), Path::new("/canonical/data"));
     assert_eq!(
-        terminal_mcp_config(Path::new("/app/terminal-rs"), Path::new("/canonical/data")),
-        json!({"mcp":{"terminal-rs":{"type":"local","command":["/app/terminal-rs","mcp-stdio"],
-            "environment":{"TR_DATA_DIR":"/canonical/data"}}}})
+        config["mcp"],
+        json!({"terminal-rs":{"type":"local","command":["/app/terminal-rs","mcp-stdio"],
+            "environment":{"TR_DATA_DIR":"/canonical/data"}}})
     );
+    // Only terminal-rs tools: every built-in is off and its permission denied.
+    assert_eq!(config["tools"]["*"], json!(false));
+    assert_eq!(config["tools"]["terminal-rs_*"], json!(true));
+    for name in ["bash", "read", "edit", "write", "webfetch", "task"] {
+        assert_eq!(config["tools"][name], json!(false), "{name}");
+    }
+    for name in ["bash", "edit", "webfetch", "read"] {
+        assert_eq!(config["permission"][name], json!("deny"), "{name}");
+    }
     for profile in [MimoProfile::Own, MimoProfile::Private] {
         let env = mimo_environment(
             [("MIMOCODE_CONFIG_CONTENT".into(), "personal".into()), ("MIMOCODE_MCP_TOOL_SEARCH".into(), "true".into())],

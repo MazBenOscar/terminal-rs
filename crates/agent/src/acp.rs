@@ -1021,9 +1021,43 @@ fn mimo_environment(
     env
 }
 
+/// mimo's built-in tools stay in its catalogue even with --pure (the live
+/// canary saw a `bash` call), so switch every one off by name and by glob,
+/// deny their permissions, and enable only the terminal-rs MCP tools.
+const MIMO_BUILTIN_TOOLS: &[&str] = &[
+    "bash",
+    "read",
+    "edit",
+    "write",
+    "patch",
+    "multiedit",
+    "glob",
+    "grep",
+    "list",
+    "webfetch",
+    "websearch",
+    "codesearch",
+    "task",
+    "todowrite",
+    "todoread",
+    "skill",
+    "lsp",
+    "exec",
+];
+
 fn terminal_mcp_config(executable: &Path, data: &Path) -> Value {
-    json!({"mcp":{"terminal-rs":{"type":"local","command":[executable,"mcp-stdio"],
-        "environment":{"TR_DATA_DIR":data}}}})
+    let mut tools = serde_json::Map::new();
+    tools.insert("*".into(), json!(false));
+    for name in MIMO_BUILTIN_TOOLS {
+        tools.insert((*name).into(), json!(false));
+    }
+    tools.insert("terminal-rs_*".into(), json!(true));
+    json!({
+        "mcp":{"terminal-rs":{"type":"local","command":[executable,"mcp-stdio"],
+            "environment":{"TR_DATA_DIR":data}}},
+        "tools": tools,
+        "permission":{"bash":"deny","edit":"deny","webfetch":"deny","read":"deny","external_directory":"deny"},
+    })
 }
 
 fn sandbox_profile(
