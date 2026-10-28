@@ -334,7 +334,20 @@ fn n4_digest_is_deterministic_grouped_and_private_by_default() {
     assert!(!text.contains("\"summary\":"));
     assert!(!text.contains("not-exported"));
     assert_eq!(first.groups[0].stories[0].url_host, "fixture.invalid");
-    assert!(first.markdown().contains("8-K"));
+    let markdown = first.markdown();
+    assert!(markdown.contains("8-K"));
+    for group in &first.groups {
+        for story in &group.stories {
+            let line = markdown.lines().find(|line| line.contains(&story.headline)).unwrap();
+            assert!(line.contains(&story.url_host));
+            for source in &story.sources {
+                assert!(line.contains(source), "per-story source missing: {line}");
+            }
+        }
+    }
+    assert!(!markdown.contains("not-exported"));
+    assert!(!markdown.contains("https://"));
+    assert!(!markdown.contains("é"));
     let full = local::digest(&[a, b], "watchlist", 0, 200, 1, true, metadata);
     assert_eq!(full.groups.iter().map(|g| g.stories.len()).sum::<usize>(), 1);
     let summary = local::digest(&[second_story_for_summary()], "market", 0, 200, 50, true, serde_json::json!([]));

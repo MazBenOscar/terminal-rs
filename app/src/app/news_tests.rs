@@ -531,6 +531,140 @@ fn text_shapes(output: &egui::FullOutput) -> Vec<(String, egui::Pos2)> {
         })
         .collect()
 }
+#[test]
+fn news_key_legend_covers_owned_keys_and_save_in_footer_and_help() {
+    for key in egui::Key::ALL {
+        if owns_key(*key, true, true) {
+            let label = match key {
+                egui::Key::ArrowDown => "↓",
+                egui::Key::ArrowUp => "↑",
+                egui::Key::Slash => "/",
+                egui::Key::Escape => "Esc",
+                _ => key.name(),
+            };
+            assert!(
+                NEWS_SHORTCUTS.iter().any(|(keys, _)| keys.to_lowercase().contains(&label.to_lowercase())),
+                "missing legend entry: {key:?}"
+            );
+        }
+    }
+    assert!(NEWS_SHORTCUTS.contains(&("S", "Save story")));
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    let (output, _) = ui_frame(&ctx, &mut pane, 1800.0, vec![], false);
+    let labels = text_shapes(&output);
+    for (key, action) in NEWS_SHORTCUTS {
+        assert!(labels.iter().any(|(s, p)| s == key && p.y > 300.0), "footer key: {key}");
+        assert!(labels.iter().any(|(s, _)| s == action), "footer action: {action}");
+    }
+    let short = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1800.0, 120.0))),
+            ..Default::default()
+        },
+        |ui| {
+            show(ui, &mut pane, &[], &mut vec![], false, None, 0);
+        },
+    );
+    assert!(!text_shapes(&short).iter().any(|(s, _)| s == "Next story"), "short panes must hide the key legend");
+    // Help uses the same table; keep its section and row actions discoverable too.
+    let help = include_str!("hotkeys_view.rs");
+    assert!(help.contains("section(ui, \"News\")"));
+    assert!(help.contains("super::news_view::NEWS_SHORTCUTS"));
+    assert!(help.contains("Copy link, Save/Unsave (S)"));
+}
+
+#[test]
+fn unread_dot_and_watch_stripe_are_painted_independently() {
+    for watched in [false, true] {
+        for unread in [false, true] {
+            let ctx = egui::Context::default();
+            let mut pane = visible_pane();
+            pane.items.truncate(1);
+            pane.items[0].seen = !unread;
+            let word = pane.items[0].item.title.clone();
+            let mut watches = if watched { vec![KeywordWatch { words: word, ..Default::default() }] } else { vec![] };
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                show(ui, &mut pane, &[], &mut watches, false, None, 0);
+            });
+            let title_y = text_shapes(&output).iter().find(|(s, _)| s == &pane.items[0].item.title).unwrap().1.y;
+            let in_row = |y: f32| (y - title_y).abs() < dp(15.0);
+            let dots = output
+                .shapes
+                .iter()
+                .filter(|s| {
+                    matches!(&s.shape,
+                        egui::Shape::Circle(c) if c.radius == dp(2.0) && c.center.x < dp(15.0) && in_row(c.center.y)
+                    )
+                })
+                .count();
+            let stripes = output.shapes.iter().filter(|s| matches!(&s.shape,
+                egui::Shape::Rect(r) if r.rect.width() == dp(2.0) && r.rect.left() < dp(15.0) && in_row(r.rect.center().y)
+            )).count();
+            assert_eq!(dots, usize::from(unread), "watched={watched}, unread={unread}");
+            assert_eq!(stripes, usize::from(watched), "watched={watched}, unread={unread}");
+            output.textures_delta.clear();
+        }
+    }
+}
+
+#[test]
+fn source_filter_is_case_insensitive_counts_matches_and_preserves_selection() {
+    assert!(source_matches("Reuters", "  EUT  "));
+    assert!(!source_matches("Reuters", "Bloomberg"));
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.filters.sources = vec!["Reuters".into(), "Bloomberg".into()];
+    pane.interaction.source_filter = "eUt".into();
+    let source_count = pane
+        .items
+        .iter()
+        .flat_map(|s| [s.source.clone(), s.provider.clone()])
+        .chain(pane.filters.sources.iter().cloned())
+        .filter(|s| !s.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ui.set_max_width(dp(300.0));
+        filters(ui, &mut pane, &mut vec![], false, 0);
+    });
+    let labels = text_shapes(&output);
+    let count = format!("1 of {source_count} sources match");
+    assert!(labels.iter().any(|(s, _)| s == &count));
+    assert!(labels.iter().any(|(s, _)| s == "Reuters"));
+    assert!(!labels.iter().any(|(s, _)| s == "Bloomberg"));
+    assert!(labels.iter().any(|(s, _)| s == "Include words (any)"));
+    assert!(labels.iter().any(|(s, _)| s.contains("Any whole word; case-insensitive, not a phrase")));
+    assert!(labels.iter().any(|(s, _)| s.contains("Reject any whole word; case-insensitive, not a phrase")));
+    assert_eq!(pane.filters.sources, ["Reuters", "Bloomberg"]);
+    output.textures_delta.clear();
+}
+
+#[test]
+fn search_is_bounded_filters_adjacent_and_collapsed_summary_is_visible() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    let (output, _) = ui_frame(&ctx, &mut pane, 1400.0, vec![], false);
+    let labels = text_shapes(&output);
+    let search = labels.iter().find(|(s, _)| s == "Search").unwrap().1;
+    let filters = labels.iter().find(|(s, _)| s == "Filters (0)").unwrap().1;
+    assert!(filters.x > search.x && filters.x - search.x <= dp(235.0), "{search:?} → {filters:?}");
+    pane.filters.sources = vec!["Reuters".into()];
+    pane.filters.include = "earnings guidance".into();
+    pane.filters.exclude = "rumor".into();
+    pane.display.unread = true;
+    pane.display.watch_hits = true;
+    let expected = active_filter_summary(&pane);
+    for value in ["Reuters", "Include any: earnings guidance", "Exclude any: rumor", "Unread only", "Watch hits"] {
+        assert!(expected.contains(value));
+    }
+    for width in [320.0, 1400.0] {
+        let (output, measured) = ui_frame(&ctx, &mut pane, width, vec![], false);
+        assert!(measured <= width + 1.0);
+        assert!(text_shapes(&output).iter().any(|(s, _)| s == &expected));
+    }
+}
+
 fn visible_pane() -> NewsPane {
     let mut pane = NewsPane::new(None);
     pane.loading = false;
@@ -591,6 +725,7 @@ fn feed_chrome_stays_two_lines_and_rows_are_dense_at_narrow_widths() {
             !labels.iter().any(|(s, _)| s.contains("non-commercial")),
             "licence belongs only in About and Settings"
         );
+        assert!(!labels.iter().any(|(s, _)| s == "Next story"), "compact panes must hide the key legend");
         let today = labels.iter().find(|(s, _)| s == "Today").unwrap().1;
         let ninety = labels.iter().find(|(s, _)| s == "90D").unwrap().1;
         assert!((today.y - ninety.y).abs() < 1.0, "single date chips may not wrap");
@@ -601,11 +736,54 @@ fn feed_chrome_stays_two_lines_and_rows_are_dense_at_narrow_widths() {
             .map(|story| labels.iter().find(|(text, _)| text == &story.item.title).unwrap().1.y)
             .collect();
         assert!(
+            positions.iter().copied().fold(f32::INFINITY, f32::min) < dp(60.0),
+            "headlines must follow two chrome lines: {positions:?}"
+        );
+        assert!(
             ((positions[0] - positions[1]).abs() - dp(22.0)).abs() < 1.0,
             "one headline per dp(22) row: {positions:?}"
         );
     }
 }
+#[test]
+fn open_search_stays_bounded_at_chrome_breakpoints() {
+    for width in [320.0, 359.0, 360.0, 600.0] {
+        for search in ["", "earnings"] {
+            let ctx = egui::Context::default();
+            let mut pane = visible_pane();
+            pane.interaction.search_open = true;
+            pane.filters.search = search.into();
+            let (_, measured) = ui_frame(&ctx, &mut pane, width, vec![], false);
+            assert!(measured <= width + 1.0, "open search overflow at {width}: {measured}");
+        }
+    }
+}
+
+#[test]
+fn legend_and_filter_summary_settle_without_idle_repaints_at_all_widths() {
+    for width in [320.0, 359.0, 360.0, 600.0, 1800.0] {
+        for summary in [false, true] {
+            let ctx = egui::Context::default();
+            let mut pane = visible_pane();
+            if summary {
+                pane.filters.exclude = "rumor".into();
+            }
+            for _ in 0..4 {
+                ui_frame(&ctx, &mut pane, width, vec![], false);
+            }
+            let (output, measured) = ui_frame(&ctx, &mut pane, width, vec![], false);
+            assert!(measured <= width + 1.0, "overflow at {width}, summary={summary}: {measured}");
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT].repaint_delay > std::time::Duration::from_secs(60),
+                "idle repaint at {width}, summary={summary}"
+            );
+            let labels = text_shapes(&output);
+            assert_eq!(labels.iter().any(|(s, _)| s == "Next story"), width == 1800.0);
+            assert_eq!(labels.iter().any(|(s, _)| s == "Exclude any: rumor"), summary);
+        }
+    }
+}
+
 #[test]
 fn keyboard_dwell_marks_seen_once_and_text_fields_own_typing() {
     let ctx = egui::Context::default();

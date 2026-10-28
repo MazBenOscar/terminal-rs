@@ -434,9 +434,11 @@ pub mod local {
                 text.push_str(&format!("\n## {} · {}\n", group.topic, group.subject));
                 for s in &group.stories {
                     text.push_str(&format!(
-                        "- {} · {} source(s) · {} [{}]\n",
+                        "- {} · {} source(s): {} · {} · {} [{}]\n",
                         s.time,
                         s.source_count,
+                        s.sources.join(", "),
+                        s.url_host,
                         s.headline,
                         s.tickers.join(", ")
                     ));
