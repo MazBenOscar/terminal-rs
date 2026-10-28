@@ -1,7 +1,100 @@
 use super::*;
+
+#[test]
+fn n5_feed_delivery_is_idempotent_even_with_reordered_replies() {
+    let mut last = 0;
+    assert!(super::super::accept_news_delivery(&mut last, 1));
+    assert!(!super::super::accept_news_delivery(&mut last, 1));
+    assert!(super::super::accept_news_delivery(&mut last, 3));
+    assert!(!super::super::accept_news_delivery(&mut last, 2));
+}
+#[test]
+fn n5_inferred_timestamp_is_honestly_labelled() {
+    let mut item = stories()[0].clone();
+    item.inferred_ts = true;
+    let model = row_model(&Cluster::wire(&item), None, item.item.ts + 60);
+    assert_eq!(model.full_time, "time unknown");
+    assert_eq!(model.time, "—");
+}
+
+#[test]
+fn n5_save_key_requires_selection_and_saved_filter_tracks_actions_and_stale_replies() {
+    assert!(!owns_key(egui::Key::S, false, false));
+    assert!(owns_key(egui::Key::S, true, false));
+    let mut pane = NewsPane::new(None);
+    pane.items = stories();
+    let original = pane.items.clone();
+    let cluster = Cluster::wire(&pane.items[0]);
+    let mut selection = Some(cluster.lead.id.clone());
+    assert_eq!(
+        reduce(Key::Save, std::slice::from_ref(&cluster.lead.id), &mut selection, &mut String::new(), &mut false),
+        Effect::Save
+    );
+    toggle_saved(&mut pane, &cluster);
+    assert!(pane.items[0].bookmark);
+    assert_eq!(pane.bookmark_queue, vec![(cluster.member_ids.clone(), true)]);
+    pane.filters.saved = true;
+    pane.apply(original.clone()); // a read issued before Save must not undo it
+    let q = current_query(&pane, pane.items[0].item.ts);
+    assert!(tr_data::news_store::matches(&pane.items[0], &q));
+    assert!(!tr_data::news_store::matches(&pane.items[1], &q));
+    let cluster = Cluster::wire(&pane.items[0]);
+    toggle_saved(&mut pane, &cluster);
+    assert!(!pane.items[0].bookmark);
+    assert!(!pane.bookmark_queue.last().unwrap().1);
+    pane.bookmark_reply(&cluster.member_ids, true, None); // older Save ack cannot undo queued Unsave
+    assert!(!pane.items[0].bookmark);
+    pane.bookmark_reply(&cluster.member_ids, false, None);
+    assert!(pane.local_bookmarks.is_empty());
+    pane.bookmark_reply(&cluster.member_ids, true, None); // another pane saved it
+    assert!(pane.items[0].bookmark);
+    let cluster = Cluster::wire(&pane.items[0]);
+    toggle_saved(&mut pane, &cluster);
+    pane.bookmark_reply(&cluster.member_ids, false, Some("Read-only store"));
+    assert!(pane.items[0].bookmark, "failed Unsave restores saved state");
+    assert_eq!(pane.error.as_deref(), Some("Read-only store"));
+}
 use crate::layouts::{LayoutDoc, PaneSettings};
 fn stories() -> Vec<tr_data::news_store::Story> {
     tr_data::finnhub::parse(include_bytes!("../../../crates/data/tests/fixtures/finnhub_news.json"), None).unwrap()
+}
+#[test]
+fn n5_history_and_source_refresh_issue_new_per_pane_generations() {
+    use super::super::{PaneKind, TerminalApp};
+    use crate::worker::{Request, Worker};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/news-generations");
+    let (worker, mut requests) = Worker::recording();
+    let mut app = TerminalApp::isolated_workspace(&root, worker);
+    let id = app.new_pane(PaneKind::News(Box::new(NewsPane::new(None))));
+    let i = app.idx(id).unwrap();
+    app.news_periodic(&[i], false);
+    let first = app.news_subscription.as_ref().unwrap().0[0].clone();
+    while requests.try_recv().is_ok() {}
+    let PaneKind::News(n) = &mut app.panes[i].kind else { panic!() };
+    n.fetched = None;
+    app.news_periodic(&[i], false);
+    let second = app.news_subscription.as_ref().unwrap().0[0].clone();
+    assert!(second.generation > first.generation);
+    assert_eq!(second.filters, first.filters);
+    assert!(matches!(requests.try_recv(), Ok(Request::NewsRead(view)) if view == second));
+    while requests.try_recv().is_ok() {}
+    let PaneKind::News(n) = &mut app.panes[i].kind else { panic!() };
+    n.refresh_source = true;
+    n.fetched = None;
+    app.news_periodic(&[i], false);
+    let third = app.news_subscription.as_ref().unwrap().0[0].clone();
+    assert!(third.generation > second.generation);
+    assert!(matches!(requests.try_recv(), Ok(Request::NewsRefresh(view)) if view == third));
+    let other = app.new_pane(PaneKind::News(Box::new(NewsPane::new(None))));
+    let j = app.idx(other).unwrap();
+    app.news_periodic(&[i, j], false);
+    let views = &app.news_subscription.as_ref().unwrap().0;
+    assert_eq!(views[0].generation, third.generation);
+    assert_eq!(views[1].generation, 1);
+    let PaneKind::News(n) = &mut app.panes[i].kind else { panic!() };
+    **n = NewsPane::new(None); // reopening News in the same pane must not reset its counter
+    app.news_periodic(&[i, j], false);
+    assert!(app.news_subscription.as_ref().unwrap().0[0].generation > third.generation);
 }
 #[test]
 fn n4_volume_banner_is_current_hour_and_scope_specific() {

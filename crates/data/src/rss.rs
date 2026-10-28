@@ -38,8 +38,21 @@ pub fn parse_rss(xml: &str, publisher: &str) -> Result<Vec<NewsItem>> {
 /// Keep headlines mentioning any of `words` (case-insensitive); no match returns empty.
 pub fn filter_relevant(items: Vec<NewsItem>, words: &[&str]) -> Vec<NewsItem> {
     let hit = |n: &NewsItem| {
-        let t = n.title.to_lowercase();
-        words.iter().any(|w| t.contains(&w.to_lowercase()))
+        let tokens = crate::news_intelligence::words(&n.title);
+        words.iter().any(|word| {
+            let word = word.to_lowercase();
+            let aliases: &[&str] = match word.as_str() {
+                "eth" => &["eth", "ethereum", "ether"],
+                "sol" => &["sol", "solana"],
+                "ada" => &["ada", "cardano"],
+                _ => &[&word],
+            };
+            // Possessives are already split by the shared tokenizer; admit only
+            // a whole-token plural, never a prefix or an interior substring.
+            aliases
+                .iter()
+                .any(|alias| tokens.iter().any(|token| token == alias || token.strip_suffix('s') == Some(*alias)))
+        })
     };
     items.into_iter().filter(hit).collect()
 }
@@ -48,6 +61,26 @@ pub fn filter_relevant(items: Vec<NewsItem>, words: &[&str]) -> Vec<NewsItem> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn token_exact_coin_filter() {
+        for (title, word, count) in [
+            ("something", "ETH", 0),
+            ("sold", "SOL", 0),
+            ("Canada", "ADA", 0),
+            ("Ethereum sell-off", "ETH", 1),
+            ("Ethereum’s rally", "ETH", 1),
+            ("Bitcoins move", "bitcoin", 1),
+        ] {
+            let items = vec![NewsItem {
+                title: title.into(),
+                link: String::new(),
+                publisher: String::new(),
+                ts: 0,
+                tickers: vec![],
+            }];
+            assert_eq!(filter_relevant(items, &[word]).len(), count, "{title}");
+        }
+    }
     #[test]
     fn parses_coindesk_fixture() {
         let n = parse_rss(include_str!("../tests/fixtures/coindesk_rss.xml"), "CoinDesk").unwrap();

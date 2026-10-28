@@ -355,6 +355,11 @@ pub enum Request {
     },
     // N1b
     NewsRead(NewsView),
+    NewsRefresh(NewsView),
+    NewsBookmark {
+        ids: Vec<String>,
+        saved: bool,
+    },
     NewsSeen(Vec<String>),
     FeedConfig {
         settings: tr_data::news_store::local::Notifications,
@@ -714,10 +719,19 @@ pub enum Response {
     },
     // N1b: saved reads carry the source update time, not the query completion time.
     FeedNotices {
+        delivery: u64,
         desktop: Vec<String>,
         history: Vec<String>,
     },
-    NewsVolume(Vec<tr_data::news_store::local::Volume>),
+    NewsVolume {
+        pane: PaneId,
+        volumes: Vec<tr_data::news_store::local::Volume>,
+    },
+    NewsBookmark {
+        ids: Vec<String>,
+        saved: bool,
+        error: Option<String>,
+    },
     DigestText {
         pane: PaneId,
         text: Result<String, String>,
@@ -1239,7 +1253,10 @@ impl Worker {
         rt.spawn(async move {
             while let Some(req) = req_rx.recv().await {
                 // N1a: serialize subscription changes so an older snapshot cannot resurrect a hidden pane.
-                if matches!(&req, Request::NewsVisible { .. } | Request::EdgarInterest { .. }) {
+                if matches!(
+                    &req,
+                    Request::NewsVisible { .. } | Request::EdgarInterest { .. } | Request::NewsBookmark { .. }
+                ) {
                     handle(&s, req).await;
                     continue;
                 }
@@ -1799,7 +1816,7 @@ async fn agent_history(
     }
 }
 
-async fn handle_agent(s: &Shared, request: AgentRequest) {
+async fn handle_agent(s: &Arc<Shared>, request: AgentRequest) {
     match request {
         // A5b-SCAN dispatch: permits release only after cancellation drops fetch futures.
         AgentRequest::LocalNews { args, symbols, reply } => {
@@ -2648,13 +2665,13 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         // N1a: requests read the store only; visibility controls the background loop.
         Request::NewsVisible { views, watchlist } => {
             *s.news.watchlist.lock().await = watchlist;
-            *s.news.views.lock().await = views.clone();
-            for view in views {
-                news::read(s, view).await;
-            }
+            *s.news.views.lock().await = views;
+            news::publish(s).await;
         }
         // N1b
         Request::NewsRead(view) => news::read(s, view).await,
+        Request::NewsRefresh(view) => news::refresh(s, view).await,
+        Request::NewsBookmark { ids, saved } => news::bookmark(s, ids, saved).await,
         Request::NewsSeen(ids) => news::mark_seen(s, ids).await,
         Request::FeedConfig { settings, watches, watched } => {
             s.news.local.lock().await.configure(settings, watches, watched)
@@ -3495,7 +3512,7 @@ where
 mod tests {
     use super::*;
 
-    fn backfill_shared(provider: Provider) -> (Arc<Shared>, mpsc::Receiver<Response>) {
+    pub(super) fn backfill_shared(provider: Provider) -> (Arc<Shared>, mpsc::Receiver<Response>) {
         let (out, rx) = mpsc::channel();
         (
             Arc::new(Shared {

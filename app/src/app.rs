@@ -188,6 +188,13 @@ impl OptionsPane {
 
 // N1b
 pub(crate) mod news_view;
+fn accept_news_delivery(last: &mut u64, delivery: u64) -> bool {
+    if delivery <= *last {
+        return false;
+    }
+    *last = delivery;
+    true
+}
 pub struct NewsPane {
     pub symbol: Option<String>,
     pub items: Vec<tr_data::news_store::Story>,
@@ -203,11 +210,14 @@ pub struct NewsPane {
     pub display: news_view::Display,
     pub interaction: news_view::Interaction,
     pub seen_queue: Vec<String>,
+    pub bookmark_queue: Vec<(Vec<String>, bool)>,
+    pub refresh_source: bool,
     // N1b: revisions invalidate presentation once, never by scanning on repaint.
     pub item_revision: u64,
     pub cache: news_view::RowCache,
     pub read_in_view: std::collections::BTreeSet<String>,
     pub local_seen: std::collections::BTreeSet<String>,
+    pub local_bookmarks: std::collections::BTreeMap<String, bool>,
 }
 impl NewsPane {
     pub fn new(symbol: Option<String>) -> Self {
@@ -226,17 +236,42 @@ impl NewsPane {
             display: Default::default(),
             interaction: Default::default(),
             seen_queue: vec![],
+            bookmark_queue: vec![],
+            refresh_source: false,
             item_revision: 0,
             cache: Default::default(),
             read_in_view: Default::default(),
             local_seen: Default::default(),
+            local_bookmarks: Default::default(),
         }
+    }
+    fn bookmark_reply(&mut self, ids: &[String], saved: bool, error: Option<&str>) {
+        let pending_here = ids.iter().any(|id| self.local_bookmarks.get(id) == Some(&saved));
+        for id in ids {
+            let pending = self.local_bookmarks.get(id).copied();
+            if pending.is_some_and(|latest| latest != saved) {
+                continue;
+            }
+            self.local_bookmarks.remove(id);
+            if error.is_none() || pending.is_some() {
+                for item in self.items.iter_mut().chain(&mut self.pending).filter(|item| &item.id == id) {
+                    item.bookmark = if error.is_some() { !saved } else { saved };
+                }
+            }
+        }
+        if let Some(error) = error.filter(|_| pending_here) {
+            self.error = Some(error.into());
+        }
+        self.item_revision = self.item_revision.wrapping_add(1);
     }
     fn apply(&mut self, mut items: Vec<tr_data::news_store::Story>) {
         // Seen is monotonic. A reply already in flight before the seen write
         // cannot undo a user action, including across scope changes.
         for item in &mut items {
             item.seen |= self.local_seen.contains(&item.id);
+            if let Some(saved) = self.local_bookmarks.get(&item.id) {
+                item.bookmark = *saved;
+            }
         }
         self.item_revision = self.item_revision.wrapping_add(1);
         if self.paused {
@@ -972,6 +1007,8 @@ pub struct TerminalApp {
     alert_toasts: Vec<(Instant, tr_core::price_alerts::Event)>,
     // N1a
     news_subscription: Option<(Vec<crate::worker::NewsView>, Vec<String>)>,
+    news_delivery: u64,
+    news_generations: std::collections::BTreeMap<PaneId, u64>,
     // N1a
     watchlist_undo: Option<(Instant, Vec<String>, Vec<String>)>,
 
@@ -1216,6 +1253,8 @@ impl TerminalApp {
             alert_toasts: Vec::new(),
             // N1a
             news_subscription: None,
+            news_delivery: 0,
+            news_generations: Default::default(),
             // N1a
             watchlist_undo: None,
             latest: Vec::new(),
@@ -2431,7 +2470,10 @@ impl TerminalApp {
                         }
                     }
                 }
-                Response::FeedNotices { desktop, history } => {
+                Response::FeedNotices { delivery, desktop, history } => {
+                    if !accept_news_delivery(&mut self.news_delivery, delivery) {
+                        continue;
+                    }
                     self.price_alerts.feed_events = history;
                     if !self.prefs.feed_notifications.enabled {
                         continue;
@@ -2446,10 +2488,15 @@ impl TerminalApp {
                         );
                     }
                 }
-                Response::NewsVolume(volumes) => {
+                Response::NewsVolume { pane, volumes } => {
+                    if let Some(PaneKind::News(n)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        n.interaction.volumes = volumes;
+                    }
+                }
+                Response::NewsBookmark { ids, saved, error } => {
                     for pane in &mut self.panes {
                         if let PaneKind::News(n) = &mut pane.kind {
-                            n.interaction.volumes = volumes.clone();
+                            n.bookmark_reply(&ids, saved, error.as_deref());
                         }
                     }
                 }
@@ -2975,17 +3022,33 @@ impl TerminalApp {
                             .unwrap_or_else(|| self.watchlist.clone()),
                         Scope::All => vec![],
                     };
-                    let view =
-                        crate::worker::NewsView { pane, symbol: n.symbol.clone(), filters: n.filters.clone(), symbols };
+                    let mut view = crate::worker::NewsView {
+                        pane,
+                        generation: *self.news_generations.entry(pane).or_default(),
+                        symbol: n.symbol.clone(),
+                        filters: n.filters.clone(),
+                        symbols,
+                    };
                     if n.query.as_ref() != Some(&view) {
                         n.pending.clear();
                         n.loading = true;
                         n.fetched = None;
                     }
-                    n.query = Some(view.clone());
                     if n.fetched.is_none() {
+                        view.generation = view.generation.saturating_add(1);
+                        self.news_generations.insert(pane, view.generation);
                         n.fetched = Some(Instant::now());
-                        self.worker.send(Request::NewsRead(view.clone()));
+                        n.loading = true;
+                        if std::mem::take(&mut n.refresh_source) {
+                            self.worker.send(Request::NewsRefresh(view.clone()));
+                        } else {
+                            self.worker.send(Request::NewsRead(view.clone()));
+                        }
+                    }
+                    n.query = Some(view.clone());
+                    if n.loading && n.fetched.is_some_and(|at| at.elapsed() > Duration::from_secs(30)) {
+                        n.loading = false;
+                        n.error = Some("History read timed out — use Re-read history".into());
                     }
                     views.push(view);
                 }
@@ -3033,7 +3096,8 @@ impl TerminalApp {
             self.worker.send(Request::YieldCurves);
             self.last_curve = Some(Instant::now());
         }
-        // News every 5 minutes and order books every second, while visible.
+        // News uses the worker's five-second scheduler with source-specific guarded cadence;
+        // order books refresh every second while visible.
         for &i in &visible {
             let p = &mut self.panes[i];
             match &mut p.kind {
@@ -3594,6 +3658,8 @@ impl TerminalApp {
             alert_toasts: Vec::new(),
             // N1a
             news_subscription: None,
+            news_delivery: 0,
+            news_generations: Default::default(),
             // N1a
             watchlist_undo: None,
             columns_in_flight: None,

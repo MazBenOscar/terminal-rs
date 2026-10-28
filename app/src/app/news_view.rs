@@ -182,7 +182,13 @@ pub(super) fn owns_key(key: egui::Key, selected: bool, search: bool) -> bool {
     match key {
         egui::Key::ArrowDown | egui::Key::ArrowUp | egui::Key::Slash => true,
         egui::Key::Escape => selected || search,
-        egui::Key::J | egui::Key::K | egui::Key::Enter | egui::Key::Space | egui::Key::C | egui::Key::U => selected,
+        egui::Key::J
+        | egui::Key::K
+        | egui::Key::Enter
+        | egui::Key::Space
+        | egui::Key::C
+        | egui::Key::U
+        | egui::Key::S => selected,
         _ => false,
     }
 }
@@ -213,6 +219,7 @@ fn key_text(key: egui::Key) -> Option<&'static str> {
         egui::Key::K => Some("k"),
         egui::Key::C => Some("c"),
         egui::Key::U => Some("u"),
+        egui::Key::S => Some("s"),
         egui::Key::Slash => Some("/"),
         egui::Key::Space => Some(" "),
         _ => None,
@@ -235,6 +242,7 @@ pub enum Key {
     Open,
     Expand,
     Chart,
+    Save,
     Search,
     Escape,
     Unread,
@@ -245,6 +253,7 @@ pub enum Effect {
     Open,
     Expand,
     Chart,
+    Save,
     Search,
 }
 /// Pure reducer: IDs, not indices, survive refresh/reordering.
@@ -284,6 +293,7 @@ pub fn reduce(
         Key::Open if current.is_some() => Effect::Open,
         Key::Expand if current.is_some() => Effect::Expand,
         Key::Chart if current.is_some() => Effect::Chart,
+        Key::Save if current.is_some() => Effect::Save,
         _ => Effect::None,
     }
 }
@@ -315,7 +325,11 @@ fn fallback_ticker<'a>(story: &'a Cluster, linked: Option<&str>, watched: &[Stri
         .or_else(|| story.tickers.first())
 }
 fn row_model_watched(story: &Cluster, linked: Option<&str>, watched: &[String], now: i64) -> RowModel {
-    let (time, full_time) = crate::feed_time::feed_time(story.newest, now, false);
+    let (time, full_time) = if story.lead.inferred_ts {
+        ("—".into(), "time unknown".into())
+    } else {
+        crate::feed_time::feed_time(story.newest, now, false)
+    };
     let ticker_is_subject = !story.subjects.is_empty();
     let tickers: Vec<_> = if ticker_is_subject {
         // Subjects are ordered by first mention. Never promote a later subject
@@ -432,6 +446,17 @@ fn mark_seen(n: &mut NewsPane, story: &Cluster) {
     }
     n.seen_queue = queued.into_iter().collect();
 }
+fn toggle_saved(n: &mut NewsPane, story: &Cluster) {
+    let saved = !story.members.iter().any(|member| member.bookmark);
+    for item in n.items.iter_mut().chain(&mut n.pending) {
+        if story.member_ids.contains(&item.id) {
+            item.bookmark = saved;
+            n.local_bookmarks.insert(item.id.clone(), saved);
+        }
+    }
+    n.bookmark_queue.push((story.member_ids.clone(), saved));
+    n.item_revision = n.item_revision.wrapping_add(1);
+}
 fn chart_ticker<'a>(story: &'a Cluster, linked: Option<&str>, watched: &[String]) -> Option<&'a String> {
     if story.subjects.is_empty() {
         fallback_ticker(story, linked, watched)
@@ -496,6 +521,7 @@ fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narro
     if narrow {
         ui.horizontal(|ui| chips(ui, &mut n.display, unread));
     }
+    ui.checkbox(&mut n.filters.saved, "Saved");
     ui.label("Sources");
     let sources: std::collections::BTreeSet<_> = n
         .items
@@ -669,10 +695,15 @@ pub(super) fn show(
                         n.interaction.copy_digest = true;
                         ui.close();
                     }
-                    if ui.button("Reload").on_hover_text("Reload saved history; source pacing is unchanged").clicked() {
+                    if ui.button("Re-read history").on_hover_text("Re-read saved history; source pacing is unchanged").clicked() {
                         n.fetched = None;
                         n.read_in_view.clear();
                         n.item_revision = n.item_revision.wrapping_add(1);
+                        ui.close();
+                    }
+                    if ui.button("Refresh source").on_hover_text("Request fresh headlines through the normal guard; respects pause, cooldown, offline and budgets").clicked() {
+                        n.refresh_source = true;
+                        n.fetched = None;
                         ui.close();
                     }
                     ui.horizontal(|ui| {
@@ -764,6 +795,7 @@ pub(super) fn show(
             ui.toggle_value(&mut n.display.watch_hits, "Watch hits");
         }
         let count = n.filters.sources.len()
+            + usize::from(n.filters.saved)
             + usize::from(!n.filters.include.is_empty())
             + usize::from(!n.filters.exclude.is_empty())
             + usize::from(narrow && n.display.unread)
@@ -812,6 +844,7 @@ pub(super) fn show(
             (egui::Key::Enter, Key::Open),
             (egui::Key::Space, Key::Expand),
             (egui::Key::C, Key::Chart),
+            (egui::Key::S, Key::Save),
             (egui::Key::Slash, Key::Search),
             (egui::Key::Escape, Key::Escape),
             (egui::Key::U, Key::Unread),
@@ -845,6 +878,7 @@ pub(super) fn show(
                         mark_seen(n, story);
                     }
                     Effect::Expand => toggle_expanded(n, story),
+                    Effect::Save => toggle_saved(n, story),
                     Effect::Chart => {
                         let linked = n.symbol.as_deref().filter(|_| n.filters.scope == Scope::Symbol);
                         if let Some(t) = chart_ticker(story, linked, &watched) {
@@ -895,7 +929,8 @@ pub(super) fn show(
         }
     }
     if rows.is_empty() {
-        let filtered = !n.filters.sources.is_empty()
+        let filtered = n.filters.saved
+            || !n.filters.sources.is_empty()
             || !n.filters.include.is_empty()
             || !n.filters.exclude.is_empty()
             || !n.filters.search.is_empty()
@@ -1117,6 +1152,15 @@ pub(super) fn show(
             mark_seen(n, story);
             child_clicked = true;
         }
+        title.context_menu(|ui| {
+            if ui
+                .button(if story.members.iter().any(|member| member.bookmark) { "Unsave story" } else { "Save story" })
+                .clicked()
+            {
+                toggle_saved(n, story);
+                ui.close();
+            }
+        });
         hover_card(&title, story, model);
         let meta = ui
             .scope_builder(
@@ -1165,7 +1209,11 @@ pub(super) fn show(
                     ui.add(egui::Label::new(summary).wrap());
                     if !n.display.wire && story.members.len() > 1 {
                         for member in &story.members {
-                            let (time, full) = crate::feed_time::feed_time(member.item.ts, now, false);
+                            let (time, full) = if member.inferred_ts {
+                                ("—".into(), "time unknown".into())
+                            } else {
+                                crate::feed_time::feed_time(member.item.ts, now, false)
+                            };
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(time).font(mono(10.5)).color(theme::muted()))
                                     .on_hover_text(full);
@@ -1189,6 +1237,17 @@ pub(super) fn show(
                             && let Some(t) = chart_ticker(story, linked.as_deref(), &watched)
                         {
                             actions.push(Action::OpenChart(t.clone()));
+                        }
+                        if ui
+                            .small_button(if story.members.iter().any(|member| member.bookmark) {
+                                "Unsave story"
+                            } else {
+                                "Save story"
+                            })
+                            .on_hover_text("Save/unsave story (S)")
+                            .clicked()
+                        {
+                            toggle_saved(n, story);
                         }
                         if ui.small_button("Copy link").clicked() {
                             ui.ctx().copy_text(story.lead.item.link.clone());

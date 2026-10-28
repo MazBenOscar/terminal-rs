@@ -8,6 +8,7 @@ use tr_data::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
     pub pane: PaneId,
+    pub generation: u64,
     pub symbol: Option<String>,
     pub filters: Filters,
     pub symbols: Vec<String>,
@@ -17,8 +18,9 @@ pub(super) struct Service {
     pub views: Mutex<Vec<View>>,
     pub watchlist: Mutex<Vec<String>>,
     pub store: Mutex<Option<NewsStore>>,
-    pub status: Mutex<String>,
-    pub updated: Mutex<Option<Instant>>,
+    refresh: Mutex<Vec<View>>,
+    wake: tokio::sync::Notify,
+    generations: Mutex<std::collections::BTreeMap<PaneId, u64>>,
     pub key: Mutex<Option<String>>,
     pub memory_only: Mutex<bool>,
     published: Mutex<Vec<Published>>,
@@ -33,8 +35,10 @@ pub(super) struct LocalState {
     session: i64,
     since: [i64; 5],
     volume_at: i64,
+    prune_at: i64,
     volumes: Vec<tr_data::news_store::local::Volume>,
     history: Option<Vec<String>>,
+    delivery: u64,
     edgar: Option<tr_edgar::store::Store>,
     edgar_at: i64,
     volume_symbols: Vec<String>,
@@ -51,8 +55,10 @@ impl Default for LocalState {
             session,
             since: [session; 5],
             volume_at: 0,
+            prune_at: 0,
             volumes: vec![],
             history: None,
+            delivery: 0,
             edgar: None,
             edgar_at: 0,
             volume_symbols: vec![],
@@ -85,15 +91,22 @@ impl LocalState {
     }
 }
 
+async fn blocking<T: Send + 'static>(s: &Arc<Shared>, work: impl FnOnce(&Shared) -> T + Send + 'static) -> T {
+    let s = Arc::clone(s);
+    tokio::task::spawn_blocking(move || work(&s)).await.expect("news blocking worker panicked")
+}
+
 pub(super) async fn local_read(
-    s: &Shared,
+    s: &Arc<Shared>,
     args: &tr_agent_tools::args::LiveArgs,
     symbols: &[String],
 ) -> Result<serde_json::Value, String> {
     use tr_data::news_store::local;
     let now = chrono::Utc::now().timestamp();
     let filing_symbols = if symbols.is_empty() { s.news.local.lock().await.watched.clone() } else { symbols.to_vec() };
-    let filings = s.news.local.lock().await.saved_filings(now).map_err(|_| "Saved filings unavailable")?;
+    let filings = blocking(s, move |s| s.news.local.blocking_lock().saved_filings(now))
+        .await
+        .map_err(|_| "Saved filings unavailable")?;
     match args {
         tr_agent_tools::args::LiveArgs::ReadNews(a) => {
             let hours = a.hours.unwrap_or(24).clamp(1, 168);
@@ -121,12 +134,16 @@ pub(super) async fn local_read(
                 },
                 ..Default::default()
             };
-            let store = s.news.store.lock().await;
-            let items = store
-                .as_ref()
-                .ok_or("Saved headlines unavailable")?
-                .query(&query)
-                .map_err(|_| "Saved headlines unavailable")?;
+            let items = blocking(s, move |s| {
+                s.news
+                    .store
+                    .blocking_lock()
+                    .as_ref()
+                    .ok_or("Saved headlines unavailable")?
+                    .query(&query)
+                    .map_err(|_| "Saved headlines unavailable")
+            })
+            .await?;
             let metadata = serde_json::json!({"filings":tr_edgar::local_metadata(&filings,&filing_symbols,start,now,&[]),
                 "insider_summary":tr_edgar::local_insider_summary(&filings,&filing_symbols,start,now)});
             serde_json::to_value(local::digest(
@@ -176,20 +193,67 @@ fn volume_symbols(watched: &[String], views: &[View]) -> Vec<String> {
     symbols.dedup();
     symbols
 }
-async fn local_tick(s: &Shared) -> anyhow::Result<()> {
+fn tick_enabled(visible: bool, settings: &tr_data::news_store::local::Notifications) -> bool {
+    visible
+        || (settings.enabled
+            && (settings.filings || settings.insiders || settings.keywords || settings.breaking || settings.volume))
+}
+async fn local_tick(s: &Arc<Shared>) -> anyhow::Result<()> {
+    let visible = !s.news.views.lock().await.is_empty();
+    if !tick_enabled(visible, &s.news.local.lock().await.settings) {
+        return Ok(());
+    }
+    blocking(s, local_tick_blocking).await
+}
+fn local_tick_blocking(s: &Shared) -> anyhow::Result<()> {
+    let mut state = {
+        let mut local = s.news.local.blocking_lock();
+        // Keep a cheap read/config projection available while the evaluator owns
+        // connections and does SQL. Configuration may change during evaluation.
+        let projection = LocalState {
+            settings: local.settings.clone(),
+            watches: local.watches.clone(),
+            watched: local.watched.clone(),
+            session: local.session,
+            since: local.since,
+            volumes: local.volumes.clone(),
+            history: local.history.clone(),
+            delivery: local.delivery,
+            ..Default::default()
+        };
+        std::mem::replace(&mut *local, projection)
+    };
+    let result = evaluate_local(s, &mut state);
+    let mut local = s.news.local.blocking_lock();
+    state.settings = local.settings.clone();
+    state.watches = local.watches.clone();
+    state.watched = local.watched.clone();
+    state.since = local.since;
+    *local = state;
+    result
+}
+fn evaluate_local(s: &Shared, state: &mut LocalState) -> anyhow::Result<()> {
     use chrono::Timelike;
     use tr_data::news_store::local;
     let now = chrono::Utc::now().timestamp();
-    let views = s.news.views.lock().await.clone();
-    let mut state = s.news.local.lock().await;
+    let views = s.news.views.blocking_lock().clone();
+    let watched = s.news.watchlist.blocking_lock().clone();
+    // No local mutex is held during news or EDGAR database work.
+    let mut guard = s.news.store.blocking_lock();
+    if let Some(store) = guard.as_mut() {
+        let _ = store.set_watched(&watched);
+    }
     let mut notices = vec![];
     // Accumulate errors, not early returns: already collected messages still go
     // through delivery even if EDGAR, volume aggregation, or a later row fails.
     let news_result = {
-        let guard = s.news.store.lock().await;
         (|| -> anyhow::Result<()> {
             let Some(store) = guard.as_ref() else { return Ok(()) };
             state.begin_session(store)?;
+            if now - state.prune_at >= 86400 {
+                store.prune(now)?;
+                state.prune_at = now;
+            }
             let rows = store.query(&Query {
                 // Cluster identity must retain earlier members, not reset at 2h.
                 start: now - 86400,
@@ -217,14 +281,17 @@ async fn local_tick(s: &Shared) -> anyhow::Result<()> {
                 }
                 if state.volumes != volumes {
                     state.volumes = volumes.clone();
-                    s.send(Response::NewsVolume(volumes));
+                    for view in &views {
+                        s.send(Response::NewsVolume { pane: view.pane, volumes: volumes.clone() });
+                    }
                 }
             }
             Ok(())
         })()
-    }; // Never hold the news store mutex during EDGAR work.
+    };
+    drop(guard);
     let edgar_result = state.collect_edgar(now, &mut notices);
-    let mut guard = s.news.store.lock().await;
+    let mut guard = s.news.store.blocking_lock();
     let store = guard.as_mut().ok_or_else(|| anyhow::anyhow!("News delivery unavailable"))?;
     let names_result = if state.names_dirty {
         let result = store.install_names(state.names.as_deref().unwrap_or_default());
@@ -242,7 +309,8 @@ async fn local_tick(s: &Shared) -> anyhow::Result<()> {
         handed = true;
         if !desktop.is_empty() || state.history.as_ref() != Some(&history) {
             state.history = Some(history.clone());
-            s.send(Response::FeedNotices { desktop, history });
+            state.delivery += 1;
+            s.send(Response::FeedNotices { delivery: state.delivery, desktop, history });
         }
         Ok(())
     });
@@ -265,11 +333,16 @@ fn handoff(
     let messages = notices.iter().map(|n| n.body.clone()).collect::<Vec<_>>();
     let (desktop, history) = store.deliver_notifications(&messages, now, quiet)?;
     deliver(desktop, history)?;
-    let mut result = Ok(());
+    let mut claims = std::collections::BTreeMap::<&str, Vec<String>>::new();
     for notice in notices.iter().filter(|n| !n.edgar) {
-        result = result.and(notice.commit(Some(store), None));
+        for (kind, id) in &notice.claims {
+            claims.entry(kind).or_default().push(id.clone());
+        }
     }
-    result
+    for (kind, ids) in claims {
+        store.claim_notifications(kind, &ids)?;
+    }
+    Ok(())
 }
 impl LocalState {
     fn begin_session(&self, store: &NewsStore) -> anyhow::Result<()> {
@@ -326,10 +399,15 @@ impl LocalState {
         notices: &mut Vec<Notice>,
     ) -> anyhow::Result<()> {
         use tr_data::news_store::local;
+        let claims = store.notification_claims(&rows.iter().map(|story| story.id.clone()).collect::<Vec<_>>())?;
+        let claimed = |kind: &str, id: &str| claims.contains(&(kind.into(), id.into()));
+        let start = rows.iter().map(|story| story.item.ts).min().unwrap_or(now).saturating_sub(86400);
+        let end = rows.iter().map(|story| story.item.ts).max().unwrap_or(now).saturating_add(86400);
+        let delivered = store.delivered_members(start, end)?;
+        let mut observed = vec![];
+        let mut propagated = vec![];
         for story in rows {
-            if store.notification_claimed("keyword", &story.id)?
-                || store.notification_claimed("keyword-observed", &story.id)?
-            {
+            if claimed("keyword", &story.id) || claimed("keyword-observed", &story.id) {
                 continue;
             }
             // Pane highlighting intentionally matches titles only, not summaries.
@@ -340,25 +418,18 @@ impl LocalState {
             if eligible {
                 notices.push(Notice::news(format!("Keyword watch · {}", story.item.title), "keyword", &story.id));
             } else {
-                store.claim_notification("keyword-observed", &story.id)?;
+                observed.push(story.id.clone());
             }
         }
         for c in tr_data::news_intelligence::clusters(rows) {
-            let mut claimed = false;
-            for id in &c.member_ids {
-                claimed |= store.notification_claimed("breaking-member", id)?;
-            }
-            if claimed {
+            if c.member_ids.iter().any(|id| claimed("breaking-member", id)) {
                 // Propagate an existing cluster identity through merges and lead changes.
-                store.claim_cluster(&c.member_ids)?;
+                propagated.extend(c.member_ids.clone());
                 continue;
             }
             let sources: std::collections::BTreeSet<_> =
                 c.members.iter().filter(|m| m.item.ts >= now - 3600).map(|m| &m.source).collect();
-            let mut blocked = false;
-            for m in &c.members {
-                blocked |= store.notification_blocked(&m.id)?;
-            }
+            let blocked = c.members.iter().any(|m| claimed("breaking-block", &m.id));
             if sources.len() >= 4
                 && self.settings.enabled
                 && self.settings.breaking
@@ -366,8 +437,8 @@ impl LocalState {
                 && c.subjects.iter().any(|t| self.watched.contains(t))
                 && c.members.iter().all(|m| local::fresh(m.item.ts, self.since[3], self.session, now))
             {
-                if store.cluster_previously_delivered(&c.lead)? {
-                    store.claim_cluster(&c.member_ids)?;
+                if delivered.iter().any(|old| tr_data::news_intelligence::same_cluster(old, &c.lead)) {
+                    propagated.extend(c.member_ids.clone());
                     continue;
                 }
                 notices.push(Notice {
@@ -377,6 +448,8 @@ impl LocalState {
                 });
             }
         }
+        store.claim_notifications("keyword-observed", &observed)?;
+        store.claim_notifications("breaking-member", &propagated)?;
         Ok(())
     }
     #[cfg(test)]
@@ -488,6 +561,7 @@ struct Published {
     view: View,
     items: Result<Vec<Story>, String>,
     status: String,
+    updated: Option<Instant>,
 }
 fn changed(
     published: &mut Vec<Published>,
@@ -496,11 +570,15 @@ fn changed(
     status: &str,
     force: bool,
 ) -> (bool, bool) {
+    if published.iter().any(|old| old.view.pane == view.pane && old.view.generation > view.generation) {
+        return (false, false);
+    }
     let old = published.iter().find(|old| old.view == *view);
+    let updated = old.and_then(|old| old.updated);
     let rows_changed = force || old.is_none_or(|old| old.items != *items);
     let status_changed = old.is_none_or(|old| old.status != status);
     published.retain(|old| old.view.pane != view.pane);
-    published.push(Published { view: view.clone(), items: items.clone(), status: status.into() });
+    published.push(Published { view: view.clone(), items: items.clone(), status: status.into(), updated });
     (rows_changed, status_changed)
 }
 /// Preserve the bad file; failure to recover disk storage must never abort startup.
@@ -540,19 +618,67 @@ pub(super) fn open_store(path: &std::path::Path) -> (Option<NewsStore>, bool) {
         }
     }
 }
-pub(super) async fn mark_seen(s: &Shared, ids: Vec<String>) {
-    if let Some(store) = s.news.store.lock().await.as_ref()
-        && let Err(error) = store.mark_seen(&ids)
-    {
-        tracing::warn!("cannot save news read state: {error}");
-    }
+pub(super) async fn mark_seen(s: &Arc<Shared>, ids: Vec<String>) {
+    blocking(s, move |s| {
+        if let Some(store) = s.news.store.blocking_lock().as_ref()
+            && let Err(error) = store.mark_seen(&ids)
+        {
+            tracing::warn!("cannot save news read state: {error}");
+        }
+    })
+    .await;
     publish(s).await;
 }
-pub(super) async fn read(s: &Shared, view: View) {
-    s.send(Response::NewsVolume(s.news.local.lock().await.volumes.clone()));
+pub(super) async fn bookmark(s: &Arc<Shared>, ids: Vec<String>, saved: bool) {
+    let write_ids = ids.clone();
+    let result = blocking(s, move |s| -> anyhow::Result<()> {
+        s.news
+            .store
+            .blocking_lock()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("News store unavailable"))?
+            .set_bookmark(&write_ids, saved)
+    })
+    .await;
+    let failed = result.is_err();
+    s.send(Response::NewsBookmark {
+        ids,
+        saved,
+        error: result.err().map(|error| format!("Cannot save story: {error}")),
+    });
+    if !failed {
+        publish(s).await;
+    }
+}
+pub(super) async fn refresh(s: &Arc<Shared>, view: View) {
+    read(s, view.clone()).await;
+    source_status(
+        s,
+        std::slice::from_ref(&view),
+        "Refresh requested — normal guard applies; pause/cooldown/budgets remain in force".into(),
+        false,
+    )
+    .await;
+    s.news.refresh.lock().await.push(view);
+    s.news.wake.notify_one();
+}
+pub(super) async fn read(s: &Arc<Shared>, view: View) {
+    let volumes = s.news.local.lock().await.volumes.clone();
+    s.send(Response::NewsVolume { pane: view.pane, volumes });
     read_view(s, view, true).await;
 }
-async fn read_view(s: &Shared, view: View, force: bool) {
+async fn read_view(s: &Arc<Shared>, view: View, force: bool) {
+    {
+        let mut generations = s.news.generations.lock().await;
+        let latest = generations.entry(view.pane).or_default();
+        if view.generation < *latest {
+            return;
+        }
+        *latest = view.generation;
+    }
+    blocking(s, move |s| read_view_blocking(s, view, force)).await;
+}
+fn read_view_blocking(s: &Shared, view: View, force: bool) {
     let now = chrono::Utc::now().timestamp();
     let days = view.filters.days.clamp(1, 90) as i64;
     let start = if days == 1 { tr_data::news_store::day_start(now) } else { now - days * 86400 };
@@ -566,8 +692,8 @@ async fn read_view(s: &Shared, view: View, force: bool) {
     // N1b: hold the store lock through publication, so no pre-seen snapshot
     // can be sent after a completed seen write. UI also overlays local actions
     // on replies which were already in flight before that write.
-    let watched = s.news.watchlist.lock().await.clone();
-    let mut store_guard = s.news.store.lock().await;
+    let watched = s.news.watchlist.blocking_lock().clone();
+    let mut store_guard = s.news.store.blocking_lock();
     if let Some(store) = store_guard.as_mut() {
         let _ = store.set_watched(&watched);
         // Company names arrive from the minute-paced local EDGAR reader; no
@@ -577,21 +703,38 @@ async fn read_view(s: &Shared, view: View, force: bool) {
         Some(store) => store.query(&query).map_err(|_| "News store unavailable".into()),
         None => Err("News store unavailable".into()),
     };
-    let mut status = s.news.status.lock().await.clone();
-    if status.is_empty() {
-        status = "Showing saved headlines".into();
+    let generations = s.news.generations.blocking_lock();
+    if generations.get(&view.pane).is_some_and(|latest| *latest > view.generation) {
+        return;
     }
+    let mut published = s.news.published.blocking_lock();
+    let old = published.iter().find(|old| {
+        old.view.pane == view.pane
+            && old.view.symbol == view.symbol
+            && old.view.filters.scope == view.filters.scope
+            && old.view.symbols == view.symbols
+    });
+    let mut status = old.map(|old| old.status.clone()).unwrap_or_else(|| "Showing saved headlines".into());
+    let updated = old.and_then(|old| old.updated);
+    status = status
+        .trim_start_matches("Saved headlines unavailable · ")
+        .split(" · Company news needs a Finnhub key.")
+        .next()
+        .unwrap_or_default()
+        .to_string();
     if view.filters.scope == tr_data::news_store::Scope::Symbol
         && view.symbol.as_deref().is_some_and(|symbol| finnhub::symbol(symbol).is_some())
-        && s.news.key.lock().await.as_deref().is_none_or(|key| key.trim().is_empty())
+        && s.news.key.blocking_lock().as_deref().is_none_or(|key| key.trim().is_empty())
     {
         status.push_str(" · Company news needs a Finnhub key.");
     }
-    if *s.news.memory_only.lock().await {
+    if *s.news.memory_only.blocking_lock() {
         status = format!("Saved headlines unavailable · {status}");
     }
-    let (rows_changed, status_changed) = changed(&mut *s.news.published.lock().await, &view, &items, &status, force);
-    let updated = *s.news.updated.lock().await;
+    let (rows_changed, status_changed) = changed(&mut published, &view, &items, &status, force);
+    if let Some(record) = published.iter_mut().find(|old| old.view == view) {
+        record.updated = updated;
+    }
     if rows_changed {
         s.send(Response::NewsSaved { view, items, status, updated });
     } else if status_changed {
@@ -600,10 +743,28 @@ async fn read_view(s: &Shared, view: View, force: bool) {
         s.send(Response::NewsStatus { view, status, updated });
     }
 }
-async fn publish(s: &Shared) {
+pub(super) async fn publish(s: &Arc<Shared>) {
     let views = s.news.views.lock().await.clone();
     for view in views {
         read_view(s, view, false).await;
+    }
+}
+async fn source_status(s: &Shared, views: &[View], status: String, success: bool) {
+    let mut published = s.news.published.lock().await;
+    for record in published.iter_mut().filter(|record| views.contains(&record.view)) {
+        let scope = record.view.symbol.as_deref().unwrap_or(match record.view.filters.scope {
+            tr_data::news_store::Scope::Watchlist => "Watchlist",
+            _ => "Market",
+        });
+        record.status = format!("{status} · {scope}");
+        if success {
+            record.updated = Some(Instant::now());
+        }
+        s.send(Response::NewsStatus {
+            view: record.view.clone(),
+            status: record.status.clone(),
+            updated: record.updated,
+        });
     }
 }
 fn refusal_status(error: &tr_net::Refused) -> String {
@@ -747,16 +908,37 @@ pub(super) async fn run(s: Arc<Shared>) {
     let mut fallback = FallbackState::default();
     let mut warnings = WarningThrottle::default();
     loop {
-        interval.tick().await;
+        tokio::select! { _ = interval.tick() => {}, _ = s.news.wake.notified() => {} }
+        let refreshes = std::mem::take(&mut *s.news.refresh.lock().await);
+        for view in refreshes {
+            if schedule.backoff_until > chrono::Utc::now().timestamp() {
+                let until =
+                    crate::feed_time::feed_time(schedule.backoff_until, chrono::Utc::now().timestamp(), false).0;
+                source_status(
+                    &s,
+                    std::slice::from_ref(&view),
+                    format!("Refresh deferred · Finnhub paused until {until} — guard cooldown/budgets unchanged"),
+                    false,
+                )
+                .await;
+            }
+            schedule.refresh(
+                &view.symbols,
+                view.filters.scope == tr_data::news_store::Scope::All
+                    || (view.filters.scope == tr_data::news_store::Scope::Symbol && view.symbol.is_none()),
+            );
+            let target = if view.filters.scope == tr_data::news_store::Scope::All { None } else { view.symbol.clone() };
+            fallback.pane_due.remove(&target);
+            for symbol in &view.symbols {
+                fallback.watch_due.remove(symbol);
+            }
+            fallback.fallback_due = 0;
+        }
         if let Err(error) = local_tick(&s).await {
             let message = format!("{error:#}");
             if warnings.allow(&message, chrono::Utc::now().timestamp()) {
                 tracing::warn!("Local news notifications unavailable: {message}");
             }
-        }
-        let watched = s.news.watchlist.lock().await.clone();
-        if let Some(store) = s.news.store.lock().await.as_mut() {
-            let _ = store.set_watched(&watched);
         }
         let views = s.news.views.lock().await.clone();
         if views.is_empty() {
@@ -764,60 +946,76 @@ pub(super) async fn run(s: Arc<Shared>) {
         }
         let now = chrono::Utc::now().timestamp();
         let key = s.news.key.lock().await.clone();
-        let guard = match tr_net::shared() {
+        let guard = match blocking(&s, |_| tr_net::shared()).await {
             Ok(guard) => guard,
             Err(error) => {
                 if now >= schedule.backoff_until {
                     schedule.refused(now, &error);
-                    *s.news.status.lock().await = refusal_status(&error);
+                    source_status(&s, &views, refusal_status(&error), false).await;
                     publish(&s).await;
                 }
                 continue;
             }
         };
-        let enabled = guard
-            .status()
-            .ok()
-            .and_then(|rows| rows.into_iter().find(|r| r.group == "finnhub"))
-            .is_some_and(|r| r.enabled);
+        let enabled = blocking(&s, move |_| {
+            guard
+                .status()
+                .ok()
+                .and_then(|rows| rows.into_iter().find(|r| r.group == "finnhub"))
+                .is_some_and(|r| r.enabled)
+        })
+        .await;
         let fallback_all = use_fallback(enabled, key.as_deref());
         let routed = fallback_views(&views, fallback_all);
         let targets = fallback_targets(&routed, now, &mut fallback);
         if !targets.is_empty() {
-            let mut status = "Yahoo / CoinDesk · showing saved headlines".to_string();
             for target in targets {
+                let affected: Vec<_> = views
+                    .iter()
+                    .filter(|view| match view.filters.scope {
+                        tr_data::news_store::Scope::All => target.is_none(),
+                        tr_data::news_store::Scope::Symbol if view.symbol.is_none() => target.is_none(),
+                        _ => target.as_ref().is_some_and(|target| view.symbols.contains(target)),
+                    })
+                    .cloned()
+                    .collect();
+                let mut success = false;
                 if s.news.views.lock().await.is_empty() {
                     break;
                 }
-                match s.provider.news(target.as_deref()).await {
+                let status = match s.provider.news(target.as_deref()).await {
                     Ok(items) => {
                         let stories = fallback_items(items, target.as_deref());
-                        if let Some(store) = s.news.store.lock().await.as_mut() {
-                            let initial = target
-                                .as_deref()
-                                .map(|t| store.latest(t).ok().flatten().is_none())
-                                .unwrap_or_else(|| store.meta("notification:fallback-market").ok().flatten().is_none());
-                            if initial && store.suppress_import(&stories).is_err() {
-                                status = "News store write failed — showing saved headlines".into();
-                                continue;
+                        success = blocking(&s, move |s| -> anyhow::Result<()> {
+                            let mut guard = s.news.store.blocking_lock();
+                            let store = guard.as_mut().ok_or_else(|| anyhow::anyhow!("News store unavailable"))?;
+                            let initial = match target.as_deref() {
+                                Some(t) => store.latest(t)?.is_none(),
+                                None => store.meta("notification:fallback-market")?.is_none(),
+                            };
+                            if initial {
+                                store.suppress_import(&stories)?;
                             }
-                            if store.insert(&stories, now).is_err() {
-                                status = "News store write failed — showing saved headlines".into();
-                            } else {
-                                if target.is_none() {
-                                    let _ = store.set_meta("notification:fallback-market", "1");
-                                }
-                                status = "Yahoo / CoinDesk · updated just now".into();
-                                *s.news.updated.lock().await = Some(Instant::now());
+                            store.insert(&stories, now)?;
+                            store.prune(now)?;
+                            if target.is_none() {
+                                store.set_meta("notification:fallback-market", "1")?;
                             }
+                            Ok(())
+                        })
+                        .await
+                        .is_ok();
+                        if success {
+                            "Yahoo / CoinDesk · updated just now"
+                        } else {
+                            "News store write failed — showing saved headlines"
                         }
+                        .into()
                     }
-                    Err(_) => {
-                        status = "Yahoo / CoinDesk unavailable — showing saved headlines".into();
-                    }
-                }
+                    Err(error) => format!("Yahoo / CoinDesk unavailable · {error} — showing saved headlines"),
+                };
+                source_status(&s, &affected, status, success).await;
             }
-            *s.news.status.lock().await = status;
             publish(&s).await;
         }
         if fallback_all {
@@ -834,14 +1032,25 @@ pub(super) async fn run(s: Arc<Shared>) {
             continue;
         };
         let token = key.as_deref().unwrap_or_default();
-        let saved_bounds = {
-            let store = s.news.store.lock().await;
-            bounds(store.as_ref(), &job)
-        };
+        let bounds_job = job.clone();
+        let saved_bounds = blocking(&s, move |s| bounds(s.news.store.blocking_lock().as_ref(), &bounds_job)).await;
+        let affected: Vec<_> = views
+            .iter()
+            .filter(|view| match &job {
+                Job::Market(category) => {
+                    view.filters.scope == tr_data::news_store::Scope::All
+                        || (*category == "general"
+                            && view.filters.scope == tr_data::news_store::Scope::Symbol
+                            && view.symbol.is_none())
+                }
+                Job::Company(symbol) => view.symbols.contains(symbol),
+            })
+            .cloned()
+            .collect();
         let Ok((latest, cursor)) = saved_bounds else {
             // A broken store/cursor must not silently become a fresh history request.
             schedule.refused(now, &tr_net::Refused::Ledger);
-            *s.news.status.lock().await = "News cursor unavailable — showing saved headlines".into();
+            source_status(&s, &affected, "News cursor unavailable — showing saved headlines".into(), false).await;
             publish(&s).await;
             continue;
         };
@@ -849,24 +1058,27 @@ pub(super) async fn run(s: Arc<Shared>) {
             Job::Company(symbol) => client.company(guard, token, symbol, latest, now).await,
             Job::Market(category) => client.market(guard, token, category, cursor).await,
         };
+        let mut success = false;
         let status = match result {
             Ok(items) => {
-                let mut lock = s.news.store.lock().await;
-                let saved = lock.as_mut().is_some_and(|store| {
-                    let initial = match &job {
-                        Job::Market(_) => cursor == 0,
-                        Job::Company(_) => latest.is_none(),
-                    };
-                    if initial && store.suppress_import(&items).is_err() {
-                        return false;
-                    }
-                    match job {
-                        Job::Market(category) => finnhub::save_market(store, category, &items, now).is_ok(),
-                        Job::Company(_) => store.insert(&items, now).is_ok(),
-                    }
-                });
+                let saved = blocking(&s, move |s| {
+                    s.news.store.blocking_lock().as_mut().is_some_and(|store| {
+                        let initial = match &job {
+                            Job::Market(_) => cursor == 0,
+                            Job::Company(_) => latest.is_none(),
+                        };
+                        if initial && store.suppress_import(&items).is_err() {
+                            return false;
+                        }
+                        match job {
+                            Job::Market(category) => finnhub::save_market(store, category, &items, now).is_ok(),
+                            Job::Company(_) => store.insert(&items, now).is_ok(),
+                        }
+                    })
+                })
+                .await;
                 if saved {
-                    *s.news.updated.lock().await = Some(Instant::now());
+                    success = true;
                     let count = symbols.iter().filter(|s| finnhub::symbol(s).is_some()).count();
                     let pacing = finnhub::company_status(count);
                     format!(
@@ -882,7 +1094,7 @@ pub(super) async fn run(s: Arc<Shared>) {
                 refusal_status(&error)
             }
         };
-        *s.news.status.lock().await = status;
+        source_status(&s, &affected, status, success).await;
         publish(&s).await;
     }
 }
@@ -890,6 +1102,100 @@ pub(super) async fn run(s: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_shared() -> (Arc<Shared>, mpsc::Receiver<Response>) {
+        super::super::tests::backfill_shared(Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)))
+    }
+    #[test]
+    fn n5_tick_is_gated_on_visibility_or_enabled_notification_types() {
+        let mut settings = tr_data::news_store::local::Notifications::default();
+        assert!(!tick_enabled(false, &settings));
+        assert!(tick_enabled(true, &settings));
+        settings.enabled = false;
+        settings.keywords = true;
+        assert!(!tick_enabled(false, &settings));
+        settings.enabled = true;
+        assert!(tick_enabled(false, &settings));
+        for kind in 0..5 {
+            let mut settings = tr_data::news_store::local::Notifications { enabled: true, ..Default::default() };
+            match kind {
+                0 => settings.filings = true,
+                1 => settings.insiders = true,
+                2 => settings.keywords = true,
+                3 => settings.breaking = true,
+                _ => settings.volume = true,
+            }
+            assert!(tick_enabled(false, &settings));
+        }
+    }
+    #[tokio::test]
+    async fn n5_hidden_disabled_tick_does_not_open_stores_and_blocking_work_leaves_runtime() {
+        let (s, _) = fixture_shared();
+        local_tick(&s).await.unwrap(); // No store: this can succeed only if gated.
+        let runtime_thread = std::thread::current().id();
+        let worker_thread = blocking(&s, |_| std::thread::current().id()).await;
+        assert_ne!(runtime_thread, worker_thread);
+    }
+    #[tokio::test]
+    async fn n5_status_update_time_and_volume_are_per_pane_and_old_generations_drop() {
+        use tr_data::news_store::Scope;
+        let (s, rx) = fixture_shared();
+        *s.news.store.lock().await = Some(NewsStore::memory().unwrap());
+        let mut a = view(Scope::Symbol, &["AAPL US Equity"]);
+        let mut b = view(Scope::Symbol, &["MSFT US Equity"]);
+        a.generation = 2;
+        b.pane = 2;
+        read(&s, a.clone()).await;
+        read(&s, b.clone()).await;
+        source_status(&s, std::slice::from_ref(&a), "A source failed".into(), false).await;
+        source_status(&s, std::slice::from_ref(&b), "B updated".into(), true).await;
+        {
+            let records = s.news.published.lock().await;
+            let a = records.iter().find(|r| r.view.pane == 1).unwrap();
+            let b = records.iter().find(|r| r.view.pane == 2).unwrap();
+            assert!(a.status.contains("A source failed") && a.status.contains("AAPL"));
+            assert!(a.updated.is_none());
+            assert!(b.status.contains("B updated") && b.status.contains("MSFT"));
+            assert!(b.updated.is_some());
+        }
+        let replies = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(replies.iter().filter(|r| matches!(r, Response::NewsVolume { pane: 1, .. })).count(), 1);
+        assert_eq!(replies.iter().filter(|r| matches!(r, Response::NewsVolume { pane: 2, .. })).count(), 1);
+        assert!(
+            !replies.iter().any(|r| matches!(r, Response::FeedNotices { .. })),
+            "reads never replay desktop notices"
+        );
+        a.generation = 1;
+        read_view(&s, a, true).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(s.news.published.lock().await.iter().find(|r| r.view.pane == 1).unwrap().view.generation, 2);
+        b.generation = 2;
+        refresh(&s, b.clone()).await;
+        assert_eq!(*s.news.refresh.lock().await, vec![b]);
+    }
+    #[test]
+    fn n5_tick_batches_story_claims_and_cluster_lookup() {
+        let store = NewsStore::memory().unwrap();
+        let mut state = n4_state();
+        state.settings.breaking = false;
+        let rows = (0..2000).map(|i| n4_story(&format!("batch-{i}"), 150, "Fixture")).collect::<Vec<_>>();
+        let mut notices = vec![];
+        state.collect_news(&store, &rows, 200, &mut notices).unwrap();
+        assert_eq!(notices.len(), 2000);
+        handoff(&notices, &store, 200, false, |desktop, history| {
+            assert_eq!(desktop.len(), 6);
+            assert_eq!(history.len(), 200);
+            Ok(())
+        })
+        .unwrap();
+        assert!(state.news_alerts(&store, &rows, 201).unwrap().is_empty());
+        let source = include_str!("news.rs");
+        let collect = source.split("    fn collect_news(").nth(1).unwrap().split("    #[cfg(test)]").next().unwrap();
+        for per_story in
+            ["notification_claimed(", "claim_notification(", "cluster_previously_delivered(", "notification_blocked("]
+        {
+            assert!(!collect.contains(per_story), "{per_story}");
+        }
+    }
     fn n4_state() -> LocalState {
         LocalState {
             session: 100,
@@ -1266,6 +1572,7 @@ mod tests {
     fn view(scope: tr_data::news_store::Scope, symbols: &[&str]) -> View {
         View {
             pane: 1,
+            generation: 1,
             symbol: symbols.first().map(|s| (*s).into()),
             filters: Filters { scope, ..Default::default() },
             symbols: symbols.iter().map(|s| (*s).into()).collect(),

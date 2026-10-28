@@ -1,6 +1,86 @@
 use super::*;
 
 #[test]
+fn n5_claim_retention_prunes_old_rows_but_keeps_live_cluster_identity() {
+    let now = chrono::Utc::now().timestamp();
+    let mut store = NewsStore::memory().unwrap();
+    let item =
+        story("https://fixture.invalid/live", "NVDA earnings record revenue", now - 60, "NVDA US Equity", "Fixture");
+    store.insert(std::slice::from_ref(&item), now).unwrap();
+    store.claim_cluster(std::slice::from_ref(&item.id)).unwrap();
+    store
+        .db
+        .execute("INSERT INTO notification_seen(kind,id,at) VALUES('keyword','expired',?1)", [now - 91 * 86400])
+        .unwrap();
+    store
+        .db
+        .execute("INSERT INTO notification_seen(kind,id,at) VALUES('volume','edge',?1)", [now - 90 * 86400])
+        .unwrap();
+    store.prune(now).unwrap();
+    assert!(!store.notification_claimed("keyword", "expired").unwrap());
+    assert!(store.notification_claimed("volume", "edge").unwrap());
+    assert!(store.notification_claimed("breaking-member", &item.id).unwrap());
+    assert!(!store.claim_cluster(&[item.id.clone(), "late-member".into()]).unwrap());
+    assert!(store.cluster_previously_delivered(&item).unwrap());
+}
+
+#[test]
+fn n5_undated_rss_is_visible_at_ingest_time_and_flagged() {
+    let now = chrono::Utc::now().timestamp();
+    let items = crate::rss::parse_rss("<rss version=\"2.0\"><channel><title>Fixture</title><link>https://fixture.invalid</link><description>Fixture</description><item><title>Undated story</title><link>https://fixture.invalid/undated</link></item></channel></rss>", "Fixture").unwrap();
+    assert_eq!(items.len(), 1);
+    let mut store = NewsStore::memory().unwrap();
+    store.insert(&[Story::new(items[0].clone(), "Fixture")], now).unwrap();
+    let q = Query {
+        start: now - 60,
+        end: now,
+        filters: Filters { scope: Scope::All, ..Default::default() },
+        ..Default::default()
+    };
+    let rows = store.query(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].item.ts, now);
+    assert!(rows[0].inferred_ts);
+    store.insert(&[Story::new(items[0].clone(), "Fixture")], now + 60).unwrap();
+    assert_eq!(store.query(&q).unwrap()[0].item.ts, now, "re-import must not move inferred time");
+    let yahoo = crate::yahoo::parse_news(
+        r#"{"news":[{"title":"Yahoo undated","link":"https://fixture.invalid/yahoo-undated"}]}"#,
+    )
+    .unwrap();
+    store.insert(&[Story::new(yahoo[0].clone(), "Yahoo")], now).unwrap();
+    let rows = store.query(&q).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|story| story.inferred_ts && story.item.ts == now));
+}
+
+#[test]
+fn n5_bookmarks_persist_filter_and_are_exempt_from_prune() {
+    let now = chrono::Utc::now().timestamp();
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data/n5-bookmarks");
+    std::fs::create_dir_all(&root).unwrap();
+    let path =
+        root.join(format!("{}-{}.sqlite3", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+    let mut store = NewsStore::open(&path).unwrap();
+    let saved = story("https://fixture.invalid/saved", "Saved story", now - 91 * 86400, "", "Fixture");
+    let other = story("https://fixture.invalid/other", "Other story", now - 91 * 86400, "", "Fixture");
+    store.insert(&[saved.clone(), other], now).unwrap();
+    store.set_bookmark(std::slice::from_ref(&saved.id), true).unwrap();
+    assert_eq!(store.prune(now).unwrap(), 1);
+    let q = Query { filters: Filters { saved: true, scope: Scope::All, ..Default::default() }, ..Default::default() };
+    let rows = store.query(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].bookmark && matches(&rows[0], &q));
+    drop(store);
+    let store = NewsStore::open(&path).unwrap();
+    assert_eq!(store.query(&q).unwrap().len(), 1, "saved old story survives reopen and startup prune");
+    store.set_bookmark(std::slice::from_ref(&saved.id), false).unwrap();
+    assert!(store.query(&q).unwrap().is_empty());
+    assert_eq!(store.prune(now).unwrap(), 1);
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn n4_freshness_is_strict_and_never_replays_a_restart_or_enabled_backlog() {
     use local::fresh;
     assert!(fresh(101, 100, 90, 102));

@@ -179,6 +179,15 @@ pub enum Job {
     Company(String),
 }
 impl Schedule {
+    /// Clear view cadence only; refusal backoff, daily budgets and guard state survive.
+    pub fn refresh(&mut self, symbols: &[String], market: bool) {
+        for symbol in symbols {
+            self.companies.remove(symbol);
+        }
+        if market {
+            self.market_due = [0; 4];
+        }
+    }
     pub fn next(&mut self, now: i64, visible: bool, symbols: &[String]) -> Option<Job> {
         self.next_for_views(now, visible, true, symbols, &[])
     }

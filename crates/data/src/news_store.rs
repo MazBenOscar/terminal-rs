@@ -26,6 +26,10 @@ pub struct Story {
     pub tags: Vec<String>,
     #[serde(default)]
     pub seen: bool,
+    #[serde(default)]
+    pub bookmark: bool,
+    #[serde(default)]
+    pub inferred_ts: bool,
 }
 impl Story {
     pub fn known_tickers(&self) -> &[String] {
@@ -46,6 +50,8 @@ impl Story {
             category: "general".into(),
             tags,
             seen: false,
+            bookmark: false,
+            inferred_ts: false,
         }
     }
 }
@@ -96,6 +102,7 @@ pub struct Filters {
     pub exclude: String,
     pub search: String,
     pub days: u32,
+    pub saved: bool,
 }
 impl Default for Filters {
     fn default() -> Self {
@@ -107,6 +114,7 @@ impl Default for Filters {
             exclude: String::new(),
             search: String::new(),
             days: 7,
+            saved: false,
         }
     }
 }
@@ -126,14 +134,15 @@ impl Default for Query {
 }
 /// Apply view filters to a retained snapshot without deleting it on an empty query.
 pub fn matches(story: &Story, q: &Query) -> bool {
-    matches_columns(
-        &format!("{} {}", story.item.title, story.summary),
-        &story.item.tickers,
-        (&story.source, &story.provider),
-        &story.category,
-        story.item.ts,
-        q,
-    )
+    (!q.filters.saved || story.bookmark)
+        && matches_columns(
+            &format!("{} {}", story.item.title, story.summary),
+            &story.item.tickers,
+            (&story.source, &story.provider),
+            &story.category,
+            story.item.ts,
+            q,
+        )
 }
 // N1b: SQL matching needs no identity hash, URL parsing or topic enrichment.
 fn matches_columns(
@@ -583,6 +592,19 @@ impl NewsStore {
         if !columns.iter().any(|c| c == "subjects") {
             db.execute("ALTER TABLE items ADD COLUMN subjects TEXT NOT NULL DEFAULT '[]'", [])?;
         }
+        if !columns.iter().any(|c| c == "inferred_ts") {
+            db.execute("ALTER TABLE items ADD COLUMN inferred_ts INTEGER NOT NULL DEFAULT 0", [])?;
+            db.execute("UPDATE items SET published=fetched,inferred_ts=1 WHERE published<=0", [])?;
+        }
+        let seen_columns: Vec<String> = db
+            .prepare("PRAGMA table_info(notification_seen)")?
+            .query_map([], |r| r.get(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !seen_columns.iter().any(|c| c == "at") {
+            db.execute("ALTER TABLE notification_seen ADD COLUMN at INTEGER NOT NULL DEFAULT 0", [])?;
+            db.execute("UPDATE notification_seen SET at=coalesce((SELECT max(published,fetched) FROM items WHERE items.id=notification_seen.id),?1)", [chrono::Utc::now().timestamp()])?;
+        }
+        db.execute_batch("CREATE INDEX IF NOT EXISTS notification_seen_at ON notification_seen(at); CREATE INDEX IF NOT EXISTS notification_seen_id ON notification_seen(id,kind);")?;
         db.execute(
             "CREATE INDEX IF NOT EXISTS news_subject_backfill ON items(published DESC) WHERE intelligence<2",
             [],
@@ -700,7 +722,12 @@ impl NewsStore {
         self.names.as_ref().unwrap_or_else(|| crate::news_intelligence::default_names())
     }
     pub fn prune(&self, now: i64) -> Result<usize> {
-        Ok(self.db.execute("DELETE FROM items WHERE published < ?1 AND bookmark=0", [now - 90 * 86400])?)
+        let cutoff = now - 90 * 86400;
+        let tx = self.db.unchecked_transaction()?;
+        let removed = tx.execute("DELETE FROM items WHERE published < ?1 AND bookmark=0", [cutoff])?;
+        tx.execute("DELETE FROM notification_seen WHERE at < ?1", [cutoff])?;
+        tx.commit()?;
+        Ok(removed)
     }
     pub fn suppress_import(&self, stories: &[Story]) -> Result<()> {
         for story in stories {
@@ -732,8 +759,8 @@ impl NewsStore {
             let identity_source = if story.provider.is_empty() { &story.source } else { &story.provider };
             let canonical = Story::new(story.item.clone(), identity_source);
             let id = canonical.id;
-            tx.execute("INSERT OR IGNORE INTO items(id,source,provider_id,url,headline,summary,published,tickers,category,fetched,provider) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-                params![id, story.source, story.provider_id, canonical.item.link, story.item.title, story.summary, story.item.ts, serde_json::to_string(&story.item.tickers)?, story.category, now, story.provider])?;
+            tx.execute("INSERT OR IGNORE INTO items(id,source,provider_id,url,headline,summary,published,tickers,category,fetched,provider,inferred_ts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![id, story.source, story.provider_id, canonical.item.link, story.item.title, story.summary, if story.item.ts <= 0 { now } else { story.item.ts }, serde_json::to_string(&story.item.tickers)?, story.category, now, story.provider, story.inferred_ts || story.item.ts <= 0])?;
             let (raw, title, summary): (String, String, String) =
                 tx.query_row("SELECT tickers,headline,summary FROM items WHERE id=?1", [&id], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -793,7 +820,10 @@ impl NewsStore {
             .is_some())
     }
     pub fn claim_notification(&self, kind: &str, id: &str) -> Result<bool> {
-        Ok(self.db.execute("INSERT OR IGNORE INTO notification_seen VALUES(?1,?2)", params![kind, id])? == 1)
+        Ok(self.db.execute(
+            "INSERT OR IGNORE INTO notification_seen(kind,id,at) VALUES(?1,?2,?3)",
+            params![kind, id, chrono::Utc::now().timestamp()],
+        )? == 1)
     }
     /// Consult any member ever handed to delivery, not just the current 2,000
     /// headline snapshot. The 24h bound is the cluster's own identity window.
@@ -823,17 +853,52 @@ impl NewsStore {
     /// Persist every member, so a better lead, late earlier member or cluster
     /// merge cannot manufacture a second identity after the threshold was met.
     pub fn claim_cluster(&self, ids: &[String]) -> Result<bool> {
-        let tx = self.db.unchecked_transaction()?;
-        let mut first = true;
-        for id in ids {
-            if tx.execute("INSERT OR IGNORE INTO notification_seen VALUES('breaking-member',?1)", [id])? == 0 {
-                first = false;
-            }
-        }
-        tx.commit()?;
-        Ok(first)
+        Ok(self.claim_notifications("breaking-member", ids)? == ids.len())
     }
-    /// Claim before delivery: a crash can lose a notification, never replay it.
+    /// Snapshot all live claims once per evaluation, not once per headline.
+    pub fn notification_claims(&self, ids: &[String]) -> Result<std::collections::BTreeSet<(String, String)>> {
+        Ok(self
+            .db
+            .prepare("SELECT kind,id FROM notification_seen WHERE id IN (SELECT value FROM json_each(?1))")?
+            .query_map([serde_json::to_string(ids)?], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn claim_notifications(&self, kind: &str, ids: &[String]) -> Result<usize> {
+        Ok(self.db.execute(
+            "INSERT OR IGNORE INTO notification_seen(kind,id,at) SELECT ?1,value,?3 FROM json_each(?2)",
+            params![kind, serde_json::to_string(ids)?, chrono::Utc::now().timestamp()],
+        )?)
+    }
+    /// Delivered members are loaded once, including those outside the bounded pane snapshot.
+    pub fn delivered_members(&self, start: i64, end: i64) -> Result<Vec<Story>> {
+        // A single set-based read, including members evicted from the pane snapshot.
+        let mut stmt = self.db.prepare("SELECT headline,published,tickers,subjects,category FROM items WHERE published BETWEEN ?1 AND ?2 AND id IN (SELECT id FROM notification_seen WHERE kind='breaking-member')")?;
+        Ok(stmt
+            .query_map(params![start, end], |r| {
+                let mut story = Story::new(
+                    NewsItem {
+                        title: r.get(0)?,
+                        ts: r.get(1)?,
+                        tickers: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default(),
+                        link: String::new(),
+                        publisher: String::new(),
+                    },
+                    "",
+                );
+                story.subjects = serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default();
+                story.category = r.get(4)?;
+                Ok(story)
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn set_bookmark(&self, ids: &[String], saved: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE items SET bookmark=?2 WHERE id IN (SELECT value FROM json_each(?1))",
+            params![serde_json::to_string(ids)?, saved],
+        )?;
+        Ok(())
+    }
+    /// History and rate reservations precede handoff; delivery claims follow it.
     /// Overflow occupies its own rate slot, so summaries cannot exceed six/10m.
     pub fn deliver_notifications(
         &self,
@@ -851,9 +916,10 @@ impl NewsStore {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let mut desktop = vec![];
-        for body in messages {
-            tx.execute("INSERT INTO notification_history VALUES(?1,?2)", params![now, body])?;
-        }
+        tx.execute(
+            "INSERT INTO notification_history SELECT ?1,value FROM json_each(?2)",
+            params![now, serde_json::to_string(messages)?],
+        )?;
         if quiet {
             pending = 0;
         } else if pending == 0 && messages.len() <= available {
@@ -866,9 +932,10 @@ impl NewsStore {
         } else {
             pending += messages.len();
         }
-        for _ in &desktop {
-            tx.execute("INSERT INTO notification_slots VALUES(?1)", [now])?;
-        }
+        tx.execute(
+            "INSERT INTO notification_slots SELECT ?1 FROM json_each(?2)",
+            params![now, serde_json::to_string(&desktop)?],
+        )?;
         tx.execute(
             "INSERT INTO meta VALUES('notification:overflow',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [pending.to_string()],
@@ -968,7 +1035,10 @@ impl NewsStore {
         // Enrichment is optional: read-only disks and transient write failures
         // must never hide otherwise readable saved history.
         let _ = self.backfill(q);
-        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category,tags,seen,provider,subjects,intelligence FROM items WHERE published>=?1 AND published<=?2".to_string();
+        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category,tags,seen,provider,subjects,intelligence,bookmark,inferred_ts FROM items WHERE published>=?1 AND published<=?2".to_string();
+        if q.filters.saved {
+            sql.push_str(" AND bookmark=1");
+        }
         let search = if self.fts && !q.filters.search.trim().is_empty() {
             sql.push_str(" AND id IN (SELECT id FROM news_fts WHERE news_fts MATCH ?3)");
             let terms = terms(&q.filters.search);
@@ -1011,6 +1081,8 @@ impl NewsStore {
                     category: r.get(8)?,
                     tags: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
                     seen: r.get(10)?,
+                    bookmark: r.get(14)?,
+                    inferred_ts: r.get(15)?,
                     item: NewsItem {
                         link: r.get(3)?,
                         title: r.get(4)?,
