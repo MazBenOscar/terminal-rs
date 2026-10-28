@@ -1134,6 +1134,10 @@ impl AgentPane {
         };
         let response = agent_markdown::wrapped(ui, &description, theme::text());
         match &self.state {
+            Onboarding::Stopped { reason, .. } if self.backend == "mimo" => {
+                // Readiness diagnostics must be readable without discovering a tooltip.
+                notice_row(ui, reason, Severity::Error);
+            }
             Onboarding::ToolsUnavailable { reason } | Onboarding::Stopped { reason, .. } => {
                 response.on_hover_text(reason);
             }
@@ -4788,6 +4792,44 @@ mod polish_tests {
         click(&mut pane, &ctx, "Clear");
         assert!(pane.queue.is_empty());
         assert!(texts(&frame(&mut pane, &ctx, vec![])).is_empty());
+    }
+
+    #[test]
+    fn mimo_readiness_failure_replaces_checking_with_visible_error_and_restart() {
+        let ctx = egui::Context::default();
+        let mut pane = AgentPane { backend: "mimo", acknowledged: true, ..Default::default() };
+        pane.transition(Onboarding::Checking);
+        pane.notice("mimo: provider unreachable (attempt 1) — Cannot connect to API");
+        let render = |pane: &mut AgentPane| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720., 900.))),
+                    ..Default::default()
+                },
+                |ui| {
+                    pane.show(ui, "BTC/USD · 1W", egui::Id::new("mimo-readiness"));
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        render(&mut pane);
+        let output = render(&mut pane);
+        assert!(texts(&output).iter().any(|(s, _)| s == "Checking mimo ACP and its isolation canary…"));
+        assert!(texts(&output).iter().any(|(s, _)| s.contains("provider unreachable (attempt 1)")));
+        for reason in [
+            "mimo could not reach its model provider (network). Check your provider/endpoint in mimo, then retry.",
+            "mimo readiness canary timed out. Check your provider/endpoint in mimo, then retry.",
+        ] {
+            pane.transition(Onboarding::Stopped { reason: reason.into(), unsafe_backend: false });
+            render(&mut pane);
+            let output = render(&mut pane);
+            let text = texts(&output);
+            assert!(text.iter().any(|(s, _)| s == reason), "diagnostic must not require hovering");
+            assert!(text.iter().any(|(s, _)| s == "Restart"));
+            assert!(!text.iter().any(|(s, _)| s.contains("Checking mimo")));
+            assert!(matches!(pane.state.action(), Some(Action::Check)));
+        }
     }
 
     #[test]

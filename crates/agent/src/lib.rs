@@ -45,6 +45,7 @@ pub enum AgentEvent {
     Usage(Value),
     RateLimits(Value),
     Done(Value),
+    Notice(String),
     Error(String),
 }
 
@@ -58,6 +59,7 @@ impl std::fmt::Debug for AgentEvent {
             Self::Usage(value) => ("Usage", value),
             Self::RateLimits(value) => ("RateLimits", value),
             Self::Done(value) => ("Done", value),
+            Self::Notice(message) => return f.debug_tuple("Notice").field(&transcript::scrub_text(message)).finish(),
             Self::Error(message) => return f.debug_tuple("Error").field(&transcript::scrub_text(message)).finish(),
         };
         let mut safe = value.clone();
