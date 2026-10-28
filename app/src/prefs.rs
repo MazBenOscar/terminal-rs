@@ -771,6 +771,8 @@ pub struct Prefs {
     // N1b
     #[serde(default)]
     pub keyword_watches: Vec<tr_data::news_intelligence::KeywordWatch>,
+    #[serde(default)]
+    pub feed_notifications: tr_data::news_store::local::Notifications,
     // N1b
     /// A custom theme built from v2 appearance overrides, for the app to save.
     #[serde(skip)]
@@ -794,6 +796,7 @@ impl Default for Prefs {
             desktop_notification: false,
             // N1b
             keyword_watches: vec![],
+            feed_notifications: Default::default(),
             // N1b
             migrated_theme: None,
         }

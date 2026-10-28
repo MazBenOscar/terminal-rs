@@ -185,6 +185,7 @@ pub fn assign_ids(drawings: &mut [Drawing]) {
 pub enum ZoneRole {
     Support,
     Resistance,
+    InPlay,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -219,6 +220,10 @@ pub struct Drawing {
     pub extend_left: bool,
     #[serde(default)]
     pub extend_right: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dashed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub technical_analysis: bool,
     /// Third anchor, absent on older drawings.
     #[serde(default)]
     pub c: Option<Anchor>,
@@ -271,6 +276,8 @@ impl Drawing {
             width: line_width(),
             extend_left: false,
             extend_right: false,
+            dashed: false,
+            technical_analysis: false,
             c: None,
             text: String::new(),
             pattern_points: Vec::new(),

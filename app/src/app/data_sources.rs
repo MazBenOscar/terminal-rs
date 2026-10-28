@@ -21,6 +21,9 @@ pub struct Reply {
 }
 #[derive(Default)]
 pub struct State {
+    // SENATE-BARGO
+    pub(super) bargo: super::bargo::State,
+    // SENATE-BARGO END
     pub settings: tr_net::Settings,
     key_input: String,
     contact_input: String,
@@ -164,10 +167,16 @@ fn source_name(group: &str) -> &str {
         "coindesk" => "CoinDesk",
         "house-disclosures" => "House disclosures",
         "house-roster" => "House roster",
+        // SENATE-BARGO
+        "bargo" => "Senate (Bargo)",
+        // SENATE-BARGO END
         _ => "Unknown source",
     }
 }
-const SENATE_ROW: &str = "Senate (needs third-party source)";
+// SENATE-BARGO
+#[cfg(test)]
+const SENATE_ROW: &str = "Senate (Bargo)";
+// SENATE-BARGO END
 fn section(ui: &mut Ui, title: &str) {
     ui.add_space(dp(10.0));
     ui.label(RichText::new(title).font(ui_font(13.5)).color(theme::text()));
@@ -250,6 +259,9 @@ impl TerminalApp {
                 ui.label(RichText::new("Enter a valid email").color(theme::down()).font(ui_font(12.0)));
             }
         });
+        // SENATE-BARGO
+        changed |= super::bargo::draw(self, ui);
+        // SENATE-BARGO END
         if changed {
             // Explicit user edits replace a rejected section with validated preferences.
             self.data_sources.settings.settings_error = false;
@@ -272,6 +284,11 @@ impl TerminalApp {
             }
             ui.end_row();
             for status in &self.data_sources.status {
+                // SENATE-BARGO: the dedicated row includes key mode and provider row allowance.
+                if status.group == "bargo" {
+                    continue;
+                }
+                // SENATE-BARGO END
                 let name = source_name(status.group);
                 ui.label(RichText::new(name).font(ui_font(12.0)).color(theme::text()));
                 ui.label(
@@ -292,14 +309,12 @@ impl TerminalApp {
                 );
                 ui.end_row();
             }
-            ui.add_enabled(false, egui::Label::new(RichText::new(SENATE_ROW).font(ui_font(12.0))))
-                .on_hover_text(tr_congress::refresh::SENATE_PAUSED);
-            ui.label(RichText::new("Disabled permanently").font(mono(11.0)));
-            ui.label("0 / 0");
-            ui.label("—");
-            ui.end_row();
+            // SENATE-BARGO: the former disabled Senate row is replaced above.
         });
-        ui.label(RichText::new(tr_congress::refresh::SENATE_PAUSED).font(ui_font(12.0)).color(theme::muted()));
+        if !self.data_sources.settings.bargo {
+            ui.label(RichText::new(tr_congress::refresh::SENATE_PAUSED).font(ui_font(12.0)).color(theme::muted()));
+        }
+        // SENATE-BARGO END
         let interval = Duration::from_secs(10);
         if self.data_sources.refresh_delay(interval) == Some(Duration::ZERO) {
             self.source_action(Action::Status);
@@ -367,7 +382,10 @@ mod tests {
     fn congress_rows_have_switches_caps_pause_and_permanent_senate_explanation() {
         assert_eq!(source_name("house-disclosures"), "House disclosures");
         assert_eq!(source_name("house-roster"), "House roster");
-        assert_eq!(SENATE_ROW, "Senate (needs third-party source)");
+        // SENATE-BARGO
+        assert_eq!(SENATE_ROW, "Senate (Bargo)");
+        assert_eq!(source_name("bargo"), SENATE_ROW);
+        // SENATE-BARGO END
         assert_eq!(
             tr_congress::refresh::SENATE_PAUSED,
             "Senate: paused — needs a third-party source (senate.gov blocked this network)"

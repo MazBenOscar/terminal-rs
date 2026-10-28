@@ -101,6 +101,8 @@ mod tests {
             tx_date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             filed_date: NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
             source_url: String::new(),
+            source: String::new(),
+            amount_range: None,
         }
     }
 

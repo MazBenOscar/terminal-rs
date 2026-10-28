@@ -1,6 +1,6 @@
 [
   {
-    "description": "Compute versioned deterministic swings, trend, levels, volume profile or volatility over returned history.",
+    "description": "Compute deterministic swings, trend, levels, trendlines, volume profile or volatility. Levels/swings default to v2 (v1 remains available). V2 levels/trendlines issue turn-local analysis_id and item_id for exact create_drawing analysis_ref coordinates. Lookback defaults to 400 D1 bars, timeframe-scaled and capped at 1000.",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -22,11 +22,21 @@
             "null"
           ]
         },
+        "lookback": {
+          "description": "Analysis bars, default 400 D1 bars scaled by timeframe, capped at 1000; limited by returned history.",
+          "maximum": 1000,
+          "minimum": 20,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "mode": {
           "enum": [
             "swings",
             "trend",
             "levels",
+            "trendlines",
             "volume_profile",
             "volatility"
           ],
@@ -73,6 +83,15 @@
         "top": {
           "default": 10,
           "maximum": 100,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "version": {
+          "default": 2,
+          "maximum": 2,
           "minimum": 1,
           "type": [
             "integer",

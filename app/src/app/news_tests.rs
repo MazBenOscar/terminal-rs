@@ -4,6 +4,28 @@ fn stories() -> Vec<tr_data::news_store::Story> {
     tr_data::finnhub::parse(include_bytes!("../../../crates/data/tests/fixtures/finnhub_news.json"), None).unwrap()
 }
 #[test]
+fn n4_volume_banner_is_current_hour_and_scope_specific() {
+    use tr_data::news_store::local::{Volume, local_hour};
+    let now = 20 * 86400 + 120;
+    let hour = local_hour(now);
+    let volume = |key: &str, at| Volume { key: key.into(), hour: at, count: 14, usual: 3., z: 11. };
+    let mut pane = NewsPane::new(Some("NVDA US Equity".into()));
+    pane.filters.scope = Scope::Symbol;
+    pane.interaction.volumes =
+        vec![volume("Topic: Earnings", hour), volume("AAPL US Equity", hour), volume("NVDA US Equity", hour - 3600)];
+    assert!(current_volume(&pane, now).is_none());
+    pane.interaction.volumes.push(volume("NVDA US Equity", hour));
+    assert_eq!(current_volume(&pane, now).unwrap().message(), "Unusual volume: NVDA — 14 stories this hour (usual 3)");
+    pane.interaction.dismissed_volume = Some(hour);
+    assert!(current_volume(&pane, now).is_none());
+    pane.interaction.dismissed_volume = None;
+    pane.filters.scope = Scope::All;
+    assert_eq!(current_volume(&pane, now).unwrap().key, "Topic: Earnings");
+    pane.filters.scope = Scope::Watchlist;
+    assert_eq!(current_volume(&pane, now).unwrap().key, "Topic: Earnings");
+    assert!(current_volume(&pane, now + 3600).is_none());
+}
+#[test]
 fn never_blank_and_pause_counts_unique_new_items() {
     let mut pane = NewsPane::new(None);
     let mut items = stories();
@@ -369,7 +391,12 @@ fn expansion_marks_every_member_seen_and_queues_one_write_per_item() {
 fn watches_are_global_prefs_with_legacy_defaults_and_roundtrip() {
     let mut prefs: crate::prefs::Prefs = serde_json::from_str("{}").unwrap();
     assert!(prefs.keyword_watches.is_empty());
-    prefs.keyword_watches.push(KeywordWatch { name: "Chips".into(), words: "NVDA \"AI chip\"".into(), colour: 5 });
+    prefs.keyword_watches.push(KeywordWatch {
+        name: "Chips".into(),
+        words: "NVDA \"AI chip\"".into(),
+        colour: 5,
+        notify: false,
+    });
     assert_eq!(serde_json::from_str::<crate::prefs::Prefs>(&serde_json::to_string(&prefs).unwrap()).unwrap(), prefs);
 }
 
@@ -733,8 +760,8 @@ fn review_filters_count_ignores_defined_watches() {
     let ctx = egui::Context::default();
     let mut pane = visible_pane();
     let mut watches = vec![
-        KeywordWatch { name: "Chips".into(), words: "chip".into(), colour: 0 },
-        KeywordWatch { name: "Fed".into(), words: "fed".into(), colour: 1 },
+        KeywordWatch { name: "Chips".into(), words: "chip".into(), colour: 0, notify: false },
+        KeywordWatch { name: "Fed".into(), words: "fed".into(), colour: 1, notify: false },
     ];
     let mut output = ctx.run_ui(
         egui::RawInput {
@@ -775,7 +802,7 @@ fn cache_invalidates_for_filters_watches_display_and_seen_only_when_changed() {
     let first = pane.cache.rebuilds;
     frame(&mut pane, &mut watches);
     assert_eq!(pane.cache.rebuilds, first);
-    watches.push(KeywordWatch { name: "Earnings".into(), words: "earnings".into(), colour: 2 });
+    watches.push(KeywordWatch { name: "Earnings".into(), words: "earnings".into(), colour: 2, notify: false });
     frame(&mut pane, &mut watches);
     assert_eq!(pane.cache.rebuilds, first + 1);
     pane.display.watch_hits = true;
@@ -799,7 +826,7 @@ fn unread_counts_displayed_clusters_and_watch_hits() {
     ui_frame(&ctx, &mut pane, 600.0, vec![], false);
     assert_eq!(pane.cache.unread, 3);
     pane.display.watch_hits = true;
-    let mut watches = vec![KeywordWatch { name: "No hits".into(), words: "absent".into(), colour: 0 }];
+    let mut watches = vec![KeywordWatch { name: "No hits".into(), words: "absent".into(), colour: 0, notify: false }];
     let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
         show(ui, &mut pane, &[], &mut watches, false, None, 0);
     });

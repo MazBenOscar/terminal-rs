@@ -471,19 +471,27 @@ pub(crate) fn project(event: BridgeEvent) -> Option<BridgeEvent> {
             match method.as_str() {
                 "item/started" | "item/completed" if params["item"]["type"] == "dynamicToolCall" => {
                     // A5b-MULTI: retain only the bounded numeric projection, not raw results.
+                    let local = crate::agent_pane::local_tool_projection(&params["item"]);
                     let scan = crate::agent_pane::scan_tool_projection(&params["item"]);
                     let multi = crate::agent_pane::multi_tool_projection(&params["item"]);
+                    let visibility = crate::agent_pane::drawing_visibility_projection(&params["item"]);
                     let summary = crate::agent_pane::edit_tool_summary(&params["item"]);
                     let error = crate::agent_pane::tool_error(&params["item"]);
                     if let Some(map) = params["item"].as_object_mut() {
                         map.retain(|key, _| {
                             matches!(key.as_str(), "id" | "type" | "tool" | "arguments" | "success" | "durationMs")
                         });
+                        if let Some(local) = local {
+                            map.insert("localRead".into(), local);
+                        }
                         if let Some(scan) = scan {
                             map.insert("scanRead".into(), scan);
                         }
                         if let Some(multi) = multi {
                             map.insert("multiRead".into(), multi);
+                        }
+                        if let Some(visibility) = visibility {
+                            map.insert("drawingVisibility".into(), visibility);
                         }
                         if let Some(summary) = summary {
                             map.remove("arguments");

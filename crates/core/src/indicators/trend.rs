@@ -258,17 +258,18 @@ pub fn gator(o: &Ohlcv, lengths: [usize; 3], offsets: [usize; 3]) -> (Vec<f64>, 
     (upper, lower)
 }
 
-/// Bill Williams' fractals: bars whose high (low) is strictly beyond the `n` bars on each
-/// side, marked at that high (low). A fractal is only known `n` bars later.
+/// Bill Williams' fractals: highs/lows at least as extreme as the `n` bars
+/// on either side. Equal runs select their first bar; separated equal tops or
+/// bottoms remain distinct. A fractal is only known `n` bars later.
 pub fn fractals(o: &Ohlcv, n: usize) -> (Vec<f64>, Vec<f64>) {
     let len = o.len();
     let (mut up, mut down) = (vec![NAN; len], vec![NAN; len]);
     for i in n..len.saturating_sub(n) {
         let mut around = (i - n..i).chain(i + 1..=i + n);
-        if around.clone().all(|j| o.high[j] < o.high[i]) {
+        if (i == 0 || o.high[i - 1] != o.high[i]) && around.clone().all(|j| o.high[j] <= o.high[i]) {
             up[i] = o.high[i];
         }
-        if around.all(|j| o.low[j] > o.low[i]) {
+        if (i == 0 || o.low[i - 1] != o.low[i]) && around.all(|j| o.low[j] >= o.low[i]) {
             down[i] = o.low[i];
         }
     }
@@ -484,6 +485,18 @@ mod tests {
         assert_eq!(a.jaw.len(), 108);
         let (up, low) = gator(&o, [13, 8, 5], [8, 5, 3]);
         assert!(up[99] > 0.0 && low[99] < 0.0);
+    }
+
+    #[test]
+    fn fractals_accept_equal_extrema_and_select_the_first_plateau_bar() {
+        let path = [1., 2., 5., 5., 1., 2., 5., 2., 1., 0., 0., 1., 2.];
+        let rows: Vec<_> = path.into_iter().map(|c| (c, c, c, c)).collect();
+        let (highs, lows) = fractals(&ohlcv(&rows), 2);
+        assert_eq!(highs[2], 5.);
+        assert!(highs[3].is_nan());
+        assert_eq!(highs[6], 5., "separated equal top remains a distinct swing");
+        assert_eq!(lows[9], 0.);
+        assert!(lows[10].is_nan());
     }
 
     #[test]

@@ -45,6 +45,28 @@ fn pane_id(id: PaneId) -> egui::Id {
 }
 
 impl TerminalApp {
+    pub(crate) fn agent_news_symbols(&self, args: &tr_agent_tools::args::LiveArgs) -> Result<Vec<String>, String> {
+        use tr_agent_tools::args::LiveArgs;
+        let symbol = match args {
+            LiveArgs::ReadNews(a) => a.symbol.as_ref(),
+            LiveArgs::ReadFilings(a) => Some(&a.symbol),
+            _ => return Err("Not a local news tool".into()),
+        };
+        if let Some(symbol) = symbol {
+            return Ok(vec![tr_data::security(symbol).key()]);
+        }
+        if let LiveArgs::ReadNews(a) = args
+            && (a.watchlist.is_some() || a.scope.as_deref() == Some("watchlist"))
+        {
+            let list = if let Some(name) = &a.watchlist {
+                self.watchlists.iter().find(|l| l.name.eq_ignore_ascii_case(name)).ok_or("Unknown watchlist")?
+            } else {
+                &self.watchlists[self.active_watchlist]
+            };
+            return Ok(list.symbols.clone());
+        }
+        Ok(vec![])
+    }
     fn first_agent(&self) -> Option<PaneId> {
         self.panes.iter().find(|p| matches!(p.kind, PaneKind::Agent(_))).map(|p| p.id)
     }
@@ -781,6 +803,17 @@ impl TerminalApp {
             self.pinned_agent_chart = None;
         }
         self.agent_pane.settings.pinned_chart = self.pinned_agent_chart;
+        let visible = self.visible_panes();
+        let charts: Vec<_> = self
+            .panes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, pane)| match &pane.kind {
+                PaneKind::Chart(chart) => Some((chart.uid, chart.drawings_hidden, visible.contains(&i))),
+                _ => None,
+            })
+            .collect();
+        self.agent_pane.refresh_drawing_visibility(&charts);
         self.refresh_agent_undo();
         self.send_next_agent_prompt();
     }
@@ -888,6 +921,17 @@ impl TerminalApp {
                     && self.agent_pane.session.is_some()
                 {
                     self.start_agent_session(ctx);
+                }
+            }
+            Action::ShowDrawings(uid) => {
+                if let Some(pane) = self.panes.iter_mut().find(|p| matches!(&p.kind, PaneKind::Chart(c) if c.uid==uid))
+                {
+                    if let PaneKind::Chart(chart) = &mut pane.kind {
+                        chart.drawings_hidden = false;
+                    }
+                    self.dock.activate(pane.id);
+                    self.agent_pane.drawings_shown(uid);
+                    self.autosave();
                 }
             }
             Action::UndoTurn(turn) => {

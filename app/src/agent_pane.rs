@@ -27,7 +27,7 @@ const INTERRUPTED: &str = "Stopped. This answer is incomplete.";
 const PRIVACY_GROUPS: &[(&str, &str)] = &[
     (
         "What is sent",
-        "Your prompts, the pinned chart’s data and tool results go to OpenAI under your ChatGPT account. Screenshots only with your consent; not available yet.",
+        "Your prompts, the pinned chart’s data and tool results go to OpenAI under your ChatGPT account. News tools share headlines and filing metadata from local storage, never fetch on demand, and omit summaries by default. Finnhub headlines are for personal, non-commercial use; SEC metadata is public domain. Screenshots only with your consent; not available yet.",
     ),
     (
         "What the agent can change",
@@ -504,6 +504,7 @@ pub enum Action {
     Send(Prompt),
     SetTools(ToolsMode),
     UndoTurn(String),
+    ShowDrawings(u64),
     // A5b-SCAN: emitted only by the user's button click, never by tool dispatch.
     OpenScanner(crate::layouts::ScanSettings),
     /// `ids` are the pending proposals the user saw; others in the turn stay pending.
@@ -603,6 +604,34 @@ impl AgentPane {
             let turn = &mut self.turns[index];
             turn.duration = Some(turn.started_at.elapsed());
             turn.finished = true;
+        }
+    }
+
+    pub fn drawings_shown(&mut self, uid: u64) {
+        for block in &mut self.blocks {
+            if let RenderedBlock::Tool(trace) = block
+                && trace.target_args["_drawing_visibility"]["uid"].as_u64() == Some(uid)
+            {
+                trace.target_args.as_object_mut().unwrap().remove("_drawing_visibility");
+            }
+        }
+    }
+
+    /// Reconcile retained notices with live chart state, regardless of which
+    /// toolbar, tab switch or pane-close path changed visibility.
+    pub(crate) fn refresh_drawing_visibility(&mut self, charts: &[(u64, bool, bool)]) {
+        for block in &mut self.blocks {
+            let RenderedBlock::Tool(trace) = block else { continue };
+            let Some(uid) = trace.target_args["_drawing_visibility"]["uid"].as_u64() else { continue };
+            let state = charts.iter().find(|&&(id, _, _)| id == uid);
+            match state {
+                None | Some((_, false, true)) => {
+                    trace.target_args.as_object_mut().unwrap().remove("_drawing_visibility");
+                }
+                Some((_, hidden, _)) => {
+                    trace.target_args["_drawing_visibility"]["hidden"] = (*hidden).into();
+                }
+            }
         }
     }
 
@@ -819,6 +848,7 @@ impl AgentPane {
             "item/completed" | "item/started" if params["item"]["type"] == "dynamicToolCall" => {
                 let item = &params["item"];
                 let name = item["tool"].as_str().unwrap_or("chart tool");
+                let local = item.get("localRead").cloned().or_else(|| local_tool_projection(item));
                 let scan = item.get("scanRead").cloned().or_else(|| scan_tool_projection(item));
                 let multi = item.get("multiRead").cloned().or_else(|| multi_tool_projection(item));
                 let summary = scan
@@ -828,7 +858,9 @@ impl AgentPane {
                     .or_else(|| multi.as_ref().and_then(|v| v["summary"].as_str().map(str::to_owned)))
                     .or_else(|| workflow_tool_target(name, &item["arguments"], &self.workflows.proposals))
                     .or_else(|| {
-                        if is_scan_tool(name) || matches!(name, "get_quotes" | "compare_symbols") {
+                        if is_scan_tool(name)
+                            || matches!(name, "get_quotes" | "compare_symbols" | "read_news" | "read_filings")
+                        {
                             return None;
                         }
                         item["editSummary"].as_str().map(short_label).or_else(|| edit_tool_summary(item)).or_else(
@@ -855,8 +887,17 @@ impl AgentPane {
                     },
                     target_args: {
                         let mut args = normalized_args(&item["arguments"]);
+                        if let Some(visibility) =
+                            item.get("drawingVisibility").cloned().or_else(|| drawing_visibility_projection(item))
+                        {
+                            args["_drawing_visibility"] = visibility;
+                        }
                         if let Some(scan) = scan {
                             args["_scan"] = scan;
+                        }
+                        if let Some(local) = local {
+                            args["_local_text"] = serde_json::to_string_pretty(&local).unwrap_or_default().into();
+                            args["_local"] = local;
                         }
                         args
                     },
@@ -1188,6 +1229,31 @@ impl AgentPane {
         } else {
             label
         };
+        if turn.is_some_and(|t| t.finished && t.reverted_changes.is_none()) {
+            let mut hidden: std::collections::BTreeMap<u64, (usize, bool)> = Default::default();
+            for trace in &traces {
+                let v = &trace.target_args["_drawing_visibility"];
+                if trace.success == Some(true)
+                    && let Some(uid) = v["uid"].as_u64()
+                {
+                    let entry = hidden.entry(uid).or_default();
+                    entry.0 += v["count"].as_u64().unwrap_or(0) as usize;
+                    entry.1 |= v["hidden"] == true;
+                }
+            }
+            for (uid, (count, hidden)) in hidden {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "{count} drawing{} added, but {} ·",
+                        if count == 1 { "" } else { "s" },
+                        if hidden { "drawings are hidden on this chart" } else { "the target chart is not visible" }
+                    ));
+                    if control(ui, "Show drawings").clicked() {
+                        actions.push(Action::ShowDrawings(uid));
+                    }
+                });
+            }
+        }
         let label = tool_group_duration(label, turn);
         let recovered = recovered_failures(&traces);
         let retries =
@@ -1270,6 +1336,10 @@ impl AgentPane {
             for trace in traces {
                 tool_row_with_history(ui, trace, reverted.is_some_and(|n| n > 0));
                 scan_tool_details(ui, trace, actions);
+                if let Some(local) = trace.target_args["_local_text"].as_str() {
+                    ui.label(RichText::new("headlines and filing metadata from local storage").color(theme::muted()));
+                    ui.add(egui::Label::new(RichText::new(local).font(theme::mono(10.5))).wrap());
+                }
             }
         }
         if let Some(id) = turn_id {
@@ -2012,6 +2082,8 @@ fn tool_label(name: &str) -> &str {
     match name {
         "read_chart" => "Read chart",
         "read_data" => "Read bars",
+        "read_news" => "Read news",
+        "read_filings" => "Read filings",
         "list_scans" => "List scans",
         "read_scan_results" => "Read scan results",
         "run_scan" => "Run scan",
@@ -2316,6 +2388,11 @@ fn tool_group_summary_outcome(traces: &[&Trace], reverted: Option<usize>, final_
                 trace.success == Some(true) && matches!(trace.name.as_str(), "list_watchlists" | "list_alerts")
             }) {
                 "Read watchlists and alerts".into()
+            } else if traces
+                .iter()
+                .any(|trace| trace.success == Some(true) && matches!(trace.name.as_str(), "read_news" | "read_filings"))
+            {
+                "Read local news and filings".into()
             } else if traces.iter().any(|trace| trace.success == Some(true) && trace.name == "analyze") {
                 "Analyzed chart".into()
             } else {
@@ -2402,6 +2479,25 @@ fn multi_symbol_label(symbol: &str) -> String {
         &security.crypto_instrument().map_or_else(|_| security.ticker.clone(), |i| format!("{}/{}", i.base, i.quote)),
     )
 }
+/// Privacy-safe visibility metadata; never retain raw drawing coordinates.
+pub(crate) fn drawing_visibility_projection(item: &Value) -> Option<Value> {
+    if item["tool"] != "create_drawing" || item["success"] != true {
+        return None;
+    }
+    item["contentItems"].as_array()?.iter().find_map(|c| {
+        if c["type"] != "inputText" {
+            return None;
+        }
+        let v: Value = serde_json::from_str(c["text"].as_str()?).ok()?;
+        let uid = v["chart_uid"].as_u64()?;
+        let count = v["drawings_added"].as_u64()?.min(1);
+        if count == 0 || (v["drawings_hidden"] != true && v["chart_visible"] != false) {
+            return None;
+        }
+        Some(serde_json::json!({"uid":uid,"count":count,"hidden":v["drawings_hidden"]==true}))
+    })
+}
+
 pub(crate) fn multi_tool_projection(item: &Value) -> Option<Value> {
     use serde_json::json;
     let name = item["tool"].as_str()?;
@@ -2593,6 +2689,21 @@ fn is_scan_tool(name: &str) -> bool {
     matches!(name, "list_scans" | "read_scan_results" | "run_scan")
 }
 
+/// Preserve the bounded, structured local result across the bridge projection;
+/// headline strings remain untrusted plain text, never instructions or Markdown.
+pub(crate) fn local_tool_projection(item: &Value) -> Option<Value> {
+    if !matches!(item["tool"].as_str()?, "read_news" | "read_filings") || item["success"] != true {
+        return None;
+    }
+    item["contentItems"].as_array()?.iter().filter(|c| c["type"] == "inputText").find_map(|c| {
+        let text = c["text"].as_str()?;
+        if text.len() > tr_agent_tools::MAX_TEXT_BYTES {
+            return None;
+        }
+        let result: Value = serde_json::from_str(text).ok()?;
+        (result["disclosure"] == "headlines and filing metadata from local storage").then_some(result)
+    })
+}
 pub(crate) fn scan_tool_projection(item: &Value) -> Option<Value> {
     use serde_json::json;
     let tool = item["tool"].as_str()?;
@@ -2932,6 +3043,83 @@ mod polish_tests {
         assert_eq!(settings.universe, tr_data::universe::Universe::Nasdaq);
         assert_eq!(settings.refresh, None);
     }
+    #[test]
+    fn precision_hidden_drawings_notice_survives_projection_and_offers_user_action() {
+        use serde_json::json;
+        for hidden in [true, false] {
+            let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
+            pane.start_prompt(Prompt { text: "mark levels".into(), requires_tools: true }).unwrap();
+            for i in 0..4 {
+                let mut trace = session_tool_trace(
+                    "create_drawing",
+                    json!({"symbol":"AAA","kind":"rectangle"}),
+                    json!({"id":i,"chart_uid":42,"drawings_added":1,"drawings_hidden":hidden,"chart_visible":false,"anchors":"never retain"}),
+                );
+                trace.id = format!("draw-{i}");
+                assert!(!format!("{:?}", trace.target_args).contains("never retain"));
+                pane.blocks.push(RenderedBlock::Tool(trace));
+            }
+            pane.finish_turn();
+            pane.running = false;
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            render(&ctx, dp(1000.), vec![], |ui| pane.conversation(ui, &mut actions));
+            let output = render(&ctx, dp(1000.), vec![], |ui| pane.conversation(ui, &mut actions));
+            let text = texts(&output);
+            let notice = if hidden {
+                "4 drawings added, but drawings are hidden on this chart ·"
+            } else {
+                "4 drawings added, but the target chart is not visible ·"
+            };
+            assert!(text.iter().any(|(s, _)| s == notice), "{text:?}");
+            assert!(actions.is_empty(), "showing the notice must not reveal drawings");
+            let pos = text.iter().find(|(s, _)| s == "Show drawings").unwrap().1.center();
+            for pressed in [true, false] {
+                render(
+                    &ctx,
+                    dp(1000.),
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    |ui| pane.conversation(ui, &mut actions),
+                );
+            }
+            assert!(actions.iter().any(|a| matches!(a, Action::ShowDrawings(42))));
+            pane.drawings_shown(42);
+            let output = render(&ctx, dp(1000.), vec![], |ui| pane.conversation(ui, &mut actions));
+            assert!(!texts(&output).iter().any(|(s, _)| s == notice));
+        }
+    }
+
+    #[test]
+    fn drawing_notice_reconciles_toolbar_tab_and_closed_pane_paths() {
+        use serde_json::json;
+        for charts in [vec![(42, false, true)], vec![]] {
+            let mut pane = AgentPane::default();
+            let trace = session_tool_trace(
+                "create_drawing",
+                json!({}),
+                json!({"chart_uid":42,"drawings_added":1,"drawings_hidden":true,"chart_visible":false}),
+            );
+            pane.blocks.push(RenderedBlock::Tool(trace));
+            pane.refresh_drawing_visibility(&[(42, true, true)]);
+            let RenderedBlock::Tool(trace) = &pane.blocks[0] else { panic!() };
+            assert!(trace.target_args["_drawing_visibility"].is_object());
+            pane.refresh_drawing_visibility(&[(42, false, false)]);
+            let RenderedBlock::Tool(trace) = &pane.blocks[0] else { panic!() };
+            assert_eq!(trace.target_args["_drawing_visibility"]["hidden"], false);
+            pane.refresh_drawing_visibility(&charts);
+            let RenderedBlock::Tool(trace) = &pane.blocks[0] else { panic!() };
+            assert!(trace.target_args["_drawing_visibility"].is_null());
+        }
+    }
+
     // Mirror DynamicToolCallThreadItem from the pinned app-server schema, including the
     // session privacy projection. Direct pane.wire fixtures miss content stripped there.
     fn session_tool_trace(tool: &str, args: Value, result: Value) -> Trace {
@@ -2962,6 +3150,29 @@ mod polish_tests {
         let projected = format!("{trace:?}");
         assert!(!projected.contains("never-forward") && !projected.contains("contentItems"));
         trace
+    }
+
+    #[test]
+    fn n4_real_session_keeps_local_results_and_labels_without_images() {
+        use serde_json::json;
+        for (tool, label, result) in [
+            (
+                "read_news",
+                "Read news",
+                json!({"disclosure":"headlines and filing metadata from local storage","groups":[{"topic":"Earnings","subject":"NVDA US Equity","stories":[{"time":"2026-10-27T12:00:00Z","headline":"Fixture earnings","url_host":"fixture.invalid","sources":["Fixture"]}]}],"filings":[]}),
+            ),
+            (
+                "read_filings",
+                "Read filings",
+                json!({"disclosure":"headlines and filing metadata from local storage","filings":[{"symbol":"NVDA","form":"8-K","items":"2.02 Results of Operations","insiders":[]}]}),
+            ),
+        ] {
+            assert_eq!(tool_label(tool), label);
+            let trace = session_tool_trace(tool, json!({"symbol":"NVDA"}), result.clone());
+            assert_eq!(trace.target_args["_local"], result);
+            assert!(!trace.target_args["_local_text"].as_str().unwrap().is_empty());
+            assert_eq!(tool_group_label(&[&trace], None), "Read local news and filings · 1 step");
+        }
     }
 
     #[test]

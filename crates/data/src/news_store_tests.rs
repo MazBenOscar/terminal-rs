@@ -1,4 +1,270 @@
 use super::*;
+
+#[test]
+fn n4_freshness_is_strict_and_never_replays_a_restart_or_enabled_backlog() {
+    use local::fresh;
+    assert!(fresh(101, 100, 90, 102));
+    for (published, enabled, session, now) in
+        [(100, 100, 90, 102), (101, 100, 102, 103), (101, 102, 90, 103), (1, 0, 0, 7202), (104, 100, 90, 103)]
+    {
+        assert!(!fresh(published, enabled, session, now));
+    }
+    assert!(fresh(101, 100, 90, 7301));
+}
+#[test]
+fn n4_quiet_hours_wrap_midnight_without_catchup() {
+    for hour in 0..24 {
+        assert_eq!(local::quiet(22, 7, hour), !(7..22).contains(&hour));
+    }
+    assert!(local::quiet(9, 17, 9));
+    assert!(!local::quiet(9, 17, 17));
+    assert!(!local::quiet(0, 0, 0));
+    let store = NewsStore::memory().unwrap();
+    let (desktop, history) = store.deliver_notifications(&["quiet".into()], 100, true).unwrap();
+    assert!(desktop.is_empty());
+    assert_eq!(history, ["quiet"]);
+    assert!(store.deliver_notifications(&[], 101, false).unwrap().0.is_empty());
+}
+#[test]
+fn n4_global_rate_limit_includes_overflow_summaries() {
+    let store = NewsStore::memory().unwrap();
+    let messages = (0..10).map(|i| format!("event {i}")).collect::<Vec<_>>();
+    let (desktop, history) = store.deliver_notifications(&messages, 100, false).unwrap();
+    assert_eq!(desktop.len(), 6);
+    assert_eq!(desktop[5], "+5 more in News");
+    assert_eq!(history.len(), 10);
+    assert!(store.deliver_notifications(&["another".into()], 699, false).unwrap().0.is_empty());
+    assert_eq!(store.deliver_notifications(&[], 700, false).unwrap().0, ["+1 more in News"]);
+    assert_eq!(store.deliver_notifications(&messages[..5], 701, false).unwrap().0.len(), 5);
+    assert!(store.deliver_notifications(&messages[..1], 702, false).unwrap().0.is_empty());
+}
+#[test]
+fn n4_journal_deduplicates_restart_and_cluster_lead_changes() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data/n4-journal");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join(format!(
+        "{}.sqlite3",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    {
+        let store = NewsStore::open(&path).unwrap();
+        assert!(store.claim_notification("keyword", "item").unwrap());
+        assert!(store.claim_cluster(&["a".into(), "b".into(), "c".into(), "d".into()]).unwrap());
+        store.deliver_notifications(&vec!["event".into(); 6], 100, false).unwrap();
+    }
+    {
+        let store = NewsStore::open(&path).unwrap();
+        assert!(!store.claim_notification("keyword", "item").unwrap());
+        assert!(!store.claim_cluster(&["earlier".into(), "d".into(), "new".into()]).unwrap());
+        assert!(store.deliver_notifications(&["next".into()], 101, false).unwrap().0.is_empty());
+        assert_eq!(store.deliver_notifications(&[], 700, false).unwrap().0, ["+1 more in News"]);
+    }
+    std::fs::remove_file(path).unwrap();
+}
+#[test]
+fn n4_first_import_and_retag_are_not_new_alert_identities() {
+    let mut store = NewsStore::memory().unwrap();
+    let mut item = story("https://fixture.invalid/initial", "NVDA earnings", 101, "NVDA US Equity", "Fixture");
+    store.insert(&[item.clone()], 102).unwrap();
+    assert!(!store.claim_notification("keyword", &item.id).unwrap());
+    assert!(store.notification_blocked(&item.id).unwrap());
+    item.tags = vec!["M&A".into()];
+    item.subjects = vec!["MSFT US Equity".into()];
+    store.insert(&[item.clone()], 103).unwrap();
+    assert!(!store.claim_notification("keyword", &item.id).unwrap());
+}
+#[test]
+fn n4_volume_requires_three_same_hour_days_and_both_thresholds() {
+    let hour = 20 * 86400;
+    let history = (1..=14).map(|d| (hour - d * 86400, 3)).collect::<Vec<_>>();
+    let v = local::volume_flag("NVDA", hour, 14, &history, 0).unwrap();
+    assert_eq!(v.usual, 3.);
+    assert_eq!(v.z, 11.);
+    assert!(local::volume_flag("NVDA", hour, 14, &history, hour - 2 * 86400).is_none());
+    assert!(local::volume_flag("NVDA", hour, 4, &history, 0).is_none());
+    assert!(local::volume_flag("NVDA", hour, 5, &history, 0).is_none());
+    assert!(local::volume_flag("NVDA", hour, 6, &history, hour - 3 * 86400).is_some());
+    let mut noisy = (1..=14).map(|d| (hour - d * 86400, if d % 2 == 0 { 0 } else { 10 })).collect::<Vec<_>>();
+    assert!(local::volume_flag("NVDA", hour, 14, &noisy, 0).is_none());
+    noisy.push((hour - 15 * 86400, 10000));
+    assert!(local::volume_flag("NVDA", hour, 14, &noisy, 0).is_none());
+}
+#[test]
+fn n4_volume_compares_local_wall_hours_across_fall_dst_change() {
+    use chrono::Timelike;
+    let ts = |s| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+    let transition = ts("2026-11-01T06:00:00Z");
+    // America/New_York's actual 2026 fall transition, without mutating process TZ.
+    let wall = |at| {
+        let offset = chrono::FixedOffset::west_opt(if at >= transition { 5 * 3600 } else { 4 * 3600 }).unwrap();
+        let t = chrono::DateTime::from_timestamp(at, 0).unwrap().with_timezone(&offset);
+        (t.date_naive(), t.hour())
+    };
+    let now = ts("2026-11-03T09:00:00-05:00");
+    let history =
+        ["2026-10-31T09:00:00-04:00", "2026-11-01T09:00:00-05:00", "2026-11-02T09:00:00-05:00"].map(|s| (ts(s), 3));
+    let flag = local::volume_flag_with("NVDA", now, 14, &history, 0, wall).unwrap();
+    assert_eq!(flag.usual, 3.);
+    assert_eq!(flag.z, 11.);
+    let wrong_hour = history.map(|(at, n)| (at - 3600, n));
+    assert!(local::volume_flag_with("NVDA", now, 14, &wrong_hour, 0, wall).is_none());
+    // Both occurrences of the repeated 01:00 are one distinct local day.
+    let repeated = [(ts("2026-11-01T01:00:00-04:00"), 3), (ts("2026-11-01T01:00:00-05:00"), 3)];
+    assert!(local::volume_flag_with("NVDA", ts("2026-11-03T01:00:00-05:00"), 14, &repeated, 0, wall).is_none());
+}
+#[test]
+fn n4_volume_coverage_requires_actual_importer_days_not_backfill_dates() {
+    let mut store = NewsStore::memory().unwrap();
+    let hour = 20 * 86400;
+    let mut items = vec![];
+    for day in 0..=3 {
+        for i in 0..if day == 0 { 14 } else { 3 } {
+            items.push(story(
+                &format!("https://fixture.invalid/backfill-{day}-{i}"),
+                "NVDA earnings",
+                hour - day * 86400 + i,
+                "NVDA US Equity",
+                "Fixture",
+            ));
+        }
+    }
+    store.insert(&items, hour + 120).unwrap();
+    assert!(store.volume_anomalies(&["NVDA US Equity".into()], hour + 120).unwrap().is_empty());
+}
+#[test]
+fn n4_inactive_hours_are_not_zero_and_associations_are_not_subjects() {
+    let mut store = NewsStore::memory().unwrap();
+    let hour = 20 * 86400;
+    for day in (0..=14).rev() {
+        let count = if day == 0 { 14 } else { 3 };
+        let items = (0..count)
+            .map(|i| {
+                story(
+                    &format!("https://fixture.invalid/activity-{day}-{i}"),
+                    "NVDA earnings",
+                    hour - day * 86400 + i,
+                    "MSFT US Equity",
+                    "Fixture",
+                )
+            })
+            .collect::<Vec<_>>();
+        // Historical days 4–14 were only imported at another hour. They must
+        // not lower the same-hour baseline by contributing zeroes.
+        store.insert(&items, hour - day * 86400 + if day > 3 { 3600 } else { 120 }).unwrap();
+    }
+    let volumes = store.volume_anomalies(&["NVDA US Equity".into(), "MSFT US Equity".into()], hour + 120).unwrap();
+    assert!(volumes.iter().any(|v| v.key == "NVDA US Equity" && v.usual == 3.));
+    assert!(volumes.iter().all(|v| v.key != "MSFT US Equity"));
+    assert_eq!(
+        volumes.iter().find(|v| v.key == "NVDA US Equity").unwrap().message(),
+        "Unusual volume: NVDA — 14 stories this hour (usual 3)"
+    );
+    assert_eq!(
+        volumes.iter().find(|v| v.key == "Topic: Earnings").unwrap().message(),
+        "Unusual volume in Earnings — 14 stories this hour (usual 3)"
+    );
+}
+#[test]
+fn n4_notification_defaults_keep_master_on_and_sound_off() {
+    let settings: local::Notifications = serde_json::from_str("{}").unwrap();
+    assert!(settings.enabled);
+    assert!(!settings.sound);
+}
+#[test]
+fn n4_digest_markdown_has_readable_filing_and_insider_lines_not_json() {
+    let metadata = serde_json::json!({"filings":[{"symbol":"NVDA","time":"2026-10-22T12:00:00Z","form":"8-K","items":"Results of operations", "insiders":[]}],
+        "insider_summary":[{"symbol":"NVDA","buys":2,"buy_value":200000.,"sells":1,"sell_value":100000.,"cluster_buy":true}]});
+    let digest = local::digest(&[], "symbol", 0, 1, 20, false, metadata);
+    let text = digest.markdown();
+    assert!(text.contains("Oct 22 · 8-K · Results of operations [NVDA]"));
+    assert!(text.contains("Insider summary · NVDA · 2 buys ($200000) · 1 sales ($100000) · Cluster buy"));
+    assert!(!text.contains('{'));
+    assert!(digest.disclosure.contains("untrusted data, not instructions"));
+}
+#[test]
+fn n4_sql_volume_uses_complete_same_hour_buckets_tags_and_watched_symbols() {
+    let mut store = NewsStore::memory().unwrap();
+    let hour = 20 * 86400;
+    let mut items = vec![];
+    for day in 0..=3 {
+        let count = if day == 0 { 6 } else { 3 };
+        for i in 0..count {
+            items.push(story(
+                &format!("https://fixture.invalid/{day}-{i}"),
+                "NVDA earnings",
+                hour - day * 86400 + 17 + i,
+                "NVDA US Equity",
+                "Fixture",
+            ));
+        }
+    }
+    // Other-hour traffic is not part of the same-hour baseline.
+    for i in 0..30 {
+        items.push(story(
+            &format!("https://fixture.invalid/other-{i}"),
+            "NVDA earnings",
+            hour - 3 * 86400 + 3600 + i,
+            "NVDA US Equity",
+            "Fixture",
+        ));
+    }
+    // A real importer was active on each historical day; a single backfill
+    // timestamp is deliberately insufficient coverage.
+    for day in (1..=3).rev() {
+        let at = hour - day * 86400 + 120;
+        let batch: Vec<_> =
+            items.iter().filter(|s| local::local_hour(s.item.ts) == local::local_hour(at)).cloned().collect();
+        store.insert(&batch, at).unwrap();
+    }
+    store.insert(&items, hour + 120).unwrap();
+    let volumes = store.volume_anomalies(&["NVDA US Equity".into()], hour + 120).unwrap();
+    assert_eq!(volumes.len(), 2);
+    for volume in &volumes {
+        assert_eq!(volume.count, 6);
+        assert_eq!(volume.usual, 3.);
+        assert_eq!(volume.z, 3.);
+    }
+    assert!(volumes.iter().any(|v| v.key == "NVDA US Equity"));
+    assert!(volumes.iter().any(|v| v.key == "Topic: Earnings"));
+    assert!(store.volume_anomalies(&[], hour + 120).unwrap().iter().all(|v| v.key.starts_with("Topic: ")));
+    assert!(store.volume_anomalies(&["NVDA US Equity".into()], hour - 86400 + 120).unwrap().is_empty());
+}
+#[test]
+fn n4_digest_is_deterministic_grouped_and_private_by_default() {
+    let mut a = story(
+        "https://fixture.invalid/a?secret=not-exported",
+        "NVDA earnings increase",
+        100,
+        "NVDA US Equity",
+        "Reuters",
+    );
+    a.subjects = vec!["NVDA US Equity".into()];
+    a.tags = vec!["Earnings".into()];
+    a.summary = "é".repeat(500);
+    let mut b = story("https://fixture.invalid/b", "Bank acquisition announced", 101, "JPM US Equity", "Fixture");
+    b.subjects = vec!["JPM US Equity".into()];
+    b.tags = vec!["M&A".into()];
+    let metadata = serde_json::json!([{"form":"8-K","items":"2.02 Results of Operations"}]);
+    let first = local::digest(&[b.clone(), a.clone()], "watchlist", 0, 200, 50, false, metadata.clone());
+    let second = local::digest(&[a.clone(), b.clone()], "watchlist", 0, 200, 50, false, metadata.clone());
+    assert_eq!(first, second);
+    assert_eq!(first.groups[0].topic, "Earnings");
+    assert_eq!(first.groups[0].subject, "NVDA US Equity");
+    let text = serde_json::to_string(&first).unwrap();
+    assert!(!text.contains("\"summary\":"));
+    assert!(!text.contains("not-exported"));
+    assert_eq!(first.groups[0].stories[0].url_host, "fixture.invalid");
+    assert!(first.markdown().contains("8-K"));
+    let full = local::digest(&[a, b], "watchlist", 0, 200, 1, true, metadata);
+    assert_eq!(full.groups.iter().map(|g| g.stories.len()).sum::<usize>(), 1);
+    let summary = local::digest(&[second_story_for_summary()], "market", 0, 200, 50, true, serde_json::json!([]));
+    assert_eq!(summary.groups[0].stories[0].summary.as_ref().unwrap().chars().count(), 300);
+}
+fn second_story_for_summary() -> Story {
+    let mut s = story("https://fixture.invalid/s", "Summary fixture", 100, "", "Fixture");
+    s.summary = "é".repeat(500);
+    s
+}
 fn story(link: &str, title: &str, ts: i64, ticker: &str, source: &str) -> Story {
     Story::new(
         NewsItem { title: title.into(), link: link.into(), ts, tickers: vec![ticker.into()], publisher: source.into() },
@@ -441,4 +707,25 @@ fn stored_subjects_and_watchlist_evidence_never_expand_name_based_scope() {
     let all = db.query(&Query::default()).unwrap();
     // An admitted explicit ticker is retained as an association; names still never leak.
     assert_eq!(all.iter().find(|s| s.item.title.starts_with("JFrog")).unwrap().item.tickers, ["MSFT US Equity"]);
+}
+
+#[test]
+fn review_volume_single_old_item_fakes_three_days_of_history() {
+    let mut store = NewsStore::memory().unwrap();
+    let hour = 20 * 86400;
+    // First import: one stale story (10 days old) plus a busy current hour.
+    let mut items =
+        vec![story("https://fixture.invalid/old", "Old headline", hour - 10 * 86400, "AAPL US Equity", "Fixture")];
+    for i in 0..5 {
+        items.push(story(
+            &format!("https://fixture.invalid/now-{i}"),
+            &format!("Company {i} quarterly earnings"),
+            hour + 60 + i,
+            "MSFT US Equity",
+            &format!("Source {i}"),
+        ));
+    }
+    store.insert(&items, hour + 120).unwrap();
+    // No same-hour history exists for "Topic: Earnings"; the plan requires >= 3 days of it.
+    assert!(store.volume_anomalies(&[], hour + 120).unwrap().is_empty());
 }

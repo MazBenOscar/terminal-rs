@@ -642,7 +642,7 @@ fn summary(history: &History, args: &ReadData, tf: Timeframe, now: i64) -> Resul
     let open_return =
         first.zip(last).map(|(a, b)| percent(a.open, b.close, "returns.open_to_close_percent")).transpose()?.flatten();
     let mut value = json!({
-        "version":1,"symbol":history.instrument.as_ref().map_or_else(||args.symbol.clone(),CryptoInstrument::canonical_ticker),
+        "version":1,"symbol":history.chart_symbol.clone().unwrap_or_else(|| history.instrument.as_ref().map_or_else(||args.symbol.clone(),CryptoInstrument::canonical_ticker)),
         "requested_symbol":args.symbol,"timeframe":tf.label(),"instrument":history.instrument,
         "price_basis":history.price_basis,"session":history.session.label(),"timezone":"UTC",
         "count":bars.len(),"first":first.and_then(|b|iso(b.ts)),"last":last.and_then(|b|iso(b.ts)),
@@ -654,6 +654,7 @@ fn summary(history: &History, args: &ReadData, tf: Timeframe, now: i64) -> Resul
         "bar_columns":["time","open","high","low","close","volume","in_progress"],
         "close_series_columns":["time","close"],"truncated":false
     });
+    history_identity(&mut value, history);
     let (mut recent, mut points) = (bars.len().min(200), bars.len().min(300));
     loop {
         value["bars"] = bars[bars.len() - recent..]
@@ -683,6 +684,16 @@ fn summary(history: &History, args: &ReadData, tf: Timeframe, now: i64) -> Resul
         }
         recent = (recent * 3 / 4).max(1).min(bars.len());
         points = (points * 3 / 4).max(2).min(bars.len());
+    }
+}
+
+fn history_identity(value: &mut Value, history: &History) {
+    if let Some(chart_id) = &history.chart_id {
+        value["chart_id"] = json!(chart_id);
+    }
+    if let Some(instrument) = &history.instrument {
+        value["instrument"] = json!(instrument);
+        value["venue"] = json!(instrument.venue.label());
     }
 }
 
@@ -727,7 +738,13 @@ pub(crate) async fn analyze(host: &dyn DataHost, args: Analyze, now: i64) -> Too
         Ok(v) => v,
         Err(e) => return e,
     };
-    let bars = &history.bars;
+    let version = match args.mode {
+        crate::args::Mode::Trendlines => 2,
+        crate::args::Mode::Levels | crate::args::Mode::Swings => args.version.unwrap_or(2),
+        _ => 1,
+    };
+    let lookback = args.lookback.unwrap_or(((400 * 86400 / tf.seconds()) as usize).clamp(20, 1000));
+    let bars = if version == 2 { &history.bars[history.bars.len().saturating_sub(lookback)..] } else { &history.bars };
     if bars.is_empty() {
         return ToolResult::error("no_data", "No bars in the requested range", None);
     }
@@ -735,9 +752,52 @@ pub(crate) async fn analyze(host: &dyn DataHost, args: Analyze, now: i64) -> Too
         Ok(value) => value,
         Err(error) => return error,
     };
-    value["version"] = 1.into();
-    value["symbol"] =
-        history.instrument.as_ref().map_or_else(|| args.symbol.clone(), CryptoInstrument::canonical_ticker).into();
+    if version == 2 {
+        match args.mode {
+            crate::args::Mode::Levels => {
+                let zones = analytics::precision::levels(bars);
+                for z in &zones {
+                    for number in [z.price, z.zone_width, z.low, z.high, z.score] {
+                        if let Err(error) = analytics::finite(number, "support_resistance") {
+                            return error;
+                        }
+                    }
+                }
+                value["support_resistance"] = json!(zones);
+            }
+            crate::args::Mode::Swings => {
+                let swings = analytics::precision::swings(bars);
+                for s in &swings {
+                    if let Err(error) = analytics::finite(s.prominence, "swings.prominence") {
+                        return error;
+                    }
+                }
+                for (key, role) in [("highs", "high"), ("lows", "low")] {
+                    value[key] = json!(
+                        swings
+                            .iter()
+                            .filter(|s| s.role == role)
+                            .map(|s| json!({"time":s.time,"price":s.price,"confirmed_at":s.confirmed_at}))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                value["swings"] = json!(swings);
+            }
+            _ => {}
+        }
+    }
+    value["version"] = version.into();
+    if version == 2 {
+        value["last_bar_ts"] = json!(bars.last().unwrap().ts);
+    }
+    value["symbol"] = history
+        .chart_symbol
+        .clone()
+        .unwrap_or_else(|| {
+            history.instrument.as_ref().map_or_else(|| args.symbol.clone(), CryptoInstrument::canonical_ticker)
+        })
+        .into();
+    history_identity(&mut value, &history);
     value["timeframe"] = tf.label().into();
     value["bar_range"] = json!({"from":iso(bars[0].ts),"to":iso(bars.last().unwrap().ts),"count":bars.len()});
     value["price_basis"] = json!(history.price_basis);
@@ -747,7 +807,7 @@ pub(crate) async fn analyze(host: &dyn DataHost, args: Analyze, now: i64) -> Too
         value["truncated"] = true.into();
         value["marker"] = "[truncated: analysis detail reduced to fit 16 KiB; bar_range retained]".into();
         let mut reduced = false;
-        for path in ["/highs", "/lows", "/support_resistance"] {
+        for path in ["/highs", "/lows", "/swings", "/support_resistance"] {
             if let Some(array) = value.pointer_mut(path).and_then(Value::as_array_mut)
                 && array.len() > 1
             {
@@ -769,6 +829,19 @@ pub(crate) async fn analyze(host: &dyn DataHost, args: Analyze, now: i64) -> Too
                 array.push(last);
             }
             reduced = true;
+        }
+        for key in ["trendlines", "historical"] {
+            for line in value[key].as_array_mut().into_iter().flatten() {
+                let count = line["touches"].as_array().map_or(0, Vec::len);
+                if count > 2 {
+                    if line["touch_count"].is_null() {
+                        line["touch_count"] = count.into();
+                    }
+                    line["touches_truncated"] = true.into();
+                    line["touches"].as_array_mut().unwrap().drain(1..1 + count / 2);
+                    reduced = true;
+                }
+            }
         }
         if !reduced {
             break;

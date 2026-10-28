@@ -3,8 +3,7 @@
 A fast, keyboard-driven market terminal in pure Rust: TradingView-class GPU charting with a
 Bloomberg Terminal look (dense tiled panes, monospace numbers, a command line like `AAPL <GO>`)
 across **stocks, ETFs, indices, FX, crypto, US Treasuries, futures/commodities and options**,
-plus **congressional trade tracking ingested directly from the official STOCK Act disclosure
-systems** and **your own brokerage accounts through [SnapTrade](https://snaptrade.com)**
+plus **congressional trade tracking from House Clerk disclosures and [Bargo Senate data](https://www.bargo.ai/free-apis/congress)** and **your own brokerage accounts through [SnapTrade](https://snaptrade.com)**
 (read-only by default, with opt-in order entry). Native compact UI, themes from Bloomberg amber
 to Solarized, and a fully dockable
 workspace with saved layouts.
@@ -180,11 +179,20 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   SQLite by configured provider route, with cached history labeled on the chart. Older history
   pages in as you scroll left. Auxiliary quote/options/book views retain their sample fallbacks.
 - **Congress trades** (key feature)
-  - Live ingest is **House Clerk only** (disclosures-clerk.house.gov: current-year `{year}FD.zip`
+  - Live House ingest uses the **House Clerk** (disclosures-clerk.house.gov: current-year `{year}FD.zip`
     XML index, PTR PDFs parsed with pure-Rust text extraction). Scanned paper filings are detected
-    and recorded as such. **Senate: paused — needs a third-party source (senate.gov blocked this
-    network)**. All senate.gov hosts are permanently denied before transport. Senate parsers,
-    fixtures and stored trades remain available for display and a future third-party source.
+    and recorded as such. **Senate trades come via [Bargo](https://www.bargo.ai/free-apis/congress)**,
+    with an optional free key in Settings → Data sources → Senate (Bargo). Keyless mode works with
+    lower budgets. All senate.gov hosts remain permanently denied before transport; Bargo's
+    `filing_portal` is never requested, stored or linked. Existing eFD history is retained and deduplicated.
+    Party comes only from stored roster history; unknown party/owner are never guessed.
+  - Senate performs one machine-wide daily 60-day transaction-date sweep (to catch late disclosures),
+    plus a first-page 10-day light poll at most every three hours while visible. The initial import is
+    only that bounded sweep, with no backlog alerts. Subsequent tracked-politician alerts require
+    a first-seen disclosure no more than two days old. Free Bargo data covers the last three months,
+    not unlimited history. `/members` adds no party information or state beyond trades, so it is not fetched.
+    Amount labels preserve Bargo's disclosed range. Visible credit: **Senate data: Bargo (bargo.ai)**;
+    Bargo's terms prohibit raw-record redistribution.
   - Normalises politician, party, chamber, state, ticker, buy/sell, amount range, transaction date
     and filed date into SQLite. The live House roster is clerk.house.gov `MemberData.xml`;
     politicians are keyed by bioguide ID, which also repairs source-index typos.
@@ -206,8 +214,8 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
     are persisted and do not block later filings (at most three attempts total, one per day).
     Refusals/challenges and invalid PDF/ZIP or non-XML roster signatures pause the group
     for 6/12/24 hours (or longer via `Retry-After`, up to seven days), shared across instances and
-    restarts. Settings → Data sources shows House switches, usage and cooldowns, a disabled Senate
-    explanation and a global kill switch. `TR_DATA_DIR` instances make **zero Congress requests**
+    restarts. Settings → Data sources shows House and Senate (Bargo) switches, usage and cooldowns,
+    the optional masked Bargo key with Save & Test, and a global kill switch. `TR_DATA_DIR` instances make **zero Congress requests**
     unless `TR_ALLOW_EXTERNAL=1` exactly. No cadence override is needed for a normal live launch.
   - Panels: latest trades feed with party/chamber/side filters (`CONG`); per-ticker "who in
     Congress traded it" (`NVDA CONG`, or right-click any ticker); politician profile with trade
@@ -297,7 +305,8 @@ QUESTRADE_REFRESH_TOKEN=… cargo run --release                  # Questrade (fi
 Data lives in `~/Library/Application Support/terminal-rs` (macOS) or
 `$XDG_DATA_HOME/terminal-rs` (Linux), or `TR_DATA_DIR`. The first Congress ingest requests
 the current House index, a bounded previous-year rollover check, and at most 50 newest PDFs,
-spread by the machine-wide guard; it never backfills older history or contacts Senate. `TR_DATA_DIR` overrides are offline for Congress/news/filings
+spread by the machine-wide guard; it never backfills older House history or contacts senate.gov. The app separately
+runs the bounded Senate Bargo sweep described above. `TR_DATA_DIR` overrides are offline for Congress/news/filings
 unless `TR_ALLOW_EXTERNAL=1` is explicitly set.
 `cargo run -p tr-congress --example ingest -- --i-know congress.sqlite3` opts into one live CLI ingest.
 It claims the same machine-wide `congress:refresh` cadence slot as the app before ingesting;
@@ -317,10 +326,10 @@ linking needs the macOS SDK).
 
 ## Data sources and privacy
 
-Open **Settings › Data sources** for **Finnhub, SEC EDGAR, Yahoo news, CoinDesk, House disclosures
+Open **Settings › Data sources** for **Finnhub, SEC EDGAR, Yahoo news, CoinDesk, House disclosures, Bargo (Senate)
 and House roster**. Each has an on/off switch and a row showing state, **requests today / cap**,
 last request and any pause deadline/reason. Usage is machine-wide and resets by **UTC day**;
-last-request times in Settings are local. Senate has a permanently disabled explanatory row.
+last-request times in Settings are local. Senate trades come from Bargo (optional key, see below); senate.gov itself is never contacted.
 **Pause all external news and filings** is the global kill switch for these guarded sources,
 including House. It does not stop chart quotes/bars, exchange streams, brokerage traffic or
 an already-started request. Pane-level **Pause updates** freezes that pane's display, not the
@@ -359,7 +368,8 @@ attempts count too**; cache hits and refusals before sending do not.
 | CoinDesk RSS (`www.coindesk.com`) | 5 min | 300 | Crypto fallback |
 | House disclosures (`disclosures-clerk.house.gov`) | 3 s (≤20/min) | 400 | 30 min by default, bounded incremental PTR discovery |
 | House roster (`clerk.house.gov`) | 3 s (≤20/min) | 20 | Successful roster cached for 24 h |
-| Senate (`senate.gov` and every subdomain) | Denied before transport | 0 | Paused until a third-party source exists |
+| Bargo Congress API (`www.bargo.ai`) | 30 s (≤2/min) | 40 keyed / 10 keyless | Daily Senate sweep first, then a 3 h light poll; see below |
+| Senate (`senate.gov` and every subdomain) | Denied before transport | 0 | Never contacted; Senate trades come from Bargo |
 
 SEC submissions and Form 4 reads stop at **1,200 total SEC requests today** to reserve feed
 capacity. Form 4 XML has an additional **300 HTTP attempts/day** ceiling and 15-second shared
@@ -385,11 +395,31 @@ clear them, and there are no requests during a pause.
 **Why these constraints:** repeated fresh-data-directory test launches previously caused a
 senate.gov block on the author's network. Live Senate refresh is removed, and the guard denies
 all senate.gov hosts and redirect targets regardless of switches. Parsers, fixtures and stored
-Senate trades remain usable; live Senate data needs a third-party source. House disclosures and
+Senate trades remain usable; live Senate data now comes from Bargo. House disclosures and
 the roster use the guard above. **`TR_CONGRESS_REFRESH_MIN` defaults to 30 minutes; positive
 values below 15 clamp to 15, the maximum is seven days, and `0` disables refresh**. Sample mode
 defaults to zero. Scheduled runs claim a shared cadence slot; `REFRESH`/F6 bypasses cadence only,
 never guard rules. See [guard details](docs/analysis/net-guard.md).
+
+## Network safety: Senate via Bargo
+
+Bargo uses the same machine-wide SQLite guard ledger as House/news/SEC, outside `TR_DATA_DIR`.
+Its `www.bargo.ai` policy allows one in-flight request, at least **30 seconds** between sends,
+no more than **2/minute**, and at most **40 HTTP attempts/day with a key or 10/day keyless**.
+These ceilings include health tests, failed sends and redirect hops. Row reservations additionally
+bound trade responses to **1,000 rows/day keyed or 100/day keyless**, even without quota headers;
+short valid pages refund unused reservations. Reported request/row balances and timestamps persist
+across instances. Runs stop below 5 requests remaining, or below 200 rows keyed / 20 keyless;
+requests also require enough allowance for the entire requested page. A small remaining allowance
+can shorten a light-poll page; sweep page sizes remain 250 keyed / 100 keyless.
+
+401 (key error), 403, 429, 5xx and HTML challenge pages pause the source without retries. A 429
+pauses until at least the next UTC midnight, also respecting the guard's escalating cooldown and
+`Retry-After`. Senate's original blocked-site explanation appears only when Bargo is off. The
+optional key is stored under secret-store account `bargo` and sent **only in a sensitive X-Api-Key
+header**, never a URL. Save & Test sends one guarded `/health` request (health checks availability,
+not key validity). No application launch or real-host request is needed for tests: the supplied
+Bargo fixtures and 127.0.0.1 fakes cover ingest, pacing, budgets, pauses and attribution.
 
 ## Brokerage setup (SnapTrade)
 
@@ -556,7 +586,7 @@ crates/data     MarketData trait; per-class router (Binance/Coinbase, Treasury.g
 crates/net      machine-wide news/SEC/House fetch guard, budgets, cooldowns and source switches
 crates/edgar    watchlist SEC filings, Form 4 parsing, local store and guarded scheduler
 crates/chart    wgpu renderer, LOD pyramids, viewport math, axes, drawings, egui paint callback
-crates/congress House-only guarded refresh; House + historical Senate parsers, rosters, SQLite, alerts, performance
+crates/congress guarded House + Senate via Bargo; historical eFD parsers, rosters, SQLite, alerts, performance
 crates/broker   SnapTrade client (request signing, accounts, balances, positions, orders, activity),
                 order entry (impact preview, place, cancel, capabilities), portfolio model and P&L,
                 Keychain / owner-only credential store, simulated sample and order simulator

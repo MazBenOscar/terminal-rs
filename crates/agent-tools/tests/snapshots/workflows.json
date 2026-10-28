@@ -71,7 +71,7 @@
     "needs_confirmation": true
   },
   {
-    "description": "Compute versioned deterministic swings, trend, levels, volume profile or volatility over returned history.",
+    "description": "Compute deterministic swings, trend, levels, trendlines, volume profile or volatility. Levels/swings default to v2 (v1 remains available). V2 levels/trendlines issue turn-local analysis_id and item_id for exact create_drawing analysis_ref coordinates. Lookback defaults to 400 D1 bars, timeframe-scaled and capped at 1000.",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -93,11 +93,21 @@
             "null"
           ]
         },
+        "lookback": {
+          "description": "Analysis bars, default 400 D1 bars scaled by timeframe, capped at 1000; limited by returned history.",
+          "maximum": 1000,
+          "minimum": 20,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "mode": {
           "enum": [
             "swings",
             "trend",
             "levels",
+            "trendlines",
             "volume_profile",
             "volatility"
           ],
@@ -144,6 +154,15 @@
         "top": {
           "default": 10,
           "maximum": 100,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "version": {
+          "default": 2,
+          "maximum": 2,
           "minimum": 1,
           "type": [
             "integer",
@@ -366,13 +385,38 @@
     "needs_confirmation": true
   },
   {
-    "description": "Create a drawing for an explicit symbol. Rectangles normalize inverted anchors, snap times to loaded bars and clamp the end to the last bar; start must be loaded and both dimensions non-zero. Pass source_timeframe from analyze/read_data for zone labels. all_symbols defaults false.",
+    "description": "Create a drawing for an explicit symbol. For S/R and trends always pass analysis_ref {analysis_id,item_id} from this turn: exact anchors, kind, label, source_timeframe, extend_right and dashed style are filled by the host, ignoring model numbers. Omit anchors with a reference. Replaces only prior agent S/R for the same symbol/timeframe, undoably. Without a reference technical drawings return 'coordinates not from analysis'. Manual rectangles normalize/snap loaded times and clamp the end. Results disclose drawings_hidden and chart_visible; tell the user when drawings are not visible.",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
         "all_symbols": {
           "default": false,
           "type": "boolean"
+        },
+        "analysis_ref": {
+          "additionalProperties": false,
+          "properties": {
+            "analysis_id": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            "item_id": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          },
+          "required": [
+            "analysis_id",
+            "item_id"
+          ],
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "anchors": {
           "items": {
@@ -406,6 +450,18 @@
             "string",
             "null"
           ]
+        },
+        "dashed": {
+          "default": false,
+          "type": "boolean"
+        },
+        "extend_left": {
+          "default": false,
+          "type": "boolean"
+        },
+        "extend_right": {
+          "default": false,
+          "type": "boolean"
         },
         "kind": {
           "enum": [
@@ -460,6 +516,7 @@
           "enum": [
             "support",
             "resistance",
+            "in_play",
             null
           ],
           "type": [
@@ -470,8 +527,7 @@
       },
       "required": [
         "symbol",
-        "kind",
-        "anchors"
+        "kind"
       ],
       "type": "object"
     },

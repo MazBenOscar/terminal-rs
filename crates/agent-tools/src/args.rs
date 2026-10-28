@@ -34,6 +34,11 @@ fn optional_schema<T: OptionalArgument>(mut schema: Value) -> Value {
 }
 
 macro_rules! field_schema {
+    (NewsScope) => { json!({"type":"string","enum":["symbol","watchlist","market"],"default":"market"}) };
+    (Hours) => { json!({"type":"integer","minimum":1,"maximum":168,"default":24}) };
+    (Days) => { json!({"type":"integer","minimum":1,"maximum":90,"default":30}) };
+    (NewsLimit) => { json!({"type":"integer","minimum":1,"maximum":50,"default":20}) };
+    (Forms) => { json!({"type":"array","maxItems":20,"items":{"type":"string","minLength":1,"maxLength":20}}) };
     (String) => { json!({"type":"string", "minLength":1, "maxLength":2048, "pattern":"\\S"}) };
     (f64) => { json!({"type":"number"}) };
     (AlertLevel) => { json!({"type":"number", "minimum":0, "maximum":1e15}) };
@@ -42,8 +47,11 @@ macro_rules! field_schema {
     (bool) => { json!({"type":"boolean", "default":false}) };
     (SourceTimeframe) => { json!({"type":"string", "enum":["1m","2m","3m","5m","15m","30m","1H","2H","4H","1D","1W","1M","3M"], "description":"Analysis timeframe; falls back to the chart timeframe when omitted."}) };
     (Timeframe) => { json!({"type":"string", "enum":["1m","2m","3m","5m","15m","30m","1H","2H","4H","1D","1W","1M","3M"], "default":"1D"}) };
-    (Mode) => { json!({"type":"string", "enum":["swings","trend","levels","volume_profile","volatility"]}) };
-    (ZoneRole) => { json!({"type":"string", "enum":["support","resistance"]}) };
+    (Version) => { json!({"type":"integer", "minimum":1,"maximum":2,"default":2}) };
+    (Lookback) => { json!({"type":"integer", "minimum":20,"maximum":1000,"description":"Analysis bars, default 400 D1 bars scaled by timeframe, capped at 1000; limited by returned history."}) };
+    (AnalysisRef) => { AnalysisRef::schema() };
+    (Mode) => { json!({"type":"string", "enum":["swings","trend","levels","trendlines","volume_profile","volatility"]}) };
+    (ZoneRole) => { json!({"type":"string", "enum":["support","resistance","in_play"]}) };
     (DrawingKind) => { json!({"type":"string", "enum":["horizontal","vertical","trend_line","ray","rectangle","text"]}) };
     (CompareAction) => { json!({"type":"string", "enum":["add","remove"]}) };
     (AlertRule) => { json!({"type":"string", "enum":["above","below"]}) };
@@ -86,6 +94,7 @@ pub enum Mode {
     Swings,
     Trend,
     Levels,
+    Trendlines,
     VolumeProfile,
     Volatility,
 }
@@ -131,7 +140,8 @@ args!(ReadData { symbol: String => String } {
 });
 args!(Analyze { symbol: String => String, mode: Mode => Mode } {
     timeframe: Option<String> => Timeframe, from: Option<i64> => Timestamp,
-    to: Option<i64> => Timestamp, limit: Option<usize> => Limit, top: Option<usize> => Top
+    to: Option<i64> => Timestamp, limit: Option<usize> => Limit, top: Option<usize> => Top,
+    version: Option<usize> => Version, lookback: Option<usize> => Lookback
 });
 // A5b-MULTI: bounded, read-only batch arguments (kept separate from scanner tools).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,9 +189,13 @@ args!(SetView {} {
     chart_id: Option<String> => String, symbol: Option<String> => String,
     timeframe: Option<String> => Timeframe, from: Option<i64> => Timestamp, to: Option<i64> => Timestamp
 });
-args!(CreateDrawing { symbol: String => String, kind: DrawingKind => DrawingKind, anchors: Vec<Anchor> => Anchors } {
+args!(AnalysisRef { analysis_id: String => String, item_id: String => String } {});
+args!(CreateDrawing { symbol: String => String, kind: DrawingKind => DrawingKind } {
+    anchors: Vec<Anchor> => Anchors,
     chart_id: Option<String> => String, all_symbols: bool => bool, label: Option<String> => String,
-    zone_role: Option<ZoneRole> => ZoneRole, source_timeframe: Option<String> => SourceTimeframe
+    zone_role: Option<ZoneRole> => ZoneRole, source_timeframe: Option<String> => SourceTimeframe,
+    analysis_ref: Option<AnalysisRef> => AnalysisRef, extend_left: bool => bool, extend_right: bool => bool,
+    dashed: bool => bool
 });
 args!(UpdateDrawing { symbol: String => String, id: u64 => u64 } {
     chart_id: Option<String> => String, all_symbols: bool => bool, anchors: Option<Vec<Anchor>> => Anchors,
@@ -606,7 +620,13 @@ macro_rules! live_args {
     };
 }
 
+args!(ReadNews {} { symbol: Option<String> => String, watchlist: Option<String> => Name,
+    scope: Option<String> => NewsScope, hours: Option<u32> => Hours, limit: Option<usize> => NewsLimit,
+    query: Option<String> => String, include_summary: bool => bool });
+args!(ReadFilings { symbol: String => String } { days: Option<u32> => Days, forms: Vec<String> => Forms });
+
 live_args!(
+    ReadNews(ReadNews) => "read_news", ReadFilings(ReadFilings) => "read_filings",
     // A5b-SCAN live tools.
     ListScans(ListScans) => "list_scans", ReadScanResults(ReadScanResults) => "read_scan_results", RunScan(RunScan) => "run_scan",
     ReadChart(ReadChart) => "read_chart", IndicatorValues(IndicatorValues) => "indicator_values",

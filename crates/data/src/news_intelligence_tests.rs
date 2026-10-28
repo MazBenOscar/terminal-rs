@@ -331,8 +331,8 @@ fn shared_token_candidates_expire_instead_of_scanning_ninety_days() {
 #[test]
 fn overlapping_watches_resolve_stably_and_colours_are_clamped() {
     let watches = vec![
-        KeywordWatch { name: "Phrase".into(), words: "\"AI chip\"".into(), colour: 1 },
-        KeywordWatch { name: "Other".into(), words: "chip NVDA".into(), colour: 5 },
+        KeywordWatch { name: "Phrase".into(), words: "\"AI chip\"".into(), colour: 1, notify: false },
+        KeywordWatch { name: "Other".into(), words: "chip NVDA".into(), colour: 5, notify: false },
     ];
     let text = "AI chip and NVDA";
     let hits = watch_highlights(text, &watches);

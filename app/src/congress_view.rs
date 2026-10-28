@@ -136,7 +136,7 @@ fn trade_row(
                     out.push(Action::Track(t.politician.clone(), true));
                     ui.close();
                 }
-                if ui.button("Copy Disclosure Link").clicked() {
+                if ui.button(disclosure_link_label(t)).clicked() {
                     ui.ctx().copy_text(t.source_url.clone());
                     ui.close();
                 }
@@ -174,13 +174,36 @@ fn trade_row(
                 None => plain(ui, "-     ", muted()),
             }
         }
-        plain(ui, format!("{:<13}", t.amount.map(|a| a.to_string()).unwrap_or_else(|| "n/a".into())), text());
+        plain(
+            ui,
+            format!(
+                "{:<13}",
+                t.amount_range.clone().or_else(|| t.amount.map(|a| a.to_string())).unwrap_or_else(|| "n/a".into())
+            ),
+            text(),
+        );
         if let Some((s, c)) = extra {
             plain(ui, s, c);
         }
-        plain(ui, truncate(t.owner.as_deref().unwrap_or("Self"), 8), muted());
+        plain(ui, truncate(t.owner.as_deref().unwrap_or("Unknown"), 8), muted());
         plain(ui, truncate(&t.asset_name, 40), muted());
     });
+}
+
+fn disclosure_link_label(trade: &Trade) -> &'static str {
+    if trade.source == "Bargo" {
+        "Copy Bargo source link"
+    } else if trade.chamber == Chamber::Senate {
+        "Copy senate.gov link (blocked on this network)"
+    } else {
+        "Copy Disclosure Link"
+    }
+}
+
+pub(crate) fn bargo_credit(ui: &mut Ui, trades: &[Trade]) {
+    if trades.iter().any(|t| t.source == "Bargo") {
+        ui.hyperlink_to(tr_congress::bargo::CREDIT, tr_congress::bargo::CREDIT_URL);
+    }
 }
 
 pub fn feed(
@@ -219,6 +242,7 @@ pub fn feed(
         plain(ui, status, muted());
     });
     header(ui, "FILED    TRADED   LAG  POLITICIAN             PTY  C  TYPE TICKER AMOUNT        OWNER    ASSET");
+    bargo_credit(ui, trades);
     let rows: Vec<&Trade> = trades.iter().filter(|t| filter.matches(t)).collect();
     if rows.is_empty() {
         plain(ui, "No disclosures yet. Ingest runs in the background (REFRESH to force).", muted());
@@ -234,6 +258,7 @@ pub fn feed(
 
 pub fn ticker_trades(ui: &mut Ui, symbol: &str, trades: &[Trade], watchlists: WatchlistMenus<'_>) -> Vec<Action> {
     let mut out = Vec::new();
+    bargo_credit(ui, trades);
     let buys = trades.iter().filter(|t| t.tx_type.is_buy()).count();
     let sells = trades.iter().filter(|t| t.tx_type.is_sell()).count();
     let mut people: Vec<&str> = trades.iter().map(|t| t.politician.as_str()).collect();
@@ -295,6 +320,7 @@ pub fn profile(
         );
         return out;
     };
+    bargo_credit(ui, &p.trades);
     let pol = &p.politician;
     ui.horizontal(|ui| {
         ui.label(RichText::new(&pol.name).font(mono(15.0)).color(theme::party_color(pol.party)));
@@ -371,6 +397,9 @@ pub fn profile(
 
 pub fn politicians(ui: &mut Ui, list: &[PoliticianSummary], search: &mut String) -> Vec<Action> {
     let mut out = Vec::new();
+    if list.iter().any(|p| p.bargo_trades > 0) {
+        ui.hyperlink_to(tr_congress::bargo::CREDIT, tr_congress::bargo::CREDIT_URL);
+    }
     ui.horizontal(|ui| {
         plain(ui, "Search:", muted());
         ui.add(egui::TextEdit::singleline(search).font(mono(12.0)).desired_width(180.0));
@@ -410,6 +439,9 @@ pub fn politicians(ui: &mut Ui, list: &[PoliticianSummary], search: &mut String)
 pub fn alerts(ui: &mut Ui, alerts: &[Alert]) -> (Vec<Action>, bool) {
     let mut out = Vec::new();
     let mut mark_seen = false;
+    if alerts.iter().any(|a| a.filing_id.starts_with("bargo:")) {
+        ui.hyperlink_to(tr_congress::bargo::CREDIT, tr_congress::bargo::CREDIT_URL);
+    }
     ui.horizontal(|ui| {
         let unseen = alerts.iter().filter(|a| !a.seen).count();
         plain(ui, format!("{unseen} unread"), if unseen > 0 { amber() } else { muted() });
@@ -460,8 +492,52 @@ mod tests {
             tx_date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             filed_date: NaiveDate::from_ymd_opt(2026, 1, 20).unwrap(),
             source_url: String::new(),
+            source: String::new(),
+            amount_range: None,
         }
     }
+
+    // SENATE-BARGO: source labels and credits must distinguish legacy eFD from Bargo.
+    #[test]
+    fn disclosure_link_labels_describe_the_actual_source() {
+        let mut row = trade(Party::Unknown, Chamber::Senate, TxType::Purchase, None);
+        assert_eq!(disclosure_link_label(&row), "Copy senate.gov link (blocked on this network)");
+        row.source = "Bargo".into();
+        assert_eq!(disclosure_link_label(&row), "Copy Bargo source link");
+        row.source.clear();
+        row.chamber = Chamber::House;
+        assert_eq!(disclosure_link_label(&row), "Copy Disclosure Link");
+    }
+
+    #[test]
+    fn politician_list_credit_requires_bargo_rows_not_just_senate_history() {
+        let db = tr_congress::Db::open_in_memory().unwrap();
+        db.upsert_politician(&tr_congress::db::NewPolitician {
+            name: "John Boozman".into(),
+            chamber: Chamber::Senate,
+            party: Party::Republican,
+            state: Some("AR".into()),
+            district: None,
+            bioguide: None,
+        })
+        .unwrap();
+        let mut list = db.search_politicians("", 10).unwrap();
+        list[0].trades = 5; // eFD-only history still has trades, but zero Bargo rows.
+        for bargo_rows in [0, 1] {
+            list[0].bargo_trades = bargo_rows;
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                politicians(ui, &list, &mut String::new());
+            });
+            let credit = output.shapes.iter().any(|shape| {
+                matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text == tr_congress::bargo::CREDIT)
+            });
+            assert_eq!(credit, bargo_rows > 0);
+            output.textures_delta.clear();
+        }
+    }
+    // SENATE-BARGO END
 
     #[test]
     fn feed_filter() {
@@ -534,6 +610,53 @@ mod tests {
         frame(vec![pointer(at, egui::PointerButton::Primary, false)]);
         assert_eq!(actions, [Action::AddToNamedWatchlist { list: "Other".into(), symbol: key.into() }]);
         assert!(crate::chart_view::WATCHLIST_TARGET_BUILDS.get() > builds);
+    }
+
+    #[test]
+    fn bargo_credit_is_rendered_and_opens_only_the_https_credit() {
+        let ctx = egui::Context::default();
+        let mut trade = trade(Party::Unknown, Chamber::Senate, TxType::Purchase, Some("AAPL"));
+        trade.source = "Bargo".into();
+        let render = |events| {
+            let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                bargo_credit(ui, std::slice::from_ref(&trade))
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let output = render(vec![]);
+        let at = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == tr_congress::bargo::CREDIT => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+            .expect("visible Bargo credit");
+        render(vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let output = render(vec![egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(
+            output
+                .platform_output
+                .commands
+                .iter()
+                .any(|c| matches!(c, egui::OutputCommand::OpenUrl(url) if url.url == tr_congress::bargo::CREDIT_URL))
+        );
     }
 
     #[test]

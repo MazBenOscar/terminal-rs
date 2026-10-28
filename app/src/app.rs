@@ -11,6 +11,9 @@ mod broker;
 mod chrome;
 mod columns_view;
 pub(crate) mod data_sources;
+// SENATE-BARGO
+pub(crate) mod bargo;
+// SENATE-BARGO END
 mod demo;
 mod demo_harness;
 mod hotkeys_view;
@@ -1271,6 +1274,10 @@ impl TerminalApp {
                 doc = migrate_legacy(s, &app.prefs.panels);
             }
         }
+        // SENATE-BARGO: resolve defaults from the secret store before showing source status.
+        let source_document = std::fs::read(settings_path()).ok();
+        app.data_sources.settings.resolve_bargo(source_document.as_deref(), bargo::key().is_some());
+        // SENATE-BARGO END
         let doc = doc
             .or_else(|| {
                 let name = app.store.list().into_iter().next()?;
@@ -1332,10 +1339,18 @@ impl TerminalApp {
         self.save_sync(vec![write]);
     }
 
+    fn send_feed_config(&self) {
+        self.worker.send(Request::FeedConfig {
+            settings: self.prefs.feed_notifications.clone(),
+            watches: self.prefs.keyword_watches.clone(),
+            watched: self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect(),
+        });
+    }
     fn save_prefs(&mut self) {
         if self.agent_demo.is_some() {
             return;
         }
+        self.send_feed_config();
         if let Err(e) = self.prefs.save(&prefs_path()) {
             self.status = format!("Could not save preferences: {e}");
         }
@@ -2398,6 +2413,38 @@ impl TerminalApp {
                         }
                     }
                 }
+                Response::FeedNotices { desktop, history } => {
+                    self.price_alerts.feed_events = history;
+                    if !self.prefs.feed_notifications.enabled {
+                        continue;
+                    }
+                    if !desktop.is_empty() && self.prefs.feed_notifications.sound {
+                        crate::alert_delivery::spawn(crate::alert_delivery::sound_command(), 0);
+                    }
+                    for body in desktop {
+                        crate::alert_delivery::spawn(
+                            crate::alert_delivery::notification_command("Terminal · News", &body),
+                            0,
+                        );
+                    }
+                }
+                Response::NewsVolume(volumes) => {
+                    for pane in &mut self.panes {
+                        if let PaneKind::News(n) = &mut pane.kind {
+                            n.interaction.volumes = volumes.clone();
+                        }
+                    }
+                }
+                Response::DigestText { pane, text } => match text {
+                    Ok(text) => {
+                        if let Some(PaneKind::News(n)) =
+                            self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        {
+                            n.interaction.digest_text = Some(text);
+                        }
+                    }
+                    Err(e) => self.status = e,
+                },
                 // N1b: stale query replies cannot replace a newly selected scope.
                 Response::NewsStatus { view, status, updated } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == view.pane)
@@ -2446,6 +2493,15 @@ impl TerminalApp {
                 }
                 Response::BrokerRegistered(result) => self.on_broker_registered(result),
                 Response::DataSources(reply) => self.data_sources.receive(reply),
+                // SENATE-BARGO
+                Response::BargoSettings(reply) => self.data_sources.bargo.receive(reply),
+                Response::BargoUpdated { status, changed } => {
+                    self.data_sources.bargo.congress_status = status;
+                    if changed {
+                        self.refresh_congress_views();
+                    }
+                }
+                // SENATE-BARGO END
                 Response::Questrade(result) => {
                     self.broker.questrade_busy = false;
                     self.broker.questrade_message = Some(match result {
@@ -2519,9 +2575,29 @@ impl TerminalApp {
         if let Some(d) = newest {
             parts.push(format!("newest filing {d}"));
         }
+        // SENATE-BARGO: don't show the legacy pause explanation while the replacement is enabled.
         if !self.congress_status.is_empty() {
-            parts.push(self.congress_status.clone());
+            let status = if self.data_sources.settings.bargo {
+                self.congress_status.replace(tr_congress::refresh::SENATE_PAUSED, "")
+            } else {
+                self.congress_status.clone()
+            };
+            parts.push(status);
         }
+        if self.data_sources.settings.bargo {
+            parts.push(if self.data_sources.bargo.congress_status.is_empty() {
+                if bargo::key().is_some() {
+                    "Senate via Bargo · waiting for daily sweep".into()
+                } else {
+                    "Senate via Bargo · needs key for full history (free window: 3 months)".into()
+                }
+            } else {
+                self.data_sources.bargo.congress_status.clone()
+            });
+        } else if !parts.iter().any(|s| s.contains(tr_congress::refresh::SENATE_PAUSED)) {
+            parts.push(tr_congress::refresh::SENATE_PAUSED.into());
+        }
+        // SENATE-BARGO END
         parts.join(" · ")
     }
 
@@ -2897,11 +2973,7 @@ impl TerminalApp {
                 }
             }
         }
-        let mut symbols: Vec<_> = if views.is_empty() {
-            vec![]
-        } else {
-            self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect()
-        };
+        let mut symbols: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
         symbols.sort();
         symbols.dedup();
         // Linked visible panes are eligible even outside every watchlist, and go first.
@@ -2914,6 +2986,7 @@ impl TerminalApp {
         let next = (views, linked);
         if self.news_subscription.as_ref() != Some(&next) {
             self.worker.send(Request::NewsVisible { views: next.0.clone(), watchlist: next.1.clone() });
+            self.send_feed_config();
             self.news_subscription = Some(next);
         }
     }
@@ -3168,6 +3241,29 @@ fn external_url(url: &str) -> bool {
     (lower.starts_with("https://") || lower.starts_with("http://")) && !url.chars().any(char::is_control)
 }
 
+fn filings_active(
+    window_visible: bool,
+    pane_active: bool,
+    notifications: &tr_data::news_store::local::Notifications,
+) -> bool {
+    window_visible && (pane_active || (notifications.enabled && (notifications.filings || notifications.insiders)))
+}
+#[test]
+fn n4_filing_notifications_keep_budgeted_scheduler_active_without_a_filings_pane() {
+    let mut n = tr_data::news_store::local::Notifications::default();
+    assert!(!filings_active(true, false, &n));
+    n.filings = true;
+    assert!(filings_active(true, false, &n));
+    assert!(!filings_active(false, false, &n));
+    n.filings = false;
+    n.insiders = true;
+    assert!(filings_active(true, false, &n));
+    n.enabled = false;
+    assert!(!filings_active(true, false, &n));
+    assert!(filings_active(true, true, &n));
+    assert!(!filings_active(false, true, &n));
+}
+
 impl eframe::App for TerminalApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.agent_logic(ctx);
@@ -3176,8 +3272,9 @@ impl eframe::App for TerminalApp {
         let window_visible = self.agent_demo.is_none()
             && edgar_window_visible(frame)
             && ctx.input(|i| i.viewport().minimized != Some(true));
-        let active = window_visible
-            && self.visible_panes().iter().any(|&i| matches!(&self.panes[i].kind, PaneKind::Filings(f) if !f.paused));
+        let pane_active =
+            self.visible_panes().iter().any(|&i| matches!(&self.panes[i].kind, PaneKind::Filings(f) if !f.paused));
+        let active = filings_active(window_visible, pane_active, &self.prefs.feed_notifications);
         // N3
         let mut symbols: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
         symbols.sort();

@@ -1,6 +1,7 @@
-//! STOCK Act congressional trade disclosures, ingested directly from the
-//! official sources: the Senate eFD system and the House Clerk's PTR filings.
+//! STOCK Act congressional trades: guarded House Clerk PTRs and Senate via Bargo.
+//! Historical Senate eFD parsers remain available; senate.gov transport stays prohibited.
 
+pub mod bargo;
 pub mod db;
 pub mod house;
 pub mod model;

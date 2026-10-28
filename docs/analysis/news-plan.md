@@ -114,12 +114,44 @@ Budget examples (continuous visible polling, direct responses): the two feeds co
 - One shared economic-lot projection deduplicates joint reporting owners and lets a 4/A supersede the original issuer/owner/date/code/shares match in summary, clusters and markers. Counts are filings, not lots; clusters use any rolling 30-day span in the shown window. Stored lots retain the issuer trading symbol, security title and document-local lot ID; known class symbols restrict rows/markers to that class, otherwise CIK classes are the fallback.
 - Empty-state causes use snapshot flags, not status-text substring matches. Pane navigation uses exact unmodified keys, including repeats, and leaves unusable Escape/Enter/arrows alone. Prior-year feed timestamps use the six-character `Sep'25` grammar.
 
-### N4: polish and agent access (later)
-- Desktop notifications for watchlist filings, breaking headlines and keyword watches (fresh items only, de-duplicated by ID).
-- Headline-volume anomalies: hourly counts per category against a stored baseline (z-score), once at least a day of history exists.
-- A deterministic digest (top headlines grouped by category, with sources and tickers) as the shape for the agent's news tool.
-- Agent tools `read_news` / `read_filings` (read-only). Licence note: Finnhub's free tier is personal and non-commercial; EDGAR is public domain. Default the agent to headlines and filings metadata only, and say so in the pane's disclosure text.
-- Optional free RSS: Fed and BLS releases, press-release wires (GlobeNewswire, PR Newswire), Cointelegraph/Decrypt.
+### N4: notifications and local agent access
+- Implemented local-store-only feed evaluation for watched issuer filings, qualifying Form 4 purchases / distinct-owner clusters, per-watch opt-in keywords and optional four-source breaking clusters. All notification types default off. Settings live under Panels > Alerts; the separate News / Filings ALRT tab keeps up to 200 local events without changing the price-alert Book model.
+- Claims are persisted before delivery, independently of UI read flags. First imports and Load once rows (including later promotion) are suppressed. Per-type enabling and session watermarks require publication after both and within two hours. Restart discards pending overflow delivery but preserves history and rate reservations. Feed-wide reservations cap desktop delivery at six per ten minutes, including `+N more in News` summaries. Local quiet hours retain history without catch-up.
+- Hourly SQL counts cover topic tags and watched symbols. The worker evaluates at most once per five minutes against fourteen trailing same-hour buckets, requiring at least three covered days, count >= 5 and robust z >= 3 (median / MAD, scale floor one). Missing buckets after the first saved hour count as zero; this is storage coverage, not proof the importer ran continuously. Scoped News panes show a muted per-hour-dismissable banner; desktop volume alerts are opt-in.
+- A pure deterministic digest groups by primary topic then primary subject (retaining all tags/subjects on each story), with timestamps, source counts, tickers, filing metadata and insider totals. News > Copy digest uses the same builder as `read_news`. Economic totals deduplicate joint lots; cluster identities retain all amendment-aware owners.
+- `read_news` / `read_filings` are available in the default read-only agent set and route through application-target local worker jobs, without provider symbol discovery, chart pinning or on-demand fetches. Strict schemas cap news windows at 168 hours / 50 stories, filings at 90 days / 50 filings, and each filing at 50 saved Form 4 lines. Summaries are omitted unless explicitly requested, then limited to 300 Unicode characters; URLs expose only their host. Structured results are bounded to 16 KiB and preserved through session projection and expanded trace rendering. Descriptions/results disclose `headlines and filing metadata from local storage`; the pane also explains Finnhub personal/non-commercial use and SEC public-domain provenance.
+- Delivery uses the existing `tr_alerts` notification command path. It has no click callback, so selecting the exact local row and guaranteed application activation remain unsupported. Feed monitoring requires the app worker; alertd is unchanged and does not fetch feeds. Native notification activation and daemon feed evaluation are deferred rather than adding platform services or daemon source interests in this phase.
+- Optional RSS (Fed/BLS, press-release wires and additional crypto feeds) is explicitly out of scope: N4 adds no sources, request construction, dependencies or guard policies. No live/real-host app check is performed for this phase; fixtures and loopback tests only.
+
+### SENATE-BARGO (2026-10-27)
+
+- Senate now uses the optional-free-key Bargo Congress API (`www.bargo.ai`), never senate.gov;
+  the permanent direct/redirect Senate host prohibition remains. Existing eFD history is retained.
+  The bounded 60-day transaction-date sweep is an explicit Senate-only exception to the watchlist
+  rule above, necessary for disclosures up to ~45 days late. Machine-wide slots: `bargo:sweep`
+  (24 h), `bargo:poll` (3 h; first 10-day page only, visible window). A first store runs only a sweep.
+- Guard: ≥30 s, ≤2/minute, concurrency 1, ≤40 HTTP attempts/day keyed or 10 keyless, including
+  Settings health tests and failed sends. Durable row reservations cap returned trade rows at
+  1,000/day keyed or 100/day keyless even without headers. Last reported request/row balances
+  and UTC timestamps are persisted; requests below 5 or rows below 200 keyed / 20 keyless stop
+  the run. Full sweep pages require enough remaining allowance; light pages may shrink.
+- 401 key-error / 403 / 429 / 5xx / HTML challenge => persisted pause, no retry loop. 429 lasts
+  until at least next UTC midnight. Overridden data dirs stay offline without exact opt-in.
+- Secret account `bargo`, masked Save & Test (`/health`, availability rather than key validation),
+  sensitive X-Api-Key header only. Free API covers three months, not unlimited key-enabled history.
+  `/members` has no party and repeats trade state, so it is not fetched. Owner remains unknown.
+- Stable SHA-1 row identities, normalized-name+state politician matching against DB roster history,
+  eFD economic-match dedupe with durable seen markers; existing eFD rows win. Only first-seen
+  disclosures within two days can alert, never the initial sweep. No filing_portal data is retained.
+- Visible linked credit in Settings, Congress panes and charts: “Senate data: Bargo (bargo.ai)”.
+  Bargo's terms prohibit raw-record redistribution. Tests use real fixtures and localhost only.
+- Verification: `cargo fmt --all` and locked offline workspace Clippy with `-D warnings` pass.
+  Locked offline workspace tests (Congress refresh forced to zero through Cargo environment config)
+  pass with **1,890 passed, 8 ignored**. Added 20 Bargo regressions (11 Congress, 6 guard, 3 app),
+  including rendered credit/browser URL and settings row, header-only secret handling, quota/cap
+  persistence, first-sweep/poll claims across instances, eFD dedupe, refusal pauses, zero-socket
+  offline mode and preservation of fresh alerts before a later-page refusal. No live-host launch,
+  network opt-in, release build or git-state change was performed.
 
 ## Order and parallelism
 

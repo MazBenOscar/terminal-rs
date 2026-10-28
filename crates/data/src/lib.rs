@@ -575,6 +575,45 @@ pub fn security(symbol: &str) -> Security {
     Security::parse(symbol).unwrap_or_else(|| Security::equity(symbol))
 }
 
+/// Compare market keys without conflating crypto quotes, explicit venues or market kinds.
+/// An unqualified crypto pair may match its venue-qualified spelling. Equities
+/// retain the exact resolved-key comparison used by `security`.
+pub fn same_instrument(a: &str, b: &str) -> bool {
+    let (a, b) = (security(a), security(b));
+    if a.key() == b.key() {
+        return true;
+    }
+    let (Ok(ai), Ok(bi)) = (a.crypto_instrument(), b.crypto_instrument()) else {
+        return false;
+    };
+    ai.base == bi.base
+        && ai.quote == bi.quote
+        && ai.kind == bi.kind
+        && (!a.ticker.contains(':') || !b.ticker.contains(':') || ai.venue == bi.venue)
+}
+
+#[cfg(test)]
+#[test]
+fn same_instrument_table() {
+    for (a, b, expected) in [
+        ("BTCUSD Curncy", "COINBASE:BTC-USD", true),
+        ("coinbase:btc-usd Curncy", "COINBASE:BTC-USD", true),
+        ("BTCUSD", "BINANCE:BTCUSD", true),
+        ("BTCUSDT", "BINANCE:BTCUSDT", true),
+        ("BTCUSD", "BINANCE:BTCUSDT", false),
+        ("COINBASE:BTC-USDT", "BINANCE:BTCUSDT", false),
+        ("COINBASE:BTC-USD", "BINANCE:BTCUSD", false),
+        ("BINANCE:BTCUSDT.P", "BINANCE:BTCUSDT", false),
+        ("BTCUSD", "COINBASE:ETH-USD", false),
+        ("AAPL", "AAPL US Equity", true),
+        ("BRK.A US Equity", "BRK.B US Equity", false),
+        ("AAPL", "MSFT", false),
+    ] {
+        assert_eq!(same_instrument(a, b), expected, "{a} vs {b}");
+        assert_eq!(same_instrument(b, a), expected, "{b} vs {a}");
+    }
+}
+
 /// Build the provider described in the crate docs from environment variables.
 pub fn from_env() -> Provider {
     from_env_with(None)

@@ -732,6 +732,18 @@ impl Cluster {
         self.members.iter().any(|s| !s.seen)
     }
 }
+/// Match saved delivery identity with the same time, headline and subject rules
+/// as clustering, even when an old member is outside the bounded pane snapshot.
+pub fn same_cluster(a: &Story, b: &Story) -> bool {
+    if a.item.ts.abs_diff(b.item.ts) > 86400 {
+        return false;
+    }
+    let aa = a.known_tickers();
+    let bb = b.known_tickers();
+    (aa.is_empty() || bb.is_empty() || aa.iter().any(|s| bb.contains(s)))
+        && similar(&headline_tokens(&a.item.title), &headline_tokens(&b.item.title), a.category == b.category)
+}
+
 /// Index only cluster representatives, not all historical item pairs. A candidate
 /// must share a token and fit the entire cluster's 24-hour span. Input order never
 /// affects leads or IDs; ties are broken by item ID.
@@ -984,6 +996,8 @@ pub struct KeywordWatch {
     pub words: String,
     #[serde(deserialize_with = "colour_index")]
     pub colour: u8,
+    /// Desktop delivery is opt-in independently of highlighting.
+    pub notify: bool,
 }
 fn colour_index<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
     Ok(u8::deserialize(d)?.min(5))
@@ -1020,6 +1034,11 @@ pub fn watch_highlights(text: &str, watches: &[KeywordWatch]) -> Vec<WatchHit> {
         }
     }
     hits
+}
+/// Keyword watches intentionally cover the headline only, in both pane and
+/// notification matching. Summaries are displayed as unhighlighted prose.
+pub fn watch_matches(story: &Story, query: &str) -> bool {
+    !watch_ranges(&story.item.title, query).is_empty()
 }
 /// Byte ranges preserve the original headline for layout, including Unicode.
 pub fn watch_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {

@@ -165,7 +165,12 @@ pub fn geometry(g: &Geometry<'_>) -> Vec<LabeledShape> {
                 std::mem::swap(&mut a, &mut b);
             }
             clip_line(a, b, g.bounds, d.tool == Tool::Trendline && d.extend_left, d.tool == Tool::Ray || d.extend_right)
-                .map(|(a, b)| vec![(Shape::Segment(a, b), None)])
+                .map(|(a, b)| {
+                    vec![(
+                        if d.dashed { Shape::DashedSegment(a, b) } else { Shape::Segment(a, b) },
+                        (!d.text.is_empty()).then(|| d.text.clone()),
+                    )]
+                })
                 .unwrap_or_default()
         }
         Tool::ExtendedLine => {
@@ -245,6 +250,30 @@ mod tests {
         assert_eq!(clip_line([100.0001, 50.], [100.0001, 50.], r, true, true), None);
         // Degenerate axis-aligned ray starting exactly on the right edge.
         assert_eq!(clip_line([100., 50.], [101., 50.], r, false, true), Some(([100., 50.], [100., 50.])));
+    }
+
+    #[test]
+    fn precision_ray_uses_dashed_geometry_and_keeps_label() {
+        use crate::drawings::{Anchor, Drawing};
+        let mut drawing = Drawing::new(Tool::Ray, Anchor { ts: 0, price: 0. }, Anchor { ts: 10, price: 10. });
+        drawing.dashed = true;
+        drawing.text = "D1 rising support".into();
+        let g = Geometry {
+            drawing: &drawing,
+            points: [[10., 10.], [20., 20.], [0., 0.]],
+            pattern_points: vec![],
+            bounds: [0., 0., 100., 100.],
+            price_y: &|p| p,
+            measure_label: String::new(),
+            text_size: [0., 0.],
+            closes: &[],
+            project: &|a| [a.ts as f64, a.price],
+        };
+        let result = geometry(&g);
+        assert!(matches!(result[0].0, Shape::DashedSegment(..)));
+        assert_eq!(result[0].1.as_deref(), Some("D1 rising support"));
+        let saved = serde_json::to_string(&drawing).unwrap();
+        assert_eq!(serde_json::from_str::<Drawing>(&saved).unwrap(), drawing);
     }
 
     #[test]

@@ -37,7 +37,8 @@ impl Form {
         }
     }
     pub fn matches(self, form: &str) -> bool {
-        let f = form.strip_suffix("/A").unwrap_or(form);
+        let family = tr_edgar::form_family(form);
+        let f = family.as_str();
         match self {
             Self::All => true,
             Self::Current => f == "8-K",
@@ -322,7 +323,7 @@ fn summarize(rows: &[Filing], symbol: &str, now: i64, days: u16, include: impl F
             "P" => {
                 buys.insert(&f.accession);
                 s.bought += amount;
-                purchases.push((date, tr_edgar::insider::owner_id(&t.owner)));
+                // Buyer identities are gathered separately below, before joint-lot deduplication.
             }
             "S" => {
                 sells.insert(&f.accession);
@@ -333,21 +334,38 @@ fn summarize(rows: &[Filing], symbol: &str, now: i64, days: u16, include: impl F
     }
     s.buys = buys.len();
     s.sells = sells.len();
-    purchases.sort();
-    // Any rolling 30-day span within the shown window, not just the latest 30 days.
-    let mut left = 0;
-    let mut owners = std::collections::BTreeMap::<&str, usize>::new();
-    for (right, (date, owner)) in purchases.iter().enumerate() {
-        *owners.entry(owner).or_default() += 1;
-        while purchases[left].0 < date - 30 * 86400 {
-            let count = owners.get_mut(purchases[left].1.as_str()).unwrap();
-            *count -= 1;
-            if *count == 0 {
-                owners.remove(purchases[left].1.as_str());
-            }
-            left += 1;
+    for (f, t) in tr_edgar::insider::effective_transactions(rows, symbol) {
+        if !include(f)
+            || t.code != "P"
+            || t.derivative
+            || t.acquired == Some(false)
+            || !t.shares.is_some_and(|v| v.is_finite() && v > 0.)
+            || !t.price.is_none_or(|v| v.is_finite() && v > 0.)
+        {
+            continue;
         }
-        if right > left && owners.len() >= 2 {
+        let Some(date) = chrono::NaiveDate::parse_from_str(&t.date, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|d| d.and_utc().timestamp())
+        else {
+            continue;
+        };
+        if (now - i64::from(days) * 86400..=now).contains(&date) {
+            purchases.push((date, f.cik, f.accession.as_str(), tr_edgar::insider::owner_id(&t.owner)));
+        }
+    }
+    purchases.sort();
+    // Any rolling 30-day span within the shown window, with the same shared
+    // distinct-accession/beneficial-owner rule as worker alerts.
+    let endings: BTreeSet<_> = purchases.iter().map(|(date, cik, _, _)| (*date, *cik)).collect();
+    for (date, cik) in &endings {
+        if tr_edgar::distinct_buyers(
+            purchases
+                .iter()
+                .filter(|(d, c, _, _)| c == cik && *d <= *date && *d >= date - 30 * 86400)
+                .map(|(_, _, accession, owner)| (*accession, owner.clone())),
+        ) {
             s.cluster = true;
             break;
         }
@@ -1581,6 +1599,7 @@ mod tests {
             chrono::NaiveDate::from_ymd_opt(2026, 10, 27).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
         let mut sale = insider_fixture();
         sale.insiders[0].code = "P".into();
+        sale.insiders[0].acquired = Some(true);
         let mut second = sale.clone();
         second.accession = "another".into();
         second.insiders[0].owner.name = "Other Owner".into();
@@ -1714,6 +1733,9 @@ mod tests {
             (Form::Reports, "10-Q/A"),
             (Form::Insider, "4"),
             (Form::Ownership, "SC 13G/A"),
+            (Form::Ownership, "SCHEDULE 13G"),
+            (Form::Ownership, "SCHEDULE 13D/A"),
+            (Form::Ownership, "schedule 13g/a"),
             (Form::Offerings, "424B5"),
             (Form::Proxy, "DEF 14A"),
         ] {
@@ -1883,6 +1905,7 @@ mod tests {
     fn summary_counts_filings_not_lots_and_finds_older_rolling_clusters() {
         let mut first = insider_fixture();
         first.insiders[0].code = "P".into();
+        first.insiders[0].acquired = Some(true);
         first.insiders[0].date = "2026-08-10".into();
         let mut lot = first.insiders[0].clone();
         lot.lot_id = Some(1);
