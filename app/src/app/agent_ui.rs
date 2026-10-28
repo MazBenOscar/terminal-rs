@@ -113,8 +113,12 @@ impl TerminalApp {
                 self.agent_config.allow_external_edits,
             ) {
                 Ok(server) => self.external_agent = Some(server),
-                Err(_) => {
-                    self.agent_pane.notice("External agent: could not open the private MCP socket. Check directory ownership or another live listener; toggle MCP to retry.");
+                Err(error) => {
+                    if let Some(error) = error.downcast_ref::<tr_agent::mcp::SocketPathTooLong>() {
+                        self.agent_pane.notice(&error.to_string());
+                    } else {
+                        self.agent_pane.notice("External agent: could not open the private MCP socket. Check directory ownership or another live listener; toggle MCP to retry.");
+                    }
                 }
             }
         }

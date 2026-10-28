@@ -60,6 +60,25 @@ fn external_notices_coalesce_per_connection_across_scope_rotation() {
 }
 
 #[test]
+fn long_data_folder_has_actionable_external_agent_notice() {
+    let temp = Temp::new();
+    let data = temp.0.join("x".repeat(tr_agent::mcp::MAX_SOCKET_PATH_BYTES));
+    let expected = tr_agent::mcp::validate_socket_path(&socket_path(&data)).unwrap_err().to_string();
+    let mut app = TerminalApp::test_workspace(&temp.0);
+    app.settings_file = data.join("settings.json");
+    app.agent_config.allow_external = true;
+    app.external_agent_logic();
+    assert!(app.external_agent.is_none());
+    assert!(
+        app.agent_pane
+            .blocks
+            .iter()
+            .any(|block| { matches!(block, crate::agent_pane::RenderedBlock::Notice(text) if text == &expected) })
+    );
+    assert!(!data.exists());
+}
+
+#[test]
 fn disabled_app_startup_removes_only_stale_socket() {
     let temp = Temp::new();
     std::fs::create_dir(temp.0.join("agent")).unwrap();

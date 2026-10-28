@@ -76,8 +76,12 @@ fn main() -> eframe::Result {
                     ))
                 },
             );
-        if result.is_err() {
-            eprintln!("terminal-rs MCP stdio stopped: protocol I/O failed");
+        if let Err(error) = &result {
+            if let Some(error) = error.downcast_ref::<tr_agent::mcp::SocketPathTooLong>() {
+                eprintln!("{error}");
+            } else {
+                eprintln!("terminal-rs MCP stdio stopped: protocol I/O failed");
+            }
         }
         return result.map_err(|_| demo_error("MCP stdio I/O failed".into()));
     }

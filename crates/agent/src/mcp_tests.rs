@@ -78,6 +78,61 @@ async fn round_trip<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 }
 
 #[test]
+fn socket_path_limit_counts_bytes_and_reserves_the_trailing_nul() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = Temp::new();
+    let prefix_bytes = temp.0.as_os_str().as_bytes().len() + 1;
+    let boundary = temp.0.join("x".repeat(MAX_SOCKET_PATH_BYTES - prefix_bytes));
+    assert!(validate_socket_path(&boundary).is_ok());
+    let too_long = boundary.with_file_name(format!("{}x", boundary.file_name().unwrap().to_str().unwrap()));
+    let error = validate_socket_path(&too_long).unwrap_err();
+    assert_eq!(error.bytes, MAX_SOCKET_PATH_BYTES + 1);
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "External agent: data folder path is too long for a Unix socket ({} bytes, max {MAX_SOCKET_PATH_BYTES}). Use a shorter TR_DATA_DIR.",
+            MAX_SOCKET_PATH_BYTES + 1
+        )
+    );
+    let unicode = temp.0.join("é".repeat(MAX_SOCKET_PATH_BYTES - prefix_bytes));
+    assert_eq!(validate_socket_path(&unicode).unwrap_err().bytes, unicode.as_os_str().as_bytes().len());
+}
+
+#[tokio::test]
+async fn long_socket_path_is_rejected_before_bind_or_stdio_io() {
+    let temp = Temp::new();
+    let data = temp.0.join("x".repeat(MAX_SOCKET_PATH_BYTES));
+    let path = socket_path(&data);
+    let expected = validate_socket_path(&path).unwrap_err().to_string();
+    let error = AppSocket::bind(&data, factory()).err().expect("long bind must fail");
+    assert_eq!(error.downcast_ref::<SocketPathTooLong>().unwrap().to_string(), expected);
+    assert!(!data.exists(), "validation must precede filesystem changes");
+    let error = serve_stdio(tokio::io::empty(), tokio::io::sink(), path).await.unwrap_err();
+    assert_eq!(error.downcast_ref::<SocketPathTooLong>().unwrap().to_string(), expected);
+}
+
+#[tokio::test]
+async fn external_schemas_omit_consent_only_tools_but_calls_still_refuse() {
+    for set in [ToolSet::ReadOnly, ToolSet::Edit, ToolSet::Workflows] {
+        let registry = Registry::new(set);
+        let external = schemas(&registry);
+        let tools = external["tools"].as_array().unwrap();
+        assert!(tools.iter().all(|tool| tool["name"] != "screenshot"));
+        for spec in registry.schemas() {
+            assert_eq!(tools.iter().any(|tool| tool["name"] == spec.name), !spec.requires_host_consent());
+        }
+        if set == ToolSet::Workflows {
+            assert!(tools.iter().any(|tool| tool["name"] == "create_watchlist"));
+        }
+        let mut budget = CallBudget::new(1);
+        let mut ctx = CallContext::new(&Host, &Host, &mut budget);
+        let refused = tool_result(registry.call("screenshot", "{}", &mut ctx).await);
+        assert_eq!(refused["isError"], true);
+        assert!(refused.to_string().contains("confirmation_required"));
+    }
+}
+
+#[test]
 fn relative_data_dir_is_created_and_canonicalized() {
     let temp = Temp::new();
     let mut base = std::env::current_dir().unwrap();
@@ -174,9 +229,10 @@ async fn full_stdio_socket_registry_round_trip_read_and_write_refused() {
     assert!(tools.iter().any(|t| t["name"] == "read_chart"));
     assert!(tools.iter().all(|t| t["annotations"]["readOnlyHint"] == true));
     let registry = Registry::new(ToolSet::ReadOnly);
-    for spec in registry.schemas() {
+    for spec in registry.schemas().iter().filter(|spec| !spec.requires_host_consent()) {
         assert_eq!(tools.iter().find(|t| t["name"] == spec.name).unwrap()["inputSchema"], spec.input_schema);
     }
+    assert!(tools.iter().all(|t| t["name"] != "screenshot"));
     let read_tool =
         round_trip(&mut write, &mut read, 3, "tools/call", json!({"name":"read_chart","arguments":{}})).await;
     assert_eq!(read_tool["result"]["isError"], false);

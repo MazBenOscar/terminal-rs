@@ -191,6 +191,65 @@ async fn terminal_rs_permission_allows_once_never_always() {
 }
 
 #[tokio::test]
+async fn unsafe_kinds_cannot_be_disguised_as_terminal_rs_permissions_or_tools() {
+    for kind in ["execute", "edit", "delete", "move", "fetch", "search", "unknown"] {
+        for permission in [true, false] {
+            let (backend, mut read, mut write, killed) = fake();
+            let mut events = backend.events();
+            let mut call = json!({"toolCallId":"spoofed","title":"terminal-rs/read_chart","kind":kind,
+                "rawInput":{"serverName":"terminal-rs","name":"read_chart"}});
+            let frame = if permission {
+                json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{
+                    "toolCall":call,"options":[{"kind":"allow_once","optionId":"yes"},{"kind":"reject_once","optionId":"no"}]
+                }})
+            } else {
+                call["sessionUpdate"] = json!("tool_call");
+                json!({"jsonrpc":"2.0","method":"session/update","params":{"update":call}})
+            };
+            send(&mut write, frame).await;
+            if permission {
+                assert_eq!(receive(&mut read).await["result"]["outcome"]["optionId"], "no", "{kind}");
+            }
+            assert_eq!(receive(&mut read).await["method"], "session/cancel");
+            assert!(matches!(events.recv().await, Some(AgentEvent::Error(_))));
+            assert!(backend.is_unsafe() && killed.load(Ordering::SeqCst), "{kind}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn safe_kinds_with_agreeing_structured_identity_allow_once_and_complete() {
+    for kind in [Some("other"), Some("read"), None] {
+        for title in ["terminal-rs/read_chart", "read_chart"] {
+            let (backend, mut read, mut write, killed) = fake();
+            let mut events = backend.events();
+            let mut call = json!({"toolCallId":"safe","title":title,
+                "_meta":{"mcp":{"serverName":"terminal-rs","toolName":"read_chart"}},
+                "rawInput":{"serverName":"terminal-rs","name":"read_chart"}});
+            if let Some(kind) = kind {
+                call["kind"] = json!(kind);
+            }
+            send(&mut write, json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{
+                "toolCall":call,"options":[{"kind":"allow_always","optionId":"forever"},{"kind":"allow_once","optionId":"once"},{"kind":"reject_once","optionId":"no"}]
+            }})).await;
+            assert_eq!(receive(&mut read).await["result"]["outcome"]["optionId"], "once");
+            call["sessionUpdate"] = json!("tool_call");
+            send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"update":call}})).await;
+            send(
+                &mut write,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{"update":{
+                    "sessionUpdate":"tool_call_update","toolCallId":"safe","status":"completed"}
+                }}),
+            )
+            .await;
+            assert!(matches!(events.recv().await, Some(AgentEvent::ToolStarted(_))));
+            assert!(matches!(events.recv().await, Some(AgentEvent::ToolFinished(_))));
+            assert!(!backend.is_unsafe() && !killed.load(Ordering::SeqCst));
+        }
+    }
+}
+
+#[tokio::test]
 async fn filesystem_and_terminal_requests_are_refused_and_trip() {
     for method in ["fs/read_text_file", "fs/write_text_file", "terminal/create", "terminal/output", "terminal/release"]
     {
@@ -297,10 +356,10 @@ fn tool_provenance_is_exact_and_sandbox_has_no_tcp_listener_or_foreign_exec() {
         busy: Arc::new(AtomicBool::new(false)),
     };
     for title in ["terminal-rs/read_chart", "mcp__terminal-rs__read_chart"] {
-        assert!(rpc.terminal_tool(&json!({"title":title})));
+        assert!(rpc.terminal_tool(&json!({"title":title}), None).is_some());
     }
     for title in ["bash terminal-rs/read_chart", "terminal-rs/bash", "terminal-rs/read_chart; bash", "read_chart"] {
-        assert!(!rpc.terminal_tool(&json!({"title":title})));
+        assert!(rpc.terminal_tool(&json!({"title":title}), None).is_none());
     }
     let profile = sandbox_profile(
         Path::new("/private/data/agent/mimo"),
@@ -345,16 +404,30 @@ async fn contradictory_tool_provenance_is_rejected_even_with_a_valid_title() {
         json!({"title":"terminal-rs/read_chart","rawInput":{"serverName":"foreign","name":"read_chart"}}),
         json!({"title":"mcp__terminal-rs__read_chart","rawInput":{"serverName":"terminal-rs","name":"bash"}}),
         json!({"title":"mcp__foreign__bash","rawInput":{"serverName":"terminal-rs","name":"read_chart"}}),
+        json!({"title":"terminal-rs/read_chart","kind":"other","rawInput":{"serverName":"terminal-rs","name":"read_data"}}),
+        json!({"title":"read_data","rawInput":{"serverName":"terminal-rs","name":"read_chart"}}),
+        json!({"title":"terminal-rs/read_chart","_meta":{"serverName":"foreign","toolName":"read_chart"}}),
+        json!({"title":"terminal-rs/read_chart","_meta":{"serverName":"terminal-rs","toolName":"read_data"}}),
+        json!({"title":"terminal-rs/read_chart","_meta":{"mcp":{"server":"terminal-rs","tool":"read_data"}},"rawInput":{"serverName":"terminal-rs","name":"read_chart"}}),
     ] {
-        let (backend, mut read, mut write, killed) = fake();
-        let mut events = backend.events();
-        send(&mut write, json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{
-            "toolCall":call,"options":[{"kind":"allow_once","optionId":"yes"},{"kind":"reject_once","optionId":"no"}]
-        }})).await;
-        assert_eq!(receive(&mut read).await["result"]["outcome"]["optionId"], "no");
-        assert_eq!(receive(&mut read).await["method"], "session/cancel");
-        assert!(matches!(events.recv().await, Some(AgentEvent::Error(_))));
-        assert!(backend.is_unsafe() && killed.load(Ordering::SeqCst));
+        for permission in [true, false] {
+            let (backend, mut read, mut write, killed) = fake();
+            let mut events = backend.events();
+            if permission {
+                send(&mut write, json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{
+                    "toolCall":call,"options":[{"kind":"allow_once","optionId":"yes"},{"kind":"reject_once","optionId":"no"}]
+                }})).await;
+                assert_eq!(receive(&mut read).await["result"]["outcome"]["optionId"], "no");
+            } else {
+                let mut update = call.clone();
+                update["sessionUpdate"] = json!("tool_call");
+                update["toolCallId"] = json!("spoofed");
+                send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"update":update}})).await;
+            }
+            assert_eq!(receive(&mut read).await["method"], "session/cancel");
+            assert!(matches!(events.recv().await, Some(AgentEvent::Error(_))));
+            assert!(backend.is_unsafe() && killed.load(Ordering::SeqCst));
+        }
     }
 }
 
@@ -401,6 +474,30 @@ async fn cleanup_waits_for_supervisor_and_propagates_findings() {
     let _ = finished.send_replace(Some(Err("mimo cleanup findings: descendant survived".into())));
     let error = backend.wait_cleanup().await.unwrap_err();
     assert!(error.to_string().contains("descendant survived"));
+}
+
+#[tokio::test]
+async fn approved_tool_updates_cannot_change_kind_or_structured_identity() {
+    for fields in [
+        json!({"kind":"execute"}),
+        json!({"kind":"fetch"}),
+        json!({"rawInput":{"name":"read_data"}}),
+        json!({"_meta":{"toolName":"read_data"}}),
+        json!({"title":"terminal-rs/read_data"}),
+    ] {
+        let (backend, mut read, mut write, killed) = fake();
+        let mut events = backend.events();
+        let call =
+            json!({"sessionUpdate":"tool_call","toolCallId":"known","title":"terminal-rs/read_chart","kind":"other"});
+        send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"update":call}})).await;
+        assert!(matches!(events.recv().await, Some(AgentEvent::ToolStarted(_))));
+        let mut update = json!({"sessionUpdate":"tool_call_update","toolCallId":"known","status":"completed"});
+        update.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"update":update}})).await;
+        assert_eq!(receive(&mut read).await["method"], "session/cancel");
+        assert!(matches!(events.recv().await, Some(AgentEvent::Error(_))));
+        assert!(backend.is_unsafe() && killed.load(Ordering::SeqCst));
+    }
 }
 
 #[tokio::test]

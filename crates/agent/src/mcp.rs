@@ -30,6 +30,37 @@ pub fn socket_path(data: &Path) -> PathBuf {
     data.join("agent/mcp.sock")
 }
 
+/// sun_path includes a trailing NUL: 104 bytes on macOS, 108 on Linux.
+#[cfg(target_os = "macos")]
+pub const MAX_SOCKET_PATH_BYTES: usize = 103;
+#[cfg(not(target_os = "macos"))]
+pub const MAX_SOCKET_PATH_BYTES: usize = 107;
+
+#[derive(Debug)]
+pub struct SocketPathTooLong {
+    pub bytes: usize,
+}
+impl std::fmt::Display for SocketPathTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "External agent: data folder path is too long for a Unix socket ({} bytes, max {MAX_SOCKET_PATH_BYTES}). Use a shorter TR_DATA_DIR.",
+            self.bytes
+        )
+    }
+}
+impl std::error::Error for SocketPathTooLong {}
+
+/// Check encoded bytes, not characters, before any bind/connect or relocation.
+pub fn validate_socket_path(path: &Path) -> std::result::Result<(), SocketPathTooLong> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes().len();
+    if bytes > MAX_SOCKET_PATH_BYTES {
+        return Err(SocketPathTooLong { bytes });
+    }
+    Ok(())
+}
+
 pub fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
 }
@@ -57,7 +88,7 @@ pub fn tool_result(result: tr_agent_tools::ToolResult) -> Value {
     json!({"content":content,"isError":failed})
 }
 pub fn schemas(registry: &tr_agent_tools::Registry) -> Value {
-    json!({"tools":registry.schemas().iter().map(|spec| json!({
+    json!({"tools":registry.schemas().iter().filter(|spec| !spec.requires_host_consent()).map(|spec| json!({
         "name":spec.name,"description":spec.description,"inputSchema":spec.input_schema,
         "annotations":{"readOnlyHint":!spec.mutating,"destructiveHint":spec.mutating}
     })).collect::<Vec<_>>()})
@@ -223,6 +254,7 @@ pub async fn serve_stdio<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut write: W,
     path: PathBuf,
 ) -> Result<()> {
+    validate_socket_path(&path)?;
     let mut read = BufReader::new(read);
     let mut proxy = Proxy { path, stream: None, next: 0 };
     let mut initialized = false;
@@ -368,6 +400,8 @@ pub struct AppSocket {
 impl AppSocket {
     pub fn bind(data: &Path, factory: Arc<dyn Fn() -> ToolHandler + Send + Sync>) -> Result<Self> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let path = socket_path(data);
+        validate_socket_path(&path)?;
         let directory = data.join("agent");
         match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
             Ok(()) => {}
@@ -379,7 +413,6 @@ impl AppSocket {
             bail!("Agent directory must be owned and not a symlink");
         }
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-        let path = socket_path(data);
         cleanup_stale_socket(data)?;
         let listener = std::os::unix::net::UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;

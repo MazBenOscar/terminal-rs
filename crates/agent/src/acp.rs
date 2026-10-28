@@ -46,7 +46,7 @@ struct Rpc {
     turn: Mutex<String>,
     text: Mutex<StreamScrubber>,
     thought: Mutex<StreamScrubber>,
-    tool_ids: Mutex<HashSet<String>>,
+    tool_ids: Mutex<HashMap<String, String>>,
     busy: Arc<AtomicBool>,
 }
 impl Rpc {
@@ -97,25 +97,60 @@ impl Rpc {
         let session = self.session.lock().unwrap().clone();
         let _ = self.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}}));
     }
-    /// Only registry names qualified by our server identity are permitted. An
-    /// arbitrary title containing "terminal-rs" is not evidence of provenance.
-    fn terminal_tool(&self, call: &Value) -> bool {
-        let raw = &call["rawInput"];
-        if raw.get("serverName").is_some_and(|server| server != "terminal-rs") {
-            return false;
+    /// Defence in depth, not an authorization boundary: agent-supplied titles
+    /// and metadata can be model-influenced. The socket policy and OS sandbox
+    /// enforce real authorization. Never let an MCP-looking title disguise an
+    /// executing/editing/fetching ACP tool, even on a previously approved ID.
+    fn terminal_tool(&self, call: &Value, expected: Option<&str>) -> Option<String> {
+        if call.get("kind").is_some_and(|kind| !matches!(kind.as_str(), Some("other" | "read"))) {
+            return None;
         }
-        let title = call["title"].as_str().unwrap_or_default();
-        let qualified =
-            ["mcp__terminal-rs__", "terminal-rs/", "terminal-rs."].iter().find_map(|prefix| title.strip_prefix(prefix));
-        if let Some(name) = qualified {
-            return self.tools.contains(name) && raw.get("name").is_none_or(|raw_name| raw_name == name);
+        let qualified_name = |title: &str| {
+            ["mcp__terminal-rs__", "terminal-rs/", "terminal-rs."]
+                .iter()
+                .find_map(|prefix| title.strip_prefix(prefix).map(str::to_owned))
+        };
+        let (name, qualified) = if let Some(title) = call.get("title") {
+            let title = title.as_str()?;
+            match qualified_name(title) {
+                Some(name) => (name, true),
+                None => (title.to_owned(), false),
+            }
+        } else {
+            // Partial updates may omit their title, but never their approved ID.
+            (expected?.to_owned(), false)
+        };
+        if !self.tools.contains(&name) || expected.is_some_and(|expected| expected != name) {
+            return None;
         }
-        // Structured provenance may accompany a human-readable title, but must
-        // never override an explicitly foreign qualified title/server identity.
-        !title.contains(['/', '.'])
-            && !title.starts_with("mcp__")
-            && raw["serverName"] == "terminal-rs"
-            && raw["name"].as_str().is_some_and(|name| self.tools.contains(name))
+        // Prefer structured identities when supplied, but require *every* known
+        // identity field to agree with the title and previously approved name.
+        // An unqualified title must be the exact tool name with both server and
+        // tool supplied structurally; arbitrary human-readable titles fail closed.
+        let mut server_seen = false;
+        let mut tool_seen = false;
+        for source in [&call["_meta"], &call["rawInput"]] {
+            for fields in [source, &source["mcp"]] {
+                for key in ["serverName", "server_name", "server"] {
+                    if let Some(server) = fields.get(key) {
+                        server_seen = true;
+                        if server != "terminal-rs" {
+                            return None;
+                        }
+                    }
+                }
+                for key in ["name", "toolName", "tool_name", "tool"] {
+                    if let Some(tool) = fields.get(key) {
+                        tool_seen = true;
+                        let tool = tool.as_str()?;
+                        if qualified_name(tool).as_deref().unwrap_or(tool) != name {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        (qualified || expected.is_some() || (server_seen && tool_seen)).then_some(name)
     }
     async fn violation(&self, reason: &str) {
         self.unsafe_backend.store(true, Ordering::SeqCst);
@@ -186,19 +221,20 @@ impl Rpc {
             return Ok(());
         }
         if method == "session/request_permission" {
-            let allowed = self.terminal_tool(&params["toolCall"]);
+            let tool = self.terminal_tool(&params["toolCall"], None);
+            let allowed = tool.is_some();
             let kind = if allowed { "allow_once" } else { "reject_once" };
             let option = params["options"].as_array().and_then(|options| options.iter().find(|o| o["kind"] == kind));
             let outcome = option.map_or_else(
                 || json!({"outcome":"cancelled"}),
                 |option| json!({"outcome":"selected","optionId":option["optionId"]}),
             );
-            if allowed
+            if let Some(tool) = tool
                 && option.is_some()
                 && let Some(id) = params["toolCall"]["toolCallId"].as_str()
             {
                 // ACP agents may omit tool_call when permission already announced it.
-                self.tool_ids.lock().unwrap().insert(id.to_owned());
+                self.tool_ids.lock().unwrap().insert(id.to_owned(), tool);
             }
             self.send(crate::mcp::success(value["id"].clone(), json!({"outcome":outcome})))?;
             if !allowed {
@@ -242,23 +278,18 @@ impl Rpc {
                 }
             }
             Some("tool_call") => {
-                if !self.terminal_tool(update) {
+                let Some(tool) = self.terminal_tool(update, None) else {
                     self.violation("mimo isolation tripwire: non-terminal-rs tool attempt ended this turn").await;
                     return Ok(());
-                }
+                };
                 let id = update["toolCallId"].as_str().context("missing ACP tool id")?.to_owned();
-                self.tool_ids.lock().unwrap().insert(id.clone());
+                self.tool_ids.lock().unwrap().insert(id.clone(), tool);
                 self.emit(AgentEvent::ToolStarted(json!({"turnId":turn,"item":{"type":"dynamicToolCall","id":id,"tool":scrub_text(update["title"].as_str().unwrap_or_default())}})));
             }
             Some("tool_call_update") => {
                 let id = update["toolCallId"].as_str().unwrap_or_default();
-                if !self.tool_ids.lock().unwrap().contains(id)
-                    || (update.get("title").is_some() && !self.terminal_tool(update))
-                    || update["rawInput"].get("serverName").is_some_and(|server| server != "terminal-rs")
-                    || update["rawInput"]
-                        .get("name")
-                        .is_some_and(|name| name.as_str().is_none_or(|name| !self.tools.contains(name)))
-                {
+                let expected = self.tool_ids.lock().unwrap().get(id).cloned();
+                if expected.as_deref().is_none_or(|name| self.terminal_tool(update, Some(name)).is_none()) {
                     self.violation("mimo isolation tripwire: update for an unapproved tool").await;
                     return Ok(());
                 }

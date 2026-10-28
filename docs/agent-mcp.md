@@ -45,6 +45,15 @@ are resolved against each process's startup working directory; use an absolute
 value when registering a client whose cwd may differ. The canonical path is also
 passed to the sandbox and mimo's child shim (whose cwd is private).
 The normal macOS default is `~/Library/Application Support/terminal-rs`.
+The complete canonical socket path (including `/agent/mcp.sock`) must fit in
+**103 encoded bytes on macOS** or **107 on Linux**, excluding the trailing NUL.
+The app checks before binding and the shim checks before connecting. If too long,
+both the Agent notice and shim stderr report:
+
+> External agent: data folder path is too long for a Unix socket (N bytes, max 103). Use a shorter TR_DATA_DIR.
+
+Linux reports max 107 instead. The socket is never silently relocated; select a
+shorter `TR_DATA_DIR` for both processes.
 For a non-default instance, register an explicit server environment, for example:
 
 ```sh
@@ -73,8 +82,12 @@ Initialization succeeds even when the app is absent or access is disabled.
 
 Schemas come directly from the same `agent-tools::Registry` as Codex. Read-only
 classification is `!ToolSpec.mutating`, not a second hard-coded list. Results use
-MCP text content and `isError` for tool errors. Screenshot/image export is refused
-with an error rather than transferring an image without separate consent.
+MCP text content and `isError` for tool errors. Host-consent-only tools (currently
+`screenshot`) are omitted from external `tools/list`; direct calls still fail
+closed. Workflow proposal tools remain listed when editing is enabled because
+their approval cards are enforced by the app, not by client-supplied consent.
+Screenshot/image export is refused with an error rather than transferring an
+image without separate consent.
 App JSON-RPC errors (including the connection rate limit) remain JSON-RPC errors
 through the proxy; they are not disguised as an unavailable app.
 
@@ -195,17 +208,31 @@ whole backend production-ready; do not grant broad networking or shell access.
 - Models are read from initialize/session model metadata when present; otherwise
   the list is a single **mimo default**. No reasoning-effort variants are invented.
   Images are not enabled.
-- Permissions allow a registry-known, explicitly qualified **terminal-rs** MCP
-  tool only via `allow_once`, never `allow_always`. Foreign tools use `reject_once`
+- ACP permission checking is **defence in depth**, not the real authorization
+  boundary: titles, `rawInput` and `_meta` are agent-supplied and may be influenced
+  by the model. Real authorization is enforced at the **app socket** (registry
+  read-only/edit policy, validation and host approval cards) and by the **OS
+  sandbox** (deny-default execution/filesystem access; no network except the
+  explicit Unix-socket, DNS and outbound HTTPS grants needed by mimo). A matching
+  title alone must never be treated as proof of trusted provenance.
+- Permissions allow a registry-known **terminal-rs** MCP tool only via
+  `allow_once`, never `allow_always`. Only ACP `kind` **`other`**, **`read`**, or
+  absent is accepted. `execute`, `edit`, `delete`, `move`, `fetch`, and any other
+  kind are refused regardless of title, including on partial tool updates.
+  Foreign tools use `reject_once`
   (or cancelled when unavailable), cancel the session and trip the sticky unsafe
   state. Every `fs/*`, `terminal/*`, unknown executing update/request, unapproved
   tool update, malformed frame or child crash fails closed with a visible error.
   The exact accepted qualifications are `mcp__terminal-rs__<tool>`,
-  `terminal-rs/<tool>`, `terminal-rs.<tool>`, or structured terminal-rs server/name
-  provenance. Permission approval also announces its tool ID, allowing subsequent
-  `tool_call_update` without a separate `tool_call`. Conflicting title/server/tool
-  identities and explicit updates for an unknown session are refused; a previously
-  approved tool ID cannot authorise a foreign-tool update. The reader commits a
+  `terminal-rs/<tool>`, `terminal-rs.<tool>`, or an exact unqualified tool name
+  backed by structured terminal-rs server/tool provenance. Structured identity
+  fields in `_meta` or `rawInput` (including nested `mcp` identity fields) must all
+  agree with the title; metadata cannot override a conflicting title or another
+  metadata field. Permission approval also records its tool ID and name, allowing
+  subsequent `tool_call_update` without a separate `tool_call`. Conflicting
+  title/server/tool identities and explicit updates for an unknown session are
+  refused; an approved tool ID cannot authorise a different registry tool or hide
+  an unsafe kind in a partial update. The reader commits a
   new session ID before routing any following line; late updates from the retired
   canary session are ignored. Actual mimo provenance formatting is not live-verified.
 - Every fresh child runs the directory/shell **canary before Ready**, then starts
@@ -396,3 +423,28 @@ The nine pre-existing ignores remain: seven external-network tests, one manual
 news audit and the unsupported precision-reference assertion. No A4 test is
 ignored. README.md is intentionally unchanged. No app/mimo was launched for this
 fix; the stdio initialization finding above is manager-supplied live evidence.
+
+### A4-HARDEN verification
+
+Added **seven regression tests**:
+
+- Socket byte-limit boundary/trailing-NUL and multibyte counting; bind/shim
+  rejection before I/O or directory creation; actionable Agent-pane notice.
+- Consent-only tools omitted from all external toolsets while direct screenshot
+  calls still fail and workflow proposals remain available.
+- Unsafe ACP kinds rejected despite matching MCP titles in permissions and tool
+  starts; `other`/`read`/absent kinds with agreeing identities allowed once;
+  approved partial updates cannot change kind or tool identity.
+
+Extended the existing provenance test to cover mismatching registered
+`rawInput.name`, `_meta` identities and title/metadata disagreement in both
+permissions and tool starts. Updated the wire schema-equality test to compare
+only externally callable tools.
+
+A4-HARDEN workspace results: **2,048 passed / 0 failed / 9 ignored** (including
+doctests). `cargo fmt --all` and offline/locked all-target workspace Clippy with
+`-D warnings` pass. The environment-prefixed test command again required runner
+approval; the equivalent forced Cargo environment configuration shown above ran
+the full workspace suite successfully (also repeated with `--quiet` to retain
+compact result totals). No app/mimo or release build was run, and no network or
+personal CLI configuration was used.

@@ -25,6 +25,14 @@ pub struct ToolSpec {
     pub needs_confirmation: bool,
 }
 
+impl ToolSpec {
+    /// Workflow tools enqueue approval cards; other confirmed tools need a
+    /// separate host UI consent grant that external MCP clients cannot supply.
+    pub fn requires_host_consent(&self) -> bool {
+        self.needs_confirmation && !workflow(&self.name)
+    }
+}
+
 /// Cumulative presets: A2 reads, A3 chart edits, A5 confirmed workflows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSet {
@@ -376,7 +384,7 @@ impl Registry {
         }
         // Workflow hosts always enqueue a proposal, even if an adapter supplies confirmed.
         // Only screenshot consent is consumed here; workflow approval is an explicit UI action.
-        if spec.name == "screenshot" && !ctx.confirmed {
+        if spec.requires_host_consent() && !ctx.confirmed {
             return ToolResult::error(
                 "confirmation_required",
                 "Host UI confirmation is required for this operation",
