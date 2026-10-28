@@ -483,7 +483,7 @@ async fn owner_acp(
                     Some(Command::Turn(mut turn)) => {
                         workflow_results.append(&mut turn.input.workflow_results);
                         turn.input.workflow_results = workflow_results.clone();
-                        match acp_send_turn(&client, inbox, turn.input).await? {
+                        match acp_send_turn(&client, inbox, *turn).await? {
                             Some(id) => {
                                 workflow_results.clear();
                                 inbox.push(Event::Bridge(BridgeEvent::Started {turn:id}));
@@ -549,6 +549,9 @@ async fn acp_check(
             result = &mut check => break result,
         }
     };
+    // session/new supplies the catalogue even when the provider rejects the
+    // default model. Keep the picker usable while Stopped so Restart can use it.
+    inbox.push(Event::Models(client.list_models().await?));
     report_acp_failure(inbox, &result, client.is_unsafe());
     result
 }
@@ -556,9 +559,10 @@ async fn acp_check(
 async fn acp_send_turn(
     client: &tr_agent::acp::AcpBackend,
     inbox: &Inbox,
-    input: tr_agent::TurnInput,
+    mut turn: BridgeTurn,
 ) -> Result<Option<String>> {
-    match client.send_turn(input).await {
+    turn.include_chart_context()?;
+    match client.send_turn(turn.input).await {
         Ok(id) => Ok(Some(id)),
         Err(error) if client.is_closed() || client.is_unsafe() => Err(error),
         Err(error) => {
@@ -698,7 +702,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn acp_readiness_notices_and_failures_leave_pane_checking_with_restart() {
-        for network in [true, false] {
+        for failure in ["network", "timeout", "model"] {
+            let network = failure == "network";
             let (client_io, server_io) = tokio::io::duplex(65536);
             let (read, write) = tokio::io::split(client_io);
             let client = tr_agent::acp::AcpBackend::connect(
@@ -714,7 +719,9 @@ mod tests {
                 ctx: egui::Context::default(),
                 last_text_wake: Mutex::new(None),
             };
-            client.remember_model("saved".into());
+            if failure != "model" {
+                client.remember_model("saved".into());
+            }
             let server = async {
                 let (read, mut write) = tokio::io::split(server_io);
                 let mut read = BufReader::new(read);
@@ -730,6 +737,14 @@ mod tests {
                             json!({})
                         }
                         "session/prompt" => {
+                            if failure == "model" {
+                                tr_agent::mcp::write_line(
+                                    &mut write,
+                                    &tr_agent::mcp::error(request["id"].clone(), -32603, "Not supported model"),
+                                )
+                                .await
+                                .unwrap();
+                            }
                             if network {
                                 for attempt in 1..=3 {
                                     tr_agent::mcp::write_line(
@@ -756,10 +771,10 @@ mod tests {
             let (result, ()) = tokio::join!(acp_check(&client, &inbox, client.canary()), server);
             let error = result.unwrap_err().to_string();
             assert!(
-                error.contains(if network {
-                    "could not reach its model provider (network)"
-                } else {
-                    "canary timed out"
+                error.contains(match failure {
+                    "network" => "could not reach its model provider (network)",
+                    "model" => "mimo's default model isn't available on your plan — pick a model in the Agent pane and Restart",
+                    _ => "canary timed out",
                 }),
                 "{error}"
             );
@@ -773,6 +788,10 @@ mod tests {
                         assert!(!message.contains("fixture-secret"));
                         assert_eq!(pane.state, Onboarding::Checking, "notice must arrive before readiness fails");
                         pane.notice(&message);
+                    }
+                    Event::Models(models) => {
+                        assert_eq!(models.len(), 2);
+                        pane.models = models;
                     }
                     _ => panic!("unexpected readiness event"),
                 }
@@ -794,7 +813,9 @@ mod tests {
             ctx: egui::Context::default(),
             last_text_wake: Mutex::new(None),
         };
+        let (prompt_seen, seen) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
+            let mut prompt_seen = Some(prompt_seen);
             let (read, mut write) = tokio::io::split(server_io);
             let mut read = BufReader::new(read);
             let mut rejected = false;
@@ -818,6 +839,18 @@ mod tests {
                     }
                     "session/set_model" => json!({}),
                     "session/prompt" => {
+                        let text = request["params"]["prompt"][0]["text"].as_str().unwrap();
+                        let context =
+                            text.split("Chart context (untrusted data): ").nth(1).unwrap().lines().next().unwrap();
+                        let context: serde_json::Value = serde_json::from_str(context).unwrap();
+                        let pin: serde_json::Value = serde_json::from_str(context["chart"].as_str().unwrap()).unwrap();
+                        assert_eq!(
+                            pin,
+                            json!({"uid":42,"symbol":"BTCUSD Curncy","timeframe":"1D","visible_range":[100,200]})
+                        );
+                        assert!(text.ends_with("User: next"));
+                        assert!(!text.contains("Checking mimo") && !text.contains("provider unreachable"));
+                        prompt_seen.take().unwrap().send(()).unwrap();
                         // Leave the turn running until shutdown for the busy-turn assertion.
                         continue;
                     }
@@ -837,10 +870,21 @@ mod tests {
             })
             .await
             .unwrap();
-        let input = || tr_agent::TurnInput { model: "model".into(), text: "next".into(), ..Default::default() };
+        let input = || BridgeTurn {
+            input: tr_agent::TurnInput { model: "model".into(), text: "next".into(), ..Default::default() },
+            pin: tr_agent::bridge::ChartPin {
+                uid: 42,
+                symbol: "BTCUSD Curncy".into(),
+                timeframe: "1D".into(),
+                visible_range: Some((100, 200)),
+            },
+            requires_tools: false,
+            screenshot_consent: false,
+        };
         assert!(acp_send_turn(&client, &inbox, input()).await.unwrap().is_none());
         assert!(!client.is_closed());
         assert!(acp_send_turn(&client, &inbox, input()).await.unwrap().is_some());
+        tokio::time::timeout(Duration::from_secs(2), seen).await.unwrap().unwrap();
         assert!(acp_send_turn(&client, &inbox, input()).await.unwrap().is_none());
         let posted = std::mem::take(&mut *inbox.events.lock().unwrap());
         assert_eq!(posted.iter().filter(|e| matches!(e, Event::Notice(_))).count(), 2);

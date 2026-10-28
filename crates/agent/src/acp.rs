@@ -24,7 +24,9 @@ pub enum MimoProfile {
 }
 
 #[derive(Debug)]
-struct Rejected;
+struct Rejected {
+    model_unavailable: bool,
+}
 impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("mimo ACP rejected request")
@@ -135,7 +137,7 @@ impl Rpc {
             return None;
         }
         let qualified_name = |title: &str| {
-            ["mcp__terminal-rs__", "terminal-rs/", "terminal-rs."]
+            ["mcp__terminal-rs__", "terminal-rs/", "terminal-rs.", "terminal-rs_"]
                 .iter()
                 .find_map(|prefix| title.strip_prefix(prefix).map(str::to_owned))
         };
@@ -158,8 +160,18 @@ impl Rpc {
         // tool supplied structurally; arbitrary human-readable titles fail closed.
         let mut server_seen = false;
         let mut tool_seen = false;
-        for source in [&call["_meta"], &call["rawInput"]] {
+        for (index, source) in [&call["_meta"], &call["rawInput"]].into_iter().enumerate() {
             for fields in [source, &source["mcp"]] {
+                // With eager tools mimo's flat prefix identifies the tool and
+                // rawInput is its arguments, not an MCP identity envelope. A
+                // workflow's `name` argument must not be mistaken for a tool.
+                if index == 1
+                    && std::ptr::eq(fields, source)
+                    && call["title"].as_str().is_some_and(|title| title.starts_with("terminal-rs_"))
+                    && !["serverName", "server_name", "server"].iter().any(|key| fields.get(key).is_some())
+                {
+                    continue;
+                }
                 for key in ["serverName", "server_name", "server"] {
                     if let Some(server) = fields.get(key) {
                         server_seen = true;
@@ -224,8 +236,26 @@ impl Rpc {
                         "status":if failed {"failed"} else {"completed"},"stopReason":value["result"]["stopReason"]},
                         "error":if failed {Some("mimo ACP rejected request; you can send another prompt")} else {None}})));
                 }
-                let result =
-                    if value.get("error").is_some() { Err(anyhow!(Rejected)) } else { Ok(value["result"].clone()) };
+                let result = if let Some(error) = value.get("error") {
+                    // Classify without forwarding provider payloads (which may contain secrets).
+                    let message = error.to_string().to_ascii_lowercase();
+                    let model_unavailable = [
+                        "not supported model",
+                        "unsupported model",
+                        "model not found",
+                        "modelnotfound",
+                        "invalid model",
+                        "model is not available",
+                        "model_not_found",
+                        "model_not_supported",
+                        "model error",
+                    ]
+                    .iter()
+                    .any(|pattern| message.contains(pattern));
+                    Err(anyhow!(Rejected { model_unavailable }))
+                } else {
+                    Ok(value["result"].clone())
+                };
                 let _ = request.sender.send(result);
             }
             return Ok(());
@@ -415,7 +445,6 @@ pub struct AcpBackend {
     rpc: Arc<Rpc>,
     initialized: tokio::sync::Mutex<Option<Value>>,
     workspace: PathBuf,
-    executable: PathBuf,
     turns: AtomicU64,
     busy: Arc<AtomicBool>,
     instructions: Mutex<String>,
@@ -455,7 +484,7 @@ impl AcpBackend {
         read: R,
         write: W,
         workspace: PathBuf,
-        executable: PathBuf,
+        _executable: PathBuf,
         kill: Arc<dyn Fn() + Send + Sync>,
     ) -> Self
     where
@@ -529,7 +558,6 @@ impl AcpBackend {
             rpc,
             initialized: tokio::sync::Mutex::new(None),
             workspace,
-            executable,
             turns: AtomicU64::new(1),
             busy,
             instructions: Default::default(),
@@ -662,6 +690,8 @@ impl AcpBackend {
     }
     fn launch_once(data: &Path, profile: MimoProfile, load_plugins: bool, port: u16) -> Result<Self> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let data = data.canonicalize().context("Could not resolve mimo data directory")?;
+        let data = data.as_path();
         let binary = Self::find_binary().context(Self::missing_message())?.canonicalize()?;
         let root = data.join("agent");
         if !root.exists() {
@@ -715,10 +745,12 @@ impl AcpBackend {
         } else {
             bail!("mimo isolation requires macOS sandbox-exec; refusing an unsandboxed child");
         };
-        command.args(acp_arguments(load_plugins, port));
+        command.args(acp_arguments(profile, load_plugins, port));
         command
             .env_clear()
             .envs(mimo_environment(std::env::vars_os(), &private, &home, profile))
+            // Configure MCP before mimo builds its startup reminder/tool catalogue.
+            .env("MIMOCODE_CONFIG_CONTENT", terminal_mcp_config(&exe, data).to_string())
             // This is a host-selected path, not an inherited secret. The shim must
             // locate precisely the app instance that launched this backend.
             .env("TR_DATA_DIR", data)
@@ -803,6 +835,7 @@ impl AcpBackend {
                 "mimo could not reach its model provider (network). Check your provider/endpoint in mimo, then retry."
             ))
         };
+        let default_model = self.preferred_model.lock().unwrap().is_empty();
         let check = async {
             self.start_thread(ThreadOptions {
                 cwd: String::new(),
@@ -828,6 +861,15 @@ impl AcpBackend {
         };
         if result.is_err() {
             self.rpc.notify_cancel();
+        }
+        if default_model
+            && result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<Rejected>())
+                .is_some_and(|error| error.model_unavailable)
+        {
+            bail!("mimo's default model isn't available on your plan — pick a model in the Agent pane and Restart");
         }
         result
     }
@@ -868,8 +910,7 @@ fn collect_model_options(options: &Value, current: &Value, models: &mut Vec<Mode
     }
 }
 
-const OWN_DIRECTORIES: [&str; 5] =
-    [".config/mimocode", ".local/share/mimocode", ".cache/mimocode", ".local/state/mimocode", ".mimocode"];
+const OWN_DIRECTORIES: [&str; 4] = [".mimocode", ".local/share/mimocode", ".cache/mimocode", ".local/state/mimocode"];
 const OWN_WRITABLE_DIRECTORIES: [&str; 2] = [".local/share/mimocode", ".local/state/mimocode"];
 
 struct SandboxRoots {
@@ -923,9 +964,9 @@ fn own_shadow_home(private: &Path, user_home: &Path) -> Result<(PathBuf, Sandbox
     Ok((home, SandboxRoots::own(directories, user_home)))
 }
 
-fn acp_arguments(load_plugins: bool, port: u16) -> Vec<String> {
+fn acp_arguments(profile: MimoProfile, load_plugins: bool, port: u16) -> Vec<String> {
     let mut args = vec!["acp".into(), "--port".into(), port.to_string()];
-    if !load_plugins {
+    if profile == MimoProfile::Own || !load_plugins {
         args.push("--pure".into());
     }
     args
@@ -969,7 +1010,20 @@ fn mimo_environment(
         // A writable temp directory without granting the user's shared tmp tree.
         env.insert("TMPDIR".into(), private.join("tmp").into_os_string());
     }
+    for (key, value) in [
+        ("MIMOCODE_MCP_TOOL_SEARCH", "false"),
+        ("MIMOCODE_DISABLE_CLAUDE_CODE", "1"),
+        ("MIMOCODE_DISABLE_MODELS_FETCH", "1"),
+        ("MIMOCODE_DISABLE_AUTOUPDATE", "1"),
+    ] {
+        env.insert(key.into(), value.into());
+    }
     env
+}
+
+fn terminal_mcp_config(executable: &Path, data: &Path) -> Value {
+    json!({"mcp":{"terminal-rs":{"type":"local","command":[executable,"mcp-stdio"],
+        "environment":{"TR_DATA_DIR":data}}}})
 }
 
 fn sandbox_profile(
@@ -1017,7 +1071,7 @@ fn sandbox_profile(
     }
     // A discovered binary must not make a forbidden personal tree readable,
     // even if it is nested more deeply than the protected root itself.
-    for forbidden in [".config/opencode", ".codex", ".ssh", "Library"] {
+    for forbidden in [".config/opencode", ".config/mimocode", ".codex", ".ssh", "Library"] {
         if install.starts_with(user_home.join(forbidden)) {
             bail!("mimo install directory is inside a protected directory");
         }
@@ -1114,7 +1168,10 @@ impl AgentBackend for AcpBackend {
         if self.busy.load(Ordering::SeqCst) {
             bail!("mimo turn is still running");
         }
-        let result = self.rpc.request("session/new", json!({"cwd":self.workspace,"mcpServers":[{"name":"terminal-rs","command":self.executable,"args":["mcp-stdio"],"env":[]}]}), Duration::from_secs(30)).await?;
+        let result = self
+            .rpc
+            .request("session/new", json!({"cwd":self.workspace,"mcpServers":[]}), Duration::from_secs(30))
+            .await?;
         let session = result["sessionId"].as_str().context("mimo did not return a session id")?.to_owned();
         *self.instructions.lock().unwrap() = opts.base_instructions;
         self.update_models(&result);

@@ -247,6 +247,27 @@ async fn full_stdio_socket_registry_round_trip_read_and_write_refused() {
 }
 
 #[tokio::test]
+async fn stdio_empty_prompts_resources_and_templates_need_no_app_connection() {
+    let temp = Temp::new();
+    let (client, shim) = tokio::io::duplex(8192);
+    let (r, w) = tokio::io::split(shim);
+    let task = tokio::spawn(serve_stdio(r, w, socket_path(&temp.0)));
+    let (r, mut w) = tokio::io::split(client);
+    let mut r = BufReader::new(r);
+    assert_eq!(round_trip(&mut w, &mut r, 1, "prompts/list", json!({})).await["error"]["code"], -32000);
+    round_trip(&mut w, &mut r, 2, "initialize", json!({})).await;
+    for (method, expected) in [
+        ("prompts/list", json!({"prompts":[]})),
+        ("resources/list", json!({"resources":[]})),
+        ("resources/templates/list", json!({"resourceTemplates":[]})),
+    ] {
+        assert_eq!(round_trip(&mut w, &mut r, 3, method, json!({})).await["result"], expected);
+    }
+    w.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn unavailable_app_initializes_and_returns_empty_tools_and_helpful_error() {
     let temp = Temp::new();
     let (client, shim) = tokio::io::duplex(8192);

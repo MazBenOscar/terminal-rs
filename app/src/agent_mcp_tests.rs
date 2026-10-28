@@ -211,8 +211,12 @@ fn mimo_settings_show_profile_radios_and_hide_plugins_in_collapsed_advanced() {
     use crate::agent_mcp::Backend;
     let temp = Temp::new();
     let mut app = TerminalApp::test_workspace(&temp.0);
-    for backend in [Backend::Codex, Backend::Mimo] {
+    use crate::agent_mcp::MimoProfile;
+    for (backend, profile) in
+        [(Backend::Codex, MimoProfile::Own), (Backend::Mimo, MimoProfile::Own), (Backend::Mimo, MimoProfile::Private)]
+    {
         app.agent_config.backend = backend;
+        app.agent_config.mimo_profile = profile;
         let ctx = egui::Context::default();
         let mut shown = String::new();
         for _ in 0..2 {
@@ -236,7 +240,7 @@ fn mimo_settings_show_profile_radios_and_hide_plugins_in_collapsed_advanced() {
             backend == Backend::Mimo
         );
         assert_eq!(shown.contains("Private login (separate sign-in inside terminal-rs)"), backend == Backend::Mimo);
-        assert_eq!(shown.contains("Advanced"), backend == Backend::Mimo);
+        assert_eq!(shown.contains("Advanced"), backend == Backend::Mimo && profile == MimoProfile::Private);
         assert!(!shown.contains("Load mimo plugins"));
     }
 }

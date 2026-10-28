@@ -50,7 +50,7 @@ const MIMO_PRIVACY_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "What is stored on this Mac",
-        "By default mimo uses your installed providers, keys and models in the five mimocode directories. Settings › Agent can instead select a separate persistent private login under the app data directory. mimo can update the selected profile's login/session data. Empty workspaces are removed after child cleanup; terminal-rs does not save raw ACP transcripts. Layouts contain choices, not conversations or sign-in details.",
+        "By default mimo uses providers, keys and models from its credential store through four mimocode directories; personal config (MCP servers, plugins and instructions) is intentionally not loaded. Settings › Agent can instead select a separate persistent private login under the app data directory. mimo can update the selected profile's login/session data. Empty workspaces are removed after child cleanup; terminal-rs does not save raw ACP transcripts. Layouts contain choices, not conversations or sign-in details.",
     ),
 ];
 
@@ -1030,6 +1030,12 @@ impl AgentPane {
             self.set_limits(&self.limits_value.clone());
         }
         ui.add_space(dp(6.0));
+        // Readiness/status belongs to pane chrome, never to a conversation turn.
+        // Keep it outside the transcript (and under its own widget identity), so
+        // it cannot appear beneath a preceding "You" header as user content.
+        if self.acknowledged && self.state != Onboarding::Ready {
+            ui.push_id(pane_id.with("status"), |ui| self.onboarding(ui, &mut actions));
+        }
 
         // Reserve the measured composer height, rather than a fixed empty footer.
         let input_width = (ui.available_width() - self.composer_controls_width(ui) - dp(18.0)).max(dp(40.0));
@@ -1086,12 +1092,6 @@ impl AgentPane {
                     suggested_prompts(ui, self.settings.tools, &mut actions);
                 }
                 self.conversation(ui, &mut actions);
-                if self.state != Onboarding::Ready {
-                    if !self.blocks.is_empty() {
-                        ui.add_space(dp(9.0));
-                    }
-                    self.onboarding(ui, &mut actions);
-                }
                 for limit in &self.limits {
                     let window = match limit.minutes {
                         300 => "5-hour".into(),
@@ -4792,6 +4792,66 @@ mod polish_tests {
         click(&mut pane, &ctx, "Clear");
         assert!(pane.queue.is_empty());
         assert!(texts(&frame(&mut pane, &ctx, vec![])).is_empty());
+    }
+
+    #[test]
+    fn mimo_status_is_pane_chrome_not_a_user_turn_or_queued_prompt() {
+        let ctx = egui::Context::default();
+        let mut pane = AgentPane { backend: "mimo", acknowledged: true, ..Default::default() };
+        pane.transition(Onboarding::Checking);
+        pane.notice("mimo: provider unreachable (attempt 1)");
+        pane.input = "What chart is pinned?".into();
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            let output = render(&ctx, 720.0, vec![], |ui| {
+                actions = pane.show(ui, "BTCUSD Curncy · 1D", egui::Id::new("status-only"));
+            });
+            assert!(!texts(&output).iter().any(|(text, _)| text == "You"));
+            assert!(!actions.iter().any(|action| matches!(action, Action::Send(_))));
+        }
+        assert!(pane.turns.is_empty() && pane.queue.is_empty() && pane.last_prompt.is_none());
+        assert!(pane.blocks.iter().all(|block| matches!(block, RenderedBlock::Notice(_))));
+        assert!(pane.workflows.context.is_empty());
+        pane.transition(Onboarding::Ready);
+        pane.enqueue(Prompt { text: pane.input.clone(), requires_tools: false });
+        assert_eq!(pane.next_prompt().unwrap().text, "What chart is pinned?");
+        assert_eq!(pane.turns.len(), 1);
+        assert_eq!(pane.blocks.iter().filter(|block| matches!(block, RenderedBlock::Prompt(_))).count(), 1);
+    }
+
+    #[test]
+    fn mimo_model_picker_works_while_stopped_before_restart() {
+        let ctx = egui::Context::default();
+        let mut pane = AgentPane { backend: "mimo", acknowledged: true, ..Default::default() };
+        pane.models = serde_json::from_value(serde_json::json!([
+            {"id":"provider/default","model":"provider/default","displayName":"provider/default","isDefault":true,"defaultReasoningEffort":"","supportedReasoningEfforts":[]},
+            {"id":"provider/working","model":"provider/working","displayName":"provider/working","defaultReasoningEffort":"","supportedReasoningEfforts":[]}
+        ]))
+        .unwrap();
+        pane.transition(Onboarding::Stopped {
+            reason: "mimo's default model isn't available on your plan — pick a model in the Agent pane and Restart"
+                .into(),
+            unsafe_backend: false,
+        });
+        let mut draw = |events| {
+            render(&ctx, 720.0, events, |ui| {
+                pane.show(ui, "BTCUSD Curncy · 1D", egui::Id::new("model-recovery"));
+            })
+        };
+        draw(vec![]);
+        let output = draw(vec![]);
+        let button = texts(&output).iter().find(|(text, _)| text == "mimo · provider/default").unwrap().1;
+        draw(pointer(button.center(), true));
+        draw(pointer(button.center(), false));
+        let output = draw(vec![]);
+        let choice = texts(&output).iter().find(|(text, _)| text == "provider/working").unwrap().1;
+        draw(pointer(choice.center(), true));
+        draw(pointer(choice.center(), false));
+        assert_eq!(pane.settings.mimo_model, "provider/working");
+        assert!(matches!(pane.state, Onboarding::Stopped { .. }));
+        assert!(pane.prepare_session_start().is_some());
+        assert_eq!(pane.settings.mimo_model, "provider/working");
+        assert_eq!(pane.state, Onboarding::Checking);
     }
 
     #[test]

@@ -306,7 +306,14 @@ pub async fn serve_stdio<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 )
             }
             "ping" => success(id, json!({})),
-            "tools/list" | "tools/call" if !initialized => error(id, -32000, "Initialize first"),
+            "tools/list" | "tools/call" | "prompts/list" | "resources/list" | "resources/templates/list"
+                if !initialized =>
+            {
+                error(id, -32000, "Initialize first")
+            }
+            "prompts/list" => success(id, json!({"prompts":[]})),
+            "resources/list" => success(id, json!({"resources":[]})),
+            "resources/templates/list" => success(id, json!({"resourceTemplates":[]})),
             "tools/call" if !valid_tool_params(&request) => {
                 error(id, -32602, "Expected tool name and object arguments")
             }
