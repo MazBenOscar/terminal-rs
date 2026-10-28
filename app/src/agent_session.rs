@@ -474,6 +474,7 @@ pub(crate) fn project(event: BridgeEvent) -> Option<BridgeEvent> {
                     let local = crate::agent_pane::local_tool_projection(&params["item"]);
                     let scan = crate::agent_pane::scan_tool_projection(&params["item"]);
                     let multi = crate::agent_pane::multi_tool_projection(&params["item"]);
+                    let visibility = crate::agent_pane::drawing_visibility_projection(&params["item"]);
                     let summary = crate::agent_pane::edit_tool_summary(&params["item"]);
                     let error = crate::agent_pane::tool_error(&params["item"]);
                     if let Some(map) = params["item"].as_object_mut() {
@@ -488,6 +489,9 @@ pub(crate) fn project(event: BridgeEvent) -> Option<BridgeEvent> {
                         }
                         if let Some(multi) = multi {
                             map.insert("multiRead".into(), multi);
+                        }
+                        if let Some(visibility) = visibility {
+                            map.insert("drawingVisibility".into(), visibility);
                         }
                         if let Some(summary) = summary {
                             map.remove("arguments");

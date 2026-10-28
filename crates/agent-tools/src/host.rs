@@ -250,7 +250,6 @@ pub mod edits {
             self.observe(chart);
             match args {
                 LiveArgs::CreateDrawing(a) => {
-                    self.can_create(chart, turn)?;
                     check_symbol(chart, &a.symbol)?;
                     let tool = match a.kind {
                         args::DrawingKind::Horizontal => Tool::Horizontal,
@@ -266,7 +265,7 @@ pub mod edits {
                             "zone_role requires kind=rectangle; omit zone_role for lines or text",
                         ));
                     }
-                    let points = drawing_anchors(chart, &a.anchors, tool)?;
+                    let points = drawing_anchors(chart, &a.anchors, tool, a.analysis_ref.is_some())?;
                     let source_timeframe = a
                         .source_timeframe
                         .as_deref()
@@ -283,6 +282,10 @@ pub mod edits {
                     drawing.turn_id = Some(turn.into());
                     drawing.source_timeframe = Some(source_timeframe);
                     drawing.zone_role = a.zone_role;
+                    drawing.extend_left = a.extend_left;
+                    drawing.extend_right = a.extend_right;
+                    drawing.dashed = a.dashed;
+                    drawing.technical_analysis = a.analysis_ref.is_some();
                     drawing.text = timeframe_label(a.label.as_deref().unwrap_or_default(), source_timeframe);
                     drawing.auto_label = drawing.zone_role.is_some() && drawing.text.is_empty();
                     if drawing.auto_label {
@@ -291,6 +294,21 @@ pub mod edits {
                     drawing.sanitize();
                     let id = drawing.id;
                     let mut next = chart.drawings.to_vec();
+                    if a.analysis_ref.is_some() {
+                        next.retain(|d| {
+                            !(d.created_by == Author::Agent
+                                && d.turn_id.as_deref() != Some(turn)
+                                && d.symbol.as_deref() == Some(chart.symbol)
+                                && d.source_timeframe == Some(source_timeframe)
+                                && (d.zone_role.is_some()
+                                    || d.technical_analysis
+                                    || (matches!(d.tool, Tool::Ray | Tool::Trendline)
+                                        && ["support", "resistance", "trend"]
+                                            .iter()
+                                            .any(|word| d.text.to_ascii_lowercase().contains(word)))))
+                        });
+                    }
+                    self.can_create(&Chart { drawings: &next, ..*chart }, turn)?;
                     next.push(drawing);
                     self.own(chart.uid, format!("drawing:{id}"), turn);
                     Ok(Plan::Drawings(next, id))
@@ -312,7 +330,7 @@ pub mod edits {
                     let timeframe = drawing.source_timeframe.unwrap_or(chart.timeframe);
                     let anchors_changed = a.anchors.is_some();
                     if let Some(points) = a.anchors {
-                        let points = drawing_anchors(chart, &points, drawing.tool)?;
+                        let points = drawing_anchors(chart, &points, drawing.tool, false)?;
                         drawing.a = points[0];
                         drawing.b = *points.last().unwrap();
                     }
@@ -481,13 +499,19 @@ pub mod edits {
         let role = match role {
             args::ZoneRole::Support => "support",
             args::ZoneRole::Resistance => "resistance",
+            args::ZoneRole::InPlay => "in play",
         };
         let low = tr_chart::scale::format_price(drawing.a.price.min(drawing.b.price), decimals);
         let high = tr_chart::scale::format_price(drawing.a.price.max(drawing.b.price), decimals);
         format!("{timeframe:?} {role} {low}–{high}")
     }
 
-    fn drawing_anchors(chart: &Chart<'_>, points: &[args::Anchor], tool: Tool) -> Result<Vec<Anchor>, ToolResult> {
+    fn drawing_anchors(
+        chart: &Chart<'_>,
+        points: &[args::Anchor],
+        tool: Tool,
+        preserve_timestamps: bool,
+    ) -> Result<Vec<Anchor>, ToolResult> {
         let count = tool.points();
         if points.len() != count {
             return Err(error("invalid_args", &format!("anchors must contain exactly {count} points for {tool:?}")));
@@ -513,7 +537,11 @@ pub mod edits {
                 ));
             }
             // Rectangle end extensions are harmless; clip them to the loaded last bar.
-            let time = if tool == Tool::Rectangle && position == 1 { p.time.min(last.ts) } else { p.time };
+            let time = if tool == Tool::Rectangle && position == 1 && !preserve_timestamps {
+                p.time.min(last.ts)
+            } else {
+                p.time
+            };
             if time < first.ts || time > last.ts || time > chrono::Utc::now().timestamp() {
                 let date = |ts| {
                     chrono::DateTime::from_timestamp(ts, 0).map(|t| t.to_rfc3339()).unwrap_or_else(|| ts.to_string())
@@ -529,7 +557,7 @@ pub mod edits {
                     ),
                 ));
             }
-            let ts = if tool == Tool::Rectangle {
+            let ts = if tool == Tool::Rectangle && !preserve_timestamps {
                 let index = chart.bars.partition_point(|bar| bar.ts < time);
                 match (index.checked_sub(1).and_then(|i| chart.bars.get(i)), chart.bars.get(index)) {
                     (Some(a), Some(b)) => {
@@ -617,6 +645,67 @@ mod tests {
         args::{self, LiveArgs},
     };
     use tr_core::{Bar, Timeframe};
+
+    #[test]
+    fn precision_replaces_only_prior_agent_sr_same_symbol_and_timeframe() {
+        use tr_chart::drawings::{Anchor, Author, Drawing, Tool};
+        let bars = [Bar::new(86400, 10., 12., 8., 11., 1.), Bar::new(172800, 10., 12., 8., 11., 1.)];
+        let mut old = Drawing::new(Tool::Rectangle, Anchor { ts: 86400, price: 8. }, Anchor { ts: 172800, price: 12. });
+        old.created_by = Author::Agent;
+        old.turn_id = Some("previous".into());
+        old.symbol = Some("AAA US Equity".into());
+        old.source_timeframe = Some(Timeframe::D1);
+        old.zone_role = Some(args::ZoneRole::Support);
+        let mut kept = old.clone();
+        kept.id = tr_chart::drawings::next_id();
+        kept.created_by = Author::User;
+        let mut h4 = old.clone();
+        h4.id = tr_chart::drawings::next_id();
+        h4.source_timeframe = Some(Timeframe::H4);
+        let mut other = old.clone();
+        other.id = tr_chart::drawings::next_id();
+        other.symbol = Some("BBB US Equity".into());
+        let mut drawings = vec![old.clone(), kept.clone(), h4.clone(), other.clone()];
+        // A full chart must permit replacement; legacy labeled rays predate the marker.
+        for _ in 0..96 {
+            let mut legacy = old.clone();
+            legacy.id = tr_chart::drawings::next_id();
+            legacy.tool = Tool::Ray;
+            legacy.zone_role = None;
+            legacy.text = "D1 rising support".into();
+            drawings.push(legacy);
+        }
+        let chart = Chart {
+            uid: 1,
+            symbol: "AAA US Equity",
+            timeframe: Timeframe::D1,
+            price_decimals: 2,
+            bars: &bars,
+            drawings: &drawings,
+            indicators: &[],
+            comparisons: &[],
+        };
+        let mut a = zone_args("support");
+        a.analysis_ref = Some(args::AnalysisRef { analysis_id: "test".into(), item_id: "zone-0".into() });
+        a.extend_right = true;
+        a.anchors[0].time += 3600; // Analysis timestamps are exact, not snapped to chart bars.
+        let mut session = Session::default();
+        let Plan::Drawings(next, id) = session.plan(&chart, "new", LiveArgs::CreateDrawing(a.clone())).unwrap() else {
+            panic!()
+        };
+        assert!(!next.iter().any(|d| d.id == old.id));
+        assert_eq!(next.len(), 4, "prior labeled rays are replaced even at the 100-object limit");
+        for d in [kept, h4, other] {
+            assert!(next.contains(&d));
+        }
+        assert!(next.iter().any(|d| d.id == id && d.extend_right && d.technical_analysis && d.a.ts == 90000));
+        let Plan::Drawings(next2, _) =
+            session.plan(&Chart { drawings: &next, ..chart }, "new", LiveArgs::CreateDrawing(a)).unwrap()
+        else {
+            panic!()
+        };
+        assert!(next2.iter().any(|d| d.id == id), "same-turn drawings must not replace one another");
+    }
 
     #[test]
     fn agent_labels_get_compact_timeframes_and_zone_roles_roundtrip() {
@@ -1095,6 +1184,10 @@ mod tests {
                     label: None,
                     zone_role: None,
                     source_timeframe: None,
+                    analysis_ref: None,
+                    extend_left: false,
+                    extend_right: false,
+                    dashed: false,
                 }),
             );
             let Err(result) = result else { panic!("invalid coordinates succeeded") };
@@ -1114,6 +1207,10 @@ mod tests {
                     label: None,
                     zone_role: None,
                     source_timeframe: None,
+                    analysis_ref: None,
+                    extend_left: false,
+                    extend_right: false,
+                    dashed: false,
                 }),
             )
             .unwrap();
@@ -1324,6 +1421,10 @@ mod tests {
                     label: None,
                     zone_role: None,
                     source_timeframe: None,
+                    analysis_ref: None,
+                    extend_left: false,
+                    extend_right: false,
+                    dashed: false,
                 }),
             )
             .unwrap()

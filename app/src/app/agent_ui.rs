@@ -912,6 +912,17 @@ impl TerminalApp {
                     self.start_agent_session(ctx);
                 }
             }
+            Action::ShowDrawings(uid) => {
+                if let Some(pane) = self.panes.iter_mut().find(|p| matches!(&p.kind, PaneKind::Chart(c) if c.uid==uid))
+                {
+                    if let PaneKind::Chart(chart) = &mut pane.kind {
+                        chart.drawings_hidden = false;
+                    }
+                    self.dock.activate(pane.id);
+                    self.agent_pane.drawings_shown(uid);
+                    self.autosave();
+                }
+            }
             Action::UndoTurn(turn) => {
                 if !self.agent_pane.running {
                     let result = self.undo_agent_turn(&turn);

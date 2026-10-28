@@ -504,6 +504,7 @@ pub enum Action {
     Send(Prompt),
     SetTools(ToolsMode),
     UndoTurn(String),
+    ShowDrawings(u64),
     // A5b-SCAN: emitted only by the user's button click, never by tool dispatch.
     OpenScanner(crate::layouts::ScanSettings),
     /// `ids` are the pending proposals the user saw; others in the turn stay pending.
@@ -603,6 +604,16 @@ impl AgentPane {
             let turn = &mut self.turns[index];
             turn.duration = Some(turn.started_at.elapsed());
             turn.finished = true;
+        }
+    }
+
+    pub fn drawings_shown(&mut self, uid: u64) {
+        for block in &mut self.blocks {
+            if let RenderedBlock::Tool(trace) = block
+                && trace.target_args["_drawing_visibility"]["uid"].as_u64() == Some(uid)
+            {
+                trace.target_args.as_object_mut().unwrap().remove("_drawing_visibility");
+            }
         }
     }
 
@@ -858,6 +869,11 @@ impl AgentPane {
                     },
                     target_args: {
                         let mut args = normalized_args(&item["arguments"]);
+                        if let Some(visibility) =
+                            item.get("drawingVisibility").cloned().or_else(|| drawing_visibility_projection(item))
+                        {
+                            args["_drawing_visibility"] = visibility;
+                        }
                         if let Some(scan) = scan {
                             args["_scan"] = scan;
                         }
@@ -1195,6 +1211,31 @@ impl AgentPane {
         } else {
             label
         };
+        if turn.is_some_and(|t| t.finished && t.reverted_changes.is_none()) {
+            let mut hidden: std::collections::BTreeMap<u64, (usize, bool)> = Default::default();
+            for trace in &traces {
+                let v = &trace.target_args["_drawing_visibility"];
+                if trace.success == Some(true)
+                    && let Some(uid) = v["uid"].as_u64()
+                {
+                    let entry = hidden.entry(uid).or_default();
+                    entry.0 += v["count"].as_u64().unwrap_or(0) as usize;
+                    entry.1 |= v["hidden"] == true;
+                }
+            }
+            for (uid, (count, hidden)) in hidden {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "{count} drawing{} added, but {} ·",
+                        if count == 1 { "" } else { "s" },
+                        if hidden { "drawings are hidden on this chart" } else { "the target chart is not visible" }
+                    ));
+                    if control(ui, "Show drawings").clicked() {
+                        actions.push(Action::ShowDrawings(uid));
+                    }
+                });
+            }
+        }
         let label = tool_group_duration(label, turn);
         let recovered = recovered_failures(&traces);
         let retries =
@@ -2420,6 +2461,25 @@ fn multi_symbol_label(symbol: &str) -> String {
         &security.crypto_instrument().map_or_else(|_| security.ticker.clone(), |i| format!("{}/{}", i.base, i.quote)),
     )
 }
+/// Privacy-safe visibility metadata; never retain raw drawing coordinates.
+pub(crate) fn drawing_visibility_projection(item: &Value) -> Option<Value> {
+    if item["tool"] != "create_drawing" || item["success"] != true {
+        return None;
+    }
+    item["contentItems"].as_array()?.iter().find_map(|c| {
+        if c["type"] != "inputText" {
+            return None;
+        }
+        let v: Value = serde_json::from_str(c["text"].as_str()?).ok()?;
+        let uid = v["chart_uid"].as_u64()?;
+        let count = v["drawings_added"].as_u64()?.min(1);
+        if count == 0 || (v["drawings_hidden"] != true && v["chart_visible"] != false) {
+            return None;
+        }
+        Some(serde_json::json!({"uid":uid,"count":count,"hidden":v["drawings_hidden"]==true}))
+    })
+}
+
 pub(crate) fn multi_tool_projection(item: &Value) -> Option<Value> {
     use serde_json::json;
     let name = item["tool"].as_str()?;
@@ -2965,6 +3025,60 @@ mod polish_tests {
         assert_eq!(settings.universe, tr_data::universe::Universe::Nasdaq);
         assert_eq!(settings.refresh, None);
     }
+    #[test]
+    fn precision_hidden_drawings_notice_survives_projection_and_offers_user_action() {
+        use serde_json::json;
+        for hidden in [true, false] {
+            let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
+            pane.start_prompt(Prompt { text: "mark levels".into(), requires_tools: true }).unwrap();
+            for i in 0..4 {
+                let mut trace = session_tool_trace(
+                    "create_drawing",
+                    json!({"symbol":"AAA","kind":"rectangle"}),
+                    json!({"id":i,"chart_uid":42,"drawings_added":1,"drawings_hidden":hidden,"chart_visible":false,"anchors":"never retain"}),
+                );
+                trace.id = format!("draw-{i}");
+                assert!(!format!("{:?}", trace.target_args).contains("never retain"));
+                pane.blocks.push(RenderedBlock::Tool(trace));
+            }
+            pane.finish_turn();
+            pane.running = false;
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            render(&ctx, dp(1000.), vec![], |ui| pane.conversation(ui, &mut actions));
+            let output = render(&ctx, dp(1000.), vec![], |ui| pane.conversation(ui, &mut actions));
+            let text = texts(&output);
+            let notice = if hidden {
+                "4 drawings added, but drawings are hidden on this chart ·"
+            } else {
+                "4 drawings added, but the target chart is not visible ·"
+            };
+            assert!(text.iter().any(|(s, _)| s == notice), "{text:?}");
+            assert!(actions.is_empty(), "showing the notice must not reveal drawings");
+            let pos = text.iter().find(|(s, _)| s == "Show drawings").unwrap().1.center();
+            for pressed in [true, false] {
+                render(
+                    &ctx,
+                    dp(1000.),
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    |ui| pane.conversation(ui, &mut actions),
+                );
+            }
+            assert!(actions.iter().any(|a| matches!(a, Action::ShowDrawings(42))));
+            pane.drawings_shown(42);
+            let output = render(&ctx, dp(1000.), vec![], |ui| pane.conversation(ui, &mut actions));
+            assert!(!texts(&output).iter().any(|(s, _)| s == notice));
+        }
+    }
+
     // Mirror DynamicToolCallThreadItem from the pinned app-server schema, including the
     // session privacy projection. Direct pane.wire fixtures miss content stripped there.
     fn session_tool_trace(tool: &str, args: Value, result: Value) -> Trace {

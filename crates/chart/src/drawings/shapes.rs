@@ -40,7 +40,17 @@ pub fn geometry(g: &Geometry<'_>) -> Vec<LabeledShape> {
             }
             shapes
         }
-        Tool::Rectangle => vec![(Shape::Rect(a, b), (!g.drawing.text.is_empty()).then(|| g.drawing.text.clone()))],
+        Tool::Rectangle => {
+            // Extend the rendered bounds, never the persisted timestamp/price anchors.
+            let (mut left, mut right) = if a[0] <= b[0] { (a, b) } else { (b, a) };
+            if g.drawing.extend_left {
+                left[0] = left[0].min(g.bounds[0]);
+            }
+            if g.drawing.extend_right {
+                right[0] = right[0].max(g.bounds[2]);
+            }
+            vec![(Shape::Rect(left, right), (!g.drawing.text.is_empty()).then(|| g.drawing.text.clone()))]
+        }
         _ => vec![(Shape::Rect(a, b), None)],
     }
 }
@@ -113,6 +123,45 @@ mod tests {
             closes: &[],
         };
         assert_eq!(geometry(&context), vec![(Shape::Rect([20., 30.], [120., 80.]), Some(drawing.text.clone()))]);
+    }
+
+    #[test]
+    fn precision_rectangle_extensions_reach_viewport_without_moving_anchors() {
+        let a = Anchor { ts: 1, price: 10. };
+        for reversed in [false, true] {
+            for (extend_left, extend_right) in [(false, false), (false, true), (true, false), (true, true)] {
+                let mut drawing = super::super::Drawing::new(Tool::Rectangle, a, a);
+                drawing.extend_left = extend_left;
+                drawing.extend_right = extend_right;
+                let saved = (drawing.a, drawing.b);
+                let (left, right) = ([20., 30.], [120., 80.]);
+                let context = Geometry {
+                    drawing: &drawing,
+                    points: if reversed { [right, left, [0., 0.]] } else { [left, right, [0., 0.]] },
+                    bounds: [0., 0., 200., 200.],
+                    price_y: &|p| p,
+                    measure_label: String::new(),
+                    text_size: [0., 0.],
+                    project: &|a| [a.ts as f64, a.price],
+                    pattern_points: Vec::new(),
+                    closes: &[],
+                };
+                assert_eq!(
+                    geometry(&context),
+                    vec![(
+                        Shape::Rect(
+                            [if extend_left { 0. } else { 20. }, 30.],
+                            [if extend_right { 200. } else { 120. }, 80.],
+                        ),
+                        None
+                    )]
+                );
+                if extend_right {
+                    assert_eq!(hit_distance(&context, [195., 30.]), 0.);
+                }
+                assert_eq!((drawing.a, drawing.b), saved);
+            }
+        }
     }
 
     #[test]

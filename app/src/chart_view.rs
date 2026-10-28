@@ -1655,7 +1655,7 @@ impl ChartState {
         let result = match plan {
             Plan::Drawings(next, id) => {
                 self.edit_drawings(Author::Agent, Some(turn.into()), |drawings| *drawings = next);
-                serde_json::json!({"id":id})
+                serde_json::json!({"id":id,"drawings_hidden":self.drawings_hidden})
             }
             Plan::Indicators(next, id) => {
                 // Use the user removal path (dependency cleanup and built cache),

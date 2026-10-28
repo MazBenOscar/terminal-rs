@@ -15,6 +15,7 @@ pub(crate) fn drawing_color(drawing: &Drawing) -> Color32 {
         || match drawing.zone_role {
             Some(tr_chart::drawings::ZoneRole::Support) => theme::up(),
             Some(tr_chart::drawings::ZoneRole::Resistance) => theme::down(),
+            Some(tr_chart::drawings::ZoneRole::InPlay) => theme::muted(),
             None => theme::cyan(),
         },
         |[r, g, b]| Color32::from_rgb(r, g, b),
@@ -46,7 +47,7 @@ pub(crate) fn label_bounds(context: &Paint<'_>, shapes: &[LabeledShape], tool: T
                 DrawingShape::VLine(x) => {
                     Align2::LEFT_TOP.anchor_size(pos2(*x as f32 + dp(3.), rect.top() + dp(3.)), size)
                 }
-                DrawingShape::Segment(a, b) => {
+                DrawingShape::Segment(a, b) | DrawingShape::DashedSegment(a, b) => {
                     let (at, align) = if a == b {
                         (pos2(a[0] as f32 - dp(4.), a[1] as f32 - dp(1.)), Align2::RIGHT_BOTTOM)
                     } else {
@@ -242,7 +243,7 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
     // label_text uses label_plate too; wrapped labels below use it directly.
     for (shape, label) in shapes {
         match shape {
-            DrawingShape::Segment(a, b) => {
+            DrawingShape::Segment(a, b) | DrawingShape::DashedSegment(a, b) => {
                 if let Some(label) = label {
                     label_text(
                         p,
@@ -301,7 +302,7 @@ fn primitives(context: &Paint<'_>, shapes: Vec<LabeledShape>, style: RectStyle) 
                     }
                 }
             }
-            DrawingShape::DashedSegment(..) | DrawingShape::Polygon(_) => {}
+            DrawingShape::Polygon(_) => {}
         }
     }
 }
