@@ -170,6 +170,125 @@ async fn initialize_models_and_workflow_outcomes_are_used_without_inventing_effo
 }
 
 #[tokio::test]
+async fn session_models_select_supported_method_and_reapply_saved_choice() {
+    for config in [false, true] {
+        let (backend, mut read, mut write, _) = fake();
+        let metadata = if config {
+            json!({"configOptions":[
+                {"id":"agent","category":"mode","type":"select","currentValue":"build",
+                 "options":[{"value":"build","name":"Build"}]},
+                {"id":"provider-model","category":"model","type":"select","currentValue":"plan/a",
+                 "options":[{"group":"plan","name":"Token plan","options":[
+                     {"value":"plan/a","name":"Model A"},{"value":"plan/b","name":"Model B"}]}]}]})
+        } else {
+            json!({"models":{"currentModelId":"plan/a","availableModels":[
+                {"modelId":"plan/a","name":"Model A"},{"modelId":"plan/b","name":"Model B"}]},
+                "modes":{"currentModeId":"build","availableModes":[{"id":"build","name":"Build"}]}})
+        };
+        let server = async {
+            let init = receive(&mut read).await;
+            send(&mut write, crate::mcp::success(init["id"].clone(), json!({"protocolVersion":1}))).await;
+            let new = receive(&mut read).await;
+            assert_eq!(new["method"], "session/new");
+            let mut result = metadata.clone();
+            result["sessionId"] = json!("first");
+            send(&mut write, crate::mcp::success(new["id"].clone(), result)).await;
+        };
+        let (result, ()) = tokio::join!(backend.start_thread(options()), server);
+        result.unwrap();
+        let models = backend.list_models().await.unwrap();
+        assert_eq!(models.iter().map(|m| m.display_name.as_str()).collect::<Vec<_>>(), ["plan/a", "plan/b"]);
+        assert!(models[0].is_default && !models[1].is_default);
+        let method = if config { "session/set_config_option" } else { "session/set_model" };
+        let server = async {
+            let set = receive(&mut read).await;
+            assert_eq!(set["method"], method);
+            assert_eq!(set["params"]["sessionId"], "first");
+            if config {
+                assert_eq!(set["params"]["configId"], "provider-model");
+                assert_eq!(set["params"]["value"], "plan/b");
+                assert!(set["params"].get("modelId").is_none());
+            } else {
+                assert_eq!(set["params"]["modelId"], "plan/b");
+            }
+            send(&mut write, crate::mcp::success(set["id"].clone(), json!({}))).await;
+        };
+        let (result, ()) = tokio::join!(backend.select_model("plan/b"), server);
+        result.unwrap();
+        assert_eq!(*backend.preferred_model.lock().unwrap(), "plan/b");
+        // Simulate the settings boundary and a newly connected child. Neither
+        // persistence nor reconnect reads any installed provider configuration.
+        let saved = serde_json::to_string(&*backend.preferred_model.lock().unwrap()).unwrap();
+        let (next, mut next_read, mut next_write, _) = fake();
+        next.remember_model(serde_json::from_str(&saved).unwrap());
+        let server = async {
+            let init = receive(&mut next_read).await;
+            send(&mut next_write, crate::mcp::success(init["id"].clone(), json!({"protocolVersion":1}))).await;
+            let new = receive(&mut next_read).await;
+            let mut result = metadata.clone();
+            result["sessionId"] = json!("next");
+            send(&mut next_write, crate::mcp::success(new["id"].clone(), result)).await;
+            let set = receive(&mut next_read).await;
+            assert_eq!(set["method"], method);
+            assert_eq!(set["params"]["sessionId"], "next");
+            assert_eq!(set["params"][if config { "value" } else { "modelId" }], "plan/b");
+            send(&mut next_write, crate::mcp::success(set["id"].clone(), json!({}))).await;
+        };
+        let (result, ()) = tokio::join!(next.start_thread(options()), server);
+        assert_eq!(result.unwrap(), "next");
+    }
+}
+
+#[test]
+fn model_labels_show_variants_without_changing_selection_ids() {
+    for (id, name, label) in [
+        ("xiaomi/mimo-v2.6-pro-ultraspeed", "MiMo", "xiaomi/mimo-v2.6-pro-ultraspeed"),
+        ("deepseek/deepseek-v4-pro/high", "DeepSeek", "deepseek/deepseek-v4-pro · high"),
+        ("minimax-coding-plan/MiniMax-M3", "MiniMax", "minimax-coding-plan/MiniMax-M3"),
+        ("unqualified", "Reported model", "Reported model"),
+    ] {
+        let model = acp_model(id, Some(name), true);
+        assert_eq!(model.display_name, label);
+        assert_eq!(model.id, id);
+        assert_eq!(model.model, id);
+        assert!(model.is_default);
+        assert!(model.supported_reasoning_efforts.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn model_category_wins_over_legacy_models_and_modes_never_become_models() {
+    let (backend, _, _, _) = fake();
+    let current = "xiaomi/mimo-v2.6-pro-ultraspeed";
+    let ids = [current, "deepseek/deepseek-v4-pro/high", "minimax-coding-plan/MiniMax-M3"];
+    // Both forms are returned by mimo 0.1.16. Deliberately give the legacy
+    // catalogue a different value to prove the category-based one takes priority.
+    let modes = json!({"id":"model","category":"mode","type":"select","currentValue":"build",
+        "options":[{"value":"build","name":"Build"},{"value":"plan","name":"Plan"}]});
+    let config = json!({"id":"provider-model","category":"model","type":"select","currentValue":current,
+        "options":ids.iter().map(|id| json!({"value":id,"name":"Reported name"})).collect::<Vec<_>>()});
+    backend.update_models(&json!({"configOptions":[modes.clone(),config],
+        "models":{"currentModelId":"legacy","availableModels":[{"modelId":"legacy"}]}}));
+    assert_eq!(backend.models.lock().unwrap().iter().map(|m| m.id.clone()).collect::<Vec<_>>(), ids);
+    assert_eq!(backend.model_config.lock().unwrap().as_deref(), Some("provider-model"));
+    // No usable model config: mode-only and empty model configs both fall back.
+    for empty_config in [false, true] {
+        let mut options = vec![modes.clone()];
+        if empty_config {
+            options.push(json!({"id":"provider-model","category":"model","type":"select","options":[]}));
+        }
+        backend.update_models(&json!({"configOptions":options,
+            "models":{"currentModelId":current,
+                "availableModels":ids.iter().map(|id| json!({"modelId":id})).collect::<Vec<_>>()}}));
+        assert!(backend.model_config.lock().unwrap().is_none());
+        let models = backend.models.lock().unwrap();
+        assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ids);
+        assert!(models[0].is_default && !models[1].is_default && !models[2].is_default);
+        assert_eq!(models[1].display_name, "deepseek/deepseek-v4-pro · high");
+    }
+}
+
+#[tokio::test]
 async fn foreign_permission_rejected_once_cancelled_and_killed() {
     let (backend, mut read, mut write, killed) = fake();
     let mut events = backend.events();
@@ -336,7 +455,7 @@ async fn malformed_acp_json_emits_clear_error() {
 }
 
 #[test]
-fn tool_provenance_is_exact_and_sandbox_has_no_tcp_listener_or_foreign_exec() {
+fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
     let (output, _) = mpsc::channel(1);
     let rpc = Rpc {
         output,
@@ -363,7 +482,7 @@ fn tool_provenance_is_exact_and_sandbox_has_no_tcp_listener_or_foreign_exec() {
     }
     let profile = sandbox_profile(
         Path::new("/private/data/agent/mimo"),
-        Path::new("/private/data/agent/mimo-home"),
+        &[PathBuf::from("/private/data/agent/mimo-home")],
         Path::new("/opt/mimo/bin/mimo"),
         Path::new("/app/terminal-rs"),
         Path::new("/private/data/agent/mcp.sock"),
@@ -371,7 +490,7 @@ fn tool_provenance_is_exact_and_sandbox_has_no_tcp_listener_or_foreign_exec() {
     )
     .unwrap();
     assert!(profile.contains("(deny default)"));
-    assert!(!profile.contains("network-inbound") && !profile.contains("network-bind"));
+    assert_localhost_and_system_rules(&profile);
     assert!(!profile.contains("/bin/bash") && !profile.contains("/bin/sh"));
     assert!(profile.contains("(literal \"/private/data/agent/mcp.sock\")"));
     for binary in [
@@ -382,11 +501,15 @@ fn tool_provenance_is_exact_and_sandbox_has_no_tcp_listener_or_foreign_exec() {
         "/Users/test/.codex/mimo",
         "/Users/test/.mimocode/mimo",
         "/Users/test/Documents/mimo",
+        "/Users/test/.config/opencode/bin/mimo",
+        "/Users/test/.ssh/bin/mimo",
+        "/Users/test/.codex/bin/mimo",
+        "/Users/test/Library/Caches/mimo/bin/mimo",
     ] {
         assert!(
             sandbox_profile(
                 Path::new("/private/data/agent/mimo"),
-                Path::new("/private/data/agent/mimo-home"),
+                &[PathBuf::from("/private/data/agent/mimo-home")],
                 Path::new(binary),
                 Path::new("/app/terminal-rs"),
                 Path::new("/private/data/agent/mcp.sock"),
@@ -396,6 +519,205 @@ fn tool_provenance_is_exact_and_sandbox_has_no_tcp_listener_or_foreign_exec() {
             "{binary}"
         );
     }
+}
+
+fn assert_localhost_and_system_rules(profile: &str) {
+    assert!(profile.contains("(subpath \"/usr\")"));
+    assert!(!profile.contains("(subpath \"/usr/lib\")"));
+    let network: Vec<_> = profile.lines().filter(|line| line.starts_with("(allow network-")).collect();
+    assert_eq!(
+        network,
+        [
+            "(allow network-outbound (literal \"/private/data/agent/mcp.sock\") (literal \"/private/var/run/mDNSResponder\") (remote tcp \"*:443\"))",
+            "(allow network-bind (local ip \"localhost:*\"))",
+            "(allow network-inbound (local ip \"localhost:*\"))",
+            "(allow network-outbound (remote ip \"localhost:*\"))",
+        ]
+    );
+}
+
+#[test]
+fn own_and_private_profiles_have_narrow_write_and_read_roots() {
+    let user = Path::new("/Users/test");
+    let own: Vec<_> = OWN_DIRECTORIES.iter().map(|relative| user.join(relative)).collect();
+    let private = vec![PathBuf::from("/private/data/agent/mimo-home")];
+    for (roots, is_own) in [(&own, true), (&private, false)] {
+        let profile = sandbox_profile(
+            Path::new("/private/data/agent/workspace"),
+            roots,
+            Path::new("/opt/mimo/bin/mimo"),
+            Path::new("/app/terminal-rs"),
+            Path::new("/private/data/agent/mcp.sock"),
+            user,
+        )
+        .unwrap();
+        assert!(profile.starts_with("(version 1)\n(deny default)"));
+        for path in &own {
+            let grant = format!("(subpath {})", crate::isolation::quote(path).unwrap());
+            assert_eq!(profile.matches(&grant).count(), if is_own { 2 } else { 0 });
+        }
+        assert_eq!(profile.contains("(subpath \"/private/data/agent/mimo-home\")"), !is_own);
+        assert!(profile.contains("(allow file-write* (subpath \"/private/data/agent/workspace\")"));
+        assert!(!profile.contains("(subpath \"/Users/test\")"));
+        for forbidden in
+            ["/Users/test/.config/opencode", "/Users/test/.codex", "/Users/test/.ssh", "/Users/test/Library"]
+        {
+            assert!(!profile.contains(forbidden), "{profile}");
+        }
+        assert_localhost_and_system_rules(&profile);
+    }
+    // The normal installed binary tree is read-only in Private; Own additionally
+    // grants its .mimocode root by explicit consent, never the home root.
+    assert!(
+        sandbox_profile(
+            Path::new("/private/workspace"),
+            &own,
+            Path::new("/Users/test/.mimocode/bin/mimo"),
+            Path::new("/app/terminal-rs"),
+            Path::new("/private/mcp.sock"),
+            user
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn own_environment_unsets_xdg_and_plugins_are_opt_in() {
+    let source = [
+        ("HOME", "/wrong"),
+        ("PATH", "/bin"),
+        ("TMPDIR", "/shared/tmp"),
+        ("LANG", "en_US.UTF-8"),
+        ("LC_CTYPE", "UTF-8"),
+        ("API_KEY", "secret"),
+        ("CODEX_HOME", "/wrong"),
+        ("XDG_CONFIG_HOME", "/wrong"),
+        ("XDG_DATA_HOME", "/wrong"),
+        ("XDG_CACHE_HOME", "/wrong"),
+        ("XDG_STATE_HOME", "/wrong"),
+    ]
+    .map(|(key, value)| (key.into(), value.into()));
+    let own = mimo_environment(
+        source.clone(),
+        Path::new("/private/workspace"),
+        Path::new("/private/workspace/home"),
+        MimoProfile::Own,
+    );
+    assert_eq!(own.get(std::ffi::OsStr::new("HOME")).unwrap(), "/private/workspace/home");
+    assert_eq!(own.get(std::ffi::OsStr::new("TMPDIR")).unwrap(), "/private/workspace/tmp");
+    assert_eq!(own.len(), 5);
+    assert!(own.keys().all(|key| !key.to_string_lossy().starts_with("XDG_")));
+    let private = mimo_environment(
+        source,
+        Path::new("/private/workspace"),
+        Path::new("/private/mimo-home"),
+        MimoProfile::Private,
+    );
+    assert_eq!(private.get(std::ffi::OsStr::new("HOME")).unwrap(), "/private/mimo-home");
+    assert_eq!(private.get(std::ffi::OsStr::new("XDG_CONFIG_HOME")).unwrap(), "/private/mimo-home/config");
+    assert_eq!(private.get(std::ffi::OsStr::new("XDG_DATA_HOME")).unwrap(), "/private/mimo-home/data");
+    assert!(!private.contains_key(std::ffi::OsStr::new("XDG_CACHE_HOME")));
+    assert!(!private.contains_key(std::ffi::OsStr::new("XDG_STATE_HOME")));
+    assert_eq!(acp_arguments(false), ["acp", "--pure"]);
+    assert_eq!(acp_arguments(true), ["acp"]);
+}
+
+#[test]
+fn own_shadow_home_links_only_existing_roots_with_private_permissions_and_cleanup() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target").canonicalize().unwrap();
+    let fixture = root.join(format!("mimo-shadow-home-{}", std::process::id()));
+    std::fs::DirBuilder::new().mode(0o700).create(&fixture).unwrap();
+    let _cleanup = Workspace(fixture.clone());
+    // Exercise every subset, including no setup and all five installed roots.
+    for mask in 0..(1 << OWN_DIRECTORIES.len()) {
+        let case = fixture.join(mask.to_string());
+        std::fs::create_dir(&case).unwrap();
+        let real = case.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let expected: Vec<_> = OWN_DIRECTORIES
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1 << index) != 0)
+            .map(|(_, relative)| real.join(relative))
+            .collect();
+        for directory in &expected {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let private = case.join("workspace");
+        std::fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+        let workspace = Workspace(private.clone());
+        let (home, writable) = own_shadow_home(&private, &real).unwrap();
+        assert_eq!(home, private.join("home"));
+        assert_eq!(writable, expected);
+        let env = mimo_environment([], &private, &home, MimoProfile::Own);
+        assert_eq!(env.get(std::ffi::OsStr::new("HOME")), Some(&home.clone().into_os_string()));
+        assert!(env.keys().all(|key| !key.to_string_lossy().starts_with("XDG_")));
+        let parents = ["", ".config", ".local", ".local/share", ".local/state", ".cache"];
+        for relative in parents {
+            let directory = home.join(relative);
+            let metadata = std::fs::symlink_metadata(&directory).unwrap();
+            assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            let mut entries: Vec<_> =
+                std::fs::read_dir(&directory).unwrap().map(|entry| entry.unwrap().path()).collect();
+            let mut allowed: Vec<_> = parents
+                .iter()
+                .filter(|p| !p.is_empty())
+                .map(|p| home.join(p))
+                .chain(expected.iter().map(|p| home.join(p.strip_prefix(&real).unwrap())))
+                .filter(|p| p.parent() == Some(directory.as_path()))
+                .collect();
+            entries.sort();
+            allowed.sort();
+            assert_eq!(entries, allowed);
+        }
+        for relative in OWN_DIRECTORIES {
+            let target = real.join(relative);
+            let link = home.join(relative);
+            if expected.contains(&target) {
+                assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+                assert_eq!(std::fs::read_link(&link).unwrap(), target);
+            } else {
+                assert!(!link.exists());
+                assert!(!target.exists());
+            }
+        }
+        for absent in [".claude.json", ".claude", ".config/opencode", ".codex", ".ssh"] {
+            assert_eq!(std::fs::symlink_metadata(home.join(absent)).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        }
+        drop(workspace);
+        assert!(!home.exists());
+        assert!(!private.exists());
+        assert_eq!(own_directories(&real).unwrap(), expected);
+    }
+}
+
+#[test]
+fn own_directory_resolution_never_creates_and_refuses_symlink_redirects() {
+    use std::os::unix::fs::symlink;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target").canonicalize().unwrap();
+    let fixture = root.join(format!("mimo-own-paths-{}", std::process::id()));
+    std::fs::create_dir(&fixture).unwrap();
+    let _cleanup = Workspace(fixture.clone());
+    let home = fixture.join("home");
+    std::fs::create_dir(&home).unwrap();
+    assert!(own_directories(&home).unwrap().is_empty());
+    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+    for relative in OWN_DIRECTORIES {
+        std::fs::create_dir_all(home.join(relative)).unwrap();
+    }
+    assert_eq!(own_directories(&home).unwrap(), OWN_DIRECTORIES.map(|relative| home.join(relative)));
+    std::fs::remove_dir(home.join(".mimocode")).unwrap();
+    let outside = fixture.join("unrelated");
+    std::fs::create_dir(&outside).unwrap();
+    symlink(&outside, home.join(".mimocode")).unwrap();
+    assert!(own_directories(&home).is_err());
+    std::fs::remove_file(home.join(".mimocode")).unwrap();
+    std::fs::remove_dir_all(home.join(".config")).unwrap();
+    std::fs::create_dir(outside.join("mimocode")).unwrap();
+    symlink(&outside, home.join(".config")).unwrap();
+    assert!(own_directories(&home).is_err());
 }
 
 #[tokio::test]

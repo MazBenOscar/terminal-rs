@@ -42,7 +42,7 @@ const PRIVACY_GROUPS: &[(&str, &str)] = &[
 const MIMO_PRIVACY_GROUPS: &[(&str, &str)] = &[
     (
         "What is sent",
-        "Your prompts, chart data, tool results and the startup isolation self-test go to the provider configured in mimo's private home. This may be MiniMax (China-hosted), not your ChatGPT account. Review that provider's terms and data licence before continuing. News tools share local headlines and filing metadata, omit summaries by default, and never fetch on demand. Screenshots are disabled.",
+        "Your prompts, chart data, tool results and the startup isolation self-test go to the provider configured in your selected mimo profile, not your ChatGPT account. mimo is Xiaomi MiMo Code (an OpenCode fork); review the actual provider you select. Review that provider's terms and data licence before continuing. News tools share local headlines and filing metadata, omit summaries by default, and never fetch on demand. Screenshots are disabled.",
     ),
     (
         "What the agent can change",
@@ -50,7 +50,7 @@ const MIMO_PRIVACY_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "What is stored on this Mac",
-        "mimo uses a separate persistent private login home under the app data directory, never your personal CLI home. Its empty workspaces are removed after child cleanup. Provider-managed login/session data can remain in that private home; terminal-rs does not save raw ACP transcripts. Layouts contain choices, not conversations or sign-in details.",
+        "By default mimo uses your installed providers, keys and models in the five mimocode directories. Settings › Agent can instead select a separate persistent private login under the app data directory. mimo can update the selected profile's login/session data. Empty workspaces are removed after child cleanup; terminal-rs does not save raw ACP transcripts. Layouts contain choices, not conversations or sign-in details.",
     ),
 ];
 
@@ -65,6 +65,7 @@ pub enum ToolsMode {
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub model: String,
+    pub mimo_model: String,
     pub effort: String,
     pub tools: ToolsMode,
     pub pinned_chart: Option<u64>,
@@ -80,6 +81,24 @@ impl ToolsMode {
 }
 
 impl Settings {
+    pub fn model(&self, backend: &str) -> &String {
+        if backend == "mimo" { &self.mimo_model } else { &self.model }
+    }
+
+    pub fn model_mut(&mut self, backend: &str) -> &mut String {
+        if backend == "mimo" { &mut self.mimo_model } else { &mut self.model }
+    }
+
+    pub fn select_defaults_for(&mut self, models: &[Model], backend: &str) {
+        if backend != "mimo" {
+            self.select_defaults(models);
+        } else if !models.iter().any(|m| m.id == self.mimo_model)
+            && let Some(model) = models.iter().find(|m| m.is_default).or_else(|| models.first())
+        {
+            self.mimo_model.clone_from(&model.id);
+        }
+    }
+
     pub fn tool_set(&self) -> ToolSet {
         self.tool_set_if_available(crate::agent_bridge::agent_edit_tools_available())
     }
@@ -778,8 +797,8 @@ impl AgentPane {
         let model = self
             .models
             .iter()
-            .find(|m| m.id == self.settings.model)
-            .map_or(self.settings.model.as_str(), |m| m.model.as_str());
+            .find(|m| m.id == *self.settings.model(self.backend))
+            .map_or(self.settings.model(self.backend).as_str(), |m| m.model.as_str());
         if let Some(reset) = blocking_reset(value, model) {
             self.transition(Onboarding::RateLimited { reset });
         } else if matches!(self.state, Onboarding::RateLimited { .. }) {
@@ -1005,9 +1024,9 @@ impl AgentPane {
         if matches!(self.state, Onboarding::RateLimited { .. }) && !self.limits_value.is_null() {
             self.set_limits(&self.limits_value.clone());
         }
-        let old_model = self.settings.model.clone();
+        let old_model = self.settings.model(self.backend).clone();
         self.header(ui, pin_label, &mut actions);
-        if old_model != self.settings.model {
+        if old_model != *self.settings.model(self.backend) {
             self.set_limits(&self.limits_value.clone());
         }
         ui.add_space(dp(6.0));
@@ -1106,7 +1125,7 @@ impl AgentPane {
         agent_markdown::show(ui, &[agent_markdown::DisplayBlock::Heading(2, self.state.title().into())]);
         let description = if self.backend == "mimo" {
             match self.state {
-                Onboarding::Dormant => "Uses mimo's private provider account, not ChatGPT. Chart tools use the external MCP policy in Settings › Agent.".into(),
+                Onboarding::Dormant => "Uses the selected mimo profile's provider account, not ChatGPT. Chart tools use the external MCP policy in Settings › Agent.".into(),
                 Onboarding::Checking => "Checking ACP and running the isolation canary with your configured provider before readiness.".into(),
                 _ => self.state.description(),
             }
@@ -1771,8 +1790,8 @@ impl AgentPane {
     }
 
     fn header(&mut self, ui: &mut Ui, pin_label: &str, actions: &mut Vec<Action>) {
-        self.settings.select_defaults(&self.models);
-        let model = self.models.iter().find(|m| m.id == self.settings.model);
+        self.settings.select_defaults_for(&self.models, self.backend);
+        let model = self.models.iter().find(|m| m.id == *self.settings.model(self.backend));
         let model_label = if self.backend == "mimo" {
             format!("mimo · {}", model.map_or("mimo default", |m| m.display_name.as_str()))
         } else {
@@ -1874,15 +1893,15 @@ impl AgentPane {
             .on_hover_text("Model and reasoning effort; costly efforts use more of your subscription and take longer.")
             .on_disabled_hover_text("Start the agent to load available models and reasoning efforts.");
         egui::Popup::menu(&response).show(|ui| {
-            let old = self.settings.model.clone();
+            let old = self.settings.model(self.backend).clone();
             for model in &self.models {
-                ui.selectable_value(&mut self.settings.model, model.id.clone(), &model.display_name);
+                ui.selectable_value(self.settings.model_mut(self.backend), model.id.clone(), &model.display_name);
             }
-            if old != self.settings.model {
+            if old != *self.settings.model(self.backend) {
                 self.settings.effort.clear();
             }
-            self.settings.select_defaults(&self.models);
-            if let Some(model) = self.models.iter().find(|m| m.id == self.settings.model)
+            self.settings.select_defaults_for(&self.models, self.backend);
+            if let Some(model) = self.models.iter().find(|m| m.id == *self.settings.model(self.backend))
                 && !model.supported_reasoning_efforts.is_empty()
             {
                 ui.separator();
@@ -5567,13 +5586,14 @@ mod tests {
     fn settings_roundtrip_contains_only_choices_and_edit_requires_availability() {
         let settings = Settings {
             model: "m".into(),
+            mimo_model: "provider/model".into(),
             effort: "max".into(),
             tools: ToolsMode::Edit,
             pinned_chart: Some(41),
             response_style: ResponseStyle::Detailed,
         };
         let value = serde_json::to_value(crate::layouts::PaneSettings::Agent(settings.clone())).unwrap();
-        assert_eq!(value["Agent"].as_object().unwrap().len(), 5);
+        assert_eq!(value["Agent"].as_object().unwrap().len(), 6);
         assert_eq!(
             serde_json::from_value::<crate::layouts::PaneSettings>(value).unwrap(),
             crate::layouts::PaneSettings::Agent(settings.clone())

@@ -20,6 +20,7 @@ pub enum Command {
     CancelLogin,
     ReopenLogin,
     RefreshLimits,
+    SelectModel(String),
     Turn(Box<BridgeTurn>),
     WorkflowResults(Vec<tr_agent::codex::WorkflowResult>),
     Interrupt,
@@ -157,7 +158,8 @@ impl Session {
         executor: AppExecutor,
         parent: PathBuf,
         tools: tr_agent_tools::ToolSet,
-        backend: crate::agent_mcp::Backend,
+        config: crate::agent_mcp::Settings,
+        mimo_model: String,
     ) -> Self {
         let (sender, receive) = mpsc::unbounded_channel();
         let (shutdown, stopping) = watch::channel(());
@@ -176,8 +178,8 @@ impl Session {
                     return Ok(());
                 }
                 let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-                if backend == crate::agent_mcp::Backend::Mimo {
-                    runtime.block_on(owner_acp(receive, stopping, &background, parent, tools))
+                if config.backend == crate::agent_mcp::Backend::Mimo {
+                    runtime.block_on(owner_acp(receive, stopping, &background, parent, tools, config, mimo_model))
                 } else {
                     runtime.block_on(owner(receive, stopping, &background, executor, parent, tools))
                 }
@@ -417,6 +419,8 @@ async fn owner_acp(
     inbox: &Inbox,
     parent: PathBuf,
     tools: tr_agent_tools::ToolSet,
+    config: crate::agent_mcp::Settings,
+    mimo_model: String,
 ) -> Result<()> {
     use tr_agent::acp::AcpBackend;
     use tr_agent::transport::WireEvent;
@@ -425,11 +429,12 @@ async fn owner_acp(
         inbox.state(Onboarding::Stopped { reason: AcpBackend::missing_message().into(), unsafe_backend: false });
         return Ok(());
     }
-    let client = AcpBackend::launch(&parent).await?;
+    let client = AcpBackend::launch(&parent, config.mimo_profile, config.mimo_load_plugins).await?;
     let run = async {
         inbox.state(Onboarding::Checking);
         client.initialize().await?;
         client.canary().await?;
+        client.remember_model(mimo_model);
         let registry = tr_agent_tools::Registry::new(tools);
         let instructions = tr_agent::bridge::session_instructions(&bridge_options(String::new(), tools), &registry)
             .replace(
@@ -488,6 +493,11 @@ async fn owner_acp(
                         }
                     }
                     Some(Command::Interrupt) => { interrupted = true; client.interrupt().await?; }
+                    Some(Command::SelectModel(model)) => {
+                        if let Err(error) = client.select_model(&model).await {
+                            inbox.push(Event::Notice(scrub_text(&error.to_string())));
+                        }
+                    }
                     Some(Command::RefreshLimits) => inbox.state(Onboarding::Ready),
                     Some(Command::WorkflowResults(mut results)) => {
                         workflow_results.append(&mut results);

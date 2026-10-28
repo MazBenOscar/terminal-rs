@@ -62,7 +62,26 @@ impl TerminalApp {
             ui.selectable_value(&mut self.agent_config.backend, Backend::Codex, "Codex");
             ui.selectable_value(&mut self.agent_config.backend, Backend::Mimo, "mimo");
         });
-        ui.label("mimo uses the MCP switch and its read-only/edit policy above. Switching backend starts a new conversation. mimo uses ACP over stdio. Private-home authentication and sandbox/tool compatibility require manual verification; no personal credentials or CLI configuration are inherited.");
+        ui.label("mimo uses ACP over stdio and the MCP read-only/edit policy above. Changing backend or mimo profile starts a new conversation. Sandbox/tool compatibility still requires manual verification.");
+        if self.agent_config.backend == Backend::Mimo {
+            use crate::agent_mcp::MimoProfile;
+            ui.radio_value(
+                &mut self.agent_config.mimo_profile,
+                MimoProfile::Own,
+                "Use my mimo setup (providers, keys and models from your installed mimo)",
+            );
+            ui.small("Shares only the five mimocode directories with mimo; it may update your existing setup. No other personal home access is granted.");
+            ui.radio_value(
+                &mut self.agent_config.mimo_profile,
+                MimoProfile::Private,
+                "Private login (separate sign-in inside terminal-rs)",
+            );
+            ui.small("Uses <data>/agent/mimo-home; provider setup/sign-in is a separate manual step. Your installed login is not used.");
+            ui.collapsing("Advanced", |ui| {
+                ui.checkbox(&mut self.agent_config.mimo_load_plugins, "Load mimo plugins");
+                ui.small("Off by default (--pure). Enable for plugin-configured providers; plugins run with the selected profile's sandbox access.");
+            });
+        }
         if old != self.agent_config {
             self.apply_agent_settings(&old);
             ui.ctx().request_repaint();
@@ -70,7 +89,11 @@ impl TerminalApp {
     }
 
     fn apply_agent_settings(&mut self, old: &crate::agent_mcp::Settings) {
-        if old.backend != self.agent_config.backend {
+        if old.backend != self.agent_config.backend
+            || (self.agent_config.backend == crate::agent_mcp::Backend::Mimo
+                && (old.mimo_profile != self.agent_config.mimo_profile
+                    || old.mimo_load_plugins != self.agent_config.mimo_load_plugins))
+        {
             let settings = self.agent_pane.settings.clone();
             self.agent_pane.session = None;
             self.agent_pane = Default::default();
@@ -876,7 +899,7 @@ impl TerminalApp {
                     }
                 }
                 Event::Models(models) => {
-                    self.agent_pane.settings.select_defaults(&models);
+                    self.agent_pane.settings.select_defaults_for(&models, self.agent_pane.backend);
                     self.agent_pane.models = models;
                 }
                 Event::Limits(limits) => self.agent_pane.set_limits(&limits),
@@ -944,7 +967,16 @@ impl TerminalApp {
             .chord(crate::prefs::Action::FocusAgentInput)
             .map_or_else(|| "Shortcut unassigned".into(), |chord| chord.display());
         self.refresh_agent_undo();
+        let old_mimo_model = self.agent_pane.settings.mimo_model.clone();
         let actions = self.agent_pane.show(ui, &pin_label, pane_id(id));
+        if self.agent_config.backend == crate::agent_mcp::Backend::Mimo
+            && old_mimo_model != self.agent_pane.settings.mimo_model
+        {
+            if !self.agent_pane.running && self.agent_pane.session.is_some() {
+                self.agent_command(Command::SelectModel(self.agent_pane.settings.mimo_model.clone()));
+            }
+            self.autosave();
+        }
         for action in actions {
             self.agent_action(ui.ctx(), id, action);
         }
@@ -970,7 +1002,8 @@ impl TerminalApp {
             AppExecutor::new(self),
             tr_alerts::data_dir(),
             tools,
-            self.agent_config.backend,
+            self.agent_config.clone(),
+            self.agent_pane.settings.mimo_model.clone(),
         ));
     }
 
@@ -1134,8 +1167,8 @@ impl TerminalApp {
             .agent_pane
             .models
             .iter()
-            .find(|m| m.id == self.agent_pane.settings.model)
-            .map_or_else(|| self.agent_pane.settings.model.clone(), |m| m.model.clone());
+            .find(|m| m.id == *self.agent_pane.settings.model(self.agent_pane.backend))
+            .map_or_else(|| self.agent_pane.settings.model(self.agent_pane.backend).clone(), |m| m.model.clone());
         let workflow_context = std::mem::take(&mut self.agent_pane.workflows.context);
         self.agent_command(Command::Turn(Box::new(BridgeTurn {
             input: TurnInput {

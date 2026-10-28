@@ -22,7 +22,7 @@ Enabling MCP gives **any process running as your user** access to the exposed
 chart, market-data and local news tools. Only enable it for clients you trust.
 Read-only does not mean no disclosure: tool results can be sent to the external
 client's model provider. Observe your market-data redistribution licence and the
-provider's privacy/jurisdiction terms (including MiniMax when using mimo).
+provider's privacy/jurisdiction terms (including Xiaomi MiMo when selected in mimo).
 
 ## Register the headless shim
 
@@ -151,9 +151,53 @@ approval cards apply to workflow writes, not to every chart edit.
 
 ## mimo backend
 
+mimo is **Xiaomi MiMo Code**, an OpenCode fork. Its ACP agentInfo
+name is `OpenCode`; this does not mean it uses `~/.config/opencode`.
 `AcpBackend` implements the existing `AgentBackend` trait separately from Codex's
-wire transport. Binary discovery checks PATH, then `~/.mimocode/bin/mimo` metadata;
-no personal CLI configuration or credential file is opened by terminal-rs.
+wire transport. Binary discovery checks PATH, then `~/.mimocode/bin/mimo` metadata.
+terminal-rs checks directory/binary metadata only: it never opens or copies your
+personal provider configuration or credentials. The sandboxed mimo child can
+read and update the selected profile, including its keys and provider-managed data.
+
+### Profiles and plugins
+
+Settings › Agent shows these choices when **Backend: mimo** is selected:
+
+- **Use my mimo setup (providers, keys and models from your installed mimo)**
+  (`mimo_profile: "Own"`, the default, including older settings without the field).
+  Uses your existing installed providers, token plan, authentication and model
+  catalogue. The child receives a per-launch **shadow HOME** at
+  `<private workspace>/home`, not the real home. This 0700 directory contains only
+  symlinks to the five real mimo roots listed below that already exist, plus 0700
+  parent directories (`.config`, `.local`, `.local/share`, `.local/state`, `.cache`).
+  `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` and `XDG_STATE_HOME` are
+  **unset**, so mimo finds its installed setup through those links. Inherited
+  custom XDG locations are intentionally not honoured. The shadow home is removed
+  with the private workspace; installed data is not copied or removed.
+
+  **Why not the real HOME?** Manager live testing of mimo 0.1.16 found that it
+  probes `~/.claude.json` at startup and exits fatally on sandbox `EPERM`. The
+  shadow home makes unrelated probes (`~/.claude.json`, `~/.claude`,
+  `~/.config/opencode`, etc.) absent (`ENOENT`, which mimo tolerates), without
+  granting access to any real Claude/OpenCode/Codex configuration or the real
+  home root. The sandbox grants the resolved real mimo paths, not broader home
+  access through the symlinks.
+- **Private login (separate sign-in inside terminal-rs)**
+  (`mimo_profile: "Private"`). Preserves the separate owned 0700 login home at
+  `<data dir>/agent/mimo-home`, with HOME there and XDG config/data set to its
+  `config`/`data` children. Existing installed credentials are not used; provider
+  setup/sign-in remains the separate manual step below, not a new in-app login UI.
+  To remove this private login, stop the backend/close the app, then delete only
+  **`<data dir>/agent/mimo-home`**. This does not remove your installed mimo login.
+
+The collapsed **Advanced** section has **Load mimo plugins**, off by default
+(`mimo_load_plugins: false`). Off keeps `mimo acp --pure`; on drops `--pure` and
+runs `mimo acp`. **Providers configured via plugins need this toggle.** Plugins
+run inside the same sandbox with access to the selected profile's data and keys;
+this is additional code you trust, not an expansion of sandbox permissions.
+Changing profile or this toggle closes the old backend and starts a new
+conversation without replaying a prompt. Model choices remain saved separately
+for mimo and Codex.
 
 ### Transport resolved: stdio
 
@@ -164,32 +208,65 @@ Its `initialize` response returns `protocolVersion: 1`,
 `agentCapabilities.loadSession: true`. These facts are supplied by the manager;
 this fix did not launch mimo, the app, or any provider or use external networking.
 
-The implementation spawns `mimo acp --pure` and uses **JSONL stdio ACP v1**.
+By default the implementation spawns `mimo acp --pure` and uses **JSONL stdio ACP v1**.
+The advanced plugin toggle removes only `--pure`, not the sandbox or ACP tripwires.
 The CLI's `--port`/`--hostname` help does not change the verified ACP transport.
-There is **no HTTP/port fallback**, no `--no-auth`, and no inbound networking/bind
-grant. Private-home authentication, sandbox compatibility and qualified MCP
-tool-title formatting still need the manual checks below before calling the
-whole backend production-ready; do not grant broad networking or shell access.
+There is **no HTTP/port transport fallback** and no `--no-auth`. mimo (Bun) also
+starts an **internal localhost HTTP server on port 0**, even for stdio ACP. Both
+profiles therefore permit bind/inbound on `localhost:*` and outbound to
+`localhost:*`, not non-loopback listeners. Manager live testing verified that the
+shadow HOME, `/usr` read grant and these localhost rules allow `initialize` and
+`session/new` to succeed. Private-home authentication and qualified MCP tool-title
+formatting still need the manual checks below before calling the whole backend
+production-ready; do not grant broad networking or shell access.
 
 ### Isolation and ACP operations
 
 - Fresh empty 0700 workspace: `<data dir>/agent/mimo-<pid>-<nonce>/empty`.
   It is removed after child/process-group cleanup, including launch-error paths.
-- Separate persistent, owned, non-symlink, owner-only login home:
-  `<data dir>/agent/mimo-home`. The child receives that HOME and private XDG paths,
-  not your personal `~/.mimocode`. The app does not copy or inspect credentials.
-  Provider setup in this private home is a deliberate manual step below.
-- Environment is cleared, then the existing small locale/PATH allowlist is used;
-  HOME/XDG and the host-selected `TR_DATA_DIR` are overridden. Inherited API keys,
-  auth tokens, personal CLI settings, plugins and `CODEX_HOME` are not passed.
+- **Own sandbox exposure:** deny-default; read/write subpaths only for these
+  five installed mimo roots, plus the private workspace (including private tmp):
+  - `~/.config/mimocode` (configuration and provider/plugin dependencies)
+  - `~/.local/share/mimocode` (auth, database, storage, logs, snapshots, tool output)
+  - `~/.cache/mimocode` (model catalogue and cached binaries)
+  - `~/.local/state/mimocode` (model selection, key/value state and locks)
+  - `~/.mimocode` (installed mimo binaries/dependencies)
+
+  Roots must exist as directories and canonicalise to those exact paths under
+  real canonical HOME. Redirected roots or ancestors are refused, not granted as
+  an unrelated destination. Missing real directories are skipped (no link),
+  **never created** by terminal-rs; finish installed setup outside the app if
+  necessary. Only the shadow home and its parent layout are created. Symlinks below
+  a granted root do not grant their outside targets. The home root is not granted
+  read/write access; exact ancestor metadata traversal is allowed as before.
+  There is no access to `~/.config/opencode`, `~/.codex`, `~/.ssh`, documents or
+  `~/Library` via this profile. In particular, `~/Library/Caches` and similar
+  speculative compatibility paths remain denied: no extra grant is guessed.
+- **Private sandbox exposure:** the existing private workspace/login-home
+  subpath grants, not the five personal mimo roots. The login home is persistent,
+  owned, non-symlink and owner-only. Provider setup is a deliberate manual step.
+- Environment is cleared, then only PATH, TMPDIR, LANG and safe LC_* locale
+  values are retained, with HOME chosen by profile. Own uses a private workspace
+  TMPDIR. Private retains the previous TMPDIR and XDG config/data behaviour.
+  The host-selected `TR_DATA_DIR` is passed solely to locate the app MCP socket.
+  Inherited API keys, auth tokens, custom XDG settings and `CODEX_HOME` are not
+  passed. Installed configuration is read by mimo itself only in Own mode.
 - Production launch requires macOS `sandbox-exec`; other platforms refuse an
-  unsandboxed mimo child. The profile permits the private workspace/login home,
-  binary installation, app executable, system libraries/DNS, HTTPS outbound and
-  the exact app Unix socket. It permits execution only of mimo and the app shim;
-  no shell, broad personal document subtree, arbitrary executable or inbound
-  listener. Install-directory grants covering personal homes or credential trees
-  are refused, even when `TR_DATA_DIR` is outside the user's home. The profile
-  itself still needs the live compatibility check noted above.
+  unsandboxed mimo child. Both profiles allow the read-only binary install tree,
+  exact app executable, system libraries (including read access to all of `/usr`
+  for Bun), DNS, outbound TCP `*:443`, and the exact app Unix socket. Both also
+  include exactly these localhost rules for mimo's internal server:
+
+  ```scheme
+  (allow network-bind (local ip "localhost:*"))
+  (allow network-inbound (local ip "localhost:*"))
+  (allow network-outbound (remote ip "localhost:*"))
+  ```
+
+  Execution is restricted to mimo and the app shim; no shell, arbitrary
+  executable, broad home subtree or non-loopback inbound listener. Broad install
+  grants covering home/credential trees are refused. Plugin loading does not
+  weaken these restrictions.
 - ACP `initialize` uses protocolVersion 1 and disables `fs.readTextFile`,
   `fs.writeTextFile` and `terminal`. `session/new` always uses the private cwd and
   the current app executable's MCP entry:
@@ -205,15 +282,30 @@ whole backend production-ready; do not grant broad networking or shell access.
   invented concurrent ACP steer or automatic prompt replay. Rejected model/turn
   requests post a notice and keep the session alive; transport death or an unsafe
   tripwire ends it. Queued final text/completion events drain before closed errors.
-- Models are read from initialize/session model metadata when present; otherwise
-  the list is a single **mimo default**. No reasoning-effort variants are invented.
+- The model picker prefers the **model-category** select entry in ACP
+  `configOptions`, including grouped provider options, with `models.availableModels`
+  as fallback (both accepted on `initialize` and `session/new`). Manager live
+  testing returned the same 20 models in both forms, with current model
+  `xiaomi/mimo-v2.6-pro-ultraspeed`, plus two separate mode options. Labels use
+  reported **provider/model** IDs when qualified; a third-segment variant is shown
+  as **provider/model · variant**, e.g. `deepseek/deepseek-v4-pro · high`, while
+  selection preserves the exact ID `deepseek/deepseek-v4-pro/high`. Unqualified
+  IDs use the reported name. `configOptions` category `mode` and session `modes`
+  (build/plan) are agent modes, never model choices. Switching uses `session/set_model`, or
+  `session/set_config_option` with the reported config ID for config-option agents.
+  The last mimo model is saved as pane choice `mimo_model`, independently of the
+  Codex `model`, and reapplied after the canary to each new user session if still
+  offered. An unavailable saved model falls back to the reported current model.
+  If no model metadata is offered the picker shows **mimo default**. No reasoning
+  efforts, providers, model IDs or models from local credential files are invented.
   Images are not enabled.
 - ACP permission checking is **defence in depth**, not the real authorization
   boundary: titles, `rawInput` and `_meta` are agent-supplied and may be influenced
   by the model. Real authorization is enforced at the **app socket** (registry
   read-only/edit policy, validation and host approval cards) and by the **OS
   sandbox** (deny-default execution/filesystem access; no network except the
-  explicit Unix-socket, DNS and outbound HTTPS grants needed by mimo). A matching
+  explicit Unix-socket, DNS, outbound HTTPS and localhost-only grants needed by
+  mimo). A matching
   title alone must never be treated as proof of trusted provenance.
 - Permissions allow a registry-known **terminal-rs** MCP tool only via
   `allow_once`, never `allow_always`. Only ACP `kind` **`other`**, **`read`**, or
@@ -355,8 +447,11 @@ is part of the manual gate, not an asserted result. Exit the setup UI, then:
 TR_DATA_DIR="$TEST_DIR" TR_PROVIDER=sample TR_CONGRESS_REFRESH_MIN=0 "$BIN"
 ```
 
-Enable MCP (keep edits off first), select **Backend: mimo**, open `NEW AGENT`,
-acknowledge the provider disclosure and start/check the backend. Expect
+Enable MCP (keep edits off first), select **Backend: mimo** and **Private login**
+for the private setup above, open `NEW AGENT`, acknowledge the provider disclosure
+and start/check the backend. Alternatively choose **Use my mimo setup** to test
+your existing installed setup without creating/copying a private login. If its
+providers depend on plugins, explicitly enable **Advanced › Load mimo plugins**. Expect
 initialize → canary → fresh session → Ready and a **mimo** header. Try the same
 read-only chart prompt, Interrupt mid-stream, then a fresh prompt. Try an unsafe
 filesystem/shell request: it must be unavailable or visibly trip/stop, not execute.

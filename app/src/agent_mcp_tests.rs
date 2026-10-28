@@ -152,6 +152,23 @@ fn external_preferences_default_off_and_are_not_layout_settings() {
     let settings: crate::agent_mcp::Settings = serde_json::from_str("{}").unwrap();
     assert!(!settings.allow_external && !settings.allow_external_edits);
     assert_eq!(settings.backend, crate::agent_mcp::Backend::Codex);
+    assert_eq!(settings.mimo_profile, crate::agent_mcp::MimoProfile::Own);
+    assert!(!settings.mimo_load_plugins);
+    let migrated: crate::agent_mcp::Settings = serde_json::from_value(json!({
+        "backend":"mimo", "allow_external":true, "allow_external_edits":false
+    }))
+    .unwrap();
+    assert_eq!(migrated.mimo_profile, crate::agent_mcp::MimoProfile::Own);
+    assert!(!migrated.mimo_load_plugins);
+    let private: crate::agent_mcp::Settings = serde_json::from_value(json!({
+        "backend":"mimo", "mimo_profile":"Private", "mimo_load_plugins":true
+    }))
+    .unwrap();
+    assert_eq!(private.mimo_profile, crate::agent_mcp::MimoProfile::Private);
+    assert_eq!(
+        serde_json::from_value::<crate::agent_mcp::Settings>(serde_json::to_value(&private).unwrap()).unwrap(),
+        private
+    );
     let temp = Temp::new();
     let mut app = TerminalApp::test_workspace(&temp.0);
     app.external_agent_logic();
@@ -184,9 +201,44 @@ fn external_preferences_default_off_and_are_not_layout_settings() {
         }
         output.textures_delta.clear();
     }
-    assert!(shown.contains("MiniMax (China-hosted)") && shown.contains("MCP policy"));
+    assert!(shown.contains("Xiaomi MiMo Code") && shown.contains("MCP policy"));
     assert!(!shown.contains("go to OpenAI under your ChatGPT account"));
     assert!(!app.agent_pane.acknowledged);
+}
+
+#[test]
+fn mimo_settings_show_profile_radios_and_hide_plugins_in_collapsed_advanced() {
+    use crate::agent_mcp::Backend;
+    let temp = Temp::new();
+    let mut app = TerminalApp::test_workspace(&temp.0);
+    for backend in [Backend::Codex, Backend::Mimo] {
+        app.agent_config.backend = backend;
+        let ctx = egui::Context::default();
+        let mut shown = String::new();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 1400.))),
+                    ..Default::default()
+                },
+                |ui| app.agent_settings_panel(ui),
+            );
+            for shape in &output.shapes {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    shown.push_str(text.galley.text());
+                    shown.push('\n');
+                }
+            }
+            output.textures_delta.clear();
+        }
+        assert_eq!(
+            shown.contains("Use my mimo setup (providers, keys and models from your installed mimo)"),
+            backend == Backend::Mimo
+        );
+        assert_eq!(shown.contains("Private login (separate sign-in inside terminal-rs)"), backend == Backend::Mimo);
+        assert_eq!(shown.contains("Advanced"), backend == Backend::Mimo);
+        assert!(!shown.contains("Load mimo plugins"));
+    }
 }
 
 #[test]
@@ -381,6 +433,49 @@ fn backend_switch_clears_conversation_without_replaying_and_closes_old_socket() 
     }
     app.agent_config.allow_external = false;
     app.external_agent_logic();
+}
+
+#[test]
+fn mimo_profile_and_plugin_changes_reset_without_losing_separate_model_choices() {
+    use crate::agent_mcp::{Backend, MimoProfile};
+    let temp = Temp::new();
+    let mut app = TerminalApp::test_workspace(&temp.0);
+    app.agent_config.backend = Backend::Mimo;
+    app.agent_pane.settings.model = "codex-choice".into();
+    app.agent_pane.settings.mimo_model = "plan/model".into();
+    for plugins in [false, true] {
+        app.agent_pane.input = "Never replay".into();
+        app.agent_pane.acknowledged = true;
+        let old = app.agent_config.clone();
+        if plugins {
+            app.agent_config.mimo_load_plugins = true;
+        } else {
+            app.agent_config.mimo_profile = MimoProfile::Private;
+        }
+        app.apply_agent_settings(&old);
+        assert!(app.agent_pane.input.is_empty() && app.agent_pane.queue.is_empty());
+        assert!(!app.agent_pane.acknowledged);
+        assert_eq!(app.agent_pane.settings.model, "codex-choice");
+        assert_eq!(app.agent_pane.settings.mimo_model, "plan/model");
+    }
+    let saved = serde_json::to_value(&app.agent_pane.settings).unwrap();
+    let mut loaded: agent_pane::Settings = serde_json::from_value(saved).unwrap();
+    assert_eq!(loaded.model("Codex"), "codex-choice");
+    assert_eq!(loaded.model("mimo"), "plan/model");
+    let available = vec![tr_agent::Model {
+        id: "plan/model".into(),
+        model: "plan/model".into(),
+        display_name: "plan/model".into(),
+        is_default: false,
+        default_reasoning_effort: String::new(),
+        supported_reasoning_efforts: vec![],
+    }];
+    loaded.select_defaults_for(&available, "mimo");
+    assert_eq!(loaded.model("mimo"), "plan/model");
+    assert_eq!(loaded.model("Codex"), "codex-choice");
+    let legacy: agent_pane::Settings = serde_json::from_value(json!({"model":"codex-existing"})).unwrap();
+    assert!(legacy.mimo_model.is_empty());
+    assert_eq!(legacy.model, "codex-existing");
 }
 
 #[test]
