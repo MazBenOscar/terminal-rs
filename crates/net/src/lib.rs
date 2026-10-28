@@ -434,8 +434,16 @@ impl Guard {
             "CREATE TABLE IF NOT EXISTS slots (key TEXT PRIMARY KEY, at INTEGER NOT NULL, until INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS counters (key TEXT PRIMARY KEY, count INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS bargo_sweeps (day INTEGER PRIMARY KEY, attempts INTEGER NOT NULL, retry_at INTEGER NOT NULL, reason TEXT);
+             CREATE TABLE IF NOT EXISTS bargo_sweep_modes (day INTEGER NOT NULL, bucket TEXT NOT NULL, attempts INTEGER NOT NULL, retry_at INTEGER NOT NULL, reason TEXT, PRIMARY KEY(day,bucket));
              CREATE TABLE IF NOT EXISTS remaining (\"group\" TEXT PRIMARY KEY, at INTEGER NOT NULL, requests INTEGER, rows INTEGER);
              CREATE TABLE IF NOT EXISTS row_usage (\"group\" TEXT, day INTEGER, count INTEGER NOT NULL, PRIMARY KEY(\"group\",day));",
+        )?;
+        // Legacy global slots have no credential identity. Preserve them only for
+        // keyless mode: they must never block a newly saved fingerprint's bootstrap.
+        db.execute_batch(
+            "INSERT OR IGNORE INTO bargo_sweep_modes SELECT day,'bargo:keyless',attempts,retry_at,reason FROM bargo_sweeps;
+             INSERT OR IGNORE INTO slots SELECT 'bargo:keyless:sweep',at,until FROM slots WHERE key='bargo:sweep';
+             INSERT OR IGNORE INTO slots SELECT 'bargo:keyless:poll',at,until FROM slots WHERE key='bargo:poll';",
         )?;
         let has_owner = |db: &Connection| -> rusqlite::Result<bool> {
             Ok(db
@@ -582,13 +590,26 @@ impl Guard {
             // An authentication deferral may retry with the replacement key, without resetting
             // any request/row counters, other pause causes, or the daily attempt bound.
             db.execute(
-                "UPDATE bargo_sweeps SET retry_at=0,reason=NULL WHERE day=?1",
-                [Utc::now().timestamp() / 86400],
+                "UPDATE bargo_sweep_modes SET retry_at=0,reason=NULL WHERE day=?1 AND bucket=?2",
+                params![Utc::now().timestamp() / 86400, bargo_bucket(Some(key))],
             )?;
         }
         Ok(())
     }
-    /// Daily UTC sweep before polls, with a durable crash lease and at most eight attempts/day.
+    /// The first successful keyed sweep covers the free tier's full 90-day window.
+    /// Failed attempts do not consume that bootstrap; later sweeps cover 60 days.
+    pub fn bargo_sweep_days(&self) -> Result<i64, Refused> {
+        let bucket = self.bargo_bucket.read().expect("Bargo bucket lock").clone();
+        let completed: bool = self.db()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM slots WHERE key=?1)",
+            [format!("{bucket}:sweep")],
+            |r| r.get(0),
+        )?;
+        Ok(if bucket != "bargo:keyless" && !completed { 90 } else { 60 })
+    }
+
+    /// Daily UTC sweep per mode/key fingerprint before polls, with a durable
+    /// machine-wide crash lease and at most eight attempts/day per fingerprint.
     /// A deferred attempt is not a completed 24-hour slot; only finish_bargo_sweep completes it.
     pub fn claim_bargo_run(&self, initial: bool) -> Result<Option<bool>, Refused> {
         if let Err(error) = self.check("bargo") {
@@ -600,22 +621,29 @@ impl Guard {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = Utc::now().timestamp_millis();
         let day = now / 86_400_000;
+        let bucket = self.bargo_bucket.read().expect("Bargo bucket lock").clone();
+        let sweep_slot = format!("{bucket}:sweep");
+        let poll_slot = format!("{bucket}:poll");
         let completed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM slots WHERE key='bargo:sweep' AND at/86400000=?1 AND until>?2)",
-            params![day, now],
+            "SELECT EXISTS(SELECT 1 FROM slots WHERE key=?3 AND at/86400000=?1 AND until>?2)",
+            params![day, now, sweep_slot],
             |r| r.get(0),
         )?;
         let state: Option<(u32, i64, Option<String>)> = tx
-            .query_row("SELECT attempts,retry_at,reason FROM bargo_sweeps WHERE day=?1", [day], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
+            .query_row(
+                "SELECT attempts,retry_at,reason FROM bargo_sweep_modes WHERE day=?1 AND bucket=?2",
+                params![day, bucket],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .optional()?;
         if !completed && state.as_ref().is_none_or(|(attempts, retry, _)| *attempts < 8 && now >= *retry) {
-            tx.execute("INSERT INTO bargo_sweeps VALUES(?1,1,?2,NULL) ON CONFLICT(day) DO UPDATE SET attempts=attempts+1,retry_at=excluded.retry_at,reason=NULL",
-                params![day, now+900_000])?;
+            tx.execute("INSERT INTO bargo_sweep_modes VALUES(?1,?3,1,?2,NULL) ON CONFLICT(day,bucket) DO UPDATE SET attempts=attempts+1,retry_at=excluded.retry_at,reason=NULL",
+                params![day, now+900_000, bucket])?;
             // A sweep replaces a poll, and polls remain suppressed for three hours after it ran.
-            tx.execute("INSERT INTO slots VALUES('bargo:poll',?1,?2) ON CONFLICT(key) DO UPDATE SET at=excluded.at,until=excluded.until",
-                params![now, now+10_800_000])?;
+            tx.execute(
+                "INSERT INTO slots VALUES(?3,?1,?2) ON CONFLICT(key) DO UPDATE SET at=excluded.at,until=excluded.until",
+                params![now, now + 10_800_000, poll_slot],
+            )?;
             tx.commit()?;
             return Ok(Some(true));
         }
@@ -626,28 +654,33 @@ impl Guard {
                 .as_ref()
                 .is_some_and(|(attempts, retry, reason)| *attempts >= 8 && now >= *retry && reason.is_none())
         {
-            tx.execute("UPDATE bargo_sweeps SET reason='Senate sweep deferred: interrupted; daily retry bound reached' WHERE day=?1", [day])?;
+            tx.execute("UPDATE bargo_sweep_modes SET reason='Senate sweep deferred: interrupted; daily retry bound reached' WHERE day=?1 AND bucket=?2", params![day, bucket])?;
             deferred = true;
         }
         tx.commit()?;
         if initial || (!completed && !deferred) {
             return Ok(None);
         }
-        Ok(self.claim_slot("bargo:poll", Duration::from_secs(10800))?.then_some(false))
+        Ok(self.claim_slot(&poll_slot, Duration::from_secs(10800))?.then_some(false))
     }
     pub fn finish_bargo_sweep(&self, reason: Option<&str>) -> Result<(), Refused> {
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = Utc::now().timestamp_millis();
+        let bucket = self.bargo_bucket.read().expect("Bargo bucket lock").clone();
         tx.execute(
-            "UPDATE bargo_sweeps SET reason=?2,retry_at=?3 WHERE day=?1",
-            params![now / 86_400_000, reason, if reason.is_some() { now + 900_000 } else { now }],
+            "UPDATE bargo_sweep_modes SET reason=?2,retry_at=?3 WHERE day=?1 AND bucket=?4",
+            params![now / 86_400_000, reason, if reason.is_some() { now + 900_000 } else { now }, bucket],
         )?;
-        tx.execute("INSERT INTO slots VALUES('bargo:poll',?1,?2) ON CONFLICT(key) DO UPDATE SET at=excluded.at,until=excluded.until",
-            params![now, now+10_800_000])?;
+        tx.execute(
+            "INSERT INTO slots VALUES(?3,?1,?2) ON CONFLICT(key) DO UPDATE SET at=excluded.at,until=excluded.until",
+            params![now, now + 10_800_000, format!("{bucket}:poll")],
+        )?;
         if reason.is_none() {
-            tx.execute("INSERT INTO slots VALUES('bargo:sweep',?1,?2) ON CONFLICT(key) DO UPDATE SET at=excluded.at,until=excluded.until",
-                params![now, (now/86_400_000+1)*86_400_000])?;
+            tx.execute(
+                "INSERT INTO slots VALUES(?3,?1,?2) ON CONFLICT(key) DO UPDATE SET at=excluded.at,until=excluded.until",
+                params![now, (now / 86_400_000 + 1) * 86_400_000, format!("{bucket}:sweep")],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -655,9 +688,11 @@ impl Guard {
     pub fn bargo_sweep_reason(&self) -> Result<Option<String>, Refused> {
         Ok(self
             .db()?
-            .query_row("SELECT reason FROM bargo_sweeps WHERE day=?1", [Utc::now().timestamp() / 86400], |r| {
-                r.get::<_, Option<String>>(0)
-            })
+            .query_row(
+                "SELECT reason FROM bargo_sweep_modes WHERE day=?1 AND bucket=?2",
+                params![Utc::now().timestamp() / 86400, self.bargo_bucket.read().expect("Bargo bucket lock").clone()],
+                |r| r.get::<_, Option<String>>(0),
+            )
             .optional()?
             .flatten())
     }

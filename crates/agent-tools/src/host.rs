@@ -24,6 +24,9 @@ pub struct History {
     pub session: Session,
     /// Authoritative source identity; do not infer a venue from an equity ticker.
     pub instrument: Option<CryptoInstrument>,
+    /// Loaded chart identity, when these bars came from a chart rather than a provider.
+    pub chart_symbol: Option<String>,
+    pub chart_id: Option<String>,
     // A5b-MULTI provenance is optional: absence must never be described as live.
     pub source: Option<String>,
     pub simulated: Option<bool>,
@@ -253,9 +256,7 @@ pub mod edits {
             self.observe(chart);
             match args {
                 LiveArgs::CreateDrawing(a) => {
-                    if a.analysis_ref.is_some()
-                        && tr_data::security(&a.symbol).key() != tr_data::security(chart.symbol).key()
-                    {
+                    if a.analysis_ref.is_some() && !tr_data::same_instrument(&a.symbol, chart.symbol) {
                         return Err(error(
                             "analysis_mismatch",
                             "Analysis symbol differs from the current chart; re-run analyze for this chart",
@@ -333,7 +334,9 @@ pub mod edits {
                         next.retain(|d| {
                             !(d.created_by == Author::Agent
                                 && d.turn_id.as_deref() != Some(turn)
-                                && d.symbol.as_deref() == Some(chart.symbol)
+                                && d.symbol
+                                    .as_deref()
+                                    .is_some_and(|symbol| tr_data::same_instrument(symbol, chart.symbol))
                                 && d.source_timeframe == Some(source_timeframe)
                                 && if tool == Tool::Rectangle {
                                     d.tool == Tool::Rectangle && (d.zone_role.is_some() || d.technical_analysis)
@@ -365,7 +368,7 @@ pub mod edits {
                     let mut next = chart.drawings.to_vec();
                     let drawing = &mut next[index];
                     self.check_owner(chart.uid, &key, drawing.created_by, drawing.turn_id.as_deref())?;
-                    if drawing.symbol.as_deref() != Some(chart.symbol) {
+                    if !drawing.symbol.as_deref().is_some_and(|symbol| tr_data::same_instrument(symbol, chart.symbol)) {
                         return Err(error("wrong_chart", "Drawing belongs to another symbol"));
                     }
                     let timeframe = drawing.source_timeframe.unwrap_or(chart.timeframe);
@@ -381,6 +384,7 @@ pub mod edits {
                     } else if drawing.auto_label && anchors_changed {
                         drawing.text = zone_label(drawing, timeframe, chart.price_decimals);
                     }
+                    drawing.symbol = Some(chart.symbol.into());
                     drawing.all_symbols = a.all_symbols;
                     drawing.sanitize();
                     Ok(Plan::Drawings(next, a.id))
@@ -391,7 +395,7 @@ pub mod edits {
                     let drawing =
                         chart.drawings.iter().find(|d| d.id == a.id).ok_or_else(|| self.missing(chart.uid, &key))?;
                     self.check_owner(chart.uid, &key, drawing.created_by, drawing.turn_id.as_deref())?;
-                    if drawing.symbol.as_deref() != Some(chart.symbol) {
+                    if !drawing.symbol.as_deref().is_some_and(|symbol| tr_data::same_instrument(symbol, chart.symbol)) {
                         return Err(error("wrong_chart", "Drawing belongs to another symbol"));
                     }
                     Ok(Plan::Drawings(chart.drawings.iter().filter(|d| d.id != a.id).cloned().collect(), a.id))
@@ -471,10 +475,7 @@ pub mod edits {
                         .transpose()
                         .map_err(|_| error("invalid_args", "Unknown timeframe"))?
                         .unwrap_or(chart.timeframe);
-                    if a.symbol
-                        .as_ref()
-                        .is_some_and(|symbol| tr_data::security(symbol).key() != tr_data::security(chart.symbol).key())
-                    {
+                    if a.symbol.as_ref().is_some_and(|symbol| !tr_data::same_instrument(symbol, chart.symbol)) {
                         return Err(error(
                             "invalid_args",
                             "set_view is limited to the loaded symbol; symbol changes are not allowed",
@@ -485,12 +486,7 @@ pub mod edits {
                     if a.from.zip(a.to).is_some_and(|(from, to)| from > to) {
                         return Err(error("invalid_args", "from must not exceed to"));
                     }
-                    Ok(Plan::View {
-                        symbol: a.symbol.map_or_else(|| chart.symbol.into(), |s| tr_data::security(&s).key()),
-                        timeframe,
-                        from: a.from,
-                        to: a.to,
-                    })
+                    Ok(Plan::View { symbol: chart.symbol.into(), timeframe, from: a.from, to: a.to })
                 }
                 LiveArgs::Compare(mut a) => {
                     a.symbol = tr_data::security(&a.symbol).key();
@@ -498,8 +494,8 @@ pub mod edits {
                     match a.action {
                         args::CompareAction::Add => {
                             self.can_create(chart, turn)?;
-                            if a.symbol == chart.symbol
-                                || chart.comparisons.iter().any(|c| c.symbol == a.symbol)
+                            if tr_data::same_instrument(&a.symbol, chart.symbol)
+                                || chart.comparisons.iter().any(|c| tr_data::same_instrument(&c.symbol, &a.symbol))
                                 || chart.comparisons.len() >= 8
                             {
                                 return Err(error(
@@ -513,9 +509,11 @@ pub mod edits {
                             let comparison = chart
                                 .comparisons
                                 .iter()
-                                .find(|c| c.symbol == a.symbol)
+                                .find(|c| tr_data::same_instrument(&c.symbol, &a.symbol))
                                 .ok_or_else(|| self.missing(chart.uid, &key))?;
+                            let key = format!("comparison:{}", comparison.symbol);
                             self.check_owner(chart.uid, &key, comparison.created_by, comparison.turn_id.as_deref())?;
+                            a.symbol = comparison.symbol.clone();
                         }
                     }
                     Ok(Plan::Compare(a))
@@ -526,7 +524,7 @@ pub mod edits {
     }
 
     fn check_symbol(chart: &Chart<'_>, symbol: &str) -> Result<(), ToolResult> {
-        if tr_data::security(symbol).key() != tr_data::security(chart.symbol).key() {
+        if !tr_data::same_instrument(symbol, chart.symbol) {
             return Err(error(
                 "wrong_chart",
                 &format!("symbol must match the loaded chart {}; call read_chart before retrying", chart.symbol),
@@ -665,6 +663,7 @@ impl<M: MarketData> DataHost for MarketDataHost<M> {
                 instrument: self.market.crypto_instrument(symbol),
                 source: Some(self.market.name().into()),
                 simulated: matches!(self.market.name(), "sample" | "offline").then_some(true),
+                ..History::default()
             })
         })
     }

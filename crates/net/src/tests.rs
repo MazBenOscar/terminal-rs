@@ -191,7 +191,7 @@ fn bargo_utc_sweep_precedes_due_polls_and_deferrals_retry_at_most_eight_times() 
         .db()
         .unwrap()
         .execute(
-            "INSERT INTO slots VALUES('bargo:sweep',?1,?2)",
+            "INSERT INTO slots VALUES('bargo:keyless:sweep',?1,?2)",
             params![(now / 86_400_000) * 86_400_000 - 1, now + 86_400_000],
         )
         .unwrap();
@@ -200,15 +200,56 @@ fn bargo_utc_sweep_precedes_due_polls_and_deferrals_retry_at_most_eight_times() 
     guard.finish_bargo_sweep(Some("Senate sweep deferred: daily row allowance used")).unwrap();
     assert_eq!(other.claim_bargo_run(false).unwrap(), None);
     for _ in 1..8 {
-        guard.db().unwrap().execute("UPDATE bargo_sweeps SET retry_at=0", []).unwrap();
+        guard.db().unwrap().execute("UPDATE bargo_sweep_modes SET retry_at=0", []).unwrap();
         assert_eq!(other.claim_bargo_run(false).unwrap(), Some(true));
         other.finish_bargo_sweep(Some("Senate sweep deferred: daily row allowance used")).unwrap();
     }
-    guard.db().unwrap().execute("UPDATE bargo_sweeps SET retry_at=0", []).unwrap();
+    guard.db().unwrap().execute("UPDATE bargo_sweep_modes SET retry_at=0", []).unwrap();
     assert_eq!(guard.claim_bargo_run(true).unwrap(), None);
     assert!(guard.bargo_sweep_reason().unwrap().unwrap().contains("daily row allowance used"));
-    guard.db().unwrap().execute("UPDATE slots SET at=0,until=0 WHERE key='bargo:poll'", []).unwrap();
+    guard.db().unwrap().execute("UPDATE slots SET at=0,until=0 WHERE key='bargo:keyless:poll'", []).unwrap();
     assert_eq!(guard.claim_bargo_run(false).unwrap(), Some(false));
+}
+#[test]
+fn bargo_key_save_bootstraps_once_per_fingerprint_across_instances() {
+    let temp = Temp::new();
+    let guard = temp.guard(false);
+    let other = temp.guard(false);
+    assert_eq!(guard.bargo_sweep_days().unwrap(), 60);
+    assert_eq!(guard.claim_bargo_run(false).unwrap(), Some(true));
+    guard.finish_bargo_sweep(None).unwrap();
+    assert_eq!(other.claim_bargo_run(false).unwrap(), None);
+
+    guard.bargo_key_saved("fixture-key-a").unwrap();
+    other.set_bargo_key(Some("fixture-key-a"));
+    assert_eq!(guard.bargo_sweep_days().unwrap(), 90);
+    assert_eq!(guard.bargo_allowance(Some("fixture-key-a")).unwrap(), 900);
+    assert_eq!(guard.claim_bargo_run(false).unwrap(), Some(true));
+    assert_eq!(other.claim_bargo_run(false).unwrap(), None); // In-flight lease.
+    guard.finish_bargo_sweep(Some("fixture deferral")).unwrap();
+    assert_eq!(other.bargo_sweep_days().unwrap(), 90); // Not successful yet.
+    guard.db().unwrap().execute("UPDATE bargo_sweep_modes SET retry_at=0", []).unwrap();
+    assert_eq!(other.claim_bargo_run(false).unwrap(), Some(true));
+    other.finish_bargo_sweep(None).unwrap();
+    assert_eq!(guard.bargo_sweep_days().unwrap(), 60);
+    guard.bargo_key_saved("fixture-key-a").unwrap(); // Saving the same key is not a reset.
+    assert_eq!(guard.claim_bargo_run(false).unwrap(), None);
+    let third = temp.guard(false);
+    third.set_bargo_key(Some("fixture-key-a"));
+    assert_eq!(third.claim_bargo_run(false).unwrap(), None);
+    assert_eq!(third.bargo_sweep_days().unwrap(), 60);
+
+    // Expire today's completion to simulate the next daily sweep; keep the
+    // durable success record so it does not become a second 90-day bootstrap.
+    guard.db().unwrap().execute("UPDATE slots SET at=0,until=0 WHERE key LIKE '%:sweep'", []).unwrap();
+    assert_eq!(guard.claim_bargo_run(false).unwrap(), Some(true));
+    assert_eq!(guard.bargo_sweep_days().unwrap(), 60);
+    guard.finish_bargo_sweep(None).unwrap();
+    guard.bargo_key_saved("fixture-key-b").unwrap();
+    assert_eq!(guard.bargo_sweep_days().unwrap(), 90);
+    assert_eq!(guard.claim_bargo_run(false).unwrap(), Some(true));
+    assert_eq!(guard.bargo_allowance(None).unwrap(), 90);
+    assert_eq!(guard.bargo_allowance(Some("fixture-key-a")).unwrap(), 900);
 }
 // SENATE-BARGO END
 

@@ -92,6 +92,7 @@ mod multi_tests {
                     source: Some("fixed_fixture".into()),
                     simulated: Some(self.simulated),
                     instrument: None,
+                    ..History::default()
                 })
             })
         }
@@ -555,6 +556,7 @@ impl Host {
                 instrument: None,
                 source: None,
                 simulated: None,
+                ..History::default()
             },
             ..Self::default()
         }

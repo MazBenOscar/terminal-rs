@@ -237,7 +237,7 @@ pub async fn sync(guard: &tr_net::Guard, db: &Mutex<Db>, key: Option<&str>) -> R
     // Suppress alerts for the entire first successful sweep even after interruption.
     db.lock().await.set_meta("bargo_initialized", "1")?;
     let today = Utc::now().date_naive();
-    let from = today - chrono::Duration::days(if run == Run::Sweep { 60 } else { 7 });
+    let from = today - chrono::Duration::days(if run == Run::Sweep { guard.bargo_sweep_days()? } else { 7 });
     let keyed = key.is_some_and(|k| !k.is_empty());
     let default_limit = match (run, keyed) {
         (Run::Sweep, true) => 250,

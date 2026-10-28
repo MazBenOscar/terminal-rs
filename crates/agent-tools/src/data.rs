@@ -642,7 +642,7 @@ fn summary(history: &History, args: &ReadData, tf: Timeframe, now: i64) -> Resul
     let open_return =
         first.zip(last).map(|(a, b)| percent(a.open, b.close, "returns.open_to_close_percent")).transpose()?.flatten();
     let mut value = json!({
-        "version":1,"symbol":history.instrument.as_ref().map_or_else(||args.symbol.clone(),CryptoInstrument::canonical_ticker),
+        "version":1,"symbol":history.chart_symbol.clone().unwrap_or_else(|| history.instrument.as_ref().map_or_else(||args.symbol.clone(),CryptoInstrument::canonical_ticker)),
         "requested_symbol":args.symbol,"timeframe":tf.label(),"instrument":history.instrument,
         "price_basis":history.price_basis,"session":history.session.label(),"timezone":"UTC",
         "count":bars.len(),"first":first.and_then(|b|iso(b.ts)),"last":last.and_then(|b|iso(b.ts)),
@@ -654,6 +654,7 @@ fn summary(history: &History, args: &ReadData, tf: Timeframe, now: i64) -> Resul
         "bar_columns":["time","open","high","low","close","volume","in_progress"],
         "close_series_columns":["time","close"],"truncated":false
     });
+    history_identity(&mut value, history);
     let (mut recent, mut points) = (bars.len().min(200), bars.len().min(300));
     loop {
         value["bars"] = bars[bars.len() - recent..]
@@ -683,6 +684,16 @@ fn summary(history: &History, args: &ReadData, tf: Timeframe, now: i64) -> Resul
         }
         recent = (recent * 3 / 4).max(1).min(bars.len());
         points = (points * 3 / 4).max(2).min(bars.len());
+    }
+}
+
+fn history_identity(value: &mut Value, history: &History) {
+    if let Some(chart_id) = &history.chart_id {
+        value["chart_id"] = json!(chart_id);
+    }
+    if let Some(instrument) = &history.instrument {
+        value["instrument"] = json!(instrument);
+        value["venue"] = json!(instrument.venue.label());
     }
 }
 
@@ -779,8 +790,14 @@ pub(crate) async fn analyze(host: &dyn DataHost, args: Analyze, now: i64) -> Too
     if version == 2 {
         value["last_bar_ts"] = json!(bars.last().unwrap().ts);
     }
-    value["symbol"] =
-        history.instrument.as_ref().map_or_else(|| args.symbol.clone(), CryptoInstrument::canonical_ticker).into();
+    value["symbol"] = history
+        .chart_symbol
+        .clone()
+        .unwrap_or_else(|| {
+            history.instrument.as_ref().map_or_else(|| args.symbol.clone(), CryptoInstrument::canonical_ticker)
+        })
+        .into();
+    history_identity(&mut value, &history);
     value["timeframe"] = tf.label().into();
     value["bar_range"] = json!({"from":iso(bars[0].ts),"to":iso(bars.last().unwrap().ts),"count":bars.len()});
     value["price_basis"] = json!(history.price_basis);

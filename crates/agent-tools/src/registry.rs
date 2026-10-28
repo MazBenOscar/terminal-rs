@@ -95,12 +95,24 @@ impl AnalysisCache {
         let value = self.values.get(&reference.analysis_id).ok_or_else(|| {
             invalid("Unknown or expired analysis_id; analyze again in this turn".into(), Some("analysis_ref"))
         })?;
-        if tr_data::security(&a.symbol).key() != tr_data::security(value["symbol"].as_str().unwrap_or_default()).key() {
+        if !tr_data::same_instrument(&a.symbol, value["symbol"].as_str().unwrap_or_default()) {
             return Err(invalid(
                 "Analysis symbol does not match drawing symbol; re-run analyze for the current chart".into(),
                 Some("analysis_ref"),
             ));
         }
+        // Preserve the analysis chart identity even when the model supplies an alias.
+        if let Some(chart_id) = value["chart_id"].as_str() {
+            if a.chart_id.as_deref().is_some_and(|target| target != chart_id) {
+                return Err(invalid(
+                    "Analysis belongs to another chart; re-run analyze for the target chart".into(),
+                    Some("analysis_ref"),
+                ));
+            }
+            a.chart_id = Some(chart_id.into());
+        }
+        // Do not lose a qualified venue when checking against the target chart.
+        a.symbol = value["symbol"].as_str().unwrap_or_default().into();
         let zone = value["support_resistance"]
             .as_array()
             .and_then(|items| items.iter().find(|i| i["item_id"] == reference.item_id));
@@ -741,6 +753,48 @@ mod tests {
             value(registry.call("create_drawing", &manual.to_string(), &mut ctx).await)["warning"],
             "coordinates not from analysis"
         );
+    }
+
+    #[test]
+    fn crypto_analysis_references_accept_aliases_but_not_other_quotes_or_venues() {
+        use crate::edits::{Chart, Plan, Session};
+        for (analysis, chart_symbol, accepted) in [
+            ("COINBASE:BTC-USD", "BTCUSD Curncy", true),
+            ("BTCUSD Curncy", "COINBASE:BTC-USD Curncy", true),
+            ("BINANCE:BTCUSDT", "BTCUSD Curncy", false),
+            ("BINANCE:BTCUSD", "COINBASE:BTC-USD Curncy", false),
+        ] {
+            let mut cache = AnalysisCache::default();
+            let output = value(cache.store(ToolResult::json(json!({"version":2,"symbol":analysis,"timeframe":"1D","last_bar_ts":1000,
+                "support_resistance":[{"item_id":"zone-0","first_touch_ts":100,"low":10.,"high":12.,"role":"support"}]}))));
+            let mut args: args::CreateDrawing =
+                serde_json::from_value(json!({"symbol":chart_symbol,"kind":"rectangle",
+                "analysis_ref":{"analysis_id":output["analysis_id"],"item_id":"zone-0"}}))
+                .unwrap();
+            if !accepted {
+                assert!(cache.fill(&mut args).is_err(), "{analysis} vs {chart_symbol}");
+                continue;
+            }
+            cache.fill(&mut args).unwrap();
+            let bars =
+                [tr_core::Bar::new(100, 11., 12., 10., 11., 1.), tr_core::Bar::new(1000, 11., 12., 10., 11., 1.)];
+            let chart = Chart {
+                uid: 1,
+                symbol: chart_symbol,
+                timeframe: Timeframe::D1,
+                price_decimals: 2,
+                bars: &bars,
+                drawings: &[],
+                indicators: &[],
+                comparisons: &[],
+            };
+            let Plan::Drawings(drawings, _) =
+                Session::default().plan(&chart, "aliases", LiveArgs::CreateDrawing(args)).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(drawings[0].symbol.as_deref(), Some(chart_symbol));
+        }
     }
 
     #[test]

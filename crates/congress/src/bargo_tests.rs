@@ -40,9 +40,10 @@ impl Temp {
         .unwrap()
     }
     fn age(&self, key: &str, seconds: i64) {
+        let pattern = key.replacen("bargo:", "bargo:%:", 1);
         rusqlite::Connection::open(self.0.join("ledger.sqlite3"))
             .unwrap()
-            .execute("UPDATE slots SET at=at-?2,until=until-?2 WHERE key=?1", params![key, seconds * 1000])
+            .execute("UPDATE slots SET at=at-?2,until=until-?2 WHERE key LIKE ?1", params![pattern, seconds * 1000])
             .unwrap();
     }
     fn unpace(&self) {
@@ -404,12 +405,16 @@ async fn sweep_shrinks_first_page_and_poll_is_seven_days_first_page_only() {
         };
         let first = query(0);
         assert_eq!(first["limit"], if key.is_some() { "250" } else { "90" });
-        assert_eq!(first["from"], (Utc::now().date_naive() - chrono::Duration::days(60)).to_string());
+        assert_eq!(
+            first["from"],
+            (Utc::now().date_naive() - chrono::Duration::days(if key.is_some() { 90 } else { 60 })).to_string()
+        );
         let poll = query(1);
         assert_eq!(poll["page"], "0");
         assert_eq!(poll["limit"], if key.is_some() { "100" } else { "50" });
         assert_eq!(poll["from"], (Utc::now().date_naive() - chrono::Duration::days(7)).to_string());
         let next = query(2);
+        assert_eq!(next["from"], (Utc::now().date_naive() - chrono::Duration::days(60)).to_string());
         assert_eq!(next["page"], "0");
         assert_eq!(next["limit"], if key.is_some() { "250" } else { "80" });
     }
@@ -428,13 +433,14 @@ async fn no_rows_sweep_defers_without_completing_and_retries_that_day() {
     assert_eq!(status(&guard, None, false), "Senate sweep deferred: daily row allowance used");
     assert_eq!(server.hits.load(Ordering::SeqCst), 0);
     assert!(db.lock().await.meta("bargo_initial_complete").unwrap().is_none());
-    let completed: bool =
-        ledger.query_row("SELECT EXISTS(SELECT 1 FROM slots WHERE key='bargo:sweep')", [], |r| r.get(0)).unwrap();
+    let completed: bool = ledger
+        .query_row("SELECT EXISTS(SELECT 1 FROM slots WHERE key='bargo:keyless:sweep')", [], |r| r.get(0))
+        .unwrap();
     assert!(!completed);
     // The immediate call does not spin/retry. After the durable bounded defer it can recover.
     sync(&guard, &db, None).await.unwrap();
     assert_eq!(server.hits.load(Ordering::SeqCst), 0);
-    ledger.execute("UPDATE bargo_sweeps SET retry_at=0", []).unwrap();
+    ledger.execute("UPDATE bargo_sweep_modes SET retry_at=0", []).unwrap();
     ledger.execute("UPDATE row_usage SET count=0", []).unwrap();
     sync(&guard, &db, None).await.unwrap();
     assert_eq!(server.hits.load(Ordering::SeqCst), 1);
@@ -576,11 +582,23 @@ async fn review_keyless_row_header_blocks_keyed_bucket() {
     let db = Mutex::new(Db::open_in_memory().unwrap());
     sync(&guard, &db, None).await.unwrap();
     assert_eq!(server.hits.load(Ordering::SeqCst), 1);
-    // The user now saves a free key (1,000 rows/day bucket) and the next sweep is due.
-    temp.age("bargo:sweep", 86401);
+    // Saving a key must allow its first sweep today, without aging the keyless slot.
+    guard.bargo_key_saved("fixture-secret").unwrap();
     temp.unpace();
     sync(&guard, &db, Some("fixture-secret")).await.unwrap();
-    assert_eq!(server.hits.load(Ordering::SeqCst), 2, "keyed sweep refused by the keyless bucket's row header");
+    assert_eq!(
+        server.hits.load(Ordering::SeqCst),
+        2,
+        "keyed sweep refused by the keyless bucket's row header or sweep slot"
+    );
+    let second = temp.guard(&server, false);
+    sync(&second, &db, Some("fixture-secret")).await.unwrap();
+    assert_eq!(server.hits.load(Ordering::SeqCst), 2, "another instance repeated the keyed bootstrap");
+    let requests = server.requests.lock().unwrap();
+    let first_keyed = &requests[1];
+    let from = (Utc::now().date_naive() - chrono::Duration::days(90)).to_string();
+    assert!(first_keyed.contains(&format!("from={from}")));
+    assert!(first_keyed.contains("limit=250"));
 }
 
 #[test]

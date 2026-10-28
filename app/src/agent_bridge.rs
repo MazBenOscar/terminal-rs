@@ -467,7 +467,7 @@ impl TerminalApp {
         }
         let (symbol, timeframe) =
             expected.get(&call.turn).cloned().unwrap_or_else(|| (call.pin.symbol.clone(), call.pin.timeframe.clone()));
-        if pinned.symbol != symbol || pinned.tf.to_string() != timeframe {
+        if !tr_data::same_instrument(&pinned.symbol, &symbol) || pinned.tf.to_string() != timeframe {
             return error(
                 "pin_changed",
                 "Pinned chart symbol or timeframe changed during the turn; stop edits and start a new turn with read_chart",
@@ -719,7 +719,7 @@ impl ScopedHost {
                     tr_agent_tools::edits::error("pin_changed", "Chart pin changed while loading data")
                 } else if let Some(chart) = app.agent_chart(ChartTarget::Uid(load.uid)) {
                     if chart.agent_view_generation() != load.generation
-                        || chart.symbol != load.symbol
+                        || !tr_data::same_instrument(&chart.symbol, &load.symbol)
                         || chart.tf != load.timeframe
                     {
                         tr_agent_tools::edits::error(
@@ -787,16 +787,14 @@ impl DataHost for ScopedHost {
                 .get(&self.call.turn)
                 .cloned()
                 .unwrap_or_else(|| (self.call.pin.symbol.clone(), self.call.pin.timeframe.clone()));
-            if tr_data::security(symbol).key() == tr_data::security(&expected_symbol).key()
-                && tf.to_string() == expected_tf
-            {
+            if tr_data::same_instrument(symbol, &expected_symbol) && tf.to_string() == expected_tf {
                 let uid = self.call.pin.uid;
                 let value = self
                     .job(ChartTarget::Uid(uid), move |app| {
                         let Some(chart) = app.agent_chart(ChartTarget::Uid(uid)) else {
                             return AgentReply::error("chart not found");
                         };
-                        if chart.symbol != expected_symbol || chart.tf != tf {
+                        if !tr_data::same_instrument(&chart.symbol, &expected_symbol) || chart.tf != tf {
                             return AgentReply::error("pinned chart changed; retry turn");
                         }
                         let bars: Vec<_> = chart
@@ -811,7 +809,7 @@ impl DataHost for ScopedHost {
                         AgentReply {
                             success: true,
                             value: json!({"bars":bars, "session":chart.read_chart().session,
-                            "instrument":chart.source_instrument()}),
+                            "instrument":chart.source_instrument(), "chart_symbol":chart.symbol, "chart_id":uid.to_string()}),
                         }
                     })
                     .await?;
@@ -823,6 +821,8 @@ impl DataHost for ScopedHost {
                         bars,
                         session: serde_json::from_value(value["session"].clone()).map_err(|e| e.to_string())?,
                         instrument: serde_json::from_value(value["instrument"].clone()).map_err(|e| e.to_string())?,
+                        chart_symbol: value["chart_symbol"].as_str().map(str::to_owned),
+                        chart_id: value["chart_id"].as_str().map(str::to_owned),
                         ..History::default()
                     });
                 }
@@ -1247,6 +1247,7 @@ impl LiveHost for ScopedHost {
                         let charts: Vec<_> = app.panes.iter().filter_map(|pane| match &pane.kind {
                             PaneKind::Chart(chart) => Some(json!({"uid":chart.uid,"symbol":chart.symbol,"timeframe":chart.tf,
                                 "visible_range":chart.visible_date_range(),"loaded_bars":chart.source_bars().bars.len(),
+                                "instrument":chart.source_instrument(),"venue":chart.source_instrument().map(|i| i.venue.label()),
                                 "drawings":chart.drawings,"studies":chart.studies_tail(None, 0),"comparisons":chart.comparison_symbols(),"comparison_provenance":chart.comparison_objects(),
                                 "undoable_agent_turns":app.undoable_agent_turns().into_iter().filter(|turn| chart.has_agent_turn(turn)).collect::<Vec<_>>()})),
                             _ => None,
@@ -1816,6 +1817,75 @@ mod tests {
             let summary=app.undo_agent_turn("replacement").unwrap(); assert!(summary.reverted>=2);
             assert_eq!(app.agent_chart(ChartTarget::Pinned).unwrap().drawings,vec![original.unwrap()]);
         });
+    }
+
+    #[test]
+    fn crypto_analysis_alias_drawings_use_the_analysis_chart_key() {
+        for (index, chart_symbol, analysis_symbol, drawing_symbol) in [
+            (0, "BTCUSD Curncy", "COINBASE:BTC-USD", "BTCUSD Curncy"),
+            (1, "COINBASE:BTC-USD Curncy", "BTCUSD Curncy", "COINBASE:BTC-USD"),
+        ] {
+            let (mut app, mut executor, _) = edit_fixture(&format!("symbol-bargo-alias-{index}"));
+            let bars = Arc::new(tr_core::sample::generate("BTCUSD", Timeframe::D1, 300, 86400));
+            let mut chart = crate::chart_view::ChartState::new(1, chart_symbol, Timeframe::D1);
+            chart.on_history(
+                0,
+                bars.clone(),
+                tr_chart::scene::SeriesGpu::build(&bars),
+                0,
+                false,
+                false,
+                false,
+                &app.worker,
+            );
+            chart.on_crypto_source(0, Some(tr_core::crypto::CryptoInstrument::parse("COINBASE:BTC-USD").unwrap()));
+            app.panes[0].kind = PaneKind::Chart(Box::new(chart));
+            let pin = AppExecutor::pin(&app).unwrap();
+            // Any fallback to a worker would fail: aliases must reuse loaded chart bars.
+            let (worker, mut requests) = mpsc::unbounded_channel();
+            executor.worker = worker;
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let read = edit_call(&mut app, &executor, &pin, "aliases", "read_data", json!({"symbol":analysis_symbol,"timeframe":"1D","limit":100})).await;
+                assert!(read.success, "{read:?}");
+                assert_eq!(result_value(&read)["symbol"], chart_symbol);
+                assert_eq!(result_value(&read)["venue"], "COINBASE");
+                let read_chart = edit_call(&mut app, &executor, &pin, "aliases", "read_chart", json!({})).await;
+                assert_eq!(result_value(&read_chart)["charts"][0]["symbol"], chart_symbol);
+                assert_eq!(result_value(&read_chart)["charts"][0]["venue"], "COINBASE");
+                let analyzed = edit_call(&mut app, &executor, &pin, "aliases", "analyze", json!({"symbol":analysis_symbol,"timeframe":"1D","mode":"levels","version":2})).await;
+                assert!(analyzed.success, "{analyzed:?}");
+                let value = result_value(&analyzed);
+                assert_eq!(value["symbol"], chart_symbol);
+                assert_eq!(value["venue"], "COINBASE");
+                assert_eq!(value["chart_id"], pin.uid.to_string());
+                assert!(requests.try_recv().is_err());
+                let reference = json!({"analysis_id":value["analysis_id"],"item_id":value["support_resistance"][0]["item_id"]});
+                let wrong_target = edit_call(&mut app, &executor, &pin, "aliases", "create_drawing", json!({"symbol":drawing_symbol,"kind":"rectangle","chart_id":"999","analysis_ref":reference})).await;
+                assert!(!wrong_target.success);
+                let drawn = edit_call(&mut app, &executor, &pin, "aliases", "create_drawing", json!({"symbol":drawing_symbol,"kind":"rectangle","analysis_ref":reference})).await;
+                assert!(drawn.success, "{drawn:?}");
+                let chart = app.agent_chart(ChartTarget::Pinned).unwrap();
+                assert_eq!(chart.drawings.len(), 1);
+                assert_eq!(chart.drawings[0].symbol.as_deref(), Some(chart_symbol));
+
+                // A genuinely different quote is analyzed off-chart via a fake worker.
+                let mut future = executor.execute(Arc::new(Registry::new(tr_agent_tools::ToolSet::Edit)), ToolCall {
+                    turn: "aliases".into(), pin: pin.clone(), name: "analyze".into(),
+                    arguments: json!({"symbol":"BINANCE:BTCUSDT","timeframe":"1D","mode":"levels","version":2}).to_string(), confirmed: false,
+                });
+                assert!(futures::poll!(future.as_mut()).is_pending());
+                let Request::Agent(AgentRequest::ToolHistory { reply, .. }) = requests.recv().await.unwrap() else { panic!() };
+                reply.send(Ok(History { bars: bars.as_ref().clone(), instrument: Some(tr_core::crypto::CryptoInstrument::parse("BINANCE:BTCUSDT").unwrap()), ..Default::default() })).unwrap();
+                let analyzed = future.await;
+                assert!(analyzed.success, "{analyzed:?}");
+                let value = result_value(&analyzed);
+                for symbol in [chart_symbol, "BINANCE:BTCUSDT"] {
+                    let drawn = edit_call(&mut app, &executor, &pin, "aliases", "create_drawing", json!({"symbol":symbol,"kind":"rectangle","analysis_ref":{"analysis_id":value["analysis_id"],"item_id":value["support_resistance"][0]["item_id"]}})).await;
+                    assert!(!drawn.success, "different quotes must not draw: {drawn:?}");
+                }
+                assert_eq!(app.agent_chart(ChartTarget::Pinned).unwrap().drawings.len(), 1);
+                });
+        }
     }
 
     #[test]
