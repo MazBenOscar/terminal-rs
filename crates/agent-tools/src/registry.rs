@@ -59,6 +59,121 @@ impl CallBudget {
     }
 }
 
+/// A turn-local cache. Hosts must share it across calls and discard it at turn end.
+#[derive(Default)]
+pub struct AnalysisCache {
+    values: std::collections::HashMap<String, Value>,
+}
+impl AnalysisCache {
+    fn store(&mut self, mut result: ToolResult) -> ToolResult {
+        if !result.success {
+            return result;
+        }
+        let Some(crate::Content::Text(text)) = result.content.first_mut() else {
+            return result;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(text) else {
+            return result;
+        };
+        if value["version"] != 2 || value["truncated"] == true {
+            return result;
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = format!("analysis-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        value["analysis_id"] = id.clone().into();
+        if self.values.len() >= 32 {
+            self.values.clear();
+        }
+        self.values.insert(id, value.clone());
+        *text = value.to_string();
+        result.capped()
+    }
+    fn fill(&self, a: &mut args::CreateDrawing) -> Result<(), ToolResult> {
+        let Some(reference) = &a.analysis_ref else {
+            return Ok(());
+        };
+        let value = self.values.get(&reference.analysis_id).ok_or_else(|| {
+            invalid("Unknown or expired analysis_id; analyze again in this turn".into(), Some("analysis_ref"))
+        })?;
+        if tr_data::security(&a.symbol).key() != tr_data::security(value["symbol"].as_str().unwrap_or_default()).key() {
+            return Err(invalid(
+                "Analysis symbol does not match drawing symbol; re-run analyze for the current chart".into(),
+                Some("analysis_ref"),
+            ));
+        }
+        let zone = value["support_resistance"]
+            .as_array()
+            .and_then(|items| items.iter().find(|i| i["item_id"] == reference.item_id));
+        let line = ["trendlines", "historical"]
+            .into_iter()
+            .flat_map(|key| value[key].as_array().into_iter().flatten())
+            .find(|i| i["item_id"] == reference.item_id);
+        let tf = value["timeframe"].as_str().unwrap_or("1D");
+        a.source_timeframe = Some(tf.into());
+        a.extend_left = false;
+        a.extend_right = true;
+        a.all_symbols = false;
+        if let Some(z) = zone {
+            a.kind = args::DrawingKind::Rectangle;
+            a.anchors = vec![
+                args::Anchor { time: z["first_touch_ts"].as_i64().unwrap(), price: z["low"].as_f64().unwrap() },
+                args::Anchor { time: value["last_bar_ts"].as_i64().unwrap(), price: z["high"].as_f64().unwrap() },
+            ];
+            a.zone_role = Some(match z["role"].as_str() {
+                Some("support") => args::ZoneRole::Support,
+                Some("resistance") => args::ZoneRole::Resistance,
+                _ => args::ZoneRole::InPlay,
+            });
+            a.label = Some(analysis_label(a.label.as_deref(), z["role"].as_str().unwrap(), false));
+            a.dashed = false;
+        } else if let Some(l) = line {
+            a.kind = args::DrawingKind::Ray;
+            a.anchors = l["anchors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| args::Anchor { time: p["time"].as_i64().unwrap(), price: p["price"].as_f64().unwrap() })
+                .collect();
+            a.zone_role = None;
+            let broken = l["broken"] == true;
+            a.label = Some(analysis_label(a.label.as_deref(), l["role"].as_str().unwrap(), broken));
+            a.dashed = broken || l["kind"] == "dashed";
+        } else {
+            return Err(invalid("Unknown item_id in analysis".into(), Some("analysis_ref")));
+        }
+        Ok(())
+    }
+}
+
+fn analysis_label(label: Option<&str>, role: &str, broken: bool) -> String {
+    let role = role.replace('_', " ");
+    // Reserve room for the authoritative role/state and the chart's timeframe
+    // prefix, so its 500-character sanitizer cannot cut off "(broken)".
+    let supplied: String = label.unwrap_or_default().trim().chars().take(450).collect();
+    let lower = supplied.to_ascii_lowercase();
+    let contradicts = (lower.contains("broken") && !broken)
+        || (broken && ["active", "not broken", "unbroken", "intact"].iter().any(|word| lower.contains(word)))
+        || (role.contains("support") && lower.contains("resistance"))
+        || (role.contains("resistance") && lower.contains("support"))
+        || (role.contains("rising") && lower.contains("falling"))
+        || (role.contains("falling") && lower.contains("rising"))
+        || (role == "in play" && ["support", "resistance"].iter().any(|word| lower.contains(word)))
+        || (role != "in play" && lower.contains("in play"));
+    let mut result = if supplied.is_empty() || contradicts {
+        role
+    } else if lower.contains(&role) {
+        supplied.to_owned()
+    } else {
+        // Preserve harmless model context; add the authoritative role, rather
+        // than replacing a label merely because it used different wording.
+        format!("{supplied} · {role}")
+    };
+    if broken && !result.to_ascii_lowercase().contains("(broken)") {
+        result.push_str(" (broken)");
+    }
+    result
+}
+
 pub struct CallContext<'a> {
     pub data: &'a dyn DataHost,
     pub live: &'a dyn LiveHost,
@@ -67,10 +182,11 @@ pub struct CallContext<'a> {
     pub now: i64,
     /// Set only after host UI consent for this operation. Never accept this from tool arguments.
     pub confirmed: bool,
+    pub analyses: std::sync::Arc<std::sync::Mutex<AnalysisCache>>,
 }
 impl<'a> CallContext<'a> {
     pub fn new(data: &'a dyn DataHost, live: &'a dyn LiveHost, budget: &'a mut CallBudget) -> Self {
-        Self { data, live, budget, now: chrono::Utc::now().timestamp(), confirmed: false }
+        Self { data, live, budget, now: chrono::Utc::now().timestamp(), confirmed: false, analyses: Default::default() }
     }
 }
 
@@ -192,7 +308,10 @@ impl Registry {
                     Err(e) => invalid(e.to_string(), None),
                 },
                 "analyze" => match serde_json::from_value::<args::Analyze>(value) {
-                    Ok(args) => data::analyze(ctx.data, args, ctx.now).await,
+                    Ok(args) => {
+                        let result = data::analyze(ctx.data, args, ctx.now).await;
+                        ctx.analyses.lock().unwrap().store(result)
+                    }
                     Err(e) => invalid(e.to_string(), None),
                 },
                 "find_symbol" => match serde_json::from_value::<args::FindSymbol>(value) {
@@ -228,6 +347,18 @@ impl Registry {
         {
             return invalid("Supply pane_id or name, not both".into(), None);
         }
+        if let LiveArgs::CreateDrawing(a) = &mut args
+            && let Err(error) = ctx.analyses.lock().unwrap().fill(a)
+        {
+            return error;
+        }
+        let unverified = if let LiveArgs::CreateDrawing(a) = &args {
+            let label = a.label.as_deref().unwrap_or_default().to_ascii_lowercase();
+            a.analysis_ref.is_none()
+                && (a.zone_role.is_some() || ["support", "resistance", "trend"].iter().any(|word| label.contains(word)))
+        } else {
+            false
+        };
         if let Err(error) = validate_live(&mut args, ctx.now) {
             return error;
         }
@@ -281,7 +412,15 @@ impl Registry {
                 return result.capped();
             }
         }
-        ctx.live.call_live(name, args).await.capped()
+        let mut result = ctx.live.call_live(name, args).await;
+        if unverified
+            && let Some(crate::Content::Text(text)) = result.content.first_mut()
+            && let Ok(mut value) = serde_json::from_str::<Value>(text)
+        {
+            value["warning"] = "coordinates not from analysis".into();
+            *text = value.to_string();
+        }
+        result.capped()
     }
 }
 
@@ -458,7 +597,7 @@ fn catalog() -> Vec<ToolSpec> {
         ),
         (
             "analyze",
-            "Compute versioned deterministic swings, trend, levels, volume profile or volatility over returned history.",
+            "Compute deterministic swings, trend, levels, trendlines, volume profile or volatility. Levels/swings default to v2 (v1 remains available). V2 levels/trendlines issue turn-local analysis_id and item_id for exact create_drawing analysis_ref coordinates. Lookback defaults to 400 D1 bars, timeframe-scaled and capped at 1000.",
             args::Analyze::schema(),
         ),
         (
@@ -489,7 +628,7 @@ fn catalog() -> Vec<ToolSpec> {
                 true,
             ),
             "create_drawing" => (
-                "Create a drawing for an explicit symbol. Rectangles normalize inverted anchors, snap times to loaded bars and clamp the end to the last bar; start must be loaded and both dimensions non-zero. Pass source_timeframe from analyze/read_data for zone labels. all_symbols defaults false.",
+                "Create a drawing for an explicit symbol. For S/R and trends always pass analysis_ref {analysis_id,item_id} from this turn: exact anchors, kind, label, source_timeframe, extend_right and dashed style are filled by the host, ignoring model numbers. Omit anchors with a reference. Replaces only prior agent S/R for the same symbol/timeframe, undoably. Without a reference technical drawings return 'coordinates not from analysis'. Manual rectangles normalize/snap loaded times and clamp the end. Results disclose drawings_hidden and chart_visible; tell the user when drawings are not visible.",
                 true,
             ),
             "update_drawing" => {
@@ -557,6 +696,52 @@ mod tests {
     use serde_json::json;
     use tr_core::Timeframe;
     use tr_data::{Quote, SearchHit};
+
+    #[tokio::test]
+    async fn precision_analysis_ref_fills_exact_coordinates_styles_and_expires() {
+        let mut cache = AnalysisCache::default();
+        let output=value(cache.store(ToolResult::json(json!({"version":2,"symbol":"AAA","timeframe":"1D","last_bar_ts":1000,
+            "support_resistance":[{"item_id":"zone-0","first_touch_ts":100,"low":123.4567890123,"high":125.987654321,"role":"in_play"}],
+            "trendlines":[{"item_id":"line-0","anchors":[{"time":100,"price":110.123456789},{"time":900,"price":120.987654321}],"role":"rising_support","kind":"dashed"}]}))));
+        let id = output["analysis_id"].as_str().unwrap();
+        let registry = Registry::new(ToolSet::Edit);
+        let mut budget = CallBudget::new(8);
+        let mut ctx = CallContext::new(&Host, &Host, &mut budget);
+        ctx.now = 2000;
+        ctx.analyses = std::sync::Arc::new(std::sync::Mutex::new(cache));
+        let mut input = json!({"symbol":"AAA","kind":"horizontal","anchors":[{"time":1,"price":999.}],"analysis_ref":{"analysis_id":id,"item_id":"zone-0"},"label":"resistance","extend_left":true});
+        let zone = value(registry.call("create_drawing", &input.to_string(), &mut ctx).await);
+        assert_eq!(
+            zone["args"]["anchors"],
+            json!([{"time":100,"price":123.4567890123},{"time":1000,"price":125.987654321}])
+        );
+        assert_eq!(zone["args"]["kind"], "rectangle");
+        assert_eq!(zone["args"]["zone_role"], "in_play");
+        assert_eq!(zone["args"]["extend_right"], true);
+        assert_eq!(zone["args"]["extend_left"], false);
+        assert!(zone["warning"].is_null());
+        input["analysis_ref"]["item_id"] = "line-0".into();
+        input.as_object_mut().unwrap().remove("anchors");
+        let line = value(registry.call("create_drawing", &input.to_string(), &mut ctx).await);
+        assert_eq!(line["args"]["anchors"][0]["price"], 110.123456789);
+        assert_eq!(line["args"]["anchors"][1]["time"], 900);
+        assert_eq!(line["args"]["kind"], "ray");
+        assert_eq!(line["args"]["dashed"], true);
+        assert_eq!(line["args"]["label"], "rising support");
+        input["symbol"] = "BBB".into();
+        assert!(!registry.call("create_drawing", &input.to_string(), &mut ctx).await.success);
+        input["symbol"] = "AAA".into();
+        ctx.analyses = Default::default();
+        assert!(!registry.call("create_drawing", &input.to_string(), &mut ctx).await.success);
+        let mut manual =
+            json!({"symbol":"AAA","kind":"ray","anchors":[{"time":100,"price":1.},{"time":900,"price":2.}]});
+        assert!(value(registry.call("create_drawing", &manual.to_string(), &mut ctx).await)["warning"].is_null());
+        manual["label"] = "rising support".into();
+        assert_eq!(
+            value(registry.call("create_drawing", &manual.to_string(), &mut ctx).await)["warning"],
+            "coordinates not from analysis"
+        );
+    }
 
     #[test]
     fn n4_local_tools_are_default_readonly_and_strictly_bounded() {
@@ -1291,5 +1476,45 @@ mod tests {
                 assert_eq!(result["args"]["chart_id"], "pinned-chart");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod review_a3e_registry_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn review_broken_line_label() {
+        let mut cache = AnalysisCache::default();
+        let stored =
+            cache.store(ToolResult::json(json!({"version":2,"symbol":"AAA","timeframe":"1D","last_bar_ts":1000,
+            "trendlines":[{"item_id":"line-0","anchors":[{"time":100,"price":110.},{"time":900,"price":120.}],
+            "role":"rising_support","kind":"solid","broken":true}]})));
+        let Some(crate::Content::Text(text)) = stored.content.first() else { panic!() };
+        let id = serde_json::from_str::<Value>(text).unwrap()["analysis_id"].as_str().unwrap().to_owned();
+        let mut a: args::CreateDrawing = serde_json::from_value(json!({"symbol":"AAA","kind":"ray",
+            "analysis_ref":{"analysis_id":id,"item_id":"line-0"},"label":"broken rising support"}))
+        .unwrap();
+        cache.fill(&mut a).unwrap();
+        assert!(a.dashed, "broken lines must always be dashed");
+        let value = cache.values.get_mut(&id).unwrap();
+        value["historical"] = value["trendlines"].take();
+        a.dashed = false;
+        cache.fill(&mut a).unwrap();
+        assert!(a.dashed, "explicit historical references must also enforce broken styling");
+        let label = a.label.unwrap_or_default();
+        assert!(label.contains("(broken)"), "broken line labelled {label:?}");
+        assert_eq!(analysis_label(Some("tested rising support"), "rising_support", false), "tested rising support");
+        assert_eq!(analysis_label(Some("September lows"), "rising_support", false), "September lows · rising support");
+        assert_eq!(
+            analysis_label(Some("not broken rising support"), "rising_support", true),
+            "rising support (broken)"
+        );
+        assert_eq!(analysis_label(Some("active rising support"), "rising_support", true), "rising support (broken)");
+        assert_eq!(analysis_label(Some("broken rising support"), "rising_support", false), "rising support");
+        let long = analysis_label(Some(&"x".repeat(500)), "rising_support", true);
+        assert!(long.ends_with("rising support (broken)"));
+        assert!(long.chars().count() < 490, "leave room for the chart timeframe prefix");
     }
 }

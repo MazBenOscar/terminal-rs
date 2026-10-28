@@ -803,6 +803,17 @@ impl TerminalApp {
             self.pinned_agent_chart = None;
         }
         self.agent_pane.settings.pinned_chart = self.pinned_agent_chart;
+        let visible = self.visible_panes();
+        let charts: Vec<_> = self
+            .panes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, pane)| match &pane.kind {
+                PaneKind::Chart(chart) => Some((chart.uid, chart.drawings_hidden, visible.contains(&i))),
+                _ => None,
+            })
+            .collect();
+        self.agent_pane.refresh_drawing_visibility(&charts);
         self.refresh_agent_undo();
         self.send_next_agent_prompt();
     }
@@ -910,6 +921,17 @@ impl TerminalApp {
                     && self.agent_pane.session.is_some()
                 {
                     self.start_agent_session(ctx);
+                }
+            }
+            Action::ShowDrawings(uid) => {
+                if let Some(pane) = self.panes.iter_mut().find(|p| matches!(&p.kind, PaneKind::Chart(c) if c.uid==uid))
+                {
+                    if let PaneKind::Chart(chart) = &mut pane.kind {
+                        chart.drawings_hidden = false;
+                    }
+                    self.dock.activate(pane.id);
+                    self.agent_pane.drawings_shown(uid);
+                    self.autosave();
                 }
             }
             Action::UndoTurn(turn) => {

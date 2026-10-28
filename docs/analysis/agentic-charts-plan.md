@@ -19,6 +19,319 @@ The design comes from four sources:
 
 Each phase lands on its own feature branch, following the existing workflow.
 
+## A3E-FIX reviewer follow-up (2026-10-27)
+
+This section supersedes the original A3e report below. All reads/edits stayed
+inside `terminal-rs-precision`; no git command/state change, commit, release build,
+app launch or network operation was used. The external scratchpad specification
+was not opened because it lies outside the explicitly permitted directory; the
+15-item task and this repository's plan were used. Reviewer tests and their hooks
+were retained; all six A3e reviewer ignores were removed.
+
+### Outcomes
+
+| Item | Outcome |
+|---|---|
+| 1 | Post-last-touch through final-bar closes are checked at 0.35 ATR per bar. More than one breach, or a final-close breach, breaks the line even after recovery. Active `trendlines` excludes broken lines; separate `historical` contains only broken lines. |
+| 2 | Score-first same-role deduplication rejects >=2 shared touches, or last projections <0.5 ATR apart with slopes whose next-ten-bar divergence is <0.5 ATR. |
+| 3 | Bounds use observed swing/body reactions only; capped merges trim to dense touches, never to the latest close. In-play requires >=0.1 ATR interior clearance on both edges. The manager's **0.6 ATR cap is retained**. |
+| 4 | Touch/close validation, final anchors, current projection and +10 projection all use bar indices, including irregular weekday histories. |
+| 5 | Broken references enforce `(broken)` and dashed styling. Contradictory labels are replaced; harmless model context is preserved, adding the authoritative role when absent. Explicit historical references resolve exact anchors. |
+| 6 | V2 ATR floor is relative only: abs(close) x 1e-12. Tiny-price regression now covers zone bounds/roles/touches/recommendations and active/historical line projections. |
+| 7 | Core fractals accept equal highs/lows, choosing the first bar of a contiguous equal run; separated equal extrema remain distinct. |
+| 8 | V2 swings exclude the still-forming final bar from confirmation. Major confirmation includes the opposite minor swing's +2 confirmation. V2 compatibility highs/lows use these same confirmed points. |
+| 9 | Replacement is per kind and same symbol/timeframe; lines retain zones and zones retain lines. Real user edits, including moves/text/style, transfer ownership to User and protect drawings from replacement. |
+| 10 | Host execution rejects symbol/timeframe mismatches with a clear re-run-analyze error, before applying drawings. |
+| 11 | Host turn counters enforce <=6 referenced zones and <=2 referenced lines per role, across analyses/charts/calls; rejected attempts do not add drawings. |
+| 12 | Manual-coordinate warnings require zone_role or support/resistance/trend label text. An ordinary unlabelled ray does not warn. |
+| 13 | Live chart reconciliation clears notices when the target closes or its drawings become visible by any toolbar/tab path; stale hidden status updates while offscreen. No automatic reveal. |
+| 14 | `recommended=true` marks up to six zones: in-play, nearest major each side, then score. Agent instructions use these flags and active-only lines. |
+| 15 | Both unchanged Coinbase fixtures are reported below at default lookback: 393 D1 / 1000 4H bars. |
+
+### Tests changed / added
+
+- Enabled all six original `review_*` regressions in `review_a3e_tests.rs` and
+  `review_a3e_registry_tests`; strengthened post-touch state/breach accounting,
+  >=2-touch and projected/slope deduplication, weekday touch/current/+10 index
+  consistency, tiny-price lines as well as zones, and broken label/style tests.
+- Added `post_touch_breaks_survive_recovery_and_one_breach_is_allowed`,
+  `plateaus_and_opposite_confirmation_exclude_the_forming_bar`,
+  `recommendations_reserve_in_play_and_nearest_majors_then_score`, and
+  `precision_h4_fixture_report`.
+- Added core `fractals_accept_equal_extrema_and_select_the_first_plateau_bar`,
+  host `analysis_refs_enforce_current_chart_and_per_turn_caps`, and pane
+  `drawing_notice_reconciles_toolbar_tab_and_closed_pane_paths`.
+- Updated existing per-kind replacement/object-cap, manual-ray warning,
+  interleaved-user-edit ownership, D1 reference-role, and real D1/4H tool-contract
+  tests. No fixture or golden/snapshot was changed. The unsupported 80,900
+  reference test remains explicitly ignored, not reported as a successful match.
+
+### Post-fix fixture tables
+
+Both end at **2026-10-28 00:00 UTC**, close **80,628.95**. Tables show all returned
+zones, not just the six recommended drawings. `S+C=T` is swing touches plus
+respected closes. Prices are rounded here; cached coordinates keep full precision.
+D1 has **no genuine in-play zone**: the former close-pinned band is support.
+4H has one touch-derived, interior-clearance-qualified in-play zone.
+
+| TF | ID | Role / strength | Low–high | S+C=T | Score | Trimmed | Recommended |
+|---|---|---|---|---|---:|---|---|
+| D1 | zone-0 | support / major | 79,107.00–80,246.85 | 11+16=27 | 30.3611 | yes | yes |
+| D1 | zone-1 | resistance / major | 81,880.08–83,019.92 | 8+5=13 | 22.9153 | yes | yes |
+| D1 | zone-2 | support / minor | 77,791.22–78,456.14 | 3+10=13 | 12.8621 | no | no |
+| D1 | zone-3 | resistance / major | 84,261.99–85,188.53 | 4+7=11 | 14.7542 | no | yes |
+| D1 | zone-4 | support / major | 75,794.72–76,845.71 | 6+9=15 | 19.8107 | no | yes |
+| D1 | zone-5 | resistance / major | 86,257.15–87,397.00 | 7+6=13 | 20.5853 | yes | yes |
+| D1 | zone-6 | support / major | 73,741.53–74,881.38 | 6+5=11 | 18.7520 | yes | yes |
+| D1 | zone-7 | resistance / minor | 87,400.72–88,065.64 | 1+9=10 | 7.0171 | no | no |
+| D1 | zone-8 | support / minor | 72,364.13–73,503.98 | 2+2=4 | 9.8924 | no | no |
+| D1 | zone-9 | support / minor | 70,020.00–70,941.65 | 3+11=14 | 12.9913 | no | no |
+| D1 | zone-10 | resistance / minor | 90,814.55–91,479.47 | 1+0=1 | 4.8094 | no | no |
+| D1 | zone-11 | resistance / minor | 110,889.53–111,554.45 | 1+0=1 | 3.8887 | no | no |
+| 4H | zone-0 | in_play / major | 80,491.12–80,908.88 | 10+12=22 | 28.7093 | yes | yes |
+| 4H | zone-1 | resistance / major | 80,927.48–81,202.49 | 3+10=13 | 14.9592 | no | yes |
+| 4H | zone-2 | support / major | 79,789.09–80,206.85 | 7+14=21 | 22.4563 | yes | yes |
+| 4H | zone-3 | resistance / major | 81,302.25–81,720.00 | 4+15=19 | 16.9328 | yes | no |
+| 4H | zone-4 | support / major | 79,091.12–79,508.88 | 14+15=29 | 37.6140 | yes | yes |
+| 4H | zone-5 | resistance / major | 81,919.62–82,337.37 | 7+13=20 | 22.6037 | yes | yes |
+| 4H | zone-6 | support / minor | 78,334.44–78,747.85 | 6+18=24 | 18.6227 | no | no |
+| 4H | zone-7 | support / major | 77,518.12–77,935.88 | 20+25=45 | 47.5790 | yes | yes |
+| 4H | zone-8 | resistance / minor | 83,513.00–83,930.75 | 3+21=24 | 13.1805 | no | no |
+| 4H | zone-9 | support / minor | 72,985.39–73,229.09 | 1+2=3 | 5.0417 | no | no |
+| 4H | zone-10 | support / minor | 69,900.59–70,144.29 | 1+1=2 | 12.4076 | no | no |
+
+**Active trendlines** (all broken=false):
+
+| TF | ID / role | Exact anchors (UTC) | Touches / style | Last projection | +10 bars | Post-touch breaches |
+|---|---|---|---|---:|---:|---:|
+| D1 | line-0 / falling resistance | 2025-10-06 126,296.00 → 2026-10-21 84,856.07 | 5 / solid | 84,092.70 | 83,002.18 | 0 |
+| 4H | line-0 / rising support | 2026-09-15 16:00 74,887.50 → 2026-10-27 08:00 79,365.93 | 6 / solid | 79,437.58 | 79,616.72 | 0 |
+| 4H | line-1 / falling resistance | 2026-10-02 12:00 87,249.05 → 2026-10-21 16:00 84,856.07 | 5 / solid | 84,065.35 | 83,857.26 | 0 |
+| 4H | line-2 / falling resistance | 2026-10-25 00:00 80,925.00 → 2026-10-26 12:00 80,710.04 | 3 / dashed | 80,495.08 | 80,256.24 | 1 |
+
+**Historical only** (all broken=true, dashed, labelled `(broken)` if explicitly drawn):
+
+| TF | ID / role | Exact anchors (UTC) | Touches | Last projection | +10 bars | Post-touch breaches |
+|---|---|---|---:|---:|---:|---:|
+| D1 | historical-line-0 / rising support | 2026-08-14 62,468.21 → 2026-10-18 80,564.57 | 3 | 83,348.63 | 86,132.68 | 6 |
+| D1 | historical-line-1 / rising support | 2026-07-06 61,250.00 → 2026-07-24 63,641.00 | 5 | 76,393.00 | 77,721.33 | 19 |
+| D1 | historical-line-2 / falling resistance | 2025-10-13 116,077.51 → 2026-09-14 79,591.17 | 6 | 74,813.20 | 73,727.29 | 41 |
+| D1 | historical-line-3 / falling resistance | 2026-05-06 82,814.23 → 2026-09-03 82,283.00 | 5 | 82,039.52 | 81,995.25 | 22 |
+| 4H | historical-line-0 / rising support | 2026-08-16 20:00 62,631.18 → 2026-10-20 12:00 81,196.01 | 6 | 83,349.15 | 83,827.62 | 32 |
+| 4H | historical-line-1 / rising support | 2026-09-20 00:00 80,085.00 → 2026-10-06 04:00 85,100.01 | 8 | 91,872.86 | 92,389.87 | 127 |
+| 4H | historical-line-2 / falling resistance | 2026-10-06 12:00 86,698.35 → 2026-10-18 08:00 82,183.56 | 4 | 78,495.42 | 77,859.54 | 48 |
+| 4H | historical-line-3 / falling resistance | 2026-09-22 12:00 86,734.00 → 2026-10-01 04:00 84,368.26 | 5 | 77,043.56 | 76,588.61 | 150 |
+
+Reproduce with `cargo test --offline --locked -p tr-agent-tools precision_ -- --nocapture`.
+The original 76,393 D1 rising line has recovered above its projection, but is
+historical because 19 post-touch closes breached it by >0.35 ATR. Recovery does
+not turn a long-broken line back into current support.
+
+### Follow-up verification
+
+- `cargo fmt --all`: passed.
+- `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`: passed, no warnings.
+- `TR_CONGRESS_REFRESH_MIN=0 cargo test --offline --locked --workspace`: passed,
+  **1,923 passed / 0 failed / 9 ignored**, including doctests. The equivalent Cargo
+  configuration form `cargo --config 'env.TR_CONGRESS_REFRESH_MIN="0"' test
+  --offline --locked --workspace` was used because shell environment-prefix
+  assignments require approval. All six targeted reviewer tests passed; none is
+  ignored. The remaining ignores are the pre-existing unsupported 80,900
+  reference assertion, seven external-network tests and one manual news audit.
+
+Logs: `target/a3e-fix-workspace-tests.log`; fixture tables:
+`target/a3e-fix-fixtures.log` (generated build artifacts, not source files).
+
+## Original A3e implementation report (pre-fix, superseded; 2026-10-27)
+
+Implemented offline in `terminal-rs-precision`; no commit, git-state command,
+release build, application launch, or network operation was performed. The supplied
+reference image was outside the permitted repository and was not opened. Both
+Coinbase CSV fixtures are retained unchanged. N4's `read_news`/`read_filings`
+implementation and its inline schema tests were not edited.
+
+### Per-item outcome
+
+1. **Swings:** confirmed 2/2 minor fractals; major requires both 5/5 fractal
+   confirmation and at least 1.5 ATR(14) reversal prominence on both sides to the
+   nearest opposite minor swing. Prices remain exact high/low observations.
+2. **Levels v2:** versioned output with configurable history, body-aware robust
+   ATR-scaled clusters, role/strength/score, separate swing and respected-close
+   counts, first/last touch timestamps, trimming metadata, overlap deduplication,
+   in-play inclusion and nearest-major reservations. Up to three major and three
+   minor per outside side are returned; the agent is instructed to draw at most
+   six zones. Explicit v1 keeps the legacy analytical format/algorithm.
+3. **Trendlines:** deterministic same-role swing pairs, rising lows/falling highs,
+   at least three swing touches within 0.35 ATR at each touch, no more than two
+   closes beyond the final line between extreme touches, and a touch in the final
+   40% of history. Revalidated exact extreme swing anchors, current/+10 projections,
+   broken status, solid >=4/dashed 3, and up to two lines per role. This new mode is
+   always v2, even if a caller supplies version=1.
+4. **Drawing provenance:** turn-local `analysis_id`/`item_id` references override
+   model coordinates, kind, label, source timeframe, extensions and dash style.
+   Rectangles use first touch to last analyzed bar and really extend right in
+   rendering; rays use exact swing endpoints. Analysis timestamps are not snapped
+   to other chart bars. Unreferenced technical drawings receive a warning.
+   Prior-turn agent S/R for the same symbol/timeframe, including legacy labeled
+   rays, is replaced through undoable drawing plans; user/Keep objects, other
+   symbols/timeframes and same-turn additions are retained. Replacement works at
+   the 100-agent-object limit.
+5. **Agent guidance:** read chart/data on the current timeframe, analyze both v2
+   levels and lines, use references rather than estimate coordinates, reserve
+   nearest majors/in-play, limit zones/lines, report touches, and describe broken
+   lines as historical rather than active. Editing turns have 16 tool calls;
+   read-only turns retain eight.
+6. **Visibility:** successful drawing results disclose hidden/target visibility,
+   chart UID and additions. The pane retains only a safe projection, aggregates
+   additions and offers an explicit **Show drawings** button. Only that user
+   action unhides drawings and activates the target tab; rendering the notice
+   does not reveal anything automatically.
+7. **Regression/verification:** unit, real D1/H4, geometry and app end-to-end tests
+   pass. The requested 80,900 rising-line acceptance assertion is explicitly
+   ignored because the real D1 fixture contradicts it; an exhaustive passing
+   test proves the disagreement is not a ranking artifact. It is not reported as
+   a successful reference match.
+
+### Parameters and boundaries
+
+Default lookback is 400 D1 bars, scaled by timeframe seconds and clamped to
+20–1000 bars (H4 therefore caps at 1000). It is additionally bounded by the
+requested/fetched history. ATR warm-up uses the observed mean true range, with a
+small relative/absolute numerical floor. No BTC-specific constants occur in the
+production algorithm.
+
+Zones use 0.35 last-bar ATR touch uncertainty, initial same-role cluster diameter
+0.7 ATR, IQR/median swing bounds biased toward the median nearer body edge, and a
+1.2 ATR height cap. High/low reactions are clustered separately before overlap
+merging to preserve polarity-flip levels. Cap-excluded distant swings do not
+inflate counts or strength. Respected closes count non-swing bars that touch a
+zone and close on the same outside side as the prior close; they are not a count
+of every close in/near a zone. Total touches = distinct swing bars + respected
+closes. Zone ranking is proximity-first, score as tie-break, with nearest-major
+reservations; scores combine touches, recency, prominence and relative volume.
+
+Line ranking combines touch count, span and normalized residual, with a
+20%-window recency half-life and a 0.5 broken-line multiplier. The 0.35 ATR broken
+threshold applies to the current close; the at-most-two historical close breaches
+are strict, with no tolerance. Projections interpolate timestamps, matching the
+rendered geometry; +10 uses the final observed bar interval.
+
+The 16 KiB tool-result cap is retained. Oversized detail is explicitly marked and
+reduced while retaining analysis metadata; line touch reduction retains exact
+anchors and original touch count. Truncated results deliberately receive no
+usable analysis reference: request a smaller history rather than silently draw
+from an incomplete result. References expire across turns and after cache
+rotation (32 entries).
+
+### Actual Coinbase BTC-USD D1 output
+
+393 bars, 2025-10-01 through 2026-10-28 UTC; final timestamp `1793145600`, close
+**80,628.95**, last ATR(14) approximately **1,899.74469**. The following are all
+returned analysis zones, not a proposal to draw all 11. Drawn rectangles end at
+the last bar and extend right; last touch below is analytical metadata, not the
+rectangle's end. Prices rounded to cents here; cached coordinates retain full
+floating-point precision. `S+C=T` means swing touches + respected closes = total.
+
+| ID | Role / strength | Low–high | S+C=T | First → last touch (UTC) | Score | Trimmed |
+|---|---|---|---|---|---:|---|
+| zone-0 | in-play / major | 78,525.63–80,628.95 | 11+13=24 | 2025-11-21 → 2026-10-28 | 30.1873 | no |
+| zone-1 | resistance / major | 81,452.63–83,041.42 | 8+8=16 | 2026-05-06 → 2026-10-23 | 23.3208 | yes |
+| zone-2 | support / major | 75,882.88–78,162.58 | 7+10=17 | 2026-04-17 → 2026-09-11 | 21.1814 | yes |
+| zone-3 | resistance / major | 84,786.19–87,065.88 | 11+11=22 | 2025-12-15 → 2026-10-21 | 29.1847 | yes |
+| zone-4 | support / major | 73,635.54–75,246.46 | 6+5=11 | 2026-03-04 → 2026-09-16 | 18.7571 | yes |
+| zone-5 | resistance / minor | 87,400.72–88,730.55 | 1+6=7 | 2025-12-07 → 2026-01-28 | 6.6655 | no |
+| zone-6 | support / major | 70,232.59–72,512.28 | 7+6=13 | 2026-02-08 → 2026-05-29 | 20.7768 | yes |
+| zone-7 | resistance / major | 89,163.61–90,809.27 | 9+8=17 | 2025-12-11 → 2026-01-29 | 23.7134 | yes |
+| zone-8 | support / minor | 68,288.62–69,015.73 | 2+9=11 | 2026-02-21 → 2026-08-20 | 9.8724 | yes |
+| zone-9 | resistance / minor | 110,224.62–111,554.45 | 1+0=1 | 2025-11-02 → 2025-11-02 | 3.8887 | no |
+| zone-10 | resistance / minor | 113,084.92–114,414.75 | 1+1=2 | 2025-10-21 → 2025-10-29 | 5.4336 | no |
+
+| ID / role | Exact swing anchors (UTC date, price) | Touches / style | Current projection | +10 bars | Broken | Closes beyond |
+|---|---|---|---:|---:|---|---:|
+| line-0 / rising support | 2026-07-06 61,250.00 → 2026-07-24 63,641.00 | 5 / solid | 76,393.00 | 77,721.33 | no | 0 |
+| line-1 / rising support | 2026-08-14 62,468.21 → 2026-10-18 80,564.57 | 3 / dashed | 83,348.63 | 86,132.68 | **yes** | 1 |
+| line-2 / falling resistance | 2025-10-06 126,296.00 → 2026-10-21 84,856.07 | 5 / solid | 84,092.70 | 83,002.18 | no | 0 |
+| line-3 / falling resistance | 2025-10-13 116,077.51 → 2026-10-21 84,856.07 | 5 / solid | 84,270.14 | 83,433.11 | no | 1 |
+
+**Reference differences:** all four requested price bands overlap a returned zone
+with the requested role and major classification where specified, but the
+computed bounds are broader, not exact replications. In particular, reference
+84,450–85,250 maps to 84,786.19–87,065.88; 82,150–82,900 to
+81,452.63–83,041.42; 80,000–80,900 to 78,525.63–80,628.95; and
+76,400–77,150 to 75,882.88–78,162.58. The test checks overlap/role, not endpoint
+equality. The in-play close is at the upper boundary after overlap/cap trimming.
+
+There is **no qualifying rising line within 1% of 80,900**, even when every low
+pair is inspected before ranking. The nearest qualifying candidate joins
+2026-09-15 **74,887.50** to 2026-10-18 **80,564.57**, has three touches, and
+projects to **82,284.894242** (+1,384.89 / +1.712% versus 80,900), already broken.
+It is not one of the final two ranked rising lines. The earlier major low is
+2026-09-02 **76,219.18**, not a mid-September 76,600 low. October 24/25/26 lows
+are **79,107.00 / 79,732.29 / 79,255.00**, not three independent confirmed rising
+D1 swing lows. Neither reference rising-line shape is reproduced; thresholds
+were not relaxed to fabricate it.
+
+Reproduce the tables without launching the app:
+
+```sh
+cargo test --offline --locked -p tr-agent-tools precision_btc_fixture_report_and_reference_comparison -- --nocapture
+```
+
+### Added tests and changed files
+
+Added tests cover fractal/prominence strength, scaled/capped/deduplicated zones
+and distinct touches, line tolerance/exact anchors/strict close validation,
+staleness/slope/minimum-touch rejection, exhaustive BTC reference disagreement,
+D1 tables/reference overlaps, the explicit ignored 80,900 assertion, analysis
+reference overrides/symbol mismatch/expiry/manual warnings, same-symbol/timeframe
+replacement at the object cap (including legacy rays and exact timestamps),
+rectangle viewport extension/hit testing, dashed ray labels/serialization,
+real D1/H4 version/lookback/result-cap contracts, app cached drawings/replacement/
+undo/hidden disclosure, and privacy-safe notice aggregation/user-button action.
+Legacy golden calls now explicitly request v1; deterministic-content comparisons
+ignore unique per-call analysis IDs; existing schema snapshots were refreshed.
+
+Changed files (all relative to repository root):
+
+- `crates/agent-tools/src/{analytics,args,data,host,lib,registry}.rs`
+- `crates/agent-tools/tests/tools.rs`
+- `crates/agent-tools/tests/snapshots/{read_only,edit,workflows}.json`
+- `crates/agent/src/bridge.rs`
+- `crates/chart/src/drawings/{mod,lines,shapes}.rs`
+- `app/src/{agent_bridge,agent_pane,agent_session,chart_view,drawing_paint}.rs`
+- `app/src/app/agent_ui.rs`
+- `docs/analysis/agentic-charts-plan.md`
+
+### Final verification
+
+- `cargo fmt --all`: **passed**.
+- `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`:
+  **passed**, no warnings.
+- `TR_CONGRESS_REFRESH_MIN=0 cargo test --offline --locked --workspace`:
+  **passed: 1,910 passed, 0 failed, 9 ignored**, including doctests. Executed
+  equivalently using `cargo test --config 'env.TR_CONGRESS_REFRESH_MIN="0"'
+  --offline --locked --workspace -- --quiet` because the shell environment-prefix
+  form required approval. The nine ignores comprise the explicit A3e reference
+  mismatch, seven pre-existing network-dependent tests, and one pre-existing
+  manual news-label audit. The ignored A3e assertion is an unmet reference
+  expectation, not a passing test.
+
+| Suite group | Passed | Ignored |
+|---|---:|---:|
+| app | 961 | 1 |
+| tr-agent (unit + integration + doctest) | 114 | 0 |
+| tr-agent-tools | 116 | 1 |
+| tr-alerts | 15 | 0 |
+| tr-broker | 47 | 0 |
+| tr-chart | 85 | 0 |
+| tr-congress | 65 | 0 |
+| tr-core | 224 | 0 |
+| tr-data | 173 | 7 |
+| tr-edgar | 66 | 0 |
+| tr-macos | 2 | 0 |
+| tr-net | 42 | 0 |
+| **Total** | **1,910** | **9** |
+
 ## Reference behaviour
 
 CoinMarketCap Agentic Charts pairs a TradingView chart with a chat panel.

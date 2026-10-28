@@ -49,6 +49,7 @@ pub struct AppExecutor {
     expected: Arc<Mutex<HashMap<String, (String, String)>>>,
     // A5b-SCAN session ownership, separate from chart edit/workflow state.
     scans: Arc<ScanSession>,
+    analyses: Arc<Mutex<HashMap<String, Arc<Mutex<tr_agent_tools::AnalysisCache>>>>>,
 }
 
 pub const fn agent_edit_tools_available() -> bool {
@@ -496,6 +497,10 @@ impl TerminalApp {
         if matches!(args, LiveArgs::SetView(_)) && uid != call.pin.uid {
             return error("wrong_chart", "set_view only changes the pinned chart");
         }
+        let drawings_hidden = selected.drawings_hidden;
+        let chart_visible =
+            self.visible_panes().iter().any(|&i| matches!(&self.panes[i].kind, PaneKind::Chart(c) if c.uid==uid));
+        let drawings_added = usize::from(matches!(&args, LiveArgs::CreateDrawing(_)));
         let comparisons = selected.comparison_objects();
         let chart = Chart {
             uid,
@@ -526,6 +531,10 @@ impl TerminalApp {
         if uid == call.pin.uid {
             expected.insert(call.turn.clone(), (pane.symbol.clone(), pane.tf.to_string()));
         }
+        value["drawings_hidden"] = json!(drawings_hidden);
+        value["chart_visible"] = json!(chart_visible);
+        value["chart_uid"] = json!(uid);
+        value["drawings_added"] = json!(drawings_added);
         self.prune_agent_turns();
         if self.agent_turn_undo_available(&call.turn) && !self.agent_turns.contains(&call.turn) {
             self.agent_turns.push(call.turn.clone());
@@ -606,6 +615,7 @@ impl AppExecutor {
             edits: Default::default(),
             expected: Default::default(),
             scans: Default::default(),
+            analyses: Default::default(),
         }
     }
 
@@ -615,6 +625,7 @@ impl AppExecutor {
         self.edits = Default::default();
         self.expected = Default::default();
         self.scans = Default::default();
+        self.analyses = Default::default();
         let tools = options.tools;
         AgentBridge::start(connector, Arc::new(self), Registry::new(tools), options).await
     }
@@ -636,6 +647,11 @@ impl ToolExecutor for AppExecutor {
             let mut budget = CallBudget::new(1);
             let mut ctx = CallContext::new(&host, &host, &mut budget);
             ctx.confirmed = host.call.confirmed;
+            ctx.analyses = {
+                let mut turns = self.analyses.lock().unwrap();
+                turns.retain(|turn, _| turn == &host.call.turn);
+                turns.entry(host.call.turn.clone()).or_default().clone()
+            };
             registry.call(&host.call.name, &host.call.arguments, &mut ctx).await
         })
     }
@@ -1269,6 +1285,7 @@ mod tests {
                 edits: Default::default(),
                 expected: Default::default(),
                 scans: Default::default(),
+                analyses: Default::default(),
             },
             call: ToolCall {
                 turn: "turn".into(),
@@ -1766,6 +1783,39 @@ mod tests {
             json!([{"time":86400,"price":10.}])
         };
         json!({"symbol":"AAA","kind":kind,"anchors":anchors,"label":"support"})
+    }
+
+    #[test]
+    fn precision_cached_drawings_replace_undo_and_disclose_hidden_chart() {
+        let (mut app, executor, pin) = edit_fixture("a3e-precision");
+        let bars = Arc::new(tr_core::sample::generate("AAA", Timeframe::D1, 300, 86400));
+        let worker = &app.worker;
+        if let PaneKind::Chart(chart) = &mut app.panes[0].kind {
+            chart.on_history(0, bars.clone(), tr_chart::scene::SeriesGpu::build(&bars), 0, false, true, false, worker);
+            chart.drawings_hidden = true;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut original=None;
+            for turn in ["first","replacement"] {
+                let analyzed=edit_call(&mut app,&executor,&pin,turn,"analyze",json!({"symbol":"AAA","timeframe":"1D","mode":"levels","version":2})).await;
+                assert!(analyzed.success,"{analyzed:?}");
+                let v=result_value(&analyzed); let z=&v["support_resistance"][0];
+                let drawn=edit_call(&mut app,&executor,&pin,turn,"create_drawing",json!({"symbol":"AAA","kind":"rectangle","analysis_ref":{"analysis_id":v["analysis_id"],"item_id":z["item_id"]}})).await;
+                assert!(drawn.success,"{drawn:?}"); let result=result_value(&drawn);
+                assert_eq!(result["drawings_hidden"],true); assert_eq!(result["drawings_added"],1);
+                let expected_visible=app.visible_panes().iter().any(|&i|matches!(&app.panes[i].kind,PaneKind::Chart(c) if c.uid==pin.uid));
+                assert_eq!(result["chart_visible"],expected_visible);
+                let chart=app.agent_chart(ChartTarget::Pinned).unwrap();
+                assert!(chart.drawings_hidden,"never reveal automatically");
+                assert_eq!(chart.drawings.len(),1,"old analysis replaced, not stacked");
+                let drawing=&chart.drawings[0];
+                assert_eq!(drawing.a.price,z["low"].as_f64().unwrap()); assert_eq!(drawing.a.ts,z["first_touch_ts"].as_i64().unwrap());
+                assert!(drawing.extend_right && drawing.text.starts_with("D1 "));
+                if turn=="first" {original=Some(drawing.clone());}
+            }
+            let summary=app.undo_agent_turn("replacement").unwrap(); assert!(summary.reverted>=2);
+            assert_eq!(app.agent_chart(ChartTarget::Pinned).unwrap().drawings,vec![original.unwrap()]);
+        });
     }
 
     #[test]

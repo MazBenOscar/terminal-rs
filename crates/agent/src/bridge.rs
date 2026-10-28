@@ -55,6 +55,7 @@ pub trait ToolExecutor: Send + Sync + 'static {
 pub struct HostExecutor<D, L> {
     pub data: D,
     pub live: L,
+    pub analyses: Mutex<std::collections::HashMap<String, Arc<Mutex<tr_agent_tools::AnalysisCache>>>>,
 }
 impl<D: DataHost + 'static, L: LiveHost + 'static> ToolExecutor for HostExecutor<D, L> {
     fn execute(&self, registry: Arc<Registry>, call: ToolCall) -> BridgeFuture<'_, ToolResult> {
@@ -62,6 +63,11 @@ impl<D: DataHost + 'static, L: LiveHost + 'static> ToolExecutor for HostExecutor
             let mut budget = CallBudget::new(1);
             let mut ctx = CallContext::new(&self.data, &self.live, &mut budget);
             ctx.confirmed = call.confirmed;
+            ctx.analyses = {
+                let mut turns = self.analyses.lock().unwrap();
+                turns.retain(|turn, _| turn == &call.turn);
+                turns.entry(call.turn.clone()).or_default().clone()
+            };
             registry.call(&call.name, &call.arguments, &mut ctx).await
         })
     }
@@ -171,10 +177,18 @@ mod answer_instruction_tests {
             "A finished weekly close above 82,850",
             "draw labeled rectangles, not single lines",
             "returned low and high bounds",
-            "recent visible range",
+            "first_touch_ts to last bar",
+            "Always use analysis_ref",
+            "drawings_hidden=true",
             "zone_role to support (theme up role) or resistance (theme down role)",
             "low-alpha fill",
-            "source_timeframe as the analyze/read_data timeframe (not the chart timeframe)",
+            "source_timeframe as the analyze/read_data timeframe (the current chart timeframe unless explicitly requested otherwise)",
+            "separate historical list contains broken=true lines",
+            "recommended=true",
+            "Use only the active trendlines list by default",
+            "labelled (broken) and dashed",
+            "Replacement is per kind",
+            "User-edited agent drawings are user-owned",
             "in_play zone(s) plus the nearest zone on each side at minimum",
             "Say in text which zone price is in",
             "one short clarifying question with 3-5 concrete options",
@@ -660,21 +674,25 @@ impl AgentBridge {
         }
         let key = self.turn_ids.allocate()?;
         turn.input.context.insert("chart".into(), serde_json::to_string(&turn.pin)?);
-        *self.dispatch.turn.lock().unwrap() = Some(TurnState {
-            key: key.clone(),
-            wire_id: None,
-            pin: turn.pin,
-            requires_tools: turn.requires_tools,
-            consent: turn.screenshot_consent,
-            calls: 0,
-            direct_calls: 0,
-            budget: CallBudget::default(),
-            text: 0,
-            images: 0,
-            interrupted: None,
-            last_event: Instant::now(),
-            unavailable: None,
-        });
+        *self.dispatch.turn.lock().unwrap() =
+            Some(TurnState {
+                key: key.clone(),
+                wire_id: None,
+                pin: turn.pin,
+                requires_tools: turn.requires_tools,
+                consent: turn.screenshot_consent,
+                calls: 0,
+                direct_calls: 0,
+                // Four reads, six zones and four rays, plus two correction calls.
+                budget: CallBudget::new(
+                    if self.dispatch.registry.schemas().iter().any(|s| s.name == "create_drawing") { 16 } else { 8 },
+                ),
+                text: 0,
+                images: 0,
+                interrupted: None,
+                last_event: Instant::now(),
+                unavailable: None,
+            });
         let mut pending = PendingTurn { dispatch: self.dispatch.clone(), client: self.client.clone(), armed: true };
         watch_turn(&self.dispatch, self.client.clone());
         let result = self.client.send_turn(turn.input).await;
@@ -914,8 +932,8 @@ fn session_instructions(options: &BridgeOptions, registry: &Registry) -> String 
     let edits_enabled = registry.schemas().iter().any(|tool| tool.name == "create_drawing");
     let mode_instructions = if edits_enabled {
         concat!(
-            "When marking support/resistance, use analyze mode levels and draw labeled rectangles, not single lines: anchors at the returned low and high bounds, across the recent visible range from read_chart (within loaded bars). ",
-            "Set zone_role to support (theme up role) or resistance (theme down role); rectangles use the existing low-alpha fill. Pass source_timeframe as the analyze/read_data timeframe (not the chart timeframe); labels use that source timeframe in compact form (W1, D1, H4, H1, M15). Draw the in_play zone(s) plus the nearest zone on each side at minimum when available. Say in text which zone price is in, or that it is between zones.",
+            "For support/resistance or trendline requests, first read_chart and read_data on the chart's CURRENT timeframe. Never reuse another timeframe's zones unless the user explicitly asks. Run analyze levels version=2 AND analyze trendlines on that same history/timeframe. For zones draw labeled rectangles, not single lines: returned low and high bounds, first_touch_ts to last bar, extend_right=true. Always use analysis_ref {analysis_id,item_id}; the host fills exact coordinates, kind, labels and style. Avoid the 'coordinates not from analysis' warning; never estimate anchors. Draw at most 6 zones: use those marked recommended=true (in-play, nearest MAJOR each side, then highest scores). Draw at most 2 rising support and 2 falling resistance rays using returned anchors, solid/dashed from kind. Use only the active trendlines list by default. The separate historical list contains broken=true lines: draw these only on explicit user request, labelled (broken) and dashed, never as active support or resistance. The host enforces per-turn caps and rejects references from another symbol/timeframe: re-run analyze on the current chart after a mismatch. Replacement is per kind (lines replace lines, zones replace zones) for the same symbol/timeframe, undoably. User-edited agent drawings are user-owned and never replaced. Reply with drawn level ranges and touch counts. If tool results report drawings_hidden=true or chart_visible=false, explicitly say drawings were added but are not visible and direct the user to Show drawings; never say 'Already drawn' without this disclosure. ",
+            "Set zone_role to support (theme up role) or resistance (theme down role); rectangles use the existing low-alpha fill. Pass source_timeframe as the analyze/read_data timeframe (the current chart timeframe unless explicitly requested otherwise); labels use that source timeframe in compact form (W1, D1, H4, H1, M15). Draw the in_play zone(s) plus the nearest zone on each side at minimum when available. Say in text which zone price is in, or that it is between zones.",
             "If the request is ambiguous about symbols or scope, make no chart edits in that turn."
         )
     } else {
@@ -1167,6 +1185,7 @@ mod tests {
                 session: Default::default(),
             },
             live: Live,
+            analyses: Default::default(),
         })
     }
     fn turn() -> BridgeTurn {

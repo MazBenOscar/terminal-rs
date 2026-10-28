@@ -625,7 +625,7 @@ fn rounded(value: &mut Value) {
 async fn golden_mode(mode: &str) {
     for name in ["seeded", "levels"] {
         let host = Host::fixture(name);
-        let result = call(&host, "analyze", json!({"symbol":"FIXTURE","mode":mode})).await;
+        let result = call(&host, "analyze", json!({"symbol":"FIXTURE","mode":mode,"version":1})).await;
         assert!(result.success);
         let mut output = value(result);
         assert_eq!(output["version"], 1);
@@ -846,10 +846,104 @@ async fn large_summary_and_swings_keep_metadata_under_text_cap() {
     assert!(series.len() <= 300);
     assert_eq!(series.first().unwrap()[0], output["first"]);
     assert_eq!(series.last().unwrap()[0], output["last"]);
-    let output = value(call(&host, "analyze", json!({"symbol":"LARGE","mode":"swings","limit":10000})).await);
+    let output =
+        value(call(&host, "analyze", json!({"symbol":"LARGE","mode":"swings","limit":10000,"version":1})).await);
     assert_eq!(output["version"], 1);
     assert_eq!(output["bar_range"]["count"], 10_000);
     assert_eq!(output["truncated"], true);
+}
+
+#[tokio::test]
+async fn precision_real_d1_h4_contracts_lookback_versions_and_caps() {
+    for (tf, csv, expected_default) in [
+        ("1D", include_str!("fixtures/btcusd_coinbase_1D.csv"), 393),
+        ("4H", include_str!("fixtures/btcusd_coinbase_4H.csv"), 1000),
+    ] {
+        let bars: Vec<_> = csv
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let cells: Vec<_> = line.split(',').collect();
+                Bar::new(
+                    cells[0].parse().unwrap(),
+                    cells[1].parse().unwrap(),
+                    cells[2].parse().unwrap(),
+                    cells[3].parse().unwrap(),
+                    cells[4].parse().unwrap(),
+                    cells[5].parse().unwrap(),
+                )
+            })
+            .collect();
+        let last = *bars.last().unwrap();
+        let host = Host { history: History { bars, ..History::default() }, ..Host::default() };
+        let registry = Registry::new(ToolSet::ReadOnly);
+        let mut budget = CallBudget::new(16);
+        let mut ctx = CallContext { now: last.ts + 86400, ..CallContext::new(&host, &host, &mut budget) };
+        for mode in ["levels", "swings", "trendlines"] {
+            let output = value(
+                registry
+                    .call(
+                        "analyze",
+                        &json!({"symbol":"COINBASE:BTC-USD", "timeframe":tf,
+                "mode":mode})
+                        .to_string(),
+                        &mut ctx,
+                    )
+                    .await,
+            );
+            assert_eq!(output["version"], 2);
+            assert_eq!(output["timeframe"], tf);
+            assert_eq!(output["bar_range"]["count"], expected_default);
+            assert_eq!(output["last_bar_ts"], last.ts);
+            if mode == "swings" {
+                for key in ["swings", "highs", "lows"] {
+                    assert!(
+                        output[key].as_array().unwrap().iter().all(|s| s["confirmed_at"].as_i64().unwrap() < last.ts)
+                    );
+                }
+            }
+            if mode == "trendlines" {
+                assert!(output["trendlines"].as_array().unwrap().iter().all(|l| l["broken"] == false));
+                assert!(
+                    output["historical"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|l| l["broken"] == true && l["kind"] == "dashed")
+                );
+            }
+            if output["truncated"] != true {
+                assert!(output["analysis_id"].is_string());
+            } else {
+                assert!(output["analysis_id"].is_null(), "incomplete results must not resolve drawing references");
+            }
+        }
+        let output = value(
+            registry
+                .call(
+                    "analyze",
+                    &json!({"symbol":"COINBASE:BTC-USD", "timeframe":tf,
+            "mode":"levels", "lookback":60})
+                    .to_string(),
+                    &mut ctx,
+                )
+                .await,
+        );
+        assert_eq!(output["bar_range"]["count"], 60);
+        let output = value(
+            registry
+                .call(
+                    "analyze",
+                    &json!({"symbol":"COINBASE:BTC-USD", "timeframe":tf,
+            "mode":"trendlines", "version":1, "lookback":60})
+                    .to_string(),
+                    &mut ctx,
+                )
+                .await,
+        );
+        assert_eq!(output["version"], 2, "new trendlines mode has no legacy v1 representation");
+        assert_eq!(output["bar_range"]["count"], 60);
+    }
 }
 
 #[tokio::test]
@@ -1203,7 +1297,7 @@ mod adversarial {
         }
         use args::{AlertRule::*, CompareAction::*, DrawingKind::*, Mode::*};
         for (name, field, variants) in [
-            ("analyze", "mode", json!([Swings, Trend, Levels, VolumeProfile, Volatility])),
+            ("analyze", "mode", json!([Swings, Trend, Levels, Trendlines, VolumeProfile, Volatility])),
             ("create_drawing", "kind", json!([Horizontal, Vertical, TrendLine, Ray, Rectangle, Text])),
             ("compare", "action", json!([Add, Remove])),
             ("create_alert", "direction", json!([Above, Below])),
@@ -1428,7 +1522,9 @@ mod adversarial {
                 .collect(),
         );
         for mode in MODES {
-            let result = review_call(&host, "analyze", json!({"symbol":"X","mode":mode,"limit":10000,"top":100})).await;
+            let result =
+                review_call(&host, "analyze", json!({"symbol":"X","mode":mode,"limit":10000,"top":100,"version":1}))
+                    .await;
             assert!(result.success, "{mode}: {result:?}");
             let output = assert_json_cap(&result);
             assert_eq!(output[0]["version"], 1);
@@ -1678,7 +1774,13 @@ mod adversarial {
                     let input = json!({"symbol":"X","mode":mode,"timeframe":"1m"});
                     let first = review_call(&host, "analyze", input.clone()).await;
                     let second = review_call(&host, "analyze", input).await;
-                    assert_eq!(first, second, "n={n}, volume={volume}, mode={mode}");
+                    assert_eq!(first.success, second.success);
+                    let mut a = value(first.clone());
+                    let mut b = value(second);
+                    // Cache handles identify calls/turns, not analytic content.
+                    a.as_object_mut().unwrap().remove("analysis_id");
+                    b.as_object_mut().unwrap().remove("analysis_id");
+                    assert_eq!(a, b, "n={n}, volume={volume}, mode={mode}");
                     if n == 0 {
                         assert!(!first.success);
                         assert_eq!(value(first)["error"]["code"], "no_data");
