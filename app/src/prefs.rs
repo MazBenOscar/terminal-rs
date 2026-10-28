@@ -124,6 +124,9 @@ pub type Rgb = [u8; 3];
 #[serde(default)]
 pub struct Appearance {
     /// Active theme name, or `System` to follow the OS with `dark_theme`/`light_theme`.
+    /// An absent JSON field is temporarily empty so migration can distinguish legacy
+    /// appearance settings from an explicitly selected `System` theme.
+    #[serde(default)]
     pub theme: String,
     pub dark_theme: String,
     pub light_theme: String,
@@ -818,8 +821,11 @@ impl Prefs {
                 }
             }
         }
-        if self.version < 3 {
+        if self.version < 3 && self.appearance.theme.is_empty() {
             self.migrated_theme = self.migrate_appearance();
+        }
+        if self.appearance.theme.is_empty() {
+            self.appearance.theme = crate::themes::SYSTEM.into();
         }
         self.version = PREFS_VERSION;
     }
@@ -1023,6 +1029,74 @@ mod tests {
         p.save(&path).unwrap();
         assert_eq!(Prefs::load(&path), p);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn modern_theme_selection_survives_legacy_versions_and_save() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target")
+            .join(format!("theme-prefs-migration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prefs.json");
+        for version in [None, Some(1), Some(2), Some(PREFS_VERSION)] {
+            for name in ["Solarized Dark", "Rosé Pine Dawn", "System", "Missing Theme"] {
+                let mut document = serde_json::json!({
+                    "appearance": {
+                        "theme": name,
+                        "dark_theme": "Tokyo Night",
+                        "light_theme": "Rosé Pine Dawn",
+                        // Explicit modern selection wins over stale legacy fields.
+                        "mode": "Light",
+                        "accent": [1, 2, 3]
+                    }
+                });
+                if let Some(version) = version {
+                    document["version"] = version.into();
+                }
+                std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+                let prefs = Prefs::load(&path);
+                assert_eq!(prefs.appearance.theme, name, "version {version:?}");
+                assert_eq!(prefs.appearance.dark_theme, "Tokyo Night");
+                assert_eq!(prefs.appearance.light_theme, "Rosé Pine Dawn");
+                assert!(prefs.migrated_theme.is_none());
+                assert_eq!(prefs.version, PREFS_VERSION);
+                prefs.save(&path).unwrap();
+                let reloaded = Prefs::load(&path);
+                assert_eq!(reloaded.appearance.theme, name);
+                assert_eq!(reloaded.appearance.dark_theme, "Tokyo Night");
+                assert_eq!(reloaded.appearance.light_theme, "Rosé Pine Dawn");
+                assert!(reloaded.migrated_theme.is_none());
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_modern_theme_still_migrates_legacy_appearance() {
+        for version in [None, Some(1), Some(2)] {
+            let mut document = serde_json::json!({"appearance": {"mode": "Dark"}});
+            if let Some(version) = version {
+                document["version"] = version.into();
+            }
+            let mut prefs: Prefs = serde_json::from_value(document).unwrap();
+            prefs.migrate();
+            assert_eq!(prefs.appearance.theme, "Terminal Dark");
+            assert!(prefs.migrated_theme.is_none());
+            prefs.migrate();
+            assert_eq!(prefs.appearance.theme, "Terminal Dark", "migration is idempotent");
+        }
+    }
+
+    #[test]
+    fn current_partial_appearance_defaults_to_system_after_migration() {
+        for appearance in [serde_json::json!({}), serde_json::json!({"theme": ""})] {
+            let document = serde_json::json!({"version": PREFS_VERSION, "appearance": appearance});
+            let mut prefs: Prefs = serde_json::from_value(document).unwrap();
+            prefs.migrate();
+            assert_eq!(prefs.appearance.theme, "System");
+            assert_eq!(prefs.appearance.dark_theme, "Terminal Dark");
+            assert_eq!(prefs.appearance.light_theme, "Terminal Light");
+        }
     }
 
     #[test]

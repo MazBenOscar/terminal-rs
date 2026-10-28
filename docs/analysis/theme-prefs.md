@@ -1,0 +1,30 @@
+# Theme preference persistence investigation
+
+## Cause and evidence
+
+- Startup loads `prefs.json` and custom theme definitions (`app/src/app.rs:1104-1117`), then restores the layout selected by `settings.json` (`app/src/app.rs:1254-1291`). If unavailable, it tries the first saved layout and finally the default workspace. `settings.json` selects the layout, not the theme directly.
+- **The restored layout overwrites the preference.** `apply_doc` applies `doc.theme` through `select_theme` (`app/src/app/workspace.rs:963-969`); `select_theme` changes `prefs.appearance.theme` and immediately writes preferences (`app/src/app/theming.rs:32-44`, `app/src/app.rs:1335-1341`). This applies equally to startup and an intentional layout switch. It explains how both an explicit Solarized Dark preference and System with Terminal Dark variants can become Rosé Pine Dawn. The write occurs during restoration, not necessarily on exit.
+- Layout themes are an existing opt-in feature, documented in `README.md:182` (`LAYOUT THEME ON`), controlled in Appearance (`app/src/app/settings_view.rs:229-235`) and by `LAYOUT THEME` (`app/src/app/workspace.rs:1050-1059`). `current_doc` saves the current preference only when `layout_theme` is set (`app/src/app/workspace.rs:890`). The checkbox did not explain that restoring the layout also replaces the global preference.
+- **Independent migration bug:** a missing/old preference version runs the v3 appearance migration, which previously overwrote an already-present modern `theme` using legacy `mode` (`app/src/prefs.rs`, `Prefs::migrate` and `migrate_appearance`). Explicit modern selections must take precedence over legacy fields.
+- System resolution uses `egui::Context::system_theme()`: Light selects `light_theme`, Dark or unknown selects `dark_theme`; explicit selections bypass OS appearance (`app/src/app/theming.rs:13-24`). The app delegates macOS appearance detection to eframe/egui; it does not read `AppleInterfaceStyle` itself. `theme::configure` forces egui's widget base to match the selected theme, not the OS (`app/src/theme.rs:287-291`). Dependency implementation was not inspected because it is outside the permitted repository.
+- Custom files supply named palettes, not an independent active selection. Built-in names cannot be shadowed: collisions receive a custom suffix (`app/src/themes.rs:1006-1042`). `TR_THEME` is another explicit startup override (`app/src/app.rs:1118-1123`). A dark-looking normal session with a light preference could therefore involve a layout, an environment override, a different data directory, or a later theme change. No user's data or environment was inspected, so the second observation cannot be uniquely attributed from source alone.
+- Unknown saved theme names silently select index zero (Terminal Dark), without a status message (`app/src/app/theming.rs:23`). Unknown layout theme names are silently ignored (`app/src/app/workspace.rs:966`).
+- Preferences save synchronously on selection and appearance changes; `Prefs::save` uses atomic writes (`app/src/prefs.rs`, `Prefs::save`). The 10-second autosave and `exit_save` save layouts/settings/custom theme edits, **not prefs.json** (`app/src/app.rs:2976-2979,3015-3028,3079-3084`). `on_exit` invokes `exit_save` (`app/src/app.rs:3381-3389`). Exit can preserve a theme already overwritten at startup by persisting it in the layout.
+
+## Changes within authorized scope
+
+- Preserve any explicit modern `appearance.theme`, including `System`, during legacy migration, even if the file has no version. Use an absent-field sentinel only during deserialization/migration; normalize it to System for current-format partial files. Legacy mode/colour/font migrations still apply when the modern field is absent.
+- Add three regression tests (`app/src/prefs.rs:1035,1075,1091`): explicit selections (including System and unknown names) survive migration/load/save across absent, v1, v2 and current versions; missing modern fields still migrate legacy appearance; current partial files normalize to System. The fix is at `app/src/prefs.rs:127-130,824-829`.
+- Clarify the Appearance checkbox as “Save and restore” and explain in its tooltip that layout restoration currently replaces the global preference, including at startup (`app/src/app/settings_view.rs:229-243`). This exposes existing behavior; it does not fix startup precedence.
+
+## Validation
+
+- `cargo fmt --all -- --check`: passed, no formatting differences.
+- `cargo clippy --offline --workspace --all-targets -- -D warnings`: passed, zero warnings/errors.
+- `TR_CONGRESS_REFRESH_MIN=0 cargo test --offline --workspace`: passed, **1,873 passed, 0 failed, 8 ignored**, including one doctest. The environment value was supplied through Cargo's `--config 'env.TR_CONGRESS_REFRESH_MIN="0"'`; the final run used `-- --quiet` for readable counts. Three new migration regression tests are included. These are not end-to-end startup/exit tests.
+
+## Required follow-up (blocked by edit scope)
+
+The allowed production files exclude `app/src/app.rs`, `app/src/app/workspace.rs`, and `app/src/app/theming.rs`. The startup overwrite and unknown-name status handling cannot be fixed cleanly without changing these callers. Scope expansion was requested; these files remain untouched.
+
+Recommended rule: startup restores workspace geometry/panes but always keeps the loaded global theme (explicit or System). An intentional layout switch may apply its explicitly saved theme, with a visible notice and consistent prefs; layouts without a theme preserve the current selection. Clarify that rule in Appearance. Centralize resolution with an injected OS appearance and return a fallback diagnostic for unknown names; surface that diagnostic at startup and on switching. Tests still needed at those call sites: startup with conflicting layout, exit persistence, System Light/Dark, themed/unthemed layout switches, and unknown-name status.
