@@ -1274,6 +1274,10 @@ impl TerminalApp {
                 doc = migrate_legacy(s, &app.prefs.panels);
             }
         }
+        // SENATE-BARGO: resolve defaults from the secret store before showing source status.
+        let source_document = std::fs::read(settings_path()).ok();
+        app.data_sources.settings.resolve_bargo(source_document.as_deref(), bargo::key().is_some());
+        // SENATE-BARGO END
         let doc = doc
             .or_else(|| {
                 let name = app.store.list().into_iter().next()?;
@@ -2542,7 +2546,11 @@ impl TerminalApp {
         }
         if self.data_sources.settings.bargo {
             parts.push(if self.data_sources.bargo.congress_status.is_empty() {
-                "Senate via Bargo · needs key for full history (free window: 3 months)".into()
+                if bargo::key().is_some() {
+                    "Senate via Bargo · waiting for daily sweep".into()
+                } else {
+                    "Senate via Bargo · needs key for full history (free window: 3 months)".into()
+                }
             } else {
                 self.data_sources.bargo.congress_status.clone()
             });

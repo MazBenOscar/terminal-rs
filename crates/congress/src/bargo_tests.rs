@@ -34,7 +34,7 @@ impl Temp {
                 allow_external: !offline,
                 max_wait: Duration::ZERO,
             },
-            tr_net::Settings::default(),
+            tr_net::Settings { bargo: true, bargo_keyless: true, ..Default::default() },
             server.url.parse().unwrap(),
         )
         .unwrap()
@@ -60,6 +60,7 @@ impl Drop for Temp {
 struct Server {
     url: String,
     hits: Arc<AtomicUsize>,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -73,6 +74,8 @@ impl Server {
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let hits = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
         let (h, s) = (hits.clone(), stop.clone());
         let response = format!(
             "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
@@ -98,6 +101,7 @@ impl Server {
                         assert!(request.contains("chamber=senate"));
                         assert!(!request.lines().next().unwrap().contains("secret"));
                         assert!(!request.contains("token="));
+                        captured.lock().unwrap().push(request.into_owned());
                         h.fetch_add(1, Ordering::SeqCst);
                         stream.write_all(response.as_bytes()).unwrap();
                     }
@@ -108,7 +112,7 @@ impl Server {
                 }
             }
         });
-        Self { url, hits, stop, worker: Some(worker) }
+        Self { url, hits, requests, stop, worker: Some(worker) }
     }
 }
 impl Drop for Server {
@@ -189,6 +193,7 @@ fn efd_dedupe_keeps_roster_party_and_marks_seen() {
     )
     .unwrap();
     db.set_tracked(pid, true).unwrap();
+    assert_eq!(db.search_politicians("", 10).unwrap()[0].bargo_trades, 0);
     for _ in 0..2 {
         ingest(&mut db, &page().trades, false, today()).unwrap();
     }
@@ -244,6 +249,7 @@ fn sweep_and_poll_slots_shared_by_two_guards_fresh_store_cannot_add_poll() {
     assert_eq!(schedule(&first, true).unwrap(), Some(Run::Sweep));
     assert_eq!(schedule(&second, true).unwrap(), None);
     assert_eq!(schedule(&second, false).unwrap(), None);
+    first.finish_bargo_sweep(None).unwrap();
     temp.age("bargo:poll", 10801);
     assert_eq!(schedule(&second, true).unwrap(), None);
     assert_eq!(schedule(&second, false).unwrap(), Some(Run::Poll));
@@ -284,7 +290,7 @@ async fn full_sweep_page_low_headers_stops_before_another_request() {
     for keyed in [true, false] {
         let temp = Temp::new();
         let mut fixture: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
-        fixture["trades"] = serde_json::json!(vec![fixture["trades"][0].clone(); if keyed { 250 } else { 100 }]);
+        fixture["trades"] = serde_json::json!(vec![fixture["trades"][0].clone(); if keyed { 250 } else { 90 }]);
         let server = Server::new(&fixture.to_string(), "X-RateLimit-Remaining: 4\r\nX-RateLimit-Rows-Remaining: 0\r\n");
         let guard = temp.guard(&server, false);
         let db = Mutex::new(Db::open_in_memory().unwrap());
@@ -366,4 +372,234 @@ fn openapi_members_have_no_party_and_state_is_already_in_trades() {
     assert!(spec["components"]["schemas"]["Trade"]["properties"].get("state").is_some());
     assert_eq!(CREDIT, "Senate data: Bargo (bargo.ai)");
     assert_eq!(reqwest::Url::parse(CREDIT_URL).unwrap().scheme(), "https");
+}
+
+// SENATE-BARGO: daily scheduling, politician identity and amendment regressions.
+#[tokio::test]
+async fn sweep_shrinks_first_page_and_poll_is_seven_days_first_page_only() {
+    for key in [None, Some("fixture-secret")] {
+        let temp = Temp::new();
+        let server = Server::new(FIXTURE, "");
+        let guard = temp.guard(&server, false);
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        sync(&guard, &db, key).await.unwrap();
+        // A just-completed sweep suppresses even a steady-state poll.
+        assert!(sync(&guard, &db, key).await.unwrap().problem.is_none());
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+        temp.age("bargo:poll", 10801);
+        temp.unpace();
+        assert!(sync(&guard, &db, key).await.unwrap().problem.is_none());
+        assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+        temp.age("bargo:sweep", 86401);
+        temp.unpace();
+        sync(&guard, &db, key).await.unwrap();
+        let requests = server.requests.lock().unwrap();
+        let query = |index: usize| {
+            let path = requests[index].lines().next().unwrap().split_whitespace().nth(1).unwrap();
+            reqwest::Url::parse(&format!("https://www.bargo.ai{path}"))
+                .unwrap()
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let first = query(0);
+        assert_eq!(first["limit"], if key.is_some() { "250" } else { "90" });
+        assert_eq!(first["from"], (Utc::now().date_naive() - chrono::Duration::days(60)).to_string());
+        let poll = query(1);
+        assert_eq!(poll["page"], "0");
+        assert_eq!(poll["limit"], if key.is_some() { "100" } else { "50" });
+        assert_eq!(poll["from"], (Utc::now().date_naive() - chrono::Duration::days(7)).to_string());
+        let next = query(2);
+        assert_eq!(next["page"], "0");
+        assert_eq!(next["limit"], if key.is_some() { "250" } else { "80" });
+    }
+}
+
+#[tokio::test]
+async fn no_rows_sweep_defers_without_completing_and_retries_that_day() {
+    let temp = Temp::new();
+    let server = Server::new(FIXTURE, "");
+    let guard = temp.guard(&server, false);
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+    let ledger = rusqlite::Connection::open(temp.0.join("ledger.sqlite3")).unwrap();
+    ledger.execute("INSERT INTO row_usage VALUES('bargo:keyless',?1,90)", [Utc::now().timestamp() / 86400]).unwrap();
+    let report = sync(&guard, &db, None).await.unwrap();
+    assert_eq!(report.problem.as_deref(), Some("Senate sweep deferred: daily row allowance used"));
+    assert_eq!(status(&guard, None, false), "Senate sweep deferred: daily row allowance used");
+    assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+    assert!(db.lock().await.meta("bargo_initial_complete").unwrap().is_none());
+    let completed: bool =
+        ledger.query_row("SELECT EXISTS(SELECT 1 FROM slots WHERE key='bargo:sweep')", [], |r| r.get(0)).unwrap();
+    assert!(!completed);
+    // The immediate call does not spin/retry. After the durable bounded defer it can recover.
+    sync(&guard, &db, None).await.unwrap();
+    assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+    ledger.execute("UPDATE bargo_sweeps SET retry_at=0", []).unwrap();
+    ledger.execute("UPDATE row_usage SET count=0", []).unwrap();
+    sync(&guard, &db, None).await.unwrap();
+    assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(db.lock().await.meta("bargo_initial_complete").unwrap().as_deref(), Some("1"));
+    assert!(guard.bargo_sweep_reason().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn partial_full_page_does_not_complete_initial_sweep_or_send_poll() {
+    let temp = Temp::new();
+    let mut fixture: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    fixture["trades"] = serde_json::json!(vec![fixture["trades"][0].clone(); 90]);
+    let server = Server::new(&fixture.to_string(), "");
+    let guard = temp.guard(&server, false);
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+    let report = sync(&guard, &db, None).await.unwrap();
+    assert_eq!(report.problem.as_deref(), Some("Senate sweep deferred: daily row allowance used"));
+    assert!(db.lock().await.meta("bargo_initial_complete").unwrap().is_none());
+    assert!(report.alerts.is_empty());
+    temp.age("bargo:poll", 10801);
+    sync(&guard, &db, None).await.unwrap();
+    assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn names_ignore_initials_punctuation_but_require_first_name_and_prefer_known_slug() {
+    let mut db = Db::open_in_memory().unwrap();
+    let mut row = page().trades.remove(0);
+    let pid = db
+        .upsert_politician(&NewPolitician {
+            name: "Boozman, John N.".into(),
+            chamber: Chamber::Senate,
+            party: Party::Republican,
+            state: Some("ar".into()),
+            district: None,
+            bioguide: None,
+        })
+        .unwrap();
+    let other = db
+        .upsert_politician(&NewPolitician {
+            name: "James Boozman".into(),
+            chamber: Chamber::Senate,
+            party: Party::Democrat,
+            state: Some("AR".into()),
+            district: None,
+            bioguide: None,
+        })
+        .unwrap();
+    assert_eq!("sEnAtE".parse::<Chamber>().unwrap(), Chamber::Senate);
+    assert_eq!(" house ".parse::<Chamber>().unwrap(), Chamber::House);
+    row.chamber = Some("SeNaTe".into());
+    row.member = Some("John N. Boozman".into());
+    ingest(&mut db, &[row.clone()], true, today()).unwrap();
+    assert_eq!(db.latest_trades(10).unwrap()[0].politician_id, pid);
+    assert_ne!(pid, other);
+    // Previously-seen slug wins even if the provider later changes display name/state.
+    row.member = Some("Different Display Name".into());
+    row.state = Some("TX".into());
+    row.transaction_date = Some(today());
+    ingest(&mut db, &[row.clone()], true, today()).unwrap();
+    assert!(db.latest_trades(10).unwrap().iter().all(|t| t.politician_id == pid));
+    row.member = Some("James Boozman".into());
+    row.state = Some("AR".into());
+    row.member_slug = Some("james-boozman".into());
+    ingest(&mut db, &[row], true, today()).unwrap();
+    assert_eq!(db.stats().unwrap().politicians, 2);
+    assert!(db.latest_trades(10).unwrap().iter().any(|t| t.politician_id == other));
+}
+
+#[test]
+fn amended_disclosure_updates_original_and_never_duplicates_or_realerts() {
+    for ticker in [true, false] {
+        let mut db = Db::open_in_memory().unwrap();
+        let mut row = page().trades.remove(0);
+        if !ticker {
+            row.ticker = None;
+        }
+        row.disclosure_date = Some(today());
+        ingest(&mut db, &[row.clone()], true, today()).unwrap();
+        let original = db.latest_trades(10).unwrap().remove(0);
+        db.set_tracked(original.politician_id, true).unwrap();
+        let original_key = row.id().unwrap();
+        row.disclosure_date = Some(today() + chrono::Duration::days(1));
+        if ticker {
+            row.asset = Some("A revised asset description".into());
+        }
+        let new_key = row.id().unwrap();
+        assert_ne!(new_key, original_key);
+        assert!(ingest(&mut db, &[row.clone()], false, today() + chrono::Duration::days(1)).unwrap().is_empty());
+        let trades = db.latest_trades(10).unwrap();
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].filing_id, original.filing_id);
+        assert_eq!(trades[0].filed_date, row.disclosure_date.unwrap());
+        let filed: String = db
+            .conn()
+            .query_row("SELECT filed_date FROM filings WHERE id=?1", [&original.filing_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(filed, row.disclosure_date.unwrap().to_string());
+        assert!(db.alerts(false, 100).unwrap().is_empty());
+        assert_eq!(db.conn().query_row("SELECT count(*) FROM bargo_seen", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        let summary = db.search_politicians("", 10).unwrap();
+        assert_eq!(summary[0].bargo_trades, 1);
+        // A different amount is genuinely different, not an amendment match.
+        row.amount_range = Some("$15,001 - $50,000".into());
+        row.amount_low = Some(15001.0);
+        row.amount_high = Some(50000.0);
+        ingest(&mut db, &[row], true, today()).unwrap();
+        assert_eq!(db.latest_trades(10).unwrap().len(), 2);
+    }
+}
+// SENATE-BARGO END
+
+// ---- Adversarial review (2026-10-27). Regression tests for the repaired defects. ----
+
+#[tokio::test]
+async fn review_sweep_starved_by_earlier_rows() {
+    let temp = Temp::new();
+    let server = Server::new(FIXTURE, "");
+    let guard = temp.guard(&server, false);
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+    // Day 1 keyless sweep: 5 rows used, 95 of 100 left.
+    sync(&guard, &db, None).await.unwrap();
+    assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    // Next sweep becomes due the same UTC day (polls in steady state consume rows the same way).
+    temp.age("bargo:sweep", 86401);
+    temp.unpace();
+    let report = sync(&guard, &db, None).await.unwrap();
+    // The sweep sends nothing and reports no problem, yet its slot is consumed for 24 h, so keyless
+    // late disclosures (transaction 10-60 days ago) are never fetched after the first day.
+    assert!(report.problem.is_some() || server.hits.load(Ordering::SeqCst) == 2, "sweep silently skipped");
+    assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn review_keyless_row_header_blocks_keyed_bucket() {
+    let temp = Temp::new();
+    let server = Server::new(FIXTURE, "X-RateLimit-Remaining: 28\r\nX-RateLimit-Rows-Remaining: 91\r\n");
+    let guard = temp.guard(&server, false);
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+    sync(&guard, &db, None).await.unwrap();
+    assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    // The user now saves a free key (1,000 rows/day bucket) and the next sweep is due.
+    temp.age("bargo:sweep", 86401);
+    temp.unpace();
+    sync(&guard, &db, Some("fixture-secret")).await.unwrap();
+    assert_eq!(server.hits.load(Ordering::SeqCst), 2, "keyed sweep refused by the keyless bucket's row header");
+}
+
+#[test]
+fn review_efd_middle_initial_senator_is_duplicated() {
+    let mut db = Db::open_in_memory().unwrap();
+    // Legacy eFD rows without a roster match were stored as `display_name()` = "<first> <last>",
+    // and eFD first names routinely carry middle initials ("Thomas H", "Shelley M", "John N").
+    let pid = db
+        .upsert_politician(&NewPolitician {
+            name: "John N Boozman".into(),
+            chamber: Chamber::Senate,
+            party: Party::Republican,
+            state: Some("AR".into()),
+            district: None,
+            bioguide: None,
+        })
+        .unwrap();
+    db.set_tracked(pid, true).unwrap();
+    ingest(&mut db, &page().trades, true, today()).unwrap();
+    let trades = db.latest_trades(100).unwrap();
+    assert!(trades.iter().all(|t| t.politician_id == pid), "Bargo rows attached to a new duplicate politician");
 }

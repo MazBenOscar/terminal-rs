@@ -140,6 +140,7 @@ pub struct Stats {
 pub struct PoliticianSummary {
     pub politician: Politician,
     pub trades: i64,
+    pub bargo_trades: i64,
     pub last_filed: Option<NaiveDate>,
     pub tracked: bool,
 }
@@ -455,8 +456,9 @@ impl Db {
     pub fn search_politicians(&self, query: &str, limit: usize) -> Result<Vec<PoliticianSummary>> {
         let mut st = self.conn.prepare_cached(
             "SELECT p.id, p.name, p.chamber, p.party, p.state, p.district, p.bioguide,
-                    COUNT(t.id), MAX(t.filed_date), EXISTS (SELECT 1 FROM tracked k WHERE k.politician_id = p.id)
-             FROM politicians p LEFT JOIN trades t ON t.politician_id = p.id
+                    COUNT(t.id), MAX(t.filed_date), EXISTS (SELECT 1 FROM tracked k WHERE k.politician_id = p.id),
+                    COUNT(CASE WHEN f.source='Bargo' THEN 1 END)
+             FROM politicians p LEFT JOIN trades t ON t.politician_id = p.id LEFT JOIN filings f ON f.id=t.filing_id
              WHERE p.name LIKE '%' || ?1 || '%'
              GROUP BY p.id ORDER BY COUNT(t.id) DESC, p.name LIMIT ?2",
         )?;
@@ -467,6 +469,7 @@ impl Db {
                     trades: r.get(7)?,
                     last_filed: r.get::<_, Option<String>>(8)?.map(date),
                     tracked: r.get(9)?,
+                    bargo_trades: r.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;

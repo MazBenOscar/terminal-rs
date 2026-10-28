@@ -10,7 +10,10 @@ use tr_broker::secrets::{SecretStore, mask};
 
 static KEY: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 pub(crate) fn key() -> Option<String> {
-    KEY.get_or_init(|| RwLock::new(store().load_text().ok().flatten())).read().expect("Bargo key lock").clone()
+    KEY.get_or_init(|| RwLock::new(store().load_text().ok().flatten().filter(|k| !k.trim().is_empty())))
+        .read()
+        .expect("Bargo key lock")
+        .clone()
 }
 fn store() -> SecretStore {
     SecretStore::platform_for(&data_dir(), "bargo")
@@ -52,14 +55,17 @@ async fn save_test(store: &SecretStore, guard: Result<&tr_net::Guard, tr_net::Re
         return "Could not save Bargo key".into();
     }
     match guard {
-        Ok(guard) => match guard.send("bargo", tr_congress::bargo::request("health", Some(value.trim()))).await {
-            Ok(body) => match serde_json::from_slice::<serde_json::Value>(&body) {
-                Ok(value) if value["status"] == "ok" => {
-                    "Bargo key saved; health test passed (health does not validate keys)".into()
-                }
-                _ => "Bargo key saved; invalid health response".into(),
-            },
+        Ok(guard) => match guard.bargo_key_saved(value.trim()) {
             Err(e) => format!("Bargo key saved; test: {e}"),
+            Ok(()) => match guard.send("bargo", tr_congress::bargo::request("health", Some(value.trim()))).await {
+                Ok(body) => match serde_json::from_slice::<serde_json::Value>(&body) {
+                    Ok(value) if value["status"] == "ok" => {
+                        "Bargo key saved; health test passed (health does not validate keys)".into()
+                    }
+                    _ => "Bargo key saved; invalid health response".into(),
+                },
+                Err(e) => format!("Bargo key saved; test: {e}"),
+            },
         },
         Err(e) => format!("Bargo key saved; test: {e}"),
     }
@@ -88,7 +94,7 @@ pub async fn perform(action: Action, updated: Option<i64>) -> Reply {
     let cap = if keyed { 40 } else { 10 };
     let (status, usage) = match tr_net::shared() {
         Ok(guard) => {
-            guard.set_bargo_keyed(keyed);
+            guard.set_bargo_key(key.as_deref());
             let status = tr_congress::bargo::status(guard, updated, keyed);
             let requests = guard
                 .status()
@@ -120,13 +126,20 @@ pub async fn perform(action: Action, updated: Option<i64>) -> Reply {
 fn heading(ui: &mut Ui, enabled: &mut bool) -> bool {
     ui.separator();
     ui.heading("Senate (Bargo)");
-    let changed = ui.checkbox(enabled, "Enable Senate (Bargo)").changed();
+    let changed = ui.checkbox(enabled, "Enable Senate (Bargo; without a key, opt in to keyless mode)").changed();
     ui.hyperlink_to(tr_congress::bargo::CREDIT, tr_congress::bargo::CREDIT_URL);
-    ui.label("Optional free key. Keyless: lower caps. Free data window: 3 months; no raw-record redistribution.");
+    ui.label("Off by default without a key. Enabling without a key explicitly opts in to keyless requests.");
+    ui.label("Keyless: Bargo allows 30 requests / 100 rows daily; this app stops at 10 requests / 90 rows.");
+    ui.label(
+        "With a key: at most 40 requests / 900 rows daily. Free data window: 3 months; no raw-record redistribution.",
+    );
     changed
 }
 pub(super) fn draw(app: &mut TerminalApp, ui: &mut Ui) -> bool {
-    let changed = heading(ui, &mut app.data_sources.settings.bargo);
+    let mut changed = heading(ui, &mut app.data_sources.settings.bargo);
+    if changed && key().is_none() {
+        app.data_sources.settings.bargo_keyless = app.data_sources.settings.bargo;
+    }
     let mut action = None;
     let state = &mut app.data_sources.bargo;
     ui.add_enabled_ui(!state.pending, |ui| {
@@ -134,9 +147,15 @@ pub(super) fn draw(app: &mut TerminalApp, ui: &mut Ui) -> bool {
             ui.add(egui::TextEdit::singleline(&mut state.input).password(true).hint_text("Optional Bargo API key"));
             ui.label(if state.masked.is_empty() { "Keyless" } else { &state.masked });
             if ui.add_enabled(!state.input.trim().is_empty(), egui::Button::new("Save & Test")).clicked() {
+                app.data_sources.settings.bargo = true;
+                changed = true;
                 action = Some(Action::Save(std::mem::take(&mut state.input)));
             }
             if ui.add_enabled(!state.masked.is_empty(), egui::Button::new("Remove")).clicked() {
+                if !app.data_sources.settings.bargo_keyless {
+                    app.data_sources.settings.bargo = false;
+                    changed = true;
+                }
                 action = Some(Action::Remove);
             }
         });
@@ -151,6 +170,11 @@ pub(super) fn draw(app: &mut TerminalApp, ui: &mut Ui) -> bool {
     }
     if let Some(action) = action {
         state.pending = true;
+        // Apply the explicit Save/enable before the worker can run its one health test.
+        if changed {
+            app.data_sources.settings.settings_error = false;
+            tr_net::configure_shared(app.data_sources.settings.clone());
+        }
         app.worker.send(Request::BargoSettings(action));
     }
     if !state.pending {
@@ -180,7 +204,7 @@ mod tests {
             .collect();
         assert!(texts.contains(&"Senate (Bargo)"));
         assert!(texts.contains(&tr_congress::bargo::CREDIT));
-        assert!(settings.enabled("bargo"));
+        assert!(!settings.enabled("bargo"), "keyless starts disabled");
         settings.bargo = false;
         let settings = tr_net::Settings::from_section(serde_json::to_value(settings).unwrap());
         assert!(!settings.enabled("bargo"));

@@ -4,9 +4,10 @@ use crate::refresh::NewTradeAlert;
 use crate::{AmountRange, Chamber, Db, Party, TxType};
 use anyhow::Result;
 use chrono::{NaiveDate, Utc};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
+#[cfg(test)]
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -55,10 +56,24 @@ pub fn request(path: &str, key: Option<&str>) -> reqwest::RequestBuilder {
 fn amount(value: Option<f64>) -> Option<u64> {
     value.filter(|v| v.is_finite() && *v >= 0.0 && *v < i64::MAX as f64 && v.fract() == 0.0).map(|v| v as u64)
 }
-fn name(value: &str) -> Vec<String> {
-    let mut words = crate::roster::normalize_name(value);
-    words.sort();
-    words
+fn name(value: &str) -> (String, String) {
+    let words = |s: &str| {
+        crate::roster::normalize_name(s)
+            .into_iter()
+            .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+            .collect::<Vec<_>>()
+    };
+    // Both roster "Last, First M." and eFD "First M. Last" reduce to first + last.
+    // Never match on surname alone: two senators in a state may share one.
+    if let Some((last, first)) = value.split_once(',') {
+        let first = words(first);
+        let last = words(last);
+        if let (Some(first), Some(last)) = (first.first(), last.last()) {
+            return (first.clone(), last.clone());
+        }
+    }
+    let words = words(value);
+    (words.first().cloned().unwrap_or_default(), words.last().cloned().unwrap_or_default())
 }
 impl BargoTrade {
     pub fn id(&self) -> Option<String> {
@@ -80,7 +95,9 @@ impl BargoTrade {
 /// One atomic page import. Seen keys also cover matches kept from old eFD history.
 pub fn ingest(db: &mut Db, rows: &[BargoTrade], initial: bool, today: NaiveDate) -> Result<Vec<NewTradeAlert>> {
     let tx = db.conn().unchecked_transaction()?;
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS bargo_seen (id TEXT PRIMARY KEY, seen_at INTEGER NOT NULL);")?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS bargo_seen (id TEXT PRIMARY KEY, seen_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS bargo_members (slug TEXT PRIMARY KEY, politician_id INTEGER NOT NULL REFERENCES politicians(id));
+        CREATE TABLE IF NOT EXISTS bargo_records (filing_id TEXT PRIMARY KEY, member_slug TEXT NOT NULL);")?;
     let politicians = {
         let mut statement = tx.prepare("SELECT id,name,state FROM politicians WHERE chamber='Senate'")?;
         statement
@@ -93,7 +110,7 @@ pub fn ingest(db: &mut Db, rows: &[BargoTrade], initial: bool, today: NaiveDate)
         .collect();
     let mut alerts = Vec::new();
     for row in rows {
-        if row.chamber.as_deref() != Some("senate") {
+        if !row.chamber.as_deref().is_some_and(|c| c.eq_ignore_ascii_case("senate")) {
             continue;
         }
         let (Some(id), Some(member), Some(tx_date), Some(filed)) = (
@@ -113,8 +130,11 @@ pub fn ingest(db: &mut Db, rows: &[BargoTrade], initial: bool, today: NaiveDate)
         }
         let state = row.state.as_deref().map(str::trim).filter(|s| s.len() == 2).map(str::to_ascii_uppercase);
         let identity = (name(member), state.clone());
-        let pid = match identities.get(&identity) {
-            Some(id) => *id,
+        let slug = row.member_slug.as_deref().unwrap_or_default();
+        let previous: Option<i64> =
+            tx.query_row("SELECT politician_id FROM bargo_members WHERE slug=?1", [slug], |r| r.get(0)).optional()?;
+        let pid = match previous.or_else(|| identities.get(&identity).copied()) {
+            Some(id) => id,
             None => {
                 let id = db.upsert_politician(&NewPolitician {
                     name: member.trim().into(),
@@ -128,6 +148,7 @@ pub fn ingest(db: &mut Db, rows: &[BargoTrade], initial: bool, today: NaiveDate)
                 id
             }
         };
+        tx.execute("INSERT OR IGNORE INTO bargo_members VALUES(?1,?2)", params![slug, pid])?;
         let ticker = row.ticker.as_deref().and_then(crate::model::normalize_ticker);
         let asset = row.asset.clone().unwrap_or_default();
         let range = row
@@ -156,6 +177,24 @@ pub fn ingest(db: &mut Db, rows: &[BargoTrade], initial: bool, today: NaiveDate)
         if duplicate {
             continue;
         }
+        // Keep the full spec key in bargo_seen, but an amendment/re-date updates the original
+        // Bargo trade instead of creating a second trade or alert. Legacy imports have no slug
+        // map yet: bootstrap it only through the already first+last+state matched politician.
+        let amended: Option<String> = tx.query_row(
+            "SELECT t.filing_id FROM trades t LEFT JOIN bargo_records b ON b.filing_id=t.filing_id
+             WHERE t.filing_id LIKE 'bargo:%' AND (b.member_slug=?1 OR (b.member_slug IS NULL AND t.politician_id=?2))
+             AND t.tx_date=?3 AND t.tx_type=?4 AND t.amount_min IS ?5 AND t.amount_max IS ?6
+             AND ((?7 IS NOT NULL AND t.ticker=?7) OR (?7 IS NULL AND ?8<>'' AND lower(trim(t.asset_name))=lower(trim(?8)))) LIMIT 1",
+            params![slug, pid, tx_date.to_string(), kind.code(), range.map(|a| a.min as i64),
+                range.and_then(|a| a.max).map(|v| v as i64), ticker, asset], |r| r.get(0),
+        ).optional()?;
+        if let Some(existing) = amended {
+            tx.execute("UPDATE trades SET filed_date=?2 WHERE filing_id=?1", params![existing, filed.to_string()])?;
+            tx.execute("UPDATE filings SET filed_date=?2 WHERE id=?1", params![existing, filed.to_string()])?;
+            tx.execute("INSERT OR IGNORE INTO bargo_records VALUES(?1,?2)", params![existing, slug])?;
+            continue;
+        }
+        tx.execute("INSERT OR IGNORE INTO bargo_records VALUES(?1,?2)", params![id, slug])?;
         // Write directly on the enclosing transaction; no nested insert_filing transaction.
         tx.execute("INSERT OR IGNORE INTO filings (id,chamber,politician_id,filed_date,url,kind,status,fetched_at,first_attempt_at,source)
             VALUES(?1,'Senate',?2,?3,?4,'electronic','parsed',?5,?5,'Bargo')",
@@ -181,16 +220,7 @@ pub enum Run {
     Poll,
 }
 pub fn schedule(guard: &tr_net::Guard, initial: bool) -> Result<Option<Run>, tr_net::Refused> {
-    guard.check("bargo")?;
-    if guard.claim_slot("bargo:sweep", Duration::from_secs(86400))? {
-        // A sweep replaces this interval's light poll, including the first run.
-        guard.claim_slot("bargo:poll", Duration::from_secs(10800))?;
-        return Ok(Some(Run::Sweep));
-    }
-    if initial {
-        return Ok(None);
-    }
-    Ok(guard.claim_slot("bargo:poll", Duration::from_secs(10800))?.then_some(Run::Poll))
+    Ok(guard.claim_bargo_run(initial)?.map(|sweep| if sweep { Run::Sweep } else { Run::Poll }))
 }
 
 #[derive(Default, Debug)]
@@ -199,22 +229,29 @@ pub struct SyncReport {
     pub problem: Option<String>,
 }
 pub async fn sync(guard: &tr_net::Guard, db: &Mutex<Db>, key: Option<&str>) -> Result<SyncReport> {
-    guard.set_bargo_keyed(key.is_some_and(|k| !k.is_empty()));
+    guard.set_bargo_key(key);
     let initial = db.lock().await.meta("bargo_initialized")?.is_none();
-    let Some(run) = schedule(guard, initial)? else { return Ok(SyncReport::default()) };
+    let initial_sweep = initial || db.lock().await.meta("bargo_initial_complete")?.is_none();
+    let Some(run) = schedule(guard, initial_sweep)? else { return Ok(SyncReport::default()) };
     // Mark before transport: a failed/partial initial sweep is never treated as fresh alerts.
     // Suppress alerts for the entire first successful sweep even after interruption.
-    let initial_sweep = initial || db.lock().await.meta("bargo_initial_complete")?.is_none();
     db.lock().await.set_meta("bargo_initialized", "1")?;
     let today = Utc::now().date_naive();
-    let from = today - chrono::Duration::days(if run == Run::Sweep { 60 } else { 10 });
+    let from = today - chrono::Duration::days(if run == Run::Sweep { 60 } else { 7 });
     let keyed = key.is_some_and(|k| !k.is_empty());
-    let default_limit = if keyed { 250 } else { 100 };
-    let allowance = guard.bargo_allowance(keyed)? as usize;
-    let limit = if run == Run::Poll { default_limit.min(allowance) } else { default_limit };
+    let default_limit = match (run, keyed) {
+        (Run::Sweep, true) => 250,
+        (Run::Sweep, false) | (Run::Poll, true) => 100,
+        (Run::Poll, false) => 50,
+    };
+    // Keep the page width fixed (page-number pagination). In particular, shrink page ONE
+    // to the remaining allowance, rather than silently burning a daily slot without a send.
+    let limit = if run == Run::Sweep { default_limit.min(guard.bargo_allowance(key)? as usize) } else { default_limit };
     let mut report = SyncReport::default();
+    let mut complete = false;
     for page in 0..40 {
-        if limit == 0 || (guard.bargo_allowance(keyed)? as usize) < limit {
+        if limit == 0 || (guard.bargo_allowance(key)? as usize) < limit {
+            report.problem = Some("Senate sweep deferred: daily row allowance used".into());
             break;
         }
         let req = request("trades", key).query(&[
@@ -225,7 +262,10 @@ pub async fn sync(guard: &tr_net::Guard, db: &Mutex<Db>, key: Option<&str>) -> R
         ]);
         let body = match guard.send_with_metadata_budget("bargo", req, if keyed { 40 } else { 10 }).await {
             Ok((body, _)) => body,
-            Err(tr_net::Refused::Budget) => break,
+            Err(tr_net::Refused::Budget) => {
+                report.problem = Some("Senate sweep deferred: daily row allowance used".into());
+                break;
+            }
             Err(e) => {
                 report.problem = Some(e.to_string());
                 break;
@@ -242,11 +282,18 @@ pub async fn sync(guard: &tr_net::Guard, db: &Mutex<Db>, key: Option<&str>) -> R
         report.alerts.extend(ingest(&mut *db.lock().await, &page.trades, initial_sweep, today)?);
         db.lock().await.set_meta("bargo_updated", &Utc::now().timestamp().to_string())?;
         if run == Run::Poll || count < limit {
+            complete = true;
             break;
         }
     }
-    if run == Run::Sweep && report.problem.is_none() {
-        db.lock().await.set_meta("bargo_initial_complete", "1")?;
+    if run == Run::Sweep {
+        if complete {
+            db.lock().await.set_meta("bargo_initial_complete", "1")?;
+            guard.finish_bargo_sweep(None)?;
+        } else {
+            let reason = report.problem.get_or_insert_with(|| "Senate sweep deferred: page bound reached".into());
+            guard.finish_bargo_sweep(Some(reason))?;
+        }
     }
     Ok(report)
 }
@@ -277,9 +324,8 @@ pub fn status(guard: &tr_net::Guard, updated: Option<i64>, keyed: bool) -> Strin
             error => format!("Senate via Bargo · {error}"),
         };
     }
-    if guard.bargo_allowance(keyed).is_ok_and(|rows| rows == 0) {
-        let until = (Utc::now().timestamp() / 86400 + 1) * 86400;
-        return format!("Senate via Bargo · paused until {} (row/request allowance)", timestamp(until));
+    if let Ok(Some(reason)) = guard.bargo_sweep_reason() {
+        return reason;
     }
     let age = updated
         .map(|at| format!("updated {}h ago", (Utc::now().timestamp() - at).max(0) / 3600))

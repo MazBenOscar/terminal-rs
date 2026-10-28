@@ -136,7 +136,7 @@ fn trade_row(
                     out.push(Action::Track(t.politician.clone(), true));
                     ui.close();
                 }
-                if ui.button("Copy Disclosure Link").clicked() {
+                if ui.button(disclosure_link_label(t)).clicked() {
                     ui.ctx().copy_text(t.source_url.clone());
                     ui.close();
                 }
@@ -188,6 +188,16 @@ fn trade_row(
         plain(ui, truncate(t.owner.as_deref().unwrap_or("Unknown"), 8), muted());
         plain(ui, truncate(&t.asset_name, 40), muted());
     });
+}
+
+fn disclosure_link_label(trade: &Trade) -> &'static str {
+    if trade.source == "Bargo" {
+        "Copy Bargo source link"
+    } else if trade.chamber == Chamber::Senate {
+        "Copy senate.gov link (blocked on this network)"
+    } else {
+        "Copy Disclosure Link"
+    }
 }
 
 pub(crate) fn bargo_credit(ui: &mut Ui, trades: &[Trade]) {
@@ -387,7 +397,7 @@ pub fn profile(
 
 pub fn politicians(ui: &mut Ui, list: &[PoliticianSummary], search: &mut String) -> Vec<Action> {
     let mut out = Vec::new();
-    if list.iter().any(|p| p.politician.chamber == Chamber::Senate && p.trades > 0) {
+    if list.iter().any(|p| p.bargo_trades > 0) {
         ui.hyperlink_to(tr_congress::bargo::CREDIT, tr_congress::bargo::CREDIT_URL);
     }
     ui.horizontal(|ui| {
@@ -486,6 +496,48 @@ mod tests {
             amount_range: None,
         }
     }
+
+    // SENATE-BARGO: source labels and credits must distinguish legacy eFD from Bargo.
+    #[test]
+    fn disclosure_link_labels_describe_the_actual_source() {
+        let mut row = trade(Party::Unknown, Chamber::Senate, TxType::Purchase, None);
+        assert_eq!(disclosure_link_label(&row), "Copy senate.gov link (blocked on this network)");
+        row.source = "Bargo".into();
+        assert_eq!(disclosure_link_label(&row), "Copy Bargo source link");
+        row.source.clear();
+        row.chamber = Chamber::House;
+        assert_eq!(disclosure_link_label(&row), "Copy Disclosure Link");
+    }
+
+    #[test]
+    fn politician_list_credit_requires_bargo_rows_not_just_senate_history() {
+        let db = tr_congress::Db::open_in_memory().unwrap();
+        db.upsert_politician(&tr_congress::db::NewPolitician {
+            name: "John Boozman".into(),
+            chamber: Chamber::Senate,
+            party: Party::Republican,
+            state: Some("AR".into()),
+            district: None,
+            bioguide: None,
+        })
+        .unwrap();
+        let mut list = db.search_politicians("", 10).unwrap();
+        list[0].trades = 5; // eFD-only history still has trades, but zero Bargo rows.
+        for bargo_rows in [0, 1] {
+            list[0].bargo_trades = bargo_rows;
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                politicians(ui, &list, &mut String::new());
+            });
+            let credit = output.shapes.iter().any(|shape| {
+                matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text == tr_congress::bargo::CREDIT)
+            });
+            assert_eq!(credit, bargo_rows > 0);
+            output.textures_delta.clear();
+        }
+    }
+    // SENATE-BARGO END
 
     #[test]
     fn feed_filter() {
