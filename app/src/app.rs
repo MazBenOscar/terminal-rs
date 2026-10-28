@@ -2408,6 +2408,12 @@ impl TerminalApp {
                 }
                 Response::FeedNotices { desktop, history } => {
                     self.price_alerts.feed_events = history;
+                    if !self.prefs.feed_notifications.enabled {
+                        continue;
+                    }
+                    if !desktop.is_empty() && self.prefs.feed_notifications.sound {
+                        crate::alert_delivery::spawn(crate::alert_delivery::sound_command(), 0);
+                    }
                     for body in desktop {
                         crate::alert_delivery::spawn(
                             crate::alert_delivery::notification_command("Terminal · News", &body),
@@ -3199,6 +3205,29 @@ fn external_url(url: &str) -> bool {
     (lower.starts_with("https://") || lower.starts_with("http://")) && !url.chars().any(char::is_control)
 }
 
+fn filings_active(
+    window_visible: bool,
+    pane_active: bool,
+    notifications: &tr_data::news_store::local::Notifications,
+) -> bool {
+    window_visible && (pane_active || (notifications.enabled && (notifications.filings || notifications.insiders)))
+}
+#[test]
+fn n4_filing_notifications_keep_budgeted_scheduler_active_without_a_filings_pane() {
+    let mut n = tr_data::news_store::local::Notifications::default();
+    assert!(!filings_active(true, false, &n));
+    n.filings = true;
+    assert!(filings_active(true, false, &n));
+    assert!(!filings_active(false, false, &n));
+    n.filings = false;
+    n.insiders = true;
+    assert!(filings_active(true, false, &n));
+    n.enabled = false;
+    assert!(!filings_active(true, false, &n));
+    assert!(filings_active(true, true, &n));
+    assert!(!filings_active(false, true, &n));
+}
+
 impl eframe::App for TerminalApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.agent_logic(ctx);
@@ -3207,8 +3236,9 @@ impl eframe::App for TerminalApp {
         let window_visible = self.agent_demo.is_none()
             && edgar_window_visible(frame)
             && ctx.input(|i| i.viewport().minimized != Some(true));
-        let active = window_visible
-            && self.visible_panes().iter().any(|&i| matches!(&self.panes[i].kind, PaneKind::Filings(f) if !f.paused));
+        let pane_active =
+            self.visible_panes().iter().any(|&i| matches!(&self.panes[i].kind, PaneKind::Filings(f) if !f.paused));
+        let active = filings_active(window_visible, pane_active, &self.prefs.feed_notifications);
         // N3
         let mut symbols: Vec<_> = self.watchlists.iter().flat_map(|l| l.symbols.iter().cloned()).collect();
         symbols.sort();

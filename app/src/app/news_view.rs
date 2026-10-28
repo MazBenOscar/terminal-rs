@@ -123,9 +123,7 @@ impl RowCache {
             .filter_map(|story| {
                 let stripe = watches
                     .iter()
-                    .find(|w| {
-                        story.members.iter().any(|m| !intelligence::watch_ranges(&m.item.title, &w.words).is_empty())
-                    })
+                    .find(|w| story.members.iter().any(|m| intelligence::watch_matches(m, &w.words)))
                     .map(|w| w.colour);
                 if (n.display.unread
                     && !story.unread()
@@ -587,6 +585,23 @@ pub(super) fn window_visible(viewport: &egui::ViewportInfo) -> bool {
     viewport.minimized != Some(true) && viewport.visible() != Some(false)
 }
 
+fn current_volume(n: &NewsPane, now: i64) -> Option<&tr_data::news_store::local::Volume> {
+    let symbols = n.query.as_ref().map(|q| q.symbols.as_slice()).unwrap_or_default();
+    n.interaction
+        .volumes
+        .iter()
+        .filter(|v| {
+            v.hour == tr_data::news_store::local::local_hour(now)
+                && v.hour != n.interaction.dismissed_volume.unwrap_or(-1)
+                && match n.filters.scope {
+                    Scope::Symbol => n.symbol.as_ref() == Some(&v.key),
+                    Scope::Watchlist => v.key.starts_with("Topic: ") || symbols.contains(&v.key),
+                    Scope::All => v.key.starts_with("Topic: "),
+                }
+        })
+        .min_by_key(|v| v.key.starts_with("Topic: "))
+}
+
 pub(super) fn show(
     ui: &mut Ui,
     n: &mut NewsPane,
@@ -599,39 +614,15 @@ pub(super) fn show(
     if let Some(text) = n.interaction.digest_text.take() {
         ui.ctx().copy_text(text);
     }
-    if n.filters.scope != Scope::All {
-        let symbols = n.query.as_ref().map(|q| q.symbols.as_slice()).unwrap_or_default();
-        if let Some(v) = n
-            .interaction
-            .volumes
-            .iter()
-            .filter(|v| {
-                v.hour != n.interaction.dismissed_volume.unwrap_or(-1)
-                    && (v.key.starts_with("Topic: ") || symbols.contains(&v.key))
-            })
-            .min_by_key(|v| v.key.starts_with("Topic: "))
-        {
-            let hour = v.hour;
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "Unusual volume: {} {} stories this hour (usual {})",
-                        if v.key.starts_with("Topic: ") {
-                            &v.key
-                        } else {
-                            v.key.split_whitespace().next().unwrap_or(&v.key)
-                        },
-                        v.count,
-                        v.usual
-                    ))
-                    .font(ui_font(10.5))
-                    .color(theme::muted()),
-                );
-                if ui.small_button("Dismiss").clicked() {
-                    n.interaction.dismissed_volume = Some(hour);
-                }
-            });
-        }
+    if let Some(v) = current_volume(n, chrono::Utc::now().timestamp()) {
+        let hour = v.hour;
+        let message = v.message();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(message).font(ui_font(10.5)).color(theme::muted()));
+            if ui.small_button("Dismiss").clicked() {
+                n.interaction.dismissed_volume = Some(hour);
+            }
+        });
     }
     let before = n.filters.clone();
     let mut actions = vec![];

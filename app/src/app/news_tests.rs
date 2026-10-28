@@ -4,6 +4,28 @@ fn stories() -> Vec<tr_data::news_store::Story> {
     tr_data::finnhub::parse(include_bytes!("../../../crates/data/tests/fixtures/finnhub_news.json"), None).unwrap()
 }
 #[test]
+fn n4_volume_banner_is_current_hour_and_scope_specific() {
+    use tr_data::news_store::local::{Volume, local_hour};
+    let now = 20 * 86400 + 120;
+    let hour = local_hour(now);
+    let volume = |key: &str, at| Volume { key: key.into(), hour: at, count: 14, usual: 3., z: 11. };
+    let mut pane = NewsPane::new(Some("NVDA US Equity".into()));
+    pane.filters.scope = Scope::Symbol;
+    pane.interaction.volumes =
+        vec![volume("Topic: Earnings", hour), volume("AAPL US Equity", hour), volume("NVDA US Equity", hour - 3600)];
+    assert!(current_volume(&pane, now).is_none());
+    pane.interaction.volumes.push(volume("NVDA US Equity", hour));
+    assert_eq!(current_volume(&pane, now).unwrap().message(), "Unusual volume: NVDA — 14 stories this hour (usual 3)");
+    pane.interaction.dismissed_volume = Some(hour);
+    assert!(current_volume(&pane, now).is_none());
+    pane.interaction.dismissed_volume = None;
+    pane.filters.scope = Scope::All;
+    assert_eq!(current_volume(&pane, now).unwrap().key, "Topic: Earnings");
+    pane.filters.scope = Scope::Watchlist;
+    assert_eq!(current_volume(&pane, now).unwrap().key, "Topic: Earnings");
+    assert!(current_volume(&pane, now + 3600).is_none());
+}
+#[test]
 fn never_blank_and_pause_counts_unique_new_items() {
     let mut pane = NewsPane::new(None);
     let mut items = stories();

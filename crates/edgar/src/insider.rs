@@ -218,7 +218,7 @@ impl Transaction {
 pub fn owner_id(owner: &Owner) -> String {
     owner.cik.map_or_else(|| owner.name.to_ascii_lowercase(), |c| c.to_string())
 }
-fn restatement_key(f: &crate::Filing, t: &Transaction) -> String {
+pub fn restatement_key(f: &crate::Filing, t: &Transaction) -> String {
     format!("{}|{}|{}|{}|{:?}", f.cik, owner_id(&t.owner), t.date, t.code, t.shares.map(f64::to_bits))
 }
 /// Economic identity within an accession; legacy rows without IDs use their lot contents.
@@ -241,7 +241,8 @@ pub fn lot_key(t: &Transaction) -> String {
     )
 }
 /// Amendment-aware owner rows. Unlike economic lots, every joint owner is kept
-/// so cluster detection counts people without multiplying the purchase value.
+/// so cluster detection can compare beneficial-owner sets across accessions
+/// without multiplying the purchase value or treating co-filers as a cluster.
 pub fn effective_transactions<'a>(
     rows: &'a [crate::Filing],
     symbol: &str,

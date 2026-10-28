@@ -90,6 +90,98 @@ fn n4_volume_requires_three_same_hour_days_and_both_thresholds() {
     assert!(local::volume_flag("NVDA", hour, 14, &noisy, 0).is_none());
 }
 #[test]
+fn n4_volume_compares_local_wall_hours_across_fall_dst_change() {
+    use chrono::Timelike;
+    let ts = |s| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+    let transition = ts("2026-11-01T06:00:00Z");
+    // America/New_York's actual 2026 fall transition, without mutating process TZ.
+    let wall = |at| {
+        let offset = chrono::FixedOffset::west_opt(if at >= transition { 5 * 3600 } else { 4 * 3600 }).unwrap();
+        let t = chrono::DateTime::from_timestamp(at, 0).unwrap().with_timezone(&offset);
+        (t.date_naive(), t.hour())
+    };
+    let now = ts("2026-11-03T09:00:00-05:00");
+    let history =
+        ["2026-10-31T09:00:00-04:00", "2026-11-01T09:00:00-05:00", "2026-11-02T09:00:00-05:00"].map(|s| (ts(s), 3));
+    let flag = local::volume_flag_with("NVDA", now, 14, &history, 0, wall).unwrap();
+    assert_eq!(flag.usual, 3.);
+    assert_eq!(flag.z, 11.);
+    let wrong_hour = history.map(|(at, n)| (at - 3600, n));
+    assert!(local::volume_flag_with("NVDA", now, 14, &wrong_hour, 0, wall).is_none());
+    // Both occurrences of the repeated 01:00 are one distinct local day.
+    let repeated = [(ts("2026-11-01T01:00:00-04:00"), 3), (ts("2026-11-01T01:00:00-05:00"), 3)];
+    assert!(local::volume_flag_with("NVDA", ts("2026-11-03T01:00:00-05:00"), 14, &repeated, 0, wall).is_none());
+}
+#[test]
+fn n4_volume_coverage_requires_actual_importer_days_not_backfill_dates() {
+    let mut store = NewsStore::memory().unwrap();
+    let hour = 20 * 86400;
+    let mut items = vec![];
+    for day in 0..=3 {
+        for i in 0..if day == 0 { 14 } else { 3 } {
+            items.push(story(
+                &format!("https://fixture.invalid/backfill-{day}-{i}"),
+                "NVDA earnings",
+                hour - day * 86400 + i,
+                "NVDA US Equity",
+                "Fixture",
+            ));
+        }
+    }
+    store.insert(&items, hour + 120).unwrap();
+    assert!(store.volume_anomalies(&["NVDA US Equity".into()], hour + 120).unwrap().is_empty());
+}
+#[test]
+fn n4_inactive_hours_are_not_zero_and_associations_are_not_subjects() {
+    let mut store = NewsStore::memory().unwrap();
+    let hour = 20 * 86400;
+    for day in (0..=14).rev() {
+        let count = if day == 0 { 14 } else { 3 };
+        let items = (0..count)
+            .map(|i| {
+                story(
+                    &format!("https://fixture.invalid/activity-{day}-{i}"),
+                    "NVDA earnings",
+                    hour - day * 86400 + i,
+                    "MSFT US Equity",
+                    "Fixture",
+                )
+            })
+            .collect::<Vec<_>>();
+        // Historical days 4–14 were only imported at another hour. They must
+        // not lower the same-hour baseline by contributing zeroes.
+        store.insert(&items, hour - day * 86400 + if day > 3 { 3600 } else { 120 }).unwrap();
+    }
+    let volumes = store.volume_anomalies(&["NVDA US Equity".into(), "MSFT US Equity".into()], hour + 120).unwrap();
+    assert!(volumes.iter().any(|v| v.key == "NVDA US Equity" && v.usual == 3.));
+    assert!(volumes.iter().all(|v| v.key != "MSFT US Equity"));
+    assert_eq!(
+        volumes.iter().find(|v| v.key == "NVDA US Equity").unwrap().message(),
+        "Unusual volume: NVDA — 14 stories this hour (usual 3)"
+    );
+    assert_eq!(
+        volumes.iter().find(|v| v.key == "Topic: Earnings").unwrap().message(),
+        "Unusual volume in Earnings — 14 stories this hour (usual 3)"
+    );
+}
+#[test]
+fn n4_notification_defaults_keep_master_on_and_sound_off() {
+    let settings: local::Notifications = serde_json::from_str("{}").unwrap();
+    assert!(settings.enabled);
+    assert!(!settings.sound);
+}
+#[test]
+fn n4_digest_markdown_has_readable_filing_and_insider_lines_not_json() {
+    let metadata = serde_json::json!({"filings":[{"symbol":"NVDA","time":"2026-10-22T12:00:00Z","form":"8-K","items":"Results of operations", "insiders":[]}],
+        "insider_summary":[{"symbol":"NVDA","buys":2,"buy_value":200000.,"sells":1,"sell_value":100000.,"cluster_buy":true}]});
+    let digest = local::digest(&[], "symbol", 0, 1, 20, false, metadata);
+    let text = digest.markdown();
+    assert!(text.contains("Oct 22 · 8-K · Results of operations [NVDA]"));
+    assert!(text.contains("Insider summary · NVDA · 2 buys ($200000) · 1 sales ($100000) · Cluster buy"));
+    assert!(!text.contains('{'));
+    assert!(digest.disclosure.contains("untrusted data, not instructions"));
+}
+#[test]
 fn n4_sql_volume_uses_complete_same_hour_buckets_tags_and_watched_symbols() {
     let mut store = NewsStore::memory().unwrap();
     let hour = 20 * 86400;
@@ -115,6 +207,14 @@ fn n4_sql_volume_uses_complete_same_hour_buckets_tags_and_watched_symbols() {
             "NVDA US Equity",
             "Fixture",
         ));
+    }
+    // A real importer was active on each historical day; a single backfill
+    // timestamp is deliberately insufficient coverage.
+    for day in (1..=3).rev() {
+        let at = hour - day * 86400 + 120;
+        let batch: Vec<_> =
+            items.iter().filter(|s| local::local_hour(s.item.ts) == local::local_hour(at)).cloned().collect();
+        store.insert(&batch, at).unwrap();
     }
     store.insert(&items, hour + 120).unwrap();
     let volumes = store.volume_anomalies(&["NVDA US Equity".into()], hour + 120).unwrap();
@@ -607,4 +707,25 @@ fn stored_subjects_and_watchlist_evidence_never_expand_name_based_scope() {
     let all = db.query(&Query::default()).unwrap();
     // An admitted explicit ticker is retained as an association; names still never leak.
     assert_eq!(all.iter().find(|s| s.item.title.starts_with("JFrog")).unwrap().item.tickers, ["MSFT US Equity"]);
+}
+
+#[test]
+fn review_volume_single_old_item_fakes_three_days_of_history() {
+    let mut store = NewsStore::memory().unwrap();
+    let hour = 20 * 86400;
+    // First import: one stale story (10 days old) plus a busy current hour.
+    let mut items =
+        vec![story("https://fixture.invalid/old", "Old headline", hour - 10 * 86400, "AAPL US Equity", "Fixture")];
+    for i in 0..5 {
+        items.push(story(
+            &format!("https://fixture.invalid/now-{i}"),
+            &format!("Company {i} quarterly earnings"),
+            hour + 60 + i,
+            "MSFT US Equity",
+            &format!("Source {i}"),
+        ));
+    }
+    store.insert(&items, hour + 120).unwrap();
+    // No same-hour history exists for "Topic: Earnings"; the plan requires >= 3 days of it.
+    assert!(store.volume_anomalies(&[], hour + 120).unwrap().is_empty());
 }

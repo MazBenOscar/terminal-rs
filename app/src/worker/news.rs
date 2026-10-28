@@ -35,6 +35,11 @@ pub(super) struct LocalState {
     volume_at: i64,
     volumes: Vec<tr_data::news_store::local::Volume>,
     history: Option<Vec<String>>,
+    edgar: Option<tr_edgar::store::Store>,
+    edgar_at: i64,
+    volume_symbols: Vec<String>,
+    names: Option<Vec<(u64, String, String)>>,
+    names_dirty: bool,
 }
 impl Default for LocalState {
     fn default() -> Self {
@@ -48,6 +53,11 @@ impl Default for LocalState {
             volume_at: 0,
             volumes: vec![],
             history: None,
+            edgar: None,
+            edgar_at: 0,
+            volume_symbols: vec![],
+            names: None,
+            names_dirty: false,
         }
     }
 }
@@ -62,7 +72,7 @@ impl LocalState {
         let flags =
             |s: &tr_data::news_store::local::Notifications| [s.filings, s.insiders, s.keywords, s.breaking, s.volume];
         for (i, (old, new)) in flags(&self.settings).into_iter().zip(flags(&settings)).enumerate() {
-            if old != new {
+            if old != new || self.settings.enabled != settings.enabled {
                 self.since[i] = now;
             }
         }
@@ -83,14 +93,7 @@ pub(super) async fn local_read(
     use tr_data::news_store::local;
     let now = chrono::Utc::now().timestamp();
     let filing_symbols = if symbols.is_empty() { s.news.local.lock().await.watched.clone() } else { symbols.to_vec() };
-    let edgar_path = data_dir().join("edgar.sqlite3");
-    let filings = if edgar_path.exists() {
-        tr_edgar::store::Store::open(edgar_path)
-            .and_then(|db| db.local_filings(now - 90 * 86400, now))
-            .map_err(|_| "Saved filings unavailable")?
-    } else {
-        vec![]
-    };
+    let filings = s.news.local.lock().await.saved_filings(now).map_err(|_| "Saved filings unavailable")?;
     match args {
         tr_agent_tools::args::LiveArgs::ReadNews(a) => {
             let hours = a.hours.unwrap_or(24).clamp(1, 168);
@@ -142,53 +145,131 @@ pub(super) async fn local_read(
         _ => Err("Not a local news tool".into()),
     }
 }
-/// Claims every first observation, including disabled/non-matching stories. A
-/// later retag, watch edit, or backfill cannot turn a saved item into an alert.
+/// Pending claims are committed only after the complete batch is handed to
+/// delivery. Observation/suppression markers are separate from delivery claims.
+struct Notice {
+    body: String,
+    edgar: bool,
+    claims: Vec<(String, String)>,
+}
+impl Notice {
+    fn news(body: String, kind: &str, id: &str) -> Self {
+        Self { body, edgar: false, claims: vec![(kind.into(), id.into())] }
+    }
+    fn commit(&self, news: Option<&NewsStore>, edgar: Option<&tr_edgar::store::Store>) -> anyhow::Result<()> {
+        for (kind, id) in &self.claims {
+            if self.edgar {
+                edgar.ok_or_else(|| anyhow::anyhow!("EDGAR claims unavailable"))?.claim_notification(kind, id)?;
+            } else {
+                news.ok_or_else(|| anyhow::anyhow!("News claims unavailable"))?.claim_notification(kind, id)?;
+            }
+        }
+        Ok(())
+    }
+}
+fn volume_symbols(watched: &[String], views: &[View]) -> Vec<String> {
+    let mut symbols = watched.to_vec();
+    symbols.extend(
+        views.iter().filter(|v| v.filters.scope == tr_data::news_store::Scope::Symbol).filter_map(|v| v.symbol.clone()),
+    );
+    symbols.sort();
+    symbols.dedup();
+    symbols
+}
 async fn local_tick(s: &Shared) -> anyhow::Result<()> {
     use chrono::Timelike;
     use tr_data::news_store::local;
     let now = chrono::Utc::now().timestamp();
+    let views = s.news.views.lock().await.clone();
     let mut state = s.news.local.lock().await;
-    let store_guard = s.news.store.lock().await;
-    let Some(store) = store_guard.as_ref() else { return Ok(()) };
-    state.begin_session(store)?;
-    let rows = store.query(&Query {
-        start: now - 7200,
-        end: now,
-        limit: tr_data::news_intelligence::MAX_ITEMS,
-        filters: Filters { scope: tr_data::news_store::Scope::All, ..Default::default() },
-        ..Default::default()
-    })?;
-    let mut messages = state.news_alerts(store, &rows, now)?;
-    let path = data_dir().join("edgar.sqlite3");
-    if path.exists() {
-        let db = tr_edgar::store::Store::open(path)?;
-        let filings = db.filings()?;
-        messages.extend(state.filing_alerts(&db, &filings, now)?);
-    }
-    if now - state.volume_at >= 300 {
-        state.volume_at = now;
-        let volumes = store.volume_anomalies(&state.watched, now)?;
-        for v in &volumes {
-            if store.claim_notification("volume", &format!("{}:{}", v.key, v.hour))?
-                && state.settings.volume
-                && v.hour >= state.since[4].max(state.session)
-            {
-                messages.push(format!("Unusual volume: {} {} stories this hour (usual {})", v.key, v.count, v.usual));
+    let mut notices = vec![];
+    // Accumulate errors, not early returns: already collected messages still go
+    // through delivery even if EDGAR, volume aggregation, or a later row fails.
+    let news_result = {
+        let guard = s.news.store.lock().await;
+        (|| -> anyhow::Result<()> {
+            let Some(store) = guard.as_ref() else { return Ok(()) };
+            state.begin_session(store)?;
+            let rows = store.query(&Query {
+                // Cluster identity must retain earlier members, not reset at 2h.
+                start: now - 86400,
+                end: now,
+                limit: tr_data::news_intelligence::MAX_ITEMS,
+                filters: Filters { scope: tr_data::news_store::Scope::All, ..Default::default() },
+                ..Default::default()
+            })?;
+            state.collect_news(store, &rows, now, &mut notices)?;
+            let symbols = volume_symbols(&state.watched, &views);
+            if now - state.volume_at >= 300 || symbols != state.volume_symbols {
+                let volumes = store.volume_anomalies(&symbols, now)?;
+                state.volume_at = now;
+                state.volume_symbols = symbols;
+                for v in &volumes {
+                    let id = format!("{}:{}", v.key, v.hour);
+                    if state.settings.enabled
+                        && state.settings.volume
+                        && (v.key.starts_with("Topic: ") || state.watched.contains(&v.key))
+                        && v.hour >= state.since[4].max(state.session)
+                        && !store.notification_claimed("volume", &id)?
+                    {
+                        notices.push(Notice::news(v.message(), "volume", &id));
+                    }
+                }
+                if state.volumes != volumes {
+                    state.volumes = volumes.clone();
+                    s.send(Response::NewsVolume(volumes));
+                }
             }
+            Ok(())
+        })()
+    }; // Never hold the news store mutex during EDGAR work.
+    let edgar_result = state.collect_edgar(now, &mut notices);
+    let mut guard = s.news.store.lock().await;
+    let store = guard.as_mut().ok_or_else(|| anyhow::anyhow!("News delivery unavailable"))?;
+    let names_result = if state.names_dirty {
+        let result = store.install_names(state.names.as_deref().unwrap_or_default());
+        if result.is_ok() {
+            state.names_dirty = false;
         }
-        if state.volumes != volumes {
-            state.volumes = volumes.clone();
-            s.send(Response::NewsVolume(volumes));
+        result
+    } else {
+        Ok(())
+    };
+    let quiet = !state.settings.enabled
+        || local::quiet(state.settings.quiet_start, state.settings.quiet_end, chrono::Local::now().hour());
+    let mut handed = false;
+    let delivery_result = handoff(&notices, store, now, quiet, |desktop, history| {
+        handed = true;
+        if !desktop.is_empty() || state.history.as_ref() != Some(&history) {
+            state.history = Some(history.clone());
+            s.send(Response::FeedNotices { desktop, history });
+        }
+        Ok(())
+    });
+    drop(guard);
+    let mut claims_result = Ok(());
+    if handed {
+        for notice in notices.iter().filter(|n| n.edgar) {
+            claims_result = claims_result.and(notice.commit(None, state.edgar.as_ref()));
         }
     }
-    let quiet = local::quiet(state.settings.quiet_start, state.settings.quiet_end, chrono::Local::now().hour());
+    delivery_result.and(claims_result).and(news_result).and(edgar_result).and(names_result)
+}
+fn handoff(
+    notices: &[Notice],
+    store: &NewsStore,
+    now: i64,
+    quiet: bool,
+    deliver: impl FnOnce(Vec<String>, Vec<String>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let messages = notices.iter().map(|n| n.body.clone()).collect::<Vec<_>>();
     let (desktop, history) = store.deliver_notifications(&messages, now, quiet)?;
-    if !desktop.is_empty() || state.history.as_ref() != Some(&history) {
-        state.history = Some(history.clone());
-        s.send(Response::FeedNotices { desktop, history });
+    deliver(desktop, history)?;
+    let mut result = Ok(());
+    for notice in notices.iter().filter(|n| !n.edgar) {
+        result = result.and(notice.commit(Some(store), None));
     }
-    Ok(())
+    result
 }
 impl LocalState {
     fn begin_session(&self, store: &NewsStore) -> anyhow::Result<()> {
@@ -199,86 +280,207 @@ impl LocalState {
         }
         Ok(())
     }
-    fn news_alerts(&self, store: &NewsStore, rows: &[Story], now: i64) -> anyhow::Result<Vec<String>> {
-        use tr_data::news_store::local;
-        let state = self;
-        let mut messages = vec![];
-        for story in rows {
-            let first = store.claim_notification("keyword", &story.id)?;
-            if first
-                && state.settings.keywords
-                && local::fresh(story.item.ts, state.since[2], state.session, now)
-                && state.watches.iter().any(|w| {
-                    w.notify && !tr_data::news_intelligence::watch_ranges(&story.item.title, &w.words).is_empty()
-                })
-            {
-                messages.push(format!("Keyword watch · {}", story.item.title));
-            }
+    fn ensure_edgar(&mut self) -> anyhow::Result<()> {
+        let path = data_dir().join("edgar.sqlite3");
+        if self.edgar.is_none() && path.exists() {
+            self.edgar = Some(tr_edgar::store::Store::open(path)?);
         }
-        for c in tr_data::news_intelligence::clusters(rows) {
-            // Earliest chronological member, not the publisher-ranked lead.
-            let sources: std::collections::BTreeSet<_> =
-                c.members.iter().filter(|m| m.item.ts >= now - 3600).map(|m| &m.source).collect();
-            if sources.len() >= 4
-                && store.claim_cluster(&c.member_ids)?
-                && state.settings.breaking
-                && !c.members.iter().any(|m| store.notification_blocked(&m.id).unwrap_or(true))
-                && c.subjects.iter().any(|t| state.watched.contains(t))
-                && c.members.iter().all(|m| local::fresh(m.item.ts, state.since[3], state.session, now))
-            {
-                messages.push(format!("Breaking · {} sources · {}", sources.len(), c.lead.item.title));
+        Ok(())
+    }
+    fn saved_filings(&mut self, now: i64) -> anyhow::Result<Vec<tr_edgar::Filing>> {
+        self.ensure_edgar()?;
+        self.edgar.as_ref().map(|db| db.local_filings(now - 90 * 86400, now)).unwrap_or_else(|| Ok(vec![]))
+    }
+    fn collect_edgar(&mut self, now: i64, notices: &mut Vec<Notice>) -> anyhow::Result<()> {
+        // At most one snapshot evaluation per minute, including disabled types.
+        if now - self.edgar_at < 60 {
+            return Ok(());
+        }
+        self.edgar_at = now;
+        self.ensure_edgar()?;
+        if let Some(db) = self.edgar.as_ref() {
+            let names = db.companies()?.into_iter().map(|c| (c.cik, c.ticker, c.title)).collect::<Vec<_>>();
+            if self.names.as_ref() != Some(&names) {
+                self.names = Some(names);
+                self.names_dirty = true;
             }
+            self.collect_filings(db, &db.filings()?, now, notices)?;
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    fn news_alerts(&self, store: &NewsStore, rows: &[Story], now: i64) -> anyhow::Result<Vec<String>> {
+        let mut notices = vec![];
+        self.collect_news(store, rows, now, &mut notices)?;
+        let messages = notices.iter().map(|n| n.body.clone()).collect(); // test delivery sink
+        for notice in notices {
+            notice.commit(Some(store), None)?;
         }
         Ok(messages)
     }
+    fn collect_news(
+        &self,
+        store: &NewsStore,
+        rows: &[Story],
+        now: i64,
+        notices: &mut Vec<Notice>,
+    ) -> anyhow::Result<()> {
+        use tr_data::news_store::local;
+        for story in rows {
+            if store.notification_claimed("keyword", &story.id)?
+                || store.notification_claimed("keyword-observed", &story.id)?
+            {
+                continue;
+            }
+            // Pane highlighting intentionally matches titles only, not summaries.
+            let eligible = self.settings.enabled
+                && self.settings.keywords
+                && local::fresh(story.item.ts, self.since[2], self.session, now)
+                && self.watches.iter().any(|w| w.notify && tr_data::news_intelligence::watch_matches(story, &w.words));
+            if eligible {
+                notices.push(Notice::news(format!("Keyword watch · {}", story.item.title), "keyword", &story.id));
+            } else {
+                store.claim_notification("keyword-observed", &story.id)?;
+            }
+        }
+        for c in tr_data::news_intelligence::clusters(rows) {
+            let mut claimed = false;
+            for id in &c.member_ids {
+                claimed |= store.notification_claimed("breaking-member", id)?;
+            }
+            if claimed {
+                // Propagate an existing cluster identity through merges and lead changes.
+                store.claim_cluster(&c.member_ids)?;
+                continue;
+            }
+            let sources: std::collections::BTreeSet<_> =
+                c.members.iter().filter(|m| m.item.ts >= now - 3600).map(|m| &m.source).collect();
+            let mut blocked = false;
+            for m in &c.members {
+                blocked |= store.notification_blocked(&m.id)?;
+            }
+            if sources.len() >= 4
+                && self.settings.enabled
+                && self.settings.breaking
+                && !blocked
+                && c.subjects.iter().any(|t| self.watched.contains(t))
+                && c.members.iter().all(|m| local::fresh(m.item.ts, self.since[3], self.session, now))
+            {
+                if store.cluster_previously_delivered(&c.lead)? {
+                    store.claim_cluster(&c.member_ids)?;
+                    continue;
+                }
+                notices.push(Notice {
+                    body: format!("Breaking · {} sources · {}", sources.len(), c.lead.item.title),
+                    edgar: false,
+                    claims: c.member_ids.iter().map(|id| ("breaking-member".into(), id.clone())).collect(),
+                });
+            }
+        }
+        Ok(())
+    }
+    #[cfg(test)]
     fn filing_alerts(
         &self,
         db: &tr_edgar::store::Store,
         filings: &[tr_edgar::Filing],
         now: i64,
     ) -> anyhow::Result<Vec<String>> {
-        use tr_data::news_store::local;
-        let state = self;
-        let mut messages = vec![];
-        for f in filings {
-            if !f.transient_symbol.is_empty() {
-                db.claim_notification("filing", &f.accession)?;
-                db.claim_notification("insider", &f.accession)?;
-                continue;
-            }
-            if f.reporting_owner || (f.form.starts_with("8-K") && !f.from_submissions && f.items.is_empty()) {
-                continue;
-            }
-            let watched = state.watched.iter().find(|s| f.matches_symbol(s));
-            let first = db.claim_notification("filing", &f.accession)?;
-            if first
-                && state.settings.filings
-                && watched.is_some()
-                && local::fresh(f.time(), state.since[0], state.session, now)
-                && matches!(
-                    f.form.trim_end_matches("/A"),
-                    "8-K" | "10-K" | "10-Q" | "SC 13D" | "SC 13G" | "13D" | "13G"
-                )
-            {
-                messages.push(format!("{} · {}", f.ticker, f.detail()));
-            }
-            // Do not consume a pending XML accession until its local parse exists.
-            if f.insider_parsed
-                && db.claim_notification("insider", &f.accession)?
-                && state.settings.insiders
-                && local::fresh(f.time(), state.since[1], state.session, now)
-                && let Some(symbol) = watched
-                && let Some((value, cluster)) = tr_edgar::insider_buy(filings, f, symbol, state.settings.insider_min)
-            {
-                messages.push(format!(
-                    "{} · Insider buy {}{}",
-                    f.ticker,
-                    tr_edgar::insider::value(value),
-                    if cluster { " · Cluster buy" } else { "" }
-                ));
-            }
+        let mut notices = vec![];
+        self.collect_filings(db, filings, now, &mut notices)?;
+        let messages = notices.iter().map(|n| n.body.clone()).collect(); // test delivery sink
+        for notice in notices {
+            notice.commit(None, Some(db))?;
         }
         Ok(messages)
+    }
+    fn collect_filings(
+        &self,
+        db: &tr_edgar::store::Store,
+        filings: &[tr_edgar::Filing],
+        now: i64,
+        notices: &mut Vec<Notice>,
+    ) -> anyhow::Result<()> {
+        use tr_data::news_store::local;
+        // Include seeded/legacy accession claims when deriving restatement identity.
+        let mut claimed_lots = std::collections::BTreeSet::new();
+        for old in filings {
+            if db.notification_claimed("insider", &old.accession)? {
+                claimed_lots.extend(old.insiders.iter().map(|t| tr_edgar::insider::restatement_key(old, t)));
+            }
+        }
+        for f in filings {
+            if !f.transient_symbol.is_empty() {
+                db.claim_notification("filing-observed", &f.accession)?;
+                db.claim_notification("insider-observed", &f.accession)?;
+                continue;
+            }
+            let family = tr_edgar::form_family(&f.form);
+            if f.reporting_owner || (family == "8-K" && !f.from_submissions && f.items.is_empty()) {
+                continue;
+            }
+            let watched = self.watched.iter().find(|s| f.matches_symbol(s));
+            if !db.notification_claimed("filing", &f.accession)?
+                && !db.notification_claimed("filing-observed", &f.accession)?
+            {
+                if self.settings.enabled
+                    && self.settings.filings
+                    && watched.is_some()
+                    && local::fresh(f.time(), self.since[0], self.session, now)
+                    && matches!(family.as_str(), "8-K" | "10-K" | "10-Q" | "SC 13D" | "SC 13G")
+                {
+                    notices.push(Notice {
+                        body: format!("{} · {}", f.ticker, f.detail()),
+                        edgar: true,
+                        claims: vec![("filing".into(), f.accession.clone())],
+                    });
+                } else {
+                    db.claim_notification("filing-observed", &f.accession)?;
+                }
+            }
+            // Pending XML must remain eligible until its parse completes.
+            if !f.insider_parsed
+                || db.notification_claimed("insider", &f.accession)?
+                || db.notification_claimed("insider-observed", &f.accession)?
+            {
+                continue;
+            }
+            let keys: std::collections::BTreeSet<_> = f
+                .insiders
+                .iter()
+                .filter(|t| t.code == "P" && !t.derivative)
+                .map(|t| tr_edgar::insider::restatement_key(f, t))
+                .collect();
+            let mut superseded_claimed = false;
+            for key in &keys {
+                superseded_claimed |= db.notification_claimed("insider-lot", key)?
+                    || notices.iter().any(|n| n.edgar && n.claims.contains(&("insider-lot".into(), key.clone())));
+                superseded_claimed |= claimed_lots.contains(key);
+            }
+            let buy = watched.and_then(|symbol| tr_edgar::insider_buy(filings, f, symbol, self.settings.insider_min));
+            if self.settings.enabled
+                && self.settings.insiders
+                && !superseded_claimed
+                && local::fresh(f.time(), self.since[1], self.session, now)
+                && let Some((value, cluster)) = buy
+            {
+                let mut claims = vec![("insider".into(), f.accession.clone())];
+                claims.extend(keys.into_iter().map(|key| ("insider-lot".into(), key)));
+                notices.push(Notice {
+                    body: format!(
+                        "{} · Insider buy {}{}",
+                        f.ticker,
+                        tr_edgar::insider::value(value),
+                        if cluster { " · Cluster buy" } else { "" }
+                    ),
+                    edgar: true,
+                    claims,
+                });
+            } else {
+                db.claim_notification("insider-observed", &f.accession)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -368,8 +570,8 @@ async fn read_view(s: &Shared, view: View, force: bool) {
     let mut store_guard = s.news.store.lock().await;
     if let Some(store) = store_guard.as_mut() {
         let _ = store.set_watched(&watched);
-        // Optional, read-only local SEC map; failures never fail saved reads.
-        let _ = store.refresh_names(&data_dir().join("edgar.sqlite3"));
+        // Company names arrive from the minute-paced local EDGAR reader; no
+        // EDGAR connection or queries are made under this store mutex.
     }
     let items = match store_guard.as_ref() {
         Some(store) => store.query(&query).map_err(|_| "News store unavailable".into()),
@@ -524,21 +726,37 @@ fn bounds(store: Option<&NewsStore>, job: &Job) -> anyhow::Result<(Option<i64>, 
         Job::Market(category) => Ok((None, finnhub::cursor(store, category)?)),
     }
 }
+#[derive(Default)]
+struct WarningThrottle(std::collections::BTreeMap<String, i64>);
+impl WarningThrottle {
+    fn allow(&mut self, error: &str, now: i64) -> bool {
+        self.0.retain(|_, at| now - *at < 600);
+        if self.0.contains_key(error) {
+            false
+        } else {
+            self.0.insert(error.into(), now);
+            true
+        }
+    }
+}
 pub(super) async fn run(s: Arc<Shared>) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let client = finnhub::Client::default();
     let mut schedule = Schedule::default();
     let mut fallback = FallbackState::default();
+    let mut warnings = WarningThrottle::default();
     loop {
         interval.tick().await;
         if let Err(error) = local_tick(&s).await {
-            tracing::warn!("Local news notifications unavailable: {error}");
+            let message = format!("{error:#}");
+            if warnings.allow(&message, chrono::Utc::now().timestamp()) {
+                tracing::warn!("Local news notifications unavailable: {message}");
+            }
         }
         let watched = s.news.watchlist.lock().await.clone();
         if let Some(store) = s.news.store.lock().await.as_mut() {
             let _ = store.set_watched(&watched);
-            let _ = store.refresh_names(&data_dir().join("edgar.sqlite3"));
         }
         let views = s.news.views.lock().await.clone();
         if views.is_empty() {
@@ -760,6 +978,147 @@ mod tests {
         assert!(other.deliver_notifications(&["fresh".into()], 101, false).unwrap().0.is_empty());
     }
     #[test]
+    fn n4_partial_failure_hands_off_collected_messages_before_returning_error() {
+        let store = NewsStore::memory().unwrap();
+        let state = n4_state();
+        let story = n4_story("partial", 150, "Fixture");
+        let mut notices = vec![];
+        state.collect_news(&store, std::slice::from_ref(&story), 200, &mut notices).unwrap();
+        assert!(!store.notification_claimed("keyword", &story.id).unwrap());
+        // A later EDGAR/volume step failed after news collection.
+        let later: anyhow::Result<()> = Err(anyhow::anyhow!("later step failed"));
+        let mut delivered = vec![];
+        let result = handoff(&notices, &store, 200, false, |desktop, history| {
+            assert_eq!(desktop.len(), 1);
+            delivered = history;
+            Ok(())
+        })
+        .and(later);
+        assert!(result.is_err());
+        assert_eq!(delivered.len(), 1);
+        assert!(store.notification_claimed("keyword", &story.id).unwrap());
+        assert!(state.news_alerts(&store, &[story], 201).unwrap().is_empty());
+    }
+    #[test]
+    fn n4_rejected_delivery_leaves_candidates_unclaimed_and_retryable() {
+        let store = NewsStore::memory().unwrap();
+        let story = n4_story("rejected", 150, "Fixture");
+        let state = n4_state();
+        let mut notices = vec![];
+        state.collect_news(&store, std::slice::from_ref(&story), 200, &mut notices).unwrap();
+        assert!(handoff(&notices, &store, 200, false, |_, _| Err(anyhow::anyhow!("sink unavailable"))).is_err());
+        assert!(!store.notification_claimed("keyword", &story.id).unwrap());
+        assert_eq!(state.news_alerts(&store, &[story], 201).unwrap().len(), 1);
+    }
+    #[test]
+    fn n4_keyword_scope_matches_pane_title_highlighting_not_summary() {
+        let store = NewsStore::memory().unwrap();
+        let state = n4_state();
+        let mut story = n4_story("summary-only", 150, "Fixture");
+        story.item.title = "NVDA launches new product".into();
+        story.summary = "Earnings beat estimates".into();
+        assert!(!tr_data::news_intelligence::watch_matches(&story, "earnings"));
+        assert!(tr_data::news_intelligence::watch_highlights(&story.item.title, &state.watches).is_empty());
+        assert!(state.news_alerts(&store, &[story], 200).unwrap().is_empty());
+        let title = n4_story("title-hit", 150, "Fixture");
+        assert!(!tr_data::news_intelligence::watch_highlights(&title.item.title, &state.watches).is_empty());
+        assert_eq!(state.news_alerts(&store, &[title], 200).unwrap().len(), 1);
+    }
+    #[test]
+    fn n4_master_switch_suppresses_all_feed_types_without_replaying() {
+        let store = NewsStore::memory().unwrap();
+        let db = tr_edgar::store::Store::memory().unwrap();
+        let mut state = n4_state();
+        state.settings.enabled = false;
+        let story = n4_story("master", 150, "Fixture");
+        let filing = review_buy("master-buy", "4", 150, 100.);
+        assert!(state.news_alerts(&store, std::slice::from_ref(&story), 200).unwrap().is_empty());
+        assert!(state.filing_alerts(&db, std::slice::from_ref(&filing), 200).unwrap().is_empty());
+        state.settings.enabled = true;
+        assert!(state.news_alerts(&store, &[story], 200).unwrap().is_empty());
+        assert!(state.filing_alerts(&db, &[filing], 200).unwrap().is_empty());
+    }
+    #[test]
+    fn n4_symbol_volume_interests_include_unwatched_linked_symbols_on_worker() {
+        use tr_data::news_store::Scope;
+        let watched = vec!["NVDA US Equity".into()];
+        let views = [
+            view(Scope::Symbol, &["AAPL US Equity"]),
+            view(Scope::Symbol, &["AAPL US Equity"]),
+            view(Scope::Watchlist, &["MSFT US Equity"]),
+        ];
+        assert_eq!(volume_symbols(&watched, &views), vec!["AAPL US Equity", "NVDA US Equity"]);
+        assert_eq!(volume_symbols(&[], &views), vec!["AAPL US Equity"]);
+    }
+    #[test]
+    fn n4_warning_throttle_is_per_error_and_ten_minutes() {
+        let mut throttle = WarningThrottle::default();
+        assert!(throttle.allow("locked", 100));
+        assert!(!throttle.allow("locked", 699));
+        assert!(throttle.allow("unavailable", 699));
+        assert!(throttle.allow("locked", 700));
+        assert!(!throttle.allow("unavailable", 701));
+    }
+    #[test]
+    fn n4_breaking_saved_member_identity_survives_two_hours_and_snapshot_eviction() {
+        let mut store = NewsStore::memory().unwrap();
+        store.insert(&[n4_story("seed", 1, "Seed")], 1).unwrap();
+        let mut state = n4_state();
+        state.settings.keywords = false;
+        let old = (0..4).map(|i| n4_story(&format!("old-{i}"), 150 + i, &format!("Source {i}"))).collect::<Vec<_>>();
+        store.insert(&old, 200).unwrap();
+        let old = store
+            .query(&Query { limit: 100, ..Default::default() })
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.item.ts >= 100)
+            .collect::<Vec<_>>();
+        assert_eq!(state.news_alerts(&store, &old, 200).unwrap().len(), 1);
+        let new = (0..4).map(|i| n4_story(&format!("new-{i}"), 8150 + i, &format!("Source {i}"))).collect::<Vec<_>>();
+        // The new bounded snapshot has no old member IDs at all.
+        assert!(state.news_alerts(&store, &new, 8200).unwrap().is_empty());
+        assert!(new.iter().all(|s| store.notification_claimed("breaking-member", &s.id).unwrap()));
+    }
+    #[test]
+    fn n4_edgar_evaluation_reuses_handle_and_runs_at_most_once_per_minute() {
+        let mut state = n4_state();
+        let mut db = tr_edgar::store::Store::memory().unwrap();
+        db.upsert(&[review_buy("seed", "4", 1, 1.)]).unwrap();
+        let buy = review_buy("minute-buy", "4", 150, 100.);
+        db.upsert(std::slice::from_ref(&buy)).unwrap();
+        db.save_insiders(
+            &buy,
+            &tr_edgar::insider::Document { issuer_cik: 1, transactions: buy.insiders.clone(), ..Default::default() },
+        )
+        .unwrap();
+        state.edgar = Some(db);
+        let mut pending = vec![];
+        state.collect_edgar(200, &mut pending).unwrap();
+        assert_eq!(pending.len(), 1);
+        let next = review_buy("later-owner", "4", 210, 100.);
+        state.edgar.as_mut().unwrap().upsert(std::slice::from_ref(&next)).unwrap();
+        state
+            .edgar
+            .as_mut()
+            .unwrap()
+            .save_insiders(
+                &next,
+                &tr_edgar::insider::Document {
+                    issuer_cik: 1,
+                    transactions: next.insiders.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        pending.clear();
+        state.collect_edgar(205, &mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(state.edgar_at, 200);
+        state.collect_edgar(260, &mut pending).unwrap();
+        assert_eq!(state.edgar_at, 260);
+        assert!(!pending.is_empty());
+    }
+    #[test]
     fn n4_breaking_requires_four_sources_watched_subject_and_one_hour() {
         let store = NewsStore::memory().unwrap();
         let mut state = n4_state();
@@ -844,6 +1203,57 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("Insider buy"));
         assert!(state.filing_alerts(&db, &[f], 200).unwrap().is_empty());
+    }
+    fn review_buy(accession: &str, form: &str, filed: i64, price: f64) -> tr_edgar::Filing {
+        tr_edgar::Filing {
+            accession: accession.into(),
+            cik: 1,
+            ticker: "NVDA".into(),
+            form: form.into(),
+            filed,
+            insider_parsed: true,
+            insiders: vec![tr_edgar::insider::Transaction {
+                owner: tr_edgar::insider::Owner { cik: Some(7), ..Default::default() },
+                code: "P".into(),
+                date: "2026-10-27".into(),
+                shares: Some(2000.),
+                price: Some(price),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn review_insider_amendment_is_not_double_notified() {
+        let db = tr_edgar::store::Store::memory().unwrap();
+        let state = n4_state();
+        let original = review_buy("original", "4", 150, 100.);
+        assert_eq!(state.filing_alerts(&db, std::slice::from_ref(&original), 200).unwrap().len(), 1);
+        // Same owner/date/code/shares, corrected price, filed 10 s later.
+        let amended = review_buy("amended", "4/A", 160, 101.);
+        assert!(state.filing_alerts(&db, &[original, amended], 210).unwrap().is_empty());
+    }
+    #[test]
+    fn review_schedule_13g_filings_alert_for_watched_issuers() {
+        let db = tr_edgar::store::Store::memory().unwrap();
+        let state = n4_state();
+        let f = tr_edgar::Filing {
+            accession: "schedule".into(),
+            cik: 1,
+            ticker: "NVDA".into(),
+            form: "SCHEDULE 13G".into(),
+            filed: 150,
+            from_submissions: true,
+            ..Default::default()
+        };
+        assert_eq!(state.filing_alerts(&db, &[f], 200).unwrap().len(), 1);
+    }
+    #[test]
+    fn review_local_tick_does_not_reopen_and_reread_edgar_every_tick() {
+        let source = include_str!("news.rs");
+        let body = source.split("async fn local_tick").nth(1).unwrap().split("impl LocalState").next().unwrap();
+        assert!(!body.contains("Store::open("), "edgar store opened on every 5 s tick");
+        assert!(!body.contains("db.filings()"), "every windowed filing and the full companies map reread every 5 s");
     }
     #[test]
     fn n4_local_paths_cannot_construct_network_requests() {

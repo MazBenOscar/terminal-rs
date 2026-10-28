@@ -12,6 +12,92 @@ use crate::theme::{self, muted, text, ui_font};
 use crate::themes::{self, Hex, SYSTEM, Theme};
 use crate::widgets;
 
+/// DragValues mutate the in-memory preference while editing, but persist only
+/// when interaction finishes, including a text edit's focus loss.
+fn finish_feed_drag(response: egui::Response) -> bool {
+    let id = response.id.with("feed-drag-dirty");
+    // Focus queries acquire Context memory: evaluate before taking data_mut.
+    let finished = response.drag_stopped()
+        || response.lost_focus()
+        || (response.changed()
+            && !response.dragged()
+            && !response.has_focus()
+            && !response.is_pointer_button_down_on());
+    response.ctx.data_mut(|data| {
+        if response.changed() {
+            data.insert_temp(id, true);
+        }
+        finished && data.remove_temp::<bool>(id).unwrap_or(false)
+    })
+}
+
+#[test]
+fn n4_feed_drag_values_persist_once_when_drag_finishes() {
+    let ctx = egui::Context::default();
+    let mut value = 100_000.;
+    let mut rect = egui::Rect::NOTHING;
+    let mut saves = 0;
+    let mut changes = 0;
+    for frame in 0..5 {
+        let p = rect.center();
+        let events = match frame {
+            1 => vec![
+                egui::Event::PointerMoved(p),
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            2 => vec![egui::Event::PointerMoved(p + egui::vec2(40., 0.))],
+            3 => vec![egui::Event::PointerButton {
+                pos: p + egui::vec2(40., 0.),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            _ => vec![],
+        };
+        let mut output = ctx.run_ui(egui::RawInput { events, time: Some(frame as f64), ..Default::default() }, |ui| {
+            let response = ui.add(egui::DragValue::new(&mut value).speed(100.));
+            rect = response.rect;
+            changes += usize::from(response.changed());
+            saves += usize::from(finish_feed_drag(response));
+        });
+        output.textures_delta.clear();
+        if frame < 3 {
+            assert_eq!(saves, 0, "must not save during the drag");
+        }
+    }
+    assert!(changes > 0);
+    assert_eq!(saves, 1);
+}
+
+#[test]
+fn n4_feed_drag_text_edit_saves_on_focus_loss_not_each_change() {
+    let ctx = egui::Context::default();
+    let mut value = 0_u32;
+    let mut saves = 0;
+    for frame in 0..4 {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut response = ui.add(egui::DragValue::new(&mut value));
+            if frame < 2 {
+                response.request_focus();
+                response.mark_changed();
+            } else {
+                response.surrender_focus();
+            }
+            saves += usize::from(finish_feed_drag(response));
+        });
+        output.textures_delta.clear();
+        if frame < 2 {
+            assert_eq!(saves, 0);
+        }
+    }
+    assert_eq!(saves, 1);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     Appearance,
@@ -594,22 +680,25 @@ impl TerminalApp {
         let sound = ui.checkbox(&mut self.prefs.alert_sound, "Alert sound").changed();
         let notification =
             ui.checkbox(&mut self.prefs.desktop_notification, "Desktop notification (price alerts)").changed();
-        section(ui, "Notifications");
         let n = &mut self.prefs.feed_notifications;
-        let mut feed = ui.checkbox(&mut n.filings, "Watchlist filings (8-K, 10-K/Q, 13D/G)").changed();
+        let mut feed = ui.checkbox(&mut n.enabled, "Feed notifications").changed();
+        feed |= ui.checkbox(&mut n.sound, "Sound for feed notifications").changed();
+        section(ui, "Notifications");
+        feed |= ui.checkbox(&mut n.filings, "Watchlist filings (8-K, 10-K/Q, 13D/G)").changed();
+        ui.label(RichText::new("Checks SEC filings for watchlist companies while terminal-rs is open").color(muted()));
         feed |= ui.checkbox(&mut n.insiders, "Insider purchases / Cluster buy").changed();
         ui.horizontal(|ui| {
             ui.label("Minimum purchase value");
-            feed |= ui.add(egui::DragValue::new(&mut n.insider_min).range(0.0..=1e12).prefix("$")).changed();
+            feed |= finish_feed_drag(ui.add(egui::DragValue::new(&mut n.insider_min).range(0.0..=1e12).prefix("$")));
         });
         feed |= ui.checkbox(&mut n.keywords, "Keyword watches (Notify enabled per watch)").changed();
         feed |= ui.checkbox(&mut n.breaking, "Breaking stories (4 sources within 60 min)").changed();
         feed |= ui.checkbox(&mut n.volume, "Unusual headline volume notifications").changed();
         ui.horizontal(|ui| {
             ui.label("Quiet hours (local, 0–23; equal disables)");
-            feed |= ui.add(egui::DragValue::new(&mut n.quiet_start).range(0..=23)).changed();
+            feed |= finish_feed_drag(ui.add(egui::DragValue::new(&mut n.quiet_start).range(0..=23)));
             ui.label("to");
-            feed |= ui.add(egui::DragValue::new(&mut n.quiet_end).range(0..=23)).changed();
+            feed |= finish_feed_drag(ui.add(egui::DragValue::new(&mut n.quiet_end).range(0..=23)));
         });
         ui.label(RichText::new("Fresh local items only · max 6 desktop notifications / 10 min · feed alerts require the app running; the price-alert daemon does not fetch news.").color(muted()));
         if feed {

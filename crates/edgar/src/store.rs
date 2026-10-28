@@ -23,7 +23,8 @@ impl Store {
                 primary_doc TEXT NOT NULL, description TEXT NOT NULL, url TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS filings_symbol ON filings(ticker,filed);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS companies(ticker TEXT PRIMARY KEY, cik INTEGER NOT NULL, title TEXT NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS companies(ticker TEXT PRIMARY KEY, cik INTEGER NOT NULL, title TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS notification_seen(kind TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(kind,id));")?;
         // Migrate the N2 store once: one accession may appear for an issuer and a reporting owner.
         db.execute_batch("BEGIN IMMEDIATE")?;
         let has_role = db
@@ -129,16 +130,17 @@ impl Store {
         Ok(self.db.query_row("SELECT 1 FROM filings WHERE accession=?1", [acc], |_| Ok(())).optional()?.is_some())
     }
     /// A feed placeholder must never erase richer submissions metadata.
+    pub fn notification_claimed(&self, kind: &str, id: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row("SELECT 1 FROM notification_seen WHERE kind=?1 AND id=?2", params![kind, id], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
     pub fn claim_notification(&self, kind: &str, id: &str) -> Result<bool> {
-        self.db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS notification_seen(kind TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(kind,id));",
-        )?;
         Ok(self.db.execute("INSERT OR IGNORE INTO notification_seen VALUES(?1,?2)", params![kind, id])? == 1)
     }
     pub fn upsert(&mut self, filings: &[Filing]) -> Result<()> {
-        self.db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS notification_seen(kind TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(kind,id));",
-        )?;
         let tx = self.db.transaction()?;
         let mut initial = std::collections::BTreeSet::new();
         for f in filings {
@@ -498,7 +500,7 @@ mod tests {
         assert!(crate::insider_buy(std::slice::from_ref(&small), &small, "NVDA", 100_000.).is_none());
         let latest = purchase("c", 1, "2026-10-27", 10_000.);
         assert_eq!(
-            crate::insider_buy(&[small.clone(), latest.clone()], &latest, "NVDA", 100_000.),
+            crate::insider_buy(&[small.clone(), latest.clone()], &latest, "NVDA", 10_000.),
             Some((10_000., true))
         );
         let old = purchase("old", 2, "2026-09-26", 10_000.);
@@ -510,12 +512,27 @@ mod tests {
         assert!(crate::insider_buy(&[small, sale.clone()], &sale, "NVDA", 0.).is_none());
     }
     #[test]
+    fn review_single_joint_filing_is_not_a_cluster_buy() {
+        let mut joint = purchase("joint", 1, "2026-10-27", 10_000.);
+        let mut second = joint.insiders[0].clone();
+        second.owner.cik = Some(2);
+        joint.insiders.push(second);
+        assert!(crate::insider_buy(std::slice::from_ref(&joint), &joint, "NVDA", 100_000.).is_none());
+    }
+    #[test]
+    fn review_submissions_keep_schedule_13g_forms() {
+        let bytes = include_bytes!("../tests/fixtures/submissions_aapl.json");
+        let rows = crate::parse_submissions(bytes, 320193, "AAPL", 0).unwrap();
+        assert!(rows.iter().any(|f| f.form.starts_with("SCHEDULE 13G")));
+    }
+    #[test]
     fn n4_clusters_preserve_joint_owners_without_duplicate_economics_or_superseded_buys() {
         let mut joint = purchase("joint", 1, "2026-10-27", 10_000.);
         let mut second = joint.insiders[0].clone();
         second.owner.cik = Some(2);
         joint.insiders.push(second);
-        assert_eq!(crate::insider_buy(std::slice::from_ref(&joint), &joint, "NVDA", 100_000.), Some((10_000., true)));
+        assert!(crate::insider_buy(std::slice::from_ref(&joint), &joint, "NVDA", 100_000.).is_none());
+        assert_eq!(crate::insider_buy(std::slice::from_ref(&joint), &joint, "NVDA", 10_000.), Some((10_000., false)));
         let end = chrono::NaiveDate::from_ymd_opt(2026, 10, 27)
             .unwrap()
             .and_hms_opt(23, 59, 59)
@@ -524,7 +541,7 @@ mod tests {
             .timestamp();
         let summary = crate::local_insider_summary(std::slice::from_ref(&joint), &["NVDA".into()], end - 86400, end);
         assert_eq!(summary[0]["buy_value"], 10_000.);
-        assert_eq!(summary[0]["cluster_buy"], true);
+        assert_eq!(summary[0]["cluster_buy"], false);
 
         let old = purchase("old", 2, "2026-10-01", 10_000.);
         let mut amendment = old.clone();
@@ -535,6 +552,57 @@ mod tests {
         let rows = [old, amendment, latest.clone()];
         assert!(crate::insider_buy(&rows, &latest, "NVDA", 100_000.).is_none());
         assert_eq!(crate::local_insider_summary(&rows, &["NVDA".into()], end - 86400, end)[0]["cluster_buy"], false);
+    }
+    #[test]
+    fn n4_metadata_filters_form_families_and_projects_effective_joint_lots() {
+        let mut original = purchase("original", 1, "2026-10-27", 100_000.);
+        original.filed = 100;
+        let mut co_owner = original.insiders[0].clone();
+        co_owner.owner.cik = Some(2);
+        original.insiders.push(co_owner);
+        let mut amendment = original.clone();
+        amendment.accession = "amended".into();
+        amendment.form = "4/A".into();
+        amendment.filed = 110;
+        for t in &mut amendment.insiders {
+            t.price = Some(1010.);
+        }
+        let eight = Filing {
+            accession: "eight".into(),
+            ticker: "NVDA".into(),
+            form: "8-K/A".into(),
+            filed: 120,
+            ..Default::default()
+        };
+        let schedule = Filing { accession: "schedule".into(), form: "SCHEDULE 13G/A".into(), ..eight.clone() };
+        let rows = [original, amendment, eight, schedule];
+        let forms = ["4".into()];
+        let result = crate::local_metadata(&rows, &["NVDA".into()], 0, 200, &forms);
+        assert_eq!(result.as_array().unwrap().len(), 2);
+        assert_eq!(result[0]["insiders"].as_array().unwrap().len(), 1);
+        assert_eq!(result[0]["insiders"][0]["value"], 101000.);
+        assert!(result[1]["insiders"].as_array().unwrap().is_empty());
+        for (filter, expected) in [("8-k", "8-K/A"), ("sc 13g", "SCHEDULE 13G/A"), ("schedule 13g/a", "SCHEDULE 13G/A")]
+        {
+            let result = crate::local_metadata(&rows, &["NVDA".into()], 0, 200, &[filter.into()]);
+            assert_eq!(result.as_array().unwrap().len(), 1);
+            assert_eq!(result[0]["form"], expected);
+        }
+    }
+    #[test]
+    fn n4_cluster_never_bypasses_aggregate_filing_threshold() {
+        let old = purchase("old", 1, "2026-10-01", 10_000.);
+        let mut filing = purchase("new", 2, "2026-10-27", 60_000.);
+        let mut lot = filing.insiders[0].clone();
+        lot.lot_id = Some(1);
+        lot.shares = Some(80.);
+        filing.insiders.push(lot);
+        assert_eq!(
+            crate::insider_buy(&[old.clone(), filing.clone()], &filing, "NVDA", 100_000.),
+            Some((108_000., true))
+        );
+        filing.insiders.pop();
+        assert!(crate::insider_buy(&[old, filing.clone()], &filing, "NVDA", 100_000.).is_none());
     }
     #[test]
     fn n4_metadata_decodes_items_and_includes_saved_form_four_lines() {

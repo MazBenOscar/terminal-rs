@@ -102,27 +102,30 @@ pub fn local_metadata(
     forms: &[String],
 ) -> serde_json::Value {
     use serde_json::json;
-    let mut rows: Vec<_> = rows
+    let mut filtered: Vec<_> = rows
         .iter()
         .filter(|f| {
             !f.reporting_owner
                 && (start..=end).contains(&f.time())
                 && symbols.iter().any(|s| f.matches_symbol(s))
-                && (forms.is_empty() || forms.contains(&f.form))
+                && (forms.is_empty() || forms.iter().any(|form| form_family(form) == form_family(&f.form)))
         })
         .collect();
-    rows.sort_by(|a, b| b.time().cmp(&a.time()).then(a.accession.cmp(&b.accession)));
-    let result: Vec<_> = rows
+    filtered.sort_by(|a, b| b.time().cmp(&a.time()).then(a.accession.cmp(&b.accession)));
+    let result: Vec<_> = filtered
         .into_iter()
         .take(50)
         .map(|f| {
-            let lines: Vec<_> = f.insiders.iter().take(50).map(|t| json!({
+            let mut seen = BTreeSet::new();
+            let lines: Vec<_> = symbols.iter().flat_map(|symbol| insider::effective_lots(rows, symbol))
+                .filter(|(lot_filing, t)| lot_filing.accession == f.accession && seen.insert(insider::lot_key(t)))
+                .take(50).map(|(_, t)| json!({
             "owner":t.owner.name,"role":t.owner.role(),"code":t.code,"code_label":insider::action(&t.code).0,
             "shares":t.shares,"price":t.price,"value":t.shares.zip(t.price).map(|(s,p)|s*p),"date":t.date
         })).collect();
             json!({"accession":f.accession,"symbol":f.ticker,"form":f.form,
             "time":chrono::DateTime::from_timestamp(f.time(),0).map(|t|t.to_rfc3339()),
-            "date_only":f.accepted.is_none(),"items":decode_items(&f.items),"insiders":lines})
+            "date_only":f.accepted.is_none(),"items":decode_items(&f.items),"description":f.description,"insiders":lines})
         })
         .collect();
     json!(result)
@@ -158,7 +161,7 @@ pub fn local_insider_summary(rows: &[Filing], symbols: &[String], start: i64, en
     json!(summary)
 }
 fn purchase_cluster(rows: &[Filing], symbol: &str, latest: chrono::NaiveDate, cik: Option<u64>) -> bool {
-    let owners: BTreeSet<_> = insider::effective_transactions(rows, symbol)
+    let buyers = insider::effective_transactions(rows, symbol)
         .into_iter()
         .filter(|(f, t)| {
             cik.is_none_or(|cik| cik == f.cik)
@@ -173,18 +176,33 @@ fn purchase_cluster(rows: &[Filing], symbol: &str, latest: chrono::NaiveDate, ci
                 .ok()
                 .is_some_and(|date| date <= latest && (latest - date).num_days() <= 30)
         })
-        .map(|(_, t)| insider::owner_id(&t.owner))
-        .filter(|owner| !owner.trim().is_empty())
-        .collect();
-    owners.len() >= 2
+        .map(|(f, t)| (f.accession.as_str(), insider::owner_id(&t.owner)));
+    distinct_buyers(buyers)
+}
+/// Joint reporting owners are one buyer. Require separate accessions whose
+/// beneficial owner sets do not overlap (a trust and its co-filer are not two buyers).
+pub fn distinct_buyers<'a>(buyers: impl IntoIterator<Item = (&'a str, String)>) -> bool {
+    let mut accessions = BTreeMap::<&str, BTreeSet<String>>::new();
+    for (accession, owner) in buyers {
+        if !owner.trim().is_empty() {
+            accessions.entry(accession).or_default().insert(owner);
+        }
+    }
+    // Repeated filings by the same beneficial owner set cannot add a buyer.
+    let unique: BTreeSet<_> = accessions.into_values().collect();
+    let sets: Vec<_> = unique.into_iter().collect();
+    if sets.first().is_none_or(|first| first.iter().any(|owner| sets.iter().all(|set| set.contains(owner)))) {
+        return false;
+    }
+    sets.iter().enumerate().any(|(i, a)| sets[i + 1..].iter().any(|b| a.is_disjoint(b)))
 }
 /// Open-market purchases only, economic lots deduplicated by the N3 projection.
-/// A cluster needs two distinct owners in the trailing 30-day transaction window.
+/// The notified filing must meet the threshold even if it belongs to a cluster.
 pub fn insider_buy(rows: &[Filing], filing: &Filing, symbol: &str, threshold: f64) -> Option<(f64, bool)> {
     let lots = insider::effective_lots(rows, symbol);
     let value: f64 = lots
         .iter()
-        .filter(|(f, t)| f.accession == filing.accession && t.code == "P" && !t.derivative)
+        .filter(|(f, t)| f.accession == filing.accession && t.code == "P" && !t.derivative && t.acquired != Some(false))
         .filter_map(|(_, t)| t.shares.zip(t.price).map(|(s, p)| s * p).filter(|v| v.is_finite() && *v > 0.))
         .sum();
     let latest = filing
@@ -194,8 +212,7 @@ pub fn insider_buy(rows: &[Filing], filing: &Filing, symbol: &str, threshold: f6
         .filter_map(|t| chrono::NaiveDate::parse_from_str(&t.date, "%Y-%m-%d").ok())
         .max()?;
     let cluster = purchase_cluster(rows, symbol, latest, Some(filing.cik));
-    (value.is_finite() && value > 0. && ((threshold.is_finite() && value >= threshold.max(0.)) || cluster))
-        .then_some((value, cluster))
+    (value.is_finite() && value > 0. && threshold.is_finite() && value >= threshold.max(0.)).then_some((value, cluster))
 }
 
 /// Only US equity keys or plain tickers can map to SEC registrants.
@@ -326,11 +343,23 @@ pub fn parse_feed(bytes: &[u8]) -> Result<Vec<Filing>> {
 fn date(value: &str) -> Option<i64> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?.and_hms_opt(0, 0, 0).map(|d| d.and_utc().timestamp())
 }
+/// Shared, case-insensitive SEC form family, including current Schedule names
+/// and amendments. Consumers must not maintain their own ownership aliases.
+pub fn form_family(form: &str) -> String {
+    let upper = form.trim().to_ascii_uppercase();
+    let base = upper.strip_suffix("/A").unwrap_or(&upper).trim();
+    match base {
+        "SCHEDULE 13D" | "13D" => "SC 13D".into(),
+        "SCHEDULE 13G" | "13G" => "SC 13G".into(),
+        _ => base.into(),
+    }
+}
 fn tracked(form: &str) -> bool {
-    let f = form.strip_suffix("/A").unwrap_or(form);
-    matches!(f, "8-K" | "10-Q" | "10-K" | "S-1" | "SC 13D" | "SC 13G" | "3" | "4" | "5" | "DEF 14A")
+    let f = form_family(form);
+    matches!(f.as_str(), "8-K" | "10-Q" | "10-K" | "S-1" | "SC 13D" | "SC 13G" | "3" | "4" | "5" | "DEF 14A")
         || f.starts_with("424B")
 }
+
 pub fn parse_submissions(bytes: &[u8], cik: u64, ticker: &str, since: i64) -> Result<Vec<Filing>> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -441,4 +470,22 @@ pub fn decode_items(items: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+#[cfg(test)]
+mod form_tests {
+    #[test]
+    fn shared_form_families_cover_schedule_aliases_case_and_amendments() {
+        for family in ["13D", "13G"] {
+            for prefix in ["", "SC ", "SCHEDULE "] {
+                for suffix in ["", "/A"] {
+                    let form = format!("{prefix}{family}{suffix}").to_ascii_lowercase();
+                    assert_eq!(super::form_family(&form), format!("SC {family}"));
+                    assert!(super::tracked(&form));
+                }
+            }
+        }
+        assert_eq!(super::form_family("8-k/a"), "8-K");
+        assert_eq!(super::form_family("4/a"), "4");
+    }
 }
