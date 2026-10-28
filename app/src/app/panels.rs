@@ -213,6 +213,9 @@ impl TerminalApp {
                 {
                     self.worker.send(Request::CopyDigest(view.clone()));
                 }
+                for (ids, saved) in std::mem::take(&mut n.bookmark_queue) {
+                    self.worker.send(Request::NewsBookmark { ids, saved });
+                }
                 if !n.seen_queue.is_empty() {
                     self.worker.send(Request::NewsSeen(std::mem::take(&mut n.seen_queue)));
                 }

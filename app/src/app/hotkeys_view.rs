@@ -292,6 +292,21 @@ impl TerminalApp {
                 ],
             );
 
+            section(ui, "News");
+            para(ui, "With the News pane focused and no text field active:");
+            for (key, action) in super::news_view::NEWS_SHORTCUTS {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = dp(6.0);
+                    ui.label(RichText::new(*key).font(mono(11.0)).color(theme::text()));
+                    ui.label(RichText::new(*action).font(ui_font(12.0)).color(theme::muted()));
+                });
+            }
+            para(
+                ui,
+                "Row actions: Open (headline or Enter), Chart (ticker or C), Copy link, Save/Unsave (S). \
+                 Click the row or press Space to expand/collapse. Esc clears search before selection.",
+            );
+
             section(ui, "Brokerage (SnapTrade)");
             command_table(
                 ui,

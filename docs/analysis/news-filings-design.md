@@ -1,6 +1,6 @@
 # News and Filings panes: target design (N1b, N3)
 
-Status: 2026-10-27 — historical critique and design target, not a current user guide. N1b/N3 and the Load once/Market-header fixes below are now implemented. The [README](../../README.md#features) describes current controls: row actions j/k/c/u/Space/Enter require a selection, feed times are local (older years use Sep'25), and Reload replaces Read saved. Filings has Symbol/Watchlist only, not Market; N4 remains unshipped. Follows DESIGN.md ("The Native Trading Desk"): dense rows, monospace data, colour for meaning only, theme roles and `dp()` only.
+Status: 2026-10-27 — historical critique and design target, not a current user guide. N1b/N3 and the Load once/Market-header fixes below are now implemented. The [README](../../README.md#features) describes current controls: row actions j/k/c/u/Space/Enter require a selection, feed times are local (older years use Sep'25), and Re-read history replaces Read saved (Refresh source is a separate guarded action). Filings has Symbol/Watchlist only, not Market; N4 notifications, volume anomalies, digest and local agent reads are shipped. Follows DESIGN.md ("The Native Trading Desk"): dense rows, monospace data, colour for meaning only, theme roles and `dp()` only.
 
 ## What the critique found
 
@@ -33,7 +33,7 @@ Priority issues, in order: (1) the inconsistent pane grammar, (2) low row densit
 - Line 1: the scope segmented control, then the effective symbol in amber mono with the link-group colour dot (Watchlist scope shows the list name instead), then, right-aligned, the status in muted 10.5pt and an overflow `⋯` menu. Labels are "Symbol", "Watchlist", "Market" in both panes (News keeps "Market" for All market).
 - Line 2: date range segmented control, the pane's type chips, the search field (flexible width, hint "Search", `/` focuses it), and a `Filters (n)` button opening a popover for everything else (sources, include/exclude words, keyword watches, and N3's "Buys and sells only").
 - Narrow panes (below about 360pt): line 2 collapses to the date range, a search icon and `Filters (n)`; chips move into the popover. Never wrap a single chip onto its own line.
-- Rename "Read saved" to "Reload" and move it into `⋯`. "Pause" becomes "Pause updates"; while paused a "12 new · Show" button replaces it.
+- The `⋯` menu calls the local-only action "Re-read history"; "Refresh source" separately clears that view's cadence and requests data through the normal guard, respecting pause/cooldown, offline mode and budgets. "Pause" becomes "Pause updates"; while paused a "12 new · Show" button replaces it.
 - The Finnhub licence note moves to Settings › Data sources and the `⋯` menu ("About this source"); it no longer repeats in every pane.
 
 ### Rows

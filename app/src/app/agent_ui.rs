@@ -162,11 +162,12 @@ impl TerminalApp {
         if let LiveArgs::ReadNews(a) = args
             && (a.watchlist.is_some() || a.scope.as_deref() == Some("watchlist"))
         {
-            let list = if let Some(name) = &a.watchlist {
-                self.watchlists.iter().find(|l| l.name.eq_ignore_ascii_case(name)).ok_or("Unknown watchlist")?
-            } else {
-                &self.watchlists[self.active_watchlist]
-            };
+            let name = a
+                .watchlist
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or("Watchlist scope requires an explicit watchlist name")?;
+            let list = self.watchlists.iter().find(|l| l.name.eq_ignore_ascii_case(name)).ok_or("Unknown watchlist")?;
             return Ok(list.symbols.clone());
         }
         Ok(vec![])
@@ -1219,6 +1220,27 @@ mod tests {
         app.price_alerts.book = Default::default();
         app
     }
+    #[test]
+    fn news_watchlist_scope_requires_name_and_never_falls_back_to_active() {
+        use serde_json::json;
+        use tr_agent_tools::args::LiveArgs;
+        let mut app = workflow_app("news-explicit-watchlist");
+        app.watchlists[app.active_watchlist].symbols = vec!["AAPL US Equity".into()];
+        app.create_watchlist("News Test".into(), vec!["NVDA US Equity".into()]).unwrap();
+        let read = |value| LiveArgs::ReadNews(serde_json::from_value(value).unwrap());
+        for value in [json!({"scope":"watchlist"}), json!({"scope":"watchlist","watchlist":"  "})] {
+            assert_eq!(
+                app.agent_news_symbols(&read(value)).unwrap_err(),
+                "Watchlist scope requires an explicit watchlist name"
+            );
+        }
+        assert_eq!(app.agent_news_symbols(&read(json!({"watchlist":"missing"}))).unwrap_err(), "Unknown watchlist");
+        assert_eq!(app.agent_news_symbols(&read(json!({"watchlist":"news test"}))).unwrap(), ["NVDA US Equity"]);
+        assert_eq!(app.agent_news_symbols(&read(json!({"symbol":"MSFT"}))).unwrap(), ["MSFT US Equity"]);
+        assert!(app.agent_news_symbols(&read(json!({"scope":"market"}))).unwrap().is_empty());
+        assert!(app.agent_news_symbols(&read(json!({}))).unwrap().is_empty());
+    }
+
     // A5b-SCAN: application action only preloads a NEW pane, never starts a scan.
     #[test]
     fn open_scanner_action_preloads_definition_universe_and_disables_refresh() {

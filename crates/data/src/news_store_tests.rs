@@ -1,6 +1,88 @@
 use super::*;
 
 #[test]
+fn n5_claim_retention_prunes_old_rows_but_keeps_live_cluster_identity() {
+    let now = chrono::Utc::now().timestamp();
+    let mut store = NewsStore::memory().unwrap();
+    let item =
+        story("https://fixture.invalid/live", "NVDA earnings record revenue", now - 60, "NVDA US Equity", "Fixture");
+    store.insert(std::slice::from_ref(&item), now).unwrap();
+    store.claim_cluster(std::slice::from_ref(&item.id)).unwrap();
+    store.claim_notification("keyword", "expired").unwrap();
+    store.claim_notification("volume", "edge").unwrap();
+    store
+        .db
+        .execute("UPDATE notification_seen_at SET at=?1 WHERE kind='keyword' AND id='expired'", [now - 91 * 86400])
+        .unwrap();
+    store
+        .db
+        .execute("UPDATE notification_seen_at SET at=?1 WHERE kind='volume' AND id='edge'", [now - 90 * 86400])
+        .unwrap();
+    store.prune(now).unwrap();
+    assert!(!store.notification_claimed("keyword", "expired").unwrap());
+    assert!(store.notification_claimed("volume", "edge").unwrap());
+    assert!(store.notification_claimed("breaking-member", &item.id).unwrap());
+    assert!(!store.claim_cluster(&[item.id.clone(), "late-member".into()]).unwrap());
+    assert!(store.cluster_previously_delivered(&item).unwrap());
+}
+
+#[test]
+fn n5_undated_rss_is_visible_at_ingest_time_and_flagged() {
+    let now = chrono::Utc::now().timestamp();
+    let items = crate::rss::parse_rss("<rss version=\"2.0\"><channel><title>Fixture</title><link>https://fixture.invalid</link><description>Fixture</description><item><title>Undated story</title><link>https://fixture.invalid/undated</link></item></channel></rss>", "Fixture").unwrap();
+    assert_eq!(items.len(), 1);
+    let mut store = NewsStore::memory().unwrap();
+    store.insert(&[Story::new(items[0].clone(), "Fixture")], now).unwrap();
+    let q = Query {
+        start: now - 60,
+        end: now,
+        filters: Filters { scope: Scope::All, ..Default::default() },
+        ..Default::default()
+    };
+    let rows = store.query(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].item.ts, now);
+    assert!(rows[0].inferred_ts);
+    store.insert(&[Story::new(items[0].clone(), "Fixture")], now + 60).unwrap();
+    assert_eq!(store.query(&q).unwrap()[0].item.ts, now, "re-import must not move inferred time");
+    let yahoo = crate::yahoo::parse_news(
+        r#"{"news":[{"title":"Yahoo undated","link":"https://fixture.invalid/yahoo-undated"}]}"#,
+    )
+    .unwrap();
+    store.insert(&[Story::new(yahoo[0].clone(), "Yahoo")], now).unwrap();
+    let rows = store.query(&q).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|story| story.inferred_ts && story.item.ts == now));
+}
+
+#[test]
+fn n5_bookmarks_persist_filter_and_are_exempt_from_prune() {
+    let now = chrono::Utc::now().timestamp();
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data/n5-bookmarks");
+    std::fs::create_dir_all(&root).unwrap();
+    let path =
+        root.join(format!("{}-{}.sqlite3", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+    let mut store = NewsStore::open(&path).unwrap();
+    let saved = story("https://fixture.invalid/saved", "Saved story", now - 91 * 86400, "", "Fixture");
+    let other = story("https://fixture.invalid/other", "Other story", now - 91 * 86400, "", "Fixture");
+    store.insert(&[saved.clone(), other], now).unwrap();
+    store.set_bookmark(std::slice::from_ref(&saved.id), true).unwrap();
+    assert_eq!(store.prune(now).unwrap(), 1);
+    let q = Query { filters: Filters { saved: true, scope: Scope::All, ..Default::default() }, ..Default::default() };
+    let rows = store.query(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].bookmark && matches(&rows[0], &q));
+    drop(store);
+    let store = NewsStore::open(&path).unwrap();
+    assert_eq!(store.query(&q).unwrap().len(), 1, "saved old story survives reopen and startup prune");
+    store.set_bookmark(std::slice::from_ref(&saved.id), false).unwrap();
+    assert!(store.query(&q).unwrap().is_empty());
+    assert_eq!(store.prune(now).unwrap(), 1);
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn n4_freshness_is_strict_and_never_replays_a_restart_or_enabled_backlog() {
     use local::fresh;
     assert!(fresh(101, 100, 90, 102));
@@ -254,7 +336,20 @@ fn n4_digest_is_deterministic_grouped_and_private_by_default() {
     assert!(!text.contains("\"summary\":"));
     assert!(!text.contains("not-exported"));
     assert_eq!(first.groups[0].stories[0].url_host, "fixture.invalid");
-    assert!(first.markdown().contains("8-K"));
+    let markdown = first.markdown();
+    assert!(markdown.contains("8-K"));
+    for group in &first.groups {
+        for story in &group.stories {
+            let line = markdown.lines().find(|line| line.contains(&story.headline)).unwrap();
+            assert!(line.contains(&story.url_host));
+            for source in &story.sources {
+                assert!(line.contains(source), "per-story source missing: {line}");
+            }
+        }
+    }
+    assert!(!markdown.contains("not-exported"));
+    assert!(!markdown.contains("https://"));
+    assert!(!markdown.contains("é"));
     let full = local::digest(&[a, b], "watchlist", 0, 200, 1, true, metadata);
     assert_eq!(full.groups.iter().map(|g| g.stories.len()).sum::<usize>(), 1);
     let summary = local::digest(&[second_story_for_summary()], "market", 0, 200, 50, true, serde_json::json!([]));
@@ -728,4 +823,220 @@ fn review_volume_single_old_item_fakes_three_days_of_history() {
     store.insert(&items, hour + 120).unwrap();
     // No same-hour history exists for "Topic: Earnings"; the plan requires >= 3 days of it.
     assert!(store.volume_anomalies(&[], hour + 120).unwrap().is_empty());
+}
+
+// ---- N5a production-readiness review ----
+fn review_n5a_old_db(tag: &str) -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data/review-n5a");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join(format!(
+        "{tag}-{}-{}.sqlite3",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+    ));
+    let now = chrono::Utc::now().timestamp();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    // Exact pre-N5a schema (6ca1d5a~1 init + its column migrations).
+    db.execute_batch(
+        "PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY, source TEXT NOT NULL, provider_id TEXT NOT NULL,
+        url TEXT NOT NULL, headline TEXT NOT NULL, summary TEXT NOT NULL, published INTEGER NOT NULL,
+        tickers TEXT NOT NULL, category TEXT NOT NULL, fetched INTEGER NOT NULL, seen INTEGER NOT NULL DEFAULT 0,
+        bookmark INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS news_published ON items(published DESC);
+        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS notification_seen(kind TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(kind,id));
+        CREATE TABLE IF NOT EXISTS notification_history(at INTEGER NOT NULL,body TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS notification_slots(at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS news_fetches(at INTEGER PRIMARY KEY);
+        ALTER TABLE items ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE items ADD COLUMN intelligence INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE items ADD COLUMN provider TEXT NOT NULL DEFAULT '';
+        ALTER TABLE items ADD COLUMN subjects TEXT NOT NULL DEFAULT '[]';
+        CREATE VIRTUAL TABLE IF NOT EXISTS news_fts USING fts5(id UNINDEXED, headline, summary);
+        CREATE TRIGGER IF NOT EXISTS news_fts_insert AFTER INSERT ON items BEGIN
+            INSERT INTO news_fts VALUES(new.id,new.headline,new.summary); END;
+        CREATE TRIGGER IF NOT EXISTS news_fts_delete AFTER DELETE ON items BEGIN
+            DELETE FROM news_fts WHERE id=old.id; END;",
+    )
+    .unwrap();
+    for (id, published, fetched) in
+        [("live", now - 600, now - 590), ("week", now - 7 * 86400, now - 7 * 86400 + 5), ("undated", 0, now - 60)]
+    {
+        db.execute(
+            "INSERT INTO items(id,source,provider_id,url,headline,summary,published,tickers,category,fetched,provider)
+             VALUES(?1,'Fixture','',?2,?3,'',?4,'[\"NVDA US Equity\"]','general',?5,'Fixture')",
+            rusqlite::params![
+                id,
+                format!("https://fixture.invalid/{id}"),
+                format!("Headline {id} Nvidia"),
+                published,
+                fetched
+            ],
+        )
+        .unwrap();
+    }
+    for (kind, id) in [
+        ("keyword", "live"),
+        ("keyword-observed", "week"),
+        ("breaking-member", "live"),
+        ("breaking-block", "week"),
+        ("volume", "NVDA US Equity:123"),
+        ("keyword", "already-pruned-item"),
+    ] {
+        db.execute("INSERT INTO notification_seen VALUES(?1,?2)", [kind, id]).unwrap();
+    }
+    drop(db);
+    path
+}
+
+#[test]
+fn review_n5a_migration_from_pre_n5a_db_keeps_rows_and_claims_and_is_idempotent() {
+    let path = review_n5a_old_db("migrate");
+    let now = chrono::Utc::now().timestamp();
+    for round in 0..3 {
+        let store = NewsStore::open(&path).unwrap_or_else(|e| panic!("open round {round}: {e}"));
+        let items: i64 = store.db.query_row("SELECT count(*) FROM items", [], |r| r.get(0)).unwrap();
+        assert_eq!(items, 3, "round {round}: no item lost");
+        let claims: i64 = store.db.query_row("SELECT count(*) FROM notification_seen", [], |r| r.get(0)).unwrap();
+        assert_eq!(claims, 6, "round {round}: no claim lost");
+        let zero: i64 =
+            store.db.query_row("SELECT count(*) FROM notification_seen_at WHERE at<=0", [], |r| r.get(0)).unwrap();
+        assert_eq!(zero, 0, "round {round}: every migrated claim has a timestamp");
+        let stamped: i64 = store
+            .db
+            .query_row(
+                "SELECT count(*) FROM notification_seen JOIN notification_seen_at USING(kind,id) WHERE at>=?1",
+                [now],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 6, "unknown ages must be backfilled at migration time");
+        assert!(store.notification_claimed("keyword", "live").unwrap());
+        assert!(store.notification_claimed("volume", "NVDA US Equity:123").unwrap());
+        assert!(!store.claim_cluster(&["live".into(), "new-member".into()]).unwrap(), "live cluster identity kept");
+        let (published, inferred): (i64, bool) = store
+            .db
+            .query_row("SELECT published,inferred_ts FROM items WHERE id='undated'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(published, now - 60, "undated row adopts its fetch time");
+        assert!(inferred);
+        let q = Query {
+            filters: Filters { scope: Scope::All, search: "Nvidia".into(), ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(store.query(&q).unwrap().len(), 3, "round {round}: FTS still finds migrated rows");
+        // A later prune must not drop any of these young claims.
+        store.prune(now).unwrap();
+        // remove the claim the test itself added so counts stay stable across rounds
+        store.db.execute("DELETE FROM notification_seen WHERE id='new-member'", []).unwrap();
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The user runs several worktree builds against one data dir. An older binary's
+/// positional `INSERT ... VALUES(?1,?2)` into notification_seen stops working once
+/// N5a adds the `at` column, so the old build can never record a claim again.
+#[test]
+fn review_n5a_pre_n5a_build_can_still_claim_after_migration() {
+    let path = review_n5a_old_db("downgrade");
+    drop(NewsStore::open(&path).unwrap());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    // Verbatim statement used by the pre-N5a claim_notification / claim_cluster.
+    let result = db.execute("INSERT OR IGNORE INTO notification_seen VALUES(?1,?2)", ["keyword", "fresh-story"]);
+    drop(db);
+    assert!(result.is_ok(), "pre-N5a claim insert fails after migration: {result:?}");
+    let now = chrono::Utc::now().timestamp();
+    let store = NewsStore::open(&path).unwrap();
+    assert!(store.notification_claimed("keyword", "fresh-story").unwrap());
+    let at: i64 = store
+        .db
+        .query_row("SELECT at FROM notification_seen_at WHERE kind='keyword' AND id='fresh-story'", [], |r| r.get(0))
+        .unwrap();
+    assert!(at >= now, "old-build claims receive a migration-time age on next open");
+    let columns: i64 =
+        store.db.query_row("SELECT count(*) FROM pragma_table_info('notification_seen')", [], |r| r.get(0)).unwrap();
+    assert_eq!(columns, 2, "keep the original claim schema");
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn n5a_dev_at_column_is_ignored_and_side_table_controls_pruning() {
+    let path = review_n5a_old_db("dev-at");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "ALTER TABLE notification_seen ADD COLUMN at INTEGER NOT NULL DEFAULT 0;
+        CREATE INDEX notification_seen_at ON notification_seen(at);
+        UPDATE notification_seen SET at=1;",
+    )
+    .unwrap();
+    drop(db);
+    let now = chrono::Utc::now().timestamp();
+    let store = NewsStore::open(&path).unwrap();
+    assert!(store.notification_claimed("keyword", "live").unwrap(), "legacy column age is not authoritative");
+    assert!(store.claim_notification("keyword", "dev-new").unwrap());
+    let at: i64 =
+        store.db.query_row("SELECT at FROM notification_seen_at WHERE id='dev-new'", [], |r| r.get(0)).unwrap();
+    assert!(at >= now);
+    store.db.execute("UPDATE notification_seen_at SET at=?1 WHERE id='dev-new'", [now - 91 * 86400]).unwrap();
+    store.prune(now).unwrap();
+    assert!(!store.notification_claimed("keyword", "dev-new").unwrap());
+    let remaining: i64 =
+        store.db.query_row("SELECT count(*) FROM notification_seen_at WHERE id='dev-new'", [], |r| r.get(0)).unwrap();
+    assert_eq!(remaining, 0);
+    drop(store);
+    assert!(NewsStore::open(&path).unwrap().notification_claimed("keyword", "live").unwrap());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn n5a_failed_migration_rolls_back_all_schema_steps() {
+    let path = review_n5a_old_db("rollback");
+    let db = Connection::open(&path).unwrap();
+    // Force a later migration step to fail after the item ALTERs have run.
+    db.execute_batch("DROP TABLE news_fetches; CREATE TABLE notification_seen_at(bad TEXT);").unwrap();
+    assert!(NewsStore::open(&path).is_err());
+    let inferred: i64 = db
+        .query_row("SELECT count(*) FROM pragma_table_info('items') WHERE name='inferred_ts'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(inferred, 0, "failed migration must not leave partial item ALTERs");
+    let tables: i64 =
+        db.query_row("SELECT count(*) FROM sqlite_master WHERE name='news_fetches'", [], |r| r.get(0)).unwrap();
+    assert_eq!(tables, 0, "initial CREATE steps roll back too");
+    db.execute_batch("DROP TABLE notification_seen_at;").unwrap();
+    drop(db);
+    assert!(NewsStore::open(&path).is_ok(), "retry after fixing the obstruction succeeds");
+    let _ = std::fs::remove_file(path);
+}
+
+/// A7 + A2 together: an undated item gets ts = first ingest. After 90 days both the
+/// row and its keyword claim are pruned (claim `at` == first-ingest wall clock). If the
+/// feed still carries the item, the next ingest gives it ts = now again, so it is
+/// fresh and unclaimed, and the keyword watch fires a second time for the same story.
+#[test]
+fn review_n5a_pruned_undated_story_is_not_fresh_again_on_reingest() {
+    let now = chrono::Utc::now().timestamp();
+    let first = now - 91 * 86400;
+    let mut store = NewsStore::memory().unwrap();
+    let undated = story("https://fixture.invalid/evergreen", "NVDA earnings explainer", 0, "NVDA US Equity", "Fixture");
+    store.insert(&[story("https://fixture.invalid/seed", "seed", first - 10, "", "Fixture")], first).unwrap();
+    store.insert(std::slice::from_ref(&undated), first).unwrap();
+    // Delivered at first ingest (claim stamped with that day's wall clock).
+    assert!(store.claim_notification("keyword", &undated.id).unwrap());
+    store.db.execute("UPDATE notification_seen_at SET at=?1", [first]).unwrap();
+    // Other live history exists, so this is not a first-import suppression.
+    store.insert(&[story("https://fixture.invalid/recent", "recent", now - 600, "", "Fixture")], now - 600).unwrap();
+    store.prune(now).unwrap();
+    store.insert(std::slice::from_ref(&undated), now).unwrap();
+    let published: i64 =
+        store.db.query_row("SELECT published FROM items WHERE id=?1", [&undated.id], |r| r.get(0)).unwrap();
+    let session = now - 3600;
+    let reingested = store.query(&Query::default()).unwrap().into_iter().find(|s| s.id == undated.id).unwrap();
+    assert!(reingested.inferred_ts);
+    assert!(!store.notification_claimed("keyword", &undated.id).unwrap(), "old claim really was pruned");
+    assert_eq!(store.latest("NVDA US Equity").unwrap(), None, "inferred time must not advance the Finnhub cursor");
+    let would_notify = local::fresh_story(&reingested, session, session, now + 1)
+        && !store.notification_claimed("keyword", &undated.id).unwrap();
+    assert!(!would_notify, "same undated story is fresh and unclaimed again (published={published}, now={now})");
 }

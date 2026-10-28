@@ -1,4 +1,28 @@
 use super::*;
+#[test]
+fn n5_refresh_clears_only_view_cadence_not_backoff_or_daily_budget() {
+    let mut schedule = Schedule::default();
+    let symbols: Vec<String> = vec!["AAPL US Equity".into(), "MSFT US Equity".into()];
+    schedule.market_due = [1000; 4];
+    schedule.companies.insert(symbols[0].clone(), 100);
+    schedule.companies.insert(symbols[1].clone(), 100);
+    schedule.backoff_until = 500;
+    schedule.company_day = 0;
+    schedule.company_count = 2000;
+    schedule.refresh(&symbols[..1], false);
+    assert!(!schedule.companies.contains_key(&symbols[0]));
+    assert!(schedule.companies.contains_key(&symbols[1]));
+    assert_eq!(schedule.market_due, [1000; 4]);
+    assert_eq!(schedule.backoff_until, 500);
+    assert!(schedule.next_for_views(200, true, false, &symbols, &symbols[..1]).is_none());
+    assert!(
+        schedule.next_for_views(500, true, false, &symbols, &symbols[..1]).is_none(),
+        "company daily cap survives refresh"
+    );
+    schedule.refresh(&[], true);
+    assert_eq!(schedule.next_for_views(500, true, true, &symbols, &[]), Some(Job::Market("general")));
+    assert_eq!(schedule.company_count, 2000);
+}
 const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/finnhub_news.json");
 #[test]
 fn parsing_mapping_and_incremental_dates() {
