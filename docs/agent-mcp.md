@@ -166,10 +166,13 @@ Settings › Agent shows these choices when **Backend: mimo** is selected:
 
 - **Use my mimo setup (providers, keys and models from your installed mimo)**
   (`mimo_profile: "Own"`, the default, including older settings without the field).
-  Uses your existing installed providers, token plan, authentication and model
-  catalogue. The child receives a per-launch **shadow HOME** at
+  Uses providers, keys and models from **mimo's credential store** (including
+  `auth.json` under the share directory), not your personal config. Personal MCP
+  servers, plugins and instructions in `~/.config/mimocode` are intentionally
+  **not loaded**: that directory is neither linked nor sandbox-readable.
+  The child receives a per-launch **shadow HOME** at
   `<private workspace>/home`, not the real home. This 0700 directory contains only
-  symlinks to the five real mimo roots listed below that already exist, plus 0700
+  symlinks to the four real mimo roots listed below that already exist, plus 0700
   parent directories (`.config`, `.local`, `.local/share`, `.local/state`, `.cache`).
   `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` and `XDG_STATE_HOME` are
   **unset**, so mimo finds its installed setup through those links. Inherited
@@ -191,10 +194,12 @@ Settings › Agent shows these choices when **Backend: mimo** is selected:
   To remove this private login, stop the backend/close the app, then delete only
   **`<data dir>/agent/mimo-home`**. This does not remove your installed mimo login.
 
-The collapsed **Advanced** section has **Load mimo plugins**, off by default
+**Own always uses `--pure`**, even if an older saved plugin toggle is true;
+**Load mimo plugins** is hidden in Own mode. For **Private only**, the collapsed
+**Advanced** section retains **Load mimo plugins**, off by default
 (`mimo_load_plugins: false`). Off uses `mimo acp --port <N> --pure`; on drops only
-`--pure`. **Providers configured via plugins need this toggle.** Plugins
-run inside the same sandbox with access to the selected profile's data and keys;
+`--pure`. Private providers configured via plugins may need this toggle. Plugins
+run inside the private sandbox with access to its data and keys;
 this is additional code you trust, not an expansion of sandbox permissions.
 Changing profile or this toggle closes the old backend and starts a new
 conversation without replaying a prompt. Model choices remain saved separately
@@ -211,7 +216,7 @@ this fix did not launch mimo, the app, or any provider or use external networkin
 
 By default the implementation spawns `mimo acp --port <N> --pure` and uses
 **JSONL stdio ACP v1**. `--port` and the selected number are separate argv items.
-The advanced plugin toggle removes only `--pure`, not the sandbox or ACP tripwires.
+The Private-only advanced plugin toggle removes only `--pure`, not the sandbox or ACP tripwires.
 There is **no HTTP/port transport fallback** and no `--no-auth`. mimo (Bun) also
 starts an **internal localhost HTTP server**, even for stdio ACP. Before spawning,
 terminal-rs binds `127.0.0.1:0`, reads the assigned port and drops the listener.
@@ -225,16 +230,17 @@ and cleanup failures never trigger a retry; prompts are never replayed.
 **Manager-verified live fact (mimo 0.1.16):** the narrowed data/state-only writable
 set, read-only install/config/cache, `/usr/lib` + `/usr/share` read grants and
 single-port localhost rules allow `initialize` and `session/new` to succeed with
-20 models. No live test was run during this implementation. Private-home
-authentication and qualified MCP tool-title formatting still need the manual
-checks below before calling the whole backend production-ready; do not grant
-broad networking or shell access.
+20 models. In a subsequent manager live test with eager, startup-configured MCP,
+MiniMax-M3 answered **“BTCUSD Curncy, 1D”** via `terminal-rs_read_chart`, with no
+permission requests, zero personal MCP servers and all 20 models present. This
+implementation did not run a live test. Private-home authentication still needs
+the manual checks below; do not grant broad networking or shell access.
 
 ### Isolation and ACP operations
 
 - Fresh empty 0700 workspace: `<data dir>/agent/mimo-<pid>-<nonce>/empty`.
   It is removed after child/process-group cleanup, including launch-error paths.
-- **Own sandbox exposure:** deny-default; all five installed mimo roots remain
+- **Own sandbox exposure:** deny-default; only four installed mimo roots remain
   readable, but only **data and state** are writable, in addition to the private
   workspace (including private tmp):
   - **Read/write:** `~/.local/share/mimocode` (auth, database, storage, logs,
@@ -242,7 +248,7 @@ broad networking or shell access.
   - **Read/write:** `~/.local/state/mimocode` (model selection, key/value state
     and locks)
   - **Read-only:** `~/.mimocode` (install tree, including `bin/mimo`)
-  - **Read-only:** `~/.config/mimocode` (configuration, plugins and dependencies)
+  - **Not exposed:** `~/.config/mimocode` (personal MCP servers, plugins, instructions)
   - **Read-only:** `~/.cache/mimocode` (model catalogue and cached binaries/models)
 
   The read-only roots prevent a manipulated session from persisting changes to
@@ -263,7 +269,7 @@ broad networking or shell access.
   `~/Library` via this profile. In particular, `~/Library/Caches` and similar
   speculative compatibility paths remain denied: no extra grant is guessed.
 - **Private sandbox exposure:** the existing private workspace/login-home
-  subpath grants, not the five personal mimo roots. The app-owned login home stays
+  subpath grants, not the four personal mimo roots. The app-owned login home stays
   writable; the binary install tree stays read-only. The login home is persistent,
   owned, non-symlink and owner-only. Provider setup is a deliberate manual step.
 - Environment is cleared, then only PATH, TMPDIR, LANG and safe LC_* locale
@@ -271,7 +277,18 @@ broad networking or shell access.
   TMPDIR. Private retains the previous TMPDIR and XDG config/data behaviour.
   The host-selected `TR_DATA_DIR` is passed solely to locate the app MCP socket.
   Inherited API keys, auth tokens, custom XDG settings and `CODEX_HOME` are not
-  passed. Installed configuration is read by mimo itself only in Own mode.
+  passed. Both modes set these host-controlled switches:
+  `MIMOCODE_MCP_TOOL_SEARCH=false`, `MIMOCODE_DISABLE_CLAUDE_CODE=1`,
+  `MIMOCODE_DISABLE_MODELS_FETCH=1`, and `MIMOCODE_DISABLE_AUTOUPDATE=1`.
+  `MIMOCODE_CONFIG_CONTENT` supplies exactly one local terminal-rs MCP server
+  before startup/tool discovery:
+
+  ```json
+  {"mcp":{"terminal-rs":{"type":"local","command":["<current executable>","mcp-stdio"],"environment":{"TR_DATA_DIR":"<canonical data dir>"}}}}
+  ```
+
+  This avoids the late `session/new` attachment/startup-reminder race and deferred
+  `mcp_tool_search`/`mcp_tool_use` discovery. Own never loads personal config.
 - Production launch requires macOS `sandbox-exec`; other platforms refuse an
   unsandboxed mimo child. Both profiles allow the read-only binary install tree,
   exact app executable, system libraries and shared resources (`/usr/lib` and
@@ -310,11 +327,9 @@ broad networking or shell access.
   weaken these restrictions.
 - ACP `initialize` uses protocolVersion 1 and disables `fs.readTextFile`,
   `fs.writeTextFile` and `terminal`. `session/new` always uses the private cwd and
-  the current app executable's MCP entry:
-
-  ```json
-  {"name":"terminal-rs","command":"<current executable>","args":["mcp-stdio"],"env":[]}
-  ```
+  **`mcpServers: []`**: startup config already supplies terminal-rs, so there is
+  no duplicate MCP connection. The shim answers `prompts/list`, `resources/list`
+  and `resources/templates/list` with their respective empty lists.
 
 - `session/prompt` streams text/thought/tool/plan events; plan entries and statuses
   are projected as bounded, scrubbed reasoning text. `session/cancel` is a
@@ -340,7 +355,17 @@ broad networking or shell access.
   to mimo's reported current model.
   If no model metadata is offered the picker shows **mimo default**. No reasoning
   efforts, providers, model IDs or models from local credential files are invented.
-  Images are not enabled.
+  Images are not enabled. If no model is saved and the canary receives a provider
+  unsupported/model error, readiness fails with **“mimo's default model isn't
+  available on your plan — pick a model in the Agent pane and Restart”**. The
+  catalogue is still published and the picker remains enabled while Stopped;
+  selecting then Restart applies that choice before the fresh canary.
+- Each mimo prompt includes the **same host-selected pinned-chart context** as
+  Codex (chart UID, symbol, timeframe and visible range), marked as untrusted data.
+  Pane readiness/status is rendered outside the transcript, not recorded as a
+  user turn; notices are separate display blocks. Neither transcript blocks nor
+  status/notice text are used to assemble ACP prompts. Canary output is discarded
+  and a fresh session is created before user turns.
 - ACP permission checking is **defence in depth**, not the real authorization
   boundary: titles, `rawInput` and `_meta` are agent-supplied and may be influenced
   by the model. Real authorization is enforced at the **app socket** (registry
@@ -358,17 +383,19 @@ broad networking or shell access.
   state. Every `fs/*`, `terminal/*`, unknown executing update/request, unapproved
   tool update, malformed frame or child crash fails closed with a visible error.
   The exact accepted qualifications are `mcp__terminal-rs__<tool>`,
-  `terminal-rs/<tool>`, `terminal-rs.<tool>`, or an exact unqualified tool name
-  backed by structured terminal-rs server/tool provenance. Structured identity
-  fields in `_meta` or `rawInput` (including nested `mcp` identity fields) must all
-  agree with the title; metadata cannot override a conflicting title or another
-  metadata field. Permission approval also records its tool ID and name, allowing
+  `terminal-rs/<tool>`, `terminal-rs.<tool>`, **`terminal-rs_<tool>`**, or an exact
+  unqualified tool name backed by structured terminal-rs server/tool provenance.
+  The flat underscore form is manager-verified with eager tools: kind `other`,
+  `rawInput` containing arguments, `_meta: null`. Ordinary argument `name` is not
+  an MCP identity in that form. Explicit server/tool identity envelopes and `_meta`
+  must agree with the title. Deferred `mcp_tool_search`/`mcp_tool_use`, unknown
+  suffixes and unsafe kinds remain rejected; metadata cannot override a conflict. Permission approval also records its tool ID and name, allowing
   subsequent `tool_call_update` without a separate `tool_call`. Conflicting
   title/server/tool identities and explicit updates for an unknown session are
   refused; an approved tool ID cannot authorise a different registry tool or hide
   an unsafe kind in a partial update. The reader commits a
   new session ID before routing any following line; late updates from the retired
-  canary session are ignored. Actual mimo provenance formatting is not live-verified.
+  canary session are ignored.
 - Every fresh child runs the directory/shell **canary before Ready**, then starts
   a separate user session. The canary has a **60-second overall deadline**, including
   session creation and model selection. ACP `session/update` retry parts appear as
@@ -518,8 +545,9 @@ TR_DATA_DIR="$TEST_DIR" TR_PROVIDER=sample TR_CONGRESS_REFRESH_MIN=0 "$BIN"
 Enable MCP (keep edits off first), select **Backend: mimo** and **Private login**
 for the private setup above, open `NEW AGENT`, acknowledge the provider disclosure
 and start/check the backend. Alternatively choose **Use my mimo setup** to test
-your existing installed setup without creating/copying a private login. If its
-providers depend on plugins, explicitly enable **Advanced › Load mimo plugins**. Expect
+your existing credential store without creating/copying a private login; personal
+config must not load. For Private only, plugin-configured providers can enable
+**Advanced › Load mimo plugins**. Expect
 initialize → canary → fresh session → Ready and a **mimo** header. Try the same
 read-only chart prompt, Interrupt mid-stream, then a fresh prompt. Try an unsafe
 filesystem/shell request: it must be unavailable or visibly trip/stop, not execute.
@@ -551,7 +579,16 @@ ACP capabilities/models/events/canary/permissions/cancel/crash/scrubbing,
 connection-local chart precision, workflow approval, default-off persistence,
 queued-write cancellation and the continuation's provenance/session/cleanup tests.
 
-A4-FIX removes both reviewer `#[ignore]` attributes and adds **12 regression tests**:
+MIMO-MCP-ONLY regressions cover four-root shadow homes even when personal config
+exists, the exact startup MCP JSON and fixed environment switches in both modes,
+Own's unconditional `--pure`, the flat eager tool title (including argument names),
+unsafe/deferred tool rejection, empty MCP discovery lists, default-model rejection
+and pre-canary saved selection, catalogue availability after readiness failure,
+model-picker clicks while Stopped, status/notice separation from user turns, and
+the full pinned-chart payload on both fake Codex and ACP wires.
+
+Historical A4-FIX verification follows. A4-FIX removes both reviewer `#[ignore]`
+attributes and adds **12 regression tests**:
 
 - Four MCP tests: injected transient accept errors/backoff versus fatal errors;
   relative data-dir creation/canonicalization; safe disabled-startup socket cleanup;

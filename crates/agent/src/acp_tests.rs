@@ -53,10 +53,7 @@ async fn handshake(
         let new = receive(read).await;
         assert_eq!(new["method"], "session/new");
         assert_eq!(new["params"]["cwd"], "/private/empty");
-        assert_eq!(
-            new["params"]["mcpServers"],
-            json!([{"name":"terminal-rs","command":"/app/terminal-rs","args":["mcp-stdio"],"env":[]}])
-        );
+        assert_eq!(new["params"]["mcpServers"], json!([]));
         send(write,crate::mcp::success(new["id"].clone(),json!({"sessionId":"fake-session","models":{"currentModelId":"model-a","availableModels":[{"modelId":"model-a","name":"Model A"}]}}))).await;
     };
     let (session, ()) = tokio::join!(backend.start_thread(options()), server);
@@ -78,7 +75,7 @@ async fn handshake_mcp_entry_streamed_chunks_tools_plan_and_models() {
     for update in [
         json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Trend is up\n"}}),
         json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Check bars\n"}}),
-        json!({"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"mcp__terminal-rs__read_chart","kind":"other"}),
+        json!({"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"terminal-rs_read_chart","kind":"other","rawInput":{},"_meta":null}),
         json!({"sessionUpdate":"tool_call_update","toolCallId":"tool-1","status":"completed"}),
         json!({"sessionUpdate":"plan","entries":[{"content":"Review finished bars","status":"in_progress","priority":"high"}]}),
     ] {
@@ -100,6 +97,85 @@ async fn handshake_mcp_entry_streamed_chunks_tools_plan_and_models() {
     );
     assert!(matches!(events.recv().await, Some(AgentEvent::Done(_))));
     assert!(!killed.load(Ordering::SeqCst));
+}
+
+#[test]
+fn child_config_has_one_eager_mcp_server_and_fixed_switches_in_both_profiles() {
+    assert_eq!(
+        terminal_mcp_config(Path::new("/app/terminal-rs"), Path::new("/canonical/data")),
+        json!({"mcp":{"terminal-rs":{"type":"local","command":["/app/terminal-rs","mcp-stdio"],
+            "environment":{"TR_DATA_DIR":"/canonical/data"}}}})
+    );
+    for profile in [MimoProfile::Own, MimoProfile::Private] {
+        let env = mimo_environment(
+            [("MIMOCODE_CONFIG_CONTENT".into(), "personal".into()), ("MIMOCODE_MCP_TOOL_SEARCH".into(), "true".into())],
+            Path::new("/workspace"),
+            Path::new("/home"),
+            profile,
+        );
+        for (key, expected) in [
+            ("MIMOCODE_MCP_TOOL_SEARCH", "false"),
+            ("MIMOCODE_DISABLE_CLAUDE_CODE", "1"),
+            ("MIMOCODE_DISABLE_MODELS_FETCH", "1"),
+            ("MIMOCODE_DISABLE_AUTOUPDATE", "1"),
+        ] {
+            assert_eq!(env.get(std::ffi::OsStr::new(key)).unwrap(), expected);
+        }
+        assert!(!env.contains_key(std::ffi::OsStr::new("MIMOCODE_CONFIG_CONTENT")));
+    }
+}
+
+#[tokio::test]
+async fn default_model_rejection_is_actionable_and_restart_applies_saved_choice() {
+    for saved in [false, true] {
+        let (backend, mut read, mut write, killed) = fake();
+        if saved {
+            backend.remember_model("provider/working".into());
+        }
+        let server = async {
+            let init = receive(&mut read).await;
+            send(&mut write, crate::mcp::success(init["id"].clone(), json!({"protocolVersion":1}))).await;
+            let new = receive(&mut read).await;
+            send(
+                &mut write,
+                crate::mcp::success(
+                    new["id"].clone(),
+                    json!({"sessionId":"canary", "models":{
+                "currentModelId":"provider/default", "availableModels":[
+                    {"modelId":"provider/default"}, {"modelId":"provider/working"}]}}),
+                ),
+            )
+            .await;
+            if saved {
+                let select = receive(&mut read).await;
+                assert_eq!(select["method"], "session/set_model");
+                assert_eq!(select["params"]["modelId"], "provider/working");
+                send(&mut write, crate::mcp::success(select["id"].clone(), json!({}))).await;
+            }
+            let prompt = receive(&mut read).await;
+            if saved {
+                send(&mut write, crate::mcp::success(prompt["id"].clone(), json!({"stopReason":"end_turn"}))).await;
+            } else {
+                send(
+                    &mut write,
+                    crate::mcp::error(prompt["id"].clone(), -32603, "Not supported model: private-provider-detail"),
+                )
+                .await;
+                assert_eq!(receive(&mut read).await["method"], "session/cancel");
+            }
+        };
+        let (result, ()) = tokio::join!(backend.canary(), server);
+        if saved {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "mimo's default model isn't available on your plan — pick a model in the Agent pane and Restart"
+            );
+        }
+        assert_eq!(backend.list_models().await.unwrap().len(), 2);
+        assert!(!backend.is_unsafe() && !killed.load(Ordering::SeqCst));
+    }
 }
 
 #[tokio::test]
@@ -621,12 +697,32 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
         busy: Arc::new(AtomicBool::new(false)),
         canary_retries: watch::channel(None).0,
     };
-    for title in ["terminal-rs/read_chart", "mcp__terminal-rs__read_chart"] {
-        assert!(rpc.terminal_tool(&json!({"title":title}), None).is_some());
+    for title in
+        ["terminal-rs/read_chart", "mcp__terminal-rs__read_chart", "terminal-rs.read_chart", "terminal-rs_read_chart"]
+    {
+        assert!(
+            rpc.terminal_tool(&json!({"title":title,"kind":"other","rawInput":{"chart_id":42},"_meta":null}), None)
+                .is_some()
+        );
+        for kind in ["execute", "edit", "fetch", "delete", "search"] {
+            assert!(rpc.terminal_tool(&json!({"title":title,"kind":kind}), None).is_none());
+        }
     }
-    for title in ["bash terminal-rs/read_chart", "terminal-rs/bash", "terminal-rs/read_chart; bash", "read_chart"] {
+    for title in [
+        "bash terminal-rs/read_chart",
+        "terminal-rs/bash",
+        "terminal-rs/read_chart; bash",
+        "read_chart",
+        "mcp_tool_search",
+        "mcp_tool_use",
+        "terminal-rs_mcp_tool_use",
+        "terminal-rs_bash",
+        "terminal-rs_read_chart extra",
+    ] {
         assert!(rpc.terminal_tool(&json!({"title":title}), None).is_none());
     }
+    assert!(rpc.terminal_tool(&json!({"title":"terminal-rs_read_chart","kind":"other","rawInput":{"name":"an ordinary argument"},"_meta":null}), None).is_some());
+    assert!(rpc.terminal_tool(&json!({"title":"terminal-rs_read_chart","kind":"other","rawInput":{"serverName":"foreign","name":"read_chart"},"_meta":null}), None).is_none());
     let profile = sandbox_profile(
         Path::new("/private/data/agent/mimo"),
         &SandboxRoots {
@@ -653,6 +749,7 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
         "/Users/test/.mimocode/mimo",
         "/Users/test/Documents/mimo",
         "/Users/test/.config/opencode/bin/mimo",
+        "/Users/test/.config/mimocode/bin/mimo",
         "/Users/test/.ssh/bin/mimo",
         "/Users/test/.codex/bin/mimo",
         "/Users/test/Library/Caches/mimo/bin/mimo",
@@ -866,7 +963,7 @@ fn own_environment_unsets_xdg_and_plugins_are_opt_in() {
     );
     assert_eq!(own.get(std::ffi::OsStr::new("HOME")).unwrap(), "/private/workspace/home");
     assert_eq!(own.get(std::ffi::OsStr::new("TMPDIR")).unwrap(), "/private/workspace/tmp");
-    assert_eq!(own.len(), 5);
+    assert_eq!(own.len(), 9);
     assert!(own.keys().all(|key| !key.to_string_lossy().starts_with("XDG_")));
     let private = mimo_environment(
         source,
@@ -880,8 +977,11 @@ fn own_environment_unsets_xdg_and_plugins_are_opt_in() {
     assert!(!private.contains_key(std::ffi::OsStr::new("XDG_CACHE_HOME")));
     assert!(!private.contains_key(std::ffi::OsStr::new("XDG_STATE_HOME")));
     for port in [1, 43123, 65535] {
-        assert_eq!(acp_arguments(false, port), ["acp", "--port", &port.to_string(), "--pure"]);
-        assert_eq!(acp_arguments(true, port), ["acp", "--port", &port.to_string()]);
+        for plugins in [false, true] {
+            assert_eq!(acp_arguments(MimoProfile::Own, plugins, port), ["acp", "--port", &port.to_string(), "--pure"]);
+        }
+        assert_eq!(acp_arguments(MimoProfile::Private, false, port), ["acp", "--port", &port.to_string(), "--pure"]);
+        assert_eq!(acp_arguments(MimoProfile::Private, true, port), ["acp", "--port", &port.to_string()]);
     }
 }
 
@@ -892,7 +992,7 @@ fn own_shadow_home_links_only_existing_roots_with_private_permissions_and_cleanu
     let fixture = root.join(format!("mimo-shadow-home-{}", std::process::id()));
     std::fs::DirBuilder::new().mode(0o700).create(&fixture).unwrap();
     let _cleanup = Workspace(fixture.clone());
-    // Exercise every subset, including no setup and all five installed roots.
+    // Exercise every subset, including no setup and all four installed roots.
     for mask in 0..(1 << OWN_DIRECTORIES.len()) {
         let case = fixture.join(mask.to_string());
         std::fs::create_dir(&case).unwrap();
@@ -907,6 +1007,8 @@ fn own_shadow_home_links_only_existing_roots_with_private_permissions_and_cleanu
         for directory in &expected {
             std::fs::create_dir_all(directory).unwrap();
         }
+        // Personal config exists but must never be linked or granted read access.
+        std::fs::create_dir_all(real.join(".config/mimocode")).unwrap();
         let private = case.join("workspace");
         std::fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
         let workspace = Workspace(private.clone());
@@ -953,7 +1055,7 @@ fn own_shadow_home_links_only_existing_roots_with_private_permissions_and_cleanu
                 assert!(!target.exists());
             }
         }
-        for absent in [".claude.json", ".claude", ".config/opencode", ".codex", ".ssh"] {
+        for absent in [".claude.json", ".claude", ".config/opencode", ".config/mimocode", ".codex", ".ssh"] {
             assert_eq!(std::fs::symlink_metadata(home.join(absent)).unwrap_err().kind(), std::io::ErrorKind::NotFound);
         }
         drop(workspace);
@@ -984,9 +1086,9 @@ fn own_directory_resolution_never_creates_and_refuses_symlink_redirects() {
     symlink(&outside, home.join(".mimocode")).unwrap();
     assert!(own_directories(&home).is_err());
     std::fs::remove_file(home.join(".mimocode")).unwrap();
-    std::fs::remove_dir_all(home.join(".config")).unwrap();
-    std::fs::create_dir(outside.join("mimocode")).unwrap();
-    symlink(&outside, home.join(".config")).unwrap();
+    std::fs::remove_dir_all(home.join(".local")).unwrap();
+    std::fs::create_dir_all(outside.join("share/mimocode")).unwrap();
+    symlink(&outside, home.join(".local")).unwrap();
     assert!(own_directories(&home).is_err());
 }
 

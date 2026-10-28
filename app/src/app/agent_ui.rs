@@ -70,17 +70,19 @@ impl TerminalApp {
                 MimoProfile::Own,
                 "Use my mimo setup (providers, keys and models from your installed mimo)",
             );
-            ui.small("Shares only the five mimocode directories with mimo; it may update your existing setup. No other personal home access is granted.");
+            ui.small("Uses providers, keys and models from mimo's credential store. Personal config (MCP servers, plugins and instructions) is intentionally not loaded. Only four mimocode directories are shared; no other personal home access is granted.");
             ui.radio_value(
                 &mut self.agent_config.mimo_profile,
                 MimoProfile::Private,
                 "Private login (separate sign-in inside terminal-rs)",
             );
             ui.small("Uses <data>/agent/mimo-home; provider setup/sign-in is a separate manual step. Your installed login is not used.");
-            ui.collapsing("Advanced", |ui| {
-                ui.checkbox(&mut self.agent_config.mimo_load_plugins, "Load mimo plugins");
-                ui.small("Off by default (--pure). Enable for plugin-configured providers; plugins run with the selected profile's sandbox access.");
-            });
+            if self.agent_config.mimo_profile == MimoProfile::Private {
+                ui.collapsing("Advanced", |ui| {
+                    ui.checkbox(&mut self.agent_config.mimo_load_plugins, "Load mimo plugins");
+                    ui.small("Off by default (--pure). Enable for plugin-configured providers; plugins run with the private profile's sandbox access.");
+                });
+            }
         }
         if old != self.agent_config {
             self.apply_agent_settings(&old);
@@ -972,7 +974,10 @@ impl TerminalApp {
         if self.agent_config.backend == crate::agent_mcp::Backend::Mimo
             && old_mimo_model != self.agent_pane.settings.mimo_model
         {
-            if !self.agent_pane.running && self.agent_pane.session.is_some() {
+            if !self.agent_pane.running
+                && self.agent_pane.state == Onboarding::Ready
+                && self.agent_pane.session.is_some()
+            {
                 self.agent_command(Command::SelectModel(self.agent_pane.settings.mimo_model.clone()));
             }
             self.autosave();

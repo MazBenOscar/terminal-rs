@@ -311,6 +311,14 @@ pub struct BridgeTurn {
     pub screenshot_consent: bool,
 }
 
+impl BridgeTurn {
+    /// Host-selected pinned-chart data, shared by Codex and ACP; never pane status or transcript text.
+    pub fn include_chart_context(&mut self) -> Result<()> {
+        self.input.context.insert("chart".into(), serde_json::to_string(&self.pin)?);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recovery {
     Resumed,
@@ -673,7 +681,7 @@ impl AgentBridge {
             bail!("turn already active")
         }
         let key = self.turn_ids.allocate()?;
-        turn.input.context.insert("chart".into(), serde_json::to_string(&turn.pin)?);
+        turn.include_chart_context()?;
         *self.dispatch.turn.lock().unwrap() =
             Some(TurnState {
                 key: key.clone(),
@@ -1364,7 +1372,7 @@ mod tests {
         assert_eq!(start["params"]["additionalContext"]["chart"]["kind"], "untrusted");
         let pin: Value =
             serde_json::from_str(start["params"]["additionalContext"]["chart"]["value"].as_str().unwrap()).unwrap();
-        assert_eq!(pin["uid"], 17);
+        assert_eq!(pin, json!({"uid":17,"symbol":"AAPL US Equity","timeframe":"1D","visible_range":[1,2]}));
     }
 
     #[tokio::test]
