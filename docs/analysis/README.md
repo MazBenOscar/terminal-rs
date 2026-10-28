@@ -48,6 +48,10 @@ Labels used in every note:
 - [A2a headless agent bridge](agent-bridge-a2a.md) — registry/queue API for A2b,
   direct-tool readiness, interrupt/recovery and manager-only live commands.
 
+- [News module review and backlog](news-module-improvements.md) — 2026-10-28 code review of the shipped
+  news module at `personal/main` (`fb3bd09`) with a ranked enhancement backlog: correctness and operational
+  risk, feature coverage, UI/UX and feed breadth.
+
 - [Quick tools and Auto/Log follow-up](toolbar-scale-followup.md) — 2026-10-21
   REA website runtime tests of drawing favorites, reload, scale-state transitions
   and indicator access; includes explicit account/interaction limits.

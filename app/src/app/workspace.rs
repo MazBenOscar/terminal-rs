@@ -1455,6 +1455,11 @@ impl TerminalApp {
         ui.multiply_opacity(fade);
         let (mut acts, clicked) = self.render_content(ui, i, content, focused);
         ui.set_opacity(opacity);
+        // Rendering can close panes (and shift indices), so look the pane up again.
+        let Some(i) = self.idx(active) else {
+            actions.extend(acts);
+            return;
+        };
         // Clicks in a linked list panel drive its link group.
         if let Some(l) = self.panes[i].link
             && !self.panes[i].kind.follows_symbol()
