@@ -52,6 +52,8 @@ struct Rpc {
     tools: HashSet<String>,
     session: Mutex<Option<String>>,
     retired_sessions: Mutex<HashSet<String>>,
+    /// Canary sessions abandoned mid-turn for a retry: late tool traffic still trips.
+    cancelled_sessions: Mutex<HashSet<String>>,
     turn: Mutex<String>,
     text: Mutex<StreamScrubber>,
     message_segment: AtomicU64,
@@ -269,6 +271,17 @@ impl Rpc {
             .get("sessionId")
             .is_some_and(|id| self.session.lock().unwrap().as_ref().is_some_and(|current| id != current));
         if wrong_session {
+            // A canary turn cancelled for a retry may still be running: any tool
+            // activity from it fails closed instead of being dropped as late noise.
+            if method == "session/update"
+                && value.get("id").is_none()
+                && params["sessionId"].as_str().is_some_and(|id| self.cancelled_sessions.lock().unwrap().contains(id))
+            {
+                if matches!(params["update"]["sessionUpdate"].as_str(), Some("tool_call" | "tool_call_update")) {
+                    self.violation("mimo isolation tripwire: tool attempt in a cancelled startup check").await;
+                }
+                return Ok(());
+            }
             // Late non-executing traffic from the canary must not poison the
             // real session. Requests/permissions still fail closed.
             if method == "session/update"
@@ -525,6 +538,7 @@ impl AcpBackend {
                 .collect(),
             session: Default::default(),
             retired_sessions: Default::default(),
+            cancelled_sessions: Default::default(),
             turn: Default::default(),
             text: Default::default(),
             message_segment: AtomicU64::new(0),
@@ -898,6 +912,9 @@ impl AcpBackend {
                 return result.and(Err(anyhow!("mimo isolation canary failed; backend is unsafe")));
             }
             if retryable && attempt == 1 {
+                if let Some(session) = self.rpc.session.lock().unwrap().clone() {
+                    self.rpc.cancelled_sessions.lock().unwrap().insert(session);
+                }
                 continue;
             }
             if default_model

@@ -418,6 +418,36 @@ async fn canary_timeout_then_success_retries_on_a_fresh_thread() {
     assert!(!backend.is_unsafe() && !killed.load(Ordering::SeqCst));
 }
 
+#[tokio::test(start_paused = true)]
+async fn late_tool_call_from_cancelled_canary_trips_after_retry() {
+    for kind in ["tool_call", "tool_call_update"] {
+        let (backend, mut read, mut write, killed) = fake();
+        handshake(&backend, &mut read, &mut write).await;
+        let server = async {
+            let first = receive(&mut read).await;
+            send(&mut write, crate::mcp::success(first["id"].clone(), json!({"sessionId":"first-canary"}))).await;
+            let _old_prompt = receive(&mut read).await;
+            let cancel = receive(&mut read).await;
+            assert_eq!(cancel["method"], "session/cancel");
+            let second = receive(&mut read).await;
+            send(&mut write, crate::mcp::success(second["id"].clone(), json!({"sessionId":"second-canary"}))).await;
+            let prompt = receive(&mut read).await;
+            assert_eq!(prompt["params"]["sessionId"], "second-canary");
+            // The abandoned turn keeps running and tries a tool after the retry began.
+            send(
+                &mut write,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"first-canary",
+                "update":{"sessionUpdate":kind,"toolCallId":"t1","title":"bash","status":"in_progress"}}}),
+            )
+            .await;
+            send(&mut write, crate::mcp::success(prompt["id"].clone(), json!({"stopReason":"end_turn"}))).await;
+        };
+        let (result, ()) = tokio::join!(backend.canary_with_timeout(Duration::from_millis(50)), server);
+        assert!(result.is_err(), "{kind}: cancelled canary tool traffic must fail readiness");
+        assert!(backend.is_unsafe() && killed.load(Ordering::SeqCst), "{kind}");
+    }
+}
+
 #[tokio::test]
 async fn saved_available_model_is_applied_before_canary_otherwise_current_model_is_used() {
     for config in [false, true] {
@@ -814,6 +844,7 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
         tools: HashSet::from(["read_chart".into()]),
         session: Default::default(),
         retired_sessions: Default::default(),
+        cancelled_sessions: Default::default(),
         turn: Default::default(),
         text: Default::default(),
         message_segment: AtomicU64::new(0),
