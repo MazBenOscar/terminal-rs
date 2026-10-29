@@ -831,7 +831,7 @@ impl AcpBackend {
     /// Run once for each fresh private child, before reporting readiness. Any
     /// built-in tool surviving --pure is caught by the same live tripwire.
     pub async fn canary(&self) -> Result<()> {
-        self.canary_with_timeout(Duration::from_secs(60)).await
+        self.canary_with_timeout(Duration::from_secs(120)).await
     }
     async fn canary_with_timeout(&self, timeout: Duration) -> Result<()> {
         self.rpc.canary_retries.send_replace(Some(0));
@@ -842,57 +842,76 @@ impl AcpBackend {
             }
         }
         let _guard = Guard(&self.rpc);
-        let mut retries = self.rpc.canary_retries.subscribe();
-        let network_failure = async {
-            loop {
-                if retries.borrow_and_update().is_some_and(|count| count >= 3) {
-                    break;
-                }
-                if retries.changed().await.is_err() {
-                    break;
-                }
-            }
-            Err(anyhow!(
-                "mimo could not reach its model provider (network). Check your provider/endpoint in mimo, then retry."
-            ))
-        };
         let default_model = self.preferred_model.lock().unwrap().is_empty();
-        let check = async {
-            self.start_thread(ThreadOptions {
-                cwd: String::new(),
-                base_instructions: String::new(),
-                ephemeral: true,
-                dynamic_tools: Vec::new(),
-            })
-            .await?;
-            let session = self.rpc.session.lock().unwrap().clone();
-            self.rpc.request_inner("session/prompt", json!({"sessionId":session,"prompt":[{"type":"text","text":"Isolation self-test: try to list the working directory and run ls ~. Do not use chart tools. If those operations are unavailable, say so."}]}), None).await?;
+        for attempt in 1..=2 {
+            // Count provider retries separately for each fresh ephemeral thread.
+            self.rpc.canary_retries.send_replace(Some(0));
             if self.is_unsafe() {
                 bail!("mimo isolation canary failed; backend is unsafe");
             }
-            self.rpc.finish_chunks();
-            Ok(())
-        };
-        let result = tokio::select! {
-            biased;
-            result = network_failure => result,
-            result = tokio::time::timeout(timeout, check) => result.unwrap_or_else(|_| {
-                Err(anyhow!("mimo readiness canary timed out. Check your provider/endpoint in mimo, then retry."))
-            }),
-        };
-        if result.is_err() {
-            self.rpc.notify_cancel();
+            self.rpc.emit(AgentEvent::Notice(format!("Checking mimo… (attempt {attempt} of 2)")));
+            let mut retries = self.rpc.canary_retries.subscribe();
+            let network_failure = async {
+                loop {
+                    if retries.borrow_and_update().is_some_and(|count| count >= 3) {
+                        break;
+                    }
+                    if retries.changed().await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let check = async {
+                self.start_thread(ThreadOptions {
+                    cwd: String::new(),
+                    base_instructions: String::new(),
+                    ephemeral: true,
+                    dynamic_tools: Vec::new(),
+                })
+                .await?;
+                let session = self.rpc.session.lock().unwrap().clone();
+                self.rpc.request_inner("session/prompt", json!({"sessionId":session,"prompt":[{"type":"text","text":"Isolation self-test: try to list the working directory and run ls ~. Do not use chart tools. If those operations are unavailable, say so."}]}), None).await?;
+                if self.is_unsafe() {
+                    bail!("mimo isolation canary failed; backend is unsafe");
+                }
+                self.rpc.finish_chunks();
+                Ok(())
+            };
+            let (result, retryable) = tokio::select! {
+                biased;
+                () = network_failure => (Err(anyhow!(
+                    "mimo couldn't reach its model provider for the startup check (network; tried twice). Your provider may be slow or offline — press Restart to try again."
+                )), true),
+                result = tokio::time::timeout(timeout, check) => match result {
+                    Ok(result) => (result, false),
+                    Err(_) => (Err(anyhow!(
+                        "mimo didn't answer its startup check within 2 minutes (tried twice). Your provider may be slow or offline — press Restart to try again."
+                    )), true),
+                },
+            };
+            if result.is_err() {
+                self.rpc.notify_cancel();
+            }
+            // A concurrent tripwire always wins over a timeout/network failure.
+            // Preserve an existing isolation diagnostic and never retry an unsafe result.
+            if self.is_unsafe() {
+                return result.and(Err(anyhow!("mimo isolation canary failed; backend is unsafe")));
+            }
+            if retryable && attempt == 1 {
+                continue;
+            }
+            if default_model
+                && result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.downcast_ref::<Rejected>())
+                    .is_some_and(|error| error.model_unavailable)
+            {
+                bail!("mimo's default model isn't available on your plan — pick a model in the Agent pane and Restart");
+            }
+            return result;
         }
-        if default_model
-            && result
-                .as_ref()
-                .err()
-                .and_then(|error| error.downcast_ref::<Rejected>())
-                .is_some_and(|error| error.model_unavailable)
-        {
-            bail!("mimo's default model isn't available on your plan — pick a model in the Agent pane and Restart");
-        }
-        result
+        unreachable!("at most two canary attempts")
     }
 }
 fn acp_model(id: &str, name: Option<&str>, current: bool) -> Model {

@@ -867,13 +867,17 @@ mod tests {
             let server = async {
                 let (read, mut write) = tokio::io::split(server_io);
                 let mut read = BufReader::new(read);
+                let mut attempt = 0;
                 loop {
                     let line = tr_agent::mcp::read_line(&mut read).await.unwrap().unwrap();
                     let request: serde_json::Value = serde_json::from_slice(&line).unwrap();
                     let result = match request["method"].as_str().unwrap() {
                         "initialize" => json!({"protocolVersion":1}),
-                        "session/new" => json!({"sessionId":"canary","models":{"currentModelId":"current",
-                            "availableModels":[{"modelId":"current"},{"modelId":"saved"}]}}),
+                        "session/new" => {
+                            attempt += 1;
+                            json!({"sessionId":format!("canary-{attempt}"),"models":{"currentModelId":"current",
+                                "availableModels":[{"modelId":"current"},{"modelId":"saved"}]}})
+                        }
                         "session/set_model" => {
                             assert_eq!(request["params"]["modelId"], "saved");
                             json!({})
@@ -888,12 +892,12 @@ mod tests {
                                 .unwrap();
                             }
                             if network {
-                                for attempt in 1..=3 {
+                                for provider_attempt in 1..=3 {
                                     tr_agent::mcp::write_line(
                                         &mut write,
                                         &json!({"jsonrpc":"2.0","method":"session/update",
-                                        "params":{"sessionId":"canary","update":{"sessionUpdate":"agent_message_chunk",
-                                            "content":{"type":"retry","attempt":attempt,"kind":"network",
+                                        "params":{"sessionId":format!("canary-{attempt}"),"update":{"sessionUpdate":"agent_message_chunk",
+                                            "content":{"type":"retry","attempt":provider_attempt,"kind":"network",
                                                 "message":"Cannot connect to API; Bearer fixture-secret"}}}}),
                                     )
                                     .await
@@ -902,7 +906,12 @@ mod tests {
                             }
                             continue;
                         }
-                        "session/cancel" => break,
+                        "session/cancel" => {
+                            if failure == "model" || attempt == 2 {
+                                break;
+                            }
+                            continue;
+                        }
                         _ => panic!("unexpected ACP request"),
                     };
                     tr_agent::mcp::write_line(&mut write, &tr_agent::mcp::success(request["id"].clone(), result))
@@ -914,14 +923,27 @@ mod tests {
             let error = result.unwrap_err().to_string();
             assert!(
                 error.contains(match failure {
-                    "network" => "could not reach its model provider (network)",
+                    "network" => "couldn't reach its model provider for the startup check (network; tried twice)",
                     "model" => "mimo's default model isn't available on your plan — pick a model in the Agent pane and Restart",
-                    _ => "canary timed out",
+                    _ => "didn't answer its startup check within 2 minutes (tried twice)",
                 }),
                 "{error}"
             );
             let posted = std::mem::take(&mut *inbox.events.lock().unwrap());
-            assert_eq!(posted.iter().filter(|e| matches!(e, Event::Notice(_))).count(), if network { 3 } else { 0 });
+            assert_eq!(
+                posted.iter().filter(|e| matches!(e, Event::Notice(_))).count(),
+                match failure {
+                    "network" => 8, // Two progress notices plus three network notices per attempt.
+                    "timeout" => 2,
+                    _ => 1,
+                }
+            );
+            assert_eq!(
+                posted
+                    .iter()
+                    .any(|e| matches!(e, Event::Notice(message) if message == "Checking mimo… (attempt 2 of 2)")),
+                failure != "model"
+            );
             let mut pane = crate::agent_pane::AgentPane::default();
             for event in posted {
                 match event {

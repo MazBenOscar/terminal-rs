@@ -480,6 +480,7 @@ pub struct AgentPane {
     coalescer: Coalescer,
     queue_paused: bool,
     retryable: bool,
+    checking_status: Option<String>,
     notice_levels: HashMap<usize, Severity>,
     external_notices: HashMap<String, (Instant, usize, usize)>,
     pub expanded_tools: std::collections::HashSet<usize>,
@@ -523,6 +524,7 @@ impl Default for AgentPane {
             coalescer: Coalescer::default(),
             queue_paused: false,
             retryable: false,
+            checking_status: None,
             notice_levels: HashMap::new(),
             external_notices: HashMap::new(),
             expanded_tools: Default::default(),
@@ -691,6 +693,11 @@ impl AgentPane {
     }
 
     pub fn notice(&mut self, text: &str) {
+        if self.backend == "mimo" && self.state == Onboarding::Checking && text.starts_with("Checking mimo…") {
+            // Startup progress uses ordinary backend notices, not conversation text.
+            self.checking_status = Some(scrub_text(text));
+            return;
+        }
         self.notice_levels.insert(self.blocks.len(), notice_severity(text));
         self.blocks.push(RenderedBlock::Notice(scrub_text(text)));
     }
@@ -719,6 +726,7 @@ impl AgentPane {
             self.interrupt_tools();
             self.finish_turn();
         }
+        self.checking_status = None;
         self.state = state;
     }
 
@@ -1152,7 +1160,7 @@ impl AgentPane {
                 agent_markdown::wrapped(
                     ui,
                     if self.backend == "mimo" {
-                        "Checking mimo ACP and its isolation canary…"
+                        self.checking_status.as_deref().unwrap_or("Checking mimo ACP and its isolation canary…")
                     } else {
                         CHECKING_STATUS
                     },
@@ -4877,9 +4885,18 @@ mod polish_tests {
         let output = render(&mut pane);
         assert!(texts(&output).iter().any(|(s, _)| s == "Checking mimo ACP and its isolation canary…"));
         assert!(texts(&output).iter().any(|(s, _)| s.contains("provider unreachable (attempt 1)")));
+        for attempt in 1..=2 {
+            let progress = format!("Checking mimo… (attempt {attempt} of 2)");
+            pane.notice(&progress);
+            render(&mut pane);
+            let output = render(&mut pane);
+            assert!(texts(&output).iter().any(|(s, _)| s == &progress));
+            assert_eq!(pane.state, Onboarding::Checking);
+            assert!(!pane.blocks.iter().any(|b| matches!(b, RenderedBlock::Notice(text) if text == &progress)));
+        }
         for reason in [
-            "mimo could not reach its model provider (network). Check your provider/endpoint in mimo, then retry.",
-            "mimo readiness canary timed out. Check your provider/endpoint in mimo, then retry.",
+            "mimo couldn't reach its model provider for the startup check (network; tried twice). Your provider may be slow or offline — press Restart to try again.",
+            "mimo didn't answer its startup check within 2 minutes (tried twice). Your provider may be slow or offline — press Restart to try again.",
         ] {
             pane.transition(Onboarding::Stopped { reason: reason.into(), unsafe_backend: false });
             render(&mut pane);
@@ -4889,7 +4906,10 @@ mod polish_tests {
             assert!(text.iter().any(|(s, _)| s == "Restart"));
             assert!(!text.iter().any(|(s, _)| s.contains("Checking mimo")));
             assert!(matches!(pane.state.action(), Some(Action::Check)));
+            assert!(pane.checking_status.is_none());
         }
+        pane.transition(Onboarding::Checking);
+        assert!(pane.checking_status.is_none(), "Restart must not display an old attempt");
     }
 
     #[test]

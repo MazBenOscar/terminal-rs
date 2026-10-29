@@ -200,9 +200,58 @@ fn state_text(status: &tr_net::Status, has_key: bool) -> String {
         "On".into()
     }
 }
+fn group_status_text(group: &str, enabled: bool, status: Option<&tr_net::Status>) -> String {
+    if !enabled {
+        return "Off — turn on to fetch".into();
+    }
+    let requests = status.map_or(0, |status| status.requests_today);
+    let cap = status.map(|status| status.cap).unwrap_or_else(|| {
+        tr_net::policies().iter().find(|policy| policy.group == group).map_or(0, |policy| policy.daily_cap)
+    });
+    format!("On · {requests} / {cap} today")
+}
+fn feed_status_label(
+    feed: &tr_data::feeds::Feed,
+    group_enabled: bool,
+    feed_enabled: bool,
+    saved: Option<&FeedStatus>,
+    now: i64,
+) -> &'static str {
+    if !group_enabled {
+        return "Group off";
+    }
+    if !feed_enabled {
+        return "Off";
+    }
+    let Some(saved) = saved else { return "Pending" };
+    let state = &saved.state;
+    let reason = saved.host.as_ref().and_then(|h| h.reason.as_deref()).unwrap_or(&state.last_status);
+    if saved.host.as_ref().is_some_and(|h| h.paused_until == Some(253_402_300_799)) {
+        "Paused — press Resume"
+    } else if reason.contains("Not a feed") {
+        "Not a feed"
+    } else if saved.host.as_ref().is_some_and(|h| h.paused_until.is_some()) {
+        "Paused"
+    } else if feed.quiet(state, now) {
+        "Quiet"
+    } else if state.last_success_at.is_some() {
+        "OK"
+    } else if !reason.is_empty() {
+        "Fetch failed"
+    } else {
+        "Pending"
+    }
+}
 fn feed_row(ui: &mut Ui, sources: &mut State, feed: &tr_data::feeds::Feed) -> bool {
+    let group_enabled = sources.settings.enabled(feed.group);
     let mut enabled = !sources.settings.disabled_feeds.contains(feed.id);
+    let opacity = ui.opacity();
+    if !group_enabled {
+        // Dim the whole checkbox, including its tick, but keep pre-selection interactive.
+        ui.multiply_opacity(0.45);
+    }
     let changed = ui.checkbox(&mut enabled, feed.name).changed();
+    ui.set_opacity(opacity);
     if changed {
         if enabled {
             sources.settings.disabled_feeds.remove(feed.id);
@@ -210,32 +259,19 @@ fn feed_row(ui: &mut Ui, sources: &mut State, feed: &tr_data::feeds::Feed) -> bo
             sources.settings.disabled_feeds.insert(feed.id.into());
         }
     }
-    if let Some(saved) = sources.feeds.iter().find(|s| s.state.id == feed.id) {
-        let state = &saved.state;
-        let now = chrono::Utc::now().timestamp();
-        let reason = saved.host.as_ref().and_then(|h| h.reason.as_deref()).unwrap_or(&state.last_status);
-        let label = if saved.host.as_ref().is_some_and(|h| h.paused_until == Some(253_402_300_799)) {
-            "Paused — press Resume"
-        } else if reason.contains("Not a feed") {
-            "Not a feed"
-        } else if saved.host.as_ref().is_some_and(|h| h.paused_until.is_some()) {
-            "Paused"
-        } else if feed.quiet(state, now) {
-            "Quiet"
-        } else if state.last_success_at.is_some() {
-            "OK"
-        } else {
-            "Pending"
-        };
-        let success = state.last_success_at.map(timestamp).unwrap_or_else(|| "—".into());
-        let age = state.last_item_at.map(|at| item_age(at, now)).unwrap_or_else(|| "—".into());
-        ui.label(
-            RichText::new(format!("{label} · last success {success} · newest {age}"))
-                .font(mono(11.0))
-                .color(theme::muted()),
-        )
-        .on_hover_text(reason);
-    }
+    let saved = sources.feeds.iter().find(|s| s.state.id == feed.id);
+    let now = chrono::Utc::now().timestamp();
+    let label = feed_status_label(feed, group_enabled, enabled, saved, now);
+    let success = saved.and_then(|s| s.state.last_success_at).map(timestamp).unwrap_or_else(|| "—".into());
+    let age = saved.and_then(|s| s.state.last_item_at).map(|at| item_age(at, now)).unwrap_or_else(|| "—".into());
+    let reason =
+        saved.map_or("", |s| s.host.as_ref().and_then(|h| h.reason.as_deref()).unwrap_or(&s.state.last_status));
+    ui.label(
+        RichText::new(format!("{label} · last success {success} · newest {age}"))
+            .font(mono(11.0))
+            .color(theme::muted()),
+    )
+    .on_hover_text(reason);
     changed
 }
 fn source_name(group: &str) -> &str {
@@ -287,11 +323,17 @@ impl TerminalApp {
         let mut resume = None;
         ui.horizontal_wrapped(|ui| {
             changed |= ui.checkbox(&mut self.data_sources.settings.sec, "SEC EDGAR").changed();
-            if let Some(status) = self.data_sources.status.iter().find(|s| s.group == "sec") {
-                ui.label(RichText::new(state_text(status, true)).font(mono(11.0)).color(theme::muted()));
-                if status.paused_until.is_some() && ui.small_button("Resume").clicked() {
-                    resume = Some("sec".to_string());
-                }
+            let status = self.data_sources.status.iter().find(|s| s.group == "sec");
+            ui.label(
+                RichText::new(group_status_text("sec", self.data_sources.settings.sec, status))
+                    .font(mono(11.0))
+                    .color(theme::muted()),
+            );
+            if let Some(status) = status
+                && status.paused_until.is_some()
+                && ui.small_button("Resume").clicked()
+            {
+                resume = Some("sec".to_string());
             }
         });
         ui.indent("sec-subfeeds", |ui| {
@@ -306,17 +348,11 @@ impl TerminalApp {
                     _ => &mut self.data_sources.settings.tech,
                 };
                 changed |= ui.checkbox(enabled, source_name(group)).changed();
-                if let Some(status) = self.data_sources.status.iter().find(|s| s.group == group) {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} / {} today · {}",
-                            status.requests_today,
-                            status.cap,
-                            state_text(status, true)
-                        ))
-                        .font(mono(11.0))
-                        .color(theme::muted()),
-                    );
+                let status = self.data_sources.status.iter().find(|s| s.group == group);
+                ui.label(
+                    RichText::new(group_status_text(group, *enabled, status)).font(mono(11.0)).color(theme::muted()),
+                );
+                if let Some(status) = status {
                     if let Some(reason) = &status.reason {
                         ui.label(RichText::new(reason).font(ui_font(11.0)).color(theme::muted()));
                     }
@@ -481,6 +517,64 @@ mod tests {
         assert_eq!(loaded.data_sources.disabled_feeds.len(), 12);
         for group in ["regulators", "global-media", "tech"] {
             assert_ne!(source_name(group), "Unknown source");
+        }
+    }
+    #[test]
+    fn feed_status_labels_respect_group_and_feed_switches_before_cached_status() {
+        let feed = &tr_data::feeds::FEEDS[0];
+        let now = 40 * 86400;
+        let mut saved = FeedStatus { state: Default::default(), host: None };
+        for cached in [None, Some(&saved)] {
+            assert_eq!(feed_status_label(feed, false, true, cached, now), "Group off");
+            assert_eq!(feed_status_label(feed, false, false, cached, now), "Group off");
+            assert_eq!(feed_status_label(feed, true, false, cached, now), "Off");
+            assert_eq!(feed_status_label(feed, true, true, cached, now), "Pending");
+        }
+        saved.state.last_status = "Connection failed".into();
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "Fetch failed");
+        saved.state.last_success_at = Some(now);
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "OK");
+        saved.state.last_item_at = Some(1);
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "Quiet");
+        saved.host = Some(tr_net::Status {
+            group: feed.group,
+            enabled: true,
+            requests_today: 7,
+            cap: 120,
+            last_request: None,
+            paused_until: Some(now + 60),
+            reason: None,
+            offline: false,
+            needs_contact: false,
+        });
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "Paused");
+        saved.state.last_status = "Not a feed".into();
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "Not a feed");
+        saved.host.as_mut().unwrap().paused_until = Some(253_402_300_799);
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "Paused — press Resume");
+        // Cached success, failure and host pauses cannot override the current switches.
+        assert_eq!(feed_status_label(feed, false, true, Some(&saved), now), "Group off");
+        assert_eq!(feed_status_label(feed, true, false, Some(&saved), now), "Off");
+    }
+    #[test]
+    fn group_status_labels_use_current_switch_even_without_or_with_stale_status() {
+        for group in ["sec", "regulators", "global-media", "tech"] {
+            assert_eq!(group_status_text(group, false, None), "Off — turn on to fetch");
+            let cap = tr_net::policies().iter().find(|p| p.group == group).unwrap().daily_cap;
+            assert_eq!(group_status_text(group, true, None), format!("On · 0 / {cap} today"));
+            let status = tr_net::Status {
+                group,
+                enabled: false,
+                requests_today: 7,
+                cap,
+                last_request: None,
+                paused_until: None,
+                reason: None,
+                offline: false,
+                needs_contact: false,
+            };
+            assert_eq!(group_status_text(group, true, Some(&status)), format!("On · 7 / {cap} today"));
+            assert_eq!(group_status_text(group, false, Some(&status)), "Off — turn on to fetch");
         }
     }
     #[test]

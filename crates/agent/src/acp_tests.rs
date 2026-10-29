@@ -232,10 +232,11 @@ async fn default_model_rejection_is_actionable_and_restart_applies_saved_choice(
 }
 
 #[tokio::test]
-async fn canary_uses_fresh_session_and_foreign_attempt_fails_readiness() {
+async fn canary_uses_fresh_session_and_foreign_attempt_fails_readiness_without_retry() {
     for foreign in [false, true] {
         let (backend, mut read, mut write, killed) = fake();
         handshake(&backend, &mut read, &mut write).await;
+        let mut events = backend.rpc.events.subscribe();
         let server = async {
             let new = receive(&mut read).await;
             assert_eq!(new["method"], "session/new");
@@ -252,6 +253,13 @@ async fn canary_uses_fresh_session_and_foreign_attempt_fails_readiness() {
         };
         let (result, ()) = tokio::join!(backend.canary(), server);
         assert_eq!(result.is_err(), foreign);
+        let mut attempts = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, AgentEvent::Notice(message) if message.starts_with("Checking mimo…")) {
+                attempts += 1;
+            }
+        }
+        assert_eq!(attempts, 1, "an unsafe first attempt must never be retried");
         assert_eq!(backend.is_unsafe(), foreign);
         assert_eq!(killed.load(Ordering::SeqCst), foreign);
     }
@@ -291,35 +299,63 @@ async fn user_turn_retries_are_scrubbed_notices_and_continue_until_interrupt() {
     assert!(matches!(events.recv().await, Some(AgentEvent::Done(_))));
 }
 
-#[tokio::test]
-async fn three_network_retries_fail_canary_and_cancel_without_marking_unsafe() {
-    let (backend, mut read, mut write, killed) = fake();
-    handshake(&backend, &mut read, &mut write).await;
-    let mut events = backend.events();
-    let server = async {
-        let new = receive(&mut read).await;
-        send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"canary"}))).await;
-        assert_eq!(receive(&mut read).await["method"], "session/prompt");
-        // Other retry kinds remain notices, not network failures; count updates,
-        // not the untrusted attempt number (which can be large or repeated).
-        send(&mut write, retry_update(99, "rate_limit")).await;
-        for _ in 0..3 {
-            send(&mut write, retry_update(1, "network")).await;
+#[tokio::test(start_paused = true)]
+async fn network_failure_retries_once_on_fresh_session_without_marking_unsafe() {
+    for recover in [false, true] {
+        let (backend, mut read, mut write, killed) = fake();
+        handshake(&backend, &mut read, &mut write).await;
+        let mut events = backend.rpc.events.subscribe();
+        let server = async {
+            for attempt in 1..=2 {
+                let new = receive(&mut read).await;
+                assert_eq!(new["method"], "session/new");
+                let session = format!("canary-{attempt}");
+                send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":session}))).await;
+                let prompt = receive(&mut read).await;
+                assert_eq!(prompt["method"], "session/prompt");
+                assert_eq!(prompt["params"]["sessionId"], session);
+                if recover && attempt == 2 {
+                    // Two network updates must not inherit the first attempt's count.
+                    for _ in 0..2 {
+                        send(&mut write, retry_update(1, "network")).await;
+                    }
+                    send(&mut write, crate::mcp::success(prompt["id"].clone(), json!({"stopReason":"end_turn"}))).await;
+                } else {
+                    // Count updates, not the untrusted attempt number or other retry kinds.
+                    send(&mut write, retry_update(99, "rate_limit")).await;
+                    for _ in 0..3 {
+                        send(&mut write, retry_update(1, "network")).await;
+                    }
+                    let cancel = receive(&mut read).await;
+                    assert_eq!(cancel["method"], "session/cancel");
+                    assert_eq!(cancel["params"]["sessionId"], session);
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(backend.canary_with_timeout(Duration::from_millis(100)), server);
+        if recover {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "mimo couldn't reach its model provider for the startup check (network; tried twice). Your provider may be slow or offline — press Restart to try again."
+            );
         }
-        assert_eq!(receive(&mut read).await["method"], "session/cancel");
-    };
-    let (result, ()) = tokio::join!(backend.canary(), server);
-    assert_eq!(
-        result.unwrap_err().to_string(),
-        "mimo could not reach its model provider (network). Check your provider/endpoint in mimo, then retry."
-    );
-    for _ in 0..4 {
-        assert!(matches!(events.recv().await, Some(AgentEvent::Notice(_))));
+        let mut progress = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let AgentEvent::Notice(message) = event {
+                assert!(!message.contains("fixture-secret"));
+                if message.starts_with("Checking mimo…") {
+                    progress.push(message);
+                }
+            }
+        }
+        assert_eq!(progress, ["Checking mimo… (attempt 1 of 2)", "Checking mimo… (attempt 2 of 2)"]);
+        assert!(!backend.is_unsafe());
+        assert!(!killed.load(Ordering::SeqCst));
+        assert!(backend.rpc.pending.lock().unwrap().is_empty());
+        assert!(backend.rpc.canary_retries.borrow().is_none());
     }
-    assert!(!backend.is_unsafe());
-    assert!(!killed.load(Ordering::SeqCst));
-    assert!(backend.rpc.pending.lock().unwrap().is_empty());
-    assert!(backend.rpc.canary_retries.borrow().is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -328,23 +364,58 @@ async fn canary_overall_timeout_covers_session_setup_and_prompt_and_cancels() {
         let (backend, mut read, mut write, _) = fake();
         handshake(&backend, &mut read, &mut write).await;
         let server = async {
-            let new = receive(&mut read).await;
-            assert_eq!(new["method"], "session/new");
-            if !hang_in_setup {
-                send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"canary"}))).await;
-                assert_eq!(receive(&mut read).await["method"], "session/prompt");
+            for attempt in 1..=2 {
+                let new = receive(&mut read).await;
+                assert_eq!(new["method"], "session/new");
+                if !hang_in_setup {
+                    let session = format!("canary-{attempt}");
+                    send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":session}))).await;
+                    assert_eq!(receive(&mut read).await["method"], "session/prompt");
+                }
+                assert_eq!(receive(&mut read).await["method"], "session/cancel");
             }
-            assert_eq!(receive(&mut read).await["method"], "session/cancel");
         };
         let (result, ()) = tokio::join!(backend.canary_with_timeout(Duration::from_millis(50)), server);
         assert_eq!(
             result.unwrap_err().to_string(),
-            "mimo readiness canary timed out. Check your provider/endpoint in mimo, then retry."
+            "mimo didn't answer its startup check within 2 minutes (tried twice). Your provider may be slow or offline — press Restart to try again."
         );
         assert!(!backend.is_unsafe());
         assert!(backend.rpc.pending.lock().unwrap().is_empty());
         assert!(backend.rpc.canary_retries.borrow().is_none());
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn canary_timeout_then_success_retries_on_a_fresh_thread() {
+    let (backend, mut read, mut write, killed) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let server = async {
+        let first = receive(&mut read).await;
+        assert_eq!(first["method"], "session/new");
+        send(&mut write, crate::mcp::success(first["id"].clone(), json!({"sessionId":"first-canary"}))).await;
+        let old_prompt = receive(&mut read).await;
+        assert_eq!(old_prompt["method"], "session/prompt");
+        let cancel = receive(&mut read).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        assert_eq!(cancel["params"]["sessionId"], "first-canary");
+        let second = receive(&mut read).await;
+        assert_eq!(second["method"], "session/new");
+        send(&mut write, crate::mcp::success(second["id"].clone(), json!({"sessionId":"second-canary"}))).await;
+        let prompt = receive(&mut read).await;
+        assert_eq!(prompt["method"], "session/prompt");
+        assert_eq!(prompt["params"]["sessionId"], "second-canary");
+        // Late completion of the cancelled turn cannot satisfy the new check.
+        send(&mut write, crate::mcp::success(old_prompt["id"].clone(), json!({"stopReason":"cancelled"}))).await;
+        send(&mut write, crate::mcp::success(prompt["id"].clone(), json!({"stopReason":"end_turn"}))).await;
+    };
+    let (result, ()) = tokio::join!(backend.canary_with_timeout(Duration::from_millis(50)), server);
+    result.unwrap();
+    assert_eq!(backend.rpc.session.lock().unwrap().as_deref(), Some("second-canary"));
+    assert!(backend.rpc.retired_sessions.lock().unwrap().contains("first-canary"));
+    assert!(backend.rpc.pending.lock().unwrap().is_empty());
+    assert!(backend.rpc.canary_retries.borrow().is_none());
+    assert!(!backend.is_unsafe() && !killed.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
