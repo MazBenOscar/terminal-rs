@@ -290,12 +290,13 @@ fn n1a_and_pre_n1a_layout_fixtures_default_to_stories() {
         let doc = LayoutDoc::from_json(fixture).unwrap();
         let PaneSettings::News(Some(settings)) = &doc.panes[0].settings else { panic!() };
         assert_eq!(settings.display, Display::default());
+        assert_eq!(settings.display.sort, intelligence::Sort::Newest);
         assert_eq!(settings.symbol.as_deref(), Some("AAPL US Equity"));
         assert_eq!(LayoutDoc::from_json(&doc.to_json()).unwrap(), doc);
     }
     let mut doc = LayoutDoc::from_json(include_bytes!("../../tests/fixtures/news_layout_n1a.json")).unwrap();
     let PaneSettings::News(Some(settings)) = &mut doc.panes[0].settings else { panic!() };
-    settings.display = Display { wire: true, unread: true, watch_hits: true };
+    settings.display = Display { wire: true, unread: true, watch_hits: true, sort: intelligence::Sort::Relevance };
     assert_eq!(LayoutDoc::from_json(&doc.to_json()).unwrap(), doc);
 }
 #[test]
@@ -663,6 +664,237 @@ fn search_is_bounded_filters_adjacent_and_collapsed_summary_is_visible() {
         assert!(measured <= width + 1.0);
         assert!(text_shapes(&output).iter().any(|(s, _)| s == &expected));
     }
+}
+
+#[test]
+fn n5c_old_display_json_defaults_newest_and_pane_sorts_persist_independently() {
+    let old: crate::layouts::NewsSettings =
+        serde_json::from_str(r#"{"symbol":null,"display":{"wire":true,"unread":true,"watch_hits":false}}"#).unwrap();
+    assert_eq!(old.display.sort, intelligence::Sort::Newest);
+    assert!(old.display.wire && old.display.unread);
+    let mut doc = LayoutDoc::from_json(include_bytes!("../../tests/fixtures/news_layout_n1a.json")).unwrap();
+    let PaneSettings::News(Some(settings)) = &mut doc.panes[0].settings else { panic!() };
+    settings.display.sort = intelligence::Sort::Relevance;
+    doc.panes[1].settings = PaneSettings::News(Some(old));
+    let loaded = LayoutDoc::from_json(&doc.to_json()).unwrap();
+    assert_eq!(loaded, doc);
+    for (index, sort) in [(0, intelligence::Sort::Relevance), (1, intelligence::Sort::Newest)] {
+        let PaneSettings::News(Some(settings)) = &loaded.panes[index].settings else { panic!() };
+        assert_eq!(settings.display.sort, sort);
+    }
+}
+
+#[test]
+fn n5c_relevance_settles_without_idle_repaint_at_narrow_widths() {
+    for width in [320.0, 359.0, 360.0, 600.0, 1800.0] {
+        let ctx = egui::Context::default();
+        let mut pane = visible_pane();
+        pane.display.sort = intelligence::Sort::Relevance;
+        for _ in 0..4 {
+            ui_frame(&ctx, &mut pane, width, vec![], false);
+        }
+        let rebuilds = pane.cache.rebuilds;
+        let (output, measured) = ui_frame(&ctx, &mut pane, width, vec![], false);
+        assert!(measured <= width + 1.0, "relevance chrome overflow at {width}");
+        assert_eq!(pane.cache.rebuilds, rebuilds);
+        assert!(output.viewport_output[&egui::ViewportId::ROOT].repaint_delay > std::time::Duration::from_secs(60));
+    }
+}
+
+#[test]
+fn n5c_sort_toggle_preserves_selection_anchor_and_read_in_view() {
+    let now = 200_000;
+    let mut pane = visible_pane();
+    pane.filters.days = 90;
+    pane.items[0].item.title = "Routine alpha bulletin".into();
+    pane.items[0].item.ts = now - 1;
+    pane.items[1].item.title = "BREAKING: Beta statement".into();
+    pane.items[1].item.ts = now - 60;
+    let mut cache = RowCache::default();
+    cache.update(&mut pane, &[], &[], now);
+    let id = cache.ids[0].clone();
+    let initial = cache.ids.clone();
+    pane.interaction.selected = Some(id.clone());
+    pane.interaction.anchor = Some(id.clone());
+    pane.interaction.anchor_offset = -dp(5.0);
+    pane.read_in_view.insert(id.clone());
+    pane.display.sort = intelligence::Sort::Relevance;
+    cache.update(&mut pane, &[], &[], now);
+    assert_eq!(cache.ids, initial.into_iter().rev().collect::<Vec<_>>());
+    assert_eq!(pane.interaction.selected.as_ref(), Some(&id));
+    assert_eq!(pane.interaction.anchor.as_ref(), Some(&id));
+    assert_eq!(pane.interaction.anchor_offset, -dp(5.0));
+    assert!(pane.interaction.restore_anchor);
+    assert!(pane.read_in_view.contains(&id));
+    // Age crossing invalidates once on an event-driven frame, not every idle frame.
+    let rebuilds = cache.rebuilds;
+    cache.update(&mut pane, &[], &[], now);
+    assert_eq!(cache.rebuilds, rebuilds);
+    cache.update(&mut pane, &[], &[], now + 86401);
+    assert_eq!(cache.ids[0], id);
+    assert_eq!(cache.rebuilds, rebuilds + 1);
+    // Saved and search filters still precede ranking.
+    pane.filters.saved = true;
+    pane.items[0].bookmark = true;
+    pane.filters.search = "routine".into();
+    cache.update(&mut pane, &[], &[], now);
+    assert_eq!(cache.ids, vec![id]);
+}
+
+#[test]
+fn n5c_r_toggles_only_with_selection_and_does_not_take_search_typing() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    assert!(!owns_key(egui::Key::R, false, false));
+    assert!(owns_key(egui::Key::R, true, false));
+    assert_eq!(key_text(egui::Key::R), Some("r"));
+    ui_frame(&ctx, &mut pane, 360.0, key_event(egui::Key::R), true);
+    assert_eq!(pane.display.sort, intelligence::Sort::Newest);
+    pane.interaction.selected = Some(pane.items[0].id.clone());
+    ui_frame(&ctx, &mut pane, 360.0, key_event(egui::Key::R), true);
+    assert_eq!(pane.display.sort, intelligence::Sort::Relevance);
+    ui_frame(&ctx, &mut pane, 360.0, key_event(egui::Key::R), true);
+    assert_eq!(pane.display.sort, intelligence::Sort::Newest);
+    ui_frame(&ctx, &mut pane, 360.0, key_event(egui::Key::Slash), true);
+    ui_frame(&ctx, &mut pane, 360.0, vec![], true);
+    ui_frame(&ctx, &mut pane, 360.0, key_event(egui::Key::R), true);
+    assert_eq!(pane.display.sort, intelligence::Sort::Newest);
+}
+
+#[test]
+fn review_unselected_r_reaches_type_anywhere() {
+    use super::super::{PaneKind, TerminalApp};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/news-review-r-ownership");
+    let (worker, _requests) = crate::worker::Worker::recording();
+    let mut app = TerminalApp::isolated_workspace(&root, worker);
+    let id = app.new_pane(PaneKind::News(Box::new(visible_pane())));
+    app.focus = id;
+    let ctx = egui::Context::default();
+    let mut events = key_event(egui::Key::R);
+    events.push(egui::Event::Text("r".into()));
+    let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| app.hotkeys(ui.ctx()));
+    output.textures_delta.clear();
+    assert_eq!(app.cmd, "R", "unselected letters belong to type-anywhere");
+    for (key, text) in [(egui::Key::I, "i"), (egui::Key::V, "v"), (egui::Key::N, "n")] {
+        let mut events = key_event(key);
+        events.push(egui::Event::Text(text.into()));
+        let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| app.hotkeys(ui.ctx()));
+        output.textures_delta.clear();
+    }
+    assert_eq!(app.cmd, "RIVN");
+}
+
+#[test]
+fn n5c_row_signals_are_aligned_and_source_count_leads_on_light_and_dark() {
+    let old_palette = theme::palette();
+    for palette in [crate::themes::terminal_dark(), crate::themes::terminal_light()] {
+        theme::set_palette(palette.palette(theme::DEFAULT_ACCENT));
+        let ctx = egui::Context::default();
+        let mut pane = visible_pane();
+        pane.items[0].item.title = "Routine alpha bulletin".into();
+        pane.items[1].item.title = "Beta beats estimates".into();
+        let mut breaking = pane.items[0].clone();
+        breaking.id = "breaking".into();
+        breaking.item.title = "FLASH: Gamma launch".into();
+        breaking.source = "Reuters".into();
+        pane.items.push(breaking.clone());
+        for (id, source) in [("two", "CNBC"), ("three", "Bloomberg"), ("duplicate", "CNBC")] {
+            let mut member = breaking.clone();
+            member.id = id.into();
+            member.source = source.into();
+            pane.items.push(member);
+        }
+        let (output, measured) = ui_frame(&ctx, &mut pane, 360.0, vec![], false);
+        assert!(measured <= 361.0);
+        let labels = text_shapes(&output);
+        let x = |text: &str| labels.iter().find(|(s, _)| s == text).unwrap().1.x;
+        // The square + gap uses precisely the removed 14dp marker slot.
+        assert_eq!(x("Routine alpha bulletin") + dp(14.0), x("Beta beats estimates"));
+        assert_eq!(x("Beta beats estimates"), x("FLASH: Gamma launch"));
+        assert!(x("×3") < x("FLASH: Gamma launch"));
+        assert!(!labels.iter().any(|(s, _)| s == "×1" || s == "×4"));
+        assert!(!labels.iter().any(|(s, _)| s == "!" || s == "+"));
+        for priority in [intelligence::Priority::Urgent, intelligence::Priority::High] {
+            let (fill, _) = pill_colours(priority);
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Rect(r) if r.fill == fill && r.rect.size() == egui::vec2(dp(10.0), dp(10.0)))));
+        }
+        for headline in ["Beta beats estimates", "FLASH: Gamma launch"] {
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Text(t) if t.galley.job.text == headline
+                    && t.galley.job.sections.iter().all(|section| section.format.coords
+                        == egui::epaint::text::VariationCoords::new([(b"wght", 680.0)])))));
+        }
+        let (wide, _) = ui_frame(&ctx, &mut pane, 900.0, vec![], false);
+        let wide_labels = text_shapes(&wide);
+        for (label, priority) in
+            [("URGENT", intelligence::Priority::Urgent), ("EARNINGS", intelligence::Priority::High)]
+        {
+            let (_, ink) = pill_colours(priority);
+            assert!(wide_labels.iter().any(|(text, _)| text == label));
+            assert!(wide.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Text(t) if t.galley.job.text == label && t.fallback_color == ink)));
+        }
+        let lum = |c: egui::Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+        let (fill, ink) = pill_colours(intelligence::Priority::Urgent);
+        assert!((lum(fill) - lum(ink)).abs() > 100.0, "attention pill must contrast in both themes");
+        assert_eq!(pill_colours(intelligence::Priority::High), (theme::accent_wash(), theme::accent()));
+        pane.display.wire = true;
+        let (wire, _) = ui_frame(&ctx, &mut pane, 360.0, vec![], false);
+        assert!(!text_shapes(&wire).iter().any(|(s, _)| s.starts_with('×')));
+    }
+    theme::set_palette(old_palette);
+}
+
+#[test]
+fn polish_pill_text_covers_every_event_and_collapses_without_headline_width_loss() {
+    use intelligence::Event::*;
+    for (event, label) in [
+        (Urgent, "URGENT"),
+        (MergerAcquisition, "M&A"),
+        (Earnings, "EARNINGS"),
+        (Guidance, "GUIDANCE"),
+        (Rating, "RATING"),
+        (Fed, "FED"),
+        (Halt, "HALT"),
+        (Bankruptcy, "BANKRUPTCY"),
+        (Fda, "FDA"),
+        (Legal, "LEGAL"),
+        (Recall, "RECALL"),
+        (Dividend, "DIVIDEND"),
+        (Leadership, "CEO"),
+        (Jobs, "JOBS"),
+    ] {
+        assert_eq!(pill_text(event, dp(900.0)), label);
+        for width in [320.0, 359.0, 360.0, 600.0] {
+            assert_eq!(pill_text(event, dp(width)), "");
+        }
+    }
+}
+
+#[test]
+fn n5c_source_column_is_reserved_only_for_visible_multi_source_stories() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.items[0].item.title = "Routine alpha bulletin".into();
+    pane.items[1].item.title = "Beta beats estimates".into();
+    let headline_x = |output: &egui::FullOutput| {
+        text_shapes(output).into_iter().find(|(text, _)| text == "Routine alpha bulletin").unwrap().1.x
+    };
+    let (single, _) = ui_frame(&ctx, &mut pane, 360.0, vec![], false);
+    pane.display.wire = true;
+    let (wire, _) = ui_frame(&ctx, &mut pane, 360.0, vec![], false);
+    assert_eq!(headline_x(&single), headline_x(&wire), "no empty source column for single-source Stories");
+    pane.display.wire = false;
+    let mut duplicate = pane.items[1].clone();
+    duplicate.id = "another-source".into();
+    duplicate.source = "Another source".into();
+    pane.items.push(duplicate);
+    let (multi, _) = ui_frame(&ctx, &mut pane, 360.0, vec![], false);
+    assert_eq!(headline_x(&multi), headline_x(&single) + dp(32.0));
+    pane.filters.search = "alpha".into();
+    let (filtered, _) = ui_frame(&ctx, &mut pane, 360.0, vec![], false);
+    assert_eq!(headline_x(&filtered), headline_x(&single), "filtered-out clusters must not reserve the column");
 }
 
 fn visible_pane() -> NewsPane {
@@ -1194,8 +1426,20 @@ fn escape_clears_focused_search_then_selection_and_releases_letters() {
     let selected = pane.interaction.selected.clone();
     ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Slash), true);
     ui_frame(&ctx, &mut pane, 600.0, vec![], true);
-    ui_frame(&ctx, &mut pane, 600.0, vec![egui::Event::Text("a".into())], true);
-    assert_eq!(pane.filters.search, "a");
+    // Keep whichever equal-time fixture sorts first visible. Short prefixes no longer match.
+    let query = pane
+        .items
+        .iter()
+        .find(|story| Some(&story.id) == selected.as_ref())
+        .unwrap()
+        .item
+        .title
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    ui_frame(&ctx, &mut pane, 600.0, vec![egui::Event::Text(query.clone())], true);
+    assert_eq!(pane.filters.search, query);
     ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Escape), true);
     assert!(pane.filters.search.is_empty());
     assert_eq!(pane.interaction.selected, selected);

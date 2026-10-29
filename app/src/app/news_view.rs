@@ -20,6 +20,7 @@ pub struct Display {
     pub wire: bool,
     pub unread: bool,
     pub watch_hits: bool,
+    pub sort: intelligence::Sort,
 }
 #[derive(Default)]
 pub struct Interaction {
@@ -58,6 +59,7 @@ pub struct RowCache {
     layout_expanded: std::collections::BTreeSet<String>,
     layout_width: f32,
     layout_dirty: bool,
+    relevance_expiry: Option<i64>,
     offsets: Vec<f32>,
 }
 #[derive(PartialEq)]
@@ -92,12 +94,15 @@ impl RowCache {
                 && k.symbol == n.symbol
                 && k.symbols == symbols
                 && k.watched == watched
+                && self.relevance_expiry.is_none_or(|expiry| now < expiry)
         }) {
             return;
         }
         if self.key.as_ref().is_some_and(|k| {
             k.filters != n.filters
-                || k.display != n.display
+                || k.display.wire != n.display.wire
+                || k.display.unread != n.display.unread
+                || k.display.watch_hits != n.display.watch_hits
                 || k.watches != watches
                 || k.symbol != n.symbol
                 || k.symbols != symbols
@@ -111,11 +116,22 @@ impl RowCache {
         self.older_match =
             n.items.iter().any(|s| s.item.ts < query.start && tr_data::news_store::matches(s, &older_query));
         let items: Vec<_> = n.items.iter().filter(|s| tr_data::news_store::matches(s, &query)).cloned().collect();
-        let rows = if n.display.wire {
+        let mut rows: Vec<Cluster> = if n.display.wire {
             items.iter().take(intelligence::MAX_ITEMS).map(Cluster::wire).collect()
         } else {
             intelligence::clusters(&items)
         };
+        intelligence::sort_clusters(&mut rows, n.display.sort, n.display.wire, now);
+        // Re-evaluate the 24h boundary on the next event-driven frame, never a timer.
+        self.relevance_expiry = (n.display.sort == intelligence::Sort::Relevance)
+            .then(|| {
+                rows.iter()
+                    .filter_map(Cluster::newest_dated)
+                    .map(|ts| ts.saturating_add(86401))
+                    .filter(|at| *at > now)
+                    .min()
+            })
+            .flatten();
         let linked = n.symbol.as_deref().filter(|_| n.filters.scope == Scope::Symbol);
         let heights: std::collections::BTreeMap<_, _> =
             self.rows.iter().flat_map(|r| r.story.member_ids.iter().map(move |id| (id.clone(), r.height))).collect();
@@ -189,6 +205,7 @@ pub(super) fn owns_key(key: egui::Key, selected: bool, search: bool) -> bool {
         | egui::Key::Space
         | egui::Key::C
         | egui::Key::U
+        | egui::Key::R
         | egui::Key::S => selected,
         _ => false,
     }
@@ -221,6 +238,7 @@ fn key_text(key: egui::Key) -> Option<&'static str> {
         egui::Key::C => Some("c"),
         egui::Key::U => Some("u"),
         egui::Key::S => Some("s"),
+        egui::Key::R => Some("r"),
         egui::Key::Slash => Some("/"),
         egui::Key::Space => Some(" "),
         _ => None,
@@ -309,6 +327,10 @@ pub struct RowModel {
     pub ticker_hover: String,
     pub about: String,
     pub headline: String,
+    pub priority: intelligence::Priority,
+    pub event: Option<intelligence::Event>,
+    pub matched_phrase: Option<&'static str>,
+    pub source_count: usize,
     pub meta: String,
     pub meta_steps: Vec<String>,
     pub unread: bool,
@@ -380,9 +402,31 @@ fn row_model_watched(story: &Cluster, linked: Option<&str>, watched: &[String], 
         ticker_hover,
         about,
         headline: story.lead.item.title.clone(),
+        priority: story.priority(),
+        event: story.classification().map(|c| c.1),
+        matched_phrase: story.classification().map(|c| c.2),
+        source_count: story.sources.len(),
         meta,
         meta_steps,
         unread: story.unread(),
+    }
+}
+/// Below this width a filled square costs exactly the reclaimed glyph slot.
+/// Full wording and the matched phrase remain available on hover.
+fn pill_text(event: intelligence::Event, width: f32) -> &'static str {
+    if width <= dp(600.0) { "" } else { event.label() }
+}
+fn pill_colours(priority: intelligence::Priority) -> (egui::Color32, egui::Color32) {
+    if priority == intelligence::Priority::Urgent {
+        let fill = theme::amber();
+        let lum = |c: egui::Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+        let text = [theme::text(), theme::card()]
+            .into_iter()
+            .max_by(|a, b| (lum(*a) - lum(fill)).abs().total_cmp(&(lum(*b) - lum(fill)).abs()))
+            .unwrap();
+        (fill, text)
+    } else {
+        (theme::accent_wash(), theme::accent())
     }
 }
 #[derive(Debug, PartialEq)]
@@ -526,6 +570,7 @@ pub(super) const NEWS_SHORTCUTS: &[(&str, &str)] = &[
     ("/", "Search"),
     ("U", "Unread only"),
     ("S", "Save story"),
+    ("R", "Newest / Relevance (selected row)"),
     ("Esc", "Clear search / selection"),
 ];
 
@@ -573,6 +618,9 @@ fn source_matches(source: &str, filter: &str) -> bool {
 
 fn active_filter_summary(n: &NewsPane) -> String {
     let mut parts = vec![];
+    if n.display.sort == intelligence::Sort::Relevance {
+        parts.push("Relevance".into());
+    }
     if !n.filters.sources.is_empty() {
         parts.push(format!("Sources: {}", n.filters.sources.join(", ")));
     }
@@ -597,6 +645,12 @@ fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narro
     if narrow {
         ui.horizontal(|ui| chips(ui, &mut n.display, unread));
     }
+    ui.horizontal(|ui| {
+        ui.label("Sort (R)");
+        ui.selectable_value(&mut n.display.sort, intelligence::Sort::Newest, "Newest");
+        ui.selectable_value(&mut n.display.sort, intelligence::Sort::Relevance, "Relevance")
+            .on_hover_text("Dated stories in the last 24h: priority, distinct sources, then time. Older or undated stories: newest first.");
+    });
     ui.checkbox(&mut n.filters.saved, "Saved");
     ui.label("Sources");
     let sources: std::collections::BTreeSet<_> = n
@@ -949,10 +1003,21 @@ pub(super) fn show(
         ui.add(egui::Label::new(RichText::new(&summary).font(ui_font(10.5)).color(theme::muted())).truncate())
             .on_hover_text(summary);
     }
+    let text_focused = ui.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(ui.ctx(), id).is_some());
+    if focused
+        && !text_focused
+        && n.interaction.selected.is_some()
+        && (n.interaction.pending_keys.contains(&egui::Key::R) || ui.input_mut(|i| consume_exact(i, egui::Key::R)))
+    {
+        n.display.sort = match n.display.sort {
+            intelligence::Sort::Newest => intelligence::Sort::Relevance,
+            intelligence::Sort::Relevance => intelligence::Sort::Newest,
+        };
+        ui.ctx().request_repaint(); // Input only; no sort timer.
+    }
     cache.update(n, watches, &watched, now);
     let ids = &cache.ids;
     let rows = &cache.rows;
-    let text_focused = ui.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(ui.ctx(), id).is_some());
     if focused && !text_focused {
         let keys = [
             (egui::Key::ArrowDown, Key::Next),
@@ -1136,6 +1201,9 @@ pub(super) fn show(
         cache.layout_width = ui.available_width();
         cache.layout_dirty = false;
     }
+    // Reserve a shared column only when the filtered Stories view needs it.
+    let source_width =
+        if !n.display.wire && cache.rows.iter().any(|row| row.model.source_count > 1) { dp(32.0) } else { dp(0.0) };
     let mut height_changed = false;
     let mut draw_row = |ui: &mut Ui, row: &mut CachedRow| {
         ui.spacing_mut().item_spacing.y = dp(0.0);
@@ -1169,11 +1237,24 @@ pub(super) fn show(
         if model.unread {
             ui.painter().circle_filled(rect.left_center() + egui::vec2(dp(7.0), dp(0.0)), dp(2.0), theme::accent());
         }
+        // Only unread/watch and (when needed) source strength remain before time.
+        if !n.display.wire && model.source_count > 1 {
+            ui.painter().text(
+                egui::pos2(rect.left() + dp(12.0) + source_width, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                format!("×{}", model.source_count),
+                mono(11.0),
+                theme::muted(),
+            );
+        }
+        let leading_width = dp(14.0) + source_width;
         let time_width = ui.fonts_mut(|f| f.glyph_width(&mono(11.0), '0')) * crate::feed_time::WIDTH_CHARS as f32;
         // A constant column keeps every headline starting at the same x, ticker or not.
         let ticker_width = time_width;
-        let time_rect =
-            egui::Rect::from_min_size(rect.min + egui::vec2(dp(12.0), dp(0.0)), egui::vec2(time_width, rect.height()));
+        let time_rect = egui::Rect::from_min_size(
+            rect.min + egui::vec2(leading_width, dp(0.0)),
+            egui::vec2(time_width, rect.height()),
+        );
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(time_rect).layout(egui::Layout::right_to_left(egui::Align::Center)),
             |ui| ui.add(egui::Label::new(RichText::new(&model.time).font(mono(11.0)).color(theme::muted())).truncate()),
@@ -1210,7 +1291,31 @@ pub(super) fn show(
                 child_clicked = true;
             }
         }
-        let available = rect.right() - ticker_rect.right() - dp(4.);
+        let pill_width = if let Some(event) = model.event {
+            let text = pill_text(event, rect.width());
+            let (fill, ink) = pill_colours(model.priority);
+            let galley = ui.painter().layout_no_wrap(text.into(), mono(9.0), ink);
+            let width = if text.is_empty() { dp(10.0) } else { galley.size().x + dp(8.0) };
+            let pill = egui::Rect::from_center_size(
+                egui::pos2(ticker_rect.right() + dp(4.0) + width / 2.0, rect.center().y),
+                egui::vec2(width, if text.is_empty() { dp(10.0) } else { galley.size().y + dp(4.0) }),
+            );
+            ui.painter().rect_filled(pill, dp(3.0), fill);
+            if !text.is_empty() {
+                ui.painter().galley(pill.center() - galley.size() / 2.0, galley, ink);
+            }
+            ui.interact(pill, ui.id().with((&model.id, "event")), egui::Sense::hover()).on_hover_text(format!(
+                "{} · priority: {} · headline wording, not verified urgency · matched phrase: ‘{}’",
+                event.label(),
+                model.priority.label(),
+                model.matched_phrase.unwrap_or_default()
+            ));
+            width + dp(4.0)
+        } else {
+            dp(0.0)
+        };
+        let headline_left = ticker_rect.right() + dp(4.0) + pill_width;
+        let available = rect.right() - headline_left;
         let budget = crate::feed_time::tail_budget(rect.width(), available);
         let (meta_text, meta_width) = model
             .meta_steps
@@ -1225,8 +1330,8 @@ pub(super) fn show(
             rect.max,
         );
         let title_rect = egui::Rect::from_min_max(
-            egui::pos2(ticker_rect.right() + dp(4.0), rect.top()),
-            egui::pos2((meta_rect.left() - dp(6.0)).max(ticker_rect.right() + dp(4.0)), rect.bottom()),
+            egui::pos2(headline_left, rect.top()),
+            egui::pos2((meta_rect.left() - dp(6.0)).max(headline_left), rect.bottom()),
         );
         let mut job = egui::text::LayoutJob::default();
         let mut cursor = 0;
@@ -1256,6 +1361,12 @@ pub(super) fn show(
             dp(0.0),
             egui::TextFormat { font_id: ui_font(13.0), color: base, ..Default::default() },
         );
+        // Real variable-font weight: one shaped run, never double-painted faux bold.
+        if model.priority != intelligence::Priority::Normal {
+            for section in &mut job.sections {
+                section.format.coords = egui::epaint::text::VariationCoords::new([(b"wght", 680.0)]);
+            }
+        }
         // The hover card below replaces egui's elided-text tip, so only one popup ever shows.
         // Left-aligned in its column: `ui.put` would centre a headline shorter than the slot.
         let title = ui
@@ -1316,7 +1427,7 @@ pub(super) fn show(
         if n.interaction.expanded.contains(&model.id) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = dp(0.0);
-                ui.add_space(time_width + ticker_width + dp(16.0));
+                ui.add_space(time_width + ticker_width + leading_width + dp(10.0));
                 ui.vertical(|ui| {
                     let mut summary = egui::text::LayoutJob::default();
                     summary.append(

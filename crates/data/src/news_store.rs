@@ -161,19 +161,24 @@ fn matches_columns(
         && (f.sources.is_empty() || f.sources.iter().any(|s| s == provenance.0 || s == provenance.1))
         && (f.include.is_empty() || whole_word(text, &f.include))
         && (f.exclude.is_empty() || !whole_word(text, &f.exclude))
-        && search_matches(text, &f.search)
+        && search_matches(text, tickers, &f.search)
 }
-/// Same token-prefix semantics in FTS, LIKE fallback and the retained view.
+/// Short terms are whole tokens; long terms are prefixes. Ticker roots are exact.
+/// Shared by the SQL post-filter and retained view.
 fn terms(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()).map(str::to_lowercase).collect()
 }
-fn search_matches(text: &str, search: &str) -> bool {
+fn search_matches(text: &str, tickers: &[String], search: &str) -> bool {
     if search.trim().is_empty() {
         return true;
     }
     let query = terms(search);
     let words = terms(text);
-    !query.is_empty() && query.iter().all(|term| words.iter().any(|word| word.starts_with(term)))
+    !query.is_empty()
+        && query.iter().all(|term| {
+            words.iter().any(|word| if term.chars().count() <= 3 { word == term } else { word.starts_with(term) })
+                || tickers.iter().any(|ticker| ticker.split(' ').next().unwrap_or(ticker).to_lowercase() == *term)
+        })
 }
 /// Today means the user's local calendar day, including DST transitions.
 pub fn day_start(now: i64) -> i64 {
@@ -351,6 +356,10 @@ pub mod local {
         pub id: String,
         pub time: String,
         pub headline: String,
+        #[serde(default)]
+        pub priority: crate::news_intelligence::Priority,
+        #[serde(default)]
+        pub event: Option<crate::news_intelligence::Event>,
         pub sources: Vec<String>,
         pub source_count: usize,
         pub subjects: Vec<String>,
@@ -406,6 +415,8 @@ pub mod local {
             groups.entry((topic, subject)).or_default().push(DigestStory {
                 id: c.member_ids[0].clone(),
                 time: iso(c.newest),
+                priority: c.priority(),
+                event: c.classification().map(|c| c.1),
                 headline: c.lead.item.title,
                 source_count: c.sources.len(),
                 sources: c.sources,
@@ -436,9 +447,19 @@ pub mod local {
             for group in &self.groups {
                 text.push_str(&format!("\n## {} · {}\n", group.topic, group.subject));
                 for s in &group.stories {
+                    let priority = if s.priority == crate::news_intelligence::Priority::Normal {
+                        String::new()
+                    } else {
+                        format!(
+                            " · priority: {} · event: {}",
+                            s.priority.label(),
+                            s.event.map_or("—", |event| event.label())
+                        )
+                    };
                     text.push_str(&format!(
-                        "- {} · {} source(s): {} · {} · {} [{}]\n",
+                        "- {}{} · {} source(s): {} · {} · {} [{}]\n",
                         s.time,
+                        priority,
                         s.source_count,
                         s.sources.join(", "),
                         s.url_host,
@@ -1080,60 +1101,74 @@ impl NewsStore {
         if q.filters.saved {
             sql.push_str(" AND bookmark=1");
         }
-        let search = if self.fts && !q.filters.search.trim().is_empty() {
-            sql.push_str(" AND id IN (SELECT id FROM news_fts WHERE news_fts MATCH ?3)");
-            let terms = terms(&q.filters.search);
-            if terms.is_empty() {
-                return Ok(vec![]);
+        use rusqlite::types::Value;
+        let mut values: Vec<Value> = vec![
+            q.start.into(),
+            q.end.into(),
+            serde_json::to_string(q)?.into(),
+            (q.limit.min(crate::news_intelligence::MAX_ITEMS) as i64).into(),
+            (q.offset.min(i64::MAX as usize) as i64).into(),
+        ];
+        let query_terms = terms(&q.filters.search);
+        if !q.filters.search.trim().is_empty() && query_terms.is_empty() {
+            return Ok(vec![]);
+        }
+        let escape_like = |s: &str| s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        for term in query_terms {
+            let text_param = values.len() + 1;
+            let ticker_space = text_param + 1;
+            let ticker_bare = text_param + 2;
+            if self.fts {
+                sql.push_str(&format!(" AND (id IN (SELECT id FROM news_fts WHERE news_fts MATCH ?{text_param})"));
+                let suffix = if term.chars().count() <= 3 { "" } else { "*" };
+                values.push(format!("\"{}\"{suffix}", term.replace('"', "\"\"")).into());
+            } else {
+                // Broad candidates only; news_matches enforces the same token rules.
+                sql.push_str(&format!(
+                    " AND (headline LIKE ?{text_param} ESCAPE '\\' OR summary LIKE ?{text_param} ESCAPE '\\'"
+                ));
+                values.push(format!("%{}%", escape_like(&term)).into());
             }
-            terms.iter().map(|term| format!("\"{}\"*", term.replace('"', "\"\""))).collect::<Vec<_>>().join(" AND ")
-        } else {
-            sql.push_str(" AND (headline LIKE ?3 ESCAPE '\\' OR summary LIKE ?3 ESCAPE '\\')");
-            // A broad LIKE candidate; news_matches applies identical per-term prefixes.
-            let first = terms(&q.filters.search).into_iter().next().unwrap_or_default();
-            format!("%{}%", first.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
-        };
-        sql.push_str(" AND news_matches(headline,summary,tickers,source||char(0)||provider,category,published,?4) ORDER BY published DESC,id LIMIT ?5 OFFSET ?6");
+            sql.push_str(&format!(
+                " OR tickers LIKE ?{ticker_space} ESCAPE '\\' OR tickers LIKE ?{ticker_bare} ESCAPE '\\')"
+            ));
+            // JSON string start + exact root boundary: GE must never admit GEV.
+            let quoted = serde_json::to_string(&term)?;
+            let root = escape_like(quoted.trim_end_matches('"'));
+            values.push(format!("%{root} %").into());
+            values.push(format!("%{root}\"%").into());
+        }
+        sql.push_str(" AND news_matches(headline,summary,tickers,source||char(0)||provider,category,published,?3) ORDER BY published DESC,id LIMIT ?4 OFFSET ?5");
         let mut stmt = self.db.prepare(&sql)?;
-        let rows = stmt.query_map(
-            params![
-                q.start,
-                q.end,
-                search,
-                serde_json::to_string(q)?,
-                q.limit.min(crate::news_intelligence::MAX_ITEMS) as i64,
-                q.offset.min(i64::MAX as usize) as i64
-            ],
-            |r| {
-                let raw: String = r.get(7)?;
-                Ok(Story {
-                    id: r.get(0)?,
-                    source: r.get(1)?,
-                    provider_id: r.get(2)?,
-                    provider: r.get(11)?,
-                    summary: r.get(5)?,
-                    // Rows beyond this bounded backfill may still contain old matcher output.
-                    // Prefer a muted association until they have been re-derived.
-                    subjects: if r.get::<_, i64>(13)? < 2 {
-                        vec![]
-                    } else {
-                        serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default()
-                    },
-                    category: r.get(8)?,
-                    tags: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
-                    seen: r.get(10)?,
-                    bookmark: r.get(14)?,
-                    inferred_ts: r.get(15)?,
-                    item: NewsItem {
-                        link: r.get(3)?,
-                        title: r.get(4)?,
-                        publisher: r.get(1)?,
-                        ts: r.get(6)?,
-                        tickers: serde_json::from_str(&raw).unwrap_or_default(),
-                    },
-                })
-            },
-        )?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
+            let raw: String = r.get(7)?;
+            Ok(Story {
+                id: r.get(0)?,
+                source: r.get(1)?,
+                provider_id: r.get(2)?,
+                provider: r.get(11)?,
+                summary: r.get(5)?,
+                // Rows beyond this bounded backfill may still contain old matcher output.
+                // Prefer a muted association until they have been re-derived.
+                subjects: if r.get::<_, i64>(13)? < 2 {
+                    vec![]
+                } else {
+                    serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default()
+                },
+                category: r.get(8)?,
+                tags: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+                seen: r.get(10)?,
+                bookmark: r.get(14)?,
+                inferred_ts: r.get(15)?,
+                item: NewsItem {
+                    link: r.get(3)?,
+                    title: r.get(4)?,
+                    publisher: r.get(1)?,
+                    ts: r.get(6)?,
+                    tickers: serde_json::from_str(&raw).unwrap_or_default(),
+                },
+            })
+        })?;
         let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         if self.pending_names.is_some() || self.pending_watched {
             // Optional invalidation writes can fail on read-only disks. Never display stale

@@ -8,6 +8,220 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_ITEMS: usize = 2_000;
 
+/// Headline-only importance, not sentiment or a claim about accuracy. Never stored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    #[default]
+    Normal,
+    High,
+    Urgent,
+}
+impl Priority {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::High => "high",
+            Self::Urgent => "urgent",
+        }
+    }
+}
+/// Headline wording only, never a verified event. Labels are shared by UI and digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Event {
+    Urgent,
+    #[serde(rename = "M&A")]
+    MergerAcquisition,
+    Earnings,
+    Guidance,
+    Rating,
+    Fed,
+    Halt,
+    Bankruptcy,
+    Fda,
+    Legal,
+    Recall,
+    Dividend,
+    #[serde(rename = "CEO")]
+    Leadership,
+    Jobs,
+}
+impl Event {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Urgent => "URGENT",
+            Self::MergerAcquisition => "M&A",
+            Self::Earnings => "EARNINGS",
+            Self::Guidance => "GUIDANCE",
+            Self::Rating => "RATING",
+            Self::Fed => "FED",
+            Self::Halt => "HALT",
+            Self::Bankruptcy => "BANKRUPTCY",
+            Self::Fda => "FDA",
+            Self::Legal => "LEGAL",
+            Self::Recall => "RECALL",
+            Self::Dividend => "DIVIDEND",
+            Self::Leadership => "CEO",
+            Self::Jobs => "JOBS",
+        }
+    }
+}
+// Fixed first-match order: urgency, halt, bankruptcy, guidance, earnings, M&A,
+// FDA, legal, recall, leadership, dividend, Fed, jobs, rating. Contiguous whole
+// tokens only, no stemming. Contextual patterns are tested within their category.
+const EVENTS: &[(Event, &[&str])] = &[
+    (
+        Event::Halt,
+        &["trading halt", "trading halted", "trading halts", "halts trading", "shares halted", "stock halted"],
+    ),
+    (Event::Bankruptcy, &["bankruptcy", "chapter 11"]),
+    (
+        Event::Guidance,
+        &[
+            "guidance cut",
+            "cuts guidance",
+            "guidance raise",
+            "raises guidance",
+            "lowers guidance",
+            "raises outlook",
+            "cuts outlook",
+            "lowers outlook",
+            "raises forecast",
+            "cuts forecast",
+            "lowers forecast",
+        ],
+    ),
+    (
+        Event::Earnings,
+        &[
+            "beats estimates",
+            "misses estimates",
+            "tops estimates",
+            "beats expectations",
+            "misses expectations",
+            "tops expectations",
+        ],
+    ),
+    (
+        Event::MergerAcquisition,
+        &["acquires", "to acquire", "agrees to buy", "acquisition agreement", "merger agreement", "buyout agreement"],
+    ),
+    (Event::Fda, &["fda approval", "fda approves", "fda rejection", "fda rejects"]),
+    (Event::Legal, &["sec charges"]),
+    (Event::Recall, &["voluntary recall"]),
+    (Event::Leadership, &["ceo resigns", "ceo steps down", "ceo to step down"]),
+    (Event::Dividend, &["dividend cut", "cuts dividend", "dividend suspended", "suspends dividend"]),
+    (
+        Event::Fed,
+        &[
+            "fed cuts rates",
+            "fed raises rates",
+            "cuts interest rates",
+            "raises interest rates",
+            "fed holds rates",
+            "fed keeps rates",
+            "fed leaves rates",
+        ],
+    ),
+    (Event::Jobs, &["job cuts", "cut jobs", "cuts jobs"]),
+    (Event::Rating, &[]),
+];
+/// Includes the matched wording for the explanatory hover, without rescanning on repaint.
+pub fn classify_with_phrase(headline: &str) -> Option<(Priority, Event, &'static str)> {
+    let tokens = words(headline);
+    let phrase = |pattern: &str| {
+        tokens
+            .windows(pattern.split_whitespace().count())
+            .any(|window| window.iter().map(String::as_str).eq(pattern.split_whitespace()))
+    };
+    let lower = headline.trim_start().to_ascii_lowercase();
+    // Desk labels only, not e.g. "Flash PMI".
+    for word in ["breaking", "urgent", "flash", "alert"] {
+        if lower.strip_prefix(word).is_some_and(|rest| rest.trim_start().starts_with([':', '-', '–', '—', '|'])) {
+            return Some((Priority::Urgent, Event::Urgent, word));
+        }
+    }
+    if phrase("breaking news") {
+        return Some((Priority::Urgent, Event::Urgent, "breaking news"));
+    }
+    for &(event, patterns) in EVENTS {
+        if let Some(&pattern) = patterns.iter().find(|p| phrase(p)) {
+            return Some((Priority::High, event, pattern));
+        }
+        let contextual = match event {
+            Event::MergerAcquisition => (phrase("to buy") && lower.contains("for $")).then_some("to buy … for $"),
+            Event::Recall => tokens.iter().position(|w| w == "recalls").and_then(|i| {
+                tokens[i + 1..]
+                    .iter()
+                    .any(|w| matches!(w.as_str(), "vehicles" | "cars" | "units" | "products"))
+                    .then_some("recalls")
+            }),
+            Event::Rating => tokens.iter().enumerate().find_map(|(i, token)| {
+                let verb = match token.as_str() {
+                    "upgrade" => "upgrade",
+                    "upgrades" => "upgrades",
+                    "upgraded" => "upgraded",
+                    "downgrade" => "downgrade",
+                    "downgrades" => "downgrades",
+                    "downgraded" => "downgraded",
+                    _ => return None,
+                };
+                tokens[i + 1..]
+                    .windows(2)
+                    .any(|w| {
+                        w[0] == "to"
+                            && matches!(
+                                w[1].as_str(),
+                                "buy"
+                                    | "outperform"
+                                    | "overweight"
+                                    | "hold"
+                                    | "neutral"
+                                    | "sell"
+                                    | "underperform"
+                                    | "underweight"
+                            )
+                    })
+                    .then_some(verb)
+            }),
+            _ => None,
+        };
+        if let Some(pattern) = contextual {
+            return Some((Priority::High, event, pattern));
+        }
+    }
+    None
+}
+pub fn classify(headline: &str) -> Option<(Priority, Event)> {
+    classify_with_phrase(headline).map(|(priority, event, _)| (priority, event))
+}
+pub fn priority(headline: &str) -> Priority {
+    classify(headline).map_or(Priority::Normal, |(priority, _)| priority)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sort {
+    #[default]
+    Newest,
+    Relevance,
+}
+/// Recent events lead by importance; older history is strictly chronological.
+/// Source strength is a Stories-only tie-break, never a Wire tie-break.
+pub fn sort_clusters(rows: &mut [Cluster], order: Sort, wire: bool, now: i64) {
+    use std::cmp::Reverse;
+    rows.sort_by_cached_key(|c| {
+        let recent = order == Sort::Relevance && c.newest_dated().is_some_and(|ts| ts >= now.saturating_sub(86400));
+        (
+            Reverse(recent),
+            Reverse(if recent { c.priority() } else { Priority::Normal }),
+            Reverse(if recent && !wire { c.sources.len() } else { 0 }),
+            Reverse(c.newest),
+            c.lead.id.clone(),
+        )
+    });
+}
+
 /// Bump whenever subject semantics change; stored rows are lazily re-derived.
 pub const MATCHER_VERSION: &str = "n1b-subjects-3";
 
@@ -716,6 +930,19 @@ pub struct Cluster {
     pub newest: i64,
 }
 impl Cluster {
+    /// Inferred observation times cannot establish freshness, even if a dated
+    /// member exists but is old. Undated-only clusters stay in the older band.
+    pub fn newest_dated(&self) -> Option<i64> {
+        self.members.iter().filter(|s| !s.inferred_ts && s.item.ts > 0).map(|s| s.item.ts).max()
+    }
+    /// Maximum member priority; first member wins ties, keeping event and phrase together.
+    pub fn classification(&self) -> Option<(Priority, Event, &'static str)> {
+        let highest = self.members.iter().filter_map(|s| classify(&s.item.title).map(|c| c.0)).max()?;
+        self.members.iter().filter_map(|s| classify_with_phrase(&s.item.title)).find(|c| c.0 == highest)
+    }
+    pub fn priority(&self) -> Priority {
+        self.classification().map_or(Priority::Normal, |c| c.0)
+    }
     pub fn wire(story: &Story) -> Self {
         Self {
             lead: story.clone(),
