@@ -752,7 +752,9 @@ impl AcpBackend {
             }
         };
         std::fs::DirBuilder::new().mode(0o700).create(private.join("tmp"))?;
-        let exe = std::env::current_exe()?;
+        // current_exe keeps the launch spelling (e.g. "../x/terminal-rs"); the sandbox
+        // needs the real absolute path the kernel will see for the MCP shim exec.
+        let exe = std::env::current_exe()?.canonicalize()?;
         let mut command = if cfg!(target_os = "macos") {
             let profile =
                 sandbox_profile(&private, &roots, &binary, &exe, &crate::mcp::socket_path(data), &user_home, port)?;
