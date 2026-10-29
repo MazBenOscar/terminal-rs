@@ -33,6 +33,11 @@ pub struct Interaction {
     pub focus_search: bool,
     pub search_open: bool,
     pub source_filter: String,
+    pub keyword_add_open: bool,
+    keyword_add_inline: bool,
+    pub(super) source_cache: SourceCache,
+    pub keyword_input: String,
+    pub(super) sources: Vec<SourceStatus>,
     pub open_data_sources: bool,
     pub anchor_offset: f32,
     pub restore_anchor: bool,
@@ -206,6 +211,7 @@ pub(super) fn owns_key(key: egui::Key, selected: bool, search: bool) -> bool {
         | egui::Key::C
         | egui::Key::U
         | egui::Key::R
+        | egui::Key::W
         | egui::Key::S => selected,
         _ => false,
     }
@@ -239,6 +245,7 @@ fn key_text(key: egui::Key) -> Option<&'static str> {
         egui::Key::U => Some("u"),
         egui::Key::S => Some("s"),
         egui::Key::R => Some("r"),
+        egui::Key::W => Some("w"),
         egui::Key::Slash => Some("/"),
         egui::Key::Space => Some(" "),
         _ => None,
@@ -556,9 +563,70 @@ fn toggle_expanded(n: &mut NewsPane, story: &Cluster) {
     }
     mark_seen(n, story);
 }
-fn chips(ui: &mut Ui, display: &mut Display, unread: usize) {
-    ui.toggle_value(&mut display.unread, format!("Unread {unread}")).on_hover_text("Unread only (u)");
-    ui.toggle_value(&mut display.watch_hits, "Watch hits");
+fn keyword_click(n: &mut NewsPane, count: usize) {
+    if count == 0 {
+        n.interaction.keyword_add_open = true;
+        n.display.watch_hits = false;
+    } else {
+        n.display.watch_hits = !n.display.watch_hits;
+    }
+}
+fn add_keyword(n: &mut NewsPane, watches: &mut Vec<KeywordWatch>) {
+    let words = n.interaction.keyword_input.trim();
+    if words.is_empty() {
+        return;
+    }
+    watches.push(KeywordWatch { name: words.into(), words: words.into(), ..Default::default() });
+    n.interaction.keyword_input.clear();
+    n.interaction.keyword_add_open = false;
+    n.interaction.watches_dirty = None;
+    n.interaction.save_watches = true;
+}
+fn keyword_field(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, focus: bool) -> bool {
+    let field = ui.add(
+        egui::TextEdit::singleline(&mut n.interaction.keyword_input)
+            .hint_text("Add keyword or \"quoted phrase\"")
+            .desired_width(dp(230.0)),
+    );
+    if focus {
+        field.request_focus();
+    }
+    if ui.input_mut(|i| consume_exact(i, egui::Key::Escape)) {
+        field.surrender_focus();
+        true
+    } else if ui.input_mut(|i| consume_exact(i, egui::Key::Enter)) {
+        add_keyword(n, watches);
+        field.surrender_focus();
+        true
+    } else {
+        false
+    }
+}
+fn chips(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, unread: usize, inline: bool) -> bool {
+    ui.toggle_value(&mut n.display.unread, format!("Unread {unread}")).on_hover_text("Unread only (u)");
+    let chip = ui.selectable_label(n.display.watch_hits, format!("Keywords {}", watches.len()));
+    if chip.clicked() {
+        keyword_click(n, watches.len());
+        if inline && n.interaction.keyword_add_open {
+            n.interaction.keyword_add_inline = true;
+            n.interaction.keyword_add_open = false;
+        }
+    }
+    if !inline {
+        let mut open = n.interaction.keyword_add_open;
+        let mut close = false;
+        egui::Popup::from_response(&chip)
+            .open_bool(&mut open)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                close = keyword_field(ui, n, watches, chip.clicked());
+                if close {
+                    ui.close();
+                }
+            });
+        n.interaction.keyword_add_open = open && !close;
+    }
+    chip.clicked()
 }
 /// Shared by the pane footer and Help, including the parallel Save story action.
 pub(super) const NEWS_SHORTCUTS: &[(&str, &str)] = &[
@@ -569,6 +637,7 @@ pub(super) const NEWS_SHORTCUTS: &[(&str, &str)] = &[
     ("C", "Chart story"),
     ("/", "Search"),
     ("U", "Unread only"),
+    ("W", "Stories / Wire (selected row)"),
     ("S", "Save story"),
     ("R", "Newest / Relevance (selected row)"),
     ("Esc", "Clear search / selection"),
@@ -612,12 +681,92 @@ fn key_legend(ui: &mut Ui) {
     });
 }
 
+#[derive(Default)]
+pub(super) struct SourceCache {
+    pub key: Option<super::data_sources::NewsSourceKey>,
+    pub summary: String,
+    pub hover: String,
+}
+impl SourceCache {
+    pub fn rebuild(&mut self, sources: &[SourceStatus], now: i64) {
+        self.summary = aggregate_status(sources, now);
+        self.hover = sources.iter().map(|s| s.line(now)).collect::<Vec<_>>().join("\n");
+    }
+}
+#[derive(Clone, Debug)]
+pub(super) struct SourceStatus {
+    pub name: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub newest: Option<i64>,
+    pub updated: Option<i64>,
+}
+impl SourceStatus {
+    fn enabled(&self) -> bool {
+        self.status != "Off"
+    }
+    fn paused(&self) -> bool {
+        self.enabled() && !matches!(self.status.as_str(), "OK" | "Quiet" | "Pending")
+    }
+    fn line(&self, now: i64) -> String {
+        let age = self.newest.map(|at| source_age(at, now)).unwrap_or_else(|| "—".into());
+        let reason = self.reason.as_deref().filter(|s| !s.is_empty()).map(|s| format!(" — {s}")).unwrap_or_default();
+        format!("{} · {}{reason} · newest {age}", self.name, self.status)
+    }
+}
+fn source_age(at: i64, now: i64) -> String {
+    match (now - at).max(0) {
+        0..60 => "now".into(),
+        60..3600 => format!("{}m ago", (now - at) / 60),
+        3600..86400 => format!("{}h ago", (now - at) / 3600),
+        _ => format!("{}d ago", (now - at) / 86400),
+    }
+}
+fn aggregate_status(sources: &[SourceStatus], now: i64) -> String {
+    let count = sources.iter().filter(|s| s.enabled()).count();
+    let paused = sources.iter().filter(|s| s.paused()).count();
+    let updated = sources.iter().filter(|s| s.enabled()).filter_map(|s| s.updated).max();
+    let age = updated.map(|at| format!("updated {}", source_age(at, now))).unwrap_or_else(|| "not updated yet".into());
+    let pending = sources.iter().filter(|s| s.status == "Pending").count();
+    let mut parts = vec![format!("{count} sources")];
+    if paused > 0 {
+        parts.push(format!("{paused} paused"));
+    }
+    if pending > 0 {
+        parts.push(format!("{pending} pending"));
+    }
+    parts.push(age);
+    parts.join(" · ")
+}
+pub(super) fn pane_source(n: &NewsPane) -> &'static str {
+    if n.status.contains("CoinDesk") {
+        "CoinDesk"
+    } else if n.status.contains("Yahoo") {
+        "Yahoo"
+    } else {
+        "Finnhub"
+    }
+}
+fn source_details(ui: &mut Ui, n: &mut NewsPane, actions: &mut Vec<Action>) {
+    ui.label(RichText::new(&n.interaction.source_cache.hover).font(mono(10.5)).color(theme::muted()));
+    if ui.button("Open Data sources").clicked() {
+        n.interaction.open_data_sources = true;
+        actions.push(Action::Command("SETTINGS".into()));
+        ui.close();
+    }
+}
 fn source_matches(source: &str, filter: &str) -> bool {
     source.to_lowercase().contains(&filter.trim().to_lowercase())
 }
 
 fn active_filter_summary(n: &NewsPane) -> String {
     let mut parts = vec![];
+    if n.filters.saved {
+        parts.push("Saved only".into());
+    }
+    if !n.filters.search.trim().is_empty() {
+        parts.push(format!("Search: {}", n.filters.search.trim()));
+    }
     if n.display.sort == intelligence::Sort::Relevance {
         parts.push("Relevance".into());
     }
@@ -637,33 +786,73 @@ fn active_filter_summary(n: &NewsPane) -> String {
         parts.push("Unread only".into());
     }
     if n.display.watch_hits {
-        parts.push("Watch hits".into());
+        parts.push("Keywords".into());
     }
     parts.join(" · ")
 }
 
-fn toggle_category(categories: &mut Vec<String>, category: &str) {
-    let selected = categories.is_empty() || categories.iter().any(|c| c == category);
-    if categories.is_empty() {
-        *categories = tr_data::feeds::CATEGORIES.iter().map(|s| s.to_string()).collect();
-    }
-    categories.retain(|c| c != "none");
-    if selected {
+fn toggle_category(categories: &mut Vec<String>, category: &str, multi: bool) {
+    categories.retain(|c| c != "none"); // Legacy explicit-empty selection remains loadable.
+    if !multi {
+        if categories.as_slice() == [category] {
+            categories.clear();
+        } else {
+            *categories = vec![category.into()];
+        }
+    } else if categories.iter().any(|c| c == category) {
         categories.retain(|c| c != category);
     } else {
         categories.push(category.into());
     }
-    if categories.is_empty() {
-        categories.push("none".into());
-    } else if categories.len() == tr_data::feeds::CATEGORIES.len() {
-        categories.clear();
+}
+fn category_code(category: &str) -> &'static str {
+    match tr_data::news_store::category_key(category) {
+        "markets" => "MKT",
+        "macro" => "MACRO",
+        "regulatory" => "REG",
+        "geopolitics" => "GEO",
+        "tech" => "TECH",
+        "crypto" => "CRYPTO",
+        _ => "",
+    }
+}
+fn publisher_sources(n: &NewsPane) -> std::collections::BTreeSet<String> {
+    n.items
+        .iter()
+        .flat_map(|s| s.sources.iter().cloned().chain([s.source.clone()]))
+        .chain(n.filters.sources.iter().cloned())
+        .filter(|s| {
+            !s.is_empty()
+                && !matches!(s.to_ascii_lowercase().as_str(), "rss" | "finnhub" | "yahoo" | "yahoo-news")
+                && !tr_data::feeds::FEEDS.iter().any(|f| f.id == s)
+        })
+        .collect()
+}
+fn filtered_empty_text(n: &NewsPane, keywords: usize) -> String {
+    let summary = active_filter_summary(n);
+    if n.display.watch_hits {
+        let others = summary.split(" · ").filter(|s| *s != "Keywords").collect::<Vec<_>>().join(" · ");
+        let noun = if keywords == 1 { "keyword" } else { "keywords" };
+        let base = format!("No stories match your {keywords} {noun}");
+        if others.is_empty() { base } else { format!("{base} · {others}") }
+    } else if summary.is_empty() {
+        if n.filters.days == 1 {
+            "No stories match Today".into()
+        } else {
+            format!("No stories match the last {} days", n.filters.days)
+        }
+    } else {
+        format!("No stories match: {summary}")
     }
 }
 fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narrow: bool, unread: usize) {
     let mut changed = false;
     let mut finished = false;
     if narrow {
-        ui.horizontal(|ui| chips(ui, &mut n.display, unread));
+        let clicked = ui.horizontal(|ui| chips(ui, n, watches, unread, true)).inner;
+        if n.interaction.keyword_add_inline && keyword_field(ui, n, watches, clicked) {
+            n.interaction.keyword_add_inline = false;
+        }
     }
     ui.horizontal(|ui| {
         ui.label("Sort (R)");
@@ -678,26 +867,38 @@ fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narro
             n.filters.categories.clear();
         }
         for category in tr_data::feeds::CATEGORIES {
-            let selected = n.filters.categories.is_empty() || n.filters.categories.iter().any(|c| c == category);
-            if ui.selectable_label(selected, category.to_uppercase()).clicked() {
-                toggle_category(&mut n.filters.categories, category);
+            let selected = n.filters.categories.iter().any(|c| c == category);
+            if ui
+                .selectable_label(selected, category.to_uppercase())
+                .on_hover_text("Click to select only this category; Cmd-click (Ctrl on Linux) to add/remove")
+                .clicked()
+            {
+                toggle_category(&mut n.filters.categories, category, ui.input(|i| i.modifiers.command));
             }
         }
     });
     ui.label("Sources");
-    let sources: std::collections::BTreeSet<_> = n
-        .items
-        .iter()
-        .flat_map(|s| s.sources.iter().cloned().chain([s.source.clone(), s.provider.clone()]))
-        .chain(n.filters.sources.iter().cloned())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let sources = publisher_sources(n);
     ui.add(
         egui::TextEdit::singleline(&mut n.interaction.source_filter)
             .hint_text("Filter sources (contains, ignoring case)")
             .desired_width(dp(260.0)),
     );
-    let matching: Vec<_> = sources.iter().filter(|s| source_matches(s, &n.interaction.source_filter)).collect();
+    let mut matching: Vec<_> = sources
+        .iter()
+        .filter(|s| source_matches(s, &n.interaction.source_filter))
+        .map(|source| {
+            let category = n
+                .items
+                .iter()
+                .find(|s| &s.source == source || s.sources.contains(source))
+                .map(|s| tr_data::news_store::category_key(&s.category).to_string())
+                .or_else(|| tr_data::feeds::FEEDS.iter().find(|f| f.publisher == source).map(|f| f.category.into()))
+                .unwrap_or_default();
+            (category, source)
+        })
+        .collect();
+    matching.sort();
     ui.label(
         RichText::new(format!("{} of {} sources match", matching.len(), sources.len()))
             .font(mono(10.5))
@@ -706,8 +907,29 @@ fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narro
     if ui.selectable_label(n.filters.sources.is_empty(), "All sources").clicked() {
         n.filters.sources.clear();
     }
+    // Pin active legacy filters above the publisher list, even when a publisher
+    // search would hide them, so every saved selection can be removed individually.
+    let legacy: Vec<_> = n.filters.sources.iter().filter(|s| !sources.contains(*s)).cloned().collect();
+    for source in legacy {
+        if ui.selectable_label(true, format!("{source} (legacy)")).clicked() {
+            n.filters.sources.retain(|s| s != &source);
+        }
+    }
     egui::ScrollArea::vertical().id_salt("news-filter-sources").max_height(dp(140.0)).show(ui, |ui| {
-        for source in matching {
+        let mut previous = None;
+        for (category, source) in matching {
+            if previous.as_ref() != Some(&category) {
+                ui.label(
+                    RichText::new(if category.is_empty() {
+                        "Other publishers".into()
+                    } else {
+                        category.to_uppercase()
+                    })
+                    .color(theme::muted())
+                    .font(ui_font(10.5)),
+                );
+                previous = Some(category);
+            }
             let selected = n.filters.sources.contains(source);
             if ui.selectable_label(selected, source).clicked() {
                 if selected {
@@ -738,7 +960,7 @@ fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narro
         )
         .wrap(),
     );
-    ui.label("Keyword watches · words or \"quoted phrases\"");
+    ui.label("Keywords · words or \"quoted phrases\"");
     let mut delete = None;
     for (i, watch) in watches.iter_mut().enumerate() {
         ui.push_id(i, |ui| {
@@ -763,7 +985,7 @@ fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narro
                     let response = crate::feed_time::icon_button(
                         ui,
                         crate::widgets::Icon::Circle,
-                        &format!("Watch colour {}", colour + 1),
+                        &format!("Keyword colour {}", colour + 1),
                     );
                     ui.painter().circle_filled(response.rect.center(), dp(3.), watch_colour(colour));
                     if watch.colour.min(5) == colour {
@@ -786,7 +1008,7 @@ fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narro
         watches.remove(i);
         changed = true;
     }
-    if ui.small_button("Add watch").clicked() {
+    if ui.small_button("Add keyword").clicked() {
         watches.push(KeywordWatch::default());
         changed = true;
     }
@@ -856,7 +1078,9 @@ pub(super) fn show(
     } else {
         format!("updated {relative}")
     };
-    let status = n.error.as_deref().unwrap_or(&n.status).replace("updated just now", &update);
+    let pane_status = n.error.as_deref().unwrap_or(&n.status).replace("updated just now", &update);
+    let status = n.interaction.source_cache.summary.clone();
+    let status_hover = n.interaction.source_cache.hover.clone();
     let watchlist_name = lists
         .iter()
         .find(|l| Some(&l.name) == n.filters.watchlist.as_ref())
@@ -876,7 +1100,9 @@ pub(super) fn show(
             |ui| {
                 let more = crate::feed_time::icon_button(ui, crate::widgets::Icon::More, "News options");
                 egui::Popup::menu(&more).show(|ui| {
+                    ui.add(egui::Label::new(&pane_status).wrap());
                     ui.add(egui::Label::new(&status).wrap());
+                    source_details(ui, n, &mut actions);
                     ui.separator();
                     if ui
                         .button("Copy digest")
@@ -886,22 +1112,29 @@ pub(super) fn show(
                         n.interaction.copy_digest = true;
                         ui.close();
                     }
-                    if ui.button("Re-read history").on_hover_text("Re-read saved history; source pacing is unchanged").clicked() {
+                    if ui
+                        .button("Reload saved headlines")
+                        .on_hover_text("Re-read saved history; source pacing is unchanged")
+                        .clicked()
+                    {
                         n.fetched = None;
                         n.read_in_view.clear();
                         n.item_revision = n.item_revision.wrapping_add(1);
                         ui.close();
                     }
-                    if ui.button("Refresh source").on_hover_text("Request fresh headlines through the normal guard; respects pause, cooldown, offline and budgets").clicked() {
+                    if ui
+                        .button("Check for new headlines")
+                        .on_hover_text(format!(
+                            "Fetch now from {} (guard limits apply). RSS feeds keep their own 15–30 min timers.",
+                            pane_source(n)
+                        ))
+                        .clicked()
+                    {
                         n.refresh_source = true;
                         n.fetched = None;
                         ui.close();
                     }
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut n.display.wire, false, "Stories");
-                        ui.selectable_value(&mut n.display.wire, true, "Wire");
-                    });
-                    if ui.button(if n.paused { "Show new updates" } else { "Pause updates" }).clicked() {
+                    if ui.button(if n.paused { "Unfreeze list" } else { "Freeze list" }).clicked() {
                         n.paused = !n.paused;
                         if !n.paused && !n.pending.is_empty() {
                             let incoming = std::mem::take(&mut n.pending);
@@ -909,9 +1142,11 @@ pub(super) fn show(
                         }
                         ui.close();
                     }
-                    ui.menu_button("About this source", |ui| {
+                    ui.menu_button("About sources", |ui| {
                         ui.label("Finnhub free tier: personal, non-commercial use.");
-                        ui.label("Headlines and metadata only; links open the publisher.");
+                        ui.label("Yahoo: headlines and links; publishers own the content.");
+                        ui.label("CoinDesk: headlines and links; publisher owns the content.");
+                        ui.label("Built-in RSS feeds: headlines and links only; publishers own the content.");
                     });
                 });
                 ui.allocate_ui_with_layout(
@@ -962,14 +1197,10 @@ pub(super) fn show(
                                 }
                             }
                             ui.add(
-                                egui::Label::new(
-                                    RichText::new(crate::feed_time::compact_status(&status))
-                                        .font(ui_font(10.5))
-                                        .color(theme::muted()),
-                                )
-                                .truncate(),
+                                egui::Label::new(RichText::new(&status).font(ui_font(10.5)).color(theme::muted()))
+                                    .truncate(),
                             )
-                            .on_hover_text(&status);
+                            .on_hover_text(&status_hover);
                         });
                     },
                 );
@@ -978,13 +1209,26 @@ pub(super) fn show(
     });
     ui.horizontal(|ui| {
         chrome(ui);
-        for (days, label) in [(1, "Today"), (7, "7D"), (30, "30D"), (90, "90D")] {
-            ui.selectable_value(&mut n.filters.days, days, label);
-        }
-        ui.toggle_value(&mut n.display.unread, format!("Unread {unread}")).on_hover_text("Unread only (u)");
+        let ranges = [(1, "Today"), (7, "7D"), (30, "30D"), (90, "90D")];
+        egui::ComboBox::from_id_salt("news-days")
+            .width(dp(48.0))
+            .selected_text(ranges.iter().find(|(days, _)| *days == n.filters.days).map_or("Today", |(_, label)| *label))
+            .show_ui(ui, |ui| {
+                for (days, label) in ranges {
+                    ui.selectable_value(&mut n.filters.days, days, label);
+                }
+            });
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = dp(0.0);
+            ui.selectable_value(&mut n.display.wire, false, "Stories")
+                .on_hover_text("Stories — duplicates merged; ×N = number of sources");
+            ui.selectable_value(&mut n.display.wire, true, "Wire").on_hover_text("Wire — every headline as it arrived");
+        });
         if !narrow {
-            ui.toggle_value(&mut n.display.watch_hits, "Watch hits");
+            chips(ui, n, watches, unread, false);
         }
+        // Count only filters hidden from the header: Unread and Keywords count
+        // in narrow panes only, using the same rules as the wide header chips.
         let count = n.filters.sources.len()
             + usize::from(!n.filters.categories.is_empty())
             + usize::from(n.filters.saved)
@@ -996,7 +1240,7 @@ pub(super) fn show(
             let filter_label = format!("Filters ({count})");
             let filter_width =
                 ui.painter().layout_no_wrap(filter_label.clone(), ui_font(10.5), theme::text()).size().x + dp(12.0);
-            // The Watch hits chip appears at 360pt, but that does not guarantee
+            // The Keywords chip appears at 360pt, but that does not guarantee
             // enough room for an editable search field beside Filters.
             let compact_search = narrow || ui.available_width() < filter_width + dp(60.0);
             if compact_search && !n.interaction.search_open && n.filters.search.is_empty() {
@@ -1028,7 +1272,17 @@ pub(super) fn show(
                     n.interaction.search_open = false;
                 }
             }
-            ui.menu_button(filter_label, |ui| filters(ui, n, watches, narrow, unread));
+            let button = ui.button(filter_label);
+            let menu = egui::Popup::menu(&button)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| filters(ui, n, watches, narrow, unread));
+            if menu.is_none() || !narrow {
+                n.interaction.keyword_add_inline = false;
+            }
+            if narrow {
+                // The compact editor belongs only to this menu, never to a later wide popup.
+                n.interaction.keyword_add_open = false;
+            }
         });
     });
     let summary = active_filter_summary(n);
@@ -1037,6 +1291,14 @@ pub(super) fn show(
             .on_hover_text(summary);
     }
     let text_focused = ui.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(ui.ctx(), id).is_some());
+    if focused
+        && !text_focused
+        && n.interaction.selected.is_some()
+        && (n.interaction.pending_keys.contains(&egui::Key::W) || ui.input_mut(|i| consume_exact(i, egui::Key::W)))
+    {
+        n.display.wire = !n.display.wire;
+        ui.ctx().request_repaint();
+    }
     if focused
         && !text_focused
         && n.interaction.selected.is_some()
@@ -1156,7 +1418,7 @@ pub(super) fn show(
             || cache.older_match;
         let no_key = n.filters.scope == Scope::Symbol
             && n.symbol.is_some()
-            && status.contains("Company news needs a Finnhub key.");
+            && pane_status.contains("Company news needs a Finnhub key.");
         match empty_cause(n.loading, no_key, filtered) {
             EmptyCause::Loading => {
                 ui.label(RichText::new("Reading saved headlines…").color(theme::muted()));
@@ -1169,16 +1431,7 @@ pub(super) fn show(
                 }
             }
             EmptyCause::Filtered => {
-                let selection = match n.filters.scope {
-                    Scope::Symbol => n.symbol.as_deref().and_then(|s| s.split_whitespace().next()).unwrap_or("Market"),
-                    Scope::Watchlist => &watchlist_name,
-                    Scope::All => "Market",
-                };
-                let message = if n.filters.days == 1 {
-                    format!("No headlines for {selection} today.")
-                } else {
-                    format!("No headlines for {selection} in the last {} days.", n.filters.days)
-                };
+                let message = filtered_empty_text(n, watches.len());
                 ui.add(egui::Label::new(RichText::new(&message).color(theme::muted())).truncate())
                     .on_hover_text(message);
                 if ui.small_button("Clear filters").clicked() {
@@ -1355,6 +1608,17 @@ pub(super) fn show(
             .meta_steps
             .iter()
             .find_map(|text| {
+                let code = category_code(&row.story.lead.category);
+                let text = if n.filters.scope == Scope::All
+                    && n.filters.categories.len() != 1
+                    && !narrow
+                    && !text.is_empty()
+                    && !code.is_empty()
+                {
+                    format!("{code} · {text}")
+                } else {
+                    text.clone()
+                };
                 let width = ui.painter().layout_no_wrap(text.clone(), ui_font(10.5), theme::muted()).size().x;
                 (width <= budget).then_some((text, width))
             })

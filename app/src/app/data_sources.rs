@@ -40,6 +40,26 @@ pub struct State {
     status: Vec<tr_net::Status>,
     feeds: Vec<FeedStatus>,
     message: Option<Result<String, String>>,
+    status_revision: u64,
+}
+#[derive(Clone, PartialEq)]
+pub(super) struct NewsSourceKey {
+    status_revision: u64,
+    settings: tr_net::Settings,
+    item_revision: u64,
+    pane_status: String,
+    pane_error: Option<String>,
+    pane_updated: Option<Instant>,
+}
+impl NewsSourceKey {
+    fn matches(&self, state: &State, pane: &super::NewsPane) -> bool {
+        self.status_revision == state.status_revision
+            && self.settings == state.settings
+            && self.item_revision == pane.item_revision
+            && self.pane_status == pane.status
+            && self.pane_error == pane.error
+            && self.pane_updated == pane.updated
+    }
 }
 pub(super) fn deserialize_settings<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -58,11 +78,131 @@ impl State {
     pub fn new(settings: tr_net::Settings) -> Self {
         Self { contact_input: settings.sec_contact.clone(), settings, ..Self::default() }
     }
+    pub(super) fn update_news_sources(&self, pane: &mut super::NewsPane, now: i64) {
+        if pane.interaction.source_cache.key.as_ref().is_some_and(|key| key.matches(self, pane)) {
+            return;
+        }
+        let sources = self.news_sources(pane, now);
+        pane.interaction.source_cache.rebuild(&sources, now);
+        pane.interaction.sources = sources;
+        pane.interaction.source_cache.key = Some(NewsSourceKey {
+            status_revision: self.status_revision,
+            settings: self.settings.clone(),
+            item_revision: pane.item_revision,
+            pane_status: pane.status.clone(),
+            pane_error: pane.error.clone(),
+            pane_updated: pane.updated,
+        });
+    }
+    pub(super) fn news_sources(&self, pane: &super::NewsPane, now: i64) -> Vec<super::news_view::SourceStatus> {
+        let mut configured = self.settings.clone();
+        // A global pause is health, not a disabled source: keep it in the count.
+        configured.pause_all = false;
+        let health = |enabled: bool, guard: Option<&tr_net::Status>, ok: bool, quiet: bool, pending: bool| {
+            if !enabled {
+                return "Off".to_string();
+            }
+            if let Some(until) = guard.and_then(|s| s.paused_until).filter(|until| *until > now) {
+                if until == 253_402_300_799 {
+                    return "Paused — press Resume in Data sources".into();
+                }
+                return format!(
+                    "Paused until {}",
+                    chrono::DateTime::from_timestamp(until, 0)
+                        .map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                        .unwrap_or_else(|| "—".into())
+                );
+            }
+            if self.settings.pause_all || guard.is_some_and(|s| s.offline || s.needs_contact || !s.enabled) || !ok {
+                "Paused".into()
+            } else if pending {
+                "Pending".into()
+            } else if quiet {
+                "Quiet".into()
+            } else {
+                "OK".into()
+            }
+        };
+        let mut rows = vec![];
+        for (name, group) in [("Finnhub", "finnhub"), ("Yahoo", "yahoo-news"), ("CoinDesk", "coindesk")] {
+            let is_pane = super::news_view::pane_source(pane) == name;
+            let newest = pane
+                .items
+                .iter()
+                .chain(&pane.pending)
+                .filter(|s| s.provider.eq_ignore_ascii_case(name) || s.source.eq_ignore_ascii_case(name))
+                .map(|s| s.item.ts)
+                .filter(|at| *at > 0)
+                .max();
+            let pane_ok = !is_pane
+                || (pane.error.is_none()
+                    && ![
+                        "paused",
+                        "cooldown",
+                        "needs",
+                        "failed",
+                        "failure",
+                        "rate-limit",
+                        "rate limit",
+                        "unavailable",
+                        "offline",
+                        "budget",
+                        "refused",
+                    ]
+                    .iter()
+                    .any(|word| pane.status.to_lowercase().contains(word)));
+            rows.push(super::news_view::SourceStatus {
+                name: name.into(),
+                status: health(
+                    configured.enabled(group),
+                    self.status.iter().find(|s| s.group == group),
+                    pane_ok,
+                    newest.is_none(),
+                    self.refreshed.is_none() && newest.is_none() && (!is_pane || pane.updated.is_none()),
+                ),
+                reason: if is_pane && !pane_ok {
+                    Some(pane.error.as_deref().unwrap_or(&pane.status).to_owned())
+                } else {
+                    self.status
+                        .iter()
+                        .find(|s| s.group == group)
+                        .and_then(|s| s.reason.clone())
+                        .or_else(|| is_pane.then(|| pane.status.clone()))
+                },
+                newest,
+                updated: if is_pane { pane.updated.map(|at| now - at.elapsed().as_secs() as i64) } else { None },
+            });
+        }
+        for feed in tr_data::feeds::FEEDS {
+            let saved = self.feeds.iter().find(|s| s.state.id == feed.id);
+            let guard =
+                saved.and_then(|s| s.host.as_ref()).or_else(|| self.status.iter().find(|s| s.group == feed.group));
+            let pending = saved.is_none_or(|s| s.state.last_status.is_empty());
+            let ok = pending || saved.is_some_and(|s| matches!(s.state.last_status.as_str(), "OK" | "Quiet"));
+            rows.push(super::news_view::SourceStatus {
+                name: feed.name.into(),
+                status: health(
+                    configured.enabled(feed.group) && !configured.disabled_feeds.contains(feed.id),
+                    guard,
+                    ok,
+                    saved.is_some_and(|s| feed.quiet(&s.state, now) || s.state.last_status == "Quiet"),
+                    pending,
+                ),
+                reason: guard
+                    .and_then(|s| s.reason.clone())
+                    .or_else(|| saved.filter(|_| !ok).map(|s| s.state.last_status.clone())),
+                newest: saved.and_then(|s| s.state.last_item_at),
+                updated: saved.and_then(|s| s.state.last_success_at),
+            });
+        }
+        rows
+    }
     fn refresh_delay(&self, interval: Duration) -> Option<Duration> {
         (!self.busy && !self.status_pending)
             .then(|| self.refreshed.map_or(Duration::ZERO, |at| interval.saturating_sub(at.elapsed())))
     }
     pub fn receive(&mut self, reply: Reply) {
+        self.status_revision = self.status_revision.wrapping_add(1);
         if reply.status_only {
             self.status_pending = false;
         } else {
@@ -301,6 +441,13 @@ fn section(ui: &mut Ui, title: &str) {
     ui.separator();
 }
 impl TerminalApp {
+    pub(super) fn refresh_news_sources(&mut self) {
+        // Reuse the settings reply (local ledger + feed_state only), without a
+        // repaint timer. Visible news panes refresh health on event-driven frames.
+        if self.data_sources.refresh_delay(Duration::from_secs(30)) == Some(Duration::ZERO) {
+            self.source_action(Action::Status);
+        }
+    }
     fn source_action(&mut self, action: Action) {
         self.data_sources.begin(&action);
         self.worker.send(Request::DataSources { action });
@@ -499,6 +646,191 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn news_health_uses_every_feed_errors_cooldowns_and_current_switches() {
+        let now = 40 * 86400;
+        let mut state = State { refreshed: Some(Instant::now()), ..State::default() };
+        state.feeds = tr_data::feeds::FEEDS
+            .iter()
+            .map(|feed| FeedStatus {
+                state: tr_data::feeds::State {
+                    id: feed.id.into(),
+                    last_status: "OK".into(),
+                    last_success_at: Some(now - 120),
+                    last_item_at: Some(now - 60),
+                    ..Default::default()
+                },
+                host: None,
+            })
+            .collect();
+        let mut pane = super::super::NewsPane::new(None);
+        pane.status = "Yahoo · updated just now".into();
+        pane.updated = Some(Instant::now());
+        let rows = state.news_sources(&pane, now);
+        assert_eq!(rows.len(), 15);
+        assert!(rows.iter().all(|s| matches!(s.status.as_str(), "OK" | "Quiet")));
+        state.feeds[0].state.last_status = "Connection failed".into();
+        state.feeds[1].state.last_item_at = Some(1);
+        state.feeds[2].host = Some(tr_net::Status {
+            group: "regulators",
+            enabled: true,
+            requests_today: 0,
+            cap: 100,
+            last_request: None,
+            paused_until: Some(now + 600),
+            reason: Some("cooldown".into()),
+            offline: false,
+            needs_contact: false,
+        });
+        pane.error = Some("Yahoo failed".into());
+        let rows = state.news_sources(&pane, now);
+        assert_eq!(rows[1].status, "Paused");
+        assert_eq!(rows[3].status, "Paused", "a past success must not hide the latest feed error");
+        assert_eq!(rows[4].status, "Quiet");
+        assert!(rows[5].status.starts_with("Paused until "));
+        assert_eq!(rows[5].newest, Some(now - 60));
+        assert_eq!(rows[5].updated, Some(now - 120));
+        state.settings.disabled_feeds.insert(tr_data::feeds::FEEDS[0].id.into());
+        state.settings.tech = false;
+        state.settings.finnhub = false;
+        let rows = state.news_sources(&pane, now);
+        assert_eq!(rows[0].status, "Off");
+        assert_eq!(rows[3].status, "Off");
+        for (feed, row) in tr_data::feeds::FEEDS.iter().zip(&rows[3..]) {
+            if feed.group == "tech" {
+                assert_eq!(row.status, "Off");
+            }
+        }
+        state.settings.pause_all = true;
+        let rows = state.news_sources(&pane, now);
+        assert_eq!(rows[0].status, "Off", "explicitly disabled stays out of aggregate");
+        assert_eq!(rows[1].status, "Paused", "global pause is health, not Off");
+    }
+
+    #[test]
+    fn review_n6b_unfetched_feeds_are_not_counted_paused() {
+        let now = 40 * 86400;
+        let mut state = State::default();
+        // What the worker sends for feeds that have not been polled yet (feed_statuses default rows).
+        state.feeds = tr_data::feeds::FEEDS
+            .iter()
+            .map(|feed| FeedStatus {
+                state: tr_data::feeds::State { id: feed.id.into(), ..Default::default() },
+                host: None,
+            })
+            .collect();
+        let pane = super::super::NewsPane::new(None);
+        let rows = state.news_sources(&pane, now);
+        let paused: Vec<_> =
+            rows[3..].iter().filter(|r| r.status.starts_with("Paused")).map(|r| r.name.clone()).collect();
+        assert!(paused.is_empty(), "pending feeds reported paused: {paused:?}");
+        let rows = State::default().news_sources(&pane, now);
+        assert!(!rows[3..].iter().any(|r| r.status.starts_with("Paused")), "before the first Status reply too");
+    }
+
+    #[test]
+    fn review_n6b_manual_pause_is_not_shown_as_a_clock_time() {
+        let now = 40 * 86400;
+        let state = State {
+            status: vec![tr_net::Status {
+                group: "finnhub",
+                enabled: true,
+                requests_today: 0,
+                cap: 100,
+                last_request: None,
+                paused_until: Some(253_402_300_799),
+                reason: Some("paused".into()),
+                offline: false,
+                needs_contact: false,
+            }],
+            ..State::default()
+        };
+        let pane = super::super::NewsPane::new(None);
+        let rows = state.news_sources(&pane, now);
+        assert!(!rows[0].status.starts_with("Paused until "), "{}", rows[0].status);
+    }
+
+    #[test]
+    fn n6b_source_cache_key_tracks_replies_settings_and_item_revision_not_frames() {
+        let now = 40 * 86400;
+        let mut state = State::default();
+        let mut pane = super::super::NewsPane::new(None);
+        state.update_news_sources(&mut pane, now);
+        let key = pane.interaction.source_cache.key.clone();
+        assert_eq!(pane.interaction.source_cache.summary, "15 sources · 15 pending · not updated yet");
+        let summary = pane.interaction.source_cache.summary.clone();
+        let hover = pane.interaction.source_cache.hover.clone();
+        state.begin(&Action::Status);
+        state.update_news_sources(&mut pane, now + 3600);
+        assert!(pane.interaction.source_cache.key == key);
+        assert_eq!(pane.interaction.source_cache.summary, summary);
+        assert_eq!(pane.interaction.source_cache.hover, hover);
+
+        state.receive(Reply {
+            status: Ok(vec![]),
+            feeds: vec![],
+            masked_key: String::new(),
+            message: None,
+            status_only: true,
+        });
+        state.update_news_sources(&mut pane, now);
+        assert!(pane.interaction.source_cache.key != key, "status reply invalidates cached health");
+        let key = pane.interaction.source_cache.key.clone();
+        state.settings.finnhub = false;
+        state.update_news_sources(&mut pane, now);
+        assert!(pane.interaction.source_cache.key != key, "settings invalidate cached counts");
+        assert!(pane.interaction.source_cache.summary.starts_with("14 sources · 12 pending"));
+        let key = pane.interaction.source_cache.key.clone();
+        pane.item_revision += 1;
+        state.update_news_sources(&mut pane, now);
+        assert!(pane.interaction.source_cache.key != key, "item revision invalidates cached ages");
+        let key = pane.interaction.source_cache.key.clone();
+        pane.error = Some("Finnhub failure".into());
+        state.update_news_sources(&mut pane, now);
+        assert!(pane.interaction.source_cache.key != key, "reason changes must also be visible immediately");
+    }
+
+    #[test]
+    fn n6b_source_hover_keeps_pane_failures_and_manual_pause_instructions() {
+        let now = 40 * 86400;
+        let state = State::default();
+        let mut pane = super::super::NewsPane::new(None);
+        for reason in ["Finnhub rate-limit: retry later", "Finnhub failure: unavailable"] {
+            pane.status = reason.into();
+            state.update_news_sources(&mut pane, now);
+            assert!(pane.interaction.source_cache.hover.contains(&format!("Finnhub · Paused — {reason}")));
+        }
+        pane.error = Some("Detailed fetch error".into());
+        state.update_news_sources(&mut pane, now);
+        assert!(pane.interaction.source_cache.hover.contains("Finnhub · Paused — Detailed fetch error"));
+        let state = State {
+            status: vec![tr_net::Status {
+                group: "finnhub",
+                enabled: true,
+                requests_today: 0,
+                cap: 100,
+                last_request: None,
+                paused_until: Some(253_402_300_799),
+                reason: None,
+                offline: false,
+                needs_contact: false,
+            }],
+            ..State::default()
+        };
+        assert_eq!(state.news_sources(&pane, now)[0].status, "Paused — press Resume in Data sources");
+    }
+
+    #[test]
+    fn news_source_status_refresh_is_local_bounded_and_reuses_settings_request() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/news-health");
+        let (worker, mut requests) = crate::worker::Worker::recording();
+        let mut app = TerminalApp::isolated_workspace(&root, worker);
+        app.refresh_news_sources();
+        assert!(matches!(requests.try_recv(), Ok(Request::DataSources { action: Action::Status })));
+        app.refresh_news_sources();
+        assert!(requests.try_recv().is_err(), "do not poll while status is pending");
+    }
     #[test]
     fn n6_group_and_feed_switches_persist_and_legacy_settings_default_on() {
         let mut old: super::super::Settings =
