@@ -13,6 +13,9 @@ pub struct Story {
     pub id: String,
     pub item: NewsItem,
     pub source: String,
+    /// Publishers retained when multiple feeds deliver the same canonical URL.
+    #[serde(default)]
+    pub sources: Vec<String>,
     pub provider_id: String,
     /// Transport provider is separate from the publisher used for story leads.
     #[serde(default)]
@@ -43,6 +46,7 @@ impl Story {
             id: Sha1::digest(identity.as_bytes()).iter().map(|b| format!("{b:02x}")).collect(),
             item: NewsItem { link, ..item },
             source: source.into(),
+            sources: vec![],
             provider_id: String::new(),
             provider: source.into(),
             subjects: vec![],
@@ -98,6 +102,8 @@ pub struct Filters {
     pub scope: Scope,
     pub watchlist: Option<String>,
     pub sources: Vec<String>,
+    /// Empty means all; old pane JSON retains every category.
+    pub categories: Vec<String>,
     pub include: String,
     pub exclude: String,
     pub search: String,
@@ -110,6 +116,7 @@ impl Default for Filters {
             scope: Scope::Symbol,
             watchlist: None,
             sources: vec![],
+            categories: vec![],
             include: String::new(),
             exclude: String::new(),
             search: String::new(),
@@ -138,11 +145,18 @@ pub fn matches(story: &Story, q: &Query) -> bool {
         && matches_columns(
             &format!("{} {}", story.item.title, story.summary),
             &story.item.tickers,
-            (&story.source, &story.provider),
+            (&format!("{}\u{001f}{}", story.source, story.sources.join("\u{001f}")), &story.provider),
             &story.category,
             story.item.ts,
             q,
         )
+}
+/// Legacy vendor labels belong on the markets desk.
+pub fn category_key(category: &str) -> &str {
+    match category {
+        "general" | "company" | "forex" | "merger" => "markets",
+        _ => category,
+    }
 }
 // N1b: SQL matching needs no identity hash, URL parsing or topic enrichment.
 fn matches_columns(
@@ -158,7 +172,9 @@ fn matches_columns(
         && !(f.scope == Scope::Watchlist && q.symbols.is_empty())
         && !(f.scope == Scope::Symbol && q.symbols.is_empty() && category != "general")
         && (q.symbols.is_empty() || q.symbols.iter().any(|key| tickers.contains(key)))
-        && (f.sources.is_empty() || f.sources.iter().any(|s| s == provenance.0 || s == provenance.1))
+        && (f.sources.is_empty()
+            || f.sources.iter().any(|s| provenance.0.split('\u{001f}').any(|p| p == s) || s == provenance.1))
+        && (f.categories.is_empty() || f.categories.iter().any(|c| c == category_key(category)))
         && (f.include.is_empty() || whole_word(text, &f.include))
         && (f.exclude.is_empty() || !whole_word(text, &f.exclude))
         && search_matches(text, tickers, &f.search)
@@ -605,6 +621,10 @@ impl NewsStore {
             CREATE TABLE IF NOT EXISTS notification_history(at INTEGER NOT NULL,body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS notification_slots(at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS news_fetches(at INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS feed_state(id TEXT PRIMARY KEY,etag TEXT,last_modified TEXT,last_success_at INTEGER,last_item_at INTEGER,last_status TEXT NOT NULL DEFAULT '',items_today INTEGER NOT NULL DEFAULT 0,day INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS item_sources(id TEXT NOT NULL,source TEXT NOT NULL,feed_id TEXT NOT NULL,PRIMARY KEY(id,source,feed_id));
+            CREATE INDEX IF NOT EXISTS item_sources_feed ON item_sources(feed_id);
+            INSERT OR IGNORE INTO item_sources SELECT id,source,provider_id FROM items;
             INSERT OR IGNORE INTO news_fetches SELECT DISTINCT fetched FROM items;",
             )?;
             let columns: Vec<String> = db
@@ -770,6 +790,7 @@ impl NewsStore {
         let cutoff = now - 90 * 86400;
         let tx = self.db.unchecked_transaction()?;
         let removed = tx.execute("DELETE FROM items WHERE published < ?1 AND bookmark=0", [cutoff])?;
+        tx.execute("DELETE FROM item_sources WHERE id NOT IN (SELECT id FROM items)", [])?;
         tx.execute(
             "DELETE FROM notification_seen WHERE (kind,id) IN (SELECT kind,id FROM notification_seen_at WHERE at < ?1)",
             [cutoff],
@@ -807,9 +828,14 @@ impl NewsStore {
             // fallback even though N1b displays the publisher separately.
             let identity_source = if story.provider.is_empty() { &story.source } else { &story.provider };
             let canonical = Story::new(story.item.clone(), identity_source);
-            let id = canonical.id;
+            let id =
+                if story.provider == "rss" && canonical.item.link.is_empty() { story.id.clone() } else { canonical.id };
             tx.execute("INSERT OR IGNORE INTO items(id,source,provider_id,url,headline,summary,published,tickers,category,fetched,provider,inferred_ts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![id, story.source, story.provider_id, canonical.item.link, story.item.title, story.summary, if story.item.ts <= 0 { now } else { story.item.ts }, serde_json::to_string(&story.item.tickers)?, story.category, now, story.provider, story.inferred_ts || story.item.ts <= 0])?;
+            tx.execute(
+                "INSERT OR IGNORE INTO item_sources VALUES(?1,?2,?3)",
+                params![id, story.source, story.provider_id],
+            )?;
             let (raw, title, summary): (String, String, String) =
                 tx.query_row("SELECT tickers,headline,summary FROM items WHERE id=?1", [&id], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -841,6 +867,52 @@ impl NewsStore {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn load_feed_state(&self, id: &str) -> Result<crate::feeds::State> {
+        Ok(self.db.query_row("SELECT id,etag,last_modified,last_success_at,last_item_at,last_status,items_today,day FROM feed_state WHERE id=?1",[id],|r|Ok(crate::feeds::State {
+            id:r.get(0)?,etag:r.get(1)?,last_modified:r.get(2)?,last_success_at:r.get(3)?,last_item_at:r.get(4)?,last_status:r.get(5)?,items_today:r.get(6)?,day:r.get(7)?
+        })).optional()?.unwrap_or_else(||crate::feeds::State {id:id.into(),..Default::default()}))
+    }
+    pub fn feed_states(&self) -> Result<Vec<crate::feeds::State>> {
+        crate::feeds::FEEDS.iter().map(|f| self.load_feed_state(f.id)).collect()
+    }
+    pub fn save_feed_error(&self, id: &str, reason: &str) -> Result<()> {
+        self.db.execute("INSERT INTO feed_state(id,last_status) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET last_status=excluded.last_status",params![id,reason])?;
+        Ok(())
+    }
+    /// Advance validators only after a successful parse and durable item insertion.
+    /// A crash before this write merely replays an idempotent page next time.
+    pub fn save_feed(
+        &mut self,
+        feed: &crate::feeds::Feed,
+        stories: &[Story],
+        metadata: &tr_net::ResponseMetadata,
+        now: i64,
+    ) -> Result<()> {
+        let mut state = self.load_feed_state(feed.id)?;
+        let count = |db: &Connection| -> rusqlite::Result<u32> {
+            db.query_row("SELECT count(*) FROM item_sources WHERE feed_id=?1", [feed.id], |r| r.get(0))
+        };
+        let before = count(&self.db)?;
+        if state.last_success_at.is_none() {
+            self.suppress_import(stories)?;
+        }
+        self.insert(stories, now)?;
+        let added = count(&self.db)?.saturating_sub(before);
+        state.items_today = if state.day == now / 86400 { state.items_today.saturating_add(added) } else { added };
+        state.day = now / 86400;
+        state.last_success_at = Some(now);
+        state.last_item_at =
+            state.last_item_at.max(stories.iter().filter(|s| !s.inferred_ts && s.item.ts > 0).map(|s| s.item.ts).max());
+        if metadata.status == 304 {
+            state.etag = metadata.etag.clone().or(state.etag);
+            state.last_modified = metadata.last_modified.clone().or(state.last_modified);
+        } else {
+            state.etag = metadata.etag.clone();
+            state.last_modified = metadata.last_modified.clone();
+        }
+        self.db.execute("INSERT INTO feed_state VALUES(?1,?2,?3,?4,?5,'OK',?6,?7) ON CONFLICT(id) DO UPDATE SET etag=excluded.etag,last_modified=excluded.last_modified,last_success_at=excluded.last_success_at,last_item_at=excluded.last_item_at,last_status=excluded.last_status,items_today=excluded.items_today,day=excluded.day",params![feed.id,state.etag,state.last_modified,state.last_success_at,state.last_item_at,state.items_today,state.day])?;
         Ok(())
     }
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -1097,7 +1169,7 @@ impl NewsStore {
         // Enrichment is optional: read-only disks and transient write failures
         // must never hide otherwise readable saved history.
         let _ = self.backfill(q);
-        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category,tags,seen,provider,subjects,intelligence,bookmark,inferred_ts FROM items WHERE published>=?1 AND published<=?2".to_string();
+        let mut sql = "SELECT id,source,provider_id,url,headline,summary,published,tickers,category,tags,seen,provider,subjects,intelligence,bookmark,inferred_ts,(SELECT json_group_array(source) FROM (SELECT DISTINCT source FROM item_sources WHERE id=items.id ORDER BY source)) FROM items WHERE published>=?1 AND published<=?2".to_string();
         if q.filters.saved {
             sql.push_str(" AND bookmark=1");
         }
@@ -1138,13 +1210,14 @@ impl NewsStore {
             values.push(format!("%{root} %").into());
             values.push(format!("%{root}\"%").into());
         }
-        sql.push_str(" AND news_matches(headline,summary,tickers,source||char(0)||provider,category,published,?3) ORDER BY published DESC,id LIMIT ?4 OFFSET ?5");
+        sql.push_str(" AND news_matches(headline,summary,tickers,source||char(31)||coalesce((SELECT group_concat(source,char(31)) FROM item_sources WHERE id=items.id),'')||char(0)||provider,category,published,?3) ORDER BY published DESC,id LIMIT ?4 OFFSET ?5");
         let mut stmt = self.db.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
             let raw: String = r.get(7)?;
             Ok(Story {
                 id: r.get(0)?,
                 source: r.get(1)?,
+                sources: serde_json::from_str(&r.get::<_, String>(16)?).unwrap_or_default(),
                 provider_id: r.get(2)?,
                 provider: r.get(11)?,
                 summary: r.get(5)?,

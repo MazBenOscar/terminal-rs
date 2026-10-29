@@ -28,7 +28,7 @@ Default ledger on this macOS account:
 
 Generally: `$HOME/Library/Application Support/terminal-rs-net/ledger.sqlite3` on macOS; `$XDG_DATA_HOME/terminal-rs-net/ledger.sqlite3` elsewhere (fallback `$HOME/.local/share`). Only `TR_NET_LEDGER` overrides the production path. Supplied HOME, XDG_DATA_HOME and TR_NET_LEDGER must be nonempty absolute paths; invalid paths fail closed. `TR_DATA_DIR` never selects or resets it. A failed shared-guard initialization is retried on demand at most once per minute, with requests refused meanwhile.
 
-An overridden `TR_DATA_DIR` is offline unless `TR_ALLOW_EXTERNAL` equals exactly `1`. The environment is captured when a guard is constructed. Tests inject that same environment lookup with repository-local temporary paths, so parallel tests never mutate process-global environment variables or open the user's ledger.
+Instances with `TR_DATA_DIR` are offline unless `TR_ALLOW_EXTERNAL=1` is explicitly supplied. The environment is captured when a guard is constructed. Tests inject that same environment lookup with repository-local temporary paths, so parallel tests never mutate process-global environment variables or open the user's ledger. HTTP mocks use an explicit loopback-only transport.
 
 The ledger uses WAL and a five-second busy timeout. UTC-day request counts, pacing reservations and in-flight leases are checked/reserved in one SQLite IMMEDIATE transaction. The extra `inflight` and `transport_failures` tables preserve concurrency and transport-failure counting across independent guard instances/processes. `last_request.at` and lease deadlines use Unix milliseconds; cooldown deadlines use Unix seconds; `requests.day` is the UTC epoch day. Every reserved attempt consumes budget, including transport failures.
 

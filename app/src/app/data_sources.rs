@@ -12,10 +12,16 @@ pub enum Action {
     Status,
     Save(String),
     Remove,
+    Resume(String),
+}
+pub struct FeedStatus {
+    pub state: tr_data::feeds::State,
+    pub host: Option<tr_net::Status>,
 }
 pub struct Reply {
     pub status: Result<Vec<tr_net::Status>, String>,
     pub masked_key: String,
+    pub feeds: Vec<FeedStatus>,
     pub message: Option<Result<String, String>>,
     status_only: bool,
 }
@@ -32,6 +38,7 @@ pub struct State {
     status_pending: bool,
     refreshed: Option<Instant>,
     status: Vec<tr_net::Status>,
+    feeds: Vec<FeedStatus>,
     message: Option<Result<String, String>>,
 }
 pub(super) fn deserialize_settings<'de, D: serde::Deserializer<'de>>(
@@ -63,6 +70,7 @@ impl State {
         }
         self.refreshed = Some(Instant::now());
         self.masked_key = reply.masked_key;
+        self.feeds = reply.feeds;
         match reply.status {
             Ok(rows) => self.status = rows,
             Err(error) => self.message = Some(Err(error)),
@@ -87,10 +95,22 @@ fn finnhub_request(key: &str) -> reqwest::RequestBuilder {
     }
 }
 pub async fn perform(action: Action, cached_key: Option<&str>) -> Reply {
-    if matches!(&action, Action::Status) {
+    if matches!(&action, Action::Status | Action::Resume(_)) {
+        let status_only = matches!(&action, Action::Status);
+        let status = tokio::task::spawn_blocking(move || {
+            let guard = tr_net::shared()?;
+            if let Action::Resume(group) = action {
+                guard.resume(&group)?;
+            }
+            guard.status()
+        })
+        .await
+        .unwrap_or(Err(tr_net::Refused::Ledger))
+        .map_err(|e| e.to_string());
         return Reply {
-            status_only: true,
-            status: tr_net::shared().and_then(|g| g.status()).map_err(|e| e.to_string()),
+            feeds: vec![],
+            status_only,
+            status,
             masked_key: cached_key.map(mask).unwrap_or_default(),
             message: None,
         };
@@ -106,6 +126,13 @@ async fn perform_with_store(
     let status_only = matches!(&action, Action::Status);
     let message = match action {
         Action::Status => None,
+        Action::Resume(group) => Some(
+            guard
+                .as_ref()
+                .map_err(|e| e.to_string())
+                .and_then(|g| g.resume(&group).map_err(|e| e.to_string()))
+                .map(|()| "Source resumed; normal spacing applies".into()),
+        ),
         Action::Remove => Some(
             store.clear().map(|()| "Finnhub key removed".into()).map_err(|_| "Could not remove Finnhub key".into()),
         ),
@@ -133,6 +160,7 @@ async fn perform_with_store(
         Err(_) => (String::new(), Some(Err("Could not read Finnhub key".into()))),
     };
     Reply {
+        feeds: vec![],
         status_only,
         status: guard.and_then(|g| g.status()).map_err(|e| e.to_string()),
         masked_key,
@@ -144,13 +172,26 @@ fn timestamp(value: i64) -> String {
         .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| "—".into())
 }
+fn item_age(at: i64, now: i64) -> String {
+    let age = now.saturating_sub(at).max(0);
+    match age {
+        0..60 => "just now".into(),
+        60..3600 => format!("{}m ago", age / 60),
+        3600..86400 => format!("{}h ago", age / 3600),
+        _ => format!("{}d ago", age / 86400),
+    }
+}
 fn state_text(status: &tr_net::Status, has_key: bool) -> String {
     if status.offline {
         "Offline (test instance)".into()
     } else if !status.enabled {
         status.reason.as_deref().filter(|s| s.starts_with("Corrupt data_sources")).unwrap_or("Off").into()
     } else if let Some(until) = status.paused_until {
-        format!("Paused until {}", timestamp(until))
+        if until == 253_402_300_799 {
+            "Paused — press Resume".into()
+        } else {
+            format!("Paused until {}", timestamp(until))
+        }
     } else if status.needs_contact {
         "Needs contact email".into()
     } else if status.group == "finnhub" && !has_key {
@@ -159,12 +200,89 @@ fn state_text(status: &tr_net::Status, has_key: bool) -> String {
         "On".into()
     }
 }
+fn group_status_text(group: &str, enabled: bool, status: Option<&tr_net::Status>) -> String {
+    if !enabled {
+        return "Off — turn on to fetch".into();
+    }
+    let requests = status.map_or(0, |status| status.requests_today);
+    let cap = status.map(|status| status.cap).unwrap_or_else(|| {
+        tr_net::policies().iter().find(|policy| policy.group == group).map_or(0, |policy| policy.daily_cap)
+    });
+    format!("On · {requests} / {cap} today")
+}
+fn feed_status_label(
+    feed: &tr_data::feeds::Feed,
+    group_enabled: bool,
+    feed_enabled: bool,
+    saved: Option<&FeedStatus>,
+    now: i64,
+) -> &'static str {
+    if !group_enabled {
+        return "Group off";
+    }
+    if !feed_enabled {
+        return "Off";
+    }
+    let Some(saved) = saved else { return "Pending" };
+    let state = &saved.state;
+    let reason = saved.host.as_ref().and_then(|h| h.reason.as_deref()).unwrap_or(&state.last_status);
+    if saved.host.as_ref().is_some_and(|h| h.paused_until == Some(253_402_300_799)) {
+        "Paused — press Resume"
+    } else if reason.contains("Not a feed") {
+        "Not a feed"
+    } else if saved.host.as_ref().is_some_and(|h| h.paused_until.is_some()) {
+        "Paused"
+    } else if feed.quiet(state, now) {
+        "Quiet"
+    } else if state.last_success_at.is_some() {
+        "OK"
+    } else if !reason.is_empty() {
+        "Fetch failed"
+    } else {
+        "Pending"
+    }
+}
+fn feed_row(ui: &mut Ui, sources: &mut State, feed: &tr_data::feeds::Feed) -> bool {
+    let group_enabled = sources.settings.enabled(feed.group);
+    let mut enabled = !sources.settings.disabled_feeds.contains(feed.id);
+    let opacity = ui.opacity();
+    if !group_enabled {
+        // Dim the whole checkbox, including its tick, but keep pre-selection interactive.
+        ui.multiply_opacity(0.45);
+    }
+    let changed = ui.checkbox(&mut enabled, feed.name).changed();
+    ui.set_opacity(opacity);
+    if changed {
+        if enabled {
+            sources.settings.disabled_feeds.remove(feed.id);
+        } else {
+            sources.settings.disabled_feeds.insert(feed.id.into());
+        }
+    }
+    let saved = sources.feeds.iter().find(|s| s.state.id == feed.id);
+    let now = chrono::Utc::now().timestamp();
+    let label = feed_status_label(feed, group_enabled, enabled, saved, now);
+    let success = saved.and_then(|s| s.state.last_success_at).map(timestamp).unwrap_or_else(|| "—".into());
+    let age = saved.and_then(|s| s.state.last_item_at).map(|at| item_age(at, now)).unwrap_or_else(|| "—".into());
+    let reason =
+        saved.map_or("", |s| s.host.as_ref().and_then(|h| h.reason.as_deref()).unwrap_or(&s.state.last_status));
+    ui.label(
+        RichText::new(format!("{label} · last success {success} · newest {age}"))
+            .font(mono(11.0))
+            .color(theme::muted()),
+    )
+    .on_hover_text(reason);
+    changed
+}
 fn source_name(group: &str) -> &str {
     match group {
         "finnhub" => "Finnhub",
         "sec" => "SEC EDGAR",
         "yahoo-news" => "Yahoo news",
         "coindesk" => "CoinDesk",
+        "regulators" => "Regulators",
+        "global-media" => "Global media",
+        "tech" => "Tech",
         "house-disclosures" => "House disclosures",
         "house-roster" => "House roster",
         // SENATE-BARGO
@@ -194,7 +312,6 @@ impl TerminalApp {
         ui.horizontal_wrapped(|ui| {
             for (label, enabled) in [
                 ("Finnhub", &mut self.data_sources.settings.finnhub),
-                ("SEC EDGAR", &mut self.data_sources.settings.sec),
                 ("Yahoo news", &mut self.data_sources.settings.yahoo_news),
                 ("CoinDesk", &mut self.data_sources.settings.coindesk),
                 ("House disclosures", &mut self.data_sources.settings.house_disclosures),
@@ -203,6 +320,59 @@ impl TerminalApp {
                 changed |= ui.checkbox(enabled, label).changed();
             }
         });
+        let mut resume = None;
+        ui.horizontal_wrapped(|ui| {
+            changed |= ui.checkbox(&mut self.data_sources.settings.sec, "SEC EDGAR").changed();
+            let status = self.data_sources.status.iter().find(|s| s.group == "sec");
+            ui.label(
+                RichText::new(group_status_text("sec", self.data_sources.settings.sec, status))
+                    .font(mono(11.0))
+                    .color(theme::muted()),
+            );
+            if let Some(status) = status
+                && status.paused_until.is_some()
+                && ui.small_button("Resume").clicked()
+            {
+                resume = Some("sec".to_string());
+            }
+        });
+        ui.indent("sec-subfeeds", |ui| {
+            changed |= feed_row(ui, &mut self.data_sources, &tr_data::feeds::FEEDS[1]);
+        });
+        section(ui, "Built-in RSS feeds");
+        for group in ["regulators", "global-media", "tech"] {
+            ui.horizontal_wrapped(|ui| {
+                let enabled = match group {
+                    "regulators" => &mut self.data_sources.settings.regulators,
+                    "global-media" => &mut self.data_sources.settings.global_media,
+                    _ => &mut self.data_sources.settings.tech,
+                };
+                changed |= ui.checkbox(enabled, source_name(group)).changed();
+                let status = self.data_sources.status.iter().find(|s| s.group == group);
+                ui.label(
+                    RichText::new(group_status_text(group, *enabled, status)).font(mono(11.0)).color(theme::muted()),
+                );
+                if let Some(status) = status {
+                    if let Some(reason) = &status.reason {
+                        ui.label(RichText::new(reason).font(ui_font(11.0)).color(theme::muted()));
+                    }
+                    if status.paused_until.is_some() && ui.small_button("Resume").clicked() {
+                        resume = Some(group.to_string());
+                    }
+                }
+            });
+            egui::CollapsingHeader::new(format!("{} feeds", source_name(group))).id_salt(("rss-feeds", group)).show(
+                ui,
+                |ui| {
+                    for feed in tr_data::feeds::FEEDS.iter().filter(|f| f.group == group) {
+                        changed |= feed_row(ui, &mut self.data_sources, feed);
+                    }
+                },
+            );
+        }
+        if let Some(group) = resume {
+            self.source_action(Action::Resume(group));
+        }
         section(ui, "Finnhub API key");
         ui.label(
             RichText::new("Personal, non-commercial use. Save & Test makes one guarded AAPL quote request.")
@@ -330,6 +500,84 @@ impl TerminalApp {
 mod tests {
     use super::*;
     #[test]
+    fn n6_group_and_feed_switches_persist_and_legacy_settings_default_on() {
+        let mut old: super::super::Settings =
+            serde_json::from_str(r#"{"data_sources":{"finnhub":false},"sidebar":false}"#).unwrap();
+        assert!(old.data_sources.regulators && old.data_sources.global_media && old.data_sources.tech);
+        assert!(old.data_sources.disabled_feeds.is_empty());
+        old.data_sources.regulators = false;
+        old.data_sources.global_media = false;
+        old.data_sources.tech = false;
+        for feed in tr_data::feeds::FEEDS {
+            old.data_sources.disabled_feeds.insert(feed.id.into());
+        }
+        let loaded: super::super::Settings = serde_json::from_slice(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(!loaded.sidebar && !loaded.data_sources.finnhub);
+        assert!(!loaded.data_sources.regulators && !loaded.data_sources.global_media && !loaded.data_sources.tech);
+        assert_eq!(loaded.data_sources.disabled_feeds.len(), 12);
+        for group in ["regulators", "global-media", "tech"] {
+            assert_ne!(source_name(group), "Unknown source");
+        }
+    }
+    #[test]
+    fn feed_status_labels_respect_group_and_feed_switches_before_cached_status() {
+        let feed = &tr_data::feeds::FEEDS[0];
+        let now = 40 * 86400;
+        let mut saved = FeedStatus { state: Default::default(), host: None };
+        for cached in [None, Some(&saved)] {
+            assert_eq!(feed_status_label(feed, false, true, cached, now), "Group off");
+            assert_eq!(feed_status_label(feed, false, false, cached, now), "Group off");
+            assert_eq!(feed_status_label(feed, true, false, cached, now), "Off");
+            assert_eq!(feed_status_label(feed, true, true, cached, now), "Pending");
+        }
+        saved.state.last_status = "Connection failed".into();
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "Fetch failed");
+        saved.state.last_success_at = Some(now);
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "OK");
+        saved.state.last_item_at = Some(1);
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "Quiet");
+        saved.host = Some(tr_net::Status {
+            group: feed.group,
+            enabled: true,
+            requests_today: 7,
+            cap: 120,
+            last_request: None,
+            paused_until: Some(now + 60),
+            reason: None,
+            offline: false,
+            needs_contact: false,
+        });
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "Paused");
+        saved.state.last_status = "Not a feed".into();
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "Not a feed");
+        saved.host.as_mut().unwrap().paused_until = Some(253_402_300_799);
+        assert_eq!(feed_status_label(feed, true, true, Some(&saved), now), "Paused — press Resume");
+        // Cached success, failure and host pauses cannot override the current switches.
+        assert_eq!(feed_status_label(feed, false, true, Some(&saved), now), "Group off");
+        assert_eq!(feed_status_label(feed, true, false, Some(&saved), now), "Off");
+    }
+    #[test]
+    fn group_status_labels_use_current_switch_even_without_or_with_stale_status() {
+        for group in ["sec", "regulators", "global-media", "tech"] {
+            assert_eq!(group_status_text(group, false, None), "Off — turn on to fetch");
+            let cap = tr_net::policies().iter().find(|p| p.group == group).unwrap().daily_cap;
+            assert_eq!(group_status_text(group, true, None), format!("On · 0 / {cap} today"));
+            let status = tr_net::Status {
+                group,
+                enabled: false,
+                requests_today: 7,
+                cap,
+                last_request: None,
+                paused_until: None,
+                reason: None,
+                offline: false,
+                needs_contact: false,
+            };
+            assert_eq!(group_status_text(group, true, Some(&status)), format!("On · 7 / {cap} today"));
+            assert_eq!(group_status_text(group, false, Some(&status)), "Off — turn on to fetch");
+        }
+    }
+    #[test]
     fn refresh_is_bounded_and_never_spins_while_pending() {
         let interval = Duration::from_secs(10);
         let mut state = State::default();
@@ -338,7 +586,13 @@ mod tests {
         assert_eq!(state.refresh_delay(interval), None);
         state.refreshed = Some(Instant::now() - interval);
         assert_eq!(state.refresh_delay(interval), None);
-        state.receive(Reply { status: Ok(Vec::new()), masked_key: String::new(), message: None, status_only: false });
+        state.receive(Reply {
+            status: Ok(Vec::new()),
+            masked_key: String::new(),
+            message: None,
+            feeds: vec![],
+            status_only: false,
+        });
         assert!(state.refresh_delay(interval).unwrap() > Duration::from_secs(9));
     }
     #[test]
@@ -349,13 +603,20 @@ mod tests {
         assert!(!state.busy);
         assert_eq!(state.refresh_delay(Duration::from_secs(10)), None);
         state.begin(&Action::Save("fixture".into()));
-        state.receive(Reply { status: Ok(Vec::new()), masked_key: String::new(), message: None, status_only: true });
+        state.receive(Reply {
+            status: Ok(Vec::new()),
+            masked_key: String::new(),
+            message: None,
+            feeds: vec![],
+            status_only: true,
+        });
         assert!(state.busy, "a status reply must not finish Save & Test");
         assert!(!state.status_pending);
         state.receive(Reply {
             status: Ok(Vec::new()),
             masked_key: String::new(),
             message: Some(Ok("saved".into())),
+            feeds: vec![],
             status_only: false,
         });
         assert!(!state.busy);
@@ -443,6 +704,8 @@ mod tests {
         assert_eq!(state_text(&status, false), "Needs contact email");
         status.paused_until = Some(1);
         assert!(state_text(&status, false).starts_with("Paused until "));
+        status.paused_until = Some(253_402_300_799);
+        assert_eq!(state_text(&status, false), "Paused — press Resume");
         status.enabled = false;
         assert_eq!(state_text(&status, false), "Off");
         status.offline = true;

@@ -432,8 +432,12 @@ impl LocalState {
                 propagated.extend(c.member_ids.clone());
                 continue;
             }
-            let sources: std::collections::BTreeSet<_> =
-                c.members.iter().filter(|m| m.item.ts >= now - 3600).map(|m| &m.source).collect();
+            let sources: std::collections::BTreeSet<_> = c
+                .members
+                .iter()
+                .filter(|m| m.item.ts >= now - 3600)
+                .flat_map(|m| std::iter::once(&m.source).chain(m.sources.iter()))
+                .collect();
             let blocked = c.members.iter().any(|m| claimed("breaking-block", &m.id));
             if sources.len() >= 4
                 && self.settings.enabled
@@ -755,6 +759,102 @@ pub(super) async fn publish(s: &Arc<Shared>) {
         read_view(s, view, false).await;
     }
 }
+pub(super) async fn feed_statuses(s: &Arc<Shared>) -> Vec<crate::app::data_sources::FeedStatus> {
+    blocking(s, |s| {
+        let locked = s.news.store.blocking_lock();
+        let Some(store) = locked.as_ref() else { return vec![] };
+        let guard = tr_net::shared().ok();
+        tr_data::feeds::FEEDS
+            .iter()
+            .filter_map(|feed| {
+                Some(crate::app::data_sources::FeedStatus {
+                    state: store.feed_state(feed.id).ok()?,
+                    host: guard.and_then(|g| g.host_status(feed.group, feed.url).ok()),
+                })
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+#[derive(Default)]
+struct FeedTasks {
+    tasks: tokio::task::JoinSet<anyhow::Result<()>>,
+    in_flight: std::collections::HashMap<tokio::task::Id, &'static tr_data::feeds::Feed>,
+}
+impl FeedTasks {
+    fn available(&self, feed: &tr_data::feeds::Feed) -> bool {
+        let host = |feed: &tr_data::feeds::Feed| feed.url.split('/').nth(2);
+        !self.in_flight.values().any(|running| running.id == feed.id || host(running) == host(feed))
+    }
+    async fn completed(&mut self) -> anyhow::Result<()> {
+        match self.tasks.join_next_with_id().await {
+            Some(Ok((id, result))) => {
+                self.in_flight.remove(&id);
+                result
+            }
+            Some(Err(error)) => {
+                self.in_flight.remove(&error.id());
+                Err(error.into())
+            }
+            None => Ok(()),
+        }
+    }
+}
+async fn feed_tick(
+    s: &Arc<Shared>,
+    schedule: &mut tr_data::feeds::Schedule,
+    tasks: &mut FeedTasks,
+) -> anyhow::Result<()> {
+    let visible = !s.news.views.lock().await.is_empty();
+    if !tick_enabled(visible, &s.news.local.lock().await.settings) {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Some(feed) = schedule.next_available(now, |feed| tasks.available(feed)) else { return Ok(()) };
+    let shared = Arc::clone(s);
+    let task = tasks.tasks.spawn(async move { fetch_feed(&shared, feed).await });
+    tasks.in_flight.insert(task.id(), feed);
+    Ok(())
+}
+async fn fetch_feed(s: &Arc<Shared>, feed: &'static tr_data::feeds::Feed) -> anyhow::Result<()> {
+    let state = blocking(s, move |s| -> anyhow::Result<_> {
+        s.news
+            .store
+            .blocking_lock()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("News store unavailable"))?
+            .feed_state(feed.id)
+    })
+    .await??;
+    let guard = blocking(s, |_| tr_net::shared()).await??;
+    let result = feed.fetch(guard, &state).await;
+    let now = chrono::Utc::now().timestamp();
+    let success = result.is_ok();
+    blocking(s, move |s| -> anyhow::Result<()> {
+        let mut locked = s.news.store.blocking_lock();
+        let store = locked.as_mut().ok_or_else(|| anyhow::anyhow!("News store unavailable"))?;
+        match result {
+            Ok((stories, metadata)) => store.save_feed(feed, &stories, &metadata, now),
+            // Host spacing deferred the fetch locally (e.g. right after a restart):
+            // nothing was sent, so keep the last real status instead of "Source busy".
+            Err(error) if matches!(error.downcast_ref::<tr_net::Refused>(), Some(tr_net::Refused::Busy)) => Ok(()),
+            Err(error) => {
+                let reason = guard
+                    .host_status(feed.group, feed.url)
+                    .ok()
+                    .and_then(|s| s.reason)
+                    .unwrap_or_else(|| error.to_string());
+                store.save_feed_error(feed.id, &reason)
+            }
+        }
+    })
+    .await??;
+    if success {
+        publish(s).await;
+    }
+    Ok(())
+}
 fn same_view(a: &View, b: &View) -> bool {
     a.pane == b.pane && a.symbol == b.symbol && a.filters == b.filters && a.symbols == b.symbols
 }
@@ -934,8 +1034,22 @@ pub(super) async fn run(s: Arc<Shared>) {
     let mut schedule = Schedule::default();
     let mut fallback = FallbackState::default();
     let mut warnings = WarningThrottle::default();
+    let mut feeds = tr_data::feeds::Schedule::new(chrono::Utc::now().timestamp());
+    let mut feed_tasks = FeedTasks::default();
     loop {
-        tokio::select! { _ = interval.tick() => {}, _ = s.news.wake.notified() => {} }
+        tokio::select! {
+            _ = interval.tick() => {},
+            _ = s.news.wake.notified() => {},
+            result = feed_tasks.completed(), if !feed_tasks.tasks.is_empty() => {
+                if let Err(error) = result {
+                    let message = format!("{error:#}");
+                    if warnings.allow(&message, chrono::Utc::now().timestamp()) {
+                        tracing::warn!("RSS feeds unavailable: {message}");
+                    }
+                }
+                continue;
+            }
+        }
         let refreshes = std::mem::take(&mut *s.news.refresh.lock().await);
         let mut served = Vec::new();
         for view in &refreshes {
@@ -955,6 +1069,12 @@ pub(super) async fn run(s: Arc<Shared>) {
             let message = format!("{error:#}");
             if warnings.allow(&message, chrono::Utc::now().timestamp()) {
                 tracing::warn!("Local news notifications unavailable: {message}");
+            }
+        }
+        if let Err(error) = feed_tick(&s, &mut feeds, &mut feed_tasks).await {
+            let message = format!("{error:#}");
+            if warnings.allow(&message, chrono::Utc::now().timestamp()) {
+                tracing::warn!("RSS feeds unavailable: {message}");
             }
         }
         let views = s.news.views.lock().await.clone();
@@ -1169,6 +1289,48 @@ mod tests {
             }
             assert!(tick_enabled(false, &settings));
         }
+    }
+    #[tokio::test]
+    async fn n6_stalled_feed_leaves_local_work_live_and_excludes_its_host() {
+        let (s, _) = fixture_shared();
+        let mut tasks = FeedTasks::default();
+        let (release, stalled) = tokio::sync::oneshot::channel::<()>();
+        let task = tasks.tasks.spawn(async move {
+            stalled.await?;
+            Ok(())
+        });
+        tasks.in_flight.insert(task.id(), &tr_data::feeds::FEEDS[4]);
+        assert!(!tasks.available(&tr_data::feeds::FEEDS[4]));
+        assert!(!tasks.available(&tr_data::feeds::FEEDS[5]));
+        assert!(tasks.available(&tr_data::feeds::FEEDS[0]));
+        let mut schedule = tr_data::feeds::Schedule::new(0);
+        for now in (3600..3660).step_by(5) {
+            if let Some(feed) = schedule.next_available(now, |feed| tasks.available(feed)) {
+                assert!(!matches!(feed.id, "bbc-world" | "bbc-business"));
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            local_tick(&s).await.unwrap();
+            let mut schedule = tr_data::feeds::Schedule::new(0);
+            feed_tick(&s, &mut schedule, &mut tasks).await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(tasks.in_flight.len(), 1);
+        release.send(()).unwrap();
+        tasks.completed().await.unwrap();
+        assert!(tasks.in_flight.is_empty());
+        assert!(tasks.available(&tr_data::feeds::FEEDS[5]));
+    }
+    #[tokio::test]
+    async fn n6_hidden_disabled_feed_tick_never_opens_store_guard_or_advances_schedule() {
+        let (s, _) = fixture_shared();
+        let now = chrono::Utc::now().timestamp();
+        let mut schedule = tr_data::feeds::Schedule::new(now);
+        // There is no store. Reaching even the state read would fail this test.
+        feed_tick(&s, &mut schedule, &mut FeedTasks::default()).await.unwrap();
+        assert_eq!(schedule.next(now).unwrap().id, "fed-press");
+        assert!(s.news.store.lock().await.is_none());
     }
     #[tokio::test]
     async fn n5_hidden_disabled_tick_does_not_open_stores_and_blocking_work_leaves_runtime() {

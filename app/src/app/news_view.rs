@@ -519,7 +519,7 @@ fn hover_card(title: &egui::Response, story: &Cluster, model: &RowModel) {
             egui::Label::new(RichText::new(&story.lead.item.title).font(ui_font(13.5)).color(theme::text()).strong())
                 .wrap(),
         );
-        let meta = [story.lead.source.clone(), model.full_time.clone(), model.about.clone()];
+        let meta = [story.sources.join(", "), model.full_time.clone(), model.about.clone()];
         ui.add(egui::Label::new(RichText::new(meta.join(" · ")).font(mono(10.5)).color(theme::muted())).wrap());
         if !summary.is_empty() {
             ui.add_space(dp(2.0));
@@ -624,6 +624,9 @@ fn active_filter_summary(n: &NewsPane) -> String {
     if !n.filters.sources.is_empty() {
         parts.push(format!("Sources: {}", n.filters.sources.join(", ")));
     }
+    if !n.filters.categories.is_empty() {
+        parts.push(format!("Categories: {}", n.filters.categories.join(", ").to_uppercase()));
+    }
     if !n.filters.include.trim().is_empty() {
         parts.push(format!("Include any: {}", n.filters.include.trim()));
     }
@@ -639,6 +642,23 @@ fn active_filter_summary(n: &NewsPane) -> String {
     parts.join(" · ")
 }
 
+fn toggle_category(categories: &mut Vec<String>, category: &str) {
+    let selected = categories.is_empty() || categories.iter().any(|c| c == category);
+    if categories.is_empty() {
+        *categories = tr_data::feeds::CATEGORIES.iter().map(|s| s.to_string()).collect();
+    }
+    categories.retain(|c| c != "none");
+    if selected {
+        categories.retain(|c| c != category);
+    } else {
+        categories.push(category.into());
+    }
+    if categories.is_empty() {
+        categories.push("none".into());
+    } else if categories.len() == tr_data::feeds::CATEGORIES.len() {
+        categories.clear();
+    }
+}
 fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narrow: bool, unread: usize) {
     let mut changed = false;
     let mut finished = false;
@@ -652,11 +672,23 @@ fn filters(ui: &mut Ui, n: &mut NewsPane, watches: &mut Vec<KeywordWatch>, narro
             .on_hover_text("Dated stories in the last 24h: priority, distinct sources, then time. Older or undated stories: newest first.");
     });
     ui.checkbox(&mut n.filters.saved, "Saved");
+    ui.label("Category");
+    ui.horizontal_wrapped(|ui| {
+        if ui.selectable_label(n.filters.categories.is_empty(), "All").clicked() {
+            n.filters.categories.clear();
+        }
+        for category in tr_data::feeds::CATEGORIES {
+            let selected = n.filters.categories.is_empty() || n.filters.categories.iter().any(|c| c == category);
+            if ui.selectable_label(selected, category.to_uppercase()).clicked() {
+                toggle_category(&mut n.filters.categories, category);
+            }
+        }
+    });
     ui.label("Sources");
     let sources: std::collections::BTreeSet<_> = n
         .items
         .iter()
-        .flat_map(|s| [s.source.clone(), s.provider.clone()])
+        .flat_map(|s| s.sources.iter().cloned().chain([s.source.clone(), s.provider.clone()]))
         .chain(n.filters.sources.iter().cloned())
         .filter(|s| !s.is_empty())
         .collect();
@@ -954,6 +986,7 @@ pub(super) fn show(
             ui.toggle_value(&mut n.display.watch_hits, "Watch hits");
         }
         let count = n.filters.sources.len()
+            + usize::from(!n.filters.categories.is_empty())
             + usize::from(n.filters.saved)
             + usize::from(!n.filters.include.is_empty())
             + usize::from(!n.filters.exclude.is_empty())
@@ -1114,6 +1147,7 @@ pub(super) fn show(
     if rows.is_empty() {
         let filtered = n.filters.saved
             || !n.filters.sources.is_empty()
+            || !n.filters.categories.is_empty()
             || !n.filters.include.is_empty()
             || !n.filters.exclude.is_empty()
             || !n.filters.search.is_empty()

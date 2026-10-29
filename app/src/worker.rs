@@ -2004,9 +2004,11 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         }
         // SENATE-BARGO END
         Request::DataSources { action } => {
-            let changed = !matches!(&action, crate::app::data_sources::Action::Status);
+            let changed =
+                matches!(&action, crate::app::data_sources::Action::Save(_) | crate::app::data_sources::Action::Remove);
             let key = s.news.key.lock().await.clone();
-            let reply = crate::app::data_sources::perform(action, key.as_deref()).await;
+            let mut reply = crate::app::data_sources::perform(action, key.as_deref()).await;
+            reply.feeds = news::feed_statuses(s).await;
             if changed {
                 // N1a: notify the news worker only on key edits, never on a polling timer.
                 *s.news.key.lock().await =
@@ -3553,7 +3555,7 @@ mod tests {
         let guard = tr_net::Guard::for_fixture(
             tr_net::Config {
                 ledger: root.join("ledger.sqlite3"),
-                data_dir: Some(root.join("instance")),
+                data_dir: None,
                 allow_external: true,
                 max_wait: Duration::ZERO,
             },

@@ -115,6 +115,8 @@ const EVENTS: &[(Event, &[&str])] = &[
     (
         Event::Fed,
         &[
+            "fomc statement",
+            "monetary policy decision",
             "fed cuts rates",
             "fed raises rates",
             "cuts interest rates",
@@ -948,7 +950,7 @@ impl Cluster {
             lead: story.clone(),
             member_ids: vec![story.id.clone()],
             members: vec![story.clone()],
-            sources: vec![story.source.clone()],
+            sources: if story.sources.is_empty() { vec![story.source.clone()] } else { story.sources.clone() },
             tickers: story.item.tickers.clone(),
             subjects: story.subjects.clone(),
             tags: story.tags.clone(),
@@ -1025,6 +1027,7 @@ pub fn cluster_stats(items: &[Story]) -> (Vec<Cluster>, usize) {
             c.member_ids.push(item.id.clone());
             c.members.push(item.clone());
             c.sources.push(item.source.clone());
+            c.sources.extend(item.sources.clone());
             c.sources.sort();
             c.sources.dedup();
             for subject in &item.subjects {

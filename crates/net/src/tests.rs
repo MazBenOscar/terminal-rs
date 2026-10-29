@@ -1,4 +1,6 @@
 use super::*;
+#[path = "feeds_tests.rs"]
+mod feeds;
 
 // SENATE-BARGO: allowance, migration, retry and credential-isolation regressions.
 #[test]
@@ -429,7 +431,7 @@ impl Temp {
         let data_dir = self.0.join(format!("instance-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
         let mut config = Config::from_lookup(|key| match key {
             "TR_NET_LEDGER" => Some(self.0.join("ledger.sqlite3").into_os_string()),
-            "TR_DATA_DIR" => Some(data_dir.clone().into_os_string()),
+            "TR_DATA_DIR" if offline => Some(data_dir.clone().into_os_string()),
             "TR_ALLOW_EXTERNAL" if !offline => Some("1".into()),
             _ => None,
         })
@@ -587,12 +589,12 @@ async fn unknown_host_and_group_are_refused_before_connect() {
 #[tokio::test]
 async fn independent_instances_share_pacing_and_daily_cap() {
     let temp = Temp::new();
-    // These instances opt into external access with independently overridden data dirs.
-    // Only the explicit machine ledger path is shared; no application data path enters Guard.
+    // Independent mock instances share only the explicit machine ledger.
+    // No TR_DATA_DIR is injected: that switch now prohibits even opted-in traffic.
     let server = Server::new(200, "", "{}");
     let one = server.attach(temp.guard(false));
     let two = server.attach(temp.guard(false));
-    assert_ne!(one.config.data_dir, two.config.data_dir);
+    assert!(one.config.data_dir.is_none() && two.config.data_dir.is_none());
     assert_eq!(one.config.ledger, two.config.ledger);
     assert_eq!(one.send("finnhub", request()).await.unwrap(), b"{}");
     assert_eq!(two.send("finnhub", request()).await, Err(Refused::Busy));
@@ -837,7 +839,7 @@ fn status_and_registry() {
     let guard = temp.guard(false);
     let rows = guard.status().unwrap();
     assert_eq!(rows.len(), GROUPS.len());
-    assert_eq!(rows.iter().map(|s| s.cap).collect::<Vec<_>>(), [3000, 1500, 1000, 300, 400, 20, 10]);
+    assert_eq!(rows.iter().map(|s| s.cap).collect::<Vec<_>>(), [3000, 1500, 1000, 300, 400, 20, 10, 360, 360, 180]);
     assert!(rows.iter().all(|s| s.enabled
         && s.requests_today == 0
         && s.last_request.is_none()
