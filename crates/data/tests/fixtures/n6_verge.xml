@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Synthetic technology fixture</title><id>urn:fixture:tech</id><updated>2026-10-28T12:00:00Z</updated>
+<entry><title>Synthetic processor laboratory opens</title><id>urn:fixture:processor</id><link rel="alternate" href="https://example.test/processor"/><published>2026-10-28T12:00:00Z</published><author><name>Fixture Author</name></author><summary>This is invented test data.</summary></entry>
+</feed>

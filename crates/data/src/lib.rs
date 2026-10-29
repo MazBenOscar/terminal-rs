@@ -16,6 +16,7 @@ pub mod alpaca;
 pub mod cache;
 pub mod crypto;
 pub mod crypto_catalog;
+pub mod feeds;
 pub mod finnhub;
 pub mod markets;
 pub mod news_intelligence;

@@ -4606,6 +4606,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rustls",
+ "scraper",
  "serde",
  "serde_json",
  "sha1",

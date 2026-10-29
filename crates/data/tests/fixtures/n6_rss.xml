@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><title>Synthetic desk</title><link>https://example.test</link><description>Offline fixture, no real article text</description>
+<item><title>Synthetic markets laboratory publishes report</title><link>https://example.test/report?utm_source=fixture</link><guid isPermaLink="false">fixture-report-1</guid><pubDate>Wed, 28 Oct 2026 12:00:00 GMT</pubDate><dc:creator>Fixture Author</dc:creator><description><![CDATA[<p>Invented summary only.</p>]]></description></item>
+</channel></rss>

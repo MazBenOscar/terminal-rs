@@ -667,6 +667,45 @@ fn search_is_bounded_filters_adjacent_and_collapsed_summary_is_visible() {
 }
 
 #[test]
+fn n6_categories_toggle_filter_persist_per_pane_and_settle_at_360pt() {
+    let old: crate::layouts::NewsSettings =
+        serde_json::from_str(r#"{"symbol":null,"filters":{"scope":"All"}}"#).unwrap();
+    assert!(old.filters.categories.is_empty());
+    let mut doc = LayoutDoc::from_json(include_bytes!("../../tests/fixtures/news_layout_n1a.json")).unwrap();
+    let PaneSettings::News(Some(settings)) = &mut doc.panes[0].settings else { panic!() };
+    settings.filters.categories = vec!["tech".into()];
+    doc.panes[1].settings = PaneSettings::News(Some(old));
+    let loaded = LayoutDoc::from_json(&doc.to_json()).unwrap();
+    assert_eq!(loaded, doc);
+    let mut categories = vec![];
+    toggle_category(&mut categories, "tech");
+    assert_eq!(categories.len(), 5);
+    assert!(!categories.iter().any(|c| c == "tech"));
+    toggle_category(&mut categories, "tech");
+    assert!(categories.is_empty());
+    for category in tr_data::feeds::CATEGORIES {
+        toggle_category(&mut categories, category);
+    }
+    assert_eq!(categories, ["none"]);
+    toggle_category(&mut categories, "tech");
+    assert_eq!(categories, ["tech"]);
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.items[0].category = "tech".into();
+    pane.items[1].category = "markets".into();
+    pane.filters.categories = categories;
+    for _ in 0..4 {
+        ui_frame(&ctx, &mut pane, 360.0, vec![], false);
+    }
+    let rebuilds = pane.cache.rebuilds;
+    let (output, measured) = ui_frame(&ctx, &mut pane, 360.0, vec![], false);
+    assert!(measured <= 361.0);
+    assert_eq!(pane.cache.rebuilds, rebuilds);
+    assert_eq!(pane.cache.ids.len(), 1);
+    assert!(output.viewport_output[&egui::ViewportId::ROOT].repaint_delay > std::time::Duration::from_secs(60));
+    assert!(active_filter_summary(&pane).contains("TECH"));
+}
+#[test]
 fn n5c_old_display_json_defaults_newest_and_pane_sorts_persist_independently() {
     let old: crate::layouts::NewsSettings =
         serde_json::from_str(r#"{"symbol":null,"display":{"wire":true,"unread":true,"watch_hits":false}}"#).unwrap();

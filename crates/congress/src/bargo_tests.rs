@@ -30,7 +30,7 @@ impl Temp {
         tr_net::Guard::for_fixture(
             tr_net::Config {
                 ledger: self.0.join("ledger.sqlite3"),
-                data_dir: Some(self.0.join(format!("instance-{}", NEXT.fetch_add(1, Ordering::Relaxed)))),
+                data_dir: offline.then(|| self.0.join(format!("instance-{}", NEXT.fetch_add(1, Ordering::Relaxed)))),
                 allow_external: !offline,
                 max_wait: Duration::ZERO,
             },

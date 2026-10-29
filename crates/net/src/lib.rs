@@ -15,8 +15,68 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const GROUPS: [&str; 7] =
-    ["finnhub", "sec", "yahoo-news", "coindesk", "house-disclosures", "house-roster", "bargo"];
+pub const GROUPS: [&str; 10] = [
+    "finnhub",
+    "sec",
+    "yahoo-news",
+    "coindesk",
+    "house-disclosures",
+    "house-roster",
+    "bargo",
+    "regulators",
+    "global-media",
+    "tech",
+];
+
+fn host_budget(group: &str) -> bool {
+    matches!(group, "regulators" | "global-media" | "tech")
+}
+
+/// Root classification, independent of MIME type. Skip declarations, processing
+/// instructions and comments; never search inside HTML for a nested feed tag.
+fn feed_signature(bytes: &[u8]) -> bool {
+    let mut bytes = trim_signature_prefix(bytes);
+    loop {
+        let end = if bytes.starts_with(b"<?") {
+            b"?>".as_slice()
+        } else if bytes.starts_with(b"<!--") {
+            b"-->".as_slice()
+        } else if bytes.starts_with(b"<!DOCTYPE") {
+            // Skip the declaration, including quoted '>' and internal subsets.
+            // This is only signature detection: never resolve external entities.
+            let mut quote = None;
+            let mut depth = 0_u32;
+            let Some(i) = bytes.iter().enumerate().skip(9).find_map(|(i, &b)| {
+                if let Some(q) = quote {
+                    if b == q {
+                        quote = None;
+                    }
+                } else {
+                    match b {
+                        b'\'' | b'"' => quote = Some(b),
+                        b'[' => depth += 1,
+                        b']' => depth = depth.saturating_sub(1),
+                        b'>' if depth == 0 => return Some(i),
+                        _ => {}
+                    }
+                }
+                None
+            }) else {
+                return false;
+            };
+            bytes = bytes[i + 1..].trim_ascii_start();
+            continue;
+        } else {
+            break;
+        };
+        let Some(i) = bytes.windows(end.len()).position(|w| w == end) else { return false };
+        bytes = bytes[i + end.len()..].trim_ascii_start();
+    }
+    let Some(bytes) = bytes.strip_prefix(b"<") else { return false };
+    let name = bytes.split(|b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/')).next().unwrap_or_default();
+    let local = name.rsplit(|b| *b == b':').next().unwrap_or_default();
+    bytes.get(name.len()).is_some() && matches!(local, b"rss" | b"feed" | b"RDF")
+}
 
 /// Permanent network prohibition, independent of switches, aliases and future policies.
 fn disabled_host(url: &reqwest::Url) -> bool {
@@ -77,6 +137,15 @@ pub fn policies() -> Vec<HostPolicy> {
         ("disclosures-clerk.house.gov", "house-disclosures", 3, 20, 400),
         ("clerk.house.gov", "house-roster", 3, 20, 20),
         ("www.bargo.ai", "bargo", 30, 2, 40),
+        ("www.federalreserve.gov", "regulators", 900, 1, 120),
+        ("www.ecb.europa.eu", "regulators", 900, 1, 120),
+        ("www.bankofengland.co.uk", "regulators", 900, 1, 120),
+        ("feeds.bbci.co.uk", "global-media", 900, 1, 120),
+        ("search.cnbc.com", "global-media", 900, 1, 120),
+        ("www.aljazeera.com", "global-media", 900, 1, 120),
+        ("techcrunch.com", "tech", 1800, 1, 60),
+        ("www.theverge.com", "tech", 1800, 1, 60),
+        ("hnrss.org", "tech", 1800, 1, 60),
     ]
     .into_iter()
     .map(|(host, group, seconds, per_minute, daily_cap)| HostPolicy {
@@ -109,6 +178,11 @@ pub struct Settings {
     pub sec: bool,
     pub yahoo_news: bool,
     pub coindesk: bool,
+    pub regulators: bool,
+    pub global_media: bool,
+    pub tech: bool,
+    /// Absence means enabled, including when loading pre-N6 settings.
+    pub disabled_feeds: std::collections::BTreeSet<String>,
     pub house_disclosures: bool,
     pub house_roster: bool,
     pub bargo: bool,
@@ -126,6 +200,10 @@ impl Default for Settings {
             sec: true,
             yahoo_news: true,
             coindesk: true,
+            regulators: true,
+            global_media: true,
+            tech: true,
+            disabled_feeds: Default::default(),
             house_disclosures: true,
             house_roster: true,
             bargo: false,
@@ -180,6 +258,9 @@ impl Settings {
                 "sec" => self.sec,
                 "yahoo-news" => self.yahoo_news,
                 "coindesk" => self.coindesk,
+                "regulators" => self.regulators,
+                "global-media" => self.global_media,
+                "tech" => self.tech,
                 "house-disclosures" => self.house_disclosures,
                 "house-roster" => self.house_roster,
                 "bargo" => self.bargo,
@@ -268,6 +349,7 @@ pub struct Config {
     pub ledger: PathBuf,
     /// Captured only for the offline gate; never used to locate the ledger.
     pub data_dir: Option<PathBuf>,
+    /// Legacy compatibility field; never overrides the TR_DATA_DIR offline gate.
     pub allow_external: bool,
     pub max_wait: Duration,
 }
@@ -907,15 +989,19 @@ impl Guard {
                 .map(|s| s.unwrap_or(0))
                 .map_err(Refused::from)
         });
-        // With an unreadable ledger, choose the highest floor rather than risk shortening an escalation.
-        let prior = local.get(group).map_or(0, |p| p.strikes).max(durable_strikes.unwrap_or(2));
-        let until_for = |strikes: u32| {
+        // An unreadable ledger is unknown, not evidence of earlier strikes.
+        let known = durable_strikes.is_ok();
+        let prior = local.get(group).map_or(0, |p| p.strikes).max(durable_strikes.unwrap_or(0));
+        let until_for = |strikes: u32, known: bool| {
+            if known && strikes >= 2 && policies().iter().any(|p| host_budget(p.group) && p.host == group) {
+                return 253_402_300_799;
+            }
             (now + [21600, 43200, 86400][strikes.min(2) as usize])
                 .max(retry.and_then(|v| retry_after(v, now)).unwrap_or(0))
                 .min(now + 604800)
         };
         let mut pause = LocalCooldown {
-            until: until_for(prior),
+            until: until_for(prior, known),
             strikes: prior.saturating_add(1),
             reason: reason.into(),
             durable: false,
@@ -930,7 +1016,7 @@ impl Guard {
                     .optional()?
                     .unwrap_or(0);
                 let strikes = strikes.max(prior);
-                let until = until_for(strikes);
+                let until = until_for(strikes, true);
                 tx.execute("INSERT INTO cooldowns VALUES (?1,?2,?3,?4) ON CONFLICT(\"group\") DO UPDATE SET until=excluded.until,strikes=excluded.strikes,reason=excluded.reason", params![group, until, strikes.saturating_add(1), reason])?;
                 tx.commit()?;
                 Ok((until, strikes.saturating_add(1)))
@@ -977,7 +1063,7 @@ impl Guard {
         request: reqwest::RequestBuilder,
         daily_limit: u32,
     ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
-        self.send_budgeted(group, request, daily_limit, None).await
+        self.send_budgeted(group, request, daily_limit, None, None).await
     }
     /// A consumer's additional daily HTTP-hop ceiling, charged atomically with the host
     /// budget only after pacing/lease acquisition. Cache hits and unsent refusals cost zero.
@@ -990,7 +1076,23 @@ impl Guard {
         counter_prefix: &str,
         counter_limit: u32,
     ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
-        self.send_budgeted(group, request, daily_limit, Some((counter_prefix, counter_limit))).await
+        self.send_budgeted(group, request, daily_limit, Some((counter_prefix, counter_limit)), None).await
+    }
+    /// Feed switches are checked before budget reservation, including each redirect hop.
+    pub async fn send_feed(
+        &self,
+        group: &str,
+        id: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
+        self.send_budgeted(group, request, u32::MAX, None, Some(id)).await
+    }
+    fn feed_enabled(&self, id: Option<&str>) -> Result<(), Refused> {
+        if id.is_some_and(|id| self.settings.read().expect("settings lock").disabled_feeds.contains(id)) {
+            Err(Refused::Disabled)
+        } else {
+            Ok(())
+        }
     }
     async fn send_budgeted(
         &self,
@@ -998,6 +1100,7 @@ impl Guard {
         request: reqwest::RequestBuilder,
         daily_limit: u32,
         counter: Option<(&str, u32)>,
+        feed: Option<&str>,
     ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
         let request = request.build().map_err(|_| Refused::InvalidRequest)?;
         // This prohibition takes precedence even over offline/unknown-group errors.
@@ -1005,6 +1108,7 @@ impl Guard {
             return Err(Refused::Disabled);
         }
         self.identity(group)?;
+        self.feed_enabled(feed)?;
         if group == "bargo" {
             let key = request.headers().get("X-Api-Key").and_then(|v| v.to_str().ok());
             self.bargo_mode_allowed(key.is_some_and(|k| !k.is_empty()))?;
@@ -1012,7 +1116,7 @@ impl Guard {
         }
         let policy = self.policy(group, request.url())?;
         if request.method() != reqwest::Method::GET {
-            return self.send_uncached(group, request, daily_limit, counter).await;
+            return self.send_uncached(group, request, daily_limit, counter, feed).await;
         }
         let key = (group.to_owned(), format!("{}#{}", request.url(), sensitive_fingerprint(&request)));
         let slot = {
@@ -1026,6 +1130,7 @@ impl Guard {
         let generation = slot.generation.load(Ordering::Acquire);
         let _flight = slot.flight.lock().await;
         self.identity(group)?;
+        self.feed_enabled(feed)?;
         if let Some((at, result)) = &*slot.result.lock().expect("cache result lock") {
             if slot.generation.load(Ordering::Acquire) != generation
                 || (result.is_ok() && at.elapsed() < policy.cache_ttl)
@@ -1033,7 +1138,7 @@ impl Guard {
                 return result.clone();
             }
         }
-        let result = self.send_uncached(group, request, daily_limit, counter).await;
+        let result = self.send_uncached(group, request, daily_limit, counter, feed).await;
         // Failures are only delivered to current waiters, never reused as cached content.
         *slot.result.lock().expect("cache result lock") = Some((Instant::now(), result.clone()));
         slot.generation.fetch_add(1, Ordering::Release);
@@ -1079,6 +1184,7 @@ impl Guard {
         mut request: reqwest::Request,
         daily_limit: u32,
         counter: Option<(&str, u32)>,
+        feed: Option<&str>,
     ) -> Result<(Vec<u8>, ResponseMetadata), Refused> {
         // Bargo's longer spacing still uses one durable reservation per actual send.
         let key = request.headers().get("X-Api-Key").and_then(|v| v.to_str().ok()).map(str::to_owned);
@@ -1110,6 +1216,12 @@ impl Guard {
         let deadline = Instant::now() + max_wait;
         for hop in 0..=3 {
             let mut policy = self.policy(group, request.url())?;
+            let feed_response = feed.is_some()
+                || host_budget(group)
+                || (group == "sec" && request.url().path() == "/news/pressreleases.rss");
+            if host_budget(group) {
+                policy.group = policy.host;
+            }
             policy.daily_cap = policy.daily_cap.min(daily_limit);
             if group == "bargo" {
                 self.set_bargo_key(key.as_deref());
@@ -1123,13 +1235,14 @@ impl Guard {
             );
             loop {
                 self.identity(group)?;
+                self.feed_enabled(feed)?;
                 match self.reserve_with_counter(&policy, &owner, counter, bargo_rows)? {
                     None => break,
                     Some(wait) if Instant::now() + wait <= deadline => tokio::time::sleep(wait).await,
                     _ => return Err(Refused::Busy),
                 }
             }
-            let _lease = Lease { guard: self, group, owner };
+            let _lease = Lease { guard: self, group: policy.group, owner };
             let ua = self.identity(group)?;
             request.headers_mut().insert(reqwest::header::USER_AGENT, ua.parse().map_err(|_| Refused::InvalidRequest)?);
             *request.timeout_mut() = Some(Duration::from_secs(30));
@@ -1145,7 +1258,7 @@ impl Guard {
             }
             let mut response = match self.client.execute(request).await {
                 Ok(r) => r,
-                Err(_) => return Err(self.transport(group)?),
+                Err(_) => return Err(self.transport(policy.group)?),
             };
             let status = response.status().as_u16();
             let retry =
@@ -1160,7 +1273,7 @@ impl Guard {
                     rows: header("x-ratelimit-rows-remaining").and_then(|v| v.parse().ok()),
                 },
             )?;
-            if matches!(status, 403 | 429 | 503) || (group == "bargo" && (status == 401 || status >= 500)) {
+            if matches!(status, 403 | 429 | 451 | 503) || (group == "bargo" && (status == 401 || status >= 500)) {
                 let retry = if group == "bargo" && status == 429 {
                     let seconds = retry
                         .as_deref()
@@ -1176,7 +1289,7 @@ impl Guard {
                 } else {
                     format!("HTTP {status}")
                 };
-                return Err(self.pause(group, &reason, retry.as_deref())?);
+                return Err(self.pause(policy.group, &reason, retry.as_deref())?);
             }
             if matches!(status, 301 | 302 | 303 | 307 | 308) {
                 let target = response
@@ -1202,16 +1315,21 @@ impl Guard {
                 .unwrap_or("")
                 .to_owned();
             let mut body = Vec::new();
-            loop {
-                let chunk = match response.chunk().await {
-                    Ok(c) => c,
-                    Err(_) => return Err(self.transport(group)?),
-                };
-                let Some(chunk) = chunk else { break };
-                if body.len() + chunk.len() > BODY_CAP {
-                    return Err(Refused::BodyTooLarge);
+            if status != 304 {
+                loop {
+                    let chunk = match response.chunk().await {
+                        Ok(c) => c,
+                        Err(_) => return Err(self.transport(policy.group)?),
+                    };
+                    let Some(chunk) = chunk else { break };
+                    if body.len() + chunk.len() > BODY_CAP {
+                        return Err(Refused::BodyTooLarge);
+                    }
+                    body.extend_from_slice(&chunk);
                 }
-                body.extend_from_slice(&chunk);
+            }
+            if feed_response && status == 200 && !feed_signature(&body) {
+                return Err(self.pause(policy.group, "Not a feed (expected rss, feed or RDF root)", None)?);
             }
             // Signatures ignore the whitespace / UTF-8 BOM sometimes prepended by the Clerk.
             let signature = trim_signature_prefix(&body);
@@ -1224,7 +1342,7 @@ impl Guard {
                         && ![b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"]
                             .iter()
                             .any(|magic| body.starts_with(*magic))));
-            if (html_response(&content_type, &body) && (blocked_body(&body) || group == "bargo"))
+            if (!feed_response && html_response(&content_type, &body) && (blocked_body(&body) || group == "bargo"))
                 || house_download_refused
                 || roster_refused
             {
@@ -1255,12 +1373,79 @@ impl Guard {
                     }
                 }
             }
-            db.execute("DELETE FROM transport_failures WHERE \"group\"=?1", [group])?;
-            db.execute("DELETE FROM cooldowns WHERE \"group\"=?1", [group])?;
-            self.cooldowns.write().expect("cooldown lock").remove(group);
+            db.execute("DELETE FROM transport_failures WHERE \"group\"=?1", [policy.group])?;
+            if !host_budget(group) {
+                db.execute("DELETE FROM cooldowns WHERE \"group\"=?1", [policy.group])?;
+                self.cooldowns.write().expect("cooldown lock").remove(policy.group);
+            }
             return Ok((body, metadata));
         }
         unreachable!("redirect loop is bounded")
+    }
+    /// Manual resume clears strikes, never budgets or request spacing.
+    pub fn resume(&self, group: &str) -> Result<(), Refused> {
+        if !GROUPS.contains(&group) {
+            return Err(Refused::UnknownHost);
+        }
+        let keys: Vec<_> = policies()
+            .into_iter()
+            .filter(|p| p.group == group)
+            .map(|p| if host_budget(group) { p.host } else { p.group })
+            .collect();
+        let db = self.db()?;
+        let mut local = self.cooldowns.write().expect("cooldown lock");
+        for key in keys {
+            db.execute("DELETE FROM cooldowns WHERE \"group\"=?1", [key])?;
+            local.remove(key);
+        }
+        Ok(())
+    }
+    pub fn host_status(&self, group: &str, url: &str) -> Result<Status, Refused> {
+        let policy = self.policy(group, &reqwest::Url::parse(url).map_err(|_| Refused::InvalidRequest)?)?;
+        if !host_budget(group) {
+            return self.status()?.into_iter().find(|s| s.group == group).ok_or(Refused::UnknownHost);
+        }
+        let db = self.db()?;
+        let key = policy.host;
+        let settings = self.settings.read().expect("settings lock");
+        let requests_today = db
+            .query_row(
+                "SELECT count FROM requests WHERE \"group\"=?1 AND day=?2",
+                params![key, Utc::now().timestamp() / 86400],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let last_request =
+            db.query_row("SELECT at FROM last_request WHERE \"group\"=?1", [key], |r| r.get(0)).optional()?;
+        let paused: Option<(i64, String)> = db
+            .query_row(
+                "SELECT until,reason FROM cooldowns WHERE \"group\"=?1 AND until>?2",
+                params![key, Utc::now().timestamp()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let local = self.cooldowns.read().expect("cooldown lock");
+        let paused = local
+            .get(key)
+            .filter(|p| !p.durable && p.until > Utc::now().timestamp())
+            .map(|p| (p.until, p.reason.clone()))
+            .or(paused);
+        Ok(Status {
+            group: policy.group,
+            enabled: settings.enabled(group),
+            requests_today,
+            cap: policy.daily_cap,
+            last_request,
+            paused_until: paused.as_ref().map(|p| p.0),
+            reason: if settings.settings_error {
+                Some("Corrupt data_sources settings; all external sources off".into())
+            } else {
+                paused.map(|p| format!("{key}: {}", p.1))
+            },
+            offline: self.offline(),
+            needs_contact: false,
+        })
     }
     pub fn status(&self) -> Result<Vec<Status>, Refused> {
         let db = self.db()?;
@@ -1268,6 +1453,24 @@ impl Guard {
         GROUPS
             .into_iter()
             .map(|group| {
+                if host_budget(group) {
+                    let mut rows = policies()
+                        .into_iter()
+                        .filter(|p| p.group == group)
+                        .map(|p| self.host_status(group, &format!("https://{}/", p.host)))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut row = rows.remove(0);
+                    for next in rows {
+                        row.requests_today += next.requests_today;
+                        row.cap += next.cap;
+                        row.last_request = row.last_request.max(next.last_request);
+                        row.paused_until = row.paused_until.max(next.paused_until);
+                        if let Some(reason) = next.reason {
+                            row.reason = Some(row.reason.map_or(reason.clone(), |old| format!("{old}; {reason}")));
+                        }
+                    }
+                    return Ok(row);
+                }
                 let bucket = self.bargo_bucket.read().expect("Bargo bucket lock").clone();
                 let usage_group = if group == "bargo" { bucket.as_str() } else { group };
                 let cap = if group == "bargo" && bucket == "bargo:keyless" {

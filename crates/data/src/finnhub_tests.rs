@@ -135,11 +135,10 @@ async fn guarded_localhost_company_market_header_cursor_and_budget() {
         }
         requests
     });
-    // Inject the equivalents of TR_NET_LEDGER=<repo-local temp>, TR_DATA_DIR=<temp>,
-    // TR_ALLOW_EXTERNAL=1, without mutating parallel tests' process environment.
+    // Inject a repo-local ledger and loopback transport with the explicit external override.
     let config = tr_net::Config {
         ledger: root.join("ledger.sqlite3"),
-        data_dir: Some(root.clone()),
+        data_dir: Some(root.join("instance")),
         allow_external: true,
         max_wait: Duration::from_secs(5),
     };
