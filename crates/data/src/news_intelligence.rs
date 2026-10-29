@@ -29,7 +29,8 @@ impl Priority {
 // Deliberately small, explicit event vocabulary. Contiguous whole tokens only;
 // punctuation is a boundary, with no stemming (halt != halting).
 // Avoid bare upgrade/recall/rate-cut words: require analyst, product or Fed
-// wording. The few variable-length rating/product/deal patterns live below.
+// wording (a rating change must name the rating; a Fed preview is not a move).
+// The few variable-length rating/product/deal patterns live below.
 const URGENCY: &[&str] = &["breaking", "urgent", "flash", "alert"];
 const MARKET_EVENTS: &[&str] = &[
     "trading halt",
@@ -44,6 +45,13 @@ const MARKET_EVENTS: &[&str] = &[
     "cuts guidance",
     "guidance raise",
     "raises guidance",
+    "lowers guidance",
+    "raises outlook",
+    "cuts outlook",
+    "lowers outlook",
+    "raises forecast",
+    "cuts forecast",
+    "lowers forecast",
     "beats estimates",
     "misses estimates",
     "tops estimates",
@@ -65,10 +73,6 @@ const MARKET_EVENTS: &[&str] = &[
     "ceo resigns",
     "ceo steps down",
     "ceo to step down",
-    "downgrade to",
-    "downgraded to",
-    "upgrade to",
-    "upgraded to",
     "dividend cut",
     "cuts dividend",
     "dividend suspended",
@@ -77,7 +81,12 @@ const MARKET_EVENTS: &[&str] = &[
     "fed raises rates",
     "cuts interest rates",
     "raises interest rates",
-    "rate decision",
+    "fed holds rates",
+    "fed keeps rates",
+    "fed leaves rates",
+    "job cuts",
+    "cut jobs",
+    "cuts jobs",
 ];
 pub fn priority(headline: &str) -> Priority {
     let tokens = words(headline);
@@ -94,20 +103,22 @@ pub fn priority(headline: &str) -> Priority {
     let contextual_event = tokens.iter().enumerate().any(|(i, token)| {
         let rest = &tokens[i + 1..];
         match token.as_str() {
-            "upgrades" | "downgrades" => rest.windows(2).any(|w| {
-                w[0] == "to"
-                    && matches!(
-                        w[1].as_str(),
-                        "buy"
-                            | "outperform"
-                            | "overweight"
-                            | "hold"
-                            | "neutral"
-                            | "sell"
-                            | "underperform"
-                            | "underweight"
-                    )
-            }),
+            "upgrade" | "upgrades" | "upgraded" | "downgrade" | "downgrades" | "downgraded" => {
+                rest.windows(2).any(|w| {
+                    w[0] == "to"
+                        && matches!(
+                            w[1].as_str(),
+                            "buy"
+                                | "outperform"
+                                | "overweight"
+                                | "hold"
+                                | "neutral"
+                                | "sell"
+                                | "underperform"
+                                | "underweight"
+                        )
+                })
+            }
             "recalls" => rest.iter().any(|w| matches!(w.as_str(), "vehicles" | "cars" | "units" | "products")),
             _ => false,
         }
