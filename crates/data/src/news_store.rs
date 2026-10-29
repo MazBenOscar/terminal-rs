@@ -351,6 +351,8 @@ pub mod local {
         pub id: String,
         pub time: String,
         pub headline: String,
+        #[serde(default)]
+        pub priority: crate::news_intelligence::Priority,
         pub sources: Vec<String>,
         pub source_count: usize,
         pub subjects: Vec<String>,
@@ -406,6 +408,7 @@ pub mod local {
             groups.entry((topic, subject)).or_default().push(DigestStory {
                 id: c.member_ids[0].clone(),
                 time: iso(c.newest),
+                priority: c.priority(),
                 headline: c.lead.item.title,
                 source_count: c.sources.len(),
                 sources: c.sources,
@@ -436,9 +439,15 @@ pub mod local {
             for group in &self.groups {
                 text.push_str(&format!("\n## {} · {}\n", group.topic, group.subject));
                 for s in &group.stories {
+                    let priority = if s.priority == crate::news_intelligence::Priority::Normal {
+                        String::new()
+                    } else {
+                        format!(" · priority: {}", s.priority.label())
+                    };
                     text.push_str(&format!(
-                        "- {} · {} source(s): {} · {} · {} [{}]\n",
+                        "- {}{} · {} source(s): {} · {} · {} [{}]\n",
                         s.time,
+                        priority,
                         s.source_count,
                         s.sources.join(", "),
                         s.url_host,

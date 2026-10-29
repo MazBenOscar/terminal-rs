@@ -8,6 +8,144 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_ITEMS: usize = 2_000;
 
+/// Headline-only importance, not sentiment or a claim about accuracy. Never stored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    #[default]
+    Normal,
+    High,
+    Urgent,
+}
+impl Priority {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::High => "high",
+            Self::Urgent => "urgent",
+        }
+    }
+}
+// Deliberately small, explicit event vocabulary. Contiguous whole tokens only;
+// punctuation is a boundary, with no stemming (halt != halting).
+// Avoid bare upgrade/recall/rate-cut words: require analyst, product or Fed
+// wording. The few variable-length rating/product/deal patterns live below.
+const URGENCY: &[&str] = &["breaking", "urgent", "flash", "alert"];
+const MARKET_EVENTS: &[&str] = &[
+    "trading halt",
+    "trading halted",
+    "trading halts",
+    "halts trading",
+    "shares halted",
+    "stock halted",
+    "bankruptcy",
+    "chapter 11",
+    "guidance cut",
+    "cuts guidance",
+    "guidance raise",
+    "raises guidance",
+    "beats estimates",
+    "misses estimates",
+    "tops estimates",
+    "beats expectations",
+    "misses expectations",
+    "tops expectations",
+    "acquires",
+    "to acquire",
+    "agrees to buy",
+    "acquisition agreement",
+    "merger agreement",
+    "buyout agreement",
+    "fda approval",
+    "fda approves",
+    "fda rejection",
+    "fda rejects",
+    "sec charges",
+    "voluntary recall",
+    "ceo resigns",
+    "ceo steps down",
+    "ceo to step down",
+    "downgrade to",
+    "downgraded to",
+    "upgrade to",
+    "upgraded to",
+    "dividend cut",
+    "cuts dividend",
+    "dividend suspended",
+    "suspends dividend",
+    "fed cuts rates",
+    "fed raises rates",
+    "cuts interest rates",
+    "raises interest rates",
+    "rate decision",
+];
+pub fn priority(headline: &str) -> Priority {
+    let tokens = words(headline);
+    let phrase = |pattern: &str| {
+        tokens
+            .windows(pattern.split_whitespace().count())
+            .any(|window| window.iter().map(String::as_str).eq(pattern.split_whitespace()))
+    };
+    // Leading urgency words must be desk labels, not e.g. "Flash PMI".
+    let lower = headline.trim_start().to_ascii_lowercase();
+    let urgent_label = URGENCY.iter().any(|word| {
+        lower.strip_prefix(word).is_some_and(|rest| rest.trim_start().starts_with([':', '-', '–', '—', '|']))
+    });
+    let contextual_event = tokens.iter().enumerate().any(|(i, token)| {
+        let rest = &tokens[i + 1..];
+        match token.as_str() {
+            "upgrades" | "downgrades" => rest.windows(2).any(|w| {
+                w[0] == "to"
+                    && matches!(
+                        w[1].as_str(),
+                        "buy"
+                            | "outperform"
+                            | "overweight"
+                            | "hold"
+                            | "neutral"
+                            | "sell"
+                            | "underperform"
+                            | "underweight"
+                    )
+            }),
+            "recalls" => rest.iter().any(|w| matches!(w.as_str(), "vehicles" | "cars" | "units" | "products")),
+            _ => false,
+        }
+    });
+    if urgent_label || phrase("breaking news") {
+        Priority::Urgent
+    } else if MARKET_EVENTS.iter().any(|p| phrase(p))
+        || contextual_event
+        || (phrase("to buy") && lower.contains("for $"))
+    {
+        Priority::High
+    } else {
+        Priority::Normal
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sort {
+    #[default]
+    Newest,
+    Relevance,
+}
+/// Recent events lead by importance; older history is strictly chronological.
+/// Source strength is a Stories-only tie-break, never a Wire tie-break.
+pub fn sort_clusters(rows: &mut [Cluster], order: Sort, wire: bool, now: i64) {
+    use std::cmp::Reverse;
+    rows.sort_by_cached_key(|c| {
+        let recent = order == Sort::Relevance && c.newest_dated().is_some_and(|ts| ts >= now.saturating_sub(86400));
+        (
+            Reverse(recent),
+            Reverse(if recent { c.priority() } else { Priority::Normal }),
+            Reverse(if recent && !wire { c.sources.len() } else { 0 }),
+            Reverse(c.newest),
+            c.lead.id.clone(),
+        )
+    });
+}
+
 /// Bump whenever subject semantics change; stored rows are lazily re-derived.
 pub const MATCHER_VERSION: &str = "n1b-subjects-3";
 
@@ -716,6 +854,14 @@ pub struct Cluster {
     pub newest: i64,
 }
 impl Cluster {
+    /// Inferred observation times cannot establish freshness, even if a dated
+    /// member exists but is old. Undated-only clusters stay in the older band.
+    pub fn newest_dated(&self) -> Option<i64> {
+        self.members.iter().filter(|s| !s.inferred_ts && s.item.ts > 0).map(|s| s.item.ts).max()
+    }
+    pub fn priority(&self) -> Priority {
+        self.members.iter().map(|s| priority(&s.item.title)).max().unwrap_or_default()
+    }
     pub fn wire(story: &Story) -> Self {
         Self {
             lead: story.clone(),

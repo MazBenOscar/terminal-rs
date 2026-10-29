@@ -15,6 +15,217 @@ fn story(id: usize, title: &str, ts: i64, source: &str) -> Story {
         source,
     )
 }
+#[test]
+fn n5c_priority_headline_fixture_is_token_exact_and_case_insensitive() {
+    use Priority::{High, Normal, Urgent};
+    let fixtures = [
+        ("BREAKING: Acme reports results", Urgent),
+        (" urgent — central bank statement", Urgent),
+        ("Flash: company update", Urgent),
+        ("ALERT: exchange notice", Urgent),
+        ("Live breaking NEWS from the desk", Urgent),
+        ("Trading halted in Acme shares", High),
+        ("Exchange announces trading halt", High),
+        ("Stock halted pending news", High),
+        ("Acme files for bankruptcy", High),
+        ("Acme enters CHAPTER 11", High),
+        ("Acme cuts guidance", High),
+        ("Acme guidance cut after weak sales", High),
+        ("Acme raises guidance", High),
+        ("Acme guidance raise confirmed", High),
+        ("Acme beats estimates", High),
+        ("Acme misses estimates", High),
+        ("Acme to acquire Beta", High),
+        ("Acme signs merger agreement", High),
+        ("Acme signs buyout agreement", High),
+        ("Acme acquisition agreement signed", High),
+        ("FDA approval for Acme drug", High),
+        ("FDA rejects Acme application", High),
+        ("FDA rejection hits Acme", High),
+        ("FDA approves therapy", High),
+        ("SEC charges Acme", High),
+        ("Acme recalls vehicles", High),
+        ("Acme CEO resigns", High),
+        ("Acme CEO steps down", High),
+        ("Analyst upgrades Acme to buy", High),
+        ("Acme downgraded to underweight by broker", High),
+        ("Acme dividend cut", High),
+        ("Acme suspends dividend", High),
+        ("Acme dividend suspended", High),
+        ("Fed rate decision due", High),
+        ("ECB cuts interest rates", High),
+        ("Fed raises rates by 25 basis points", High),
+        ("ECB raises interest rates", High),
+        ("Acme upgrade to buy", High),
+        ("Acme upgraded to outperform", High),
+        ("Acme downgrade to sell", High),
+        ("Broker downgrades Acme to neutral", High),
+        ("Broker upgrades Acme to overweight", High),
+        ("Acme announces voluntary recall", High),
+        ("Acme recalls 10000 cars", High),
+        ("Acme recalls 500 units", High),
+        ("Acme recalls defective products", High),
+        ("Acme to buy Beta for $5 billion", High),
+        ("Acme tops expectations", High),
+        ("Acme beats expectations", High),
+        ("Acme misses expectations", High),
+        ("Acme CEO to step down", High),
+        ("BREAKING - exchange notice", Urgent),
+        ("urgent–exchange notice", Urgent),
+        ("Flash | exchange notice", Urgent),
+        ("Alert — exchange notice", Urgent),
+        ("Breaking down the Fed's rate path", Normal),
+        ("Flash PMI: activity slows", Normal),
+        ("Urgent care chain plans IPO", Normal),
+        ("BREAKING Acme opens factory", Normal),
+        ("Breakingnewsletter explores savings", Normal),
+        ("Analyst upgrade cycle preview", Normal),
+        ("Acme downgraded software version", Normal),
+        ("Acme upgrades security features", Normal),
+        ("Voters debate recall of governor", Normal),
+        ("Traders recall past rate cuts", Normal),
+        ("Mortgage rate cut helps buyers", Normal),
+        ("Shipping rate hike expected", Normal),
+        ("Acme to buy new office furniture", Normal),
+        ("New products improve alertness", Normal),
+        ("Alert investors watch Acme", Normal),
+        ("Flashy launch draws crowds", Normal),
+        ("Urgently needed repairs completed", Normal),
+        ("Groundbreaking research unveiled", Normal),
+        ("Acme breaking ground on factory", Normal),
+        ("Acme halting progress on new factory", Normal),
+        ("Chapter 110 of company history", Normal),
+        ("Bankruptcyproof portfolio ideas", Normal),
+        ("Acme misses estimated delivery date", Normal),
+        ("FDA approvalness is not a word", Normal),
+        ("InSEC charges are disputed", Normal),
+        ("CEO resignation rumors circulate", Normal),
+        ("Dividend cutting tools on display", Normal),
+        ("Rate decisions previewed", Normal),
+        ("Acme publishes annual report", Normal),
+        ("", Normal),
+    ];
+    assert!(fixtures.len() >= 30);
+    for (headline, expected) in fixtures {
+        assert_eq!(priority(headline), expected, "{headline}");
+        assert_eq!(priority(&headline.to_uppercase()), expected, "upper: {headline}");
+    }
+}
+
+#[test]
+fn n5c_sort_recent_priorities_source_strength_and_old_history() {
+    let now = 200_000;
+    let make = |id, title, age| Cluster::wire(&story(id, title, now - age, "Reuters"));
+    let mut rows = vec![
+        make(1, "Routine", 1),
+        make(2, "Acme beats estimates", 2),
+        make(3, "URGENT: statement", 3),
+        make(4, "Acme cuts dividend", 4),
+        make(5, "BREAKING: stale", 86400 + 2),
+        make(6, "Routine old", 86401),
+        make(7, "Routine boundary", 86400),
+    ];
+    rows[3].sources.push("CNBC".into());
+    let ids = |rows: &[Cluster]| rows.iter().map(|c| c.lead.id.clone()).collect::<Vec<_>>();
+    let original = ids(&rows);
+    let expected = |indices: &[usize]| indices.iter().map(|&i| original[i].clone()).collect::<Vec<_>>();
+    sort_clusters(&mut rows, Sort::Newest, false, now);
+    assert_eq!(ids(&rows), expected(&[0, 1, 2, 3, 6, 5, 4]));
+    sort_clusters(&mut rows, Sort::Relevance, false, now);
+    assert_eq!(ids(&rows), expected(&[2, 3, 1, 0, 6, 5, 4]));
+    sort_clusters(&mut rows, Sort::Relevance, true, now);
+    assert_eq!(ids(&rows), expected(&[2, 1, 3, 0, 6, 5, 4]));
+    sort_clusters(&mut rows, Sort::Relevance, false, now + 86401);
+    assert_eq!(ids(&rows), expected(&[0, 1, 2, 3, 6, 5, 4]));
+}
+
+#[test]
+fn n5c_completed_acquisition_is_not_below_talks() {
+    assert!(priority("Acme acquires Beta for $5 billion") >= priority("Acme in talks to acquire Beta"));
+}
+
+#[test]
+fn n5c_relevance_requires_a_recent_dated_member_and_keeps_old_band_chronological() {
+    let now = 200_000;
+    let mut inferred = story(1, "URGENT: Acme results", now - 1, "Reuters");
+    inferred.inferred_ts = true;
+    let old = story(2, "Acme results", now - 86401, "CNBC");
+    let dated = story(3, "Routine dated report", now - 20, "Reuters");
+    let mut mixed = Cluster::wire(&inferred);
+    mixed.members.push(old);
+    let mut undated = inferred.clone();
+    undated.id = "undated".into();
+    undated.item.ts -= 1;
+    for wire in [true, false] {
+        let mut rows = vec![mixed.clone(), Cluster::wire(&undated), Cluster::wire(&dated)];
+        sort_clusters(&mut rows, Sort::Relevance, wire, now);
+        assert_eq!(rows.iter().map(|c| &c.lead.id).collect::<Vec<_>>(), vec![&dated.id, &inferred.id, &undated.id]);
+        let mut recent = dated.clone();
+        recent.item.ts = now - 30;
+        rows[1].members.push(recent);
+        sort_clusters(&mut rows, Sort::Relevance, wire, now);
+        assert_eq!(rows[0].lead.id, inferred.id, "a genuine recent member establishes freshness");
+    }
+}
+
+#[test]
+fn n5c_cluster_priority_is_maximum_even_when_lead_is_normal() {
+    let a = story(1, "Acme revenue results today", 100, "Reuters");
+    let b = story(2, "BREAKING: Acme revenue results today", 101, "CNBC");
+    let rows = clusters(&[a, b]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(priority(&rows[0].lead.item.title), Priority::Normal);
+    assert_eq!(rows[0].priority(), Priority::Urgent);
+    assert_eq!(rows[0].sources.len(), 2);
+}
+
+#[test]
+fn review_priority_first_token_urgency_false_positives() {
+    for headline in [
+        "Breaking down the Fed's rate path for 2027",
+        "Flash PMI: euro zone business activity slows in October",
+        "Urgent care chain Acme files for IPO",
+    ] {
+        assert_ne!(priority(headline), Priority::Urgent, "{headline}");
+    }
+}
+
+#[test]
+fn review_priority_generic_word_false_positives() {
+    for headline in [
+        "Microsoft upgrades Windows security features",
+        "Apple's iPhone upgrade cycle slows",
+        "California governor faces recall election",
+        "Traders recall the 1987 crash as volatility returns",
+    ] {
+        assert_eq!(priority(headline), Priority::Normal, "{headline}");
+    }
+}
+
+#[test]
+fn review_priority_misses_common_market_event_wording() {
+    for headline in [
+        "Microsoft acquires Activision for $69 billion",
+        "Acme agrees to buy Beta for $5 billion",
+        "Nasdaq halts trading in Acme shares",
+        "Fed cuts rates by a quarter point",
+        "Acme tops estimates as sales jump",
+    ] {
+        assert_eq!(priority(headline), Priority::High, "{headline}");
+    }
+}
+
+#[test]
+fn review_relevance_inferred_time_does_not_lead_recent_band() {
+    let now = 200_000;
+    let mut undated = story(1, "BREAKING: Acme old repost", now - 10, "Reuters");
+    undated.inferred_ts = true;
+    let dated = story(2, "Acme beats estimates", now - 20, "CNBC");
+    let mut rows = vec![Cluster::wire(&undated), Cluster::wire(&dated)];
+    sort_clusters(&mut rows, Sort::Relevance, true, now);
+    assert_eq!(rows[0].lead.id, dated.id, "inferred freshness must not rank as a recent breaking event");
+}
+
 fn subject_names() -> NameIndex {
     let companies = [
         (1, "FROG", "JFrog Ltd"),

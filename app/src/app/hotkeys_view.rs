@@ -304,7 +304,9 @@ impl TerminalApp {
             para(
                 ui,
                 "Row actions: Open (headline or Enter), Chart (ticker or C), Copy link, Save/Unsave (S). \
-                 Click the row or press Space to expand/collapse. Esc clears search before selection.",
+                 Click the row or press Space to expand/collapse. Esc clears search before selection. \
+                 R switches Newest / Relevance only with a row selected; use Filters without a selection. \
+                 Unselected letters remain available for type-anywhere commands.",
             );
 
             section(ui, "Brokerage (SnapTrade)");

@@ -355,6 +355,43 @@ fn n4_digest_is_deterministic_grouped_and_private_by_default() {
     let summary = local::digest(&[second_story_for_summary()], "market", 0, 200, 50, true, serde_json::json!([]));
     assert_eq!(summary.groups[0].stories[0].summary.as_ref().unwrap().chars().count(), 300);
 }
+#[test]
+fn n5c_digest_exports_cluster_priority_in_json_and_markdown() {
+    let a = story("https://fixture.invalid/a", "Acme revenue results today", 100, "", "Reuters");
+    let b = story("https://fixture.invalid/b", "BREAKING: Acme revenue results today", 101, "", "CNBC");
+    let digest = local::digest(&[a, b], "market", 0, 200, 50, false, serde_json::json!([]));
+    let json = serde_json::to_value(&digest).unwrap();
+    assert_eq!(json["groups"][0]["stories"][0]["priority"], "urgent");
+    assert_eq!(json["groups"][0]["stories"][0]["source_count"], 2);
+    assert!(digest.markdown().contains("priority: urgent"));
+    assert_eq!(digest.groups[0].stories[0].headline, "Acme revenue results today");
+    let mut legacy = json["groups"][0]["stories"][0].clone();
+    legacy.as_object_mut().unwrap().remove("priority");
+    let legacy: local::DigestStory = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.priority, crate::news_intelligence::Priority::Normal);
+}
+#[test]
+fn n5c_digest_markdown_omits_only_normal_priority() {
+    let stories = [
+        story("https://fixture.invalid/routine", "Routine bulletin", 100, "", "Reuters"),
+        story("https://fixture.invalid/high", "Acme beats estimates", 101, "", "CNBC"),
+        story("https://fixture.invalid/urgent", "URGENT: exchange notice", 102, "", "Bloomberg"),
+    ];
+    let digest = local::digest(&stories, "market", 0, 200, 50, false, serde_json::json!([]));
+    let markdown = digest.markdown();
+    assert!(!markdown.contains("priority: normal"));
+    assert!(markdown.contains("priority: high"));
+    assert!(markdown.contains("priority: urgent"));
+    let json = serde_json::to_value(&digest).unwrap();
+    assert!(
+        json["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["stories"].as_array().unwrap())
+            .any(|s| s["priority"] == "normal")
+    );
+}
 fn second_story_for_summary() -> Story {
     let mut s = story("https://fixture.invalid/s", "Summary fixture", 100, "", "Fixture");
     s.summary = "é".repeat(500);
