@@ -52,6 +52,12 @@ Labels used in every note:
   news module at `personal/main` (`fb3bd09`) with a ranked enhancement backlog: correctness and operational
   risk, feature coverage, UI/UX and feed breadth.
 
+- [News feed catalogue](news-feed-catalogue.md) — 2026-10-28 candidate seed catalogue, category/region/tier
+  vocabulary, registry row shape, probe rules and guard grouping for the feed registry (backlog item D1).
+
+- [N6: first built-in RSS feeds](news-feeds-n6-plan.md) — 2026-10-28 plan for 12 probed feeds (regulators,
+  global media, tech) in three guarded groups, conditional GET, per-feed Settings and a category filter.
+
 - [Quick tools and Auto/Log follow-up](toolbar-scale-followup.md) — 2026-10-21
   REA website runtime tests of drawing favorites, reload, scale-state transitions
   and indicator access; includes explicit account/interaction limits.
