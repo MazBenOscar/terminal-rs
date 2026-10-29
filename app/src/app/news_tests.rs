@@ -808,19 +808,68 @@ fn n5c_row_signals_are_aligned_and_source_count_leads_on_light_and_dark() {
         assert!(measured <= 361.0);
         let labels = text_shapes(&output);
         let x = |text: &str| labels.iter().find(|(s, _)| s == text).unwrap().1.x;
-        assert_eq!(x("Routine alpha bulletin"), x("Beta beats estimates"));
+        // The square + gap uses precisely the removed 14dp marker slot.
+        assert_eq!(x("Routine alpha bulletin") + dp(14.0), x("Beta beats estimates"));
         assert_eq!(x("Beta beats estimates"), x("FLASH: Gamma launch"));
         assert!(x("×3") < x("FLASH: Gamma launch"));
         assert!(!labels.iter().any(|(s, _)| s == "×1" || s == "×4"));
-        for (marker, colour) in [("!", theme::amber()), ("+", theme::accent())] {
+        assert!(!labels.iter().any(|(s, _)| s == "!" || s == "+"));
+        for priority in [intelligence::Priority::Urgent, intelligence::Priority::High] {
+            let (fill, _) = pill_colours(priority);
             assert!(output.shapes.iter().any(|s| matches!(&s.shape,
-                egui::Shape::Text(t) if t.galley.job.text == marker && t.fallback_color == colour)));
+                egui::Shape::Rect(r) if r.fill == fill && r.rect.size() == egui::vec2(dp(10.0), dp(10.0)))));
         }
+        for headline in ["Beta beats estimates", "FLASH: Gamma launch"] {
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Text(t) if t.galley.job.text == headline
+                    && t.galley.job.sections.iter().all(|section| section.format.coords
+                        == egui::epaint::text::VariationCoords::new([(b"wght", 680.0)])))));
+        }
+        let (wide, _) = ui_frame(&ctx, &mut pane, 900.0, vec![], false);
+        let wide_labels = text_shapes(&wide);
+        for (label, priority) in
+            [("URGENT", intelligence::Priority::Urgent), ("EARNINGS", intelligence::Priority::High)]
+        {
+            let (_, ink) = pill_colours(priority);
+            assert!(wide_labels.iter().any(|(text, _)| text == label));
+            assert!(wide.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Text(t) if t.galley.job.text == label && t.fallback_color == ink)));
+        }
+        let lum = |c: egui::Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+        let (fill, ink) = pill_colours(intelligence::Priority::Urgent);
+        assert!((lum(fill) - lum(ink)).abs() > 100.0, "attention pill must contrast in both themes");
+        assert_eq!(pill_colours(intelligence::Priority::High), (theme::accent_wash(), theme::accent()));
         pane.display.wire = true;
         let (wire, _) = ui_frame(&ctx, &mut pane, 360.0, vec![], false);
         assert!(!text_shapes(&wire).iter().any(|(s, _)| s.starts_with('×')));
     }
     theme::set_palette(old_palette);
+}
+
+#[test]
+fn polish_pill_text_covers_every_event_and_collapses_without_headline_width_loss() {
+    use intelligence::Event::*;
+    for (event, label) in [
+        (Urgent, "URGENT"),
+        (MergerAcquisition, "M&A"),
+        (Earnings, "EARNINGS"),
+        (Guidance, "GUIDANCE"),
+        (Rating, "RATING"),
+        (Fed, "FED"),
+        (Halt, "HALT"),
+        (Bankruptcy, "BANKRUPTCY"),
+        (Fda, "FDA"),
+        (Legal, "LEGAL"),
+        (Recall, "RECALL"),
+        (Dividend, "DIVIDEND"),
+        (Leadership, "CEO"),
+        (Jobs, "JOBS"),
+    ] {
+        assert_eq!(pill_text(event, dp(900.0)), label);
+        for width in [320.0, 359.0, 360.0, 600.0] {
+            assert_eq!(pill_text(event, dp(width)), "");
+        }
+    }
 }
 
 #[test]
@@ -1377,8 +1426,20 @@ fn escape_clears_focused_search_then_selection_and_releases_letters() {
     let selected = pane.interaction.selected.clone();
     ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Slash), true);
     ui_frame(&ctx, &mut pane, 600.0, vec![], true);
-    ui_frame(&ctx, &mut pane, 600.0, vec![egui::Event::Text("a".into())], true);
-    assert_eq!(pane.filters.search, "a");
+    // Keep whichever equal-time fixture sorts first visible. Short prefixes no longer match.
+    let query = pane
+        .items
+        .iter()
+        .find(|story| Some(&story.id) == selected.as_ref())
+        .unwrap()
+        .item
+        .title
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    ui_frame(&ctx, &mut pane, 600.0, vec![egui::Event::Text(query.clone())], true);
+    assert_eq!(pane.filters.search, query);
     ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Escape), true);
     assert!(pane.filters.search.is_empty());
     assert_eq!(pane.interaction.selected, selected);

@@ -328,6 +328,8 @@ pub struct RowModel {
     pub about: String,
     pub headline: String,
     pub priority: intelligence::Priority,
+    pub event: Option<intelligence::Event>,
+    pub matched_phrase: Option<&'static str>,
     pub source_count: usize,
     pub meta: String,
     pub meta_steps: Vec<String>,
@@ -401,10 +403,30 @@ fn row_model_watched(story: &Cluster, linked: Option<&str>, watched: &[String], 
         about,
         headline: story.lead.item.title.clone(),
         priority: story.priority(),
+        event: story.classification().map(|c| c.1),
+        matched_phrase: story.classification().map(|c| c.2),
         source_count: story.sources.len(),
         meta,
         meta_steps,
         unread: story.unread(),
+    }
+}
+/// Below this width a filled square costs exactly the reclaimed glyph slot.
+/// Full wording and the matched phrase remain available on hover.
+fn pill_text(event: intelligence::Event, width: f32) -> &'static str {
+    if width <= dp(600.0) { "" } else { event.label() }
+}
+fn pill_colours(priority: intelligence::Priority) -> (egui::Color32, egui::Color32) {
+    if priority == intelligence::Priority::Urgent {
+        let fill = theme::amber();
+        let lum = |c: egui::Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+        let text = [theme::text(), theme::card()]
+            .into_iter()
+            .max_by(|a, b| (lum(*a) - lum(fill)).abs().total_cmp(&(lum(*b) - lum(fill)).abs()))
+            .unwrap();
+        (fill, text)
+    } else {
+        (theme::accent_wash(), theme::accent())
     }
 }
 #[derive(Debug, PartialEq)]
@@ -1215,32 +1237,17 @@ pub(super) fn show(
         if model.unread {
             ui.painter().circle_filled(rect.left_center() + egui::vec2(dp(7.0), dp(0.0)), dp(2.0), theme::accent());
         }
-        // Fixed leading slots: unread/watch, priority, then Stories source strength.
-        // When needed, single-source rows leave the shared count slot blank.
-        let priority_rect =
-            egui::Rect::from_min_size(rect.min + egui::vec2(dp(12.0), dp(0.0)), egui::vec2(dp(14.0), rect.height()));
-        let marker = match model.priority {
-            intelligence::Priority::Urgent => Some(("!", theme::amber())), // attention role
-            intelligence::Priority::High => Some(("+", theme::accent())),
-            intelligence::Priority::Normal => None,
-        };
-        if let Some((text, colour)) = marker {
-            ui.painter().text(priority_rect.center(), egui::Align2::CENTER_CENTER, text, mono(11.0), colour);
-            ui.interact(priority_rect, ui.id().with("priority"), egui::Sense::hover()).on_hover_text(format!(
-                "Priority: {} · headline patterns, not verified urgency",
-                model.priority.label()
-            ));
-        }
+        // Only unread/watch and (when needed) source strength remain before time.
         if !n.display.wire && model.source_count > 1 {
             ui.painter().text(
-                egui::pos2(priority_rect.right() + source_width, rect.center().y),
+                egui::pos2(rect.left() + dp(12.0) + source_width, rect.center().y),
                 egui::Align2::RIGHT_CENTER,
                 format!("×{}", model.source_count),
                 mono(11.0),
                 theme::muted(),
             );
         }
-        let leading_width = dp(28.0) + source_width;
+        let leading_width = dp(14.0) + source_width;
         let time_width = ui.fonts_mut(|f| f.glyph_width(&mono(11.0), '0')) * crate::feed_time::WIDTH_CHARS as f32;
         // A constant column keeps every headline starting at the same x, ticker or not.
         let ticker_width = time_width;
@@ -1284,7 +1291,31 @@ pub(super) fn show(
                 child_clicked = true;
             }
         }
-        let available = rect.right() - ticker_rect.right() - dp(4.);
+        let pill_width = if let Some(event) = model.event {
+            let text = pill_text(event, rect.width());
+            let (fill, ink) = pill_colours(model.priority);
+            let galley = ui.painter().layout_no_wrap(text.into(), mono(9.0), ink);
+            let width = if text.is_empty() { dp(10.0) } else { galley.size().x + dp(8.0) };
+            let pill = egui::Rect::from_center_size(
+                egui::pos2(ticker_rect.right() + dp(4.0) + width / 2.0, rect.center().y),
+                egui::vec2(width, if text.is_empty() { dp(10.0) } else { galley.size().y + dp(4.0) }),
+            );
+            ui.painter().rect_filled(pill, dp(3.0), fill);
+            if !text.is_empty() {
+                ui.painter().galley(pill.center() - galley.size() / 2.0, galley, ink);
+            }
+            ui.interact(pill, ui.id().with((&model.id, "event")), egui::Sense::hover()).on_hover_text(format!(
+                "{} · priority: {} · headline wording, not verified urgency · matched phrase: ‘{}’",
+                event.label(),
+                model.priority.label(),
+                model.matched_phrase.unwrap_or_default()
+            ));
+            width + dp(4.0)
+        } else {
+            dp(0.0)
+        };
+        let headline_left = ticker_rect.right() + dp(4.0) + pill_width;
+        let available = rect.right() - headline_left;
         let budget = crate::feed_time::tail_budget(rect.width(), available);
         let (meta_text, meta_width) = model
             .meta_steps
@@ -1299,8 +1330,8 @@ pub(super) fn show(
             rect.max,
         );
         let title_rect = egui::Rect::from_min_max(
-            egui::pos2(ticker_rect.right() + dp(4.0), rect.top()),
-            egui::pos2((meta_rect.left() - dp(6.0)).max(ticker_rect.right() + dp(4.0)), rect.bottom()),
+            egui::pos2(headline_left, rect.top()),
+            egui::pos2((meta_rect.left() - dp(6.0)).max(headline_left), rect.bottom()),
         );
         let mut job = egui::text::LayoutJob::default();
         let mut cursor = 0;
@@ -1330,6 +1361,12 @@ pub(super) fn show(
             dp(0.0),
             egui::TextFormat { font_id: ui_font(13.0), color: base, ..Default::default() },
         );
+        // Real variable-font weight: one shaped run, never double-painted faux bold.
+        if model.priority != intelligence::Priority::Normal {
+            for section in &mut job.sections {
+                section.format.coords = egui::epaint::text::VariationCoords::new([(b"wght", 680.0)]);
+            }
+        }
         // The hover card below replaces egui's elided-text tip, so only one popup ever shows.
         // Left-aligned in its column: `ui.put` would centre a headline shorter than the slot.
         let title = ui

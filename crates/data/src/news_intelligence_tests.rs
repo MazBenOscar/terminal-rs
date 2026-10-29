@@ -16,6 +16,40 @@ fn story(id: usize, title: &str, ts: i64, source: &str) -> Story {
     )
 }
 #[test]
+fn polish_classification_returns_event_and_fixed_first_match() {
+    use Event::*;
+    for (headline, event) in [
+        ("BREAKING: Acme to acquire Beta", Urgent),
+        ("GE Vernova to Acquire Trench Group", MergerAcquisition),
+        ("Acme beats estimates", Earnings),
+        ("Acme raises guidance", Guidance),
+        ("Broker upgrades Acme to buy", Rating),
+        ("Fed holds rates", Fed),
+        ("Acme shares halted", Halt),
+        ("Acme files bankruptcy", Bankruptcy),
+        ("FDA approves therapy", Fda),
+        ("SEC charges Acme", Legal),
+        ("Acme recalls 500 units", Recall),
+        ("Acme dividend suspended", Dividend),
+        ("Acme CEO resigns", Leadership),
+        ("Acme cuts jobs", Jobs),
+        ("Acme beats estimates but cuts guidance", Guidance),
+        ("Acme files bankruptcy; trading halted", Halt),
+        ("Acme acquires Beta, broker upgrades Acme to buy", MergerAcquisition),
+    ] {
+        let p = if event == Urgent { Priority::Urgent } else { Priority::High };
+        assert_eq!(classify(headline), Some((p, event)), "{headline}");
+        assert_eq!(priority(headline), p);
+        let (_, _, phrase) = classify_with_phrase(headline).unwrap();
+        assert!(!phrase.is_empty());
+        assert_eq!(serde_json::to_value(event).unwrap(), event.label());
+    }
+    for headline in ["Investors get ready", "Flash PMI rises", "Acme CEO resignation rumors"] {
+        assert_eq!(classify(headline), None);
+    }
+}
+
+#[test]
 fn n5c_priority_headline_fixture_is_token_exact_and_case_insensitive() {
     use Priority::{High, Normal, Urgent};
     let fixtures = [

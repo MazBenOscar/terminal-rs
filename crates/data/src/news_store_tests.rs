@@ -362,13 +362,17 @@ fn n5c_digest_exports_cluster_priority_in_json_and_markdown() {
     let digest = local::digest(&[a, b], "market", 0, 200, 50, false, serde_json::json!([]));
     let json = serde_json::to_value(&digest).unwrap();
     assert_eq!(json["groups"][0]["stories"][0]["priority"], "urgent");
+    assert_eq!(json["groups"][0]["stories"][0]["event"], "URGENT");
+    assert!(digest.markdown().contains("event: URGENT"));
     assert_eq!(json["groups"][0]["stories"][0]["source_count"], 2);
     assert!(digest.markdown().contains("priority: urgent"));
     assert_eq!(digest.groups[0].stories[0].headline, "Acme revenue results today");
     let mut legacy = json["groups"][0]["stories"][0].clone();
     legacy.as_object_mut().unwrap().remove("priority");
+    legacy.as_object_mut().unwrap().remove("event");
     let legacy: local::DigestStory = serde_json::from_value(legacy).unwrap();
     assert_eq!(legacy.priority, crate::news_intelligence::Priority::Normal);
+    assert_eq!(legacy.event, None);
 }
 #[test]
 fn n5c_digest_markdown_omits_only_normal_priority() {
@@ -380,8 +384,9 @@ fn n5c_digest_markdown_omits_only_normal_priority() {
     let digest = local::digest(&stories, "market", 0, 200, 50, false, serde_json::json!([]));
     let markdown = digest.markdown();
     assert!(!markdown.contains("priority: normal"));
-    assert!(markdown.contains("priority: high"));
-    assert!(markdown.contains("priority: urgent"));
+    assert!(markdown.contains("priority: high · event: EARNINGS"));
+    assert!(markdown.contains("priority: urgent · event: URGENT"));
+    assert!(!markdown.lines().find(|line| line.contains("Routine bulletin")).unwrap().contains("event:"));
     let json = serde_json::to_value(&digest).unwrap();
     assert!(
         json["groups"]
@@ -559,6 +564,52 @@ fn review_store_search_matches_partial_words_like_view_filter() {
         assert_eq!(!fts.is_empty(), matches(&s, &q), "view: {search}");
         db.fts = false;
         assert_eq!(db.query(&q).unwrap(), fts, "LIKE: {search}");
+    }
+}
+
+#[test]
+fn polish_short_search_terms_and_exact_tickers_agree_in_all_paths() {
+    let mut db = NewsStore::memory().unwrap();
+    let mut items = vec![
+        story("https://fixture.test/ge", "GE Vernova to Acquire Trench Group", 100, "", "Fixture"),
+        story("https://fixture.test/ticker", "Industrial outlook", 101, "ge US Equity", "Fixture"),
+        story("https://fixture.test/gev", "Power equipment update", 102, "GEV", "Fixture"),
+        story("https://fixture.test/get", "Investors get ready", 103, "", "Fixture"),
+        story("https://fixture.test/generally", "Markets generally rise", 104, "", "Fixture"),
+        story("https://fixture.test/german", "German factories recover", 105, "", "Fixture"),
+        story("https://fixture.test/crypto", "Digital asset update", 106, "BTCUSD", "Fixture"),
+        story("https://fixture.test/summary", "Summary only fixture", 107, "", "Fixture"),
+    ];
+    items[7].summary = "GE orders improve".into();
+    db.insert(&items, 110).unwrap();
+    let mut q = Query { filters: Filters { scope: Scope::All, ..Default::default() }, ..Default::default() };
+    for (search, expected) in [
+        ("ge", vec![7, 1, 0]),
+        ("GE", vec![7, 1, 0]),
+        ("verno", vec![0]),
+        ("gev", vec![2]),
+        ("btcusd", vec![6]),
+        ("btc", vec![]),
+        ("ge verno", vec![0]),
+        ("ge industrial", vec![1]),
+        ("ge get", vec![]),
+        ("get", vec![3]),
+        ("germ", vec![5]),
+        ("gener", vec![4]),
+        ("g", vec![]),
+        ("ge%_", vec![7, 1, 0]),
+        ("\" OR 1=1 --", vec![]),
+    ] {
+        q.filters.search = search.into();
+        db.fts = true;
+        let fts = db.query(&q).unwrap();
+        let expected: Vec<_> = expected.into_iter().map(|i| items[i].id.clone()).collect();
+        assert_eq!(fts.iter().map(|s| s.id.clone()).collect::<Vec<_>>(), expected, "FTS: {search}");
+        db.fts = false;
+        assert_eq!(db.query(&q).unwrap(), fts, "fallback: {search}");
+        for item in &items {
+            assert_eq!(matches(item, &q), expected.contains(&item.id), "retained: {search}: {}", item.item.title);
+        }
     }
 }
 
