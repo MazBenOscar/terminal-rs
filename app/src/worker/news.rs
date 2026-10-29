@@ -836,6 +836,9 @@ async fn fetch_feed(s: &Arc<Shared>, feed: &'static tr_data::feeds::Feed) -> any
         let store = locked.as_mut().ok_or_else(|| anyhow::anyhow!("News store unavailable"))?;
         match result {
             Ok((stories, metadata)) => store.save_feed(feed, &stories, &metadata, now),
+            // Host spacing deferred the fetch locally (e.g. right after a restart):
+            // nothing was sent, so keep the last real status instead of "Source busy".
+            Err(error) if matches!(error.downcast_ref::<tr_net::Refused>(), Some(tr_net::Refused::Busy)) => Ok(()),
             Err(error) => {
                 let reason = guard
                     .host_status(feed.group, feed.url)
