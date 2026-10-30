@@ -132,14 +132,6 @@ impl ExternalServer {
                         }));
                         return Ok(schemas);
                     }
-                    // Connection registries stay immutable. Enforce the active
-                    // analysis turn before even validating a terminal-rs call.
-                    {
-                        let state = state.lock().await;
-                        if let Some(error) = state.executor.story_tool_error(&state.turn).await {
-                            return Ok(tr_agent::mcp::tool_result(error));
-                        }
-                    }
                     let Some(name) = request["params"]["name"].as_str() else {
                         return Ok(tr_agent::mcp::tool_error("Invalid tool name"));
                     };
@@ -164,6 +156,11 @@ impl ExternalServer {
                         return Ok(tr_agent::mcp::tool_error(
                             "Per-turn tool budget exhausted; external connection turns last 60 seconds",
                         ));
+                    }
+                    // Budget is consumed before any denial notice can queue.
+                    // The shared policy emits at most one notice per connection turn.
+                    if let Some(error) = state.executor.story_tool_error(&state.turn).await {
+                        return Ok(tr_agent::mcp::tool_result(error));
                     }
                     if name == "read_proposal_outcomes" {
                         #[derive(Deserialize)]

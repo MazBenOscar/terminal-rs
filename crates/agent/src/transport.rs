@@ -96,6 +96,7 @@ impl std::fmt::Debug for WireEvent {
 
 #[derive(Default)]
 struct EventQueue {
+    analysis: bool,
     queue: Mutex<VecDeque<WireEvent>>,
     ready: Notify,
     dropped: AtomicU64,
@@ -150,6 +151,9 @@ struct Shared {
     tool_cancel: watch::Sender<u64>,
     login_only: Mutex<Option<bool>>,
     shutdown_check: Mutex<Option<ShutdownCheck>>,
+    analysis_starting: AtomicBool,
+    analysis_threads: Mutex<HashMap<String, bool>>,
+    analysis_requests: Mutex<std::collections::HashSet<u64>>,
 }
 
 impl Shared {
@@ -161,9 +165,17 @@ impl Shared {
     }
 
     fn emit(&self, event: WireEvent) {
+        let analysis = match &event {
+            WireEvent::Notification { params, .. } => {
+                params["threadId"].as_str().is_some_and(|id| self.analysis_threads.lock().unwrap().contains_key(id))
+            }
+            WireEvent::Error(_) => false,
+        };
         self.events.lock().unwrap().retain(|subscriber| {
             if let Some(queue) = subscriber.upgrade() {
-                queue.push(event.clone());
+                if queue.analysis == analysis || matches!(event, WireEvent::Error(_)) {
+                    queue.push(event.clone());
+                }
                 true
             } else {
                 false
@@ -312,6 +324,9 @@ impl Transport {
             tool_cancel: watch::channel(0).0,
             login_only: Mutex::new(None),
             shutdown_check: Mutex::new(None),
+            analysis_starting: AtomicBool::new(false),
+            analysis_threads: Mutex::new(HashMap::new()),
+            analysis_requests: Mutex::new(std::collections::HashSet::new()),
         });
         tokio::spawn(write_loop(write, receiver, shared.clone()));
         tokio::spawn(read_loop(read, shared.clone(), handler));
@@ -322,6 +337,27 @@ impl Transport {
         let queue = Arc::new(EventQueue::default());
         self.shared.events.lock().unwrap().push(Arc::downgrade(&queue));
         EventStream { queue, terminal: self.shared.terminal.subscribe(), ended: false }
+    }
+
+    pub(crate) fn begin_analysis(&self) -> EventStream {
+        self.shared.analysis_starting.store(true, Ordering::SeqCst);
+        let queue = Arc::new(EventQueue { analysis: true, ..Default::default() });
+        self.shared.events.lock().unwrap().push(Arc::downgrade(&queue));
+        EventStream { queue, terminal: self.shared.terminal.subscribe(), ended: false }
+    }
+
+    pub(crate) fn cancel_analysis(&self, thread: Value, turn: Value) {
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .shared
+            .enqueue(json!({"id":id,"method":"turn/interrupt","params":{"threadId":thread,"turnId":turn}}), None);
+    }
+
+    pub(crate) fn retire_analysis(&self) {
+        self.shared.analysis_starting.store(false, Ordering::SeqCst);
+        for active in self.shared.analysis_threads.lock().unwrap().values_mut() {
+            *active = false;
+        }
     }
 
     pub fn is_unsafe(&self) -> bool {
@@ -409,6 +445,9 @@ impl Transport {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.shared.pending.lock().unwrap().insert(id, tx);
+        if method == "thread/start" && self.shared.analysis_starting.load(Ordering::SeqCst) {
+            self.shared.analysis_requests.lock().unwrap().insert(id);
+        }
         let _cleanup = PendingGuard { id, shared: self.shared.clone() };
         self.shared.enqueue(json!({"id": id, "method": method, "params": params}), None)?;
         match tokio::time::timeout(TIMEOUT, rx).await {
@@ -525,6 +564,18 @@ fn route(value: Value, shared: &Arc<Shared>, handler: &ToolHandler, slots: &Arc<
             shared.violation(&Value::Null, "unsafe malformed response envelope".into());
             return false;
         }
+        // Keep start request identities after cancellation too: even a late
+        // thread/start response must register a retired, tool-denied thread.
+        if let Some(id) = value["id"].as_u64()
+            && shared.analysis_requests.lock().unwrap().remove(&id)
+            && let Some(thread) = value["result"]["thread"]["id"].as_str()
+        {
+            shared
+                .analysis_threads
+                .lock()
+                .unwrap()
+                .insert(thread.into(), shared.analysis_starting.load(Ordering::SeqCst));
+        }
         if let Some(id) = value["id"].as_u64()
             && let Some(sender) = shared.pending.lock().unwrap().remove(&id)
         {
@@ -538,6 +589,19 @@ fn route(value: Value, shared: &Arc<Shared>, handler: &ToolHandler, slots: &Arc<
         return true;
     };
     let params = value["params"].clone();
+    let analysis = params["threadId"].as_str().and_then(|id| shared.analysis_threads.lock().unwrap().get(id).copied());
+    let tool = method == "item/tool/call" || params["item"]["type"] == "dynamicToolCall";
+    if tool && (analysis.is_some() || shared.analysis_starting.load(Ordering::SeqCst)) {
+        if let Some(id) = value.get("id") {
+            shared.security_reply(json!({"id":id,"result":{"success":false,"contentItems":[{"type":"inputText","text":"Tools are disabled for story analysis"}]}}));
+        }
+        shared.violation(&params, "tool attempt on isolated story analysis thread".into());
+        return false;
+    }
+    if analysis == Some(false) && value.get("id").is_none() && !method.ends_with("requestApproval") {
+        // Retired analysis text/status must never reach any ordinary subscriber.
+        return true;
+    }
     // Approval-shaped messages are always violations, even when they are not
     // schema requests (for example a future method, or one without an id).
     if method.ends_with("requestApproval") || matches!(method, "applyPatchApproval" | "execCommandApproval") {
@@ -757,6 +821,34 @@ pub(crate) mod tests {
     }
     pub(crate) async fn send<W: AsyncWrite + Unpin>(write: &mut W, value: Value) {
         write.write_all(format!("{value}\n").as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_analysis_start_response_still_registers_retired_toolless_thread() {
+        let (transport, mut read, mut write, killed) = fake(no_tools());
+        let _analysis = transport.begin_analysis();
+        let mut ordinary = transport.events();
+        let id = {
+            let request = transport.request("thread/start", json!({"ephemeral":true,"dynamicTools":[]}));
+            tokio::pin!(request);
+            tokio::select! {
+                _ = &mut request => panic!("unexpected reply"),
+                packet = receive(&mut read) => packet["id"].clone(),
+            }
+        }; // Cancel before thread/start responds.
+        transport.retire_analysis();
+        send(&mut write, json!({"id":id,"result":{"thread":{"id":"late-story"}}})).await;
+        send(
+            &mut write,
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"late-story","delta":"late injection"}}),
+        )
+        .await;
+        assert!(tokio::time::timeout(Duration::from_millis(10), ordinary.recv()).await.is_err());
+        assert_eq!(transport.shared.analysis_threads.lock().unwrap().get("late-story"), Some(&false));
+        send(&mut write, json!({"method":"item/started","params":{"threadId":"late-story","turnId":"late-turn","item":{"type":"dynamicToolCall"}}})).await;
+        assert!(matches!(ordinary.recv().await, Some(WireEvent::Error(_))));
+        assert!(transport.is_unsafe());
+        assert!(killed.load(Ordering::SeqCst));
     }
 
     #[test]

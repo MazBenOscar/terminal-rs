@@ -54,6 +54,7 @@ struct Rpc {
     retired_sessions: Mutex<HashSet<String>>,
     /// Canary sessions abandoned mid-turn for a retry: late tool traffic still trips.
     cancelled_sessions: Mutex<HashSet<String>>,
+    analysis: AtomicBool,
     turn: Mutex<String>,
     text: Mutex<StreamScrubber>,
     message_segment: AtomicU64,
@@ -294,6 +295,16 @@ impl Rpc {
                 self.send(crate::mcp::error(id.clone(), -32602, "Unexpected ACP session"))?;
             }
             self.violation("mimo isolation tripwire: update/request for another session").await;
+            return Ok(());
+        }
+        if self.analysis.load(Ordering::SeqCst)
+            && (method == "session/request_permission"
+                || matches!(params["update"]["sessionUpdate"].as_str(), Some("tool_call" | "tool_call_update")))
+        {
+            if let Some(id) = value.get("id") {
+                self.send(crate::mcp::error(id.clone(), -32601, "Tools are disabled for story analysis"))?;
+            }
+            self.violation("mimo isolation tripwire: tool attempt in story analysis").await;
             return Ok(());
         }
         if method == "session/request_permission" {
@@ -539,6 +550,7 @@ impl AcpBackend {
             session: Default::default(),
             retired_sessions: Default::default(),
             cancelled_sessions: Default::default(),
+            analysis: AtomicBool::new(false),
             turn: Default::default(),
             text: Default::default(),
             message_segment: AtomicU64::new(0),
@@ -842,8 +854,80 @@ impl AcpBackend {
         });
         Ok(backend)
     }
-    /// Run once for each fresh private child, before reporting readiness. Any
-    /// built-in tool surviving --pure is caught by the same live tripwire.
+    /// Serial with ordinary turns on the same verified process. The guard also
+    /// retires on dropped futures (shutdown/cancel); the main session is never prompted.
+    pub async fn analyze(&self, input: TurnInput) -> std::result::Result<String, crate::AnalysisError> {
+        use crate::AnalysisError;
+        if self.is_closed() || self.is_unsafe() || self.busy.swap(true, Ordering::SeqCst) {
+            return Err(AnalysisError::NotReady);
+        }
+        let main = self.rpc.session.lock().unwrap().clone();
+        if main.is_none() {
+            self.busy.store(false, Ordering::SeqCst);
+            return Err(AnalysisError::NotReady);
+        }
+        struct Restore<'a>(&'a AcpBackend, Option<String>, String);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let rpc = &self.0.rpc;
+                let current = rpc.session.lock().unwrap().clone();
+                if current != self.1 {
+                    rpc.notify_cancel();
+                    if let Some(id) = current {
+                        // Even after successful completion, late tool updates
+                        // must trip exactly like cancelled canary sessions.
+                        rpc.cancelled_sessions.lock().unwrap().insert(id.clone());
+                        rpc.retired_sessions.lock().unwrap().insert(id);
+                    }
+                }
+                *rpc.session.lock().unwrap() = self.1.clone();
+                if let Some(main) = &self.1 {
+                    rpc.retired_sessions.lock().unwrap().remove(main);
+                }
+                *rpc.turn.lock().unwrap() = self.2.clone();
+                *rpc.text.lock().unwrap() = StreamScrubber::default();
+                *rpc.thought.lock().unwrap() = StreamScrubber::default();
+                rpc.tool_ids.lock().unwrap().clear();
+                rpc.analysis.store(false, Ordering::SeqCst);
+                self.0.busy.store(false, Ordering::SeqCst);
+            }
+        }
+        let _restore = Restore(self, main, self.rpc.turn.lock().unwrap().clone());
+        self.rpc.analysis.store(true, Ordering::SeqCst);
+        let mut events = self.events();
+        let run = async {
+            let result = self
+                .rpc
+                .request("session/new", json!({"cwd":self.workspace,"mcpServers":[]}), Duration::from_secs(30))
+                .await
+                .map_err(|_| AnalysisError::NotReady)?;
+            let session = result["sessionId"].as_str().ok_or(AnalysisError::NotReady)?;
+            self.apply_model(&input.model).await.map_err(|_| AnalysisError::NotReady)?;
+            *self.rpc.turn.lock().unwrap() = format!("story-{}", self.turns.fetch_add(1, Ordering::Relaxed));
+            let prompt = self.rpc.request_inner(
+                "session/prompt",
+                json!({"sessionId":session,"prompt":[{"type":"text","text":input.text}]}),
+                None,
+            );
+            tokio::pin!(prompt);
+            // The reader emits final scrubbed chunks and Done before resolving
+            // the prompt RPC. Keep collecting until Done, including rejection.
+            let reply = crate::analysis_reply(&mut events);
+            tokio::pin!(reply);
+            tokio::select! {
+                biased;
+                result = &mut reply => result,
+                result = &mut prompt => match result {
+                    Err(error) if !error.is::<Rejected>() => Err(AnalysisError::NotReady),
+                    _ => reply.await,
+                },
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(90), run).await.unwrap_or(Err(AnalysisError::TimedOut));
+        if self.is_unsafe() { Err(AnalysisError::ToolAttempt) } else { result }
+    }
+
+    /// Run once for each fresh child before readiness, never per analysis.
     pub async fn canary(&self) -> Result<()> {
         self.canary_with_timeout(Duration::from_secs(120)).await
     }

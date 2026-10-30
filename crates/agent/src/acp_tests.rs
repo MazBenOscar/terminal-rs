@@ -61,6 +61,72 @@ async fn handshake(
 }
 
 #[tokio::test]
+async fn story_analysis_is_history_free_restores_main_and_rejects_retired_tools() {
+    let (backend, mut read, mut write, killed) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let instructions = backend.instructions.lock().unwrap().clone();
+    let server = async {
+        let new = receive(&mut read).await;
+        assert_eq!(new["method"], "session/new");
+        assert_eq!(new["params"]["mcpServers"], json!([]));
+        send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"story"}))).await;
+        let prompt = receive(&mut read).await;
+        assert_eq!(prompt["params"]["sessionId"], "story");
+        assert_eq!(prompt["params"]["prompt"][0]["text"], "untrusted news");
+        send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"story","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Isolated answer\n"}}}})).await;
+        send(&mut write, crate::mcp::success(prompt["id"].clone(), json!({"stopReason":"end_turn"}))).await;
+    };
+    let (result, ()) =
+        tokio::join!(backend.analyze(TurnInput { text: "untrusted news".into(), ..Default::default() }), server);
+    assert_eq!(result.unwrap(), "Isolated answer\n");
+    assert_eq!(backend.rpc.session.lock().unwrap().as_deref(), Some("fake-session"));
+    assert_eq!(*backend.instructions.lock().unwrap(), instructions);
+    assert!(!killed.load(Ordering::SeqCst));
+    let mut events = backend.events();
+    backend.rpc.route(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"story","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"late injection"}}}})).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(10), events.recv()).await.is_err());
+    backend.rpc.route(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"story","update":{"sessionUpdate":"tool_call_update","toolCallId":"late"}}})).await.unwrap();
+    assert!(backend.is_unsafe());
+    assert!(killed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn story_analysis_tool_call_is_a_tripwire_even_for_terminal_tools() {
+    let (backend, mut read, mut write, killed) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let server = async {
+        let new = receive(&mut read).await;
+        send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"story"}))).await;
+        let _prompt = receive(&mut read).await;
+        send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"story","update":{"sessionUpdate":"tool_call","toolCallId":"x","title":"terminal-rs_read_chart","kind":"other"}}})).await;
+    };
+    let (result, ()) = tokio::join!(backend.analyze(TurnInput::default()), server);
+    assert_eq!(result, Err(crate::AnalysisError::ToolAttempt));
+    assert!(backend.is_unsafe());
+    assert!(killed.load(Ordering::SeqCst));
+    assert_eq!(backend.rpc.session.lock().unwrap().as_deref(), Some("fake-session"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn story_analysis_timeout_cancels_retires_and_restores_main() {
+    let (backend, mut read, mut write, _) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let server = async {
+        let new = receive(&mut read).await;
+        send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"slow-story"}))).await;
+        let _prompt = receive(&mut read).await;
+        tokio::time::sleep(Duration::from_secs(91)).await;
+        let cancel = receive(&mut read).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        assert_eq!(cancel["params"]["sessionId"], "slow-story");
+    };
+    let (result, ()) = tokio::join!(backend.analyze(TurnInput::default()), server);
+    assert_eq!(result, Err(crate::AnalysisError::TimedOut));
+    assert!(backend.rpc.cancelled_sessions.lock().unwrap().contains("slow-story"));
+    assert_eq!(backend.rpc.session.lock().unwrap().as_deref(), Some("fake-session"));
+}
+
+#[tokio::test]
 async fn handshake_mcp_entry_streamed_chunks_tools_plan_and_models() {
     let (backend, mut read, mut write, killed) = fake();
     handshake(&backend, &mut read, &mut write).await;
@@ -845,6 +911,7 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
         session: Default::default(),
         retired_sessions: Default::default(),
         cancelled_sessions: Default::default(),
+        analysis: AtomicBool::new(false),
         turn: Default::default(),
         text: Default::default(),
         message_segment: AtomicU64::new(0),

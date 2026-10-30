@@ -43,18 +43,21 @@ static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) const STORY_TOOLS_DISABLED: &str = "Tools are disabled for story analysis";
 
-/// Shared with both backend executors. Canonical in-app ids stay denied for
-/// late traffic. MCP connection ids span agent turns: retain their refusals
-/// until the next ordinary prompt explicitly opens a new tool-enabled turn.
+/// Defence in depth shared with both executors, in addition to protocol-level
+/// session isolation. Unattributable external calls fail closed while analysis
+/// is active. Only confirmed completion/retirement releases the active denial;
+/// canonical attributed ids remain denied for late traffic.
 #[derive(Default)]
 pub(crate) struct StoryToolPolicy {
     pub active: bool,
     blocked_turns: std::collections::HashSet<String>,
+    noticed_turns: std::collections::HashSet<String>,
 }
 impl StoryToolPolicy {
     pub fn begin(&mut self, analysis: bool) {
-        self.active = analysis;
-        if !analysis {
+        // Starting an ordinary prompt is not proof the analysis ended.
+        self.active |= analysis;
+        if !self.active {
             self.blocked_turns.retain(|turn| !turn.starts_with("external-"));
         }
     }
@@ -642,8 +645,16 @@ impl AppExecutor {
     /// Check before registry validation/execution, including the MCP-only tool.
     /// The notice is host-owned, not part of the folded tool transcript.
     pub(crate) async fn story_tool_error(&self, turn: &str) -> Option<ToolResult> {
-        if !self.story_tools.lock().unwrap().denies(turn) {
-            return None;
+        {
+            let mut policy = self.story_tools.lock().unwrap();
+            if !policy.denies(turn) {
+                return None;
+            }
+            // Reserve before queuing a UI job. Repeated denials never enqueue
+            // work, including while the first notice is waiting on the UI.
+            if !policy.noticed_turns.insert(turn.into()) {
+                return Some(ToolResult::error("tools_disabled", STORY_TOOLS_DISABLED, None));
+            }
         }
         let host = ScopedHost {
             app: self.clone(),

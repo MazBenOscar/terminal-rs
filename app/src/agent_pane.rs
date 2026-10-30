@@ -673,6 +673,14 @@ impl AgentPane {
         self.story_tools.lock().unwrap().begin(analysis);
     }
 
+    /// Called only for a confirmed isolated reply/end, never on interrupt.
+    pub(crate) fn story_analysis_ended(&mut self) {
+        self.story_turn = false;
+        let mut policy = self.story_tools.lock().unwrap();
+        policy.active = false;
+        policy.begin(false);
+    }
+
     fn remember_story_turn(&mut self, turn: &str) {
         if self.story_turn {
             self.story_tools.lock().unwrap().remember(turn);
@@ -773,7 +781,8 @@ impl AgentPane {
     }
 
     pub fn interrupt(&mut self) {
-        self.story_tools.lock().unwrap().active = false;
+        // Cancellation is not completion: keep denial until the owner confirms
+        // completion/retirement or reports a stopped backend.
         self.retryable = true;
         self.queue_paused = true;
         self.interrupt_tools();
@@ -811,6 +820,7 @@ impl AgentPane {
         self.starting_prompt = Some(prompt.id.clone());
         Some(prompt)
     }
+    #[cfg(test)]
     pub fn next_prompt(&mut self) -> Option<Prompt> {
         let prompt = self.dequeue_prompt()?;
         self.start_prompt(prompt)
@@ -884,6 +894,17 @@ impl AgentPane {
     }
 
     pub fn event(&mut self, event: BridgeEvent) {
+        // Isolated analysis never produces ordinary Started/Completed events.
+        // A delayed main-thread ack must not release its denial or running slot.
+        if self.story_turn
+            && self.active_turn.is_none()
+            && matches!(
+                &event,
+                BridgeEvent::Started { .. } | BridgeEvent::Completed { .. } | BridgeEvent::ToolsUnavailable { .. }
+            )
+        {
+            return;
+        }
         match event {
             BridgeEvent::Wire(WireEvent::Notification { method, params }) => self.wire(&method, &params),
             BridgeEvent::Wire(WireEvent::Error(reason)) => self.error_notice(&reason),
@@ -4399,7 +4420,28 @@ mod polish_tests {
     }
 
     #[test]
-    fn story_tool_flag_clears_on_every_terminal_path_and_keeps_attributed_calls_denied() {
+    fn isolated_analysis_denial_survives_interrupt_and_unrelated_main_completion() {
+        let mut pane = AgentPane::default();
+        pane.set_story_turn(true);
+        pane.running = true;
+        pane.interrupt();
+        pane.event(BridgeEvent::Completed {
+            turn: "main".into(),
+            status: "completed".into(),
+            calls: 0,
+            interrupt_elapsed: None,
+        });
+        assert!(pane.running);
+        assert!(pane.story_tools.lock().unwrap().active);
+        assert!(pane.turns.is_empty());
+        pane.story_tools.lock().unwrap().begin(false);
+        assert!(pane.story_tools.lock().unwrap().active, "ordinary start cannot confirm isolated end");
+        pane.story_analysis_ended();
+        assert!(!pane.story_tools.lock().unwrap().active);
+    }
+
+    #[test]
+    fn story_tool_flag_releases_only_on_confirmed_end_and_keeps_attributed_calls_denied() {
         for ending in ["completed", "cancelled", "failed", "interrupt", "stopped", "unavailable", "recovered"] {
             let mut pane = AgentPane::default();
             pane.transition(Onboarding::Ready);
@@ -4420,9 +4462,9 @@ mod polish_tests {
                 }),
             }
             let mut policy = pane.story_tools.lock().unwrap();
-            assert!(!policy.active, "{ending}");
+            assert_eq!(policy.active, ending == "interrupt", "{ending}");
             assert!(policy.denies("story-turn"), "{ending}");
-            assert!(!policy.denies("ordinary-turn"), "{ending}");
+            assert_eq!(policy.denies("ordinary-turn"), ending == "interrupt", "{ending}");
         }
     }
 

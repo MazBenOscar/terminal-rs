@@ -313,8 +313,8 @@ impl TerminalApp {
             prompt.id.clone(),
             Job { story_id: story.lead.id.clone(), agent, created_at: Instant::now(), model: String::new() },
         );
-        // The app has one shared Agent session. Route its UI to the chosen pane;
-        // the queue and transcript remain shared rather than duplicating sessions.
+        // Share the existing backend owner and FIFO, never its conversation.
+        // Analysis output is delivered separately to this Story's cache.
         self.agent_pane_owner = Some(agent);
         let details = self.story_desk.details.entry(story.lead.id.clone()).or_default();
         details.agent = Some(agent);
@@ -327,46 +327,24 @@ impl TerminalApp {
             job.model = model.into();
         }
     }
-    pub(super) fn collect_story_analysis(&mut self) {
-        let done: Vec<_> = self
-            .story_desk
-            .jobs
-            .iter()
-            .filter_map(|(prompt, j)| {
-                if self.agent_pane.queue.iter().any(|p| p.id == *prompt)
-                    || self.agent_pane.starting_prompt.as_ref() == Some(prompt)
-                {
-                    return None;
-                }
-                // The canonical request id is attached at turn creation for ALL
-                // backends. Queue absence alone says nothing about turn failure.
-                let Some((index, turn)) =
-                    self.agent_pane.turns.iter().enumerate().rev().find(|(_, t)| t.prompt_id == *prompt)
-                else {
-                    // Neither queued, owned by startup, nor represented by a
-                    // turn: the user removed/cleared this request.
-                    return Some((prompt.clone(), j.story_id.clone(), j.model.clone(), String::new(), false));
-                };
-                if !turn.finished {
-                    return None;
-                }
-                let text = self.agent_pane.turn_reply_text(index);
-                let model = if j.model.is_empty() {
-                    self.agent_pane.settings.model(self.agent_pane.backend).clone()
-                } else {
-                    j.model.clone()
-                };
-                Some((prompt.clone(), j.story_id.clone(), model, text, turn.final_answer_succeeded))
-            })
-            .collect();
-        for (prompt, id, model, text, success) in done {
-            self.story_desk.jobs.remove(&prompt);
-            let details = self.story_desk.details.entry(id.clone()).or_default();
-            if success && !text.trim().is_empty() {
+    pub(super) fn finish_story_analysis(&mut self, prompt: PromptId, result: Result<String, tr_agent::AnalysisError>) {
+        let Some(job) = self.story_desk.jobs.remove(&prompt) else { return };
+        if self.agent_pane.starting_prompt.as_ref() == Some(&prompt) {
+            self.agent_pane.starting_prompt = None;
+            self.agent_pane.running = false;
+        }
+        // A cancel/timeout without a confirmed end stops the process. Keep the
+        // external denial until that Stopped event, not the interrupt request.
+        if matches!(result, Ok(_) | Err(tr_agent::AnalysisError::NoAnswer)) {
+            self.agent_pane.story_analysis_ended();
+        }
+        let details = self.story_desk.details.entry(job.story_id.clone()).or_default();
+        match result {
+            Ok(text) if !text.trim().is_empty() => {
                 let input = self.story_desk.analysis_inputs.get(&prompt).expect("story input retained through retry");
                 let analysis = StoryAnalysis::v2(
-                    id,
-                    model,
+                    job.story_id,
+                    job.model,
                     chrono::Utc::now().timestamp(),
                     text,
                     serde_json::to_value(input).expect("analysis input serializes"),
@@ -374,10 +352,31 @@ impl TerminalApp {
                 self.worker.send(Request::SaveStoryAnalysis(analysis.clone()));
                 details.set_analysis(analysis);
                 details.error = None;
-            } else {
-                details.error =
-                    Some("Analysis stopped, cancelled, or removed from the queue. Retry when ready.".into());
             }
+            result => details.error = Some(result.err().unwrap_or(tr_agent::AnalysisError::NoAnswer).to_string()),
+        }
+        // At most one host-owned line; no prompt/reply blocks or conversation turn.
+        self.agent_pane.notice("Story analysis ran on a separate thread (no tools)");
+    }
+
+    pub(super) fn collect_story_analysis(&mut self) {
+        let removed: Vec<_> = self
+            .story_desk
+            .jobs
+            .keys()
+            .filter(|prompt| {
+                !self.agent_pane.queue.iter().any(|p| p.id == **prompt)
+                    && self.agent_pane.starting_prompt.as_ref() != Some(*prompt)
+            })
+            .cloned()
+            .collect();
+        for prompt in removed {
+            self.finish_story_analysis(prompt, Err(tr_agent::AnalysisError::Cancelled));
+        }
+        if matches!(self.agent_pane.state, Onboarding::Stopped { .. })
+            && let Some(prompt) = self.agent_pane.starting_prompt.clone()
+        {
+            self.finish_story_analysis(prompt, Err(tr_agent::AnalysisError::NotReady));
         }
         self.story_desk.readonly_prompts.retain(|prompt, _| {
             self.story_desk.jobs.contains_key(prompt)
@@ -553,16 +552,16 @@ impl TerminalApp {
             let entry = self.story_desk.jobs.iter().find(|(_, j)| j.story_id == story.lead.id);
             let job = entry.map(|(_, j)| j);
             if let Some((prompt, job)) = entry {
-                let turn = self.agent_pane.turns.iter().rev().find(|t| t.prompt_id == *prompt && !t.finished);
+                let running = self.agent_pane.running && self.agent_pane.starting_prompt.as_ref() == Some(prompt);
                 let waiting = job.created_at.elapsed();
-                let timed_out = turn.is_none() && waiting > ANALYSIS_START_TIMEOUT;
+                let timed_out = !running && waiting > ANALYSIS_START_TIMEOUT;
                 let phase = analysis_phase(
                     &self.agent_pane.state,
                     self.agent_config.backend == crate::agent_mcp::Backend::Mimo,
-                    turn.is_some(),
+                    running,
                     waiting,
                 );
-                let elapsed = turn.map_or(job.created_at, |t| t.started_at).elapsed().as_secs();
+                let elapsed = waiting.as_secs();
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{phase} · {elapsed}s")).font(mono(10.5)).color(theme::muted()));
                     if timed_out && ui.small_button("Retry").clicked() {
@@ -572,7 +571,7 @@ impl TerminalApp {
                         analyze = true;
                     }
                     if ui.small_button("Cancel").clicked() {
-                        cancel = Some((prompt.clone(), job.agent, turn.is_some()));
+                        cancel = Some((prompt.clone(), job.agent, running));
                     }
                 });
                 ui.ctx().request_repaint_after(Duration::from_secs(1));
@@ -673,8 +672,7 @@ impl TerminalApp {
                     self.agent_pane.starting_prompt = None;
                 }
                 self.story_desk.jobs.remove(&prompt);
-                self.story_desk.details.entry(story.lead.id.clone()).or_default().error =
-                    Some("Analysis cancelled. Retry when ready.".into());
+                self.story_desk.details.entry(story.lead.id.clone()).or_default().error = Some("Cancelled".into());
             }
         }
         if analyze {
@@ -1016,20 +1014,25 @@ mod tests {
                 let prompt_id = app.agent_pane.queue.front().unwrap().id.clone();
                 app.agent_logic(&ctx);
                 assert!(app.agent_pane.queue.is_empty());
-                assert_eq!(app.agent_pane.turns.last().unwrap().prompt_id, prompt_id);
-                assert!(matches!(commands.try_recv().unwrap(), Command::Turn(turn) if !turn.requires_tools));
+                assert!(app.agent_pane.turns.is_empty());
+                assert!(app.agent_pane.blocks.is_empty());
+                assert!(
+                    matches!(commands.try_recv().unwrap(), Command::Analysis { id, input } if id == prompt_id && input.workflow_results.is_empty() && input.context.is_empty())
+                );
                 assert!(!commands.is_closed(), "the original session must still own the receiver");
                 assert_eq!(app.agent_pane.state, Onboarding::Ready);
                 assert_eq!(app.agent_pane.session_tools, Some(tools));
                 assert_eq!(app.agent_pane.settings.tools, mode);
                 assert_eq!(app.agent_config, saved);
                 assert!(Arc::ptr_eq(&listener_pin, &app.external_agent.as_ref().unwrap().pin));
-                app.agent_pane.event(tr_agent::bridge::BridgeEvent::Completed {
-                    turn: "analysis".into(),
-                    status: "completed".into(),
-                    calls: 0,
-                    interrupt_elapsed: None,
-                });
+                app.finish_story_analysis(prompt_id, Ok("Isolated result".into()));
+                assert!(app.agent_pane.turns.is_empty());
+                assert!(
+                    app.agent_pane
+                        .blocks
+                        .iter()
+                        .all(|block| matches!(block, crate::agent_pane::RenderedBlock::Notice(_)))
+                );
                 app.agent_logic(&ctx);
                 assert!(!commands.is_closed(), "completion must not restore/restart the session");
                 assert!(Arc::ptr_eq(&listener_pin, &app.external_agent.as_ref().unwrap().pin));
@@ -1037,6 +1040,56 @@ mod tests {
                 std::fs::remove_dir_all(root).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn isolated_result_and_errors_leave_existing_conversation_and_workflow_history_untouched() {
+        let (mut app, root) = fixture("isolated-history");
+        app.agent_pane.transition(Onboarding::Ready);
+        let ordinary = Prompt { id: Default::default(), text: "My ordinary question".into(), requires_tools: true };
+        app.agent_pane.start_prompt(ordinary.clone()).unwrap();
+        app.agent_pane.wire(
+            "item/completed",
+            &serde_json::json!({"item":{"id":"main-reply","type":"agentMessage","text":"Prior ordinary answer"}}),
+        );
+        app.agent_pane.event(tr_agent::bridge::BridgeEvent::Completed {
+            turn: "main".into(),
+            status: "completed".into(),
+            calls: 0,
+            interrupt_elapsed: None,
+        });
+        app.agent_pane.workflows.context.push(tr_agent::codex::WorkflowResult::Undo {
+            turn: "main".into(),
+            reverted: 1,
+            kept: vec![],
+        });
+        let blocks = app.agent_pane.blocks.len();
+        let pane = app.new_pane(PaneKind::Story { link_follow: true });
+        for result in [
+            Ok("Story-only answer".into()),
+            Err(tr_agent::AnalysisError::ToolAttempt),
+            Err(tr_agent::AnalysisError::NoAnswer),
+            Err(tr_agent::AnalysisError::Cancelled),
+            Err(tr_agent::AnalysisError::TimedOut),
+            Err(tr_agent::AnalysisError::NotReady),
+        ] {
+            app.analyze_story(pane, &cluster("Untrusted story"));
+            let prompt = app.agent_pane.dequeue_prompt().unwrap();
+            app.story_prompt_started(&prompt, "fixture");
+            app.agent_pane.running = true;
+            app.finish_story_analysis(prompt.id, result);
+            assert_eq!(app.agent_pane.turns.len(), 1);
+            assert_eq!(app.agent_pane.turns[0].prompt_id, ordinary.id);
+            assert_eq!(app.agent_pane.last_prompt.as_ref().unwrap().id, ordinary.id);
+            assert_eq!(app.agent_pane.turn_reply_text(0), "Prior ordinary answer");
+            assert_eq!(app.agent_pane.workflows.context.len(), 1);
+            assert!(
+                app.agent_pane.blocks[blocks..]
+                    .iter()
+                    .all(|block| matches!(block, crate::agent_pane::RenderedBlock::Notice(_)))
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1081,40 +1134,23 @@ mod tests {
             app.collect_story_analysis(); // dequeued, no turn yet
             assert_eq!(app.story_desk.jobs.len(), 2);
             assert!(app.story_desk.details[&first.lead.id].error.is_none());
-            app.agent_pane.start_prompt(prompt.clone()).unwrap();
-            app.collect_story_analysis(); // turn exists, send/start hook has not run
-            assert_eq!(app.story_desk.jobs.len(), 2);
-            assert!(app.story_desk.details[&first.lead.id].error.is_none());
             app.story_prompt_started(&prompt, "fixture-model");
-            app.agent_pane.wire(
-                "item/completed",
-                &serde_json::json!({"item":{
-                    "id":"reply", "type":"agentMessage", "text":"Analysis reply"
-                }}),
-            );
-            let turn = app.agent_pane.turns.last_mut().unwrap();
-            turn.finished = true;
-            turn.final_answer_succeeded = true;
-            app.agent_pane.running = false;
+            app.agent_pane.running = true;
+            app.collect_story_analysis();
+            assert_eq!(app.story_desk.jobs.len(), 2);
+            app.finish_story_analysis(prompt.id.clone(), Ok("Analysis reply".into()));
+            assert!(app.agent_pane.turns.is_empty());
             app.collect_story_analysis();
             assert_eq!(app.story_desk.jobs.len(), 1);
             assert_eq!(app.story_desk.details[&first.lead.id].analysis.as_ref().unwrap().reply(), "Analysis reply");
             assert!(app.story_desk.details[&second.lead.id].error.is_none());
-            let second_prompt = app.agent_pane.next_prompt().unwrap();
+            let second_prompt = app.agent_pane.dequeue_prompt().unwrap();
             assert_ne!(prompt.id, second_prompt.id);
-            // No notification hook: creation itself must associate the second job.
+            app.story_prompt_started(&second_prompt, "fixture-model");
             app.collect_story_analysis();
             assert_eq!(app.story_desk.jobs.len(), 1);
-            app.agent_pane.wire(
-                "item/completed",
-                &serde_json::json!({"item":{
-                    "id":"second-reply", "type":"agentMessage", "text":"Second result"
-                }}),
-            );
-            let turn = app.agent_pane.turns.last_mut().unwrap();
-            turn.finished = true;
-            turn.final_answer_succeeded = true;
-            app.agent_pane.running = false;
+            app.finish_story_analysis(second_prompt.id, Ok("Second result".into()));
+            assert!(app.agent_pane.turns.is_empty());
             app.collect_story_analysis();
             assert!(app.story_desk.jobs.is_empty());
             assert_eq!(app.story_desk.details[&second.lead.id].analysis.as_ref().unwrap().reply(), "Second result");
@@ -1129,14 +1165,11 @@ mod tests {
         let story = cluster("Reply test");
         app.analyze_story(story_pane, &story);
         app.agent_pane.transition(Onboarding::Ready);
-        let prompt = app.agent_pane.next_prompt().unwrap();
+        let prompt = app.agent_pane.dequeue_prompt().unwrap();
         app.story_prompt_started(&prompt, "fixture-model");
         let reply = "Prose fallback, with original whitespace.\n\nNo structured object.";
-        app.agent_pane
-            .wire("item/completed", &serde_json::json!({"item":{"id":"reply", "type":"agentMessage", "text":reply}}));
-        app.agent_pane.turns[0].finished = true;
-        app.agent_pane.turns[0].final_answer_succeeded = true;
-        app.agent_pane.running = false;
+        app.finish_story_analysis(prompt.id, Ok(reply.into()));
+        assert!(app.agent_pane.turns.is_empty());
         app.collect_story_analysis();
         assert!(app.story_desk.jobs.is_empty());
         assert_eq!(app.story_desk.details[&story.lead.id].analysis.as_ref().unwrap().reply(), reply);
@@ -1225,7 +1258,9 @@ mod tests {
         pane.set_story_turn(true);
         assert!(pane.story_tools.lock().unwrap().denies("canonical-analysis"));
         pane.interrupt();
-        assert!(!pane.story_tools.lock().unwrap().denies("ordinary-next-turn"));
+        assert!(pane.story_tools.lock().unwrap().denies("ordinary-next-turn"));
+        pane.transition(Onboarding::Stopped { reason: "Confirmed stopped".into(), unsafe_backend: false });
+        assert!(!pane.story_tools.lock().unwrap().denies("new-ordinary-turn"));
         assert!(pane.story_tools.lock().unwrap().denies("canonical-analysis"));
     }
     #[test]
@@ -1479,7 +1514,7 @@ mod tests {
         app.agent_pane.queue.clear();
         app.collect_story_analysis();
         assert!(app.story_desk.jobs.is_empty());
-        assert!(app.story_desk.details[&story.lead.id].error.as_ref().unwrap().contains("stopped"));
+        assert_eq!(app.story_desk.details[&story.lead.id].error.as_deref(), Some("Cancelled"));
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1541,37 +1576,26 @@ mod tests {
     }
 
     #[test]
-    fn agent_retry_recreates_story_job_and_stores_the_retried_reply() {
+    fn story_retry_creates_another_isolated_job_and_stores_only_the_reply() {
         let (mut app, root) = fixture("agent-retry");
         let pane = app.new_pane(PaneKind::Story { link_follow: true });
         app.dock_pane(pane, None, crate::dock::Zone::Right);
         let story = cluster("Retry through Agent");
         app.analyze_story(pane, &story);
-        let agent = app.agent_pane_owner.unwrap();
         app.agent_pane.transition(Onboarding::Ready);
-        let prompt = app.agent_pane.next_prompt().unwrap();
+        let prompt = app.agent_pane.dequeue_prompt().unwrap();
         app.story_prompt_started(&prompt, "failed-model");
-        app.agent_pane.turns[0].finished = true;
-        app.agent_pane.running = false;
+        app.finish_story_analysis(prompt.id.clone(), Err(tr_agent::AnalysisError::NoAnswer));
         app.collect_story_analysis();
         assert!(app.story_desk.jobs.is_empty());
-        assert!(app.story_desk.details[&story.lead.id].error.is_some());
-        app.agent_action(&egui::Context::default(), agent, crate::agent_pane::Action::Retry);
-        assert_eq!(app.story_desk.jobs[&prompt.id].story_id, story.lead.id);
-        assert_eq!(app.story_desk.jobs[&prompt.id].agent, agent);
+        assert_eq!(app.story_desk.details[&story.lead.id].error.as_deref(), Some("Model returned no answer"));
+        app.analyze_story(pane, &story);
         assert!(app.story_desk.queued_read_only(app.agent_pane.queue.front().unwrap()));
-        let retried = app.agent_pane.next_prompt().unwrap();
+        let retried = app.agent_pane.dequeue_prompt().unwrap();
+        assert_ne!(retried.id, prompt.id);
         app.story_prompt_started(&retried, "retry-model");
-        app.agent_pane.wire(
-            "item/completed",
-            &serde_json::json!({"item":{
-                "id":"retry-reply", "type":"agentMessage", "text":"Retried story analysis"
-            }}),
-        );
-        let turn = app.agent_pane.turns.last_mut().unwrap();
-        turn.finished = true;
-        turn.final_answer_succeeded = true;
-        app.agent_pane.running = false;
+        app.finish_story_analysis(retried.id, Ok("Retried story analysis".into()));
+        assert!(app.agent_pane.turns.is_empty());
         app.collect_story_analysis();
         let result = app.story_desk.details[&story.lead.id].analysis.as_ref().unwrap();
         assert_eq!(result.reply(), "Retried story analysis");

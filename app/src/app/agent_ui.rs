@@ -916,6 +916,7 @@ impl TerminalApp {
                     self.agent_pane.models = models;
                 }
                 Event::Limits(limits) => self.agent_pane.set_limits(&limits),
+                Event::Analysis { id, result } => self.finish_story_analysis(id, result),
                 Event::Bridge(event) => self.agent_pane.event(event),
                 Event::Notice(reason) => self.agent_pane.error_notice(&reason),
             }
@@ -1171,11 +1172,40 @@ impl TerminalApp {
         if self.agent_pane.session.is_none() || self.agent_pane.models.is_empty() {
             return;
         }
-        let Some(prompt) = self.agent_pane.next_prompt() else { return };
-        self.send_agent_prompt(prompt);
+        let Some(prompt) = self.agent_pane.dequeue_prompt() else { return };
+        if self.story_desk.read_only_prompt_id(&prompt.id) {
+            self.send_story_analysis(prompt);
+        } else if let Some(prompt) = self.agent_pane.start_prompt(prompt) {
+            self.send_agent_prompt(prompt);
+        }
+    }
+
+    fn send_story_analysis(&mut self, prompt: agent_pane::Prompt) {
+        let model = self
+            .agent_pane
+            .models
+            .iter()
+            .find(|m| m.id == *self.agent_pane.settings.model(self.agent_pane.backend))
+            .map_or_else(|| self.agent_pane.settings.model(self.agent_pane.backend).clone(), |m| m.model.clone());
+        self.story_prompt_started(&prompt, &model);
+        self.agent_pane.running = true;
+        // No start_prompt: preserve turns, replies, last_prompt and workflow context.
+        self.agent_command(Command::Analysis {
+            id: prompt.id,
+            input: TurnInput {
+                model,
+                effort: self.agent_pane.settings.effort.clone(),
+                text: prompt.text,
+                ..Default::default()
+            },
+        });
     }
 
     fn send_agent_prompt(&mut self, prompt: agent_pane::Prompt) {
+        if self.story_desk.read_only_prompt_id(&prompt.id) {
+            self.send_story_analysis(prompt);
+            return;
+        }
         // Without a valid pin, pin the chart the user last focused (else the visible chart) so
         // the turn's chart and later Pinned lookups agree; the header shows the pin.
         let pinned_valid = self

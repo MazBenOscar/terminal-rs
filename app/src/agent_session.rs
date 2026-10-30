@@ -22,6 +22,7 @@ pub enum Command {
     RefreshLimits,
     SelectModel(String),
     Turn(Box<BridgeTurn>),
+    Analysis { id: crate::agent_pane::PromptId, input: tr_agent::TurnInput },
     WorkflowResults(Vec<tr_agent::codex::WorkflowResult>),
     Interrupt,
 }
@@ -32,6 +33,7 @@ pub enum Event {
     Models(Vec<Model>),
     Limits(serde_json::Value),
     Bridge(BridgeEvent),
+    Analysis { id: crate::agent_pane::PromptId, result: std::result::Result<String, tr_agent::AnalysisError> },
     Notice(String),
 }
 struct Inbox {
@@ -476,6 +478,7 @@ async fn owner_acp(
         let mut calls = 0;
         let mut interrupted = false;
         let mut workflow_results = Vec::new();
+        let mut deferred = std::collections::VecDeque::new();
         loop {
             tokio::select! {
                 event = events.recv() => {
@@ -502,7 +505,19 @@ async fn owner_acp(
                         if let Some(event) = project(event) { inbox.push(Event::Bridge(event)); }
                     }
                 }
-                command = receive.recv() => match command {
+                command = async { if let Some(command) = deferred.pop_front() { Some(command) } else { receive.recv().await } } => match command {
+                    Some(Command::Analysis { id, input }) => {
+                        let result = isolated_analysis(client.analyze(input), &mut receive, &mut deferred).await;
+                        // Discard the secondary subscription's buffered analysis
+                        // packets. Retired-session filtering handles all late data.
+                        events = client.events();
+                        let unconfirmed = matches!(result, Err(tr_agent::AnalysisError::Cancelled | tr_agent::AnalysisError::TimedOut | tr_agent::AnalysisError::NotReady | tr_agent::AnalysisError::ToolAttempt));
+                        inbox.push(Event::Analysis { id, result });
+                        if unconfirmed || client.is_unsafe() {
+                            client.shutdown();
+                            bail!("Analysis session retired; backend stopped for safety");
+                        }
+                    }
                     Some(Command::Turn(mut turn)) => {
                         workflow_results.append(&mut turn.input.workflow_results);
                         turn.input.workflow_results = workflow_results.clone();
@@ -608,6 +623,25 @@ async fn deliver_workflow_results(
     }
 }
 
+/// The same FIFO owns both kinds of work. Non-interrupt commands arriving
+/// during analysis are deferred, not lost or steered into the isolated thread.
+async fn isolated_analysis(
+    run: impl std::future::Future<Output = std::result::Result<String, tr_agent::AnalysisError>>,
+    receive: &mut mpsc::UnboundedReceiver<Command>,
+    deferred: &mut std::collections::VecDeque<Command>,
+) -> std::result::Result<String, tr_agent::AnalysisError> {
+    tokio::pin!(run);
+    loop {
+        tokio::select! {
+            result = &mut run => return result,
+            command = receive.recv() => match command {
+                Some(Command::Interrupt) | None => return Err(tr_agent::AnalysisError::Cancelled),
+                Some(command) => deferred.push_back(command),
+            }
+        }
+    }
+}
+
 async fn run_bridge(
     receive: &mut mpsc::UnboundedReceiver<Command>,
     inbox: &Inbox,
@@ -624,13 +658,23 @@ async fn run_bridge(
     // The owner serializes steers and turn starts. Only failed/no-active-turn
     // deliveries carry over; a successful steer is never repeated next turn.
     let mut undelivered = Vec::new();
+    let mut deferred = std::collections::VecDeque::new();
     loop {
         tokio::select! {
             event = bridge.next_event() => {
                 let event = event?;
                 if let Some(event) = project(event) { inbox.push(Event::Bridge(event)); }
             }
-            command = receive.recv() => match command {
+            command = async { if let Some(command) = deferred.pop_front() { Some(command) } else { receive.recv().await } } => match command {
+                Some(Command::Analysis { id, input }) => {
+                    let result = isolated_analysis(bridge.client().analyze(input), receive, &mut deferred).await;
+                    let unconfirmed = matches!(result, Err(tr_agent::AnalysisError::Cancelled | tr_agent::AnalysisError::TimedOut | tr_agent::AnalysisError::NotReady | tr_agent::AnalysisError::ToolAttempt));
+                    inbox.push(Event::Analysis { id, result });
+                    if unconfirmed || bridge.is_unsafe() {
+                        bridge.shutdown();
+                        bail!("Analysis session retired; backend stopped for safety");
+                    }
+                }
                 Some(Command::Turn(mut turn)) => {
                     undelivered.append(&mut turn.input.workflow_results);
                     turn.input.workflow_results = undelivered.clone();
@@ -722,6 +766,26 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tr_agent::transport::{Transport, WireEvent};
+
+    #[tokio::test]
+    async fn isolated_owner_defers_workflow_and_model_commands_and_cancels_without_replay() {
+        let (send, mut receive) = mpsc::unbounded_channel();
+        send.send(Command::WorkflowResults(vec![tr_agent::codex::WorkflowResult::Undo {
+            turn: "main".into(),
+            reverted: 1,
+            kept: vec![],
+        }]))
+        .unwrap();
+        send.send(Command::SelectModel("next-model".into())).unwrap();
+        send.send(Command::Interrupt).unwrap();
+        let mut deferred = std::collections::VecDeque::new();
+        let result = isolated_analysis(std::future::pending(), &mut receive, &mut deferred).await;
+        assert_eq!(result, Err(tr_agent::AnalysisError::Cancelled));
+        assert!(matches!(deferred.pop_front(), Some(Command::WorkflowResults(results)) if results.len() == 1));
+        assert!(matches!(deferred.pop_front(), Some(Command::SelectModel(model)) if model == "next-model"));
+        assert!(deferred.is_empty());
+        assert!(receive.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn mimo_echo_and_segmented_stream_render_one_prompt_and_two_replies() {
