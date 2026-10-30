@@ -253,6 +253,12 @@ impl TerminalApp {
             self.show_perf = !self.show_perf;
             ui.close();
         }
+        if ui.checkbox(&mut self.prefs.headline_tape, "Headline tape").changed() {
+            changed = true;
+        }
+        if ui.checkbox(&mut self.prefs.reduce_motion, "Reduce motion").changed() {
+            changed = true;
+        }
         if ui.button("Settings…").clicked() {
             self.apply(Function::Settings);
             ui.close();
@@ -799,7 +805,20 @@ impl TerminalApp {
     fn sidebar_layouts(&mut self, ui: &mut Ui, out: &mut Vec<SidebarCmd>) {
         use super::workspace::LayoutOp;
         ui.horizontal(|ui| {
-            section(ui, "Layouts");
+            ui.menu_button("Layouts", |ui| {
+                ui.menu_button("Dashboards", |ui| {
+                    for dashboard in crate::dashboards::ALL {
+                        if ui.button(dashboard.name).on_hover_text(dashboard.description).clicked() {
+                            out.push(SidebarCmd::Function(Function::Dashboard(dashboard.id.into())));
+                            ui.close();
+                        }
+                    }
+                });
+                if ui.button("Saved layouts…").clicked() {
+                    out.push(SidebarCmd::Function(Function::Layouts));
+                    ui.close();
+                }
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(egui::Button::new(RichText::new("+").font(ui_font(14.0)).color(muted())).frame(false))

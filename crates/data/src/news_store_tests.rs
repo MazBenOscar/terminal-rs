@@ -1,6 +1,215 @@
 use super::*;
 
 #[test]
+fn n7_analysis_cache_migrates_old_database_preserves_news_and_round_trips() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data/n7-analysis");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join(format!("{}.sqlite3", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let now = chrono::Utc::now().timestamp();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE items(id TEXT PRIMARY KEY,source TEXT NOT NULL,provider_id TEXT NOT NULL,
+        url TEXT NOT NULL,headline TEXT NOT NULL,summary TEXT NOT NULL,published INTEGER NOT NULL,
+        tickers TEXT NOT NULL,category TEXT NOT NULL,fetched INTEGER NOT NULL,seen INTEGER NOT NULL DEFAULT 0,
+        bookmark INTEGER NOT NULL DEFAULT 0);",
+    )
+    .unwrap();
+    db.execute("INSERT INTO items VALUES('old','Fixture','','https://fixture.invalid/old','Existing headline','summary',?1,'[]','general',?1,1,1)", [now]).unwrap();
+    drop(db);
+    let store = NewsStore::open(&path).unwrap();
+    let rows = store
+        .query(&Query { filters: Filters { scope: Scope::All, ..Default::default() }, ..Default::default() })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].item.title, "Existing headline");
+    assert!(rows[0].seen && rows[0].bookmark);
+    assert!(store.story_analysis(&["lead".into(), "old".into()]).unwrap().is_none());
+    let member = StoryAnalysis {
+        story_id: "old".into(),
+        model: "fixture-model".into(),
+        created_at: now,
+        json: "Prose fallback is cached verbatim".into(),
+    };
+    store.save_story_analysis(&member).unwrap();
+    assert_eq!(store.story_analysis(&["lead".into(), "old".into()]).unwrap(), Some(member.clone()));
+    let lead = StoryAnalysis { story_id: "lead".into(), json: "{\"sentiment\":0}".into(), ..member.clone() };
+    store.save_story_analysis(&lead).unwrap();
+    assert_eq!(store.story_analysis(&["lead".into(), "old".into()]).unwrap(), Some(lead.clone()));
+    drop(store);
+    let store = NewsStore::open(&path).unwrap();
+    assert_eq!(store.story_analysis(&["lead".into()]).unwrap(), Some(lead));
+    assert_eq!(store.story_analysis(&["old".into()]).unwrap(), Some(member));
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn n7_related_prefers_tickers_caps_eight_and_excludes_cluster_and_out_of_window() {
+    use crate::news_intelligence::Cluster;
+    let now = 10_000_000;
+    let selected = story(
+        "https://fixture.invalid/selected",
+        "Acme reports quarterly earnings",
+        now - 10,
+        "ACME US Equity",
+        "Fixture",
+    );
+    let cluster = Cluster::wire(&selected);
+    let titles = [
+        "Factory expansion in Japan",
+        "Director resigns unexpectedly",
+        "Dividend increases ten percent",
+        "Bond issuance closes",
+        "Patent dispute settled",
+        "New smartphone introduced",
+        "Retail store closures",
+        "Cloud sales accelerate",
+        "Union wage talks begin",
+        "Cybersecurity breach investigated",
+        "Warehouse construction starts",
+        "Executive compensation approved",
+    ];
+    let mut items: Vec<_> = titles
+        .iter()
+        .enumerate()
+        .map(|(i, title)| {
+            story(
+                &format!("https://fixture.invalid/related/{i}"),
+                title,
+                now - i as i64 * 40_000,
+                "ACME US Equity",
+                "Fixture",
+            )
+        })
+        .collect();
+    items.push(selected.clone());
+    let mut member = selected.clone();
+    member.id = "syndicated-member".into();
+    items.push(member);
+    items.push(story("https://fixture.invalid/old", "Old", now - 7 * 86400 - 1, "ACME US Equity", "Fixture"));
+    items.push(story("https://fixture.invalid/future", "Future", now + 1, "ACME US Equity", "Fixture"));
+    items.push(story("https://fixture.invalid/other", "Other category match", now, "OTHER US Equity", "Fixture"));
+    let related = related_stories(&cluster, &items, now);
+    assert_eq!(related.len(), 8);
+    assert!(related.iter().all(|c| c.tickers.contains(&"ACME US Equity".into())
+        && !c.member_ids.contains(&selected.id)
+        && !c.member_ids.contains(&"syndicated-member".into())));
+    assert!(related.windows(2).all(|w| w[0].newest >= w[1].newest));
+    assert!(related.iter().all(|c| c.newest <= now && c.newest >= now - 7 * 86400));
+    let edge = story("https://fixture.invalid/edge", "Boundary story", now - 7 * 86400, "ACME US Equity", "Fixture");
+    assert_eq!(related_stories(&cluster, &[edge], now).len(), 1);
+}
+
+#[test]
+fn n7_related_finds_ticker_beyond_the_first_market_page() {
+    use crate::news_intelligence::{Cluster, MAX_ITEMS};
+    let now = chrono::Utc::now().timestamp();
+    let selected = story(
+        "https://fixture.invalid/page-selected",
+        "Chip supplier expands fabrication",
+        now,
+        "NVDA US Equity",
+        "Fixture",
+    );
+    let mut items: Vec<_> = (0..=MAX_ITEMS)
+        .map(|i| {
+            story(
+                &format!("https://fixture.invalid/page/{i}"),
+                &format!("Unrelated shipping update {i}"),
+                now - i as i64,
+                "OTHER US Equity",
+                "Fixture",
+            )
+        })
+        .collect();
+    let ticker = story(
+        "https://fixture.invalid/page-ticker",
+        "Graphics product launch",
+        now - MAX_ITEMS as i64 - 10,
+        "NVDA US Equity",
+        "Fixture",
+    );
+    items.push(ticker.clone());
+    let cluster = Cluster::wire(&selected);
+    let related = related_stories(&cluster, &items, now);
+    assert_eq!(related.len(), 1);
+    assert_eq!(related[0].lead.id, ticker.id);
+    let mut store = NewsStore::memory().unwrap();
+    store.insert(&items, now).unwrap();
+    let related = store.related_stories(&cluster, now).unwrap();
+    assert_eq!(related.len(), 1);
+    assert_eq!(related[0].lead.id, ticker.id);
+}
+
+#[test]
+fn related_archive_scan_stops_at_four_pages() {
+    use crate::news_intelligence::{Cluster, MAX_ITEMS};
+    let now = chrono::Utc::now().timestamp();
+    let selected = story(
+        "https://fixture.invalid/cap-selected",
+        "Chip supplier expands fabrication",
+        now,
+        "NVDA US Equity",
+        "Fixture",
+    );
+    let mut items: Vec<_> = (0..4 * MAX_ITEMS)
+        .map(|i| {
+            story(
+                &format!("https://fixture.invalid/cap/{i}"),
+                &format!("Shipping report {i}"),
+                now - i as i64,
+                "OTHER US Equity",
+                "Fixture",
+            )
+        })
+        .collect();
+    let outside = story(
+        "https://fixture.invalid/cap-outside",
+        "Graphics product launch",
+        now - 4 * MAX_ITEMS as i64 - 1,
+        "NVDA US Equity",
+        "Fixture",
+    );
+    items.push(outside.clone());
+    let mut store = NewsStore::memory().unwrap();
+    store.insert(&items, now).unwrap();
+    let related = store.related_stories(&Cluster::wire(&selected), now).unwrap();
+    assert!(
+        related.iter().all(|c| !c.member_ids.contains(&outside.id)),
+        "the inspector must not walk the entire archive"
+    );
+}
+
+#[test]
+fn n7_related_falls_back_to_event_or_category_only_without_shared_tickers() {
+    use crate::news_intelligence::Cluster;
+    let now = 10_000_000;
+    let mut selected =
+        story("https://fixture.invalid/selected", "Acme beats estimates", now, "ACME US Equity", "Fixture");
+    selected.category = "technology".into();
+    let mut same_category =
+        story("https://fixture.invalid/category", "New product preview", now - 1, "OTHER US Equity", "Fixture");
+    same_category.category = "technology".into();
+    let same_event =
+        story("https://fixture.invalid/event", "Other beats estimates", now - 2, "OTHER US Equity", "Fixture");
+    let mut unrelated =
+        story("https://fixture.invalid/unrelated", "Sports results", now - 3, "OTHER US Equity", "Fixture");
+    unrelated.category = "sports".into();
+    let mut undated = same_category.clone();
+    undated.id = "undated".into();
+    undated.inferred_ts = true;
+    let rows = related_stories(
+        &Cluster::wire(&selected),
+        &[same_category.clone(), same_event.clone(), unrelated, undated],
+        now,
+    );
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|c| c.member_ids.contains(&same_category.id)));
+    assert!(rows.iter().any(|c| c.member_ids.contains(&same_event.id)));
+}
+
+#[test]
 fn n5_claim_retention_prunes_old_rows_but_keeps_live_cluster_identity() {
     let now = chrono::Utc::now().timestamp();
     let mut store = NewsStore::memory().unwrap();

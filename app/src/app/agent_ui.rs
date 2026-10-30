@@ -43,6 +43,23 @@ fn alert_configuration(alert: &tr_core::price_alerts::Alert) -> serde_json::Valu
     value
 }
 
+/// No backend side effects until an existing session reaches an idle Ready
+/// boundary. Check both directions: cancellation during startup also needs a
+/// deferred restore, even when the read-only policy flag is already cleared.
+fn story_policy_change(
+    running: bool,
+    ready: bool,
+    session_tools: Option<tr_agent_tools::ToolSet>,
+    desired: bool,
+    current: bool,
+    ordinary: tr_agent_tools::ToolSet,
+) -> bool {
+    let target = if desired { tr_agent_tools::ToolSet::ReadOnly } else { ordinary };
+    !running
+        && (session_tools.is_none() || ready)
+        && (desired != current || session_tools.is_some_and(|tools| tools != target))
+}
+
 fn pane_id(id: PaneId) -> egui::Id {
     egui::Id::new(("agent-pane", id))
 }
@@ -135,7 +152,7 @@ impl TerminalApp {
                 data,
                 AppExecutor::new(self),
                 pin,
-                self.agent_config.allow_external_edits,
+                self.agent_config.allow_external_edits && !self.story_desk.read_only,
             ) {
                 Ok(server) => self.external_agent = Some(server),
                 Err(error) => {
@@ -173,6 +190,12 @@ impl TerminalApp {
         Ok(vec![])
     }
     fn first_agent(&self) -> Option<PaneId> {
+        if let Some(id) = self
+            .agent_pane_owner
+            .filter(|id| self.panes.iter().any(|p| p.id == *id && matches!(p.kind, PaneKind::Agent(_))))
+        {
+            return Some(id);
+        }
         self.panes.iter().find(|p| matches!(p.kind, PaneKind::Agent(_))).map(|p| p.id)
     }
 
@@ -933,6 +956,8 @@ impl TerminalApp {
             .collect();
         self.agent_pane.refresh_drawing_visibility(&charts);
         self.refresh_agent_undo();
+        self.collect_story_analysis();
+        self.prepare_story_agent(ctx);
         self.send_next_agent_prompt();
     }
 
@@ -990,6 +1015,7 @@ impl TerminalApp {
         for action in actions {
             self.agent_action(ui.ctx(), id, action);
         }
+        self.prepare_story_agent(ui.ctx());
         self.send_next_agent_prompt();
     }
 
@@ -1004,7 +1030,8 @@ impl TerminalApp {
         let Some(tools) = self.agent_pane.prepare_session_start() else { return };
         // Codex's per-pane preset is not mimo's policy: its tools are served by
         // the external socket. Keep the instructions/schema aligned with it.
-        let tools = self.agent_config.session_tools(tools);
+        let tools = self.story_desk.effective_tools(self.agent_config.session_tools(tools));
+        self.agent_pane.session_tools = Some(tools);
         self.agent_pane.workflows.reset();
         self.agent_pane.session = None;
         self.agent_pane.session = Some(Session::start(
@@ -1039,7 +1066,7 @@ impl TerminalApp {
         }
     }
 
-    fn agent_action(&mut self, ctx: &egui::Context, id: PaneId, action: Action) {
+    pub(super) fn agent_action(&mut self, ctx: &egui::Context, id: PaneId, action: Action) {
         // Fixtures are for visual review only, including their enabled-looking controls.
         if self.agent_demo.is_some() {
             return;
@@ -1099,6 +1126,11 @@ impl TerminalApp {
             Action::Retry => {
                 self.agent_pane.transition(Onboarding::Ready);
                 if let Some(prompt) = self.agent_pane.last_prompt.clone()
+                    && self.retry_story_prompt(id, &prompt)
+                {
+                    return;
+                }
+                if let Some(prompt) = self.agent_pane.last_prompt.clone()
                     && let Some(prompt) = self.agent_pane.start_prompt(prompt)
                 {
                     self.send_agent_prompt(prompt);
@@ -1141,7 +1173,45 @@ impl TerminalApp {
         }
     }
 
+    /// Analysis uses a fresh read-only session, not a natural-language promise.
+    /// Session inventories are immutable in both backends; restart at an idle
+    /// queue boundary and leave the user's saved tools mode untouched.
+    fn prepare_story_agent(&mut self, ctx: &egui::Context) {
+        let desired = self.agent_pane.starting_prompt.as_ref().map_or_else(
+            || self.agent_pane.queue.front().is_some_and(|p| self.story_desk.queued_read_only(p)),
+            |id| self.story_desk.read_only_prompt_id(id),
+        );
+        let ordinary = self.agent_config.session_tools(self.agent_pane.tool_set());
+        let session_tools = self.agent_pane.session.as_ref().map(|_| self.agent_pane.session_tools.unwrap_or(ordinary));
+        if !story_policy_change(
+            self.agent_pane.running,
+            self.agent_pane.state == Onboarding::Ready,
+            session_tools,
+            desired,
+            self.story_desk.read_only,
+            ordinary,
+        ) {
+            return;
+        }
+        self.story_desk.read_only = desired;
+        // mimo serves tools through the external listener. Replace that registry
+        // too; old accepted peers and queued calls are cancelled on drop.
+        self.external_agent = None;
+        self.external_attempted = false;
+        self.external_agent_logic();
+        if self.agent_pane.session.is_some() && self.agent_pane.state == Onboarding::Ready {
+            let paused = self.agent_pane.queue_paused;
+            self.start_agent_session(ctx);
+            self.agent_pane.queue_paused = paused;
+        }
+    }
+
     fn send_next_agent_prompt(&mut self) {
+        if self.agent_pane.queue.front().is_some_and(|p| self.story_desk.queued_read_only(p))
+            && (!self.story_desk.read_only || self.agent_pane.session_tools != Some(tr_agent_tools::ToolSet::ReadOnly))
+        {
+            return;
+        }
         if self.agent_pane.session.is_none() || self.agent_pane.models.is_empty() {
             return;
         }
@@ -1179,6 +1249,7 @@ impl TerminalApp {
             .iter()
             .find(|m| m.id == *self.agent_pane.settings.model(self.agent_pane.backend))
             .map_or_else(|| self.agent_pane.settings.model(self.agent_pane.backend).clone(), |m| m.model.clone());
+        self.story_prompt_started(&prompt, &model);
         let workflow_context = std::mem::take(&mut self.agent_pane.workflows.context);
         self.agent_command(Command::Turn(Box::new(BridgeTurn {
             input: TurnInput {
@@ -1199,6 +1270,23 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn story_policy_waits_during_startup_and_restores_cancelled_analysis_once_ready() {
+        use tr_agent_tools::ToolSet::{ReadOnly, Workflows};
+        // A queued analysis cannot replace either listener or starting session.
+        assert!(!story_policy_change(false, false, Some(Workflows), true, false, Workflows));
+        assert!(story_policy_change(false, true, Some(Workflows), true, false, Workflows));
+        // Cancel while the read-only session is starting; defer restoration.
+        assert!(!story_policy_change(false, false, Some(ReadOnly), false, true, Workflows));
+        assert!(story_policy_change(false, true, Some(ReadOnly), false, true, Workflows));
+        // Also repair a mismatched session when the policy flag was cleared.
+        assert!(story_policy_change(false, true, Some(ReadOnly), false, false, Workflows));
+        // The restart records the ordinary inventory; no second restart/notice.
+        assert!(!story_policy_change(false, false, Some(Workflows), false, false, Workflows));
+        assert!(!story_policy_change(false, true, Some(Workflows), false, false, Workflows));
+        assert!(!story_policy_change(true, true, Some(ReadOnly), false, true, Workflows));
+    }
 
     fn workflow(app: &mut TerminalApp, turn: &str, name: &str, value: serde_json::Value) -> tr_agent_tools::ToolResult {
         use tr_agent_tools::args::*;
@@ -2463,7 +2551,11 @@ mod tests {
         let executor = AppExecutor::new(&app);
         let turn = tr_agent::bridge::TurnIds::new().unwrap().allocate().unwrap();
         app.agent_pane
-            .start_prompt(agent_pane::Prompt { text: "add two RSI studies".into(), requires_tools: false })
+            .start_prompt(agent_pane::Prompt {
+                text: "add two RSI studies".into(),
+                id: Default::default(),
+                requires_tools: false,
+            })
             .unwrap();
         app.agent_pane.event(BridgeEvent::Started { turn: turn.clone() });
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -2516,7 +2608,9 @@ mod tests {
 
         // The conversation survives layout changes, but inverse edits do not.
         let second = tr_agent::bridge::TurnIds::new().unwrap().allocate().unwrap();
-        app.agent_pane.start_prompt(agent_pane::Prompt { text: "RSI".into(), requires_tools: false }).unwrap();
+        app.agent_pane
+            .start_prompt(agent_pane::Prompt { text: "RSI".into(), id: Default::default(), requires_tools: false })
+            .unwrap();
         app.agent_pane.event(BridgeEvent::Started { turn: second.clone() });
         runtime.block_on(async {
             let mut future = executor.execute(
@@ -2593,7 +2687,11 @@ mod tests {
         app.agent_pane.active_chart = Some(last_used);
         app.focus = app.first_agent().unwrap();
         app.pinned_agent_chart = None;
-        app.send_agent_prompt(agent_pane::Prompt { text: "What's the trend?".into(), requires_tools: true });
+        app.send_agent_prompt(agent_pane::Prompt {
+            text: "What's the trend?".into(),
+            id: Default::default(),
+            requires_tools: true,
+        });
         assert_eq!(app.pinned_agent_chart, Some(last_used));
         assert_eq!(app.agent_pane.settings.pinned_chart, Some(last_used));
         assert_eq!(app.agent_chart_uid(crate::agent_queue::ChartTarget::Pinned), Some(last_used));
@@ -2674,7 +2772,11 @@ mod review_tests {
         let setup = |n: usize| {
             let (mut app, id) = agent_app(&format!("workflow-card-decline-enter-{n}"));
             app.focus_cmd = false;
-            app.agent_pane.start_prompt(agent_pane::Prompt { text: "Propose a list".into(), requires_tools: false });
+            app.agent_pane.start_prompt(agent_pane::Prompt {
+                text: "Propose a list".into(),
+                id: Default::default(),
+                requires_tools: false,
+            });
             app.agent_pane.event(BridgeEvent::Started { turn: "decline:1".into() });
             app.agent_workflow(
                 "decline:1",
@@ -2747,7 +2849,11 @@ mod review_tests {
         use crate::agent_bridge::ProposalStatus;
         let (mut app, id) = agent_app("workflow-card-keyboard");
         app.focus_cmd = false;
-        app.agent_pane.start_prompt(agent_pane::Prompt { text: "Propose two lists".into(), requires_tools: false });
+        app.agent_pane.start_prompt(agent_pane::Prompt {
+            text: "Propose two lists".into(),
+            id: Default::default(),
+            requires_tools: false,
+        });
         app.agent_pane.event(BridgeEvent::Started { turn: "keyboard:1".into() });
         for name in ["Crypto", "Research"] {
             app.agent_workflow(
@@ -2843,7 +2949,11 @@ mod review_tests {
 
     fn paused_queue(app: &mut TerminalApp) {
         for text in ["A", "B"] {
-            app.agent_pane.enqueue(agent_pane::Prompt { text: text.into(), requires_tools: false });
+            app.agent_pane.enqueue(agent_pane::Prompt {
+                text: text.into(),
+                id: Default::default(),
+                requires_tools: false,
+            });
         }
         app.agent_pane.event(BridgeEvent::Recovered(Recovery::Resumed));
         assert!(app.agent_pane.next_prompt().is_none(), "recovery must pause the queue");

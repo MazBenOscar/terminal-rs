@@ -60,6 +60,50 @@ impl Story {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoryAnalysis {
+    pub story_id: String,
+    pub model: String,
+    pub created_at: i64,
+    /// Original reply, including prose when JSON parsing fails.
+    pub json: String,
+}
+
+/// Local, deterministic related selection. Prefer shared tickers; use event/category
+/// only if no ticker-related stories exist, never the selected cluster itself.
+pub fn related_stories(
+    selected: &crate::news_intelligence::Cluster,
+    items: &[Story],
+    now: i64,
+) -> Vec<crate::news_intelligence::Cluster> {
+    use crate::news_intelligence::{clusters, same_cluster};
+    let mut eligible: Vec<_> = items
+        .iter()
+        .filter(|s| !s.inferred_ts && s.item.ts >= now - 7 * 86400 && s.item.ts <= now)
+        .filter(|m| !selected.member_ids.contains(&m.id) && !selected.members.iter().any(|s| same_cluster(s, m)))
+        .collect();
+    let ticker_match = |s: &Story| s.item.tickers.iter().any(|t| selected.tickers.contains(t));
+    let has_tickers = eligible.iter().any(|s| ticker_match(s));
+    let event = selected.classification().map(|v| v.1);
+    let category = category_key(&selected.lead.category);
+    // Filter before the clusterer's bounded snapshot: a busy market must not
+    // hide an older ticker match behind thousands of unrelated headlines.
+    eligible.retain(|s| {
+        if has_tickers {
+            ticker_match(s)
+        } else {
+            (event.is_some() && crate::news_intelligence::classify(&s.item.title).map(|v| v.1) == event)
+                || (!category.is_empty() && category_key(&s.category) == category)
+        }
+    });
+    eligible.sort_by(|a, b| b.item.ts.cmp(&a.item.ts).then(a.id.cmp(&b.id)));
+    let eligible: Vec<_> = eligible.into_iter().take(crate::news_intelligence::MAX_ITEMS).cloned().collect();
+    let mut rows = clusters(&eligible);
+    rows.sort_by(|a, b| b.newest.cmp(&a.newest).then_with(|| a.lead.id.cmp(&b.lead.id)));
+    rows.truncate(8);
+    rows
+}
+
 /// Only safe web links survive; tracking does not change a story's identity.
 pub fn normalize_link(link: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(link) else { return String::new() };
@@ -577,6 +621,66 @@ impl NewsStore {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Self::init(Connection::open(path)?)
     }
+    /// Lead id first, then surviving cluster members. Runs on the news worker.
+    pub fn story_analysis(&self, ids: &[String]) -> Result<Option<StoryAnalysis>> {
+        for id in ids {
+            let cached = self
+                .db
+                .query_row("SELECT story_id,model,created_at,json FROM story_analysis WHERE story_id=?1", [id], |r| {
+                    Ok(StoryAnalysis { story_id: r.get(0)?, model: r.get(1)?, created_at: r.get(2)?, json: r.get(3)? })
+                })
+                .optional()?;
+            if cached.is_some() {
+                return Ok(cached);
+            }
+        }
+        Ok(None)
+    }
+    pub fn save_story_analysis(&self, analysis: &StoryAnalysis) -> Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO story_analysis(story_id,model,created_at,json) VALUES(?1,?2,?3,?4)",
+            params![analysis.story_id, analysis.model, analysis.created_at, analysis.json],
+        )?;
+        Ok(())
+    }
+    pub fn related_stories(
+        &self,
+        selected: &crate::news_intelligence::Cluster,
+        now: i64,
+    ) -> Result<Vec<crate::news_intelligence::Cluster>> {
+        let mut query = Query {
+            filters: Filters { scope: Scope::All, ..Default::default() },
+            start: now - 7 * 86400,
+            end: now,
+            limit: crate::news_intelligence::MAX_ITEMS,
+            ..Default::default()
+        };
+        let mut items = Vec::new();
+        let mut ticker_candidates = 0;
+        // There is no ticker index in this store. Inspect at most four bounded
+        // pages, stopping earlier once we have a useful ticker candidate set.
+        // This still searches past a busy first market page, without walking
+        // an arbitrarily large seven-day archive for every inspector selection.
+        for _ in 0..4 {
+            let page = self.query(&query)?;
+            let len = page.len();
+            ticker_candidates += page
+                .iter()
+                .filter(|s| {
+                    !s.inferred_ts
+                        && s.item.tickers.iter().any(|t| selected.tickers.contains(t))
+                        && !selected.member_ids.contains(&s.id)
+                        && !selected.members.iter().any(|m| crate::news_intelligence::same_cluster(m, s))
+                })
+                .count();
+            items.extend(page);
+            if len < query.limit || ticker_candidates >= 64 {
+                break;
+            }
+            query.offset += len;
+        }
+        Ok(related_stories(selected, &items, now))
+    }
     pub fn memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -617,6 +721,7 @@ impl NewsStore {
             bookmark INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS news_published ON items(published DESC);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS story_analysis(story_id TEXT PRIMARY KEY,model TEXT NOT NULL,created_at INTEGER NOT NULL,json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS notification_seen(kind TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(kind,id));
             CREATE TABLE IF NOT EXISTS notification_history(at INTEGER NOT NULL,body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS notification_slots(at INTEGER NOT NULL);

@@ -361,6 +361,8 @@ pub enum Request {
         saved: bool,
     },
     NewsSeen(Vec<String>),
+    StoryDetails(Box<tr_data::news_intelligence::Cluster>),
+    SaveStoryAnalysis(tr_data::news_store::StoryAnalysis),
     FeedConfig {
         settings: tr_data::news_store::local::Notifications,
         watches: Vec<tr_data::news_intelligence::KeywordWatch>,
@@ -723,6 +725,7 @@ pub enum Response {
         desktop: Vec<String>,
         history: Vec<String>,
     },
+    HeadlineTape(Vec<tr_data::news_store::Story>),
     NewsVolume {
         pane: PaneId,
         volumes: Vec<tr_data::news_store::local::Volume>,
@@ -730,6 +733,13 @@ pub enum Response {
     NewsBookmark {
         ids: Vec<String>,
         saved: bool,
+        error: Option<String>,
+    },
+    StoryDetails {
+        id: String,
+        result: Result<(Option<tr_data::news_store::StoryAnalysis>, Vec<tr_data::news_intelligence::Cluster>), String>,
+    },
+    StoryAnalysisSaved {
         error: Option<String>,
     },
     DigestText {
@@ -2678,6 +2688,8 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             tokio::spawn(async move { news::bookmark(&s, ids, saved).await });
         }
         Request::NewsSeen(ids) => news::mark_seen(s, ids).await,
+        Request::StoryDetails(story) => news::story_details(s, *story).await,
+        Request::SaveStoryAnalysis(analysis) => news::save_analysis(s, analysis).await,
         Request::FeedConfig { settings, watches, watched } => {
             s.news.local.lock().await.configure(settings, watches, watched)
         }

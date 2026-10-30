@@ -184,7 +184,7 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
         } else {
             "What's the weekly trend on BTC? Use the loaded sample bars."
         };
-        pane.start_prompt(Prompt { text: prompt.into(), requires_tools: true });
+        pane.start_prompt(Prompt { text: prompt.into(), id: Default::default(), requires_tools: true });
         pane.event(BridgeEvent::Started { turn: TURN.into() });
         pane.turns[0].local_time = crate::agent_pane::local_time(SAMPLE_NOW);
         if !state.edits() {
@@ -227,6 +227,7 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
     if state.0 == "compare" {
         pane.start_prompt(Prompt {
             text: "Compare NVDA with XLK, SPY and an unknown symbol.".into(),
+            id: Default::default(),
             requires_tools: true,
         });
         pane.event(BridgeEvent::Started { turn: TURN.into() });
@@ -270,6 +271,7 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
         pane.session_tools = Some(tr_agent_tools::ToolSet::Workflows);
         pane.start_prompt(Prompt {
             text: "Create Research and add AAPL, MSFT and BTC-USD to Agent Test.".into(),
+            id: Default::default(),
             requires_tools: false,
         });
         pane.event(BridgeEvent::Started { turn: TURN.into() });
@@ -321,6 +323,7 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
     if state.0 == "scan" {
         pane.start_prompt(Prompt {
             text: "Scan cached Nasdaq stocks above their 20-day SMA.".into(),
+            id: Default::default(),
             requires_tools: true,
         });
         pane.event(BridgeEvent::Started { turn: TURN.into() });
@@ -339,7 +342,7 @@ pub fn pane(state: State, chart: u64) -> AgentPane {
         pane.queue_review = true;
         pane.input = "Check momentum after those prompts.".into();
         for text in ["Compare the last 20 weekly closes.", "Identify the nearest support and resistance."] {
-            pane.enqueue(Prompt { text: text.into(), requires_tools: true });
+            pane.enqueue(Prompt { text: text.into(), id: Default::default(), requires_tools: true });
         }
         pane.interrupt(); // Same queue pause as an explicit interruption; no session involved.
     }

@@ -56,6 +56,8 @@ pub enum Target {
     SwitchLayout(String),
     /// Select a theme (or System) by exact name.
     Theme(String),
+    /// Toggle the app-level news headline strip.
+    HeadlineTape,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

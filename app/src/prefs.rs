@@ -771,6 +771,12 @@ pub struct Prefs {
     // N1b
     #[serde(default)]
     pub keyword_watches: Vec<tr_data::news_intelligence::KeywordWatch>,
+    /// N7b: app-wide tape; dashboard builders may enable this.
+    #[serde(default)]
+    pub headline_tape: bool,
+    /// Use static headline rotation even when the OS allows animation.
+    #[serde(default)]
+    pub reduce_motion: bool,
     #[serde(default)]
     pub feed_notifications: tr_data::news_store::local::Notifications,
     // N1b
@@ -796,6 +802,8 @@ impl Default for Prefs {
             desktop_notification: false,
             // N1b
             keyword_watches: vec![],
+            headline_tape: false,
+            reduce_motion: false,
             feed_notifications: Default::default(),
             // N1b
             migrated_theme: None,

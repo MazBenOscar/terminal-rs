@@ -100,6 +100,10 @@ pub fn muted() -> Color32 {
 pub fn amber() -> Color32 {
     palette().amber
 }
+/// Warning ink uses the theme's amber role (also used by urgent news pills).
+pub fn warn() -> Color32 {
+    amber()
+}
 pub fn amber_dim() -> Color32 {
     palette().amber_dim
 }

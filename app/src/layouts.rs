@@ -60,6 +60,9 @@ pub struct NewsSettings {
     pub symbol: Option<String>,
     pub filters: tr_data::news_store::Filters,
     pub display: crate::app::news_view::Display,
+    /// N7b: off for ordinary panes; dashboard builders can opt in.
+    #[serde(default)]
+    pub flash_high: bool,
 }
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -72,13 +75,17 @@ enum NewsCompat {
         filters: tr_data::news_store::Filters,
         #[serde(default)]
         display: crate::app::news_view::Display,
+        #[serde(default)]
+        flash_high: bool,
     },
 }
 impl From<NewsCompat> for NewsSettings {
     fn from(value: NewsCompat) -> Self {
         match value {
             NewsCompat::Legacy(symbol) => Self { symbol: Some(symbol), ..Default::default() },
-            NewsCompat::Current { symbol, filters, display } => Self { symbol, filters, display },
+            NewsCompat::Current { symbol, filters, display, flash_high } => {
+                Self { symbol, filters, display, flash_high }
+            }
         }
     }
 }
@@ -158,6 +165,10 @@ pub enum PaneSettings {
     Search(String),
     /// Headlines for a security (`None` = general market news).
     News(Option<NewsSettings>),
+    Story {
+        #[serde(default = "yes")]
+        link_follow: bool,
+    },
     // N2: serde defaults keep existing layouts valid.
     Filings(crate::filings_view::Settings),
     OrderBook {

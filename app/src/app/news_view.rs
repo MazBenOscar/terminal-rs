@@ -48,6 +48,9 @@ pub struct Interaction {
     pub digest_text: Option<String>,
     pub volumes: Vec<tr_data::news_store::local::Volume>,
     pub dismissed_volume: Option<i64>,
+    pub flash: Flash,
+    // A strip selection may legitimately be outside the table's date/filter range.
+    pub external_selected: Option<String>,
 }
 // N1b: all history-sized work happens only on invalidation. Models, ranges,
 // metadata and unread counts are reused by settled frames.
@@ -65,6 +68,7 @@ pub struct RowCache {
     layout_width: f32,
     layout_dirty: bool,
     relevance_expiry: Option<i64>,
+    flash: Vec<Cluster>,
     offsets: Vec<f32>,
 }
 #[derive(PartialEq)]
@@ -78,6 +82,7 @@ struct CacheKey {
     symbol: Option<String>,
     symbols: Vec<String>,
     watched: Vec<String>,
+    flash_high: bool,
 }
 struct CachedRow {
     story: Cluster,
@@ -87,6 +92,9 @@ struct CachedRow {
     height: f32,
 }
 impl RowCache {
+    pub(super) fn selected(&self, id: &str) -> Option<&Cluster> {
+        self.rows.iter().find(|r| r.story.member_ids.iter().any(|m| m == id)).map(|r| &r.story)
+    }
     fn update(&mut self, n: &mut NewsPane, watches: &[KeywordWatch], watched: &[String], now: i64) {
         let symbols = n.query.as_ref().map(|q| q.symbols.as_slice()).unwrap_or_default();
         if self.key.as_ref().is_some_and(|k| {
@@ -99,6 +107,7 @@ impl RowCache {
                 && k.symbol == n.symbol
                 && k.symbols == symbols
                 && k.watched == watched
+                && k.flash_high == n.flash_high
                 && self.relevance_expiry.is_none_or(|expiry| now < expiry)
         }) {
             return;
@@ -115,6 +124,7 @@ impl RowCache {
         }) {
             n.read_in_view.clear();
         }
+        self.flash = if n.flash_high { flash_stories(n, watches, now) } else { vec![] };
         let query = current_query(n, now);
         self.empty_message = n.empty_message(&query);
         let older_query = tr_data::news_store::Query { start: 0, ..current_query(n, now) };
@@ -172,7 +182,9 @@ impl RowCache {
                 id.and_then(|id| self.rows.iter().find(|r| r.story.member_ids.iter().any(|m| m == id)))
                     .map(|r| r.model.id.clone())
             };
-            n.interaction.selected = remap(n.interaction.selected.as_deref());
+            n.interaction.selected = remap(n.interaction.selected.as_deref()).or_else(|| {
+                n.interaction.selected.clone().filter(|id| n.interaction.external_selected.as_ref() == Some(id))
+            });
             n.interaction.anchor = remap(n.interaction.anchor.as_deref());
             n.interaction.restore_anchor = n.interaction.anchor.is_some();
             n.interaction.snapshot = self.ids.clone();
@@ -197,6 +209,7 @@ impl RowCache {
             symbol: n.symbol.clone(),
             symbols: symbols.to_vec(),
             watched: watched.to_vec(),
+            flash_high: n.flash_high,
         });
     }
 }
@@ -498,7 +511,7 @@ fn mark_seen(n: &mut NewsPane, story: &Cluster) {
     }
     n.seen_queue = queued.into_iter().collect();
 }
-fn toggle_saved(n: &mut NewsPane, story: &Cluster) {
+pub(super) fn toggle_saved(n: &mut NewsPane, story: &Cluster) {
     let saved = !story.members.iter().any(|member| member.bookmark);
     for item in n.items.iter_mut().chain(&mut n.pending) {
         if story.member_ids.contains(&item.id) {
@@ -539,7 +552,7 @@ fn hover_card(title: &egui::Response, story: &Cluster, model: &RowModel) {
         {
             ui.add_space(dp(2.0));
             ui.label(
-                RichText::new(format!("{} · click to open", host.trim_start_matches("www.")))
+                RichText::new(format!("{} · Enter to open", host.trim_start_matches("www.")))
                     .font(ui_font(10.5))
                     .color(theme::muted()),
             );
@@ -805,7 +818,7 @@ fn toggle_category(categories: &mut Vec<String>, category: &str, multi: bool) {
         categories.push(category.into());
     }
 }
-fn category_code(category: &str) -> &'static str {
+pub(super) fn category_code(category: &str) -> &'static str {
     match tr_data::news_store::category_key(category) {
         "markets" => "MKT",
         "macro" => "MACRO",
@@ -1050,6 +1063,9 @@ pub(super) fn show(
     link: Option<crate::layouts::Link>,
     active_watchlist: usize,
 ) -> Vec<Action> {
+    if focused {
+        n.last_focused = Some(std::time::Instant::now());
+    }
     if let Some(text) = n.interaction.digest_text.take() {
         ui.ctx().copy_text(text);
     }
@@ -1103,6 +1119,7 @@ pub(super) fn show(
                     ui.add(egui::Label::new(&pane_status).wrap());
                     ui.add(egui::Label::new(&status).wrap());
                     source_details(ui, n, &mut actions);
+                    ui.checkbox(&mut n.flash_high, "Flash high-priority");
                     ui.separator();
                     if ui
                         .button("Copy digest")
@@ -1285,6 +1302,10 @@ pub(super) fn show(
             }
         });
     });
+    cache.update(n, watches, &watched, now);
+    if n.flash_high && !narrow {
+        show_flash(ui, n, &cache.flash, now);
+    }
     let summary = active_filter_summary(n);
     if !summary.is_empty() {
         ui.add(egui::Label::new(RichText::new(&summary).font(ui_font(10.5)).color(theme::muted())).truncate())
@@ -1675,8 +1696,8 @@ pub(super) fn show(
                 },
             )
             .inner;
+        // A click selects (the Story pane follows); Enter or an Open button opens the source.
         if title.clicked() {
-            open(ui, story);
             mark_seen(n, story);
             child_clicked = true;
         }
@@ -1784,6 +1805,11 @@ pub(super) fn show(
                 });
             });
         }
+        // N7a: pointer selection publishes the same stable id as keyboard selection.
+        if response.clicked() || child_clicked {
+            n.interaction.selected = Some(model.id.clone());
+            n.interaction.dwell = Some((model.id.clone(), std::time::Instant::now()));
+        }
         let height = (ui.next_widget_position().y - start).max(dp(22.0));
         if top.is_none() && start + height > ui.clip_rect().top() {
             top = Some((model.id.clone(), start - ui.clip_rect().top()));
@@ -1872,4 +1898,448 @@ pub(super) fn show(
         n.query = None;
     }
     actions
+}
+
+// N7b: strips share the existing news intelligence and UI snapshots. Neither
+// path subscribes to news, queries the store, or starts a source refresh.
+const FLASH_SECONDS: i64 = 600;
+const TAPE_SECONDS: i64 = 2 * 3600;
+const TAPE_FRAME: std::time::Duration = std::time::Duration::from_millis(50); // at most 20 Hz
+const ROTATION_SECONDS: f64 = 8.0;
+
+#[derive(Default)]
+pub struct Flash {
+    arrivals: std::collections::BTreeMap<String, i64>,
+    newest_seen: Option<i64>,
+    dismissed: std::collections::BTreeSet<String>,
+    dismissed_at: Option<(i64, i64)>,
+}
+impl Flash {
+    /// Compare the whole delivery with the previous high-water mark, not with
+    /// other rows in this delivery. Empty loads do not hydrate the pane.
+    pub(super) fn observe(&mut self, items: &[tr_data::news_store::Story], now: i64) {
+        for story in items {
+            let arrival =
+                if self.newest_seen.is_some_and(|ts| story.item.ts > ts) { now } else { story.item.ts.min(now) };
+            self.arrivals.entry(story.id.clone()).or_insert(arrival);
+        }
+        if let Some(newest) = items.iter().map(|s| s.item.ts).max() {
+            self.newest_seen = Some(self.newest_seen.map_or(newest, |seen| seen.max(newest)));
+        }
+        // Expired IDs can use publication time again: the high-water mark
+        // prevents their redelivery from restarting the clock.
+        self.arrivals.retain(|_, at| now < at.saturating_add(FLASH_SECONDS));
+        const LIMIT: usize = 2 * intelligence::MAX_ITEMS;
+        if self.arrivals.len() > LIMIT {
+            let mut oldest: Vec<_> = self.arrivals.iter().map(|(id, at)| (*at, id.clone())).collect();
+            oldest.sort();
+            for (_, id) in oldest.into_iter().take(self.arrivals.len() - LIMIT) {
+                self.arrivals.remove(&id);
+            }
+        }
+        self.dismissed.retain(|id| self.arrivals.contains_key(id));
+    }
+    fn arrival(&self, story: &Cluster) -> i64 {
+        story.members.iter().map(|s| self.arrivals.get(&s.id).copied().unwrap_or(s.item.ts)).max().unwrap_or(0)
+    }
+    fn pick<'a>(&self, stories: &'a [Cluster], now: i64) -> Option<&'a Cluster> {
+        // Pick first, then suppress: dismissing the newest must not reveal an
+        // older alert. Only a strictly newer arrival can re-arm the strip.
+        let newest = stories.iter().max_by_key(|s| (self.arrival(s), s.newest, &s.lead.id))?;
+        let arrival = self.arrival(newest);
+        (arrival <= now
+            && now < arrival.saturating_add(FLASH_SECONDS)
+            && self.dismissed_at.is_none_or(|at| (arrival, newest.newest) > at)
+            && !newest.member_ids.iter().any(|id| self.dismissed.contains(id)))
+        .then_some(newest)
+    }
+    fn dismiss(&mut self, story: &Cluster) {
+        self.dismissed_at =
+            Some(self.dismissed_at.unwrap_or((i64::MIN, i64::MIN)).max((self.arrival(story), story.newest)));
+        self.dismissed.extend(story.member_ids.iter().cloned());
+        while self.dismissed.len() > 2 * intelligence::MAX_ITEMS {
+            self.dismissed.pop_first();
+        }
+    }
+}
+
+fn flash_stories(n: &NewsPane, watches: &[KeywordWatch], now: i64) -> Vec<Cluster> {
+    let mut query = current_query(n, now);
+    query.start = 0; // all pane filters, deliberately excluding the date range
+    query.end = i64::MAX;
+    let mut items = std::collections::BTreeMap::new();
+    for item in n.items.iter().chain(&n.pending).filter(|s| tr_data::news_store::matches(s, &query)) {
+        items.insert(item.id.clone(), item.clone());
+    }
+    intelligence::clusters(&items.into_values().collect::<Vec<_>>())
+        .into_iter()
+        .filter(|story| {
+            story.priority() >= intelligence::Priority::High
+                && (!n.display.unread || story.unread())
+                && (!n.display.watch_hits
+                    || story.members.iter().any(|s| watches.iter().any(|w| intelligence::watch_matches(s, &w.words))))
+        })
+        .collect()
+}
+
+/// Selecting from a strip never opens the URL or resets pane filters. Retain the
+/// selected members when the tape routes into a pane with a different snapshot.
+pub(super) fn select_strip_story(n: &mut NewsPane, story: &Cluster) {
+    for member in &story.members {
+        if !n.items.iter().chain(&n.pending).any(|s| s.id == member.id) {
+            n.items.push(member.clone());
+            n.item_revision = n.item_revision.wrapping_add(1);
+        }
+    }
+    let id = story.lead.id.clone();
+    n.interaction.external_selected = Some(id.clone());
+    n.interaction.selected = Some(id.clone());
+    n.interaction.scroll_to = Some(id.clone());
+    n.interaction.dwell = Some((id, std::time::Instant::now()));
+}
+
+fn show_flash(ui: &mut Ui, n: &mut NewsPane, stories: &[Cluster], now: i64) {
+    let Some(story) = n.interaction.flash.pick(stories, now) else { return };
+    let expiry = n.interaction.flash.arrival(story).saturating_add(FLASH_SECONDS);
+    ui.ctx().request_repaint_after(std::time::Duration::from_secs((expiry - now).max(1) as u64));
+    ui.horizontal(|ui| {
+        chrome(ui);
+        let badge = ui.add(
+            egui::Label::new(RichText::new("FLASH").font(mono(10.5)).strong().color(theme::warn()))
+                .sense(egui::Sense::click()),
+        );
+        if badge.clicked() {
+            select_strip_story(n, story);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("×").on_hover_text("Dismiss this flash story").clicked() {
+                n.interaction.flash.dismiss(story);
+            }
+            let source_width = ui
+                .painter()
+                .layout_no_wrap(story.lead.source.clone(), mono(10.5), theme::muted())
+                .size()
+                .x
+                .min(dp(120.0));
+            let source = ui.add_sized(
+                egui::vec2(source_width, dp(22.0)),
+                egui::Label::new(RichText::new(&story.lead.source).font(mono(10.5)).color(theme::muted()))
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            );
+            if source.clicked() {
+                select_strip_story(n, story);
+            }
+            let response = ui
+                .add_sized(
+                    egui::vec2(ui.available_width(), dp(22.0)),
+                    egui::Label::new(RichText::new(&story.lead.item.title).font(ui_font(12.0)).color(theme::text()))
+                        .truncate()
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text(format!("{} · {}", story.lead.item.title, story.lead.source));
+            if response.clicked() {
+                select_strip_story(n, story);
+            }
+        });
+    });
+}
+
+fn tape_items(items: &[tr_data::news_store::Story], watches: &[KeywordWatch], now: i64) -> Vec<Cluster> {
+    let mut unique = std::collections::BTreeMap::new();
+    for story in items.iter().filter(|s| !s.inferred_ts && s.item.ts > now - TAPE_SECONDS && s.item.ts <= now) {
+        unique.insert(story.id.clone(), story.clone());
+    }
+    let mut stories = intelligence::clusters(&unique.into_values().collect::<Vec<_>>());
+    stories.sort_by(|a, b| {
+        tape_emphasized(b, watches)
+            .cmp(&tape_emphasized(a, watches))
+            .then(b.newest.cmp(&a.newest))
+            .then(a.lead.id.cmp(&b.lead.id))
+    });
+    stories.truncate(20);
+    stories
+}
+fn tape_emphasized(story: &Cluster, watches: &[KeywordWatch]) -> bool {
+    story.priority() >= intelligence::Priority::High
+        || story.members.iter().any(|s| watches.iter().any(|w| intelligence::watch_matches(s, &w.words)))
+}
+
+fn tape_static_mode(preference: bool, os: bool, focused: bool) -> bool {
+    preference || os || !focused
+}
+
+#[derive(Default)]
+struct TapeClock {
+    last: Option<f64>,
+    paused: bool,
+    static_mode: bool,
+    offset: f64,
+    rotation: f64,
+    index: usize,
+}
+impl TapeClock {
+    fn step(&mut self, time: f64, paused: bool, static_mode: bool, count: usize) {
+        let elapsed = self.last.replace(time).map_or(0.0, |last| (time - last).max(0.0));
+        if !paused && !self.paused && self.static_mode == static_mode {
+            if static_mode {
+                self.rotation += elapsed;
+                self.index = (self.index + (self.rotation / ROTATION_SECONDS) as usize) % count.max(1);
+                self.rotation %= ROTATION_SECONDS;
+            } else {
+                self.offset += elapsed * 40.0; // logical pixels/second, independent of frame rate
+            }
+        }
+        self.paused = paused;
+        self.static_mode = static_mode;
+        self.index %= count.max(1);
+    }
+    fn repaint_after(&self) -> Option<std::time::Duration> {
+        if self.paused {
+            None
+        } else if self.static_mode {
+            Some(std::time::Duration::from_secs_f64((ROTATION_SECONDS - self.rotation).max(TAPE_FRAME.as_secs_f64())))
+        } else {
+            Some(TAPE_FRAME)
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Tape {
+    dirty: bool,
+    key: Vec<(crate::dock::PaneId, u64, usize, usize)>,
+    watches: Vec<KeywordWatch>,
+    items: Vec<Cluster>,
+    // App-level retention makes the URL fallback usable after the last News
+    // pane closes. This is only a bounded copy of already-delivered UI data.
+    market_items: Vec<tr_data::news_store::Story>,
+    expiry: Option<i64>,
+    clock: TapeClock,
+    text_key: Option<(theme::Palette, egui::FontId, egui::FontId, f32)>,
+    galleys: Vec<std::sync::Arc<egui::Galley>>,
+    offsets: Vec<f32>,
+}
+impl Tape {
+    pub(super) fn receive_market(&mut self, items: Vec<tr_data::news_store::Story>) {
+        if self.market_items != items {
+            self.market_items = items;
+            self.dirty = true;
+        }
+    }
+    fn update(&mut self, panes: &[super::Pane], watches: &[KeywordWatch], now: i64) {
+        // Only market-scope snapshots: symbol/watchlist news does not silently
+        // turn into a market subscription when this preference is enabled.
+        let market = || {
+            panes.iter().filter_map(|p| match &p.kind {
+                super::PaneKind::News(n)
+                    if n.filters.scope == Scope::All
+                        && n.query.as_ref().is_none_or(|q| q.filters.scope == Scope::All) =>
+                {
+                    Some((p.id, n))
+                }
+                _ => None,
+            })
+        };
+        let key: Vec<_> = market().map(|(id, n)| (id, n.item_revision, n.items.len(), n.pending.len())).collect();
+        if !self.dirty && key == self.key && self.watches == watches && self.expiry.is_none_or(|at| now < at) {
+            return;
+        }
+        let mut unique: std::collections::BTreeMap<_, _> =
+            std::mem::take(&mut self.market_items).into_iter().map(|s| (s.id.clone(), s)).collect();
+        for item in market().flat_map(|(_, n)| n.items.iter().chain(&n.pending)) {
+            unique.insert(item.id.clone(), item.clone());
+        }
+        self.market_items = unique
+            .into_values()
+            .filter(|s| !s.inferred_ts && s.item.ts > now - TAPE_SECONDS && s.item.ts <= now)
+            .collect();
+        self.market_items.sort_by(|a, b| b.item.ts.cmp(&a.item.ts).then(a.id.cmp(&b.id)));
+        self.market_items.truncate(intelligence::MAX_ITEMS);
+        self.items = tape_items(&self.market_items, watches, now);
+        self.dirty = false;
+        // Content changes invalidate layout as well as theme/font changes.
+        self.text_key = None;
+        self.clock.index %= self.items.len().max(1);
+        // Rebuild when any member ages out, including members that contribute
+        // priority or keyword hits but are not the cluster lead.
+        self.expiry = self.market_items.iter().map(|s| s.item.ts + TAPE_SECONDS).min();
+        self.key = key;
+        self.watches = watches.to_vec();
+    }
+}
+
+impl super::TerminalApp {
+    pub(super) fn toggle_headline_tape(&mut self) {
+        self.prefs.headline_tape = !self.prefs.headline_tape;
+        self.headline_tape.clock = TapeClock::default();
+        self.save_prefs();
+    }
+
+    /// Return a safe URL only when no News pane exists. Selections use stable
+    /// story ids; focus activates background tabs without creating a new pane.
+    pub(super) fn route_tape_story(&mut self, story: &Cluster) -> Option<String> {
+        let target = self
+            .panes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| match &p.kind {
+                super::PaneKind::News(n) => Some((i, (p.id == self.focus, n.last_focused))),
+                _ => None,
+            })
+            .max_by_key(|(_, rank)| *rank)
+            .map(|(i, _)| i);
+        if let Some(i) = target {
+            let id = self.panes[i].id;
+            if let super::PaneKind::News(n) = &mut self.panes[i].kind {
+                select_strip_story(n, story);
+                n.last_focused = Some(std::time::Instant::now());
+            }
+            self.focus = id;
+            self.dock.activate(id);
+            None
+        } else {
+            let url = tr_data::news_store::normalize_link(&story.lead.item.link);
+            (!url.is_empty()).then_some(url)
+        }
+    }
+
+    /// Paint just above the status bar; zero height means zero reserved space.
+    pub(super) fn show_headline_tape(&mut self, ui: &mut Ui, available: egui::Rect) -> f32 {
+        if !self.prefs.headline_tape {
+            self.headline_tape.clock = TapeClock::default();
+            return dp(0.0);
+        }
+        let now = chrono::Utc::now().timestamp();
+        self.headline_tape.update(&self.panes, &self.prefs.keyword_watches, now);
+        let rect = egui::Rect::from_min_max(egui::pos2(available.left(), available.bottom() - dp(24.0)), available.max);
+        let ctx = ui.ctx().clone();
+        let (time, focused, hovered, visible) = ctx.input(|i| {
+            (i.time, i.focused, i.pointer.hover_pos().is_some_and(|p| rect.contains(p)), window_visible(i.viewport()))
+        });
+        let tape = &mut self.headline_tape;
+        let static_mode = tape_static_mode(self.prefs.reduce_motion, crate::anim::reduced(), focused);
+        tape.clock.step(time, hovered || !visible, static_mode, tape.items.len());
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        painter.rect_filled(rect, dp(0.0), theme::header());
+        painter.hline(rect.x_range(), rect.top(), egui::Stroke::new(dp(1.0), theme::border()));
+        if tape.items.is_empty() {
+            tape.clock = TapeClock::default();
+            tape.galleys.clear();
+            tape.offsets.clear();
+            painter.text(
+                egui::pos2(rect.left() + dp(8.0), rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                "No headlines in the last 2 hours",
+                ui_font(12.0),
+                theme::muted(),
+            );
+            return rect.height();
+        }
+        let text_key = (theme::palette(), mono(10.5), ui_font(12.0), theme::density());
+        if tape.text_key.as_ref() != Some(&text_key) {
+            tape.galleys = tape
+                .items
+                .iter()
+                .map(|item| {
+                    let mut job = egui::text::LayoutJob::default();
+                    let emphasized = tape_emphasized(item, &tape.watches);
+                    if emphasized {
+                        job.append(
+                            "! ",
+                            dp(0.0),
+                            egui::TextFormat { font_id: mono(10.5), color: theme::warn(), ..Default::default() },
+                        );
+                    }
+                    job.append(
+                        &format!("{}  ", item.lead.source),
+                        dp(0.0),
+                        egui::TextFormat { font_id: mono(10.5), color: theme::muted(), ..Default::default() },
+                    );
+                    job.append(
+                        &item.lead.item.title,
+                        dp(0.0),
+                        egui::TextFormat {
+                            font_id: ui_font(12.0),
+                            color: if emphasized { theme::warn() } else { theme::text() },
+                            ..Default::default()
+                        },
+                    );
+                    painter.layout_job(job)
+                })
+                .collect();
+            tape.offsets.clear();
+            tape.offsets.push(dp(0.0));
+            for galley in &tape.galleys {
+                tape.offsets.push(tape.offsets.last().copied().unwrap_or_default() + galley.size().x + dp(24.0));
+            }
+            tape.text_key = Some(text_key);
+        }
+        let mut picked = None;
+        let mut draw = |index: usize, cycle: usize, x: f32, width: f32, galley: std::sync::Arc<egui::Galley>| {
+            let item = &tape.items[index];
+            let entry = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(width, rect.height()));
+            let hit = entry.intersect(rect);
+            if hit.is_positive() {
+                let response = ui
+                    .interact(hit, ui.id().with(("headline-tape", &item.lead.id, cycle)), egui::Sense::click())
+                    .on_hover_text(format!("{} · {}", item.lead.source, item.lead.item.title));
+                if response.hovered() {
+                    painter.rect_filled(hit, dp(0.0), theme::control_hover());
+                }
+                painter.galley(egui::pos2(x + dp(8.0), rect.center().y - galley.size().y / 2.0), galley, theme::text());
+                painter.vline(
+                    x + width - dp(1.0),
+                    rect.y_range().shrink(dp(5.0)),
+                    egui::Stroke::new(dp(1.0), theme::border()),
+                );
+                if response.clicked() {
+                    picked = Some(item.clone());
+                }
+            }
+        };
+        if static_mode {
+            let index = tape.clock.index;
+            draw(index, 0, rect.left(), rect.width(), tape.galleys[index].clone());
+        } else {
+            let total = *tape.offsets.last().unwrap_or(&dp(0.0));
+            let cycle_width = total.max(rect.width()).max(dp(1.0));
+            tape.clock.offset %= f64::from(cycle_width);
+            // Repeat seamlessly. A short tape leaves a calm gap; stable ids
+            // distinguish the two visible copies at the wrap boundary.
+            for cycle in 0..2 {
+                let origin = rect.left() - tape.clock.offset as f32 + cycle as f32 * cycle_width;
+                let first = tape.offsets.partition_point(|x| origin + x <= rect.left()).saturating_sub(1);
+                let end = tape.offsets.partition_point(|x| origin + x < rect.right()).min(tape.items.len());
+                for index in first.min(end)..end {
+                    draw(
+                        index,
+                        cycle,
+                        origin + tape.offsets[index],
+                        tape.offsets[index + 1] - tape.offsets[index],
+                        tape.galleys[index].clone(),
+                    );
+                }
+            }
+        }
+        if visible {
+            if let Some(wait) = tape.clock.repaint_after() {
+                ctx.request_repaint_after(wait);
+            }
+            if let Some(expiry) = tape.expiry {
+                ctx.request_repaint_after(std::time::Duration::from_secs((expiry - now).max(1) as u64));
+            }
+        }
+        if let Some(story) = picked {
+            if let Some(url) = self.route_tape_story(&story) {
+                ctx.open_url(egui::OpenUrl::new_tab(url));
+            } else if let Some(pane) = self.panes.iter().find(|p| p.id == self.focus && p.window.is_some()) {
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::from_hash_of(("pane-window", pane.id)),
+                    egui::ViewportCommand::Focus,
+                );
+            }
+        }
+        rect.height()
+    }
 }

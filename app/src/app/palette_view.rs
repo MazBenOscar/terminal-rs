@@ -37,6 +37,8 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("WL", "", "watchlist monitor", Some(Action::Watchlist)),
     ("SCAN", "Watchlist scanner", "easyscan screener conditions filter", None),
     ("N", "", "news headlines", None),
+    ("STORY", "Story inspector", "news selected headline", None),
+    ("DASH NEWS", "News desk", "dashboard workspace", None),
     ("OB", "", "order book depth dom", None),
     ("WEI", "", "world equity indices markets", None),
     ("GC", "", "yield curve treasury rates", None),
@@ -191,8 +193,23 @@ pub(super) fn static_items() -> Vec<Item> {
         Item::new(Kind::Action, "Reset the demo account", "Settings › Trading", Target::Settings("Trading".into()))
             .keywords("paper demo restart cash"),
     );
+    v.push(
+        Item::new(Kind::Action, "Headline tape", "Toggle the bottom news strip", Target::HeadlineTape)
+            .keywords("news ticker scroll headlines"),
+    );
     for &(a, words) in ACTIONS {
         v.push(Item::new(Kind::Action, a.label(), a.category(), Target::Hotkey(a)).keywords(words).hotkey(a));
+    }
+    for dashboard in crate::dashboards::ALL {
+        v.push(
+            Item::new(
+                Kind::Layout,
+                dashboard.name,
+                dashboard.description,
+                Target::Run(format!("DASH {}", dashboard.id)),
+            )
+            .keywords("dashboard new workspace"),
+        );
     }
     for l in Layout::ALL {
         let n = l.slots();
@@ -361,6 +378,7 @@ impl TerminalApp {
     /// Run a picked item.
     fn run_palette_target(&mut self, t: Target) {
         match t {
+            Target::HeadlineTape => self.toggle_headline_tape(),
             Target::Run(line) => self.execute(&line),
             Target::Hotkey(a) => self.run_hotkey(a),
             Target::Settings(label) => {

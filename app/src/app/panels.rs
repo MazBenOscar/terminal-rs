@@ -195,6 +195,10 @@ impl TerminalApp {
                 ));
                 // N3
             }
+            PaneKind::Story { link_follow } => {
+                let follow = *link_follow;
+                self.story_panel(ui, id, follow);
+            }
             PaneKind::News(_) => {
                 self.refresh_news_sources();
                 let link = self.panes[i].link;
@@ -227,6 +231,7 @@ impl TerminalApp {
                 if std::mem::take(&mut n.interaction.save_watches) {
                     self.save_prefs();
                 }
+                self.broadcast_story(id);
             }
             // N1a
             PaneKind::Options(o) => {

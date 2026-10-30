@@ -1,5 +1,403 @@
 use super::*;
 
+fn n7_story(id: &str, title: &str, ts: i64) -> tr_data::news_store::Story {
+    let mut story = tr_data::news_store::Story::new(
+        tr_data::NewsItem {
+            title: title.into(),
+            link: format!("https://example.test/{id}"),
+            ts,
+            tickers: vec!["ACME US Equity".into()],
+            publisher: "Reuters".into(),
+        },
+        "Reuters",
+    );
+    story.id = id.into();
+    story.category = "tech".into();
+    story
+}
+
+#[test]
+fn n7b_flash_pick_expiry_dismiss_and_newer_rearm() {
+    let now = 100_000;
+    let old = Cluster::wire(&n7_story("old", "Acme raises guidance", now - 30));
+    let new = Cluster::wire(&n7_story("new", "Beta trading halted", now - 10));
+    let mut flash = Flash::default();
+    let stories = vec![old.clone(), new.clone()];
+    assert_eq!(flash.pick(&stories, now).unwrap().lead.id, "new");
+    assert!(flash.pick(&stories, now + 590).is_none(), "expiry must not fall back to an older flash");
+    flash.dismiss(&new);
+    assert!(flash.pick(&stories, now).is_none());
+    assert!(flash.pick(&[old], now).is_none(), "filter changes cannot resurrect an older alert");
+    let newer = Cluster::wire(&n7_story("newer", "Urgent: gamma factory closed", now + 1));
+    assert_eq!(flash.pick(std::slice::from_ref(&newer), now + 1).unwrap().lead.id, "newer");
+    flash.dismiss(&newer);
+    let mut changed_lead = newer.clone();
+    changed_lead.lead.id = "another-publisher".into();
+    changed_lead.member_ids.push("another-publisher".into());
+    assert!(flash.pick(&[changed_lead], now + 2).is_none(), "cluster lead changes must not undo dismissal");
+}
+
+#[test]
+fn n7b_flash_arrival_is_monotonic_and_history_is_not_rearmed() {
+    let now = 100_000;
+    let historical = n7_story("history", "Acme raises guidance", now - 3600);
+    let mut flash = Flash::default();
+    flash.observe(std::slice::from_ref(&historical), now);
+    assert!(flash.pick(&[Cluster::wire(&historical)], now).is_none());
+    let delayed = n7_story("delayed", "Beta trading halt", now - 3000);
+    flash.observe(std::slice::from_ref(&delayed), now + 1);
+    let stories = [Cluster::wire(&delayed)];
+    assert!(flash.pick(&stories, now + 600).is_some(), "new deliveries expire by arrival, not publication");
+    flash.observe(&[delayed], now + 601);
+    assert!(flash.pick(&stories, now + 601).is_none(), "repeat delivery cannot restart the clock");
+}
+
+#[test]
+fn review_n7_flash_older_history_delivered_later_is_not_fresh() {
+    let now = chrono::Utc::now().timestamp();
+    let mut pane = NewsPane::new(None);
+    pane.filters.scope = Scope::All;
+    pane.filters.days = 1;
+    pane.flash_high = true;
+    // First delivery: today's window (or an empty store on first run).
+    pane.apply(vec![n7_story("today", "Routine market report", now - 60)]);
+    // The user widens the date range to 7 days; the worker returns older saved history.
+    let old = n7_story("old-high", "Acme raises guidance", now - 3 * 86400);
+    pane.filters.days = 7;
+    pane.apply(vec![n7_story("today", "Routine market report", now - 60), old]);
+    let stories = flash_stories(&pane, &[], now);
+    assert!(stories.iter().any(|s| s.lead.id == "old-high"));
+    assert!(
+        pane.interaction.flash.pick(&stories, now).is_none(),
+        "a three-day-old saved headline must not appear as a fresh FLASH"
+    );
+}
+
+#[test]
+fn flash_empty_first_load_and_older_navigation_never_restart_arrival() {
+    let now = 1_000_000;
+    let old = n7_story("old", "Acme raises guidance", now - 3 * 86400);
+    let mut flash = Flash::default();
+    flash.observe(&[], now);
+    assert_eq!(flash.newest_seen, None);
+    flash.observe(std::slice::from_ref(&old), now + 1);
+    assert!(flash.pick(&[Cluster::wire(&old)], now + 1).is_none());
+    let latest = n7_story("latest", "Routine market report", now - 10);
+    flash.observe(&[latest], now + 2);
+    // select_related applies a snapshot containing only older members.
+    let other = n7_story("related-old", "Beta trading halted", now - 2 * 86400);
+    flash.observe(std::slice::from_ref(&other), now + 3);
+    assert!(flash.pick(&[Cluster::wire(&other)], now + 3).is_none());
+    assert_eq!(flash.newest_seen, Some(now - 10));
+}
+
+#[test]
+fn flash_retention_is_bounded_and_eviction_cannot_rearm_old_ids() {
+    let now = 1_000_000;
+    let items: Vec<_> = (0..2 * intelligence::MAX_ITEMS + 20)
+        .map(|i| n7_story(&format!("bounded-{i}"), "Acme raises guidance", now))
+        .collect();
+    let mut flash = Flash::default();
+    flash.observe(&items, now);
+    assert_eq!(flash.arrivals.len(), 2 * intelligence::MAX_ITEMS);
+    let mut cluster = Cluster::wire(&items[0]);
+    cluster.member_ids = items.iter().map(|s| s.id.clone()).collect();
+    flash.dismiss(&cluster);
+    assert_eq!(flash.dismissed.len(), 2 * intelligence::MAX_ITEMS);
+    flash.observe(&[], now + FLASH_SECONDS);
+    assert!(flash.arrivals.is_empty());
+    assert!(flash.dismissed.is_empty());
+    flash.observe(&items, now + FLASH_SECONDS + 1);
+    assert!(flash.pick(&[Cluster::wire(&items[0])], now + FLASH_SECONDS + 1).is_none());
+}
+
+#[test]
+fn n7b_flash_obeys_every_pane_filter_except_date_and_sort() {
+    let now = 1_000_000;
+    let mut pane = NewsPane::new(Some("ACME US Equity".into()));
+    pane.filters.days = 1;
+    pane.items = vec![
+        n7_story("high", "Acme raises guidance for quantum chips", now - 2 * 86400),
+        n7_story("normal", "Routine market report", now),
+    ];
+    let watches = vec![KeywordWatch { words: "quantum".into(), ..Default::default() }];
+    let allowed = |p: &NewsPane| flash_stories(p, &watches, now).iter().any(|s| s.lead.id == "high");
+    assert!(allowed(&pane), "date is excluded and normal priority is not picked");
+    assert_eq!(flash_stories(&pane, &watches, now).len(), 1);
+    pane.filters.sources = vec!["Other publisher".into()];
+    assert!(!allowed(&pane));
+    pane.filters.sources = vec!["Reuters".into()];
+    assert!(allowed(&pane));
+    pane.filters.sources.clear();
+    pane.filters.categories = vec!["macro".into()];
+    assert!(!allowed(&pane));
+    pane.filters.categories = vec!["tech".into()];
+    assert!(allowed(&pane));
+    pane.filters.categories.clear();
+    pane.filters.include = "absent".into();
+    assert!(!allowed(&pane));
+    pane.filters.include = "quantum".into();
+    assert!(allowed(&pane));
+    pane.filters.include.clear();
+    pane.filters.exclude = "quantum".into();
+    assert!(!allowed(&pane));
+    pane.filters.exclude.clear();
+    pane.filters.search = "absent".into();
+    assert!(!allowed(&pane));
+    pane.filters.search.clear();
+    pane.filters.saved = true;
+    assert!(!allowed(&pane));
+    pane.items[0].bookmark = true;
+    assert!(allowed(&pane));
+    pane.filters.saved = false;
+    pane.display.unread = true;
+    pane.items[0].seen = true;
+    assert!(!allowed(&pane));
+    pane.items[0].seen = false;
+    assert!(allowed(&pane));
+    pane.display.unread = false;
+    pane.display.watch_hits = true;
+    assert!(allowed(&pane));
+    assert!(flash_stories(&pane, &[], now).is_empty());
+    pane.display.watch_hits = false;
+    pane.symbol = Some("OTHER US Equity".into());
+    assert!(!allowed(&pane));
+    pane.filters.scope = Scope::Watchlist;
+    assert!(!allowed(&pane));
+    pane.filters.scope = Scope::All;
+    assert!(allowed(&pane));
+    pane.items.clear();
+    pane.pending = vec![n7_story("pending", "Acme raises guidance", now)];
+    assert_eq!(flash_stories(&pane, &[], now)[0].lead.id, "pending", "frozen lists still expose flash arrivals");
+}
+
+#[test]
+fn n7b_tape_window_priority_keywords_and_cluster_dedup() {
+    let now = 100_000;
+    let high = n7_story("high", "Acme raises guidance", now - 1);
+    let mut duplicate = high.clone();
+    duplicate.id = "duplicate".into();
+    duplicate.source = "CNBC".into();
+    let keyword = n7_story("keyword", "Quantum laboratory opens in Zurich", now - 2);
+    let normal = n7_story("normal", "Routine weather bulletin", now);
+    let old = n7_story("old", "Delta files bankruptcy", now - TAPE_SECONDS);
+    let future = n7_story("future", "Fed cuts rates", now + 1);
+    let mut inferred = n7_story("inferred", "CEO resigns", now);
+    inferred.inferred_ts = true;
+    let watches = [KeywordWatch { words: "quantum".into(), ..Default::default() }];
+    let items = [high.clone(), duplicate, high, keyword, normal, old, future, inferred];
+    let selected = tape_items(&items, &watches, now);
+    assert_eq!(selected.len(), 3);
+    assert_eq!(selected[0].member_ids.len(), 2, "same ids dedup before clustering publishers");
+    assert_eq!(selected[1].lead.id, "keyword");
+    assert_eq!(selected[2].lead.id, "normal", "newer ordinary headlines top up after emphasized entries");
+    assert!(tape_emphasized(&selected[0], &watches));
+    assert!(tape_emphasized(&selected[1], &watches));
+    assert!(!tape_emphasized(&selected[2], &watches));
+    let no_keywords = tape_items(&items, &[], now);
+    assert_eq!(no_keywords.len(), 3);
+    assert_eq!(no_keywords[1].lead.id, "normal");
+}
+
+#[test]
+fn tape_top_up_is_bounded_and_newest_first_without_priority_or_keywords() {
+    let now = 100_000;
+    let items: Vec<_> =
+        (0..25).map(|i| n7_story(&format!("ordinary-{i}"), &format!("Observatory{i}"), now - i)).collect();
+    let selected = tape_items(&items, &[], now);
+    assert_eq!(selected.len(), 20);
+    for (i, story) in selected.iter().enumerate() {
+        assert_eq!(story.lead.id, format!("ordinary-{i}"));
+        assert!(!tape_emphasized(story, &[]));
+    }
+}
+#[test]
+fn n7b_tape_clock_caps_repaint_pauses_and_rotates_statically() {
+    for pref in [false, true] {
+        for os in [false, true] {
+            for focused in [false, true] {
+                assert_eq!(tape_static_mode(pref, os, focused), pref || os || !focused);
+            }
+        }
+    }
+    let mut clock = TapeClock::default();
+    clock.step(0.0, false, false, 3);
+    clock.step(1.0, false, false, 3);
+    assert_eq!(clock.offset, 40.0);
+    assert_eq!(clock.repaint_after(), Some(TAPE_FRAME));
+    assert!(TAPE_FRAME >= std::time::Duration::from_millis(33));
+    clock.step(2.0, true, false, 3);
+    clock.step(20.0, true, false, 3);
+    assert_eq!(clock.offset, 40.0);
+    assert!(clock.repaint_after().is_none());
+    clock.step(21.0, false, false, 3);
+    clock.step(22.0, false, false, 3);
+    assert_eq!(clock.offset, 80.0, "unhover must not catch up paused time");
+    clock.step(30.0, false, true, 3);
+    clock.step(37.999, false, true, 3);
+    assert_eq!(clock.index, 0);
+    clock.step(38.0, false, true, 3);
+    assert_eq!(clock.index, 1);
+    assert_eq!(clock.offset, 80.0);
+    assert_eq!(clock.repaint_after(), Some(std::time::Duration::from_secs(8)));
+    clock.step(54.0, false, true, 3);
+    assert_eq!(clock.index, 0);
+}
+
+#[test]
+fn n7b_old_json_defaults_and_preset_flags_roundtrip() {
+    for raw in [r#"{}"#, r#"{"symbol":null,"filters":{},"display":{}}"#, r#""ACME US Equity""#] {
+        let settings: crate::layouts::NewsSettings = serde_json::from_str(raw).unwrap();
+        assert!(!settings.flash_high);
+    }
+    let prefs: crate::prefs::Prefs = serde_json::from_str("{}").unwrap();
+    assert!(!prefs.headline_tape);
+    assert!(!prefs.reduce_motion);
+    let settings: crate::layouts::NewsSettings = serde_json::from_str(r#"{"flash_high":true}"#).unwrap();
+    let kind = super::super::PaneKind::from_settings(PaneSettings::News(Some(settings)));
+    let PaneSettings::News(Some(saved)) = kind.settings() else { panic!() };
+    assert!(saved.flash_high);
+    let mut prefs = prefs;
+    prefs.headline_tape = true;
+    prefs.reduce_motion = true;
+    assert_eq!(serde_json::from_str::<crate::prefs::Prefs>(&serde_json::to_string(&prefs).unwrap()).unwrap(), prefs);
+    assert!(
+        super::super::palette_view::static_items()
+            .iter()
+            .any(|i| i.title == "Headline tape" && i.target == crate::palette::Target::HeadlineTape)
+    );
+}
+
+#[test]
+fn n7b_tape_routes_to_most_recent_news_activates_tab_and_retains_filtered_selection() {
+    use super::super::{PaneKind, TerminalApp};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/n7b-routing");
+    let mut app = TerminalApp::test_workspace(&root);
+    let story = Cluster::wire(&n7_story("pick", "Acme raises guidance", 100_000));
+    assert_eq!(app.route_tape_story(&story).as_deref(), Some("https://example.test/pick"));
+    let mut unsafe_story = story.clone();
+    unsafe_story.lead.item.link = "javascript:alert(1)".into();
+    assert!(app.route_tape_story(&unsafe_story).is_none());
+    let first = app.new_pane(PaneKind::News(Box::new(NewsPane::new(None))));
+    let mut recent = NewsPane::new(None);
+    recent.last_focused = Some(std::time::Instant::now());
+    recent.filters.search = "not-matching".into();
+    let second = app.new_pane(PaneKind::News(Box::new(recent)));
+    let other = app.new_pane(PaneKind::Help);
+    app.dock = crate::dock::Node::Tabs { panes: vec![first, second, other], active: 2 };
+    app.focus = other;
+    assert!(app.route_tape_story(&story).is_none());
+    assert_eq!(app.focus, second);
+    assert_eq!(app.dock.visible(), vec![second]);
+    let PaneKind::News(n) = &mut app.panes[1].kind else { panic!() };
+    assert_eq!(n.interaction.selected.as_deref(), Some("pick"));
+    assert_eq!(n.filters.search, "not-matching");
+    let mut cache = RowCache::default();
+    cache.update(n, &[], &[], 100_000);
+    assert!(cache.rows.is_empty());
+    assert_eq!(n.interaction.selected.as_deref(), Some("pick"));
+    assert!(n.items.iter().any(|s| s.id == "pick"));
+    app.focus = first;
+    app.route_tape_story(&story);
+    assert_eq!(app.focus, first);
+}
+
+#[test]
+fn n7b_flash_ui_narrow_hidden_click_selects_and_cross_dismisses() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.flash_high = true;
+    pane.items = vec![n7_story("flash", "Acme raises guidance", chrono::Utc::now().timestamp())];
+    let (narrow, _) = ui_frame(&ctx, &mut pane, 340.0, vec![], true);
+    assert!(!text_shapes(&narrow).iter().any(|(s, _)| s == "FLASH"));
+    let (wide, _) = ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    let badge = text_shapes(&wide).iter().find(|(s, _)| s == "FLASH").unwrap().1 + egui::vec2(3.0, 3.0);
+    let output = click_at(&ctx, &mut pane, badge);
+    assert_eq!(pane.interaction.selected.as_deref(), Some("flash"));
+    assert!(output.platform_output.commands.iter().all(|c| !matches!(c, egui::OutputCommand::OpenUrl(_))));
+    let cross = text_shapes(&output).iter().find(|(s, _)| s == "×").unwrap().1 + egui::vec2(3.0, 3.0);
+    click_at(&ctx, &mut pane, cross);
+    let (after, _) = ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    assert!(!text_shapes(&after).iter().any(|(s, _)| s == "FLASH"));
+}
+
+#[test]
+fn n7b_tape_ui_placeholder_cache_expiry_and_no_requests() {
+    use super::super::{PaneKind, TerminalApp};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/n7b-tape");
+    let (worker, mut requests) = crate::worker::Worker::recording();
+    let mut app = TerminalApp::isolated_workspace(&root, worker);
+    app.prefs.headline_tape = true;
+    app.prefs.reduce_motion = true;
+    let ctx = egui::Context::default();
+    let frame = |app: &mut TerminalApp, time| {
+        let mut height = -1.0;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(time),
+                focused: false,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))),
+                ..Default::default()
+            },
+            |ui| {
+                height = app.show_headline_tape(ui, ui.max_rect());
+            },
+        );
+        output.append(ctx.run_ui(egui::RawInput { time: Some(time), focused: false, ..Default::default() }, |ui| {
+            height = app.show_headline_tape(ui, ui.max_rect());
+        }));
+        output.textures_delta.clear();
+        (height, output)
+    };
+    let (height, output) = frame(&mut app, 0.0);
+    assert_eq!(height, dp(24.0));
+    assert!(text_shapes(&output).iter().any(|(s, _)| s == "No headlines in the last 2 hours"));
+    let mut news = NewsPane::new(None);
+    news.filters.scope = Scope::All;
+    let now = chrono::Utc::now().timestamp();
+    news.items = vec![n7_story("tape", "Acme raises guidance", now - 10)];
+    let id = app.new_pane(PaneKind::News(Box::new(news)));
+    let (height, output) = frame(&mut app, 1.0);
+    assert_eq!(height, dp(24.0));
+    assert!(text_shapes(&output).iter().any(|(s, _)| s.contains("Acme raises guidance")));
+    let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+    assert!(delay >= TAPE_FRAME && delay <= std::time::Duration::from_secs(8));
+    let galley = app.headline_tape.galleys[0].clone();
+    frame(&mut app, 2.0);
+    assert!(std::sync::Arc::ptr_eq(&galley, &app.headline_tape.galleys[0]), "settled frames reuse text layout");
+    let index = app.idx(id).unwrap();
+    let PaneKind::News(n) = &mut app.panes[index].kind else { panic!() };
+    n.filters.scope = Scope::Symbol;
+    let mut fresh_tape = Tape::default();
+    fresh_tape.update(&app.panes, &[], now);
+    assert!(fresh_tape.items.is_empty(), "symbol caches are not market caches");
+    assert_eq!(frame(&mut app, 2.5).0, dp(24.0), "already cached market items survive scope changes");
+    app.panes.clear();
+    assert_eq!(frame(&mut app, 2.75).0, dp(24.0), "closing the last News pane retains the app-level tape");
+    let cached = app.headline_tape.items[0].clone();
+    assert_eq!(app.route_tape_story(&cached).as_deref(), Some("https://example.test/tape"));
+    app.headline_tape.update(&app.panes, &[], now + TAPE_SECONDS);
+    assert!(app.headline_tape.items.is_empty());
+    assert_eq!(frame(&mut app, 3.0).0, dp(24.0), "expired tape retains a visible placeholder");
+    // Worker data alone populates the tape without any News pane, high priority,
+    // or keyword watches. Replacing it rebuilds galleys AND measured offsets.
+    app.headline_tape.receive_market(vec![n7_story("ordinary", "Routine weather bulletin", now - 1)]);
+    let (_, output) = frame(&mut app, 4.0);
+    assert!(text_shapes(&output).iter().any(|(s, _)| s.contains("Routine weather bulletin")));
+    let galley = app.headline_tape.galleys[0].clone();
+    let offsets = app.headline_tape.offsets.clone();
+    app.headline_tape.receive_market(vec![n7_story(
+        "changed",
+        "Unscheduled observatory bulletin from northern facilities",
+        now,
+    )]);
+    let (_, output) = frame(&mut app, 5.0);
+    assert!(!std::sync::Arc::ptr_eq(&galley, &app.headline_tape.galleys[0]));
+    assert_ne!(offsets, app.headline_tape.offsets);
+    assert!(text_shapes(&output).iter().any(|(s, _)| s.contains("Unscheduled observatory")));
+    assert!(requests.try_recv().is_err(), "drawing strips must never fetch or subscribe");
+}
+
 #[test]
 fn n6b_keyword_chip_reducer_adds_without_enabling_and_legacy_json_loads() {
     let mut pane = visible_pane();
@@ -1469,7 +1867,7 @@ fn click_at(ctx: &egui::Context, pane: &mut NewsPane, position: egui::Pos2) -> e
     .0
 }
 #[test]
-fn row_body_expands_but_headline_opens_a_safe_link() {
+fn row_body_expands_headline_selects_and_enter_opens_a_safe_link() {
     let ctx = egui::Context::default();
     let mut pane = visible_pane();
     let title = pane.items[0].item.title.clone();
@@ -1480,19 +1878,26 @@ fn row_body_expands_but_headline_opens_a_safe_link() {
     assert!(pane.interaction.expanded.contains(&id));
     assert!(pane.items.iter().find(|s| s.id == id).unwrap().seen);
     let position = text_shapes(&body).into_iter().find(|(text, _)| text == &title).unwrap().1 + egui::vec2(8.0, 5.0);
-    let opened = click_at(&ctx, &mut pane, position);
+    pane.interaction.selected = None;
+    let clicked = click_at(&ctx, &mut pane, position);
+    let opens =
+        |o: &egui::FullOutput| o.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(_)));
+    assert!(!opens(&clicked), "a headline click selects; it must not open the browser");
+    assert_eq!(pane.interaction.selected.as_ref(), Some(&id));
+    assert!(pane.interaction.expanded.contains(&id), "title clicks must not also toggle the row body");
+    let (entered, _) = ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Enter), true);
     assert!(
-        opened
+        entered
             .platform_output
             .commands
             .iter()
-            .any(|c| matches!(c,egui::OutputCommand::OpenUrl(url) if url.url.starts_with("https://example.test/")))
+            .any(|c| matches!(c, egui::OutputCommand::OpenUrl(url) if url.url.starts_with("https://example.test/")))
     );
-    assert!(pane.interaction.expanded.contains(&id), "title clicks must not also toggle the row body");
     pane.items.iter_mut().find(|s| s.id == id).unwrap().item.link = "javascript:alert(1)".into();
     pane.item_revision += 1;
-    let unsafe_open = click_at(&ctx, &mut pane, position);
-    assert!(!unsafe_open.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(_))));
+    ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    let (unsafe_open, _) = ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Enter), true);
+    assert!(!opens(&unsafe_open));
 }
 #[test]
 fn paused_pane_exposes_new_count_show_action_without_a_footer() {
