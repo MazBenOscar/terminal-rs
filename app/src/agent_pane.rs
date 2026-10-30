@@ -1287,7 +1287,11 @@ impl AgentPane {
                         agent_markdown::wrapped(ui, &self.turn_reply_text(index), theme::text());
                     });
                 }
-                continue;
+                // Only the untrusted prompt and model reply fold away: tool traces and
+                // host notices (e.g. isolation tripwires) always stay visible.
+                if matches!(self.blocks[i], RenderedBlock::Prompt(_) | RenderedBlock::Reply(_)) {
+                    continue;
+                }
             }
             match &self.blocks[i] {
                 RenderedBlock::Prompt(text) => {
@@ -4372,6 +4376,24 @@ mod polish_tests {
                 matches!(pane.blocks.last(), Some(RenderedBlock::Notice(s)) if s == "Chart edits on restart. Queue stays paused; nothing is resent.")
             );
         }
+    }
+
+    #[test]
+    fn story_analysis_turn_never_hides_host_notices() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("empty-ready").unwrap(), 1);
+        pane.start_prompt(Prompt {
+            id: PromptId::story("Fixture headline"),
+            text: "Analyze <STORY_DATA>{}</STORY_DATA>".into(),
+            requires_tools: false,
+        })
+        .unwrap();
+        pane.notice("Agent stopped for safety — fixture tripwire");
+        let output = render(&ctx, dp(900.0), vec![], |ui| pane.conversation(ui, &mut Vec::new()));
+        let text = texts(&output);
+        assert!(text.iter().any(|(s, _)| s.contains("fixture tripwire")), "{text:?}");
+        assert!(!text.iter().any(|(s, _)| s.contains("STORY_DATA")));
     }
 
     #[test]
