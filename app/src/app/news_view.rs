@@ -552,7 +552,7 @@ fn hover_card(title: &egui::Response, story: &Cluster, model: &RowModel) {
         {
             ui.add_space(dp(2.0));
             ui.label(
-                RichText::new(format!("{} · click to open", host.trim_start_matches("www.")))
+                RichText::new(format!("{} · Enter to open", host.trim_start_matches("www.")))
                     .font(ui_font(10.5))
                     .color(theme::muted()),
             );
@@ -1696,8 +1696,8 @@ pub(super) fn show(
                 },
             )
             .inner;
+        // A click selects (the Story pane follows); Enter or an Open button opens the source.
         if title.clicked() {
-            open(ui, story);
             mark_seen(n, story);
             child_clicked = true;
         }

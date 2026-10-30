@@ -1867,7 +1867,7 @@ fn click_at(ctx: &egui::Context, pane: &mut NewsPane, position: egui::Pos2) -> e
     .0
 }
 #[test]
-fn row_body_expands_but_headline_opens_a_safe_link() {
+fn row_body_expands_headline_selects_and_enter_opens_a_safe_link() {
     let ctx = egui::Context::default();
     let mut pane = visible_pane();
     let title = pane.items[0].item.title.clone();
@@ -1878,19 +1878,26 @@ fn row_body_expands_but_headline_opens_a_safe_link() {
     assert!(pane.interaction.expanded.contains(&id));
     assert!(pane.items.iter().find(|s| s.id == id).unwrap().seen);
     let position = text_shapes(&body).into_iter().find(|(text, _)| text == &title).unwrap().1 + egui::vec2(8.0, 5.0);
-    let opened = click_at(&ctx, &mut pane, position);
+    pane.interaction.selected = None;
+    let clicked = click_at(&ctx, &mut pane, position);
+    let opens =
+        |o: &egui::FullOutput| o.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(_)));
+    assert!(!opens(&clicked), "a headline click selects; it must not open the browser");
+    assert_eq!(pane.interaction.selected.as_ref(), Some(&id));
+    assert!(pane.interaction.expanded.contains(&id), "title clicks must not also toggle the row body");
+    let (entered, _) = ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Enter), true);
     assert!(
-        opened
+        entered
             .platform_output
             .commands
             .iter()
-            .any(|c| matches!(c,egui::OutputCommand::OpenUrl(url) if url.url.starts_with("https://example.test/")))
+            .any(|c| matches!(c, egui::OutputCommand::OpenUrl(url) if url.url.starts_with("https://example.test/")))
     );
-    assert!(pane.interaction.expanded.contains(&id), "title clicks must not also toggle the row body");
     pane.items.iter_mut().find(|s| s.id == id).unwrap().item.link = "javascript:alert(1)".into();
     pane.item_revision += 1;
-    let unsafe_open = click_at(&ctx, &mut pane, position);
-    assert!(!unsafe_open.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(_))));
+    ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    let (unsafe_open, _) = ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Enter), true);
+    assert!(!opens(&unsafe_open));
 }
 #[test]
 fn paused_pane_exposes_new_count_show_action_without_a_footer() {
