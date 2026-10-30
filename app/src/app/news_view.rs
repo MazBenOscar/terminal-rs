@@ -87,6 +87,9 @@ struct CachedRow {
     height: f32,
 }
 impl RowCache {
+    pub(super) fn selected(&self, id: &str) -> Option<&Cluster> {
+        self.rows.iter().find(|r| r.story.member_ids.iter().any(|m| m == id)).map(|r| &r.story)
+    }
     fn update(&mut self, n: &mut NewsPane, watches: &[KeywordWatch], watched: &[String], now: i64) {
         let symbols = n.query.as_ref().map(|q| q.symbols.as_slice()).unwrap_or_default();
         if self.key.as_ref().is_some_and(|k| {
@@ -498,7 +501,7 @@ fn mark_seen(n: &mut NewsPane, story: &Cluster) {
     }
     n.seen_queue = queued.into_iter().collect();
 }
-fn toggle_saved(n: &mut NewsPane, story: &Cluster) {
+pub(super) fn toggle_saved(n: &mut NewsPane, story: &Cluster) {
     let saved = !story.members.iter().any(|member| member.bookmark);
     for item in n.items.iter_mut().chain(&mut n.pending) {
         if story.member_ids.contains(&item.id) {
@@ -805,7 +808,7 @@ fn toggle_category(categories: &mut Vec<String>, category: &str, multi: bool) {
         categories.push(category.into());
     }
 }
-fn category_code(category: &str) -> &'static str {
+pub(super) fn category_code(category: &str) -> &'static str {
     match tr_data::news_store::category_key(category) {
         "markets" => "MKT",
         "macro" => "MACRO",
@@ -1783,6 +1786,11 @@ pub(super) fn show(
                     });
                 });
             });
+        }
+        // N7a: pointer selection publishes the same stable id as keyboard selection.
+        if response.clicked() || child_clicked {
+            n.interaction.selected = Some(model.id.clone());
+            n.interaction.dwell = Some((model.id.clone(), std::time::Instant::now()));
         }
         let height = (ui.next_widget_position().y - start).max(dp(22.0));
         if top.is_none() && start + height > ui.clip_rect().top() {

@@ -663,6 +663,33 @@ pub(super) async fn bookmark(s: &Arc<Shared>, ids: Vec<String>, saved: bool) {
         publish(s).await;
     }
 }
+pub(super) async fn story_details(s: &Arc<Shared>, story: tr_data::news_intelligence::Cluster) {
+    let id = story.lead.id.clone();
+    let result = blocking(s, move |s| -> anyhow::Result<_> {
+        let guard = s.news.store.blocking_lock();
+        let store = guard.as_ref().ok_or_else(|| anyhow::anyhow!("News store unavailable"))?;
+        let mut ids = vec![story.lead.id.clone()];
+        ids.extend(story.member_ids.iter().filter(|id| **id != story.lead.id).cloned());
+        Ok((store.story_analysis(&ids)?, store.related_stories(&story, chrono::Utc::now().timestamp())?))
+    })
+    .await
+    .and_then(|r| r)
+    .map_err(|e| e.to_string());
+    s.send(Response::StoryDetails { id, result });
+}
+pub(super) async fn save_analysis(s: &Arc<Shared>, analysis: tr_data::news_store::StoryAnalysis) {
+    let result = blocking(s, move |s| -> anyhow::Result<()> {
+        s.news
+            .store
+            .blocking_lock()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("News store unavailable"))?
+            .save_story_analysis(&analysis)
+    })
+    .await
+    .and_then(|r| r);
+    s.send(Response::StoryAnalysisSaved { error: result.err().map(|e| e.to_string()) });
+}
 pub(super) async fn refresh(s: &Arc<Shared>, view: View) {
     read(s, view.clone()).await;
     source_status(

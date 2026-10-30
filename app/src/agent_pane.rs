@@ -478,7 +478,7 @@ pub struct AgentPane {
     reply_cache: HashMap<usize, Vec<agent_markdown::DisplayBlock>>,
     limits_value: Value,
     coalescer: Coalescer,
-    queue_paused: bool,
+    pub(crate) queue_paused: bool,
     retryable: bool,
     checking_status: Option<String>,
     notice_levels: HashMap<usize, Severity>,
@@ -795,6 +795,15 @@ impl AgentPane {
         Some(prompt)
     }
 
+    /// Original plain reply text for a completed host-requested turn, not rendered Markdown.
+    pub(crate) fn turn_reply_text(&self, index: usize) -> String {
+        let Some(turn) = self.turns.get(index) else { return String::new() };
+        let end = self.turns.get(index + 1).map_or(self.blocks.len(), |t| t.prompt_index);
+        let mut replies: Vec<_> =
+            self.replies.values().filter(|r| r.index > turn.prompt_index && r.index < end).collect();
+        replies.sort_by_key(|r| r.index);
+        replies.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n")
+    }
     pub fn resume_queue(&mut self) {
         self.queue_paused = false;
     }

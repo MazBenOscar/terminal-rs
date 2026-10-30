@@ -28,6 +28,7 @@ pub mod chart_view;
 mod chart_workflow;
 mod command;
 mod congress_view;
+mod dashboards;
 mod dock;
 pub mod drawing_history;
 mod drawing_paint;

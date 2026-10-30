@@ -158,6 +158,10 @@ pub enum PaneSettings {
     Search(String),
     /// Headlines for a security (`None` = general market news).
     News(Option<NewsSettings>),
+    Story {
+        #[serde(default = "yes")]
+        link_follow: bool,
+    },
     // N2: serde defaults keep existing layouts valid.
     Filings(crate::filings_view::Settings),
     OrderBook {

@@ -20,13 +20,14 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 17] = [
+pub const PANELS: [(&str, &str); 18] = [
     // N2
     ("Filings", "CF"),
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("Scanner", "SCAN"),
     ("News", "NEWS"),
+    ("Story", "STORY"),
     ("Order Book", "BOOK"),
     ("Options", "OMON"),
     ("Portfolio", "PORT"),
@@ -778,6 +779,7 @@ impl TerminalApp {
                 current.as_deref().unwrap_or("AAPL US Equity"),
                 d,
             )),
+            "STORY" => PaneKind::Story { link_follow: true },
             "WL" | "WATCHLIST" | "W" => PaneKind::Watchlist,
             "SCAN" | "SCANNER" | "EASYSCAN" => PaneKind::Scanner(Box::default()),
             "NEWS" | "N" | "CN" | "TOP" => PaneKind::News(Box::new(NewsPane::new(current))),
@@ -898,6 +900,8 @@ impl TerminalApp {
     pub(super) fn apply_doc(&mut self, mut doc: LayoutDoc) {
         // Layout documents retain provenance, but never the in-memory inverse edits.
         self.agent_turns.clear();
+        self.story_desk.reset_workspace();
+        self.agent_pane_owner = None;
         self.agent_pane.workflows.reset();
         self.agent_pane.workflows.undo.clear();
         doc.repair();
@@ -986,6 +990,29 @@ impl TerminalApp {
         if let Ok(bytes) = std::fs::read(&path) {
             self.saves.written.insert(path, bytes);
         }
+    }
+
+    pub(super) fn open_dashboard(&mut self, id: &str) {
+        let Some(dashboard) = crate::dashboards::ALL
+            .iter()
+            .find(|d| d.id.eq_ignore_ascii_case(id.trim()) || d.name.eq_ignore_ascii_case(id.trim()))
+        else {
+            self.status = format!("Unknown dashboard {id:?}");
+            return;
+        };
+        // Save current edits to their existing name, then instantiate a fresh template.
+        self.save_layout();
+        let mut doc = (dashboard.build)(&self.prefs.panels);
+        doc.name = self.store.unique_name(dashboard.name);
+        // Save before switching: a failed new-workspace write leaves the desk intact.
+        if let Err(error) = self.store.save(&doc) {
+            self.status = format!("Dashboard: {error:#}");
+            return;
+        }
+        self.apply_doc(doc);
+        self.save_layout();
+        self.save_settings();
+        self.status = format!("New workspace {:?}", self.layout_name);
     }
 
     pub(super) fn save_layout(&mut self) {
@@ -1170,6 +1197,7 @@ impl TerminalApp {
     // ---- drawing the dock ----------------------------------------------------------------
 
     pub(super) fn render_dock(&mut self, ui: &mut Ui, area: Rect, gap: f32) -> Vec<Action> {
+        self.note_story_focus();
         let mut actions = Vec::new();
         let mut cmds = Vec::new();
         if self.dock.is_empty() {
@@ -1213,6 +1241,7 @@ impl TerminalApp {
         }
         self.drag_and_drop(ui, area, &groups);
         self.apply_group_cmds(cmds);
+        self.note_story_focus();
         actions
     }
 
@@ -1820,6 +1849,35 @@ mod tests {
         app.close_pane(first);
         assert_eq!(app.agent_chart_uid(ChartTarget::Pinned), app.peek_chart().map(|c| c.uid));
         assert_ne!(app.agent_chart_uid(ChartTarget::Pinned), Some(uid));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn news_dashboard_opens_pristine_unique_workspace_without_replacing_current() {
+        let (mut app, root) = fixture("n7-dashboard");
+        let chart = app
+            .new_pane(PaneKind::from_settings(crate::layouts::chart_settings("NVDA US Equity", &Default::default())));
+        app.dock_pane(chart, None, Zone::Right);
+        app.layout_name = "My working desk".into();
+        app.save_layout();
+        let original = app.store.load("My working desk").unwrap();
+        app.open_dashboard("NEWS");
+        assert_eq!(app.layout_name, "News desk");
+        assert_eq!(app.store.load("My working desk").unwrap(), original);
+        assert_eq!(app.panes.len(), 3);
+        assert!(app.panes.iter().all(|p| p.link == Some(Link::Orange)));
+        // An edited first copy must not contaminate the next pristine template.
+        let first = app.panes.iter().find(|p| matches!(p.kind, PaneKind::Chart(_))).unwrap().id;
+        app.broadcast(Link::Orange, "AAPL US Equity", None);
+        assert_eq!(app.panes.iter().find(|p| p.id == first).unwrap().kind.symbol(), Some("AAPL US Equity"));
+        app.open_dashboard("News desk");
+        assert_eq!(app.layout_name, "News desk 2");
+        assert_eq!(app.store.load("My working desk").unwrap(), original);
+        assert!(app.store.load("News desk").unwrap().panes.iter().any(
+            |p| matches!(&p.settings, crate::layouts::PaneSettings::Chart { symbol, .. } if symbol == "AAPL US Equity")
+        ));
+        assert!(app.panes.iter().any(|p| p.kind.symbol() == Some("SPY US Equity")));
+        assert!(app.store.load("News desk 2").is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
 

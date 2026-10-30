@@ -100,6 +100,10 @@ pub fn muted() -> Color32 {
 pub fn amber() -> Color32 {
     palette().amber
 }
+/// Warning emphasis uses the theme's amber role (there is no separate palette slot).
+pub fn warn() -> Color32 {
+    amber()
+}
 pub fn amber_dim() -> Color32 {
     palette().amber_dim
 }

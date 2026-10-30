@@ -135,7 +135,7 @@ impl TerminalApp {
                 data,
                 AppExecutor::new(self),
                 pin,
-                self.agent_config.allow_external_edits,
+                self.agent_config.allow_external_edits && !self.story_desk.read_only,
             ) {
                 Ok(server) => self.external_agent = Some(server),
                 Err(error) => {
@@ -173,6 +173,12 @@ impl TerminalApp {
         Ok(vec![])
     }
     fn first_agent(&self) -> Option<PaneId> {
+        if let Some(id) = self
+            .agent_pane_owner
+            .filter(|id| self.panes.iter().any(|p| p.id == *id && matches!(p.kind, PaneKind::Agent(_))))
+        {
+            return Some(id);
+        }
         self.panes.iter().find(|p| matches!(p.kind, PaneKind::Agent(_))).map(|p| p.id)
     }
 
@@ -933,6 +939,8 @@ impl TerminalApp {
             .collect();
         self.agent_pane.refresh_drawing_visibility(&charts);
         self.refresh_agent_undo();
+        self.collect_story_analysis();
+        self.prepare_story_agent(ctx);
         self.send_next_agent_prompt();
     }
 
@@ -990,6 +998,7 @@ impl TerminalApp {
         for action in actions {
             self.agent_action(ui.ctx(), id, action);
         }
+        self.prepare_story_agent(ui.ctx());
         self.send_next_agent_prompt();
     }
 
@@ -1004,7 +1013,8 @@ impl TerminalApp {
         let Some(tools) = self.agent_pane.prepare_session_start() else { return };
         // Codex's per-pane preset is not mimo's policy: its tools are served by
         // the external socket. Keep the instructions/schema aligned with it.
-        let tools = self.agent_config.session_tools(tools);
+        let tools = self.story_desk.effective_tools(self.agent_config.session_tools(tools));
+        self.agent_pane.session_tools = Some(tools);
         self.agent_pane.workflows.reset();
         self.agent_pane.session = None;
         self.agent_pane.session = Some(Session::start(
@@ -1099,6 +1109,12 @@ impl TerminalApp {
             Action::Retry => {
                 self.agent_pane.transition(Onboarding::Ready);
                 if let Some(prompt) = self.agent_pane.last_prompt.clone()
+                    && self.story_desk.queued_read_only(&prompt)
+                {
+                    self.agent_pane.enqueue(prompt);
+                    return;
+                }
+                if let Some(prompt) = self.agent_pane.last_prompt.clone()
                     && let Some(prompt) = self.agent_pane.start_prompt(prompt)
                 {
                     self.send_agent_prompt(prompt);
@@ -1141,7 +1157,39 @@ impl TerminalApp {
         }
     }
 
+    /// Analysis uses a fresh read-only session, not a natural-language promise.
+    /// Session inventories are immutable in both backends; restart at an idle
+    /// queue boundary and leave the user's saved tools mode untouched.
+    fn prepare_story_agent(&mut self, ctx: &egui::Context) {
+        if self.agent_pane.running {
+            return;
+        }
+        let desired = self.agent_pane.queue.front().is_some_and(|p| self.story_desk.queued_read_only(p));
+        let registry_mismatch = desired
+            && self.agent_pane.session.is_some()
+            && self.agent_pane.session_tools != Some(tr_agent_tools::ToolSet::ReadOnly);
+        if desired == self.story_desk.read_only && !registry_mismatch {
+            return;
+        }
+        self.story_desk.read_only = desired;
+        // mimo serves tools through the external listener. Replace that registry
+        // too; old accepted peers and queued calls are cancelled on drop.
+        self.external_agent = None;
+        self.external_attempted = false;
+        self.external_agent_logic();
+        if self.agent_pane.session.is_some() && self.agent_pane.state == Onboarding::Ready {
+            let paused = self.agent_pane.queue_paused;
+            self.start_agent_session(ctx);
+            self.agent_pane.queue_paused = paused;
+        }
+    }
+
     fn send_next_agent_prompt(&mut self) {
+        if self.agent_pane.queue.front().is_some_and(|p| self.story_desk.queued_read_only(p))
+            && (!self.story_desk.read_only || self.agent_pane.session_tools != Some(tr_agent_tools::ToolSet::ReadOnly))
+        {
+            return;
+        }
         if self.agent_pane.session.is_none() || self.agent_pane.models.is_empty() {
             return;
         }
@@ -1179,6 +1227,7 @@ impl TerminalApp {
             .iter()
             .find(|m| m.id == *self.agent_pane.settings.model(self.agent_pane.backend))
             .map_or_else(|| self.agent_pane.settings.model(self.agent_pane.backend).clone(), |m| m.model.clone());
+        self.story_prompt_started(&prompt, &model);
         let workflow_context = std::mem::take(&mut self.agent_pane.workflows.context);
         self.agent_command(Command::Turn(Box::new(BridgeTurn {
             input: TurnInput {

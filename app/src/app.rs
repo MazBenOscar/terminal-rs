@@ -121,6 +121,9 @@ pub enum PaneKind {
         query: String,
     },
     News(Box<NewsPane>),
+    Story {
+        link_follow: bool,
+    },
     // N2
     Filings(crate::filings_view::Settings),
     OrderBook(Box<BookPane>),
@@ -188,6 +191,7 @@ impl OptionsPane {
 
 // N1b
 pub(crate) mod news_view;
+mod story_view;
 fn accept_news_delivery(last: &mut u64, delivery: u64) -> bool {
     if delivery <= *last {
         return false;
@@ -379,6 +383,7 @@ impl PaneKind {
             PaneKind::Portfolio(p) => p.title(),
             PaneKind::Settings => "Settings".into(),
             PaneKind::Agent(_) => "Agent".into(),
+            PaneKind::Story { .. } => "Story".into(),
         }
     }
 
@@ -396,6 +401,7 @@ impl PaneKind {
             PaneKind::Curve => "GC",
             PaneKind::Search { .. } => "SECF",
             PaneKind::News(_) => "CN",
+            PaneKind::Story { .. } => "STORY",
             // N2
             PaneKind::Filings(_) => "CF",
             PaneKind::OrderBook(_) => "OB",
@@ -492,6 +498,7 @@ impl PaneKind {
             }
             PaneKind::Settings => PaneSettings::Settings,
             PaneKind::Agent(settings) => PaneSettings::Agent(settings.clone()),
+            PaneKind::Story { link_follow } => PaneSettings::Story { link_follow: *link_follow },
             PaneKind::Options(o) => {
                 PaneSettings::Options { symbol: o.symbol.clone(), strikes: o.strikes, greeks: o.show_greeks }
             }
@@ -583,6 +590,7 @@ impl PaneKind {
                 PaneKind::Options(Box::new(OptionsPane::new(&symbol, strikes, greeks)))
             }
             PaneSettings::Agent(settings) => PaneKind::Agent(settings),
+            PaneSettings::Story { link_follow } => PaneKind::Story { link_follow },
             PaneSettings::Portfolio { view, account, symbol, sort, open_only } => {
                 PaneKind::Portfolio(Box::new(broker::PortfolioPane { view, account, symbol, sort, open_only }))
             }
@@ -929,6 +937,8 @@ pub struct TerminalApp {
     pub agent_queue: crate::agent_queue::AgentToolQueue,
     pub pinned_agent_chart: Option<u64>,
     pub(crate) agent_pane: crate::agent_pane::AgentPane,
+    story_desk: story_view::Desk,
+    agent_pane_owner: Option<PaneId>,
     agent_config: crate::agent_mcp::Settings,
     external_agent: Option<crate::agent_mcp::ExternalServer>,
     external_attempted: bool,
@@ -1189,6 +1199,8 @@ impl TerminalApp {
             agent_queue: crate::agent_queue::AgentToolQueue::new(ctx.clone()),
             pinned_agent_chart: None,
             agent_pane: crate::agent_pane::AgentPane::default(),
+            story_desk: Default::default(),
+            agent_pane_owner: None,
             agent_config: Default::default(),
             external_agent: None,
             external_attempted: false,
@@ -1987,6 +1999,8 @@ impl TerminalApp {
                 self.set_link(focus, link);
             }
             Function::News => self.open_panel(PaneKind::News(Box::new(NewsPane::new(self.focused_symbol())))),
+            Function::Story => self.open_panel(PaneKind::Story { link_follow: true }),
+            Function::Dashboard(id) => self.open_dashboard(&id),
             // N2
             Function::Filings => {
                 self.open_panel(PaneKind::Filings(crate::filings_view::Settings::new(self.focused_symbol())))
@@ -2498,6 +2512,12 @@ impl TerminalApp {
                         if let PaneKind::News(n) = &mut pane.kind {
                             n.bookmark_reply(&ids, saved, error.as_deref());
                         }
+                    }
+                }
+                Response::StoryDetails { id, result } => self.story_details_reply(id, result),
+                Response::StoryAnalysisSaved { error } => {
+                    if let Some(error) = error {
+                        self.status = format!("Analysis cache: {error}");
                     }
                 }
                 Response::DigestText { pane, text } => match text {
@@ -3591,6 +3611,8 @@ impl TerminalApp {
             agent_queue: crate::agent_queue::AgentToolQueue::new(egui::Context::default()),
             pinned_agent_chart: None,
             agent_pane: crate::agent_pane::AgentPane::default(),
+            story_desk: Default::default(),
+            agent_pane_owner: None,
             agent_config: Default::default(),
             external_agent: None,
             external_attempted: false,

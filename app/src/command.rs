@@ -250,6 +250,8 @@ pub enum Function {
     Layout(String),
     /// List saved layouts.
     Layouts,
+    Dashboard(String),
+    Story,
     /// Add a panel (`NEW NEWS`, `NEW BOOK BTCUSD`); empty adds a chart.
     NewPanel(String),
     /// Split the focused pane, adding a panel to the right (or below).
@@ -447,6 +449,8 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         },
         "LAYOUT" | "GRID" | "LP" => Function::Layout(joined()),
         "LAYOUTS" => Function::Layouts,
+        "DASH" => Function::Dashboard(joined()),
+        "STORY" => Function::Story,
         "NEW" | "ADD" => Function::NewPanel(joined()),
         "SPLIT" | "SPLITV" | "SPLITH" => {
             let w = words();
@@ -619,6 +623,8 @@ fn describe(f: &Function) -> String {
         Function::Layout(l) if l.trim().is_empty() => "Saved layouts".into(),
         Function::Layout(l) => format!("Layout {l}"),
         Function::Layouts => "Saved layouts".into(),
+        Function::Dashboard(_) => "Open a dashboard as a new workspace".into(),
+        Function::Story => "Selected news story".into(),
         Function::NewPanel(p) if p.trim().is_empty() => "Add a chart pane".into(),
         Function::NewPanel(p) => format!("Add panel: {p}"),
         Function::Split { down, panel } => {
