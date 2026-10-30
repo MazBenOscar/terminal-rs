@@ -24,6 +24,7 @@ pub(super) struct Service {
     pub key: Mutex<Option<String>>,
     pub memory_only: Mutex<bool>,
     published: Mutex<Vec<Published>>,
+    tape_published: Mutex<Option<Vec<Story>>>,
     pub local: Mutex<LocalState>,
 }
 /// All N4 reads are local. This service has no provider/guard handle and adds no
@@ -780,7 +781,30 @@ fn read_view_blocking(s: &Shared, view: View, force: bool) {
         s.send(Response::NewsStatus { view, status, updated });
     }
 }
+/// Publish a bounded local market snapshot independently of open panes. This
+/// never adds a provider interest, refresh, or network request.
+async fn publish_tape(s: &Arc<Shared>) {
+    let _ = blocking(s, |s| {
+        let now = chrono::Utc::now().timestamp();
+        let query = Query {
+            filters: Filters { scope: tr_data::news_store::Scope::All, ..Default::default() },
+            start: now - 2 * 3600 + 1,
+            end: now,
+            limit: tr_data::news_intelligence::MAX_ITEMS,
+            ..Default::default()
+        };
+        let store = s.news.store.blocking_lock();
+        let Some(items) = store.as_ref().and_then(|store| store.query(&query).ok()) else { return };
+        let mut old = s.news.tape_published.blocking_lock();
+        if old.as_ref() != Some(&items) {
+            *old = Some(items.clone());
+            s.send(Response::HeadlineTape(items));
+        }
+    })
+    .await;
+}
 pub(super) async fn publish(s: &Arc<Shared>) {
+    publish_tape(s).await;
     let views = s.news.views.lock().await.clone();
     for view in views {
         read_view(s, view, false).await;
@@ -1104,6 +1128,7 @@ pub(super) async fn run(s: Arc<Shared>) {
                 tracing::warn!("RSS feeds unavailable: {message}");
             }
         }
+        publish_tape(&s).await;
         let views = s.news.views.lock().await.clone();
         if views.is_empty() {
             resolve_refreshes(&s, &refreshes, &served).await;
@@ -1930,6 +1955,30 @@ mod tests {
         assert!(rows.iter().all(|s| s.source == "CoinDesk" && s.category == "crypto"));
         store.insert(&fallback_items(vec![], Some("BTCUSD Curncy")), 1).unwrap();
         assert_eq!(store.query(&query).unwrap().len(), 5);
+    }
+    #[tokio::test]
+    async fn headline_tape_publishes_local_cache_without_views_and_only_on_change() {
+        let (s, rx) = fixture_shared();
+        let now = chrono::Utc::now().timestamp();
+        let item = n4_story("tape-local", now - 10, "Fixture");
+        let mut store = NewsStore::memory().unwrap();
+        store.insert(std::slice::from_ref(&item), now).unwrap();
+        *s.news.store.lock().await = Some(store);
+        assert!(s.news.views.lock().await.is_empty());
+        publish(&s).await;
+        let replies: Vec<_> = rx.try_iter().collect();
+        assert!(
+            replies
+                .iter()
+                .any(|r| matches!(r, Response::HeadlineTape(items) if items.len() == 1 && items[0].id == item.id))
+        );
+        publish(&s).await;
+        assert!(
+            !rx.try_iter().any(|r| matches!(r, Response::HeadlineTape(_))),
+            "unchanged cache must not churn UI layout"
+        );
+        assert!(s.news.views.lock().await.is_empty(), "no subscription or refresh may be created");
+        assert!(s.news.refresh.lock().await.is_empty());
     }
     #[tokio::test]
     async fn n5a_blocking_panic_returns_error_and_worker_remains_usable() {

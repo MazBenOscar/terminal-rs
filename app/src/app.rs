@@ -2514,6 +2514,7 @@ impl TerminalApp {
                         );
                     }
                 }
+                Response::HeadlineTape(items) => self.headline_tape.receive_market(items),
                 Response::NewsVolume { pane, volumes } => {
                     if let Some(PaneKind::News(n)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
                         n.interaction.volumes = volumes;

@@ -757,7 +757,8 @@ mod tests {
         let mut events = client.events();
         let mut pane = AgentPane::default();
         pane.transition(Onboarding::Ready);
-        pane.start_prompt(Prompt { text: "What's the trend?".into(), requires_tools: false }).unwrap();
+        pane.start_prompt(Prompt { id: Default::default(), text: "What's the trend?".into(), requires_tools: false })
+            .unwrap();
         let turn = client
             .send_turn(tr_agent::TurnInput { text: "What's the trend?".into(), ..Default::default() })
             .await

@@ -2051,12 +2051,18 @@ fn tape_items(items: &[tr_data::news_store::Story], watches: &[KeywordWatch], no
         unique.insert(story.id.clone(), story.clone());
     }
     let mut stories = intelligence::clusters(&unique.into_values().collect::<Vec<_>>());
-    stories.retain(|s| {
-        s.priority() >= intelligence::Priority::High
-            || s.members.iter().any(|s| watches.iter().any(|w| intelligence::watch_matches(s, &w.words)))
+    stories.sort_by(|a, b| {
+        tape_emphasized(b, watches)
+            .cmp(&tape_emphasized(a, watches))
+            .then(b.newest.cmp(&a.newest))
+            .then(a.lead.id.cmp(&b.lead.id))
     });
-    stories.sort_by(|a, b| b.newest.cmp(&a.newest).then(a.lead.id.cmp(&b.lead.id)));
+    stories.truncate(20);
     stories
+}
+fn tape_emphasized(story: &Cluster, watches: &[KeywordWatch]) -> bool {
+    story.priority() >= intelligence::Priority::High
+        || story.members.iter().any(|s| watches.iter().any(|w| intelligence::watch_matches(s, &w.words)))
 }
 
 fn tape_static_mode(preference: bool, os: bool, focused: bool) -> bool {
@@ -2101,6 +2107,7 @@ impl TapeClock {
 
 #[derive(Default)]
 pub(super) struct Tape {
+    dirty: bool,
     key: Vec<(crate::dock::PaneId, u64, usize, usize)>,
     watches: Vec<KeywordWatch>,
     items: Vec<Cluster>,
@@ -2114,6 +2121,12 @@ pub(super) struct Tape {
     offsets: Vec<f32>,
 }
 impl Tape {
+    pub(super) fn receive_market(&mut self, items: Vec<tr_data::news_store::Story>) {
+        if self.market_items != items {
+            self.market_items = items;
+            self.dirty = true;
+        }
+    }
     fn update(&mut self, panes: &[super::Pane], watches: &[KeywordWatch], now: i64) {
         // Only market-scope snapshots: symbol/watchlist news does not silently
         // turn into a market subscription when this preference is enabled.
@@ -2129,7 +2142,7 @@ impl Tape {
             })
         };
         let key: Vec<_> = market().map(|(id, n)| (id, n.item_revision, n.items.len(), n.pending.len())).collect();
-        if key == self.key && self.watches == watches && self.expiry.is_none_or(|at| now < at) {
+        if !self.dirty && key == self.key && self.watches == watches && self.expiry.is_none_or(|at| now < at) {
             return;
         }
         let mut unique: std::collections::BTreeMap<_, _> =
@@ -2144,7 +2157,10 @@ impl Tape {
         self.market_items.sort_by(|a, b| b.item.ts.cmp(&a.item.ts).then(a.id.cmp(&b.id)));
         self.market_items.truncate(intelligence::MAX_ITEMS);
         self.items = tape_items(&self.market_items, watches, now);
+        self.dirty = false;
+        // Content changes invalidate layout as well as theme/font changes.
         self.text_key = None;
+        self.clock.index %= self.items.len().max(1);
         // Rebuild when any member ages out, including members that contribute
         // priority or keyword hits but are not the cluster lead.
         self.expiry = self.market_items.iter().map(|s| s.item.ts + TAPE_SECONDS).min();
@@ -2196,10 +2212,6 @@ impl super::TerminalApp {
         }
         let now = chrono::Utc::now().timestamp();
         self.headline_tape.update(&self.panes, &self.prefs.keyword_watches, now);
-        if self.headline_tape.items.is_empty() {
-            self.headline_tape.clock = TapeClock::default();
-            return dp(0.0);
-        }
         let rect = egui::Rect::from_min_max(egui::pos2(available.left(), available.bottom() - dp(24.0)), available.max);
         let ctx = ui.ctx().clone();
         let (time, focused, hovered, visible) = ctx.input(|i| {
@@ -2211,6 +2223,19 @@ impl super::TerminalApp {
         let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
         painter.rect_filled(rect, dp(0.0), theme::header());
         painter.hline(rect.x_range(), rect.top(), egui::Stroke::new(dp(1.0), theme::border()));
+        if tape.items.is_empty() {
+            tape.clock = TapeClock::default();
+            tape.galleys.clear();
+            tape.offsets.clear();
+            painter.text(
+                egui::pos2(rect.left() + dp(8.0), rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                "No headlines in the last 2 hours",
+                ui_font(12.0),
+                theme::muted(),
+            );
+            return rect.height();
+        }
         let text_key = (theme::palette(), mono(10.5), ui_font(12.0), theme::density());
         if tape.text_key.as_ref() != Some(&text_key) {
             tape.galleys = tape
@@ -2218,6 +2243,14 @@ impl super::TerminalApp {
                 .iter()
                 .map(|item| {
                     let mut job = egui::text::LayoutJob::default();
+                    let emphasized = tape_emphasized(item, &tape.watches);
+                    if emphasized {
+                        job.append(
+                            "! ",
+                            dp(0.0),
+                            egui::TextFormat { font_id: mono(10.5), color: theme::warn(), ..Default::default() },
+                        );
+                    }
                     job.append(
                         &format!("{}  ", item.lead.source),
                         dp(0.0),
@@ -2226,7 +2259,11 @@ impl super::TerminalApp {
                     job.append(
                         &item.lead.item.title,
                         dp(0.0),
-                        egui::TextFormat { font_id: ui_font(12.0), color: theme::text(), ..Default::default() },
+                        egui::TextFormat {
+                            font_id: ui_font(12.0),
+                            color: if emphasized { theme::warn() } else { theme::text() },
+                            ..Default::default()
+                        },
                     );
                     painter.layout_job(job)
                 })

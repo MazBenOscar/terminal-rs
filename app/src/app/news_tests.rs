@@ -179,7 +179,7 @@ fn n7b_tape_window_priority_keywords_and_cluster_dedup() {
     duplicate.id = "duplicate".into();
     duplicate.source = "CNBC".into();
     let keyword = n7_story("keyword", "Quantum laboratory opens in Zurich", now - 2);
-    let normal = n7_story("normal", "Routine weather bulletin", now - 3);
+    let normal = n7_story("normal", "Routine weather bulletin", now);
     let old = n7_story("old", "Delta files bankruptcy", now - TAPE_SECONDS);
     let future = n7_story("future", "Fed cuts rates", now + 1);
     let mut inferred = n7_story("inferred", "CEO resigns", now);
@@ -187,12 +187,30 @@ fn n7b_tape_window_priority_keywords_and_cluster_dedup() {
     let watches = [KeywordWatch { words: "quantum".into(), ..Default::default() }];
     let items = [high.clone(), duplicate, high, keyword, normal, old, future, inferred];
     let selected = tape_items(&items, &watches, now);
-    assert_eq!(selected.len(), 2);
+    assert_eq!(selected.len(), 3);
     assert_eq!(selected[0].member_ids.len(), 2, "same ids dedup before clustering publishers");
     assert_eq!(selected[1].lead.id, "keyword");
-    assert_eq!(tape_items(&items, &[], now).len(), 1);
+    assert_eq!(selected[2].lead.id, "normal", "newer ordinary headlines top up after emphasized entries");
+    assert!(tape_emphasized(&selected[0], &watches));
+    assert!(tape_emphasized(&selected[1], &watches));
+    assert!(!tape_emphasized(&selected[2], &watches));
+    let no_keywords = tape_items(&items, &[], now);
+    assert_eq!(no_keywords.len(), 3);
+    assert_eq!(no_keywords[1].lead.id, "normal");
 }
 
+#[test]
+fn tape_top_up_is_bounded_and_newest_first_without_priority_or_keywords() {
+    let now = 100_000;
+    let items: Vec<_> =
+        (0..25).map(|i| n7_story(&format!("ordinary-{i}"), &format!("Observatory{i}"), now - i)).collect();
+    let selected = tape_items(&items, &[], now);
+    assert_eq!(selected.len(), 20);
+    for (i, story) in selected.iter().enumerate() {
+        assert_eq!(story.lead.id, format!("ordinary-{i}"));
+        assert!(!tape_emphasized(story, &[]));
+    }
+}
 #[test]
 fn n7b_tape_clock_caps_repaint_pauses_and_rotates_statically() {
     for pref in [false, true] {
@@ -304,7 +322,7 @@ fn n7b_flash_ui_narrow_hidden_click_selects_and_cross_dismisses() {
 }
 
 #[test]
-fn n7b_tape_ui_empty_zero_height_cache_expiry_and_no_requests() {
+fn n7b_tape_ui_placeholder_cache_expiry_and_no_requests() {
     use super::super::{PaneKind, TerminalApp};
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/n7b-tape");
     let (worker, mut requests) = crate::worker::Worker::recording();
@@ -331,7 +349,9 @@ fn n7b_tape_ui_empty_zero_height_cache_expiry_and_no_requests() {
         output.textures_delta.clear();
         (height, output)
     };
-    assert_eq!(frame(&mut app, 0.0).0, 0.0);
+    let (height, output) = frame(&mut app, 0.0);
+    assert_eq!(height, dp(24.0));
+    assert!(text_shapes(&output).iter().any(|(s, _)| s == "No headlines in the last 2 hours"));
     let mut news = NewsPane::new(None);
     news.filters.scope = Scope::All;
     let now = chrono::Utc::now().timestamp();
@@ -358,7 +378,23 @@ fn n7b_tape_ui_empty_zero_height_cache_expiry_and_no_requests() {
     assert_eq!(app.route_tape_story(&cached).as_deref(), Some("https://example.test/tape"));
     app.headline_tape.update(&app.panes, &[], now + TAPE_SECONDS);
     assert!(app.headline_tape.items.is_empty());
-    assert_eq!(frame(&mut app, 3.0).0, 0.0, "expired tape is zero height");
+    assert_eq!(frame(&mut app, 3.0).0, dp(24.0), "expired tape retains a visible placeholder");
+    // Worker data alone populates the tape without any News pane, high priority,
+    // or keyword watches. Replacing it rebuilds galleys AND measured offsets.
+    app.headline_tape.receive_market(vec![n7_story("ordinary", "Routine weather bulletin", now - 1)]);
+    let (_, output) = frame(&mut app, 4.0);
+    assert!(text_shapes(&output).iter().any(|(s, _)| s.contains("Routine weather bulletin")));
+    let galley = app.headline_tape.galleys[0].clone();
+    let offsets = app.headline_tape.offsets.clone();
+    app.headline_tape.receive_market(vec![n7_story(
+        "changed",
+        "Unscheduled observatory bulletin from northern facilities",
+        now,
+    )]);
+    let (_, output) = frame(&mut app, 5.0);
+    assert!(!std::sync::Arc::ptr_eq(&galley, &app.headline_tape.galleys[0]));
+    assert_ne!(offsets, app.headline_tape.offsets);
+    assert!(text_shapes(&output).iter().any(|(s, _)| s.contains("Unscheduled observatory")));
     assert!(requests.try_recv().is_err(), "drawing strips must never fetch or subscribe");
 }
 

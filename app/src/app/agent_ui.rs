@@ -1177,7 +1177,10 @@ impl TerminalApp {
     /// Session inventories are immutable in both backends; restart at an idle
     /// queue boundary and leave the user's saved tools mode untouched.
     fn prepare_story_agent(&mut self, ctx: &egui::Context) {
-        let desired = self.agent_pane.queue.front().is_some_and(|p| self.story_desk.queued_read_only(p));
+        let desired = self.agent_pane.starting_prompt.as_ref().map_or_else(
+            || self.agent_pane.queue.front().is_some_and(|p| self.story_desk.queued_read_only(p)),
+            |id| self.story_desk.read_only_prompt_id(id),
+        );
         let ordinary = self.agent_config.session_tools(self.agent_pane.tool_set());
         let session_tools = self.agent_pane.session.as_ref().map(|_| self.agent_pane.session_tools.unwrap_or(ordinary));
         if !story_policy_change(
@@ -2548,7 +2551,11 @@ mod tests {
         let executor = AppExecutor::new(&app);
         let turn = tr_agent::bridge::TurnIds::new().unwrap().allocate().unwrap();
         app.agent_pane
-            .start_prompt(agent_pane::Prompt { text: "add two RSI studies".into(), requires_tools: false })
+            .start_prompt(agent_pane::Prompt {
+                text: "add two RSI studies".into(),
+                id: Default::default(),
+                requires_tools: false,
+            })
             .unwrap();
         app.agent_pane.event(BridgeEvent::Started { turn: turn.clone() });
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -2601,7 +2608,9 @@ mod tests {
 
         // The conversation survives layout changes, but inverse edits do not.
         let second = tr_agent::bridge::TurnIds::new().unwrap().allocate().unwrap();
-        app.agent_pane.start_prompt(agent_pane::Prompt { text: "RSI".into(), requires_tools: false }).unwrap();
+        app.agent_pane
+            .start_prompt(agent_pane::Prompt { text: "RSI".into(), id: Default::default(), requires_tools: false })
+            .unwrap();
         app.agent_pane.event(BridgeEvent::Started { turn: second.clone() });
         runtime.block_on(async {
             let mut future = executor.execute(
@@ -2678,7 +2687,11 @@ mod tests {
         app.agent_pane.active_chart = Some(last_used);
         app.focus = app.first_agent().unwrap();
         app.pinned_agent_chart = None;
-        app.send_agent_prompt(agent_pane::Prompt { text: "What's the trend?".into(), requires_tools: true });
+        app.send_agent_prompt(agent_pane::Prompt {
+            text: "What's the trend?".into(),
+            id: Default::default(),
+            requires_tools: true,
+        });
         assert_eq!(app.pinned_agent_chart, Some(last_used));
         assert_eq!(app.agent_pane.settings.pinned_chart, Some(last_used));
         assert_eq!(app.agent_chart_uid(crate::agent_queue::ChartTarget::Pinned), Some(last_used));
@@ -2759,7 +2772,11 @@ mod review_tests {
         let setup = |n: usize| {
             let (mut app, id) = agent_app(&format!("workflow-card-decline-enter-{n}"));
             app.focus_cmd = false;
-            app.agent_pane.start_prompt(agent_pane::Prompt { text: "Propose a list".into(), requires_tools: false });
+            app.agent_pane.start_prompt(agent_pane::Prompt {
+                text: "Propose a list".into(),
+                id: Default::default(),
+                requires_tools: false,
+            });
             app.agent_pane.event(BridgeEvent::Started { turn: "decline:1".into() });
             app.agent_workflow(
                 "decline:1",
@@ -2832,7 +2849,11 @@ mod review_tests {
         use crate::agent_bridge::ProposalStatus;
         let (mut app, id) = agent_app("workflow-card-keyboard");
         app.focus_cmd = false;
-        app.agent_pane.start_prompt(agent_pane::Prompt { text: "Propose two lists".into(), requires_tools: false });
+        app.agent_pane.start_prompt(agent_pane::Prompt {
+            text: "Propose two lists".into(),
+            id: Default::default(),
+            requires_tools: false,
+        });
         app.agent_pane.event(BridgeEvent::Started { turn: "keyboard:1".into() });
         for name in ["Crypto", "Research"] {
             app.agent_workflow(
@@ -2928,7 +2949,11 @@ mod review_tests {
 
     fn paused_queue(app: &mut TerminalApp) {
         for text in ["A", "B"] {
-            app.agent_pane.enqueue(agent_pane::Prompt { text: text.into(), requires_tools: false });
+            app.agent_pane.enqueue(agent_pane::Prompt {
+                text: text.into(),
+                id: Default::default(),
+                requires_tools: false,
+            });
         }
         app.agent_pane.event(BridgeEvent::Recovered(Recovery::Resumed));
         assert!(app.agent_pane.next_prompt().is_none(), "recovery must pause the queue");

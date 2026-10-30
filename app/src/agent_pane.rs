@@ -232,8 +232,28 @@ impl Onboarding {
     }
 }
 
+/// Canonical in-memory request identity. Cloning a queued/retried request keeps
+/// its identity; independently constructed prompts never alias by text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PromptId {
+    serial: u64,
+    pub story_headline: Option<String>,
+}
+impl Default for PromptId {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self { serial: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), story_headline: None }
+    }
+}
+impl PromptId {
+    pub fn story(headline: &str) -> Self {
+        Self { story_headline: Some(headline.to_owned()), ..Default::default() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
+    pub id: PromptId,
     pub text: String,
     pub requires_tools: bool,
 }
@@ -257,6 +277,9 @@ pub struct Trace {
 /// Local conversation metadata, never part of Settings or a layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationTurn {
+    /// Recorded where the turn is created, independent of backend notifications.
+    pub prompt_id: PromptId,
+    archived_reply: Option<String>,
     pub id: Option<String>,
     pub prompt_index: usize,
     pub finished: bool,
@@ -459,6 +482,7 @@ pub struct AgentPane {
     pub blocks: Vec<RenderedBlock>,
     pub queue: VecDeque<Prompt>,
     pub last_prompt: Option<Prompt>,
+    pub(crate) starting_prompt: Option<PromptId>,
     pub running: bool,
     pub input: String,
     pub disclosure: bool,
@@ -503,6 +527,7 @@ impl Default for AgentPane {
             blocks: Vec::new(),
             queue: VecDeque::new(),
             last_prompt: None,
+            starting_prompt: None,
             running: false,
             input: String::new(),
             disclosure: true,
@@ -758,11 +783,18 @@ impl AgentPane {
         }
     }
 
-    pub fn next_prompt(&mut self) -> Option<Prompt> {
-        if self.running || self.queue_paused || self.state != Onboarding::Ready {
+    /// Ownership remains explicit between dequeue and turn creation, including
+    /// callers that need to wait for a session/policy boundary before starting.
+    pub(crate) fn dequeue_prompt(&mut self) -> Option<Prompt> {
+        if self.running || self.queue_paused || self.state != Onboarding::Ready || self.starting_prompt.is_some() {
             return None;
         }
         let prompt = self.queue.pop_front()?;
+        self.starting_prompt = Some(prompt.id.clone());
+        Some(prompt)
+    }
+    pub fn next_prompt(&mut self) -> Option<Prompt> {
+        let prompt = self.dequeue_prompt()?;
         self.start_prompt(prompt)
     }
 
@@ -772,10 +804,17 @@ impl AgentPane {
             return None;
         }
         self.flush(Instant::now());
+        if let Some(index) = self.turns.len().checked_sub(1) {
+            let reply = self.turn_reply_text(index);
+            self.turns[index].archived_reply = Some(reply);
+        }
         self.replies.clear();
         self.last_prompt = Some(prompt.clone());
+        self.starting_prompt = None;
         self.active_turn = Some(self.turns.len());
         self.turns.push(ConversationTurn {
+            prompt_id: prompt.id.clone(),
+            archived_reply: None,
             id: None,
             prompt_index: self.blocks.len(),
             finished: false,
@@ -798,6 +837,9 @@ impl AgentPane {
     /// Original plain reply text for a completed host-requested turn, not rendered Markdown.
     pub(crate) fn turn_reply_text(&self, index: usize) -> String {
         let Some(turn) = self.turns.get(index) else { return String::new() };
+        if let Some(reply) = &turn.archived_reply {
+            return reply.clone();
+        }
         let end = self.turns.get(index + 1).map_or(self.blocks.len(), |t| t.prompt_index);
         let mut replies: Vec<_> =
             self.replies.values().filter(|r| r.index > turn.prompt_index && r.index < end).collect();
@@ -1210,6 +1252,43 @@ impl AgentPane {
         // Expire before deriving headers as well as cards on the single deadline wake.
         self.workflows.expire(Instant::now(), None);
         for i in 0..self.blocks.len() {
+            if let Some((index, turn)) = self.turns.iter().enumerate().rev().find(|(_, t)| t.prompt_index <= i)
+                && let Some(headline) = &turn.prompt_id.story_headline
+            {
+                if i == turn.prompt_index {
+                    let headline: String =
+                        headline.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(72).collect();
+                    let status = if !turn.finished {
+                        "Running…"
+                    } else if turn.final_answer_succeeded {
+                        "Done — shown in Story pane"
+                    } else {
+                        "Stopped — see Story pane"
+                    };
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Story analysis · {headline} · {status}"))
+                                    .font(theme::ui_font(10.5))
+                                    .color(readable(theme::muted())),
+                            )
+                            .truncate(),
+                        );
+                    });
+                    egui::CollapsingHeader::new(
+                        RichText::new("Show raw").font(theme::ui_font(10.5)).color(readable(theme::muted())),
+                    )
+                    .id_salt(("story-raw", i))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if let RenderedBlock::Prompt(text) = &self.blocks[i] {
+                            agent_markdown::wrapped(ui, text, theme::text());
+                        }
+                        agent_markdown::wrapped(ui, &self.turn_reply_text(index), theme::text());
+                    });
+                }
+                continue;
+            }
             match &self.blocks[i] {
                 RenderedBlock::Prompt(text) => {
                     if i > 0 {
@@ -1649,7 +1728,14 @@ impl AgentPane {
                                 egui::Layout::left_to_right(egui::Align::Min),
                                 |ui| {
                                     agent_markdown::wrapped(ui, &format!("{}.", index + 1), theme::text());
-                                    agent_markdown::wrapped(ui, &prompt.text, theme::text());
+                                    let label = prompt.id.story_headline.as_ref().map(|h| {
+                                        format!("Story analysis · {} · Queued", h.chars().take(72).collect::<String>())
+                                    });
+                                    agent_markdown::wrapped(
+                                        ui,
+                                        label.as_deref().unwrap_or(&prompt.text),
+                                        theme::text(),
+                                    );
                                 },
                             );
                         });
@@ -1788,7 +1874,11 @@ impl AgentPane {
         field.end(ui);
         // Enter still appends to the queue during a running turn.
         if (send || enter) && self.send_blocked_reason().is_none() {
-            actions.push(Action::Send(Prompt { text: std::mem::take(&mut self.input), requires_tools: false }));
+            actions.push(Action::Send(Prompt {
+                text: std::mem::take(&mut self.input),
+                id: Default::default(),
+                requires_tools: false,
+            }));
         }
     }
 
@@ -2261,7 +2351,11 @@ fn suggested_prompts(ui: &mut Ui, mode: ToolsMode, actions: &mut Vec<Action>) {
                 ui.add_enabled(false, egui::Button::new(*prompt).wrap()).on_disabled_hover_text("Switch to Chart edits")
             };
             if response.clicked() {
-                actions.push(Action::Send(Prompt { text: (*prompt).into(), requires_tools: true }));
+                actions.push(Action::Send(Prompt {
+                    text: (*prompt).into(),
+                    id: Default::default(),
+                    requires_tools: true,
+                }));
             }
         }
     }
@@ -3170,7 +3264,8 @@ mod polish_tests {
         use serde_json::json;
         for hidden in [true, false] {
             let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
-            pane.start_prompt(Prompt { text: "mark levels".into(), requires_tools: true }).unwrap();
+            pane.start_prompt(Prompt { text: "mark levels".into(), id: Default::default(), requires_tools: true })
+                .unwrap();
             for i in 0..4 {
                 let mut trace = session_tool_trace(
                     "create_drawing",
@@ -3309,7 +3404,10 @@ mod polish_tests {
         assert_eq!(tool_group_label(&[&trace], None), "Listed scans · 1 step");
         let mut pane = AgentPane::default();
         pane.transition(Onboarding::Ready);
-        assert!(pane.start_prompt(Prompt { text: "List my scans".into(), requires_tools: true }).is_some());
+        assert!(
+            pane.start_prompt(Prompt { text: "List my scans".into(), id: Default::default(), requires_tools: true })
+                .is_some()
+        );
         pane.blocks.push(RenderedBlock::Tool(trace));
         pane.finish_turn();
         pane.running = false;
@@ -4089,7 +4187,7 @@ mod polish_tests {
         let mut full = crate::agent_demo::pane(crate::agent_demo::State::parse("empty-ready").unwrap(), 1);
         full.input = "Question".into();
         for _ in 0..32 {
-            full.enqueue(Prompt { text: "queued".into(), requires_tools: false });
+            full.enqueue(Prompt { text: "queued".into(), id: Default::default(), requires_tools: false });
         }
         assert!(full.send_blocked_reason().unwrap().contains("queue is full"));
     }
@@ -4277,6 +4375,69 @@ mod polish_tests {
     }
 
     #[test]
+    fn story_analysis_transcript_is_compact_and_raw_is_opt_in() {
+        for backend in ["mimo", "codex"] {
+            let ctx = egui::Context::default();
+            ctx.all_styles_mut(|style| style.animation_time = 0.0);
+            let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("empty-ready").unwrap(), 1);
+            pane.backend = backend;
+            let raw = "Analyze untrusted data <STORY_DATA>{\"secret\":\"fixture\"}</STORY_DATA>";
+            pane.start_prompt(Prompt {
+                id: PromptId::story("Fixture headline"),
+                text: raw.into(),
+                requires_tools: false,
+            })
+            .unwrap();
+            let output = render(&ctx, dp(900.0), vec![], |ui| pane.conversation(ui, &mut Vec::new()));
+            let text = texts(&output);
+            assert!(text.iter().any(|(s, _)| s == "Story analysis · Fixture headline · Running…"));
+            assert!(text.iter().any(|(s, _)| s == "Show raw"));
+            assert!(!text.iter().any(|(s, _)| s.contains("STORY_DATA") || s == "You"));
+            let reply = r#"{"sentiment":0.5,"outlook":"Raw JSON fixture"}"#;
+            pane.wire(
+                "item/completed",
+                &serde_json::json!({"item":{"id":"reply", "type":"agentMessage", "text":reply}}),
+            );
+            pane.turns[0].finished = true;
+            pane.turns[0].final_answer_succeeded = true;
+            pane.running = false;
+            // Move on: the original debug reply must survive replies.clear().
+            pane.start_prompt(Prompt {
+                id: Default::default(),
+                text: "Next ordinary turn".into(),
+                requires_tools: false,
+            })
+            .unwrap();
+            assert_eq!(pane.turn_reply_text(0), reply);
+            let output = render(&ctx, dp(900.0), vec![], |ui| pane.conversation(ui, &mut Vec::new()));
+            let text = texts(&output);
+            assert_eq!(text.iter().filter(|(s, _)| s.starts_with("Story analysis ·")).count(), 1);
+            assert!(text.iter().any(|(s, _)| s.contains("Done — shown in Story pane")));
+            assert!(!text.iter().any(|(s, _)| s.contains("STORY_DATA") || s.contains("Raw JSON fixture")));
+            assert!(text.iter().any(|(s, _)| s == "Next ordinary turn"));
+            let pos = text.iter().find(|(s, _)| s == "Show raw").unwrap().1.center();
+            for pressed in [true, false] {
+                render(
+                    &ctx,
+                    dp(900.0),
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    |ui| pane.conversation(ui, &mut Vec::new()),
+                );
+            }
+            let output = render(&ctx, dp(900.0), vec![], |ui| pane.conversation(ui, &mut Vec::new()));
+            assert!(texts(&output).iter().any(|(s, _)| s.contains("STORY_DATA")));
+            assert!(texts(&output).iter().any(|(s, _)| s.contains("Raw JSON fixture")));
+        }
+    }
+    #[test]
     fn every_user_turn_keeps_you_at_the_left_across_demo_states_widths_and_long_markdown() {
         for state in crate::agent_demo::STATES {
             for width in [240.0, 360.0, 450.0, 660.0] {
@@ -4286,7 +4447,11 @@ mod polish_tests {
                 // including fixtures that have no conversation to start with.
                 pane.running = false;
                 pane.state = Onboarding::Ready;
-                pane.start_prompt(Prompt { text: "A long user prompt ".repeat(8), requires_tools: false });
+                pane.start_prompt(Prompt {
+                    text: "A long user prompt ".repeat(8),
+                    id: Default::default(),
+                    requires_tools: false,
+                });
                 pane.blocks.push(RenderedBlock::Reply(agent_markdown::parse(&crate::agent_demo::MARKDOWN.repeat(3))));
                 let mut output = ctx.run_ui(
                     egui::RawInput {
@@ -4454,7 +4619,7 @@ mod polish_tests {
         assert_eq!(pane.coalescer.due_in(Instant::now(), true), None);
 
         let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
-        pane.start_prompt(Prompt { text: "Read chart".into(), requires_tools: true });
+        pane.start_prompt(Prompt { text: "Read chart".into(), id: Default::default(), requires_tools: true });
         pane.turns[0].started_at = Instant::now() - Duration::from_secs(7);
         pane.event(BridgeEvent::Completed {
             turn: "duration".into(),
@@ -4741,7 +4906,7 @@ mod polish_tests {
     #[test]
     fn clearing_rate_limit_never_resumes_queue_and_failed_turn_keeps_retry() {
         let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
-        pane.enqueue(Prompt { text: "queued".into(), requires_tools: true });
+        pane.enqueue(Prompt { text: "queued".into(), id: Default::default(), requires_tools: true });
         pane.set_limits(&serde_json::json!({"rateLimits":{"primary":{"usedPercent":100,"resetsAt":crate::agent_demo::SAMPLE_NOW + 42 * 60}}}));
         assert!(pane.queue_paused);
         pane.set_limits(&serde_json::json!({"rateLimits":{"primary":{"usedPercent":0}}}));
@@ -4830,7 +4995,7 @@ mod polish_tests {
         assert!(pane.blocks.iter().all(|block| matches!(block, RenderedBlock::Notice(_))));
         assert!(pane.workflows.context.is_empty());
         pane.transition(Onboarding::Ready);
-        pane.enqueue(Prompt { text: pane.input.clone(), requires_tools: false });
+        pane.enqueue(Prompt { text: pane.input.clone(), id: Default::default(), requires_tools: false });
         assert_eq!(pane.next_prompt().unwrap().text, "What chart is pinned?");
         assert_eq!(pane.turns.len(), 1);
         assert_eq!(pane.blocks.iter().filter(|block| matches!(block, RenderedBlock::Prompt(_))).count(), 1);
@@ -4976,7 +5141,7 @@ mod polish_tests {
     fn user_prompt_has_small_you_label_strong_ink_hairline_and_no_caret_rule() {
         let ctx = egui::Context::default();
         let mut pane = crate::agent_demo::pane(crate::agent_demo::State::parse("answer").unwrap(), 1);
-        pane.start_prompt(Prompt { text: "Second question".into(), requires_tools: true });
+        pane.start_prompt(Prompt { text: "Second question".into(), id: Default::default(), requires_tools: true });
         let mut output = ctx.run_ui(Default::default(), |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(dp(8.0), dp(8.0));
             pane.conversation(ui, &mut Vec::new());
@@ -5069,7 +5234,7 @@ mod polish_tests {
         let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
         assert!(pane.queue.is_empty());
         assert!(!pane.show_retry());
-        pane.start_prompt(Prompt { text: "trend".into(), requires_tools: true });
+        pane.start_prompt(Prompt { text: "trend".into(), id: Default::default(), requires_tools: true });
         assert!(!pane.show_retry());
         pane.event(BridgeEvent::Completed {
             turn: "one".into(),
@@ -5087,7 +5252,7 @@ mod polish_tests {
             interrupt_elapsed: None,
         });
         assert!(pane.show_retry());
-        pane.enqueue(Prompt { text: "next".into(), requires_tools: false });
+        pane.enqueue(Prompt { text: "next".into(), id: Default::default(), requires_tools: false });
         assert_eq!(pane.queue.len(), 1);
         pane.state = Onboarding::ToolsUnavailable { reason: "test".into() };
         assert!(pane.show_retry());
@@ -5413,8 +5578,8 @@ mod polish_tests {
             let ctx = egui::Context::default();
             let mut pane =
                 AgentPane { state: Onboarding::Ready, acknowledged: true, disclosure: false, ..Default::default() };
-            pane.start_prompt(Prompt { text: "trend".into(), requires_tools: true });
-            pane.enqueue(Prompt { text: "next".into(), requires_tools: false });
+            pane.start_prompt(Prompt { text: "trend".into(), id: Default::default(), requires_tools: true });
+            pane.enqueue(Prompt { text: "next".into(), id: Default::default(), requires_tools: false });
             pane.event(BridgeEvent::Completed {
                 turn: "failed".into(),
                 status: "failed".into(),
@@ -5678,7 +5843,7 @@ mod tests {
     fn queue_is_fifo_and_recovery_never_resends() {
         let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
         for text in ["one", "two", "three"] {
-            pane.enqueue(Prompt { text: text.into(), requires_tools: false });
+            pane.enqueue(Prompt { text: text.into(), id: Default::default(), requires_tools: false });
         }
         assert_eq!(pane.next_prompt().unwrap().text, "one");
         assert!(pane.next_prompt().is_none());
@@ -5789,7 +5954,7 @@ mod tests {
                 assert!(pane.input.contains('\n'));
             } else {
                 assert!(actions.iter().any(
-                    |a| matches!(a, Action::Send(Prompt { text, requires_tools: false }) if text == "read my chart")
+                    |a| matches!(a, Action::Send(Prompt { text, requires_tools: false, .. }) if text == "read my chart")
                 ));
                 assert!(pane.input.is_empty());
             }
@@ -5805,11 +5970,15 @@ mod fix_tests {
     #[test]
     fn prompts_preserve_whitespace_and_retry_does_not_release_paused_fifo() {
         let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
-        pane.enqueue(Prompt { text: " \n user-defined account-level question \n ".into(), requires_tools: false });
+        pane.enqueue(Prompt {
+            text: " \n user-defined account-level question \n ".into(),
+            id: Default::default(),
+            requires_tools: false,
+        });
         let prompt = pane.next_prompt().unwrap();
         assert_eq!(prompt.text, " \n user-defined account-level question \n ");
         assert_eq!(pane.blocks[0], RenderedBlock::Prompt(prompt.text.clone()));
-        pane.enqueue(Prompt { text: "stale".into(), requires_tools: false });
+        pane.enqueue(Prompt { text: "stale".into(), id: Default::default(), requires_tools: false });
         pane.event(BridgeEvent::Recovered(Recovery::Resumed));
         pane.start_prompt(prompt).unwrap();
         pane.event(BridgeEvent::Completed {
@@ -5938,7 +6107,7 @@ mod wire_tests {
     #[test]
     fn mode_switch_is_gated_never_mid_turn_and_restart_keeps_queue_paused() {
         let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
-        pane.enqueue(Prompt { text: "queued".into(), requires_tools: false });
+        pane.enqueue(Prompt { text: "queued".into(), id: Default::default(), requires_tools: false });
         assert!(!pane.can_change_tools(ToolsMode::Edit, false));
         assert!(!pane.select_tools(ToolsMode::Edit, false));
         assert!(pane.can_change_tools(ToolsMode::Edit, true));
@@ -5966,7 +6135,7 @@ mod wire_tests {
     }
 
     fn completed_edit(pane: &mut AgentPane, id: &str) {
-        pane.start_prompt(Prompt { text: "support".into(), requires_tools: false }).unwrap();
+        pane.start_prompt(Prompt { text: "support".into(), id: Default::default(), requires_tools: false }).unwrap();
         pane.event(BridgeEvent::Started { turn: id.into() });
         pane.wire(
             "item/completed",
@@ -6011,7 +6180,7 @@ mod wire_tests {
     #[test]
     fn undo_availability_alone_detects_edits_without_tool_notifications() {
         let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
-        pane.start_prompt(Prompt { text: "RSI".into(), requires_tools: false }).unwrap();
+        pane.start_prompt(Prompt { text: "RSI".into(), id: Default::default(), requires_tools: false }).unwrap();
         pane.event(BridgeEvent::Started { turn: "canonical".into() });
         pane.refresh_undo(&["canonical".into()], Some("canonical"));
         assert!(pane.turns[0].made_edits);
@@ -6135,7 +6304,7 @@ mod review_tests {
     fn enqueue_does_not_rewrite_ordinary_prompt_text() {
         let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
         let text = "Is this user-friendly for an account-level review of 0x6B175474E89094C44Da98b954EedeAC495271d0F?";
-        pane.enqueue(Prompt { text: text.into(), requires_tools: false });
+        pane.enqueue(Prompt { text: text.into(), id: Default::default(), requires_tools: false });
         assert_eq!(pane.next_prompt().unwrap().text, text);
     }
 
@@ -6154,7 +6323,7 @@ mod review_tests {
     #[test]
     fn preamble_and_final_answer_stay_separate_messages() {
         let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
-        pane.enqueue(Prompt { text: "trend?".into(), requires_tools: true });
+        pane.enqueue(Prompt { text: "trend?".into(), id: Default::default(), requires_tools: true });
         pane.next_prompt().unwrap();
         delta(&mut pane, "Reading the chart.");
         pane.flush(Instant::now());
@@ -6247,16 +6416,16 @@ mod review_tests {
         ] {
             pane.transition(state);
         }
-        pane.enqueue(Prompt { text: "What's the trend?".into(), requires_tools: true });
+        pane.enqueue(Prompt { text: "What's the trend?".into(), id: Default::default(), requires_tools: true });
         assert_eq!(pane.next_prompt().map(|p| p.text).as_deref(), Some("What's the trend?"));
     }
 
     #[test]
     fn stale_paused_prompts_still_wait_for_explicit_resume() {
         let mut pane = AgentPane { state: Onboarding::Ready, ..Default::default() };
-        pane.enqueue(Prompt { text: "stale".into(), requires_tools: false });
+        pane.enqueue(Prompt { text: "stale".into(), id: Default::default(), requires_tools: false });
         pane.interrupt();
-        pane.enqueue(Prompt { text: "new".into(), requires_tools: false });
+        pane.enqueue(Prompt { text: "new".into(), id: Default::default(), requires_tools: false });
         assert!(pane.next_prompt().is_none(), "a non-empty paused queue must not resume implicitly");
     }
 }

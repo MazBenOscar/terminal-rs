@@ -725,6 +725,7 @@ pub enum Response {
         desktop: Vec<String>,
         history: Vec<String>,
     },
+    HeadlineTape(Vec<tr_data::news_store::Story>),
     NewsVolume {
         pane: PaneId,
         volumes: Vec<tr_data::news_store::local::Volume>,
