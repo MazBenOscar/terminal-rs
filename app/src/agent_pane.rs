@@ -678,6 +678,7 @@ impl AgentPane {
         self.story_turn = false;
         let mut policy = self.story_tools.lock().unwrap();
         policy.active = false;
+        policy.noticed_turns.clear();
         policy.begin(false);
     }
 
@@ -689,7 +690,11 @@ impl AgentPane {
 
     fn finish_turn(&mut self) {
         self.story_turn = false;
-        self.story_tools.lock().unwrap().active = false;
+        {
+            let mut policy = self.story_tools.lock().unwrap();
+            policy.active = false;
+            policy.noticed_turns.clear();
+        }
         if let Some(index) = self.active_turn.take() {
             let turn = &mut self.turns[index];
             turn.duration = Some(turn.started_at.elapsed());
@@ -783,7 +788,9 @@ impl AgentPane {
     pub fn interrupt(&mut self) {
         // Cancellation is not completion: keep denial until the owner confirms
         // completion/retirement or reports a stopped backend.
-        self.retryable = true;
+        if !self.story_turn {
+            self.retryable = true;
+        }
         self.queue_paused = true;
         self.interrupt_tools();
     }
@@ -894,6 +901,9 @@ impl AgentPane {
     }
 
     pub fn event(&mut self, event: BridgeEvent) {
+        if self.story_turn && matches!(&event, BridgeEvent::Recovered(_)) {
+            return;
+        }
         // Isolated analysis never produces ordinary Started/Completed events.
         // A delayed main-thread ack must not release its denial or running slot.
         if self.story_turn
@@ -4441,6 +4451,44 @@ mod polish_tests {
     }
 
     #[test]
+    fn isolated_interrupt_never_retries_earlier_prompt_and_recovery_never_releases_denial() {
+        for active_main in [false, true] {
+            let mut pane = AgentPane::default();
+            pane.transition(Onboarding::Ready);
+            pane.start_prompt(Prompt {
+                id: Default::default(),
+                text: "earlier main prompt".into(),
+                requires_tools: false,
+            })
+            .unwrap();
+            if !active_main {
+                pane.event(BridgeEvent::Completed {
+                    turn: "main".into(),
+                    status: "completed".into(),
+                    calls: 0,
+                    interrupt_elapsed: None,
+                });
+            }
+            pane.set_story_turn(true);
+            pane.running = true;
+            pane.story_tools.lock().unwrap().noticed_turns.insert("analysis-notice".into());
+            let blocks = pane.blocks.len();
+            pane.interrupt();
+            assert!(!pane.retryable, "Escape must not expose Retry for the earlier user prompt");
+            assert_eq!(pane.last_prompt.as_ref().unwrap().text, "earlier main prompt");
+            pane.event(BridgeEvent::Recovered(Recovery::Resumed));
+            assert!(pane.story_turn);
+            assert!(pane.running);
+            assert!(pane.story_tools.lock().unwrap().active);
+            assert_eq!(pane.blocks.len(), blocks);
+            pane.story_analysis_ended();
+            let policy = pane.story_tools.lock().unwrap();
+            assert!(!policy.active);
+            assert!(policy.noticed_turns.is_empty());
+        }
+    }
+
+    #[test]
     fn story_tool_flag_releases_only_on_confirmed_end_and_keeps_attributed_calls_denied() {
         for ending in ["completed", "cancelled", "failed", "interrupt", "stopped", "unavailable", "recovered"] {
             let mut pane = AgentPane::default();
@@ -4462,9 +4510,10 @@ mod polish_tests {
                 }),
             }
             let mut policy = pane.story_tools.lock().unwrap();
-            assert_eq!(policy.active, ending == "interrupt", "{ending}");
+            let still_active = matches!(ending, "interrupt" | "recovered");
+            assert_eq!(policy.active, still_active, "{ending}");
             assert!(policy.denies("story-turn"), "{ending}");
-            assert_eq!(policy.denies("ordinary-turn"), ending == "interrupt", "{ending}");
+            assert_eq!(policy.denies("ordinary-turn"), still_active, "{ending}");
         }
     }
 

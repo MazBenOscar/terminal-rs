@@ -51,7 +51,7 @@ pub(crate) const STORY_TOOLS_DISABLED: &str = "Tools are disabled for story anal
 pub(crate) struct StoryToolPolicy {
     pub active: bool,
     blocked_turns: std::collections::HashSet<String>,
-    noticed_turns: std::collections::HashSet<String>,
+    pub(crate) noticed_turns: std::collections::HashSet<String>,
 }
 impl StoryToolPolicy {
     pub fn begin(&mut self, analysis: bool) {

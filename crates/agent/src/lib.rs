@@ -73,6 +73,8 @@ impl std::fmt::Debug for AgentEvent {
 pub enum AnalysisError {
     ToolAttempt,
     NoAnswer,
+    /// NoAnswer caused by the bounded reply collector, not a confirmed turn end.
+    NoAnswerTooLong,
     Cancelled,
     TimedOut,
     NotReady,
@@ -82,6 +84,7 @@ impl std::fmt::Display for AnalysisError {
         f.write_str(match self {
             Self::ToolAttempt => "Agent tried to use a tool — analysis stopped for safety",
             Self::NoAnswer => "Model returned no answer",
+            Self::NoAnswerTooLong => "Model returned no answer — reply too long",
             Self::Cancelled => "Cancelled",
             Self::TimedOut => "Analysis timed out — Retry",
             Self::NotReady => "Agent not ready",
@@ -93,10 +96,27 @@ impl std::fmt::Display for AnalysisError {
 /// timeout; the 90 second budget includes session creation and turn startup.
 pub(crate) async fn analysis_reply(events: &mut impl AgentEvents) -> Result<String, AnalysisError> {
     let mut chunks: Vec<(String, String)> = Vec::new();
+    let mut bytes = 0usize;
+    const MAX_REPLY: usize = 64 * 1024;
     loop {
         match events.recv().await {
             Some(AgentEvent::TextDelta(params)) => {
                 let id = params["itemId"].as_str().unwrap_or_default();
+                let final_text = params["finalText"].as_str();
+                let text = final_text.unwrap_or_else(|| params["delta"].as_str().unwrap_or_default());
+                if text.is_empty() && final_text.is_none() {
+                    continue;
+                }
+                let old = chunks.iter().find(|(key, _)| key == id).map_or(0, |(_, text)| text.len());
+                let separator = usize::from(!chunks.is_empty() && !chunks.iter().any(|(key, _)| key == id));
+                let next = bytes
+                    .saturating_sub(if final_text.is_some() { old } else { 0 })
+                    .saturating_add(text.len())
+                    .saturating_add(separator);
+                if next > MAX_REPLY {
+                    return Err(AnalysisError::NoAnswerTooLong);
+                }
+                bytes = next;
                 let index = chunks.iter().position(|(key, _)| key == id).unwrap_or_else(|| {
                     chunks.push((id.into(), String::new()));
                     chunks.len() - 1
@@ -129,6 +149,41 @@ pub(crate) async fn analysis_reply(events: &mut impl AgentEvents) -> Result<Stri
             }
             None => return Err(AnalysisError::NotReady),
             _ => {}
+        }
+    }
+}
+
+/// Small FIFO tombstone set: late protocol traffic stays denied without growing
+/// session metadata for the lifetime of the application.
+pub(crate) struct BoundedIds<T>(std::collections::VecDeque<T>);
+impl<T> Default for BoundedIds<T> {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+impl<T: PartialEq> BoundedIds<T> {
+    pub(crate) fn insert(&mut self, id: T) {
+        self.remove(&id);
+        self.0.push_back(id);
+        if self.0.len() > 64 {
+            self.0.pop_front();
+        }
+    }
+    pub(crate) fn contains<Q: PartialEq + ?Sized>(&self, id: &Q) -> bool
+    where
+        T: std::borrow::Borrow<Q>,
+    {
+        self.0.iter().any(|entry| entry.borrow() == id)
+    }
+    pub(crate) fn remove<Q: PartialEq + ?Sized>(&mut self, id: &Q) -> bool
+    where
+        T: std::borrow::Borrow<Q>,
+    {
+        if let Some(index) = self.0.iter().position(|entry| entry.borrow() == id) {
+            self.0.remove(index);
+            true
+        } else {
+            false
         }
     }
 }
@@ -177,6 +232,51 @@ mod analysis_tests {
             let mut events = Fixture(vec![AgentEvent::Done(json!({"turn":{"status":status}}))].into());
             assert_eq!(analysis_reply(&mut events).await, Err(error));
         }
+    }
+    #[tokio::test]
+    async fn analysis_text_budget_bounds_deltas_finals_and_item_separators() {
+        for updates in [
+            vec![json!({"delta":"x".repeat(65537)})],
+            vec![json!({"delta":"x".repeat(65536)}), json!({"delta":"y"})],
+            vec![json!({"finalText":"x".repeat(65537)})],
+            vec![json!({"itemId":"a","delta":"x".repeat(65536)}), json!({"itemId":"b","delta":"y"})],
+        ] {
+            let mut events = Fixture(updates.into_iter().map(AgentEvent::TextDelta).collect());
+            assert_eq!(analysis_reply(&mut events).await, Err(AnalysisError::NoAnswerTooLong));
+        }
+        let mut events = Fixture(
+            vec![
+                AgentEvent::TextDelta(json!({"delta":"x".repeat(65536)})),
+                AgentEvent::TextDelta(json!({"finalText":"Final"})),
+                AgentEvent::Done(json!({"turn":{"status":"completed"}})),
+            ]
+            .into(),
+        );
+        assert_eq!(analysis_reply(&mut events).await, Ok("Final".into()));
+        let mut events = Fixture(
+            vec![
+                AgentEvent::TextDelta(json!({"delta":"discard"})),
+                AgentEvent::TextDelta(json!({"finalText":""})),
+                AgentEvent::Done(json!({"turn":{"status":"completed"}})),
+            ]
+            .into(),
+        );
+        assert_eq!(analysis_reply(&mut events).await, Err(AnalysisError::NoAnswer));
+        assert!(AnalysisError::NoAnswerTooLong.to_string().contains("reply too long"));
+    }
+    #[test]
+    fn tombstones_keep_only_the_last_64_unique_ids() {
+        let mut ids = BoundedIds::default();
+        for id in 0..1000 {
+            ids.insert(id);
+        }
+        assert_eq!(ids.0.len(), 64);
+        assert!(!ids.contains(&935));
+        assert!(ids.contains(&936));
+        ids.insert(936);
+        ids.insert(1000);
+        assert!(ids.contains(&936));
+        assert!(!ids.contains(&937));
     }
     #[test]
     fn error_copy_is_specific_and_actionable() {
