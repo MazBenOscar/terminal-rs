@@ -56,15 +56,32 @@ pub struct AnalysisRoles {
     pub text: Color32,
     pub muted: Color32,
     pub ticker: Color32,
+    pub control_fill: Color32,
+    pub control_hover: Color32,
+    pub meter_empty: Color32,
+}
+/// Resolve premultiplied sRGBA over an opaque backing before measuring contrast.
+/// Un-premultiplication matters: translucent channels are not straight RGB.
+fn composite_over(foreground: Color32, background: Color32) -> Color32 {
+    let [r, g, b, a] = foreground.to_srgba_unmultiplied();
+    let alpha = f64::from(a) / 255.0;
+    let mix =
+        |c: u8, back: u8| (f64::from(c) * alpha + f64::from(back) * (1.0 - alpha)).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(mix(r, background.r()), mix(g, background.g()), mix(b, background.b()))
 }
 fn luminance(c: Color32) -> f64 {
     let channel = |v: u8| {
         let v = f64::from(v) / 255.0;
         if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
     };
-    0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+    let [r, g, b, _] = c.to_srgba_unmultiplied();
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
 }
+/// Backgrounds without a palette backing default to black; analysis_roles
+/// resolves window, card and control layers explicitly before calling this.
 pub fn contrast(a: Color32, b: Color32) -> f64 {
+    let b = composite_over(b, Color32::BLACK);
+    let a = composite_over(a, b);
     let (a, b) = (luminance(a), luminance(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
@@ -87,20 +104,51 @@ fn analysis_ink(color: Color32, background: Color32, minimum: f64) -> Color32 {
     }
     unreachable!("black or white always reaches 4.5:1")
 }
+fn analysis_chip_ink(color: Color32, backgrounds: &[Color32]) -> Option<Color32> {
+    let [r, g, b, _] = color.to_srgba_unmultiplied();
+    let score = |ink| backgrounds.iter().map(|bg| contrast(ink, *bg)).fold(f64::INFINITY, f64::min);
+    let endpoint = if score(Color32::BLACK) > score(Color32::WHITE) { 0.0 } else { 255.0 };
+    for step in 0..=255 {
+        let mix = |v: u8| (f64::from(v) + (endpoint - f64::from(v)) * f64::from(step) / 255.0).round() as u8;
+        let ink = Color32::from_rgb(mix(r), mix(g), mix(b));
+        // Small headroom also covers 8-bit premultiplication rounding.
+        if score(ink) >= 4.55 {
+            return Some(ink);
+        }
+    }
+    None
+}
 pub fn analysis_roles(p: &Palette) -> AnalysisRoles {
+    let window = composite_over(p.window, if p.dark { Color32::BLACK } else { Color32::WHITE });
+    let card = composite_over(p.card, window);
     let attention = if contrast(p.amber, p.text) < 1.5 { p.cyan } else { p.amber };
-    // 4.5 also guarantees card-coloured ink on the alarm fill is readable.
-    let alarm_fill = analysis_ink(p.down, p.card, 4.5);
+    let alarm_fill = analysis_ink(p.down, card, 4.5);
+    let mut control_fill = composite_over(p.control, card);
+    let mut control_hover = composite_over(p.control_hover, card);
+    let backgrounds = [card, control_fill, control_hover];
+    let (text, ticker) = match (analysis_chip_ink(p.text, &backgrounds), analysis_chip_ink(p.amber, &backgrounds)) {
+        (Some(text), Some(ticker)) => (text, ticker),
+        _ => {
+            // Arbitrary user palettes can have mutually incompatible surfaces.
+            // In that case use the card for chips too, rather than unreadable ink.
+            control_fill = card;
+            control_hover = card;
+            (analysis_ink(p.text, card, 4.5), analysis_ink(p.amber, card, 4.5))
+        }
+    };
     AnalysisRoles {
-        direction_up: analysis_ink(p.up, p.card, 4.5),
-        direction_down: analysis_ink(p.down, p.card, 4.5),
-        attention: analysis_ink(attention, p.card, 4.5),
-        attention_rule: analysis_ink(attention, p.card, 3.0),
+        direction_up: analysis_ink(p.up, card, 4.5),
+        direction_down: analysis_ink(p.down, card, 4.5),
+        attention: analysis_ink(attention, card, 4.5),
+        attention_rule: analysis_ink(attention, card, 3.0),
         alarm_fill,
-        alarm_ink: p.card,
-        text: analysis_ink(p.text, p.card, 4.5),
-        muted: analysis_ink(p.muted, p.card, 4.5),
-        ticker: analysis_ink(p.amber, p.card, 4.5),
+        alarm_ink: card,
+        text,
+        muted: analysis_ink(p.muted, card, 4.5),
+        ticker,
+        control_fill,
+        control_hover,
+        meter_empty: analysis_ink(p.grid, card, 3.0),
     }
 }
 
@@ -467,9 +515,43 @@ mod tests {
             for ink in [r.attention_rule, r.alarm_fill] {
                 assert!(contrast(ink, p.card) >= 3.0, "{}", t.name);
             }
+            for fill in [r.control_fill, r.control_hover] {
+                for ink in [r.text, r.ticker] {
+                    assert!(contrast(ink, fill) >= 4.5, "{}: chip {ink:?} on {fill:?}", t.name);
+                }
+            }
+            // Built-ins must retain their intended control/hover surfaces.
+            let card = composite_over(p.card, composite_over(p.window, Color32::BLACK));
+            for fill in [p.control, p.control_hover] {
+                for ink in [r.text, r.ticker] {
+                    assert!(contrast(ink, composite_over(fill, card)) >= 4.5, "{}: control", t.name);
+                }
+            }
+            assert!(contrast(r.meter_empty, p.card) >= 3.0, "{}", t.name);
             assert!(contrast(r.alarm_ink, r.alarm_fill) >= 4.5, "{}", t.name);
             let source = if contrast(p.amber, p.text) < 1.5 { p.cyan } else { p.amber };
             assert_eq!(r.attention, analysis_ink(source, p.card, 4.5));
+        }
+    }
+
+    #[test]
+    fn translucent_colors_are_measured_as_composited_straight_rgb() {
+        let translucent = Color32::from_rgba_unmultiplied(255, 255, 255, 128);
+        assert!((luminance(translucent) - 1.0).abs() < 0.001);
+        let over_black = composite_over(translucent, Color32::BLACK);
+        assert_eq!(over_black, Color32::from_rgb(128, 128, 128));
+        assert_eq!(contrast(translucent, Color32::BLACK), contrast(over_black, Color32::BLACK));
+        let mut p = Palette::dark(DEFAULT_ACCENT);
+        p.window = Color32::from_rgb(30, 30, 30);
+        p.card = Color32::from_rgba_unmultiplied(255, 255, 255, 30);
+        let r = analysis_roles(&p);
+        let card = composite_over(p.card, p.window);
+        for ink in [r.text, r.muted, r.ticker, r.direction_up, r.direction_down] {
+            assert!(contrast(ink, card) >= 4.5);
+        }
+        for fill in [r.control_fill, r.control_hover] {
+            assert!(contrast(r.ticker, fill) >= 4.5);
+            assert!(contrast(r.text, fill) >= 4.5);
         }
     }
 

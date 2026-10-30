@@ -51,8 +51,53 @@ struct Details {
     touched: u64,
     agent: Option<PaneId>,
     analysis: Option<StoryAnalysis>,
+    validated: Option<Analysis>,
+    basis_label: Option<String>,
+    reply: String,
+    format_label: Option<&'static str>,
+    roles: Option<(theme::Palette, theme::AnalysisRoles)>,
     related: Vec<Cluster>,
     error: Option<String>,
+}
+impl Details {
+    /// Decode the envelope and validate the note exactly once, on arrival/load.
+    /// Rendering only reads these retained values (including prose fallback).
+    fn set_analysis(&mut self, analysis: StoryAnalysis) {
+        self.validated = None;
+        self.basis_label = None;
+        self.format_label = Some("Older analysis · Re-analyze");
+        self.reply = analysis.json.clone();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&analysis.json) {
+            match value.get("schema").and_then(serde_json::Value::as_u64) {
+                Some(2) => {
+                    self.format_label = None;
+                    if let Some(reply) = value.get("reply").and_then(serde_json::Value::as_str) {
+                        self.reply = reply.to_owned();
+                    }
+                    if let Some(input) = value.get("input")
+                        && let Ok(input) = serde_json::from_value::<Input>(input.clone())
+                    {
+                        self.validated = analysis_v2::parse(&self.reply, &input);
+                        self.basis_label = Some(input.label());
+                    }
+                }
+                Some(3..) => {
+                    self.format_label = Some("Newer analysis format · Re-analyze");
+                    if let Some(reply) = value.get("reply").and_then(serde_json::Value::as_str) {
+                        self.reply = reply.to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.analysis = Some(analysis);
+    }
+    fn analysis_roles(&mut self, palette: theme::Palette) -> theme::AnalysisRoles {
+        if self.roles.as_ref().is_none_or(|(key, _)| *key != palette) {
+            self.roles = Some((palette, theme::analysis_roles(&palette)));
+        }
+        self.roles.expect("roles initialized").1
+    }
 }
 struct Job {
     story_id: String,
@@ -181,8 +226,10 @@ impl TerminalApp {
         match result {
             Ok((analysis, related)) => {
                 // An older worker read must not replace a just-completed turn.
-                if details.analysis.is_none() {
-                    details.analysis = analysis;
+                if details.analysis.is_none()
+                    && let Some(analysis) = analysis
+                {
+                    details.set_analysis(analysis);
                 }
                 details.related = related;
                 details.error = None;
@@ -310,7 +357,7 @@ impl TerminalApp {
                     serde_json::to_value(input).expect("analysis input serializes"),
                 );
                 self.worker.send(Request::SaveStoryAnalysis(analysis.clone()));
-                details.analysis = Some(analysis);
+                details.set_analysis(analysis);
                 details.error = None;
             } else {
                 details.error =
@@ -397,8 +444,8 @@ impl TerminalApp {
         let mut analysis_action = None;
         let mut focus_agent = None;
         let mut cancel = None;
-        let empty_details = Details::default();
-        let details = self.story_desk.details.get(&story.lead.id).unwrap_or(&empty_details);
+        let roles = self.story_desk.details.entry(story.lead.id.clone()).or_default().analysis_roles(theme::palette());
+        let details = &self.story_desk.details[&story.lead.id];
         egui::ScrollArea::vertical().id_salt(("story", id)).auto_shrink([false, false]).show(ui, |ui| {
             ui.set_max_width(dp(680.0).min(ui.available_width()));
             ui.spacing_mut().item_spacing = egui::vec2(dp(6.0), dp(3.0));
@@ -529,32 +576,25 @@ impl TerminalApp {
                 analyze |= ui.button("Retry").clicked();
             }
             if let Some(cached) = &details.analysis {
-                if let Some((reply, input)) = cached.v2_payload() {
-                    if let Ok(input) = serde_json::from_value::<Input>(input) {
-                        if let Some(a) = analysis_v2::parse(&reply, &input) {
-                            analysis_action = show_analysis(ui, &a);
-                        } else {
-                            ui.add(egui::Label::new(reply).wrap());
-                            analyze |= ui.button("Retry").clicked();
-                        }
-                        ui.label(
-                            RichText::new(input.label())
-                                .font(mono(10.5))
-                                .color(theme::analysis_roles(&theme::palette()).muted),
-                        );
-                    } else {
-                        ui.add(egui::Label::new(reply).wrap());
+                if let Some(label) = details.format_label {
+                    ui.label(RichText::new(label).font(mono(10.5)).color(roles.muted));
+                }
+                if let Some(a) = &details.validated {
+                    analysis_action = show_analysis(ui, a, &roles);
+                } else {
+                    ui.add(egui::Label::new(RichText::new(&details.reply).color(roles.text)).wrap());
+                    if details.format_label.is_none() {
                         analyze |= ui.button("Retry").clicked();
                     }
-                } else {
-                    ui.label(RichText::new("Older analysis · Re-analyze").font(mono(10.5)).color(theme::muted()));
-                    ui.add(egui::Label::new(cached.reply()).wrap());
+                }
+                if let Some(label) = &details.basis_label {
+                    ui.label(RichText::new(label).font(mono(10.5)).color(roles.muted));
                 }
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!("{} · {}", cached.model, analysis_age(cached.created_at, now)))
                             .font(mono(10.5))
-                            .color(theme::analysis_roles(&theme::palette()).muted),
+                            .color(roles.muted),
                     );
                     analyze |= ui.button("Re-analyze").clicked();
                 });
@@ -670,16 +710,24 @@ fn analysis_badge(ui: &mut Ui, urgency: Urgency, r: &theme::AnalysisRoles) {
         });
 }
 fn analysis_chip(ui: &mut Ui, label: &str, ticker: bool, r: &theme::AnalysisRoles) -> bool {
-    ui.add(
-        egui::Button::new(RichText::new(label).font(mono(12.0)).color(if ticker { r.ticker } else { r.text }))
-            .fill(theme::control())
-            .stroke(egui::Stroke::NONE)
-            .corner_radius(dp(6.0) as u8),
-    )
-    .clicked()
+    ui.scope(|ui| {
+        let widgets = &mut ui.style_mut().visuals.widgets;
+        widgets.inactive.bg_fill = r.control_fill;
+        widgets.inactive.weak_bg_fill = r.control_fill;
+        widgets.hovered.bg_fill = r.control_hover;
+        widgets.hovered.weak_bg_fill = r.control_hover;
+        widgets.active.bg_fill = r.control_hover;
+        widgets.active.weak_bg_fill = r.control_hover;
+        ui.add(
+            egui::Button::new(RichText::new(label).font(mono(12.0)).color(if ticker { r.ticker } else { r.text }))
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(dp(6.0) as u8),
+        )
+        .clicked()
+    })
+    .inner
 }
-fn show_analysis(ui: &mut Ui, a: &Analysis) -> Option<AnalysisAction> {
-    let r = theme::analysis_roles(&theme::palette());
+fn show_analysis(ui: &mut Ui, a: &Analysis, r: &theme::AnalysisRoles) -> Option<AnalysisAction> {
     let mut action = None;
     ui.scope(|ui| {
         ui.style_mut().visuals.override_text_color = Some(r.text);
@@ -705,7 +753,7 @@ fn show_analysis(ui: &mut Ui, a: &Analysis) -> Option<AnalysisAction> {
                         ui.painter().rect_filled(
                             rect,
                             dp(1.0),
-                            if f64::from(cell) < a.verdict.conviction { r.text } else { theme::grid() },
+                            if f64::from(cell) < a.verdict.conviction { r.text } else { r.meter_empty },
                         );
                     }
                 });
@@ -714,13 +762,16 @@ fn show_analysis(ui: &mut Ui, a: &Analysis) -> Option<AnalysisAction> {
                 ui.label(RichText::new("inconsistent").font(mono(10.5)).color(r.attention));
             }
         });
-        let invalidation = ui.horizontal_wrapped(|ui| {
-            ui.add_space(dp(6.0));
-            ui.label(RichText::new("Proves wrong if").strong().color(r.attention));
-            ui.add(egui::Label::new(RichText::new(&a.invalidation).color(r.text)).wrap());
-        });
-        let rect = invalidation.response.rect;
-        ui.painter().line_segment([rect.left_top(), rect.left_bottom()], egui::Stroke::new(dp(2.0), r.attention_rule));
+        if !a.invalidation.is_empty() {
+            let invalidation = ui.horizontal_wrapped(|ui| {
+                ui.add_space(dp(6.0));
+                ui.label(RichText::new("Proves wrong if").strong().color(r.attention));
+                ui.add(egui::Label::new(RichText::new(&a.invalidation).color(r.text)).wrap());
+            });
+            let rect = invalidation.response.rect;
+            ui.painter()
+                .line_segment([rect.left_top(), rect.left_bottom()], egui::Stroke::new(dp(2.0), r.attention_rule));
+        }
         if !a.summary.is_empty() {
             ui.add(egui::Label::new(RichText::new(&a.summary).font(ui_font(13.0)).color(r.text)).wrap());
         }
@@ -745,7 +796,7 @@ fn show_analysis(ui: &mut Ui, a: &Analysis) -> Option<AnalysisAction> {
             ui.label(RichText::new(format!("{:.0}%", a.confidence * 100.0)).font(mono(12.0)).color(r.muted));
             ui.end_row();
             ui.label(RichText::new("Urgency").color(r.muted));
-            analysis_badge(ui, a.urgency, &r);
+            analysis_badge(ui, a.urgency, r);
             ui.end_row();
             ui.label(RichText::new("Outlook").color(r.muted));
             ui.add(egui::Label::new(RichText::new(&a.outlook).color(r.text)).wrap());
@@ -763,7 +814,7 @@ fn show_analysis(ui: &mut Ui, a: &Analysis) -> Option<AnalysisAction> {
         for risk in &a.risks {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(risk.category.label()).color(r.text));
-                analysis_badge(ui, risk.level.urgency(), &r);
+                analysis_badge(ui, risk.level.urgency(), r);
             });
             ui.add(egui::Label::new(RichText::new(&risk.note).color(r.muted)).wrap());
         }
@@ -783,7 +834,7 @@ fn show_analysis(ui: &mut Ui, a: &Analysis) -> Option<AnalysisAction> {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Topics").color(r.muted));
                 for topic in &a.topics {
-                    if analysis_chip(ui, topic, false, &r) {
+                    if analysis_chip(ui, topic, false, r) {
                         action = Some(AnalysisAction::Search(topic.clone()));
                     }
                 }
@@ -796,11 +847,11 @@ fn show_analysis(ui: &mut Ui, a: &Analysis) -> Option<AnalysisAction> {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(e.kind.label()).font(mono(10.5)).color(r.muted));
                 if !e.ticker.is_empty() {
-                    if analysis_chip(ui, &e.ticker, true, &r) {
+                    if analysis_chip(ui, &e.ticker, true, r) {
                         action = Some(AnalysisAction::Ticker(e.ticker.clone()));
                     }
                     ui.label(RichText::new(&e.name).color(r.text));
-                } else if analysis_chip(ui, &e.name, false, &r) {
+                } else if analysis_chip(ui, &e.name, false, r) {
                     action = Some(AnalysisAction::Search(e.name.clone()));
                 }
                 let detail = [&e.alias, &e.descriptor, &e.code]
@@ -1111,9 +1162,9 @@ mod tests {
         use analysis_v2::Basis;
         let mut story = cluster("Synthetic title");
         for (basis, name, cap) in [
-            (Basis::HeadlineOnly, "headline_only", "70%"),
-            (Basis::Standfirst, "standfirst", "80%"),
-            (Basis::MultiSource, "multi_source", "90%"),
+            (Basis::HeadlineOnly, "headline_only", "capped at 0.70"),
+            (Basis::Standfirst, "standfirst", "capped at 0.80"),
+            (Basis::MultiSource, "multi_source", "capped at 0.90"),
         ] {
             match basis {
                 Basis::HeadlineOnly => {}
@@ -1173,11 +1224,11 @@ mod tests {
             };
             // Grid and wrapped layout settle on the second frame.
             let mut out = ctx.run_ui(raw(), |ui| {
-                show_analysis(ui, &analysis);
+                show_analysis(ui, &analysis, &theme::analysis_roles(&theme::palette()));
             });
             out.textures_delta.clear();
             let mut out = ctx.run_ui(raw(), |ui| {
-                show_analysis(ui, &analysis);
+                show_analysis(ui, &analysis, &theme::analysis_roles(&theme::palette()));
             });
             let mut text = vec![];
             for shape in &out.shapes {
@@ -1209,7 +1260,7 @@ mod tests {
                     ];
                     let mut action = None;
                     let mut out = ctx.run_ui(raw, |ui| {
-                        action = show_analysis(ui, &analysis);
+                        action = show_analysis(ui, &analysis, &theme::analysis_roles(&theme::palette()));
                     });
                     if !pressed {
                         assert_eq!(action, Some(expected.clone()), "chip {label}");
@@ -1246,13 +1297,18 @@ mod tests {
                 "Preserved prose fallback".into(),
                 input,
             ),
+            StoryAnalysis {
+                story_id: story.lead.id.clone(),
+                model: "future-model".into(),
+                created_at: now,
+                json: serde_json::json!({"schema":3,"reply":"Future reply","input":{}}).to_string(),
+            },
         ];
         let ctx = egui::Context::default();
         for (index, cached) in rows.into_iter().enumerate() {
-            app.story_desk.details.insert(
-                story.lead.id.clone(),
-                Details { requested: true, analysis: Some(cached), ..Default::default() },
-            );
+            let mut details = Details { requested: true, ..Default::default() };
+            details.set_analysis(cached);
+            app.story_desk.details.insert(story.lead.id.clone(), details);
             let mut text = vec![];
             for _ in 0..2 {
                 let raw = egui::RawInput {
@@ -1280,10 +1336,15 @@ mod tests {
                     assert!(contains("new-model · now"));
                     assert!(!contains("Older analysis"));
                 }
-                _ => {
+                2 => {
                     assert!(contains("Preserved prose fallback"));
                     assert!(contains("Retry"));
                     assert!(contains("Based on headline + 2 summaries"));
+                }
+                _ => {
+                    assert!(contains("Newer analysis format · Re-analyze"));
+                    assert!(contains("Future reply"));
+                    assert!(!contains("Older analysis"));
                 }
             }
         }
@@ -1509,5 +1570,171 @@ mod tests {
         assert_eq!(app.panes.iter().find(|p| p.id == agent).unwrap().link, Some(Link::Orange));
         assert_eq!(app.focus, story);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distinct_input_summaries_ignore_headlines_case_whitespace_and_punctuation() {
+        let mut story = cluster("Synthetic maker cuts outlook");
+        story.members = vec![
+            review_member("Synthetic maker cuts outlook", "A", "https://a.invalid/1", "SYNTHETIC maker cuts outlook!"),
+            review_member(
+                "Synthetic maker cuts outlook",
+                "B",
+                "https://b.invalid/1",
+                " Synthetic maker   cuts outlook. ",
+            ),
+        ];
+        let input = Input::from_story(&story);
+        assert_eq!(input.input, analysis_v2::Basis::HeadlineOnly);
+        assert_eq!(input.summaries, 0);
+        story.members[0].summary = "Repairs delay deliveries.".into();
+        story.members[1].summary = " REPAIRS  delay deliveries! ".into();
+        let input = Input::from_story(&story);
+        assert_eq!(input.input, analysis_v2::Basis::Standfirst);
+        assert_eq!(input.summaries, 1);
+        assert_eq!(input.label(), "Based on headline + 1 summary");
+        story.members[1].summary = "Demand falls.".into();
+        let input = Input::from_story(&story);
+        assert_eq!(input.input, analysis_v2::Basis::MultiSource);
+        assert_eq!(input.summaries, 2);
+    }
+
+    #[test]
+    fn analysis_load_validates_once_and_rendering_reuses_palette_roles() {
+        let (mut app, root) = fixture("parse-cache");
+        let source = app.new_pane(PaneKind::News(Box::new(super::super::NewsPane::new(None))));
+        let pane = app.new_pane(PaneKind::Story { link_follow: true });
+        let story = cluster("Cached once");
+        app.note_story_focus();
+        select(&mut app, source, story.clone());
+        let (input, json) = analysis_v2::sample(1);
+        app.story_desk.details.insert(story.lead.id.clone(), Details { requested: true, ..Default::default() });
+        let before = analysis_v2::PARSE_COUNT.with(std::cell::Cell::get);
+        app.story_details_reply(
+            story.lead.id.clone(),
+            Ok((
+                Some(StoryAnalysis::v2(
+                    story.lead.id.clone(),
+                    "fixture".into(),
+                    0,
+                    json,
+                    serde_json::to_value(input).unwrap(),
+                )),
+                vec![],
+            )),
+        );
+        assert_eq!(analysis_v2::PARSE_COUNT.with(std::cell::Cell::get), before + 1);
+        let original = theme::palette();
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.story_panel(ui, pane, true));
+            output.textures_delta.clear();
+        }
+        assert_eq!(analysis_v2::PARSE_COUNT.with(std::cell::Cell::get), before + 1);
+        assert_eq!(app.story_desk.details[&story.lead.id].roles.unwrap().0, original);
+        let changed = crate::themes::terminal_light().palette(theme::DEFAULT_ACCENT);
+        theme::set_palette(changed);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.story_panel(ui, pane, true));
+        output.textures_delta.clear();
+        theme::set_palette(original);
+        assert_eq!(app.story_desk.details[&story.lead.id].roles.unwrap().0, changed);
+        assert_eq!(analysis_v2::PARSE_COUNT.with(std::cell::Cell::get), before + 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_invalidation_is_not_rendered() {
+        let (input, json) = analysis_v2::sample(1);
+        let mut a = analysis_v2::parse(&json, &input).unwrap();
+        a.invalidation.clear();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            show_analysis(ui, &a, &theme::analysis_roles(&theme::palette()));
+        });
+        let mut text = vec![];
+        for shape in &output.shapes {
+            rendered_text(&shape.shape, &mut text);
+        }
+        output.textures_delta.clear();
+        assert!(!text.iter().any(|(text, _)| text == "Proves wrong if"));
+    }
+
+    // ---- N7d independent review regressions ----
+    fn review_member(title: &str, source: &str, link: &str, summary: &str) -> Story {
+        let mut s = Story::new(
+            NewsItem {
+                title: title.into(),
+                link: link.into(),
+                ts: 1_000_000,
+                tickers: vec!["SPY US Equity".into()],
+                publisher: source.into(),
+            },
+            source,
+        );
+        s.summary = summary.into();
+        s
+    }
+    #[test]
+    fn review_n7d_duplicate_summary_inflates_basis() {
+        // Syndicated copy: two publishers deliver the SAME standfirst. That is one
+        // summary of evidence, not multi-source (which unlocks 90% / 80 words / 5 points).
+        let text = "Synthetic maker cuts delivery outlook after repairs.";
+        let mut story = cluster("Synthetic maker cuts outlook");
+        story.members = vec![
+            review_member("Synthetic maker cuts outlook", "Wire A", "https://a.invalid/1", text),
+            review_member("Synthetic maker cuts outlook", "Wire B", "https://b.invalid/1", &format!("  {text} ")),
+        ];
+        assert_eq!(Input::from_story(&story).input, analysis_v2::Basis::Standfirst);
+    }
+    #[test]
+    fn review_n7d_publisher_host_never_excludes_entity() {
+        // Finnhub falls back to source "Finnhub" when the outlet is blank; the link
+        // host is then the only publisher signal, but "reuters.com" -> "reuterscom"
+        // never matches an entity named "Reuters".
+        let mut story = cluster("Synthetic headline");
+        story.members =
+            vec![review_member("Synthetic headline", "Finnhub", "https://www.reuters.com/markets/x", "Summary.")];
+        story.sources = vec!["Finnhub".into()];
+        let input = Input::from_story(&story);
+        let (_, json) = analysis_v2::sample(1);
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["entities"] = serde_json::json!([{"type":"ORG","name":"Reuters"},{"type":"ORG","name":"Nova Fabrication"}]);
+        let a = analysis_v2::parse(&v.to_string(), &input).unwrap();
+        assert!(a.entities.iter().all(|e| e.name != "Reuters"), "{:?}", a.entities);
+    }
+    #[test]
+    fn review_n7d_percent_confidence_inflated_to_cap() {
+        // The prompt itself mentions "integer percent"; a model answering 30 (=30%)
+        // must not be displayed as the basis cap (70%).
+        let (mut input, json) = analysis_v2::sample(1);
+        input.input = analysis_v2::Basis::HeadlineOnly;
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["confidence"] = 30.into();
+        assert!(analysis_v2::parse(&v.to_string(), &input).is_none_or(|a| a.confidence <= 0.30));
+    }
+    #[test]
+    fn review_n7d_chip_ink_contrast_on_control_fill() {
+        // Chips render r.text / r.ticker on theme::control(), but the guard only
+        // measures against card.
+        let mut failures = vec![];
+        for t in crate::themes::builtins() {
+            let p = t.palette(theme::DEFAULT_ACCENT);
+            let r = theme::analysis_roles(&p);
+            // control is translucent (premultiplied): composite it over the card.
+            let a = f32::from(p.control.a()) / 255.0;
+            let over = |c: u8, b: u8| (f32::from(c) + f32::from(b) * (1.0 - a)).round().min(255.0) as u8;
+            let fill = egui::Color32::from_rgb(
+                over(p.control.r(), p.card.r()),
+                over(p.control.g(), p.card.g()),
+                over(p.control.b(), p.card.b()),
+            );
+            for (name, ink) in [("text", r.text), ("ticker", r.ticker)] {
+                let c = theme::contrast(ink, fill);
+                if c < 4.5 {
+                    failures.push(format!("{} {name} {c:.2}", t.name));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
     }
 }
