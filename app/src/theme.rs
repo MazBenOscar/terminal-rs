@@ -54,7 +54,8 @@ pub struct AnalysisRoles {
     pub alarm_fill: Color32,
     pub alarm_ink: Color32,
     pub text: Color32,
-    pub muted: Color32,
+    /// Local small-text role, readable on the card and both chip surfaces.
+    pub secondary: Color32,
     pub ticker: Color32,
     pub control_fill: Color32,
     pub control_hover: Color32,
@@ -126,14 +127,18 @@ pub fn analysis_roles(p: &Palette) -> AnalysisRoles {
     let mut control_fill = composite_over(p.control, card);
     let mut control_hover = composite_over(p.control_hover, card);
     let backgrounds = [card, control_fill, control_hover];
-    let (text, ticker) = match (analysis_chip_ink(p.text, &backgrounds), analysis_chip_ink(p.amber, &backgrounds)) {
-        (Some(text), Some(ticker)) => (text, ticker),
+    let (text, ticker, secondary) = match (
+        analysis_chip_ink(p.text, &backgrounds),
+        analysis_chip_ink(p.amber, &backgrounds),
+        analysis_chip_ink(p.muted, &backgrounds),
+    ) {
+        (Some(text), Some(ticker), Some(secondary)) => (text, ticker, secondary),
         _ => {
             // Arbitrary user palettes can have mutually incompatible surfaces.
             // In that case use the card for chips too, rather than unreadable ink.
             control_fill = card;
             control_hover = card;
-            (analysis_ink(p.text, card, 4.5), analysis_ink(p.amber, card, 4.5))
+            (analysis_ink(p.text, card, 4.5), analysis_ink(p.amber, card, 4.5), analysis_ink(p.muted, card, 4.5))
         }
     };
     AnalysisRoles {
@@ -144,7 +149,7 @@ pub fn analysis_roles(p: &Palette) -> AnalysisRoles {
         alarm_fill,
         alarm_ink: card,
         text,
-        muted: analysis_ink(p.muted, card, 4.5),
+        secondary,
         ticker,
         control_fill,
         control_hover,
@@ -509,21 +514,21 @@ mod tests {
         for t in crate::themes::builtins().into_iter().chain([poor]) {
             let p = t.palette(DEFAULT_ACCENT);
             let r = analysis_roles(&p);
-            for ink in [r.direction_up, r.direction_down, r.attention, r.text, r.muted, r.ticker] {
+            for ink in [r.direction_up, r.direction_down, r.attention, r.text, r.secondary, r.ticker] {
                 assert!(contrast(ink, p.card) >= 4.5, "{}: {ink:?}", t.name);
             }
             for ink in [r.attention_rule, r.alarm_fill] {
                 assert!(contrast(ink, p.card) >= 3.0, "{}", t.name);
             }
             for fill in [r.control_fill, r.control_hover] {
-                for ink in [r.text, r.ticker] {
+                for ink in [r.text, r.ticker, r.secondary] {
                     assert!(contrast(ink, fill) >= 4.5, "{}: chip {ink:?} on {fill:?}", t.name);
                 }
             }
             // Built-ins must retain their intended control/hover surfaces.
             let card = composite_over(p.card, composite_over(p.window, Color32::BLACK));
             for fill in [p.control, p.control_hover] {
-                for ink in [r.text, r.ticker] {
+                for ink in [r.text, r.ticker, r.secondary] {
                     assert!(contrast(ink, composite_over(fill, card)) >= 4.5, "{}: control", t.name);
                 }
             }
@@ -546,7 +551,7 @@ mod tests {
         p.card = Color32::from_rgba_unmultiplied(255, 255, 255, 30);
         let r = analysis_roles(&p);
         let card = composite_over(p.card, p.window);
-        for ink in [r.text, r.muted, r.ticker, r.direction_up, r.direction_down] {
+        for ink in [r.text, r.secondary, r.ticker, r.direction_up, r.direction_down] {
             assert!(contrast(ink, card) >= 4.5);
         }
         for fill in [r.control_fill, r.control_hover] {

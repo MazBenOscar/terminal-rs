@@ -223,6 +223,8 @@ pub(super) struct Analysis {
     pub entities: Vec<Entity>,
     #[serde(skip)]
     pub inconsistent: bool,
+    #[serde(skip)]
+    pub cut_off: bool,
 }
 fn words(s: &str, max: usize) -> String {
     s.split_whitespace().take(max).collect::<Vec<_>>().join(" ")
@@ -271,7 +273,8 @@ pub(super) fn parse(reply: &str, input: &Input) -> Option<Analysis> {
     #[cfg(test)]
     PARSE_COUNT.with(|n| n.set(n.get() + 1));
     let start = reply.find('{')?;
-    let (mut depth, mut string, mut escape) = (0, false, false);
+    let (mut string, mut escape) = (false, false);
+    let mut closers = Vec::new();
     for (offset, c) in reply[start..].char_indices() {
         if string {
             if escape {
@@ -284,10 +287,13 @@ pub(super) fn parse(reply: &str, input: &Input) -> Option<Analysis> {
         } else {
             match c {
                 '"' => string = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
+                '{' => closers.push('}'),
+                '[' => closers.push(']'),
+                '}' | ']' => {
+                    if closers.pop() != Some(c) {
+                        return None;
+                    }
+                    if closers.is_empty() {
                         let a = serde_json::from_str(&reply[start..=start + offset]).ok()?;
                         return validate(a, input);
                     }
@@ -296,7 +302,19 @@ pub(super) fn parse(reply: &str, input: &Input) -> Option<Analysis> {
             }
         }
     }
-    None
+    let tail = reply[start..].trim_end();
+    // Only close containers at EOF, never finish a token or remove garbage.
+    // A bare number at EOF is ambiguous (0.6 might have been 0.65), so refuse
+    // numeric tails even when serde could accept them as complete numbers.
+    let token_ended = tail.ends_with(['"', ']', '}', '[', '{'])
+        || ["true", "false", "null"].iter().any(|literal| tail.ends_with(literal));
+    if string || escape || closers.is_empty() || closers.len() > 8 || !token_ended {
+        return None;
+    }
+    let repaired: String = tail.chars().chain(closers.into_iter().rev()).collect();
+    let mut a = validate(serde_json::from_str(&repaired).ok()?, input)?;
+    a.cut_off = true;
+    Some(a)
 }
 fn validate(mut a: Analysis, input: &Input) -> Option<Analysis> {
     if [a.sentiment, a.intensity, a.confidence, a.verdict.conviction].iter().any(|v| !v.is_finite()) {
@@ -333,6 +351,11 @@ fn validate(mut a: Analysis, input: &Input) -> Option<Analysis> {
         r.note = words(&r.note, 18);
     }
     a.not_addressed = Category::ALL.into_iter().filter(|c| !a.risks.iter().any(|r| r.category == *c)).collect();
+    // Normalize hashtags before merging so neither the display nor the search
+    // query keeps a leading #, including mixed-case duplicates of Topics.
+    for tag in &mut a.hashtags {
+        *tag = tag.trim().trim_start_matches('#').trim().to_owned();
+    }
     a.topics.append(&mut a.hashtags);
     for topic in &mut a.topics {
         *topic = chars(topic.trim().trim_start_matches('#').trim(), 32);
@@ -427,6 +450,7 @@ CONTENT RULES
 9. Entities: ORG then PER then LOC, most salient first, no duplicates. ORG descriptor is Title Case institutional function/sector; ticker ONLY if supplied, never invented; alias only if known by it. PER bare name, LOC ISO code for city/country, none for regions/waterways. Never list publisher(s), author or news outlets.
 10. ONE FACT, ONE PLACE: every number, name and claim once. Risk can characterise but not repeat figures from summary/bullets. Preserve supplied precision. No invented winners/losers, tickers, price levels, dates, events or historical percentiles/comparisons.
 11. Terse terminal register, at most one qualifier per sentence, no chains like could potentially remain, no emoji or exclamation marks. Character maxima: verdict.asset and sentiment_subject 16; outlook and each topic 32; entity name/alias/descriptor 60; code 8.
+12. Never describe the input, the feed, the data supplied, or attached tickers. Write about the news and its market consequence only. When information is thin, say less and lower confidence instead of explaining why. Key points must be facts from the story, not observations about it. No meta-commentary such as "The feed supplies no operating mechanism" or "NVDA US Equity is the only ticker attached to the story".
 SELF-CHECK silently: verdict agrees with sentiment and outlook; invalidation concrete or absent; sentiment names asset; no repetition or invented facts; caps respected; risks <=18 words with omissions once; no publisher/author entities. Output only JSON.
 <STORY_DATA>
 {data}
@@ -491,6 +515,42 @@ mod tests {
             let a = parse(&v.to_string(), &input).unwrap();
             assert_eq!(a.risks.len(), value["risks"].as_array().unwrap().len() - 1);
         }
+    }
+    #[test]
+    fn repairs_only_missing_container_closers_at_eof_then_validates() {
+        let (input, json) = sample(1);
+        assert!(!parse(&json, &input).unwrap().cut_off);
+        let prefix = json.trim_end().strip_suffix('}').unwrap();
+        // The reported failure: entities is complete, only the outer } is absent.
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("entities");
+        let without_entities = value.to_string();
+        let reply = format!("{},\"entities\":[]", without_entities.strip_suffix('}').unwrap());
+        assert!(parse(&reply, &input).unwrap().cut_off);
+        for (suffix, accepted) in [
+            (",\"extra\":[", true),
+            (",\"extra\":{", true),
+            (",\"extra\":[[[[[[[", true),
+            (",\"extra\":[[[[[[[[", false),
+            (",\"extra\":[{\"x\":[\"complete\"", true),
+            (",\"extra\":[[[[[[[\"complete\"", true),
+            (",\"extra\":[[[[[[[[\"complete\"", false),
+            (",\"extra\":true", true),
+            (",\"extra\":fals", false),
+            (",\"extra\":\"partial", false),
+            (",\"extra\":\"escape\\", false),
+            (",\"extra\":0.6", false),
+            (",\"extra\":1e", false),
+            (",\"extra\":", false),
+            (",\"extra\":[\"complete\",", false),
+            (",\"extra\":[}", false),
+            (",\"extra\":[] garbage", false),
+            (",\"extra\":[]\n```", false),
+            (",\"urgency\":\"invalid\"", false),
+        ] {
+            assert_eq!(parse(&format!("{prefix}{suffix}"), &input).is_some(), accepted, "{suffix}");
+        }
+        assert!(parse("{\"entities\":[]", &input).is_none(), "required fields still mandatory");
     }
     #[test]
     fn clamps_precision_caps_topics_risks_exclusions_and_consistency() {
@@ -626,7 +686,7 @@ mod tests {
         let (input, json) = sample(1);
         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
         v["topics"] = serde_json::json!(["Inflation", "Policy"]);
-        v["hashtags"] = serde_json::json!(["#inflation", "#POLICY", "Rates"]);
+        v["hashtags"] = serde_json::json!(["#inflation", " #POLICY ", "##Rates", "#rAtEs", "#"]);
         v["entities"][0]["ticker"] = "NOVA".into();
         let a = parse(&v.to_string(), &input).unwrap();
         assert_eq!(a.topics, ["Inflation", "Policy", "Rates"]);

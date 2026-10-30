@@ -519,8 +519,7 @@ impl TerminalApp {
                 );
             });
             ui.add(egui::Label::new(RichText::new(&story.lead.summary).font(ui_font(13.0))).wrap());
-            ui.separator();
-            ui.label("Sources");
+            analysis_section(ui, "Sources", &roles);
             for member in &story.members {
                 let time = if member.inferred_ts {
                     "—".into()
@@ -562,7 +561,10 @@ impl TerminalApp {
                 }
             });
             ui.horizontal_wrapped(|ui| {
-                safe_link(ui, "Open", &story.lead.item.link);
+                let url = tr_data::news_store::normalize_link(&story.lead.item.link);
+                if ui.add_enabled(!url.is_empty(), egui::Button::new("Open")).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
                 if ui.button("Copy link").clicked() {
                     ui.ctx().copy_text(story.lead.item.link.clone());
                 }
@@ -572,10 +574,11 @@ impl TerminalApp {
                 save = ui
                     .button(if story.members.iter().any(|m| m.bookmark) { "Unsave story" } else { "Save story" })
                     .clicked();
-                analyze |= ui.button("Analyze").clicked();
+                if details.analysis.is_none() {
+                    analyze |= ui.button("Analyze").clicked();
+                }
             });
-            ui.separator();
-            ui.label("Analysis");
+            analysis_section(ui, "Analysis", &roles);
             let entry = self.story_desk.jobs.iter().find(|(_, j)| j.story_id == story.lead.id);
             let job = entry.map(|(_, j)| j);
             if let Some((prompt, job)) = entry {
@@ -594,7 +597,7 @@ impl TerminalApp {
                 };
                 let elapsed = waiting.as_secs();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{phase} · {elapsed}s")).font(mono(10.5)).color(theme::muted()));
+                    ui.label(RichText::new(format!("{phase} · {elapsed}s")).font(mono(10.5)).color(roles.secondary));
                     if timed_out && ui.small_button("Retry").clicked() {
                         // Replace only this waiting request; never replay another
                         // story's prompt or restart a live/checking session.
@@ -607,7 +610,9 @@ impl TerminalApp {
                 });
                 ui.ctx().request_repaint_after(Duration::from_secs(1));
             }
-            if let Some(agent) = self.story_agent(id, job.map(|j| j.agent).or(details.agent)) {
+            let needs_agent = details.error.is_some()
+                || job.is_some_and(|_| self.agent_pane.state != Onboarding::Ready || !self.agent_pane.running);
+            if needs_agent && let Some(agent) = self.story_agent(id, job.map(|j| j.agent).or(details.agent)) {
                 if self.agent_pane.state != Onboarding::Ready {
                     let state = &self.agent_pane.state;
                     let message = match state {
@@ -623,36 +628,24 @@ impl TerminalApp {
             }
             if let Some(error) = &details.error {
                 ui.add(egui::Label::new(RichText::new(error).color(theme::warn())).wrap());
-                analyze |= ui.button("Retry").clicked();
+                if details.analysis.is_none() {
+                    analyze |= ui.button("Retry").clicked();
+                }
             }
             if let Some(cached) = &details.analysis {
                 if let Some(label) = details.format_label {
-                    ui.label(RichText::new(label).font(mono(10.5)).color(roles.muted));
+                    ui.label(RichText::new(label).font(mono(10.5)).color(roles.secondary));
                 }
                 if let Some(a) = &details.validated {
                     analysis_action = show_analysis(ui, a, &roles);
                 } else {
                     ui.add(egui::Label::new(RichText::new(&details.reply).color(roles.text)).wrap());
-                    if details.format_label.is_none() {
-                        analyze |= ui.button("Retry").clicked();
-                    }
                 }
-                if let Some(label) = &details.basis_label {
-                    ui.label(RichText::new(label).font(mono(10.5)).color(roles.muted));
-                }
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!("{} · {}", cached.model, analysis_age(cached.created_at, now)))
-                            .font(mono(10.5))
-                            .color(roles.muted),
-                    );
-                    analyze |= ui.button("Re-analyze").clicked();
-                });
+                analyze |= analysis_footer(ui, cached, details.basis_label.as_deref(), now, &roles);
             }
-            ui.separator();
-            ui.label("Related");
+            analysis_section(ui, "Related", &roles);
             for row in &details.related {
-                if ui.add(egui::Button::new(&row.lead.item.title).wrap()).clicked() {
+                if related_row(ui, row, now, &roles).clicked() {
                     related = Some(row.clone());
                 }
             }
@@ -729,6 +722,63 @@ fn analysis_age(created_at: i64, now: i64) -> String {
         _ => format!("{}d ago", age / 86400),
     }
 }
+fn display_model(id: &str) -> &str {
+    let id = match id.rsplit_once('/') {
+        Some((model, "minimal" | "low" | "medium" | "high" | "xhigh" | "none")) => model,
+        _ => id,
+    };
+    id.rsplit('/').next().unwrap_or(id)
+}
+fn analysis_footer(
+    ui: &mut Ui,
+    cached: &StoryAnalysis,
+    basis: Option<&str>,
+    now: i64,
+    r: &theme::AnalysisRoles,
+) -> bool {
+    let line = [
+        basis.unwrap_or_default().to_owned(),
+        display_model(&cached.model).to_owned(),
+        analysis_age(cached.created_at, now),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ");
+    ui.add_space(dp(8.0));
+    ui.horizontal_wrapped(|ui| {
+        ui.add(egui::Label::new(RichText::new(line).font(ui_font(10.5)).color(r.secondary)).wrap())
+            .on_hover_text(&cached.model);
+        ui.small_button("Re-analyze").clicked()
+    })
+    .inner
+}
+fn related_row(ui: &mut Ui, story: &Cluster, now: i64, r: &theme::AnalysisRoles) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), dp(24.0)), egui::Sense::click());
+    if response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(rect, dp(3.0), r.control_hover);
+    }
+    // Paint within one hit target: selectable child labels would steal clicks
+    // from the row, while a button would reintroduce the heavy filled pill.
+    let painter = ui.painter().with_clip_rect(rect);
+    let mut x = rect.left();
+    let mut paint = |text: &str, font, ink, maximum: f32| {
+        let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, ink);
+        job.wrap.max_width = maximum.min((rect.right() - x).max(dp(0.0)));
+        job.wrap.max_rows = 1;
+        job.wrap.overflow_character = Some('…');
+        let galley = painter.layout_job(job);
+        let size = galley.size();
+        painter.galley(egui::pos2(x, rect.center().y - size.y * 0.5), galley, ink);
+        x += size.x + dp(4.0);
+    };
+    paint(&crate::feed_time::feed_time(story.newest, now, false).0, mono(10.5), r.secondary, dp(60.0));
+    paint("·", ui_font(10.5), r.secondary, dp(8.0));
+    paint(&story.lead.source, ui_font(10.5), r.secondary, (rect.width() * 0.24).min(dp(100.0)));
+    paint("·", ui_font(10.5), r.secondary, dp(8.0));
+    paint(&story.lead.item.title, ui_font(13.0), r.text, rect.width());
+    response.on_hover_text(&story.lead.item.title).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
 fn safe_link(ui: &mut Ui, label: &str, url: &str) {
     let normalized = tr_data::news_store::normalize_link(url);
     if !normalized.is_empty() {
@@ -742,9 +792,22 @@ enum AnalysisAction {
     Search(String),
     Ticker(String),
 }
+fn analysis_section(ui: &mut Ui, title: &str, r: &theme::AnalysisRoles) {
+    ui.add_space(dp(12.0));
+    ui.label(egui::text::LayoutJob::single_section(
+        title.to_uppercase(),
+        egui::TextFormat {
+            font_id: ui_font(10.5),
+            color: r.secondary,
+            extra_letter_spacing: dp(0.6),
+            ..Default::default()
+        },
+    ));
+    ui.add_space(dp(4.0));
+}
 fn analysis_badge(ui: &mut Ui, urgency: Urgency, r: &theme::AnalysisRoles) {
     let (ink, fill, stroke) = match urgency {
-        Urgency::Low => (r.muted, egui::Color32::TRANSPARENT, egui::Stroke::NONE),
+        Urgency::Low => (r.secondary, egui::Color32::TRANSPARENT, egui::Stroke::NONE),
         Urgency::Medium => (r.text, egui::Color32::TRANSPARENT, egui::Stroke::NONE),
         Urgency::High => (r.attention, egui::Color32::TRANSPARENT, egui::Stroke::new(dp(1.0), r.attention_rule)),
         Urgency::Breaking | Urgency::Critical => (r.alarm_ink, r.alarm_fill, egui::Stroke::NONE),
@@ -768,49 +831,119 @@ fn analysis_chip(ui: &mut Ui, label: &str, ticker: bool, r: &theme::AnalysisRole
         widgets.active.bg_fill = r.control_hover;
         widgets.active.weak_bg_fill = r.control_hover;
         ui.add(
-            egui::Button::new(RichText::new(label).font(mono(12.0)).color(if ticker { r.ticker } else { r.text }))
-                .stroke(egui::Stroke::NONE)
-                .corner_radius(dp(6.0) as u8),
+            egui::Button::new(
+                RichText::new(label).font(if ticker { mono(12.0) } else { ui_font(12.0) }).color(if ticker {
+                    r.ticker
+                } else {
+                    r.text
+                }),
+            )
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(dp(6.0) as u8),
         )
         .clicked()
     })
     .inner
+}
+/// Each row owns its full height; the value column is sized from the pane, not
+/// from a preceding cell's intrinsic width (as it was in Grid).
+fn inspector_row(ui: &mut Ui, label: &str, r: &theme::AnalysisRoles, value: impl FnOnce(&mut Ui)) -> egui::Rect {
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(dp(84.0), dp(18.0)),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                ui.add(egui::Label::new(RichText::new(label).font(ui_font(12.0)).color(r.secondary)).truncate());
+            },
+        );
+        let width = ui.available_width();
+        ui.allocate_ui_with_layout(egui::vec2(width, dp(0.0)), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(width);
+            value(ui);
+        });
+    })
+    .response
+    .rect
+}
+fn analysis_inspector(ui: &mut Ui, a: &Analysis, r: &theme::AnalysisRoles) -> Vec<egui::Rect> {
+    let mut rows = vec![];
+    rows.push(inspector_row(ui, "Sentiment", r, |ui| {
+        let color = if a.sentiment > 0.0 {
+            r.direction_up
+        } else if a.sentiment < 0.0 {
+            r.direction_down
+        } else {
+            r.text
+        };
+        let score = format!("{:+.2}", a.sentiment).replace('-', "−");
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&score, dp(0.0), egui::TextFormat::simple(mono(12.0), color));
+        job.append(
+            &format!("  {}", a.sentiment_subject),
+            dp(0.0),
+            egui::TextFormat::simple(ui_font(12.0), r.secondary),
+        );
+        ui.add(egui::Label::new(job).wrap());
+    }));
+    rows.push(inspector_row(ui, "Intensity", r, |ui| {
+        ui.label(RichText::new(format!("{:.2}", a.intensity)).font(mono(12.0)).color(r.secondary));
+    }));
+    rows.push(inspector_row(ui, "Confidence", r, |ui| {
+        ui.label(RichText::new(format!("{:.0}%", a.confidence * 100.0)).font(mono(12.0)).color(r.secondary));
+    }));
+    rows.push(inspector_row(ui, "Urgency", r, |ui| analysis_badge(ui, a.urgency, r)));
+    rows.push(inspector_row(ui, "Outlook", r, |ui| {
+        ui.add(egui::Label::new(RichText::new(&a.outlook).font(ui_font(13.0)).color(r.text)).wrap());
+    }));
+    rows
+}
+fn analysis_verdict(ui: &mut Ui, a: &Analysis, r: &theme::AnalysisRoles) {
+    let direction = match a.verdict.direction {
+        Direction::Bullish => r.direction_up,
+        Direction::Bearish => r.direction_down,
+        Direction::Neutral => r.text,
+        Direction::None => r.secondary,
+    };
+    // A single shaped line aligns the mixed UI/mono runs to one baseline.
+    let mut job = egui::text::LayoutJob::default();
+    let format =
+        |font_id, color| egui::TextFormat { font_id, color, valign: egui::Align::BOTTOM, ..Default::default() };
+    let mut word = format(ui_font(12.0), direction);
+    word.coords = egui::epaint::text::VariationCoords::new([(b"wght", 600.0)]);
+    job.append(a.verdict.direction.label(), dp(0.0), word);
+    if a.verdict.direction != Direction::None {
+        job.append(" · ", dp(0.0), format(ui_font(12.0), r.secondary));
+        job.append(&a.verdict.asset, dp(0.0), format(mono(12.0), r.ticker));
+        job.append(&format!(" · {} · ", a.verdict.horizon), dp(0.0), format(ui_font(12.0), r.secondary));
+        job.append(&format!("conviction {:.0}/10", a.verdict.conviction), dp(0.0), format(mono(12.0), r.secondary));
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.add(egui::Label::new(job).wrap());
+        if a.verdict.direction != Direction::None {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(dp(78.0), dp(6.0)), egui::Sense::hover());
+            for cell in 0..10 {
+                let square = egui::Rect::from_min_size(
+                    rect.min + egui::vec2(dp(cell as f32 * 8.0), dp(0.0)),
+                    egui::vec2(dp(6.0), dp(6.0)),
+                );
+                ui.painter().rect_filled(
+                    square,
+                    dp(0.0),
+                    if f64::from(cell) < a.verdict.conviction { r.text } else { r.meter_empty },
+                );
+            }
+        }
+    });
+    if a.inconsistent {
+        ui.label(RichText::new("inconsistent").font(ui_font(10.5)).color(r.attention));
+    }
 }
 fn show_analysis(ui: &mut Ui, a: &Analysis, r: &theme::AnalysisRoles) -> Option<AnalysisAction> {
     let mut action = None;
     ui.scope(|ui| {
         ui.style_mut().visuals.override_text_color = Some(r.text);
         ui.spacing_mut().item_spacing = egui::vec2(dp(6.0), dp(3.0));
-        ui.horizontal_wrapped(|ui| {
-            let direction = match a.verdict.direction {
-                Direction::Bullish => r.direction_up,
-                Direction::Bearish => r.direction_down,
-                Direction::Neutral => r.text,
-                Direction::None => r.muted,
-            };
-            ui.label(RichText::new(a.verdict.direction.label()).strong().color(direction));
-            if a.verdict.direction != Direction::None {
-                ui.label(RichText::new(&a.verdict.asset).font(mono(12.0)).color(r.ticker));
-                ui.label(RichText::new(&a.verdict.horizon).color(r.text));
-                ui.label(
-                    RichText::new(format!("conviction {:.0}/10", a.verdict.conviction)).font(mono(12.0)).color(r.text),
-                );
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = dp(2.0);
-                    for cell in 0..10 {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(dp(4.0), dp(9.0)), egui::Sense::hover());
-                        ui.painter().rect_filled(
-                            rect,
-                            dp(1.0),
-                            if f64::from(cell) < a.verdict.conviction { r.text } else { r.meter_empty },
-                        );
-                    }
-                });
-            }
-            if a.inconsistent {
-                ui.label(RichText::new("inconsistent").font(mono(10.5)).color(r.attention));
-            }
-        });
+        analysis_verdict(ui, a, r);
         if !a.invalidation.is_empty() {
             let invalidation = ui.horizontal_wrapped(|ui| {
                 ui.add_space(dp(6.0));
@@ -824,48 +957,27 @@ fn show_analysis(ui: &mut Ui, a: &Analysis, r: &theme::AnalysisRoles) -> Option<
         if !a.summary.is_empty() {
             ui.add(egui::Label::new(RichText::new(&a.summary).font(ui_font(13.0)).color(r.text)).wrap());
         }
-        egui::Grid::new("analysis-inspector").spacing([dp(6.0), dp(3.0)]).show(ui, |ui| {
-            ui.label(RichText::new("Sentiment").color(r.muted));
-            ui.horizontal_wrapped(|ui| {
-                let color = if a.sentiment > 0.0 {
-                    r.direction_up
-                } else if a.sentiment < 0.0 {
-                    r.direction_down
-                } else {
-                    r.text
-                };
-                ui.label(RichText::new(format!("{:+.2}", a.sentiment)).font(mono(12.0)).color(color));
-                ui.label(RichText::new(format!("({})", a.sentiment_subject)).font(mono(12.0)).color(r.muted));
-            });
-            ui.end_row();
-            ui.label(RichText::new("int").color(r.muted));
-            ui.label(RichText::new(format!("{:.2}", a.intensity)).font(mono(12.0)).color(r.muted));
-            ui.end_row();
-            ui.label(RichText::new("Confidence").color(r.muted));
-            ui.label(RichText::new(format!("{:.0}%", a.confidence * 100.0)).font(mono(12.0)).color(r.muted));
-            ui.end_row();
-            ui.label(RichText::new("Urgency").color(r.muted));
-            analysis_badge(ui, a.urgency, r);
-            ui.end_row();
-            ui.label(RichText::new("Outlook").color(r.muted));
-            ui.add(egui::Label::new(RichText::new(&a.outlook).color(r.text)).wrap());
-            ui.end_row();
-        });
+        analysis_inspector(ui, a, r);
         if !a.key_points.is_empty() {
-            ui.label(RichText::new("Key points").color(r.muted));
+            analysis_section(ui, "Key points", r);
         }
-        for point in &a.key_points {
-            ui.add(egui::Label::new(RichText::new(format!("• {point}")).color(r.text)).wrap());
+        for (index, point) in a.key_points.iter().enumerate() {
+            if index > 0 {
+                ui.add_space(dp(5.0));
+            }
+            ui.add(egui::Label::new(RichText::new(format!("• {point}")).font(ui_font(13.0)).color(r.text)).wrap());
         }
         if !a.risks.is_empty() {
-            ui.label(RichText::new("Risk signals").color(r.muted));
+            analysis_section(ui, "Risk signals", r);
         }
-        for risk in &a.risks {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(risk.category.label()).color(r.text));
+        for (index, risk) in a.risks.iter().enumerate() {
+            if index > 0 {
+                ui.add_space(dp(5.0));
+            }
+            inspector_row(ui, risk.category.label(), r, |ui| {
                 analysis_badge(ui, risk.level.urgency(), r);
+                ui.add(egui::Label::new(RichText::new(&risk.note).font(ui_font(12.0)).color(r.secondary)).wrap());
             });
-            ui.add(egui::Label::new(RichText::new(&risk.note).color(r.muted)).wrap());
         }
         ui.label(
             RichText::new(format!(
@@ -876,12 +988,12 @@ fn show_analysis(ui: &mut Ui, a: &Analysis, r: &theme::AnalysisRoles) -> Option<
                     a.not_addressed.iter().map(|c| c.label()).collect::<Vec<_>>().join(", ")
                 }
             ))
-            .font(mono(10.5))
-            .color(r.muted),
+            .font(ui_font(10.5))
+            .color(r.secondary),
         );
         if !a.topics.is_empty() {
+            analysis_section(ui, "Topics", r);
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Topics").color(r.muted));
                 for topic in &a.topics {
                     if analysis_chip(ui, topic, false, r) {
                         action = Some(AnalysisAction::Search(topic.clone()));
@@ -890,29 +1002,48 @@ fn show_analysis(ui: &mut Ui, a: &Analysis, r: &theme::AnalysisRoles) -> Option<
             });
         }
         if !a.entities.is_empty() {
-            ui.label(RichText::new("Entities").color(r.muted));
+            analysis_section(ui, "Entities", r);
         }
-        for e in &a.entities {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(e.kind.label()).font(mono(10.5)).color(r.muted));
-                if !e.ticker.is_empty() {
-                    if analysis_chip(ui, &e.ticker, true, r) {
-                        action = Some(AnalysisAction::Ticker(e.ticker.clone()));
-                    }
-                    ui.label(RichText::new(&e.name).color(r.text));
-                } else if analysis_chip(ui, &e.name, false, r) {
-                    action = Some(AnalysisAction::Search(e.name.clone()));
-                }
-                let detail = [&e.alias, &e.descriptor, &e.code]
-                    .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                if !detail.is_empty() {
-                    ui.label(RichText::new(detail).font(mono(10.5)).color(r.muted));
-                }
+        for (index, e) in a.entities.iter().enumerate() {
+            if index > 0 {
+                ui.add_space(dp(5.0));
+            }
+            ui.horizontal_top(|ui| {
+                ui.add_sized(
+                    [dp(32.0), dp(20.0)],
+                    egui::Label::new(RichText::new(e.kind.label()).font(mono(10.5)).color(r.secondary)),
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), dp(0.0)),
+                    egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                    |ui| {
+                        if !e.ticker.is_empty() {
+                            if analysis_chip(ui, &e.ticker, true, r) {
+                                action = Some(AnalysisAction::Ticker(e.ticker.clone()));
+                            }
+                            ui.label(RichText::new(&e.name).font(ui_font(12.0)).color(r.secondary));
+                        } else if analysis_chip(ui, &e.name, false, r) {
+                            action = Some(AnalysisAction::Search(e.name.clone()));
+                        }
+                        let detail = [&e.alias, &e.descriptor, &e.code]
+                            .into_iter()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        if !detail.is_empty() {
+                            ui.add(
+                                egui::Label::new(RichText::new(detail).font(ui_font(10.5)).color(r.secondary)).wrap(),
+                            );
+                        }
+                    },
+                );
             });
+        }
+        if a.cut_off {
+            ui.label(
+                RichText::new("reply was cut off — some fields may be missing").font(ui_font(10.5)).color(r.secondary),
+            );
         }
     });
     action
@@ -1366,6 +1497,14 @@ mod tests {
             let prompt = analysis_prompt(&story);
             assert!(prompt.text.contains(&format!("\"input\":\"{name}\"")));
             assert!(prompt.text.contains(cap));
+            for rule in [
+                "Never describe the input, the feed, the data supplied, or attached tickers",
+                "Write about the news and its market consequence only",
+                "say less and lower confidence instead of explaining why",
+                "Key points must be facts from the story, not observations about it",
+            ] {
+                assert!(prompt.text.contains(rule), "missing rule: {rule}");
+            }
             assert!(!prompt.text.contains("https://"));
             assert_eq!(prompt.text.matches("<STORY_DATA>").count(), 1);
             assert_eq!(prompt.text.matches("</STORY_DATA>").count(), 1);
@@ -1396,6 +1535,268 @@ mod tests {
             _ => {}
         }
     }
+    fn text_shapes<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::epaint::TextShape>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    text_shapes(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn raw_size(width: f32) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 4000.0))),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn polish_inspector_rows_never_overlap_and_sentiment_is_one_line_at_600_in_all_themes() {
+        let (input, json) = analysis_v2::sample(1);
+        let mut a = analysis_v2::parse(&json, &input).unwrap();
+        a.sentiment = -0.4;
+        a.sentiment_subject = "Google stock".into();
+        a.outlook = "near-term weakness".into();
+        let original = theme::palette();
+        for t in crate::themes::builtins() {
+            let ctx = egui::Context::default();
+            theme::configure(&ctx, &t, theme::DEFAULT_ACCENT);
+            let r = theme::analysis_roles(&theme::palette());
+            for width in [320.0, 600.0] {
+                let mut rows = vec![];
+                let mut out = ctx.run_ui(raw_size(dp(width)), |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(dp(6.0), dp(3.0));
+                    rows = analysis_inspector(ui, &a, &r);
+                });
+                for (index, row) in rows.iter().enumerate() {
+                    assert!(row.right() <= dp(width), "{} {width}: {row:?}", t.name);
+                    for next in &rows[index + 1..] {
+                        assert!(row.bottom() <= next.top(), "{} {width}: {row:?} overlaps {next:?}", t.name);
+                    }
+                }
+                let mut text = vec![];
+                for shape in &out.shapes {
+                    text_shapes(&shape.shape, &mut text);
+                }
+                let sentiment = text.iter().find(|s| s.galley.text().contains("Google stock")).unwrap();
+                assert_eq!(sentiment.galley.text(), "−0.40  Google stock");
+                if width == 600.0 {
+                    assert_eq!(sentiment.galley.rows.len(), 1, "{} sentiment", t.name);
+                }
+                let outlook = text.iter().find(|s| s.galley.text() == a.outlook).unwrap();
+                assert_eq!(outlook.galley.rows.len(), 1, "{} outlook at {width}", t.name);
+                let label = text.iter().find(|s| s.galley.text() == "Intensity").unwrap();
+                assert!(label.pos.y >= sentiment.pos.y + sentiment.galley.size().y);
+                out.textures_delta.clear();
+            }
+            theme::configure(&ctx, &crate::themes::terminal_dark(), theme::DEFAULT_ACCENT);
+        }
+        theme::set_palette(original);
+    }
+    #[test]
+    fn polish_chips_sections_badges_and_cutoff_note_use_their_font_and_color_roles() {
+        let (input, json) = analysis_v2::sample(1);
+        let mut a = analysis_v2::parse(&json, &input).unwrap();
+        a.cut_off = true;
+        let original = theme::palette();
+        for t in crate::themes::builtins()
+            .into_iter()
+            .filter(|t| matches!(t.name.as_str(), "Terminal Light" | "Bloomberg" | "Solarized Dark"))
+        {
+            let ctx = egui::Context::default();
+            theme::configure(&ctx, &t, theme::DEFAULT_ACCENT);
+            let r = theme::analysis_roles(&theme::palette());
+            for width in [320.0, 600.0] {
+                let mut out = ctx.run_ui(raw_size(dp(width)), |ui| {
+                    show_analysis(ui, &a, &r);
+                });
+                let mut text = vec![];
+                for shape in &out.shapes {
+                    text_shapes(&shape.shape, &mut text);
+                }
+                for (label, ticker) in
+                    a.topics.iter().map(|s| (s.as_str(), false)).chain(a.entities.iter().map(|e| {
+                        if e.ticker.is_empty() { (e.name.as_str(), false) } else { (e.ticker.as_str(), true) }
+                    }))
+                {
+                    let shape = text.iter().find(|s| s.galley.text() == label).unwrap();
+                    for section in &shape.galley.job.sections {
+                        assert_eq!(section.format.font_id, if ticker { mono(12.0) } else { ui_font(12.0) });
+                        assert_eq!(section.format.extra_letter_spacing, 0.0);
+                        assert_eq!(section.format.color, if ticker { r.ticker } else { r.text });
+                    }
+                }
+                for label in ["KEY POINTS", "RISK SIGNALS", "TOPICS", "ENTITIES"] {
+                    let shape = text.iter().find(|s| s.galley.text() == label).unwrap();
+                    let f = &shape.galley.job.sections[0].format;
+                    assert_eq!(f.font_id, ui_font(10.5));
+                    assert_eq!(f.color, r.secondary);
+                    assert_eq!(f.extra_letter_spacing, dp(0.6));
+                }
+                for label in ["Not addressed:", "reply was cut off"] {
+                    let shape = text.iter().find(|s| s.galley.text().starts_with(label)).unwrap();
+                    let f = &shape.galley.job.sections[0].format;
+                    assert_eq!(f.font_id, ui_font(10.5));
+                    assert_eq!(f.color, r.secondary);
+                }
+                out.textures_delta.clear();
+            }
+            theme::configure(&ctx, &crate::themes::terminal_dark(), theme::DEFAULT_ACCENT);
+        }
+        theme::set_palette(original);
+    }
+    #[test]
+    fn polish_verdict_is_one_baseline_with_ten_square_meter_cells() {
+        let (input, json) = analysis_v2::sample(1);
+        let mut a = analysis_v2::parse(&json, &input).unwrap();
+        a.verdict.asset = "GOOGL".into();
+        a.verdict.horizon = "days".into();
+        a.verdict.conviction = 4.0;
+        let ctx = egui::Context::default();
+        let r = theme::analysis_roles(&theme::palette());
+        let mut out = ctx.run_ui(raw_size(600.0), |ui| analysis_verdict(ui, &a, &r));
+        let mut text = vec![];
+        for shape in &out.shapes {
+            text_shapes(&shape.shape, &mut text);
+        }
+        let verdict = text.iter().find(|s| s.galley.text().contains("conviction 4/10")).unwrap();
+        assert_eq!(verdict.galley.rows.len(), 1);
+        let glyphs = &verdict.galley.rows[0].glyphs;
+        let baseline = glyphs.iter().find(|g| g.chr.is_ascii_alphabetic()).unwrap().pos.y;
+        assert!(glyphs.iter().filter(|g| g.chr.is_ascii_alphabetic()).all(|g| (g.pos.y - baseline).abs() < 0.1));
+        let cells: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Rect(rect) if rect.rect.size() == egui::vec2(dp(6.0), dp(6.0)) => Some(rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cells.len(), 10);
+        assert_eq!(cells.iter().filter(|c| c.fill == r.text).count(), 4);
+        for pair in cells.windows(2) {
+            assert_eq!(pair[1].rect.left() - pair[0].rect.right(), dp(2.0));
+        }
+        for cell in cells {
+            assert!(cell.rect.top() >= verdict.pos.y);
+            assert!(cell.rect.bottom() <= verdict.pos.y + verdict.galley.size().y);
+        }
+        out.textures_delta.clear();
+    }
+    #[test]
+    fn polish_related_rows_truncate_without_pills_and_keep_click_selection() {
+        let mut story = cluster("A long related headline with enough words to truncate in a narrow Story pane");
+        story.lead.source = "Fixture publisher".into();
+        let ctx = egui::Context::default();
+        let r = theme::analysis_roles(&theme::palette());
+        for width in [320.0, 600.0] {
+            let mut row_rect = egui::Rect::NOTHING;
+            let mut out = ctx.run_ui(raw_size(width), |ui| {
+                row_rect = related_row(ui, &story, story.newest, &r).rect;
+            });
+            let mut text = vec![];
+            for shape in &out.shapes {
+                text_shapes(&shape.shape, &mut text);
+            }
+            let title = text.iter().find(|s| s.galley.text() == story.lead.item.title).unwrap();
+            assert_eq!(title.galley.rows.len(), 1);
+            assert!(title.pos.x + title.galley.size().x <= row_rect.right() + 1.0);
+            assert!(
+                !out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(rect) if rect.fill == r.control_fill))
+            );
+            out.textures_delta.clear();
+            for pressed in [true, false] {
+                let pos = row_rect.center();
+                let mut raw = raw_size(width);
+                raw.events = vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ];
+                let mut selected = false;
+                let mut out = ctx.run_ui(raw, |ui| {
+                    selected = related_row(ui, &story, story.newest, &r).clicked();
+                });
+                if !pressed {
+                    assert!(selected);
+                }
+                out.textures_delta.clear();
+            }
+        }
+    }
+    #[test]
+    fn polish_actions_focus_agent_and_footer_at_narrow_and_wide_widths() {
+        let (mut app, root) = fixture("polish-controls");
+        let source = app.new_pane(PaneKind::News(Box::new(super::super::NewsPane::new(None))));
+        let pane = app.new_pane(PaneKind::Story { link_follow: true });
+        let agent = app.new_pane(PaneKind::Agent(Default::default()));
+        let story = cluster("Polished analysis controls");
+        app.note_story_focus();
+        select(&mut app, source, story.clone());
+        let (input, json) = analysis_v2::sample(1);
+        let now = chrono::Utc::now().timestamp();
+        let original = theme::palette();
+        for t in crate::themes::builtins()
+            .into_iter()
+            .filter(|t| matches!(t.name.as_str(), "Terminal Light" | "Bloomberg" | "Solarized Dark"))
+        {
+            let ctx = egui::Context::default();
+            theme::configure(&ctx, &t, theme::DEFAULT_ACCENT);
+            for width in [320.0, 600.0] {
+                for has_analysis in [false, true] {
+                    let mut details = Details { requested: true, agent: Some(agent), ..Default::default() };
+                    if has_analysis {
+                        details.set_analysis(StoryAnalysis::v2(
+                            story.lead.id.clone(),
+                            "xiami/mimo-v2.6-flash/medium".into(),
+                            now,
+                            json.clone(),
+                            serde_json::to_value(&input).unwrap(),
+                        ));
+                    }
+                    app.story_desk.details.insert(story.lead.id.clone(), details);
+                    // Even a stopped unrelated Agent must not solicit focus after success.
+                    app.agent_pane.state = Onboarding::Stopped { reason: "fixture".into(), unsafe_backend: false };
+                    let mut labels = vec![];
+                    for _ in 0..2 {
+                        let mut out = ctx.run_ui(raw_size(dp(width)), |ui| app.story_panel(ui, pane, true));
+                        labels.clear();
+                        for shape in &out.shapes {
+                            rendered_text(&shape.shape, &mut labels);
+                        }
+                        out.textures_delta.clear();
+                    }
+                    let has = |s: &str| labels.iter().any(|(t, _)| t == s);
+                    assert_eq!(has("Analyze"), !has_analysis, "{} {width}", t.name);
+                    assert!(!has("Focus Agent"), "{} {width}", t.name);
+                    assert_eq!(has("Re-analyze"), has_analysis);
+                    if has_analysis {
+                        assert!(has("Based on headline + 1 summary · mimo-v2.6-flash · now"));
+                        assert!(!labels.iter().any(|(s, _)| s.contains("xiami/")));
+                    }
+                }
+            }
+            app.story_desk.details.get_mut(&story.lead.id).unwrap().error = Some("tool attempt".into());
+            let mut out = ctx.run_ui(raw_size(dp(600.0)), |ui| app.story_panel(ui, pane, true));
+            let mut labels = vec![];
+            for shape in &out.shapes {
+                rendered_text(&shape.shape, &mut labels);
+            }
+            assert!(labels.iter().any(|(s, _)| s == "Focus Agent"));
+            out.textures_delta.clear();
+            theme::configure(&ctx, &crate::themes::terminal_dark(), theme::DEFAULT_ACCENT);
+        }
+        theme::set_palette(original);
+        assert_eq!(display_model("xiami/mimo-v2.6-flash/medium"), "mimo-v2.6-flash");
+        assert_eq!(display_model("mimo-v2.6-flash"), "mimo-v2.6-flash");
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn renderer_smoke_all_samples_and_topic_entity_ticker_click_actions() {
         for i in 0..3 {
@@ -1418,7 +1819,7 @@ mod tests {
             for shape in &out.shapes {
                 rendered_text(&shape.shape, &mut text);
             }
-            assert!(text.iter().any(|(t, _)| t == analysis.verdict.direction.label()));
+            assert!(text.iter().any(|(t, _)| t.starts_with(analysis.verdict.direction.label())));
             assert!(text.iter().any(|(t, _)| t == "Proves wrong if"));
             assert!(text.iter().any(|(t, _)| t.starts_with("Not addressed:")));
             out.textures_delta.clear();
@@ -1522,7 +1923,7 @@ mod tests {
                 }
                 2 => {
                     assert!(contains("Preserved prose fallback"));
-                    assert!(contains("Retry"));
+                    assert!(!contains("Retry"));
                     assert!(contains("Based on headline + 2 summaries"));
                 }
                 _ => {

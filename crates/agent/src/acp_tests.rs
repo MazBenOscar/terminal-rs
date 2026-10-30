@@ -108,6 +108,43 @@ async fn story_analysis_is_history_free_restores_main_and_rejects_retired_tools(
 }
 
 #[tokio::test]
+async fn story_analysis_drains_final_chunk_after_prompt_response_before_retiring_session() {
+    for close_after_chunk in [false, true] {
+        let (backend, _main_read, _main_write, _) = fake();
+        let (child, mut read, mut write, _) = attach_analysis(&backend).await;
+        let server = async {
+            let new = receive(&mut read).await;
+            send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"draining-story"}))).await;
+            let prompt = receive(&mut read).await;
+            send(
+                &mut write,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"draining-story","update":{"sessionUpdate":"agent_message_chunk",
+            "content":{"type":"text","text":"{\"entities\":[]"}}}}),
+            )
+            .await;
+            send(&mut write, crate::mcp::success(prompt["id"].clone(), json!({"stopReason":"end_turn"}))).await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert_eq!(child.rpc.session.lock().unwrap().as_deref(), Some("draining-story"));
+            // No newline: this also checks that the final scrubber tail is flushed.
+            send(
+                &mut write,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"draining-story","update":{"sessionUpdate":"agent_message_chunk",
+            "content":{"type":"text","text":"}"}}}}),
+            )
+            .await;
+            if close_after_chunk {
+                write.shutdown().await.unwrap();
+            }
+        };
+        let (result, ()) = tokio::join!(backend.analyze(TurnInput::default()), server);
+        assert_eq!(result.unwrap(), "{\"entities\":[]}");
+        assert_eq!(child.rpc.session.lock().unwrap().as_deref(), Some("fake-session"));
+    }
+}
+
+#[tokio::test]
 async fn story_analysis_tool_call_is_a_tripwire_even_for_terminal_tools() {
     let (backend, mut read, mut write, killed) = fake();
     handshake(&backend, &mut read, &mut write).await;
@@ -1132,6 +1169,7 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
         retired_sessions: Default::default(),
         cancelled_sessions: Default::default(),
         analysis: AtomicBool::new(false),
+        analysis_done: Default::default(),
         turn: Default::default(),
         text: Default::default(),
         message_segment: AtomicU64::new(0),

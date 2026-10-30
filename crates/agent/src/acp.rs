@@ -100,6 +100,8 @@ struct Rpc {
     /// Canary sessions abandoned mid-turn for a retry: late tool traffic still trips.
     cancelled_sessions: Mutex<crate::BoundedIds<String>>,
     analysis: AtomicBool,
+    /// Acknowledged story turn awaiting its bounded trailing-message drain.
+    analysis_done: Mutex<Option<(String, Option<String>, AgentEvent)>>,
     turn: Mutex<String>,
     text: Mutex<StreamScrubber>,
     message_segment: AtomicU64,
@@ -253,7 +255,7 @@ impl Rpc {
         tokio::time::sleep(Duration::from_millis(20)).await;
         self.stop(reason);
     }
-    async fn route(&self, value: Value) -> Result<()> {
+    async fn route(self: &Arc<Self>, value: Value) -> Result<()> {
         if value["jsonrpc"] != "2.0"
             || value.get("method").is_some_and(|method| !method.is_string())
             || value.get("id").is_some_and(|id| !id.is_string() && !id.is_number())
@@ -282,12 +284,27 @@ impl Rpc {
                 // Finish on the reader as well: a prompt response and EOF in
                 // one read must queue final text + Done before the closed error.
                 if let Some(turn) = request.prompt_turn {
-                    self.finish_chunks();
-                    self.busy.store(false, Ordering::SeqCst);
                     let failed = value.get("error").is_some();
-                    self.emit(AgentEvent::Done(json!({"turnId":turn,"turn":{"id":turn,
+                    let done = AgentEvent::Done(json!({"turnId":turn,"turn":{"id":turn,
                         "status":if failed {"failed"} else {"completed"},"stopReason":value["result"]["stopReason"]},
-                        "error":if failed {Some("mimo ACP rejected request; you can send another prompt")} else {None}})));
+                        "error":if failed {Some("mimo ACP rejected request; you can send another prompt")} else {None}}));
+                    if self.analysis.load(Ordering::SeqCst) && turn.starts_with("story-") {
+                        // mimo can acknowledge the prompt before its last message
+                        // update. Keep the session registered and the reader free
+                        // to route those chunks, including an unterminated line.
+                        // A fixed deadline bounds the drain even under traffic.
+                        let rpc = self.clone();
+                        let session = self.session.lock().unwrap().clone();
+                        *self.analysis_done.lock().unwrap() = Some((turn.clone(), session, done));
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            rpc.finish_analysis_drain(Some(&turn));
+                        });
+                    } else {
+                        self.finish_chunks();
+                        self.busy.store(false, Ordering::SeqCst);
+                        self.emit(done);
+                    }
                 }
                 let result = if let Some(error) = value.get("error") {
                     // Classify without forwarding provider payloads (which may contain secrets).
@@ -484,6 +501,20 @@ impl Rpc {
     fn message_id(&self) -> String {
         format!("{}-message-{}", self.turn.lock().unwrap(), self.message_segment.load(Ordering::Relaxed))
     }
+    fn finish_analysis_drain(&self, expected_turn: Option<&str>) {
+        let mut pending = self.analysis_done.lock().unwrap();
+        if expected_turn.is_some_and(|expected| pending.as_ref().is_none_or(|(turn, _, _)| turn != expected)) {
+            return;
+        }
+        if let Some((turn, session, done)) = pending.take() {
+            let current = *self.session.lock().unwrap() == session && *self.turn.lock().unwrap() == turn;
+            if current {
+                self.finish_chunks();
+                self.busy.store(false, Ordering::SeqCst);
+                self.emit(done);
+            }
+        }
+    }
     fn finish_chunks(&self) {
         let turn = self.turn.lock().unwrap().clone();
         let text = self.text.lock().unwrap().finish();
@@ -624,6 +655,7 @@ impl AcpBackend {
             retired_sessions: Default::default(),
             cancelled_sessions: Default::default(),
             analysis: AtomicBool::new(false),
+            analysis_done: Default::default(),
             turn: Default::default(),
             text: Default::default(),
             message_segment: AtomicU64::new(0),
@@ -656,6 +688,11 @@ impl AcpBackend {
             loop {
                 let line = tokio::select! { biased; _ = closed.changed() => break, line = crate::mcp::read_line(&mut read) => line };
                 let Ok(Some(line)) = line else {
+                    // A clean EOF after the stop response proves no chunks remain.
+                    // Preserve the queued answer before the closed diagnostic.
+                    if matches!(line, Ok(None)) {
+                        reader.finish_analysis_drain(None);
+                    }
                     reader.stop("mimo ACP child exited or read failed");
                     break;
                 };
@@ -1112,6 +1149,10 @@ impl AcpBackend {
         impl Drop for Restore<'_> {
             fn drop(&mut self) {
                 let rpc = &self.0.rpc;
+                // Serialize retirement with the drain timer/EOF flush. A cancelled
+                // turn must never flush its tail into the next analysis session.
+                let mut draining = rpc.analysis_done.lock().unwrap();
+                *draining = None;
                 let current = rpc.session.lock().unwrap().clone();
                 if current != self.1 {
                     rpc.notify_cancel();
@@ -1164,8 +1205,8 @@ impl AcpBackend {
                 None,
             );
             tokio::pin!(prompt);
-            // The reader emits final scrubbed chunks and Done before resolving
-            // the prompt RPC. Keep collecting until Done, including rejection.
+            // The prompt RPC can resolve before the reader's bounded tail drain.
+            // Keep collecting until its final scrubbed chunks + Done, including rejection.
             let reply = crate::analysis_reply(&mut events);
             tokio::pin!(reply);
             tokio::select! {
