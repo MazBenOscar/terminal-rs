@@ -44,6 +44,66 @@ impl Palette {
     }
 }
 
+/// Contrast-guarded roles local to the analysis inspector; no theme fields added.
+#[derive(Debug, Clone, Copy)]
+pub struct AnalysisRoles {
+    pub direction_up: Color32,
+    pub direction_down: Color32,
+    pub attention: Color32,
+    pub attention_rule: Color32,
+    pub alarm_fill: Color32,
+    pub alarm_ink: Color32,
+    pub text: Color32,
+    pub muted: Color32,
+    pub ticker: Color32,
+}
+fn luminance(c: Color32) -> f64 {
+    let channel = |v: u8| {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+}
+pub fn contrast(a: Color32, b: Color32) -> f64 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+/// Move toward the better lightness endpoint without rotating hue. The finite
+/// search includes both endpoints, including pathological mid-grey user cards.
+fn analysis_ink(color: Color32, background: Color32, minimum: f64) -> Color32 {
+    let [r, g, b, _] = color.to_srgba_unmultiplied();
+    let color = Color32::from_rgb(r, g, b);
+    if contrast(color, background) >= minimum {
+        return color;
+    }
+    let endpoint =
+        if contrast(Color32::BLACK, background) > contrast(Color32::WHITE, background) { 0.0 } else { 255.0 };
+    for step in 1..=255 {
+        let mix = |v: u8| (f64::from(v) + (endpoint - f64::from(v)) * f64::from(step) / 255.0).round() as u8;
+        let adjusted = Color32::from_rgb(mix(r), mix(g), mix(b));
+        if contrast(adjusted, background) >= minimum {
+            return adjusted;
+        }
+    }
+    unreachable!("black or white always reaches 4.5:1")
+}
+pub fn analysis_roles(p: &Palette) -> AnalysisRoles {
+    let attention = if contrast(p.amber, p.text) < 1.5 { p.cyan } else { p.amber };
+    // 4.5 also guarantees card-coloured ink on the alarm fill is readable.
+    let alarm_fill = analysis_ink(p.down, p.card, 4.5);
+    AnalysisRoles {
+        direction_up: analysis_ink(p.up, p.card, 4.5),
+        direction_down: analysis_ink(p.down, p.card, 4.5),
+        attention: analysis_ink(attention, p.card, 4.5),
+        attention_rule: analysis_ink(attention, p.card, 3.0),
+        alarm_fill,
+        alarm_ink: p.card,
+        text: analysis_ink(p.text, p.card, 4.5),
+        muted: analysis_ink(p.muted, p.card, 4.5),
+        ticker: analysis_ink(p.amber, p.card, 4.5),
+    }
+}
+
 /// macOS default (blue) accent, used when the system does not report one.
 pub const DEFAULT_ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
 
@@ -393,6 +453,24 @@ mod tests {
         });
         out.textures_delta.clear();
         assert!(missing.is_empty(), "Unsupported UI literals:\n{}", missing.join("\n"));
+    }
+
+    #[test]
+    fn analysis_contrast_guard_covers_all_builtins_and_poor_user_colors() {
+        let poor = crate::themes::Theme::parse(r##"{"name":"Poor user","colors":{"panel":"#808080","text":"#818181","muted":"#828282","highlight":"#818181","up":"#818281","down":"#828181","info":"#818282"}}"##, true).unwrap();
+        for t in crate::themes::builtins().into_iter().chain([poor]) {
+            let p = t.palette(DEFAULT_ACCENT);
+            let r = analysis_roles(&p);
+            for ink in [r.direction_up, r.direction_down, r.attention, r.text, r.muted, r.ticker] {
+                assert!(contrast(ink, p.card) >= 4.5, "{}: {ink:?}", t.name);
+            }
+            for ink in [r.attention_rule, r.alarm_fill] {
+                assert!(contrast(ink, p.card) >= 3.0, "{}", t.name);
+            }
+            assert!(contrast(r.alarm_ink, r.alarm_fill) >= 4.5, "{}", t.name);
+            let source = if contrast(p.amber, p.text) < 1.5 { p.cyan } else { p.amber };
+            assert_eq!(r.attention, analysis_ink(source, p.card, 4.5));
+        }
     }
 
     #[test]
