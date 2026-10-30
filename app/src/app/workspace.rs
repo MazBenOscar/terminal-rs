@@ -1010,6 +1010,10 @@ impl TerminalApp {
             return;
         }
         self.apply_doc(doc);
+        if dashboard.headline_tape && !self.prefs.headline_tape {
+            self.prefs.headline_tape = true;
+            self.save_prefs();
+        }
         self.save_layout();
         self.save_settings();
         self.status = format!("New workspace {:?}", self.layout_name);

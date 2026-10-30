@@ -100,7 +100,7 @@ pub fn muted() -> Color32 {
 pub fn amber() -> Color32 {
     palette().amber
 }
-/// Warning emphasis uses the theme's amber role (there is no separate palette slot).
+/// Warning ink uses the theme's amber role (also used by urgent news pills).
 pub fn warn() -> Color32 {
     amber()
 }

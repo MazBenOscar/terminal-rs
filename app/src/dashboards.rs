@@ -11,19 +11,22 @@ pub struct Dashboard {
     pub name: &'static str,
     pub description: &'static str,
     pub build: fn(&PanelDefaults) -> LayoutDoc,
+    /// Turn the app-level headline tape on when this dashboard opens.
+    pub headline_tape: bool,
 }
 pub const ALL: &[Dashboard] = &[Dashboard {
     id: "NEWS",
     name: "News desk",
     description: "Market headlines, story inspector and linked SPY chart",
     build: news_desk,
+    headline_tape: true,
 }];
 fn news_desk(defaults: &PanelDefaults) -> LayoutDoc {
     let news = NewsSettings {
         filters: tr_data::news_store::Filters { scope: tr_data::news_store::Scope::All, ..Default::default() },
+        flash_high: true,
         ..Default::default()
     };
-    // TODO(n7b): enable the News FLASH field and workspace headline-tape field when available.
     let mut doc = LayoutDoc::preset(
         "News desk",
         Layout::MainRight2,
@@ -57,9 +60,10 @@ mod tests {
         assert_eq!(shares, &[0.64, 0.36]);
         assert!(matches!(&children[1], Node::Split { dir: Dir::Column, shares, .. } if shares == &[0.62,0.38]));
         assert!(
-            matches!(&doc.panes[0].settings, PaneSettings::News(Some(n)) if n.filters.scope == tr_data::news_store::Scope::All && !n.display.wire)
+            matches!(&doc.panes[0].settings, PaneSettings::News(Some(n)) if n.filters.scope == tr_data::news_store::Scope::All && !n.display.wire && n.flash_high)
         );
         assert!(matches!(&doc.panes[2].settings, PaneSettings::Chart { symbol, .. } if symbol == "SPY US Equity"));
+        assert!(ALL[0].headline_tape);
         assert_eq!(LayoutDoc::from_json(&doc.to_json()).unwrap(), doc);
         assert_eq!(
             serde_json::from_str::<PaneSettings>(r#"{"Story":{}}"#).unwrap(),

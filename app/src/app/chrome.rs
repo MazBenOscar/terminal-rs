@@ -253,6 +253,12 @@ impl TerminalApp {
             self.show_perf = !self.show_perf;
             ui.close();
         }
+        if ui.checkbox(&mut self.prefs.headline_tape, "Headline tape").changed() {
+            changed = true;
+        }
+        if ui.checkbox(&mut self.prefs.reduce_motion, "Reduce motion").changed() {
+            changed = true;
+        }
         if ui.button("Settings…").clicked() {
             self.apply(Function::Settings);
             ui.close();

@@ -212,6 +212,9 @@ pub struct NewsPane {
     pub fetched: Option<Instant>,
     pub query: Option<crate::worker::NewsView>,
     pub display: news_view::Display,
+    /// N7b: public so dashboard presets can opt in.
+    pub flash_high: bool,
+    pub last_focused: Option<Instant>,
     pub interaction: news_view::Interaction,
     pub seen_queue: Vec<String>,
     pub bookmark_queue: Vec<(Vec<String>, bool)>,
@@ -238,6 +241,8 @@ impl NewsPane {
             fetched: None,
             query: None,
             display: Default::default(),
+            flash_high: false,
+            last_focused: None,
             interaction: Default::default(),
             seen_queue: vec![],
             bookmark_queue: vec![],
@@ -277,6 +282,7 @@ impl NewsPane {
                 item.bookmark = *saved;
             }
         }
+        self.interaction.flash.observe(&items, chrono::Utc::now().timestamp());
         self.item_revision = self.item_revision.wrapping_add(1);
         if self.paused {
             if !items.is_empty() {
@@ -482,13 +488,16 @@ impl PaneKind {
             PaneKind::Search { query } => PaneSettings::Search(query.clone()),
             // N1b
             PaneKind::News(n) => PaneSettings::News(
-                (n.symbol.is_some() || n.filters != Default::default() || n.display != Default::default()).then(|| {
-                    crate::layouts::NewsSettings {
+                (n.symbol.is_some()
+                    || n.filters != Default::default()
+                    || n.display != Default::default()
+                    || n.flash_high)
+                    .then(|| crate::layouts::NewsSettings {
                         symbol: n.symbol.clone(),
                         filters: n.filters.clone(),
                         display: n.display.clone(),
-                    }
-                }),
+                        flash_high: n.flash_high,
+                    }),
             ),
             // N1b
             // N2
@@ -577,6 +586,7 @@ impl PaneKind {
                 let mut pane = NewsPane::new(saved.symbol);
                 pane.filters = saved.filters;
                 pane.display = saved.display;
+                pane.flash_high = saved.flash_high;
                 PaneKind::News(Box::new(pane))
             }
             // N1b
@@ -1018,6 +1028,7 @@ pub struct TerminalApp {
     // N1a
     news_subscription: Option<(Vec<crate::worker::NewsView>, Vec<String>)>,
     news_delivery: u64,
+    headline_tape: news_view::Tape,
     news_generations: std::collections::BTreeMap<PaneId, u64>,
     // N1a
     watchlist_undo: Option<(Instant, Vec<String>, Vec<String>)>,
@@ -1266,6 +1277,7 @@ impl TerminalApp {
             // N1a
             news_subscription: None,
             news_delivery: 0,
+            headline_tape: Default::default(),
             news_generations: Default::default(),
             // N1a
             watchlist_undo: None,
@@ -3427,7 +3439,7 @@ impl eframe::App for TerminalApp {
             if let Some([r, g, b]) = tr_macos::accent_color() {
                 self.system_accent = Color32::from_rgb(r, g, b);
             }
-            anim::set_reduced(tr_macos::reduce_motion());
+            anim::set_reduced(self.prefs.reduce_motion || tr_macos::reduce_motion());
             self.last_accent_poll = Some(Instant::now());
         }
         self.system_theme = ctx.system_theme();
@@ -3463,10 +3475,11 @@ impl eframe::App for TerminalApp {
         ui.painter().rect_filled(main, 0.0, theme::window());
         let toolbar = Rect::from_min_size(main.min, vec2(main.width(), self.toolbar_h()));
         let status = Rect::from_min_max(pos2(main.left(), main.bottom() - STATUS_H), main.max);
+        let tape_height = self.show_headline_tape(ui, Rect::from_min_max(main.min, pos2(main.right(), status.top())));
         let gap = theme::dp(6.0);
         let area = Rect::from_min_max(
             pos2(main.left() + gap, toolbar.bottom() + gap),
-            pos2(main.right() - gap, status.top() - gap * 0.5),
+            pos2(main.right() - gap, status.top() - tape_height - gap * 0.5),
         );
 
         if self.symbol_search.is_none() {
@@ -3681,6 +3694,7 @@ impl TerminalApp {
             // N1a
             news_subscription: None,
             news_delivery: 0,
+            headline_tape: Default::default(),
             news_generations: Default::default(),
             // N1a
             watchlist_undo: None,
