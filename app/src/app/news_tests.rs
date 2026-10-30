@@ -1,6 +1,341 @@
 use super::*;
 
 #[test]
+fn n6b_keyword_chip_reducer_adds_without_enabling_and_legacy_json_loads() {
+    let mut pane = visible_pane();
+    let mut watches = vec![];
+    keyword_click(&mut pane, watches.len());
+    assert!(pane.interaction.keyword_add_open);
+    assert!(!pane.display.watch_hits);
+    pane.interaction.keyword_input = "  \"rate cut\"  ".into();
+    add_keyword(&mut pane, &mut watches);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].words, "\"rate cut\"");
+    assert!(!pane.display.watch_hits);
+    assert!(!pane.interaction.keyword_add_open);
+    assert!(pane.interaction.save_watches);
+    keyword_click(&mut pane, watches.len());
+    assert!(pane.display.watch_hits);
+    keyword_click(&mut pane, watches.len());
+    assert!(!pane.display.watch_hits);
+    pane.interaction.keyword_input = "   ".into();
+    add_keyword(&mut pane, &mut watches);
+    assert_eq!(watches.len(), 1, "ignore blank additions");
+    let old: crate::layouts::NewsSettings =
+        serde_json::from_str(r#"{"symbol":null,"display":{"watch_hits":true}}"#).unwrap();
+    assert!(old.display.watch_hits);
+    assert!(!old.display.wire);
+    assert!(serde_json::to_string(&old).unwrap().contains("\"watch_hits\":true"));
+}
+
+#[test]
+fn n6b_zero_keyword_popover_enter_saves_and_escape_cancels() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    let mut watches = vec![];
+    let frame = |pane: &mut NewsPane, watches: &mut Vec<KeywordWatch>, events| {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                show(ui, pane, &[], watches, true, None, 0);
+            },
+        );
+        output.textures_delta.clear();
+        output
+    };
+    let output = frame(&mut pane, &mut watches, vec![]);
+    let position = text_shapes(&output).iter().find(|(s, _)| s == "Keywords 0").unwrap().1 + egui::vec2(3.0, 3.0);
+    let click = |pressed| egui::Event::PointerButton {
+        pos: position,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    frame(&mut pane, &mut watches, vec![egui::Event::PointerMoved(position), click(true)]);
+    frame(&mut pane, &mut watches, vec![click(false)]);
+    assert!(pane.interaction.keyword_add_open);
+    assert!(!pane.display.watch_hits);
+    frame(&mut pane, &mut watches, vec![]);
+    frame(&mut pane, &mut watches, vec![egui::Event::Text("inflation".into())]);
+    assert_eq!(pane.interaction.keyword_input, "inflation");
+    frame(&mut pane, &mut watches, key_event(egui::Key::Enter));
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].words, "inflation");
+    assert!(!pane.display.watch_hits);
+    assert!(pane.interaction.save_watches);
+    watches.clear();
+    frame(&mut pane, &mut watches, vec![egui::Event::PointerMoved(position), click(true)]);
+    frame(&mut pane, &mut watches, vec![click(false)]);
+    frame(&mut pane, &mut watches, key_event(egui::Key::Escape));
+    assert!(!pane.interaction.keyword_add_open);
+    assert!(watches.is_empty());
+    assert!(!pane.display.watch_hits);
+}
+
+#[test]
+fn n6b_empty_state_names_keywords_and_all_active_causes() {
+    let mut pane = visible_pane();
+    pane.display.watch_hits = true;
+    assert_eq!(filtered_empty_text(&pane, 1), "No stories match your 1 keyword");
+    assert_eq!(filtered_empty_text(&pane, 2), "No stories match your 2 keywords");
+    pane.filters.search = "absent".into();
+    pane.filters.sources = vec!["Reuters".into()];
+    pane.filters.categories = vec!["tech".into()];
+    pane.filters.saved = true;
+    pane.filters.include = "earnings".into();
+    pane.filters.exclude = "rumor".into();
+    pane.display.unread = true;
+    for keyword_filter in [true, false] {
+        pane.display.watch_hits = keyword_filter;
+        let text = filtered_empty_text(&pane, 2);
+        for cause in [
+            "Search: absent",
+            "Sources: Reuters",
+            "Categories: TECH",
+            "Saved only",
+            "Include any: earnings",
+            "Exclude any: rumor",
+            "Unread only",
+        ] {
+            assert!(text.contains(cause), "{text}");
+        }
+        assert!(!text.contains("days"), "do not blame date range for other filters");
+    }
+    pane.display.watch_hits = true;
+    let ctx = egui::Context::default();
+    let (output, _) = ui_frame(&ctx, &mut pane, 1800.0, vec![], false);
+    assert!(text_shapes(&output).iter().any(|(s, _)| s.starts_with("No stories match your 0 keywords")));
+    let clear = text_shapes(&output).into_iter().find(|(s, _)| s == "Clear filters").unwrap().1;
+    click_at(&ctx, &mut pane, clear + egui::vec2(3.0, 3.0));
+    assert!(!pane.display.watch_hits && !pane.display.unread);
+    assert!(pane.filters.sources.is_empty() && pane.filters.categories.is_empty());
+}
+
+#[test]
+fn n6b_status_counts_enabled_sources_pauses_and_latest_success() {
+    let now = 100_000;
+    let mut sources = vec![];
+    for (name, status, updated) in [
+        ("Finnhub", "OK", now - 500),
+        ("Yahoo", "Quiet", now - 120),
+        ("BBC", "Paused until 14:32", now - 600),
+        ("SEC", "Off", now),
+    ] {
+        sources.push(SourceStatus {
+            name: name.into(),
+            status: status.into(),
+            reason: None,
+            newest: Some(now - 7200),
+            updated: Some(updated),
+        });
+    }
+    assert_eq!(aggregate_status(&sources, now), "3 sources · 1 paused · updated 2m ago");
+    assert_eq!(sources[2].line(now), "BBC · Paused until 14:32 · newest 2h ago");
+    sources[0].status = "Paused".into();
+    assert_eq!(aggregate_status(&sources, now), "3 sources · 2 paused · updated 2m ago");
+    assert_eq!(aggregate_status(&[], now), "0 sources · not updated yet");
+    sources[0].status = "OK".into();
+    sources[2].status = "Pending".into();
+    assert_eq!(aggregate_status(&sources, now), "3 sources · 1 pending · updated 2m ago");
+    sources[2].status = "Quiet".into();
+    assert_eq!(aggregate_status(&sources, now), "3 sources · updated 2m ago");
+}
+
+#[test]
+fn n6b_sources_are_publishers_only_without_changing_saved_provider_filters() {
+    let mut pane = visible_pane();
+    pane.items[0].source = "Reuters".into();
+    pane.items[0].provider = "finnhub".into();
+    pane.items[0].sources = vec!["Reuters".into(), "rss".into()];
+    pane.items[0].category = "macro".into();
+    pane.items[1].category = "crypto".into();
+    pane.items[1].source = "CoinDesk".into();
+    pane.items[1].provider = "CoinDesk".into();
+    pane.filters.sources =
+        vec!["finnhub".into(), "yahoo".into(), "rss".into(), "sec-press".into(), "Saved publisher".into()];
+    let before = pane.filters.sources.clone();
+    let sources = publisher_sources(&pane);
+    for publisher in ["Reuters", "CoinDesk", "Saved publisher"] {
+        assert!(sources.contains(publisher));
+    }
+    for provider in ["finnhub", "yahoo", "rss", "sec-press"] {
+        assert!(!sources.contains(provider));
+    }
+    pane.filters.sources = vec!["finnhub".into()];
+    assert!(tr_data::news_store::matches(&pane.items[0], &current_query(&pane, chrono::Utc::now().timestamp())));
+    pane.filters.sources = before.clone();
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        filters(ui, &mut pane, &mut vec![], false, 0);
+    });
+    output.textures_delta.clear();
+    assert_eq!(pane.filters.sources, before);
+    let labels = text_shapes(&output);
+    let sources_y = labels.iter().find(|(s, _)| s == "Sources").unwrap().1.y;
+    for category in ["MACRO", "CRYPTO"] {
+        assert!(labels.iter().any(|(s, p)| s == category && p.y > sources_y), "publisher category heading: {category}");
+    }
+}
+
+#[test]
+fn n6b_selected_legacy_sources_are_visible_above_publishers_and_individually_removable() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.items[0].source = "Reuters".into();
+    pane.filters.sources = vec!["finnhub".into(), "rss".into(), "Reuters".into()];
+    // Active legacy entries remain visible even when the publisher search hides them.
+    pane.interaction.source_filter = "Reuters".into();
+    let frame = |pane: &mut NewsPane, events| {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 1000.0))),
+                ..Default::default()
+            },
+            |ui| filters(ui, pane, &mut vec![], false, 0),
+        );
+        output.textures_delta.clear();
+        output
+    };
+    let output = frame(&mut pane, vec![]);
+    let labels = text_shapes(&output);
+    let finnhub = labels.iter().find(|(s, _)| s == "finnhub (legacy)").unwrap().1;
+    let rss = labels.iter().find(|(s, _)| s == "rss (legacy)").unwrap().1;
+    let reuters = labels.iter().find(|(s, p)| s == "Reuters" && p.y > rss.y).unwrap().1;
+    assert!(finnhub.y < reuters.y && rss.y < reuters.y);
+    let position = finnhub + egui::vec2(3.0, 3.0);
+    let click = |pressed| egui::Event::PointerButton {
+        pos: position,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    frame(&mut pane, vec![egui::Event::PointerMoved(position), click(true)]);
+    frame(&mut pane, vec![click(false)]);
+    assert_eq!(pane.filters.sources, ["rss", "Reuters"]);
+}
+
+#[test]
+fn n6b_w_requires_selection_and_respects_pane_and_search_focus() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    assert!(pane.interaction.selected.is_none());
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::W), true);
+    assert!(!pane.display.wire, "unselected W belongs to type-anywhere");
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::ArrowDown), true);
+    assert!(pane.interaction.selected.is_some());
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::W), false);
+    assert!(!pane.display.wire);
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::W), true);
+    assert!(pane.display.wire);
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::W), true);
+    assert!(!pane.display.wire);
+    ui_frame(&ctx, &mut pane, 600.0, key_event(egui::Key::Slash), true);
+    ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    let mut typing = key_event(egui::Key::W);
+    typing.push(egui::Event::Text("w".into()));
+    ui_frame(&ctx, &mut pane, 600.0, typing, true);
+    assert_eq!(pane.filters.search, "w");
+    assert!(!pane.display.wire);
+    assert!(NEWS_SHORTCUTS.contains(&("W", "Stories / Wire (selected row)")));
+}
+
+#[test]
+fn n6b_filters_count_only_hidden_header_chips() {
+    for width in [320.0, 359.0, 360.0, 600.0] {
+        let ctx = egui::Context::default();
+        let mut pane = visible_pane();
+        pane.display.unread = true;
+        pane.display.watch_hits = true;
+        let (output, _) = ui_frame(&ctx, &mut pane, width, vec![], false);
+        let labels = text_shapes(&output);
+        let count = if width < 360.0 { 2 } else { 0 };
+        assert!(labels.iter().any(|(s, _)| s == &format!("Filters ({count})")));
+        assert_eq!(labels.iter().any(|(s, _)| s == "Unread 0"), width >= 360.0);
+        assert_eq!(labels.iter().any(|(s, _)| s == "Keywords 0"), width >= 360.0);
+    }
+}
+
+#[test]
+fn n6b_category_meta_is_market_only_wide_and_mixed_category() {
+    for (scope, width, single, visible) in [
+        (Scope::All, 1800.0, false, true),
+        (Scope::All, 1800.0, true, false),
+        (Scope::All, 320.0, false, false),
+        (Scope::Watchlist, 1800.0, false, false),
+    ] {
+        let ctx = egui::Context::default();
+        let mut pane = visible_pane();
+        pane.filters.scope = scope;
+        for item in &mut pane.items {
+            item.category = "tech".into();
+            item.source = "Reuters".into();
+        }
+        if single {
+            pane.filters.categories = vec!["tech".into()];
+        }
+        let (output, _) = ui_frame(&ctx, &mut pane, width, vec![], false);
+        assert_eq!(text_shapes(&output).iter().any(|(s, _)| s.starts_with("TECH · Reuters")), visible);
+    }
+    for (category, code) in [
+        ("general", "MKT"),
+        ("markets", "MKT"),
+        ("macro", "MACRO"),
+        ("regulatory", "REG"),
+        ("geopolitics", "GEO"),
+        ("tech", "TECH"),
+        ("crypto", "CRYPTO"),
+    ] {
+        assert_eq!(category_code(category), code);
+    }
+}
+
+#[test]
+fn n6b_selected_w_capture_respects_app_text_focus() {
+    use super::super::{PaneKind, TerminalApp};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/news-wire-key");
+    let (worker, _requests) = crate::worker::Worker::recording();
+    let mut app = TerminalApp::isolated_workspace(&root, worker);
+    let mut pane = visible_pane();
+    pane.interaction.selected = Some(pane.items[0].id.clone());
+    let id = app.new_pane(PaneKind::News(Box::new(pane)));
+    app.focus = id;
+    let ctx = egui::Context::default();
+    let typing = || {
+        let mut events = key_event(egui::Key::W);
+        events.push(egui::Event::Text("w".into()));
+        events
+    };
+    let mut output = ctx.run_ui(egui::RawInput { events: typing(), ..Default::default() }, |ui| app.hotkeys(ui.ctx()));
+    output.textures_delta.clear();
+    assert!(app.cmd.is_empty());
+    let i = app.idx(id).unwrap();
+    let PaneKind::News(n) = &mut app.panes[i].kind else { panic!() };
+    assert_eq!(n.interaction.pending_keys, [egui::Key::W]);
+    n.interaction.pending_keys.clear();
+    let mut text = String::new();
+    let input_id = egui::Id::new("n6b-wire-typing");
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ui.add(egui::TextEdit::singleline(&mut text).id(input_id)).request_focus();
+    });
+    output.textures_delta.clear();
+    let mut output = ctx.run_ui(egui::RawInput { events: typing(), ..Default::default() }, |ui| {
+        app.hotkeys(ui.ctx());
+        ui.add(egui::TextEdit::singleline(&mut text).id(input_id));
+    });
+    output.textures_delta.clear();
+    assert_eq!(text, "w");
+    assert!(app.cmd.is_empty());
+    let PaneKind::News(n) = &app.panes[i].kind else { panic!() };
+    assert!(n.interaction.pending_keys.is_empty());
+}
+
+#[test]
 fn n5_feed_delivery_is_idempotent_even_with_reordered_replies() {
     let mut last = 0;
     assert!(super::super::accept_news_delivery(&mut last, 1));
@@ -617,14 +952,7 @@ fn source_filter_is_case_insensitive_counts_matches_and_preserves_selection() {
     let mut pane = visible_pane();
     pane.filters.sources = vec!["Reuters".into(), "Bloomberg".into()];
     pane.interaction.source_filter = "eUt".into();
-    let source_count = pane
-        .items
-        .iter()
-        .flat_map(|s| [s.source.clone(), s.provider.clone()])
-        .chain(pane.filters.sources.iter().cloned())
-        .filter(|s| !s.is_empty())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
+    let source_count = publisher_sources(&pane).len();
     let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
         ui.set_max_width(dp(300.0));
         filters(ui, &mut pane, &mut vec![], false, 0);
@@ -656,7 +984,7 @@ fn search_is_bounded_filters_adjacent_and_collapsed_summary_is_visible() {
     pane.display.unread = true;
     pane.display.watch_hits = true;
     let expected = active_filter_summary(&pane);
-    for value in ["Reuters", "Include any: earnings guidance", "Exclude any: rumor", "Unread only", "Watch hits"] {
+    for value in ["Reuters", "Include any: earnings guidance", "Exclude any: rumor", "Unread only", "Keywords"] {
         assert!(expected.contains(value));
     }
     for width in [320.0, 1400.0] {
@@ -678,16 +1006,20 @@ fn n6_categories_toggle_filter_persist_per_pane_and_settle_at_360pt() {
     let loaded = LayoutDoc::from_json(&doc.to_json()).unwrap();
     assert_eq!(loaded, doc);
     let mut categories = vec![];
-    toggle_category(&mut categories, "tech");
-    assert_eq!(categories.len(), 5);
-    assert!(!categories.iter().any(|c| c == "tech"));
-    toggle_category(&mut categories, "tech");
+    toggle_category(&mut categories, "tech", false);
+    assert_eq!(categories, ["tech"]);
+    toggle_category(&mut categories, "macro", false);
+    assert_eq!(categories, ["macro"]);
+    toggle_category(&mut categories, "tech", true);
+    assert_eq!(categories, ["macro", "tech"]);
+    toggle_category(&mut categories, "macro", true);
+    assert_eq!(categories, ["tech"]);
+    toggle_category(&mut categories, "tech", true);
     assert!(categories.is_empty());
-    for category in tr_data::feeds::CATEGORIES {
-        toggle_category(&mut categories, category);
-    }
-    assert_eq!(categories, ["none"]);
-    toggle_category(&mut categories, "tech");
+    toggle_category(&mut categories, "tech", false);
+    toggle_category(&mut categories, "tech", false);
+    assert!(categories.is_empty(), "last selected chip returns to All");
+    toggle_category(&mut categories, "tech", false);
     assert_eq!(categories, ["tech"]);
     let ctx = egui::Context::default();
     let mut pane = visible_pane();
@@ -969,7 +1301,8 @@ fn header_scope_labels_and_vector_overflow_survive_340pt() {
         let header: Vec<_> = labels.iter().filter(|(_, p)| p.y < dp(25.)).map(|(s, _)| s.as_str()).collect();
         assert_eq!(header.contains(&"AAPL"), scope == Scope::Symbol, "{header:?}");
         assert_eq!(header.contains(&"Core list"), scope == Scope::Watchlist, "{header:?}");
-        assert!(labels.iter().any(|(s, p)| s.starts_with("Unread ") && p.y >= dp(20.)));
+        assert!(!labels.iter().any(|(s, _)| s.starts_with("Unread ")), "narrow pane keeps Unread in Filters");
+        assert!(labels.iter().any(|(s, p)| s == "Stories" && p.y >= dp(20.)));
         let dots = output
             .shapes
             .iter()
@@ -997,10 +1330,12 @@ fn feed_chrome_stays_two_lines_and_rows_are_dense_at_narrow_widths() {
             "licence belongs only in About and Settings"
         );
         assert!(!labels.iter().any(|(s, _)| s == "Next story"), "compact panes must hide the key legend");
-        let today = labels.iter().find(|(s, _)| s == "Today").unwrap().1;
-        let ninety = labels.iter().find(|(s, _)| s == "90D").unwrap().1;
-        assert!((today.y - ninety.y).abs() < 1.0, "single date chips may not wrap");
-        assert_eq!(labels.iter().any(|(s, _)| s == "Watch hits"), width >= 360.0);
+        let today = labels.iter().find(|(s, _)| s == "7D").unwrap().1;
+        let stories = labels.iter().find(|(s, _)| s == "Stories").unwrap().1;
+        assert!((today.y - stories.y).abs() < dp(3.0), "date dropdown and view mode share a row");
+        assert!(!labels.iter().any(|(s, _)| s == "90D"), "date options belong in the dropdown");
+        assert_eq!(labels.iter().any(|(s, _)| s == "Keywords 0"), width >= 360.0);
+        assert_eq!(labels.iter().any(|(s, _)| s.starts_with("Unread ")), width >= 360.0);
         let positions: Vec<_> = pane
             .items
             .iter()
@@ -1622,4 +1957,123 @@ fn expanded_virtual_rows_use_measured_heights_and_settle_without_repaint() {
     let rebuilds = pane.cache.rebuilds;
     ui_frame(&ctx, &mut pane, 900.0, vec![], false);
     assert_eq!(pane.cache.rebuilds, rebuilds);
+}
+
+#[test]
+fn review_n6b_unselected_w_reaches_type_anywhere() {
+    use super::super::{PaneKind, TerminalApp};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/news-review-w-ownership");
+    let (worker, _requests) = crate::worker::Worker::recording();
+    let mut app = TerminalApp::isolated_workspace(&root, worker);
+    let id = app.new_pane(PaneKind::News(Box::new(visible_pane())));
+    app.focus = id;
+    let ctx = egui::Context::default();
+    for (key, text) in [(egui::Key::W, "w"), (egui::Key::M, "m"), (egui::Key::T, "t")] {
+        let mut events = key_event(key);
+        events.push(egui::Event::Text(text.into()));
+        let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| app.hotkeys(ui.ctx()));
+        output.textures_delta.clear();
+    }
+    assert_eq!(
+        app.cmd, "WMT",
+        "unselected letters belong to type-anywhere (see review_unselected_r_reaches_type_anywhere)"
+    );
+}
+
+fn n6b_click(ctx: &egui::Context, pane: &mut NewsPane, width: f32, position: egui::Pos2) -> egui::FullOutput {
+    let button = |pressed| egui::Event::PointerButton {
+        pos: position,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    ui_frame(ctx, pane, width, vec![egui::Event::PointerMoved(position), button(true)], true);
+    ui_frame(ctx, pane, width, vec![button(false)], true);
+    ui_frame(ctx, pane, width, vec![], true).0
+}
+
+#[test]
+fn review_n6b_keyword_popover_survives_click_in_its_field() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    let (output, _) = ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    let chip = text_shapes(&output).iter().find(|(s, _)| s == "Keywords 0").unwrap().1 + egui::vec2(3.0, 3.0);
+    let output = n6b_click(&ctx, &mut pane, 600.0, chip);
+    assert!(pane.interaction.keyword_add_open);
+    let field =
+        text_shapes(&output).iter().find(|(s, _)| s.starts_with("Add keyword or")).expect("popover field visible").1
+            + egui::vec2(3.0, 3.0);
+    n6b_click(&ctx, &mut pane, 600.0, field);
+    assert!(pane.interaction.keyword_add_open, "clicking inside the popover's own field must not dismiss it");
+}
+
+#[test]
+fn n6b_narrow_keyword_editor_stays_inline_and_does_not_reopen() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    let (output, _) = ui_frame(&ctx, &mut pane, 320.0, vec![], true);
+    let filters =
+        text_shapes(&output).iter().find(|(s, _)| s.starts_with("Filters (")).unwrap().1 + egui::vec2(3.0, 3.0);
+    let output = n6b_click(&ctx, &mut pane, 320.0, filters);
+    let chip = text_shapes(&output).iter().find(|(s, _)| s == "Keywords 0").unwrap().1 + egui::vec2(3.0, 3.0);
+    let output = n6b_click(&ctx, &mut pane, 320.0, chip);
+    let field =
+        text_shapes(&output).iter().find(|(s, _)| s.starts_with("Add keyword or")).unwrap().1 + egui::vec2(3.0, 3.0);
+    let output = n6b_click(&ctx, &mut pane, 320.0, field);
+    assert!(text_shapes(&output).iter().any(|(s, _)| s == "Sort (R)"), "Filters stays open");
+    assert!(pane.interaction.keyword_add_inline);
+    assert!(!pane.interaction.keyword_add_open, "inline state must not leak into a wide popup");
+    // This menu is taller than the viewport, so close with Escape rather than
+    // assuming that any particular viewport coordinate is outside it.
+    ui_frame(&ctx, &mut pane, 320.0, key_event(egui::Key::Escape), true);
+    ui_frame(&ctx, &mut pane, 320.0, key_event(egui::Key::Escape), true);
+    ui_frame(&ctx, &mut pane, 320.0, vec![], true);
+    assert!(!pane.interaction.keyword_add_inline);
+    let output = n6b_click(&ctx, &mut pane, 320.0, filters);
+    assert!(!text_shapes(&output).iter().any(|(s, _)| s.starts_with("Add keyword or")));
+    let (output, _) = ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    assert!(!pane.interaction.keyword_add_open);
+    assert!(!text_shapes(&output).iter().any(|(s, _)| s.starts_with("Add keyword or")));
+}
+
+#[test]
+fn n6b_overflow_starts_with_the_panes_own_status_reason() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    pane.error = Some("Finnhub rate-limit: specific failure reason".into());
+    super::super::data_sources::State::default().update_news_sources(&mut pane, 100_000);
+    ui_frame(&ctx, &mut pane, 600.0, vec![], true);
+    // The overflow icon is reserved at the top right, independent of the summary width.
+    let output = n6b_click(&ctx, &mut pane, 600.0, egui::pos2(590.0, 10.0));
+    let labels = text_shapes(&output);
+    let reason = labels
+        .iter()
+        .find(|(s, _)| s == "Finnhub rate-limit: specific failure reason")
+        .expect("overflow restores the detailed pane reason")
+        .1;
+    let summary = labels
+        .iter()
+        .filter(|(s, p)| s.starts_with("15 sources") && p.y > reason.y)
+        .min_by(|a, b| a.1.y.total_cmp(&b.1.y))
+        .expect("aggregate follows the pane reason")
+        .1;
+    assert!(reason.y < summary.y);
+}
+
+#[test]
+fn review_n6b_narrow_zero_keyword_chip_shows_add_field() {
+    let ctx = egui::Context::default();
+    let mut pane = visible_pane();
+    let (output, _) = ui_frame(&ctx, &mut pane, 320.0, vec![], true);
+    let filters =
+        text_shapes(&output).iter().find(|(s, _)| s.starts_with("Filters (")).unwrap().1 + egui::vec2(3.0, 3.0);
+    let output = n6b_click(&ctx, &mut pane, 320.0, filters);
+    let chip =
+        text_shapes(&output).iter().find(|(s, _)| s == "Keywords 0").expect("chip in Filters").1 + egui::vec2(3.0, 3.0);
+    let output = n6b_click(&ctx, &mut pane, 320.0, chip);
+    assert!(
+        text_shapes(&output).iter().any(|(s, _)| s.starts_with("Add keyword or")),
+        "0-keyword click in a narrow pane must show the add field (open flag: {})",
+        pane.interaction.keyword_add_open
+    );
 }

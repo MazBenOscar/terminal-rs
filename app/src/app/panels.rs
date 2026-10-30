@@ -196,9 +196,11 @@ impl TerminalApp {
                 // N3
             }
             PaneKind::News(_) => {
+                self.refresh_news_sources();
                 let link = self.panes[i].link;
                 let news_focused = focused && !self.agent_captures_focus(ui.ctx()) && self.cmd.is_empty();
                 let PaneKind::News(n) = &mut self.panes[i].kind else { unreachable!() };
+                self.data_sources.update_news_sources(n, chrono::Utc::now().timestamp());
                 actions.extend(super::news_view::show(
                     ui,
                     n,
