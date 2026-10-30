@@ -43,6 +43,23 @@ fn alert_configuration(alert: &tr_core::price_alerts::Alert) -> serde_json::Valu
     value
 }
 
+/// No backend side effects until an existing session reaches an idle Ready
+/// boundary. Check both directions: cancellation during startup also needs a
+/// deferred restore, even when the read-only policy flag is already cleared.
+fn story_policy_change(
+    running: bool,
+    ready: bool,
+    session_tools: Option<tr_agent_tools::ToolSet>,
+    desired: bool,
+    current: bool,
+    ordinary: tr_agent_tools::ToolSet,
+) -> bool {
+    let target = if desired { tr_agent_tools::ToolSet::ReadOnly } else { ordinary };
+    !running
+        && (session_tools.is_none() || ready)
+        && (desired != current || session_tools.is_some_and(|tools| tools != target))
+}
+
 fn pane_id(id: PaneId) -> egui::Id {
     egui::Id::new(("agent-pane", id))
 }
@@ -1049,7 +1066,7 @@ impl TerminalApp {
         }
     }
 
-    fn agent_action(&mut self, ctx: &egui::Context, id: PaneId, action: Action) {
+    pub(super) fn agent_action(&mut self, ctx: &egui::Context, id: PaneId, action: Action) {
         // Fixtures are for visual review only, including their enabled-looking controls.
         if self.agent_demo.is_some() {
             return;
@@ -1109,9 +1126,8 @@ impl TerminalApp {
             Action::Retry => {
                 self.agent_pane.transition(Onboarding::Ready);
                 if let Some(prompt) = self.agent_pane.last_prompt.clone()
-                    && self.story_desk.queued_read_only(&prompt)
+                    && self.retry_story_prompt(id, &prompt)
                 {
-                    self.agent_pane.enqueue(prompt);
                     return;
                 }
                 if let Some(prompt) = self.agent_pane.last_prompt.clone()
@@ -1161,14 +1177,17 @@ impl TerminalApp {
     /// Session inventories are immutable in both backends; restart at an idle
     /// queue boundary and leave the user's saved tools mode untouched.
     fn prepare_story_agent(&mut self, ctx: &egui::Context) {
-        if self.agent_pane.running {
-            return;
-        }
         let desired = self.agent_pane.queue.front().is_some_and(|p| self.story_desk.queued_read_only(p));
-        let registry_mismatch = desired
-            && self.agent_pane.session.is_some()
-            && self.agent_pane.session_tools != Some(tr_agent_tools::ToolSet::ReadOnly);
-        if desired == self.story_desk.read_only && !registry_mismatch {
+        let ordinary = self.agent_config.session_tools(self.agent_pane.tool_set());
+        let session_tools = self.agent_pane.session.as_ref().map(|_| self.agent_pane.session_tools.unwrap_or(ordinary));
+        if !story_policy_change(
+            self.agent_pane.running,
+            self.agent_pane.state == Onboarding::Ready,
+            session_tools,
+            desired,
+            self.story_desk.read_only,
+            ordinary,
+        ) {
             return;
         }
         self.story_desk.read_only = desired;
@@ -1248,6 +1267,23 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn story_policy_waits_during_startup_and_restores_cancelled_analysis_once_ready() {
+        use tr_agent_tools::ToolSet::{ReadOnly, Workflows};
+        // A queued analysis cannot replace either listener or starting session.
+        assert!(!story_policy_change(false, false, Some(Workflows), true, false, Workflows));
+        assert!(story_policy_change(false, true, Some(Workflows), true, false, Workflows));
+        // Cancel while the read-only session is starting; defer restoration.
+        assert!(!story_policy_change(false, false, Some(ReadOnly), false, true, Workflows));
+        assert!(story_policy_change(false, true, Some(ReadOnly), false, true, Workflows));
+        // Also repair a mismatched session when the policy flag was cleared.
+        assert!(story_policy_change(false, true, Some(ReadOnly), false, false, Workflows));
+        // The restart records the ordinary inventory; no second restart/notice.
+        assert!(!story_policy_change(false, false, Some(Workflows), false, false, Workflows));
+        assert!(!story_policy_change(false, true, Some(Workflows), false, false, Workflows));
+        assert!(!story_policy_change(true, true, Some(ReadOnly), false, true, Workflows));
+    }
 
     fn workflow(app: &mut TerminalApp, turn: &str, name: &str, value: serde_json::Value) -> tr_agent_tools::ToolResult {
         use tr_agent_tools::args::*;

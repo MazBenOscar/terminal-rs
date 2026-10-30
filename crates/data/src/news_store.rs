@@ -81,10 +81,9 @@ pub fn related_stories(
         .iter()
         .filter(|s| !s.inferred_ts && s.item.ts >= now - 7 * 86400 && s.item.ts <= now)
         .filter(|m| !selected.member_ids.contains(&m.id) && !selected.members.iter().any(|s| same_cluster(s, m)))
-        .cloned()
         .collect();
     let ticker_match = |s: &Story| s.item.tickers.iter().any(|t| selected.tickers.contains(t));
-    let has_tickers = eligible.iter().any(ticker_match);
+    let has_tickers = eligible.iter().any(|s| ticker_match(s));
     let event = selected.classification().map(|v| v.1);
     let category = category_key(&selected.lead.category);
     // Filter before the clusterer's bounded snapshot: a busy market must not
@@ -97,6 +96,8 @@ pub fn related_stories(
                 || (!category.is_empty() && category_key(&s.category) == category)
         }
     });
+    eligible.sort_by(|a, b| b.item.ts.cmp(&a.item.ts).then(a.id.cmp(&b.id)));
+    let eligible: Vec<_> = eligible.into_iter().take(crate::news_intelligence::MAX_ITEMS).cloned().collect();
     let mut rows = clusters(&eligible);
     rows.sort_by(|a, b| b.newest.cmp(&a.newest).then_with(|| a.lead.id.cmp(&b.lead.id)));
     rows.truncate(8);
@@ -655,11 +656,25 @@ impl NewsStore {
             ..Default::default()
         };
         let mut items = Vec::new();
-        loop {
+        let mut ticker_candidates = 0;
+        // There is no ticker index in this store. Inspect at most four bounded
+        // pages, stopping earlier once we have a useful ticker candidate set.
+        // This still searches past a busy first market page, without walking
+        // an arbitrarily large seven-day archive for every inspector selection.
+        for _ in 0..4 {
             let page = self.query(&query)?;
             let len = page.len();
+            ticker_candidates += page
+                .iter()
+                .filter(|s| {
+                    !s.inferred_ts
+                        && s.item.tickers.iter().any(|t| selected.tickers.contains(t))
+                        && !selected.member_ids.contains(&s.id)
+                        && !selected.members.iter().any(|m| crate::news_intelligence::same_cluster(m, s))
+                })
+                .count();
             items.extend(page);
-            if len < query.limit {
+            if len < query.limit || ticker_candidates >= 64 {
                 break;
             }
             query.offset += len;

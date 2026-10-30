@@ -1910,19 +1910,34 @@ const ROTATION_SECONDS: f64 = 8.0;
 #[derive(Default)]
 pub struct Flash {
     arrivals: std::collections::BTreeMap<String, i64>,
-    initialized: bool,
+    newest_seen: Option<i64>,
     dismissed: std::collections::BTreeSet<String>,
     dismissed_at: Option<(i64, i64)>,
 }
 impl Flash {
-    /// Hydrating saved history must not make old headlines fresh again. Once
-    /// hydrated, a newly delivered id uses its actual UI arrival, not publication.
+    /// Compare the whole delivery with the previous high-water mark, not with
+    /// other rows in this delivery. Empty loads do not hydrate the pane.
     pub(super) fn observe(&mut self, items: &[tr_data::news_store::Story], now: i64) {
         for story in items {
-            let arrival = if self.initialized { now } else { story.item.ts.min(now) };
+            let arrival =
+                if self.newest_seen.is_some_and(|ts| story.item.ts > ts) { now } else { story.item.ts.min(now) };
             self.arrivals.entry(story.id.clone()).or_insert(arrival);
         }
-        self.initialized = true;
+        if let Some(newest) = items.iter().map(|s| s.item.ts).max() {
+            self.newest_seen = Some(self.newest_seen.map_or(newest, |seen| seen.max(newest)));
+        }
+        // Expired IDs can use publication time again: the high-water mark
+        // prevents their redelivery from restarting the clock.
+        self.arrivals.retain(|_, at| now < at.saturating_add(FLASH_SECONDS));
+        const LIMIT: usize = 2 * intelligence::MAX_ITEMS;
+        if self.arrivals.len() > LIMIT {
+            let mut oldest: Vec<_> = self.arrivals.iter().map(|(id, at)| (*at, id.clone())).collect();
+            oldest.sort();
+            for (_, id) in oldest.into_iter().take(self.arrivals.len() - LIMIT) {
+                self.arrivals.remove(&id);
+            }
+        }
+        self.dismissed.retain(|id| self.arrivals.contains_key(id));
     }
     fn arrival(&self, story: &Cluster) -> i64 {
         story.members.iter().map(|s| self.arrivals.get(&s.id).copied().unwrap_or(s.item.ts)).max().unwrap_or(0)
@@ -1942,6 +1957,9 @@ impl Flash {
         self.dismissed_at =
             Some(self.dismissed_at.unwrap_or((i64::MIN, i64::MIN)).max((self.arrival(story), story.newest)));
         self.dismissed.extend(story.member_ids.iter().cloned());
+        while self.dismissed.len() > 2 * intelligence::MAX_ITEMS {
+            self.dismissed.pop_first();
+        }
     }
 }
 

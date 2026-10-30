@@ -10,8 +10,16 @@ use crate::{
 };
 use egui::{RichText, Ui};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use tr_data::{news_intelligence::Cluster, news_store::StoryAnalysis};
+
+const DETAILS_LIMIT: usize = 128;
+const DETAILS_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 pub(super) struct Desk {
@@ -21,16 +29,22 @@ pub(super) struct Desk {
     selections: HashMap<PaneId, Selection>,
     details: HashMap<String, Details>,
     jobs: HashMap<String, Job>,
-    readonly_prompts: std::collections::HashSet<String>,
+    // Keep retry routing only for queued/running prompts and the retryable last
+    // prompt. Completed transcript history does not need session-long metadata.
+    readonly_prompts: HashMap<String, (String, PaneId)>,
+    pending_details: HashMap<PaneId, (String, Instant)>,
+    detail_clock: u64,
     pub read_only: bool,
 }
 struct Selection {
     link: Option<Link>,
-    story: Option<Cluster>,
+    story: Option<Arc<Cluster>>,
     revision: u64,
 }
 #[derive(Default)]
 struct Details {
+    requested: bool,
+    touched: u64,
     agent: Option<PaneId>,
     analysis: Option<StoryAnalysis>,
     related: Vec<Cluster>,
@@ -119,6 +133,7 @@ impl Desk {
         self.last_focus = None;
         self.focused.clear();
         self.selections.clear();
+        self.pending_details.clear();
         // Keep queued/running analysis policy across layout switches. Clearing it
         // could send an already queued untrusted story with the user's edit mode.
     }
@@ -130,7 +145,51 @@ impl Desk {
             .map(|(id, _)| *id)
     }
     pub(super) fn queued_read_only(&self, prompt: &Prompt) -> bool {
-        self.readonly_prompts.contains(&prompt.text)
+        self.readonly_prompts.contains_key(&prompt.text)
+    }
+    /// Only the latest stable selection of each inspector is queried. Returning
+    /// to an already cached story cancels its previous pending selection too.
+    fn details_due(&mut self, pane: PaneId, story: &str, now: Instant) -> bool {
+        let pending = self.pending_details.entry(pane).or_insert_with(|| (story.to_owned(), now));
+        if pending.0 != story {
+            *pending = (story.to_owned(), now);
+        }
+        self.detail_clock += 1;
+        if let Some(details) = self.details.get_mut(story) {
+            details.touched = self.detail_clock;
+            if details.requested {
+                return false;
+            }
+        }
+        if now.saturating_duration_since(pending.1) < DETAILS_DELAY {
+            return false;
+        }
+        // Analyze may have created this entry before the debounce elapsed.
+        // Preserve its job/result while still requesting related stories once.
+        let details = self.details.entry(story.to_owned()).or_default();
+        details.touched = self.detail_clock;
+        details.requested = true;
+        self.prune_details();
+        true
+    }
+    fn prune_details(&mut self) {
+        if self.details.len() <= DETAILS_LIMIT {
+            return;
+        }
+        let mut oldest: Vec<_> = self
+            .details
+            .iter()
+            .filter(|(id, _)| {
+                !self.jobs.values().any(|j| j.story_id == **id)
+                    && !self.selections.values().any(|s| s.story.as_ref().is_some_and(|s| s.lead.id == **id))
+                    && !self.pending_details.values().any(|(pending, _)| pending == *id)
+            })
+            .map(|(id, d)| (d.touched, id.clone()))
+            .collect();
+        oldest.sort();
+        for (_, id) in oldest.into_iter().take(self.details.len().saturating_sub(DETAILS_LIMIT)) {
+            self.details.remove(&id);
+        }
     }
     pub(super) fn effective_tools(&self, ordinary: tr_agent_tools::ToolSet) -> tr_agent_tools::ToolSet {
         if self.read_only { tr_agent_tools::ToolSet::ReadOnly } else { ordinary }
@@ -146,6 +205,11 @@ impl TerminalApp {
         self.story_desk
             .selections
             .retain(|id, _| self.panes.iter().any(|p| p.id == *id && matches!(p.kind, PaneKind::News(_))));
+        self.story_desk.focused.retain(|id, _| self.panes.iter().any(|p| p.id == *id));
+        self.story_desk
+            .pending_details
+            .retain(|id, _| self.panes.iter().any(|p| p.id == *id && matches!(p.kind, PaneKind::Story { .. })));
+        self.story_desk.prune_details();
         for pane in &self.panes {
             if matches!(pane.kind, PaneKind::News(_)) {
                 self.story_desk
@@ -169,7 +233,7 @@ impl TerminalApp {
         }) {
             return;
         }
-        let story = selected.and_then(|id| n.cache.selected(id)).cloned();
+        let story = selected.and_then(|id| n.cache.selected(id)).cloned().map(Arc::new);
         self.story_desk.selections.insert(source, Selection { link: pane.link, story, revision: n.item_revision });
     }
     pub(super) fn story_details_reply(
@@ -177,7 +241,8 @@ impl TerminalApp {
         id: String,
         result: Result<(Option<StoryAnalysis>, Vec<Cluster>), String>,
     ) {
-        let details = self.story_desk.details.entry(id).or_default();
+        // A reply may arrive after LRU eviction or after navigating away.
+        let Some(details) = self.story_desk.details.get_mut(&id) else { return };
         match result {
             Ok((analysis, related)) => {
                 // An older worker read must not replace a just-completed turn.
@@ -190,33 +255,63 @@ impl TerminalApp {
             Err(error) => details.error = Some(error),
         }
     }
-    fn analyze_story(&mut self, story_pane: PaneId, story: &Cluster) {
-        if self.story_desk.jobs.values().any(|j| j.story_id == story.lead.id) {
-            return;
+    fn story_agent(&self, story_pane: PaneId, preferred: Option<PaneId>) -> Option<PaneId> {
+        if let Some(id) =
+            preferred.filter(|id| self.panes.iter().any(|p| p.id == *id && matches!(p.kind, PaneKind::Agent(_))))
+        {
+            return Some(id);
         }
         let link = self.panes.iter().find(|p| p.id == story_pane).and_then(|p| p.link);
-        let agent = self
-            .panes
+        self.panes
             .iter()
             .filter(|p| matches!(p.kind, PaneKind::Agent(_)))
             .max_by_key(|p| {
                 (link.is_some() && p.link == link, self.story_desk.focused.get(&p.id).copied().unwrap_or(0), p.id)
             })
             .map(|p| p.id)
-            .unwrap_or_else(|| {
-                let id = self.new_pane(PaneKind::Agent(Default::default()));
-                self.dock_pane(id, Some(story_pane), crate::dock::Zone::Center);
-                self.set_link(id, link);
-                self.dock.activate(story_pane);
-                self.focus = story_pane;
-                id
-            });
+    }
+    pub(super) fn retry_story_prompt(&mut self, pane: PaneId, prompt: &Prompt) -> bool {
+        let Some((story_id, previous_agent)) = self.story_desk.readonly_prompts.get(&prompt.text).cloned() else {
+            return false;
+        };
+        if self.agent_pane.queue.len() >= 32 {
+            self.status = "Agent queue is full".into();
+            return true;
+        }
+        if self.story_desk.jobs.contains_key(&prompt.text) {
+            return true;
+        }
+        let Some(agent) = self.story_agent(pane, Some(previous_agent)) else { return true };
+        self.story_desk.jobs.insert(
+            prompt.text.clone(),
+            Job { story_id: story_id.clone(), agent, turn_index: None, model: String::new() },
+        );
+        let details = self.story_desk.details.entry(story_id).or_default();
+        details.agent = Some(agent);
+        details.error = None;
+        self.agent_pane_owner = Some(agent);
+        self.agent_pane.enqueue(prompt.clone());
+        true
+    }
+    fn analyze_story(&mut self, story_pane: PaneId, story: &Cluster) {
+        if self.story_desk.jobs.values().any(|j| j.story_id == story.lead.id) {
+            return;
+        }
+        let link = self.panes.iter().find(|p| p.id == story_pane).and_then(|p| p.link);
+        let agent = self.story_agent(story_pane, None).unwrap_or_else(|| {
+            let id = self.new_pane(PaneKind::Agent(Default::default()));
+            self.dock_pane(id, Some(story_pane), crate::dock::Zone::Center);
+            self.set_link(id, link);
+            self.dock.activate(story_pane);
+            self.focus = story_pane;
+            id
+        });
         if self.agent_pane.queue.len() >= 32 {
             self.status = "Agent queue is full".into();
             return;
         }
         let prompt = analysis_prompt(story);
-        self.story_desk.readonly_prompts.insert(prompt.text.clone());
+        self.story_desk.readonly_prompts.insert(prompt.text.clone(), (story.lead.id.clone(), agent));
         self.story_desk.jobs.insert(
             prompt.text.clone(),
             Job { story_id: story.lead.id.clone(), agent, turn_index: None, model: String::new() },
@@ -268,6 +363,12 @@ impl TerminalApp {
                 details.error = Some("Analysis interrupted or stopped. Retry, or use Cancel in the Agent pane.".into());
             }
         }
+        self.story_desk.readonly_prompts.retain(|prompt, _| {
+            self.story_desk.jobs.contains_key(prompt)
+                || self.agent_pane.queue.iter().any(|p| p.text == *prompt)
+                || self.agent_pane.last_prompt.as_ref().is_some_and(|p| p.text == *prompt)
+        });
+        self.story_desk.prune_details();
     }
     fn select_related(&mut self, source: PaneId, story: &Cluster) {
         if let Some(p) = self.pane_mut(source)
@@ -288,7 +389,7 @@ impl TerminalApp {
             n.interaction.scroll_to = n.interaction.selected.clone();
         }
         if let Some(s) = self.story_desk.selections.get_mut(&source) {
-            s.story = Some(story.clone());
+            s.story = Some(Arc::new(story.clone()));
         }
         self.dock.activate(source);
         self.focus = source;
@@ -308,15 +409,19 @@ impl TerminalApp {
         let source = self.story_desk.source(link, follow);
         let selected = source.and_then(|s| self.story_desk.selections.get(&s)).and_then(|s| s.story.clone());
         let Some(story) = selected else {
+            self.story_desk.pending_details.remove(&id);
             ui.label(RichText::new("Select a headline in a News pane").color(theme::muted()));
             if self.story_desk.selections.is_empty() && ui.button("Open News").clicked() {
                 self.apply(crate::command::Function::News);
             }
             return;
         };
-        if !self.story_desk.details.contains_key(&story.lead.id) {
-            self.story_desk.details.insert(story.lead.id.clone(), Details::default());
-            self.worker.send(Request::StoryDetails(Box::new(story.clone())));
+        if self.story_desk.details_due(id, &story.lead.id, Instant::now()) {
+            self.worker.send(Request::StoryDetails(Box::new((*story).clone())));
+        }
+        if !self.story_desk.details.get(&story.lead.id).is_some_and(|d| d.requested) {
+            let elapsed = self.story_desk.pending_details[&id].1.elapsed();
+            ui.ctx().request_repaint_after(DETAILS_DELAY.saturating_sub(elapsed));
         }
         let now = chrono::Utc::now().timestamp();
         let mut analyze = false;
@@ -324,6 +429,8 @@ impl TerminalApp {
         let mut ticker = None;
         let mut related = None;
         let mut focus_agent = None;
+        let empty_details = Details::default();
+        let details = self.story_desk.details.get(&story.lead.id).unwrap_or(&empty_details);
         egui::ScrollArea::vertical().id_salt(("story", id)).auto_shrink([false, false]).show(ui, |ui| {
             ui.set_max_width(dp(680.0).min(ui.available_width()));
             ui.spacing_mut().item_spacing = egui::vec2(dp(6.0), dp(3.0));
@@ -413,7 +520,6 @@ impl TerminalApp {
             });
             ui.separator();
             ui.label("Analysis");
-            let details = &self.story_desk.details[&story.lead.id];
             let job = self.story_desk.jobs.values().find(|j| j.story_id == story.lead.id);
             if let Some(job) = job {
                 ui.label(if job.turn_index.is_some() {
@@ -422,7 +528,7 @@ impl TerminalApp {
                     "Queued · Cancel in Agent"
                 });
             }
-            if let Some(agent) = job.map(|j| j.agent).or(details.agent) {
+            if let Some(agent) = self.story_agent(id, job.map(|j| j.agent).or(details.agent)) {
                 if self.agent_pane.state != Onboarding::Ready {
                     let state = &self.agent_pane.state;
                     let message = match state {
@@ -432,7 +538,7 @@ impl TerminalApp {
                     };
                     ui.add(egui::Label::new(message).wrap());
                 }
-                if self.panes.iter().any(|p| p.id == agent) && ui.button("Focus Agent").clicked() {
+                if ui.button("Focus Agent").clicked() {
                     focus_agent = Some(agent);
                 }
             }
@@ -484,6 +590,7 @@ impl TerminalApp {
                 && let Some(selected) = &mut selection.story
             {
                 let saved = !story.members.iter().any(|m| m.bookmark);
+                let selected = Arc::make_mut(selected);
                 for member in &mut selected.members {
                     member.bookmark = saved;
                 }
@@ -581,7 +688,7 @@ mod tests {
     }
     fn select(app: &mut TerminalApp, id: PaneId, story: Cluster) {
         let link = app.panes.iter().find(|p| p.id == id).unwrap().link;
-        app.story_desk.selections.insert(id, Selection { link, story: Some(story), revision: 0 });
+        app.story_desk.selections.insert(id, Selection { link, story: Some(Arc::new(story)), revision: 0 });
     }
     #[test]
     fn news_selection_bus_delivers_cluster_without_changing_chart_or_auto_analyzing() {
@@ -729,7 +836,7 @@ mod tests {
         assert_eq!(prompt.text.matches("</STORY_DATA>").count(), 1);
         assert!(prompt.text.contains("\\u003c/STORY_DATA\\u003e"));
         let mut desk = Desk::default();
-        desk.readonly_prompts.insert(prompt.text.clone());
+        desk.readonly_prompts.insert(prompt.text.clone(), (story.lead.id.clone(), 0));
         desk.read_only = true;
         desk.reset_workspace();
         assert!(desk.queued_read_only(&prompt));
@@ -792,6 +899,171 @@ mod tests {
         assert!(app.story_desk.details[&story.lead.id].error.as_ref().unwrap().contains("stopped"));
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn review_n7_queued_analysis_does_not_churn_external_listener() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target").canonicalize().unwrap();
+        let root = base.join(format!("r7c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = TerminalApp::test_workspace(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        app.agent_config.allow_external = true;
+        let story_pane = app.new_pane(PaneKind::Story { link_follow: true });
+        app.dock_pane(story_pane, None, crate::dock::Zone::Right);
+        app.analyze_story(story_pane, &cluster("Churn"));
+        // An existing user session (ordinary tools) that is still starting / stopped.
+        app.agent_pane.session = Some(crate::agent_session::Session::review_n7_inert());
+        app.agent_pane.session_tools = Some(tr_agent_tools::ToolSet::Workflows);
+        app.agent_pane.transition(Onboarding::Checking);
+        let ctx = egui::Context::default();
+        app.agent_logic(&ctx);
+        let first = app.external_agent.as_ref().map(|s| s.pin.clone()).expect("listener after first frame");
+        for _ in 0..3 {
+            app.agent_logic(&ctx);
+        }
+        let stable = app.external_agent.as_ref().is_some_and(|s| std::sync::Arc::ptr_eq(&s.pin, &first));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(stable, "settled frames must not drop and rebind the external listener (mimo/external peers lose it)");
+    }
+    #[test]
+    fn details_requests_coalesce_to_latest_stable_selection_and_share_cache() {
+        let mut desk = Desk::default();
+        let now = Instant::now();
+        assert!(!desk.details_due(1, "first", now));
+        assert!(!desk.details_due(1, "second", now + Duration::from_millis(100)));
+        assert!(!desk.details_due(1, "latest", now + Duration::from_millis(200)));
+        assert!(!desk.details_due(1, "latest", now + Duration::from_millis(449)));
+        assert!(desk.details_due(1, "latest", now + Duration::from_millis(450)));
+        assert_eq!(desk.details.len(), 1);
+        assert!(!desk.details_due(2, "latest", now + Duration::from_secs(1)));
+        assert!(!desk.details_due(1, "discarded", now + Duration::from_secs(2)));
+        assert!(!desk.details_due(1, "latest", now + Duration::from_secs(3)));
+        assert!(!desk.details_due(1, "latest", now + Duration::from_secs(4)));
+        assert!(!desk.details.contains_key("discarded"));
+        assert!(!desk.details.contains_key("first"));
+        assert!(!desk.details.contains_key("second"));
+    }
+
+    #[test]
+    fn analysis_created_details_still_load_related_after_debounce() {
+        let mut desk = Desk::default();
+        let now = Instant::now();
+        assert!(!desk.details_due(1, "early-analysis", now));
+        desk.details.insert("early-analysis".into(), Details { agent: Some(7), ..Default::default() });
+        assert!(desk.details_due(1, "early-analysis", now + DETAILS_DELAY));
+        assert_eq!(desk.details["early-analysis"].agent, Some(7));
+        assert!(!desk.details_due(1, "early-analysis", now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn agent_retry_recreates_story_job_and_stores_the_retried_reply() {
+        let (mut app, root) = fixture("agent-retry");
+        let pane = app.new_pane(PaneKind::Story { link_follow: true });
+        app.dock_pane(pane, None, crate::dock::Zone::Right);
+        let story = cluster("Retry through Agent");
+        app.analyze_story(pane, &story);
+        let agent = app.agent_pane_owner.unwrap();
+        app.agent_pane.transition(Onboarding::Ready);
+        let prompt = app.agent_pane.next_prompt().unwrap();
+        app.story_prompt_started(&prompt, "failed-model");
+        app.agent_pane.turns[0].finished = true;
+        app.agent_pane.running = false;
+        app.collect_story_analysis();
+        assert!(app.story_desk.jobs.is_empty());
+        assert!(app.story_desk.details[&story.lead.id].error.is_some());
+        app.agent_action(&egui::Context::default(), agent, crate::agent_pane::Action::Retry);
+        assert_eq!(app.story_desk.jobs[&prompt.text].story_id, story.lead.id);
+        assert_eq!(app.story_desk.jobs[&prompt.text].agent, agent);
+        assert!(app.story_desk.queued_read_only(app.agent_pane.queue.front().unwrap()));
+        let retried = app.agent_pane.next_prompt().unwrap();
+        app.story_prompt_started(&retried, "retry-model");
+        app.agent_pane.wire(
+            "item/completed",
+            &serde_json::json!({"item":{
+                "id":"retry-reply", "type":"agentMessage", "text":"Retried story analysis"
+            }}),
+        );
+        let turn = app.agent_pane.turns.last_mut().unwrap();
+        turn.finished = true;
+        turn.final_answer_succeeded = true;
+        app.agent_pane.running = false;
+        app.collect_story_analysis();
+        let result = app.story_desk.details[&story.lead.id].analysis.as_ref().unwrap();
+        assert_eq!(result.json, "Retried story analysis");
+        assert_eq!(result.model, "retry-model");
+        assert!(app.story_desk.details[&story.lead.id].error.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_job_and_details_agent_ids_fall_back_to_a_real_linked_agent() {
+        let (mut app, root) = fixture("stale-agent");
+        let pane = app.new_pane(PaneKind::Story { link_follow: true });
+        app.dock_pane(pane, None, crate::dock::Zone::Right);
+        app.set_link(pane, Some(Link::Orange));
+        let story = cluster("Stale agent ID");
+        app.analyze_story(pane, &story);
+        let old_agent = app.agent_pane_owner.unwrap();
+        app.pane_mut(old_agent).unwrap().kind = PaneKind::Story { link_follow: false };
+        let other = app.new_pane(PaneKind::Agent(Default::default()));
+        let linked = app.new_pane(PaneKind::Agent(Default::default()));
+        app.set_link(other, Some(Link::Blue));
+        app.set_link(linked, Some(Link::Orange));
+        let job_agent = app.story_desk.jobs.values().next().unwrap().agent;
+        let details_agent = app.story_desk.details[&story.lead.id].agent;
+        assert_eq!(app.story_agent(pane, Some(job_agent)), Some(linked));
+        assert_eq!(app.story_agent(pane, details_agent), Some(linked));
+        assert_eq!(app.story_agent(pane, Some(other)), Some(other), "a valid recorded Agent stays preferred");
+        app.pane_mut(linked).unwrap().kind = PaneKind::Story { link_follow: false };
+        app.pane_mut(other).unwrap().kind = PaneKind::Story { link_follow: false };
+        assert_eq!(app.story_agent(pane, Some(old_agent)), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn desk_retention_bounds_details_and_drops_unreferenced_prompt_metadata() {
+        let (mut app, root) = fixture("retention");
+        let now = Instant::now();
+        for i in 0..DETAILS_LIMIT + 20 {
+            app.story_desk.details.insert(format!("story-{i}"), Details { touched: i as u64, ..Default::default() });
+            app.story_desk.readonly_prompts.insert(format!("prompt-{i}"), (format!("story-{i}"), 0));
+        }
+        let hot = "story-0";
+        assert!(!app.story_desk.details_due(1, hot, now));
+        let queued = Prompt { text: "prompt-0".into(), requires_tools: false };
+        app.agent_pane.enqueue(queued.clone());
+        app.agent_pane.last_prompt = Some(Prompt { text: "prompt-1".into(), requires_tools: false });
+        app.collect_story_analysis();
+        assert_eq!(app.story_desk.details.len(), DETAILS_LIMIT);
+        assert!(app.story_desk.details.contains_key(hot));
+        assert_eq!(app.story_desk.readonly_prompts.len(), 2);
+        assert!(app.story_desk.queued_read_only(&queued));
+        app.agent_pane.queue.clear();
+        app.agent_pane.last_prompt = None;
+        app.collect_story_analysis();
+        assert!(app.story_desk.readonly_prompts.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn settled_story_frames_share_the_selected_cluster_snapshot() {
+        let (mut app, root) = fixture("shared-snapshot");
+        let source = app.new_pane(PaneKind::News(Box::new(super::super::NewsPane::new(None))));
+        let inspector = app.new_pane(PaneKind::Story { link_follow: true });
+        app.note_story_focus();
+        select(&mut app, source, cluster("Shared snapshot"));
+        let snapshot = app.story_desk.selections[&source].story.clone().unwrap();
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.story_panel(ui, inspector, true));
+            output.textures_delta.clear();
+            assert!(Arc::ptr_eq(&snapshot, app.story_desk.selections[&source].story.as_ref().unwrap()));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn analyze_opens_agent_as_tab_when_absent() {
         let (mut app, root) = fixture("new-agent");

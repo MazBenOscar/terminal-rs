@@ -53,6 +53,65 @@ fn n7b_flash_arrival_is_monotonic_and_history_is_not_rearmed() {
 }
 
 #[test]
+fn review_n7_flash_older_history_delivered_later_is_not_fresh() {
+    let now = chrono::Utc::now().timestamp();
+    let mut pane = NewsPane::new(None);
+    pane.filters.scope = Scope::All;
+    pane.filters.days = 1;
+    pane.flash_high = true;
+    // First delivery: today's window (or an empty store on first run).
+    pane.apply(vec![n7_story("today", "Routine market report", now - 60)]);
+    // The user widens the date range to 7 days; the worker returns older saved history.
+    let old = n7_story("old-high", "Acme raises guidance", now - 3 * 86400);
+    pane.filters.days = 7;
+    pane.apply(vec![n7_story("today", "Routine market report", now - 60), old]);
+    let stories = flash_stories(&pane, &[], now);
+    assert!(stories.iter().any(|s| s.lead.id == "old-high"));
+    assert!(
+        pane.interaction.flash.pick(&stories, now).is_none(),
+        "a three-day-old saved headline must not appear as a fresh FLASH"
+    );
+}
+
+#[test]
+fn flash_empty_first_load_and_older_navigation_never_restart_arrival() {
+    let now = 1_000_000;
+    let old = n7_story("old", "Acme raises guidance", now - 3 * 86400);
+    let mut flash = Flash::default();
+    flash.observe(&[], now);
+    assert_eq!(flash.newest_seen, None);
+    flash.observe(std::slice::from_ref(&old), now + 1);
+    assert!(flash.pick(&[Cluster::wire(&old)], now + 1).is_none());
+    let latest = n7_story("latest", "Routine market report", now - 10);
+    flash.observe(&[latest], now + 2);
+    // select_related applies a snapshot containing only older members.
+    let other = n7_story("related-old", "Beta trading halted", now - 2 * 86400);
+    flash.observe(std::slice::from_ref(&other), now + 3);
+    assert!(flash.pick(&[Cluster::wire(&other)], now + 3).is_none());
+    assert_eq!(flash.newest_seen, Some(now - 10));
+}
+
+#[test]
+fn flash_retention_is_bounded_and_eviction_cannot_rearm_old_ids() {
+    let now = 1_000_000;
+    let items: Vec<_> = (0..2 * intelligence::MAX_ITEMS + 20)
+        .map(|i| n7_story(&format!("bounded-{i}"), "Acme raises guidance", now))
+        .collect();
+    let mut flash = Flash::default();
+    flash.observe(&items, now);
+    assert_eq!(flash.arrivals.len(), 2 * intelligence::MAX_ITEMS);
+    let mut cluster = Cluster::wire(&items[0]);
+    cluster.member_ids = items.iter().map(|s| s.id.clone()).collect();
+    flash.dismiss(&cluster);
+    assert_eq!(flash.dismissed.len(), 2 * intelligence::MAX_ITEMS);
+    flash.observe(&[], now + FLASH_SECONDS);
+    assert!(flash.arrivals.is_empty());
+    assert!(flash.dismissed.is_empty());
+    flash.observe(&items, now + FLASH_SECONDS + 1);
+    assert!(flash.pick(&[Cluster::wire(&items[0])], now + FLASH_SECONDS + 1).is_none());
+}
+
+#[test]
 fn n7b_flash_obeys_every_pane_filter_except_date_and_sort() {
     let now = 1_000_000;
     let mut pane = NewsPane::new(Some("ACME US Equity".into()));

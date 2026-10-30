@@ -2022,3 +2022,23 @@ mod review_tests {
         assert!(result.is_ok(), "cancel race became a fatal session error: {:#}", result.unwrap_err());
     }
 }
+
+/// Review N7 test support: an inert session with no backend owner thread, so
+/// host-side session policy can be exercised without launching an agent.
+#[cfg(test)]
+impl Session {
+    pub(crate) fn review_n7_inert() -> Self {
+        let (sender, receive) = mpsc::unbounded_channel();
+        std::mem::forget(receive);
+        let (shutdown, stopping) = watch::channel(());
+        std::mem::forget(stopping);
+        let (_done, finished) = std::sync::mpsc::channel();
+        let inbox = Arc::new(Inbox {
+            events: Mutex::new(Vec::new()),
+            visible: AtomicBool::new(true),
+            ctx: egui::Context::default(),
+            last_text_wake: Mutex::new(None),
+        });
+        Session { sender: Some(sender), inbox, shutdown, finished, owner: None }
+    }
+}

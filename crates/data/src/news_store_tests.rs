@@ -143,6 +143,45 @@ fn n7_related_finds_ticker_beyond_the_first_market_page() {
 }
 
 #[test]
+fn related_archive_scan_stops_at_four_pages() {
+    use crate::news_intelligence::{Cluster, MAX_ITEMS};
+    let now = chrono::Utc::now().timestamp();
+    let selected = story(
+        "https://fixture.invalid/cap-selected",
+        "Chip supplier expands fabrication",
+        now,
+        "NVDA US Equity",
+        "Fixture",
+    );
+    let mut items: Vec<_> = (0..4 * MAX_ITEMS)
+        .map(|i| {
+            story(
+                &format!("https://fixture.invalid/cap/{i}"),
+                &format!("Shipping report {i}"),
+                now - i as i64,
+                "OTHER US Equity",
+                "Fixture",
+            )
+        })
+        .collect();
+    let outside = story(
+        "https://fixture.invalid/cap-outside",
+        "Graphics product launch",
+        now - 4 * MAX_ITEMS as i64 - 1,
+        "NVDA US Equity",
+        "Fixture",
+    );
+    items.push(outside.clone());
+    let mut store = NewsStore::memory().unwrap();
+    store.insert(&items, now).unwrap();
+    let related = store.related_stories(&Cluster::wire(&selected), now).unwrap();
+    assert!(
+        related.iter().all(|c| !c.member_ids.contains(&outside.id)),
+        "the inspector must not walk the entire archive"
+    );
+}
+
+#[test]
 fn n7_related_falls_back_to_event_or_category_only_without_shared_tickers() {
     use crate::news_intelligence::Cluster;
     let now = 10_000_000;
