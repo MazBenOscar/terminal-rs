@@ -153,6 +153,29 @@ impl Drop for Session {
     }
 }
 impl Session {
+    /// Command-only fixture: never creates a runtime, process, or private home.
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, mpsc::UnboundedReceiver<Command>) {
+        let (sender, receive) = mpsc::unbounded_channel();
+        let (shutdown, _) = watch::channel(());
+        let (_, finished) = std::sync::mpsc::channel();
+        (
+            Self {
+                sender: Some(sender),
+                inbox: Arc::new(Inbox {
+                    events: Mutex::new(Vec::new()),
+                    visible: AtomicBool::new(true),
+                    ctx: egui::Context::default(),
+                    last_text_wake: Mutex::new(None),
+                }),
+                shutdown,
+                finished,
+                owner: None,
+            },
+            receive,
+        )
+    }
+
     pub fn start(
         ctx: egui::Context,
         executor: AppExecutor,

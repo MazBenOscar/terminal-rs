@@ -132,6 +132,14 @@ impl ExternalServer {
                         }));
                         return Ok(schemas);
                     }
+                    // Connection registries stay immutable. Enforce the active
+                    // analysis turn before even validating a terminal-rs call.
+                    {
+                        let state = state.lock().await;
+                        if let Some(error) = state.executor.story_tool_error(&state.turn).await {
+                            return Ok(tr_agent::mcp::tool_result(error));
+                        }
+                    }
                     let Some(name) = request["params"]["name"].as_str() else {
                         return Ok(tr_agent::mcp::tool_error("Invalid tool name"));
                     };

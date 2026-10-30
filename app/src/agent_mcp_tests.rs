@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -39,6 +40,110 @@ async fn call(app: &mut TerminalApp, stream: &mut BufReader<UnixStream>, id: u64
             _ = tokio::time::sleep(Duration::from_millis(1)) => app.process_logic(),
             _ = &mut deadline => panic!("app tool did not finish"),
         }
+    }
+}
+
+#[test]
+fn story_analysis_refuses_all_tools_on_dynamic_and_mcp_paths_then_allows_ordinary_turn() {
+    use crate::agent_bridge::STORY_TOOLS_DISABLED;
+    use tr_agent::bridge::{BridgeEvent, ChartPin, ToolCall, ToolExecutor};
+    use tr_agent_tools::{Registry, ToolSet};
+    for cancelled in [false, true] {
+        let temp = Temp::new();
+        let mut app = TerminalApp::test_workspace(&temp.0);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            app.agent_config.backend = crate::agent_mcp::Backend::Mimo;
+            app.agent_config.allow_external = true;
+            app.agent_config.allow_external_edits = true;
+            app.external_agent_logic();
+            let mut stream = BufReader::new(UnixStream::connect(socket_path(&temp.0)).await.unwrap());
+            app.agent_pane.state = Onboarding::Ready;
+            app.agent_pane
+                .start_prompt(agent_pane::Prompt {
+                    text: "analysis".into(),
+                    id: Default::default(),
+                    requires_tools: false,
+                })
+                .unwrap();
+            app.agent_pane.set_story_turn(true);
+            app.agent_pane.event(BridgeEvent::Started { turn: "analysis-id".into() });
+            let executor = AppExecutor::new(&app);
+            for name in ["list_watchlists", "create_watchlist", "read_proposal_outcomes", "unknown_tool"] {
+                let result = call(&mut app, &mut stream, 1, name, json!({})).await;
+                assert_eq!(result["result"]["isError"], true, "{result}");
+                assert!(result.to_string().contains(STORY_TOOLS_DISABLED), "{result}");
+                let execute = executor.execute(
+                    Arc::new(Registry::new(ToolSet::Workflows)),
+                    ToolCall {
+                        turn: "analysis-id".into(),
+                        pin: ChartPin { uid: 0, symbol: String::new(), timeframe: String::new(), visible_range: None },
+                        name: name.into(),
+                        arguments: "{}".into(),
+                        confirmed: false,
+                    },
+                );
+                tokio::pin!(execute);
+                let result = loop {
+                    tokio::select! {
+                        result = &mut execute => break result,
+                        _ = tokio::time::sleep(Duration::from_millis(1)) => app.process_logic(),
+                    }
+                };
+                assert!(!result.success);
+                assert!(format!("{:?}", result.content).contains(STORY_TOOLS_DISABLED));
+            }
+            assert!(app.agent_pane.blocks.iter().any(|block| matches!(block,
+                agent_pane::RenderedBlock::Notice(text) if text == STORY_TOOLS_DISABLED)));
+            assert!(app.agent_pane.workflows.proposals.is_empty());
+            if cancelled {
+                app.agent_pane.interrupt();
+                assert!(!app.agent_pane.story_tools.lock().unwrap().active);
+            }
+            app.agent_pane.event(BridgeEvent::Completed {
+                turn: "analysis-id".into(),
+                status: if cancelled { "cancelled" } else { "completed" }.into(),
+                calls: 0,
+                interrupt_elapsed: None,
+            });
+            assert!(!app.agent_pane.story_tools.lock().unwrap().active);
+            assert!(
+                app.agent_pane.story_tools.lock().unwrap().denies("analysis-id"),
+                "late attributed calls stay denied"
+            );
+            let late = call(&mut app, &mut stream, 2, "list_watchlists", json!({})).await;
+            assert!(late.to_string().contains(STORY_TOOLS_DISABLED), "late MCP traffic: {late}");
+            app.agent_pane
+                .start_prompt(agent_pane::Prompt {
+                    text: "ordinary".into(),
+                    id: Default::default(),
+                    requires_tools: true,
+                })
+                .unwrap();
+            app.agent_pane.set_story_turn(false);
+            let result = call(&mut app, &mut stream, 2, "list_watchlists", json!({})).await;
+            assert_eq!(result["result"]["isError"], false, "{result}");
+            let execute = executor.execute(
+                Arc::new(Registry::new(ToolSet::Workflows)),
+                ToolCall {
+                    turn: "ordinary-id".into(),
+                    pin: ChartPin { uid: 0, symbol: String::new(), timeframe: String::new(), visible_range: None },
+                    name: "list_watchlists".into(),
+                    arguments: "{}".into(),
+                    confirmed: false,
+                },
+            );
+            tokio::pin!(execute);
+            let result = loop {
+                tokio::select! {
+                    result = &mut execute => break result,
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => app.process_logic(),
+                }
+            };
+            assert!(result.success, "{:?}", result.content);
+            app.agent_config.allow_external = false;
+            app.external_agent_logic();
+        });
     }
 }
 

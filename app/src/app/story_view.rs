@@ -23,6 +23,24 @@ use tr_data::{news_intelligence::Cluster, news_store::StoryAnalysis};
 
 const DETAILS_LIMIT: usize = 128;
 const DETAILS_DELAY: Duration = Duration::from_millis(250);
+const ANALYSIS_START_TIMEOUT: Duration = Duration::from_secs(150);
+
+fn analysis_phase(state: &Onboarding, mimo: bool, has_turn: bool, waiting: Duration) -> &'static str {
+    if has_turn {
+        return "Analyzing…";
+    }
+    if waiting > ANALYSIS_START_TIMEOUT {
+        return "Agent didn't start — Retry";
+    }
+    match state {
+        Onboarding::Checking if mimo => "Starting mimo (one-time safety check)…",
+        Onboarding::Checking | Onboarding::Dormant => "Starting agent — Focus Agent",
+        Onboarding::SigningIn | Onboarding::SignedOut => "Agent needs sign-in — Focus Agent",
+        Onboarding::Stopped { .. } => "Agent stopped — Restart in Agent pane",
+        Onboarding::Ready => "Queued",
+        other => other.title(),
+    }
+}
 
 #[derive(Default)]
 pub(super) struct Desk {
@@ -38,7 +56,6 @@ pub(super) struct Desk {
     analysis_inputs: HashMap<PromptId, Input>,
     pending_details: HashMap<PaneId, (String, Instant)>,
     detail_clock: u64,
-    pub read_only: bool,
 }
 struct Selection {
     link: Option<Link>,
@@ -170,9 +187,6 @@ impl Desk {
         for (_, id) in oldest.into_iter().take(self.details.len().saturating_sub(DETAILS_LIMIT)) {
             self.details.remove(&id);
         }
-    }
-    pub(super) fn effective_tools(&self, ordinary: tr_agent_tools::ToolSet) -> tr_agent_tools::ToolSet {
-        if self.read_only { tr_agent_tools::ToolSet::ReadOnly } else { ordinary }
     }
 }
 impl TerminalApp {
@@ -308,6 +322,7 @@ impl TerminalApp {
         self.agent_pane.enqueue(prompt);
     }
     pub(super) fn story_prompt_started(&mut self, prompt: &Prompt, model: &str) {
+        self.agent_pane.set_story_turn(self.story_desk.read_only_prompt_id(&prompt.id));
         if let Some(job) = self.story_desk.jobs.get_mut(&prompt.id) {
             job.model = model.into();
         }
@@ -539,18 +554,23 @@ impl TerminalApp {
             let job = entry.map(|(_, j)| j);
             if let Some((prompt, job)) = entry {
                 let turn = self.agent_pane.turns.iter().rev().find(|t| t.prompt_id == *prompt && !t.finished);
-                let phase = if turn.is_some() {
-                    "Analyzing…"
-                } else if self.agent_pane.starting_prompt.as_ref() == Some(prompt)
-                    || (!self.agent_pane.running && self.agent_pane.state != Onboarding::Ready)
-                {
-                    "Starting agent…"
-                } else {
-                    "Queued"
-                };
+                let waiting = job.created_at.elapsed();
+                let timed_out = turn.is_none() && waiting > ANALYSIS_START_TIMEOUT;
+                let phase = analysis_phase(
+                    &self.agent_pane.state,
+                    self.agent_config.backend == crate::agent_mcp::Backend::Mimo,
+                    turn.is_some(),
+                    waiting,
+                );
                 let elapsed = turn.map_or(job.created_at, |t| t.started_at).elapsed().as_secs();
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{phase} · {elapsed}s")).font(mono(10.5)).color(theme::muted()));
+                    if timed_out && ui.small_button("Retry").clicked() {
+                        // Replace only this waiting request; never replay another
+                        // story's prompt or restart a live/checking session.
+                        cancel = Some((prompt.clone(), job.agent, false));
+                        analyze = true;
+                    }
                     if ui.small_button("Cancel").clicked() {
                         cancel = Some((prompt.clone(), job.agent, turn.is_some()));
                     }
@@ -955,6 +975,90 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn ready_analysis_sends_without_session_restart_or_listener_rebuild_in_both_modes_and_backends() {
+        use crate::agent_mcp::Backend;
+        use crate::agent_pane::ToolsMode;
+        use crate::agent_session::{Command, Session};
+        for backend in [Backend::Mimo, Backend::Codex] {
+            for mode in [ToolsMode::Edit, ToolsMode::ReadOnly] {
+                let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target").canonicalize().unwrap();
+                let root = base.join(format!("nr-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&root);
+                std::fs::create_dir_all(&root).unwrap();
+                let mut app = TerminalApp::test_workspace(&root);
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let _guard = runtime.enter();
+                app.agent_config.backend = backend;
+                app.agent_config.allow_external = true;
+                app.agent_config.allow_external_edits = mode == ToolsMode::Edit;
+                app.agent_pane.initialized = true;
+                app.agent_pane.settings.tools = mode;
+                app.agent_pane.acknowledged = true;
+                app.agent_pane.state = Onboarding::Ready;
+                let tools = app.agent_config.session_tools(app.agent_pane.tool_set());
+                app.agent_pane.session_tools = Some(tools);
+                app.agent_pane.models = vec![tr_agent::codex::Model {
+                    id: "fixture".into(),
+                    model: "fixture".into(),
+                    display_name: "Fixture".into(),
+                    is_default: true,
+                    default_reasoning_effort: "low".into(),
+                    supported_reasoning_efforts: vec![],
+                }];
+                let (session, mut commands) = Session::test_channel();
+                app.agent_pane.session = Some(session);
+                let ctx = egui::Context::default();
+                app.agent_logic(&ctx);
+                let listener_pin = app.external_agent.as_ref().unwrap().pin.clone();
+                let saved = app.agent_config.clone();
+                let pane = app.new_pane(PaneKind::Story { link_follow: true });
+                app.analyze_story(pane, &cluster("Immediate analysis"));
+                let prompt_id = app.agent_pane.queue.front().unwrap().id.clone();
+                app.agent_logic(&ctx);
+                assert!(app.agent_pane.queue.is_empty());
+                assert_eq!(app.agent_pane.turns.last().unwrap().prompt_id, prompt_id);
+                assert!(matches!(commands.try_recv().unwrap(), Command::Turn(turn) if !turn.requires_tools));
+                assert!(!commands.is_closed(), "the original session must still own the receiver");
+                assert_eq!(app.agent_pane.state, Onboarding::Ready);
+                assert_eq!(app.agent_pane.session_tools, Some(tools));
+                assert_eq!(app.agent_pane.settings.tools, mode);
+                assert_eq!(app.agent_config, saved);
+                assert!(Arc::ptr_eq(&listener_pin, &app.external_agent.as_ref().unwrap().pin));
+                app.agent_pane.event(tr_agent::bridge::BridgeEvent::Completed {
+                    turn: "analysis".into(),
+                    status: "completed".into(),
+                    calls: 0,
+                    interrupt_elapsed: None,
+                });
+                app.agent_logic(&ctx);
+                assert!(!commands.is_closed(), "completion must not restore/restart the session");
+                assert!(Arc::ptr_eq(&listener_pin, &app.external_agent.as_ref().unwrap().pin));
+                drop(app);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn analysis_status_tracks_startup_signin_stop_timeout_and_active_turn() {
+        for (state, expected) in [
+            (Onboarding::Checking, "Starting mimo (one-time safety check)…"),
+            (Onboarding::SigningIn, "Agent needs sign-in — Focus Agent"),
+            (Onboarding::SignedOut, "Agent needs sign-in — Focus Agent"),
+            (
+                Onboarding::Stopped { reason: "fixture".into(), unsafe_backend: false },
+                "Agent stopped — Restart in Agent pane",
+            ),
+        ] {
+            assert_eq!(analysis_phase(&state, true, false, Duration::from_secs(60)), expected);
+            assert_eq!(analysis_phase(&state, true, false, Duration::from_secs(151)), "Agent didn't start — Retry");
+            assert_eq!(analysis_phase(&state, true, true, Duration::from_secs(151)), "Analyzing…");
+        }
+        assert_eq!(analysis_phase(&Onboarding::Ready, false, false, Duration::ZERO), "Queued");
+        assert_ne!(analysis_phase(&Onboarding::Checking, false, false, Duration::ZERO), "Starting agent…");
+    }
+
+    #[test]
     fn analysis_dequeued_before_started_survives_both_backends_and_two_jobs() {
         for backend in [crate::agent_mcp::Backend::Mimo, crate::agent_mcp::Backend::Codex] {
             let (mut app, root) = fixture(&format!("dequeued-{backend:?}"));
@@ -970,7 +1074,7 @@ mod tests {
             app.analyze_story(pane, &first);
             app.analyze_story(pane, &second);
             app.agent_pane.transition(Onboarding::Checking);
-            app.collect_story_analysis(); // read-only session restart
+            app.collect_story_analysis(); // first-ever session startup
             assert_eq!(app.story_desk.jobs.len(), 2);
             app.agent_pane.transition(Onboarding::Ready);
             let prompt = app.agent_pane.dequeue_prompt().unwrap();
@@ -1112,29 +1216,17 @@ mod tests {
         assert!(prompt.text.contains("\\u003c/STORY_DATA\\u003e"));
         let mut desk = Desk::default();
         desk.readonly_prompts.insert(prompt.id.clone(), (story.lead.id.clone(), 0));
-        desk.read_only = true;
         desk.reset_workspace();
         assert!(desk.queued_read_only(&prompt));
-        for ordinary in
-            [tr_agent_tools::ToolSet::Edit, tr_agent_tools::ToolSet::Workflows, tr_agent_tools::ToolSet::ReadOnly]
-        {
-            assert_eq!(desk.effective_tools(ordinary), tr_agent_tools::ToolSet::ReadOnly);
-        }
-        for backend in [crate::agent_mcp::Backend::Codex, crate::agent_mcp::Backend::Mimo] {
-            let settings = crate::agent_mcp::Settings {
-                backend,
-                allow_external: true,
-                allow_external_edits: true,
-                ..Default::default()
-            };
-            let saved = settings.clone();
-            let effective = desk.effective_tools(settings.session_tools(tr_agent_tools::ToolSet::Workflows));
-            let registry = tr_agent_tools::Registry::new(effective);
-            assert!(registry.schemas().iter().all(|spec| !spec.mutating));
-            assert_eq!(settings, saved, "analysis must not change the saved mode");
-        }
-        desk.read_only = false;
-        assert_eq!(desk.effective_tools(tr_agent_tools::ToolSet::Edit), tr_agent_tools::ToolSet::Edit);
+        // Policy survives workspace changes, but inventories no longer change:
+        // ALL tools (including reads) are refused per turn by the app host.
+        assert!(prompt.text.contains("Do not use tools"));
+        let mut pane = crate::agent_pane::AgentPane::default();
+        pane.set_story_turn(true);
+        assert!(pane.story_tools.lock().unwrap().denies("canonical-analysis"));
+        pane.interrupt();
+        assert!(!pane.story_tools.lock().unwrap().denies("ordinary-next-turn"));
+        assert!(pane.story_tools.lock().unwrap().denies("canonical-analysis"));
     }
     #[test]
     fn identical_analysis_text_has_distinct_canonical_ids_and_read_only_routing() {
