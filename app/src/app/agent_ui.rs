@@ -916,6 +916,9 @@ impl TerminalApp {
                     self.agent_pane.models = models;
                 }
                 Event::Limits(limits) => self.agent_pane.set_limits(&limits),
+                Event::AnalysisStarting { id, starting } => {
+                    self.story_analysis_starting(&id, starting);
+                }
                 Event::Analysis { id, result } => {
                     // The queue owner has confirmed the end or stopped the
                     // relevant process before posting this event.

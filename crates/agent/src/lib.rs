@@ -77,6 +77,7 @@ pub enum AnalysisError {
     NoAnswerTooLong,
     Cancelled,
     TimedOut,
+    StartTimedOut,
     NotReady,
 }
 impl std::fmt::Display for AnalysisError {
@@ -87,6 +88,7 @@ impl std::fmt::Display for AnalysisError {
             Self::NoAnswerTooLong => "Model returned no answer — reply too long",
             Self::Cancelled => "Cancelled",
             Self::TimedOut => "Analysis timed out — Retry",
+            Self::StartTimedOut => "Analysis agent didn't start — Retry",
             Self::NotReady => "Agent not ready",
         })
     }

@@ -342,10 +342,7 @@ impl CodexAppServer {
     /// still pending. Completion, not this best-effort send, confirms cancellation.
     pub async fn interrupt_analysis(&self) {
         if let Ok(transport) = self.transport() {
-            let active = self.active.lock().unwrap().clone();
-            if active.0.as_deref().is_some_and(|id| transport.is_analysis_thread(id)) {
-                transport.cancel_analysis(json!(active.0), json!(active.1));
-            }
+            transport.interrupt_analysis();
         }
     }
 
@@ -792,6 +789,7 @@ mod tests {
     #[tokio::test]
     async fn events_map_text_reasoning_tools_usage_limits_and_completion() {
         let (transport, _read, mut write, _) = fake(no_tools());
+        transport.register_test_main();
         let client = ready(transport);
         let mut events = client.events();
         for method in [
@@ -803,7 +801,7 @@ mod tests {
             "account/rateLimits/updated",
             "turn/completed",
         ] {
-            send(&mut write, json!({"method":method,"params":{"item":{"type":"dynamicToolCall"},"delta":"text"}}))
+            send(&mut write, json!({"method":method,"params":{"threadId":"main","turnId":"main-turn","item":{"type":"dynamicToolCall"},"delta":"text"}}))
                 .await;
         }
         assert!(matches!(events.recv().await, Some(AgentEvent::TextDelta(_))));
@@ -1145,6 +1143,82 @@ mod tests {
         assert_eq!(result, Err(crate::AnalysisError::Cancelled));
         assert!(!killed.load(Ordering::SeqCst));
         assert_eq!(*client.active.lock().unwrap(), (Some("main".into()), Some("user-turn".into())));
+    }
+
+    /// The queue owner polls `interrupt_analysis` exactly once per Escape and
+    /// then gives the analysis 3 s to confirm before stopping the whole Codex
+    /// backend. An Escape that lands while `thread/start` (or `turn/start`) is
+    /// still pending is dropped here and never re-sent once the story turn is
+    /// known, so the turn runs on, the 3 s deadline expires and the user's main
+    /// conversation is shut down "for safety" although nothing unsafe happened.
+    #[tokio::test]
+    async fn review_final_codex_early_analysis_cancel_is_lost() {
+        let (transport, mut read, mut write, killed) = fake(no_tools());
+        let client = ready(transport);
+        *client.active.lock().unwrap() = (Some("main".into()), None);
+        let run = client.analyze(TurnInput::default());
+        tokio::pin!(run);
+        tokio::select! {
+            _ = &mut run => panic!("no reply yet"),
+            new = receive(&mut read) => {
+                assert_eq!(new["method"], "thread/start");
+                // The single Escape the owner forwards for this analysis.
+                client.interrupt_analysis().await;
+                send(&mut write, json!({"id":new["id"],"result":{"thread":{"id":"story"}}})).await;
+            }
+        }
+        let server = async {
+            let prompt = receive(&mut read).await;
+            assert_eq!(prompt["method"], "turn/start");
+            send(&mut write, json!({"id":prompt["id"],"result":{"turn":{"id":"analysis"}}})).await;
+            let cancel = tokio::time::timeout(std::time::Duration::from_millis(500), receive(&mut read)).await;
+            assert!(
+                cancel.as_ref().is_ok_and(|packet| packet["method"] == "turn/interrupt" && packet["params"]["threadId"] == "story"),
+                "the earlier Escape never reached the analysis turn"
+            );
+            send(
+                &mut write,
+                json!({"method":"turn/completed","params":{"threadId":"story","turn":{"status":"interrupted"}}}),
+            )
+            .await;
+        };
+        let (result, ()) = tokio::join!(&mut run, server);
+        assert_eq!(result, Err(crate::AnalysisError::Cancelled));
+        assert!(!killed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn analysis_cancel_before_turn_ack_waits_for_a_real_turn_id() {
+        for notify_before_ack in [false, true] {
+            let (transport, mut read, mut write, killed) = fake(no_tools());
+            let client = ready(transport);
+            *client.active.lock().unwrap() = (Some("main".into()), Some("user-turn".into()));
+            let server = async {
+                let thread = receive(&mut read).await;
+                send(&mut write, json!({"id":thread["id"],"result":{"thread":{"id":"story"}}})).await;
+                let prompt = receive(&mut read).await;
+                assert_eq!(prompt["method"], "turn/start");
+                client.interrupt_analysis().await;
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(10), receive(&mut read)).await.is_err());
+                if notify_before_ack {
+                    send(
+                        &mut write,
+                        json!({"method":"turn/started","params":{"threadId":"story","turn":{"id":"analysis"}}}),
+                    )
+                    .await;
+                } else {
+                    send(&mut write, json!({"id":prompt["id"],"result":{"turn":{"id":"analysis"}}})).await;
+                }
+                let cancel = receive(&mut read).await;
+                assert_eq!(cancel["method"], "turn/interrupt");
+                assert_eq!(cancel["params"], json!({"threadId":"story","turnId":"analysis"}));
+                send(&mut write, json!({"method":"turn/completed","params":{"threadId":"story","turn":{"id":"analysis","status":"interrupted"}}})).await;
+            };
+            let (result, ()) = tokio::join!(client.analyze(TurnInput::default()), server);
+            assert_eq!(result, Err(crate::AnalysisError::Cancelled));
+            assert!(!killed.load(Ordering::SeqCst));
+            assert_eq!(*client.active.lock().unwrap(), (Some("main".into()), Some("user-turn".into())));
+        }
     }
 
     #[tokio::test(start_paused = true)]

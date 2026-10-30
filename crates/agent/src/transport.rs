@@ -151,7 +151,13 @@ struct Shared {
     tool_cancel: watch::Sender<u64>,
     login_only: Mutex<Option<bool>>,
     shutdown_check: Mutex<Option<ShutdownCheck>>,
+    main: Mutex<(Option<String>, Option<String>)>,
+    main_requests: Mutex<HashMap<u64, String>>,
+    unconfirmed_analysis_threads: Mutex<std::collections::HashSet<String>>,
     analysis_starting: AtomicBool,
+    analysis_cancelled: AtomicBool,
+    analysis_turns: Mutex<HashMap<String, (String, bool)>>,
+    analysis_turn_requests: Mutex<HashMap<u64, String>>,
     analysis_threads: Mutex<HashMap<String, bool>>,
     analysis_requests: Mutex<std::collections::HashSet<u64>>,
     retired_analysis_threads: Mutex<crate::BoundedIds<String>>,
@@ -159,6 +165,27 @@ struct Shared {
 }
 
 impl Shared {
+    fn remember_analysis_turn(&self, thread: &str, turn: &str) {
+        self.analysis_turns.lock().unwrap().entry(thread.into()).or_insert((turn.into(), false));
+        self.cancel_known_analysis();
+    }
+
+    fn cancel_known_analysis(&self) {
+        if !self.analysis_cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        for (thread, (turn, sent)) in self.analysis_turns.lock().unwrap().iter_mut() {
+            if !*sent {
+                *sent = true;
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                let _ = self.enqueue(
+                    json!({"id":id,"method":"turn/interrupt","params":{"threadId":thread,"turnId":turn}}),
+                    None,
+                );
+            }
+        }
+    }
+
     fn taint(&self) {
         self.unsafe_backend.store(true, Ordering::SeqCst);
         if let Some(safety) = self.bridge_safety.lock().unwrap().as_ref() {
@@ -235,13 +262,17 @@ impl Shared {
         let already_stopped = self.stopped.load(Ordering::SeqCst);
         self.taint();
         self.tool_cancel.send_modify(|generation| *generation += 1);
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let packet = Outbound {
-            value: json!({"id": id, "method": "turn/interrupt", "params": {
+        let value = if params["threadId"].is_string() && params["turnId"].is_string() {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            json!({"id": id, "method": "turn/interrupt", "params": {
                 "threadId": params["threadId"], "turnId": params["turnId"]
-            }}),
-            stop_after: Some(message.clone()),
+            }})
+        } else {
+            // Internal stop barrier: flush preceding denials without inventing a
+            // null turnId. The writer never serializes this sentinel.
+            Value::Null
         };
+        let packet = Outbound { value, stop_after: Some(message.clone()) };
         if self.output.try_send(packet).is_err() {
             // Do not replace the security finding with a generic queue error.
             self.fail(&message);
@@ -329,7 +360,13 @@ impl Transport {
             tool_cancel: watch::channel(0).0,
             login_only: Mutex::new(None),
             shutdown_check: Mutex::new(None),
+            main: Default::default(),
+            main_requests: Default::default(),
+            unconfirmed_analysis_threads: Default::default(),
             analysis_starting: AtomicBool::new(false),
+            analysis_cancelled: AtomicBool::new(false),
+            analysis_turns: Default::default(),
+            analysis_turn_requests: Default::default(),
             analysis_threads: Mutex::new(HashMap::new()),
             analysis_requests: Mutex::new(std::collections::HashSet::new()),
             retired_analysis_threads: Default::default(),
@@ -346,18 +383,28 @@ impl Transport {
         EventStream { queue, terminal: self.shared.terminal.subscribe(), ended: false }
     }
 
+    #[cfg(test)]
+    pub(crate) fn register_test_main(&self) {
+        *self.shared.main.lock().unwrap() = (Some("main".into()), Some("main-turn".into()));
+    }
+
     pub(crate) fn begin_analysis(&self) -> EventStream {
+        self.shared.analysis_cancelled.store(false, Ordering::SeqCst);
         self.shared.analysis_starting.store(true, Ordering::SeqCst);
         let queue = Arc::new(EventQueue { analysis: true, ..Default::default() });
         self.shared.events.lock().unwrap().push(Arc::downgrade(&queue));
         EventStream { queue, terminal: self.shared.terminal.subscribe(), ended: false }
     }
 
-    pub(crate) fn is_analysis_thread(&self, thread: &str) -> bool {
-        self.shared.analysis_threads.lock().unwrap().contains_key(thread)
+    pub(crate) fn interrupt_analysis(&self) {
+        self.shared.analysis_cancelled.store(true, Ordering::SeqCst);
+        self.shared.cancel_known_analysis();
     }
 
     pub(crate) fn cancel_analysis(&self, thread: Value, turn: Value) {
+        if !thread.is_string() || !turn.is_string() {
+            return;
+        }
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let _ = self
             .shared
@@ -366,6 +413,7 @@ impl Transport {
 
     pub(crate) fn retire_analysis(&self) {
         self.shared.analysis_starting.store(false, Ordering::SeqCst);
+        self.shared.analysis_turns.lock().unwrap().clear();
         for (thread, _) in self.shared.analysis_threads.lock().unwrap().drain() {
             self.shared.retired_analysis_threads.lock().unwrap().insert(thread);
         }
@@ -461,6 +509,16 @@ impl Transport {
         self.shared.pending.lock().unwrap().insert(id, tx);
         if method == "thread/start" && self.shared.analysis_starting.load(Ordering::SeqCst) {
             self.shared.analysis_requests.lock().unwrap().insert(id);
+        } else if matches!(method, "thread/start" | "thread/resume") {
+            self.shared.main_requests.lock().unwrap().insert(id, method.into());
+        } else if method == "turn/start" && self.shared.analysis_starting.load(Ordering::SeqCst) {
+            if let Some(thread) = params["threadId"].as_str() {
+                self.shared.analysis_turn_requests.lock().unwrap().insert(id, thread.into());
+            }
+        } else if method == "turn/start" && params["threadId"].as_str() == self.shared.main.lock().unwrap().0.as_deref()
+        {
+            self.shared.main.lock().unwrap().1 = None;
+            self.shared.main_requests.lock().unwrap().insert(id, method.into());
         }
         let _cleanup = PendingGuard { id, shared: self.shared.clone() };
         self.shared.enqueue(json!({"id": id, "method": method, "params": params}), None)?;
@@ -479,6 +537,8 @@ struct PendingGuard {
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         self.shared.pending.lock().unwrap().remove(&self.id);
+        self.shared.main_requests.lock().unwrap().remove(&self.id);
+        self.shared.analysis_turn_requests.lock().unwrap().remove(&self.id);
         if self.shared.analysis_requests.lock().unwrap().remove(&self.id) {
             self.shared.retired_analysis_requests.lock().unwrap().insert(self.id);
         }
@@ -495,6 +555,10 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut write: W, mut input: mpsc::Receiv
             _ = terminal.changed() => break,
             packet = input.recv() => match packet { Some(packet) => packet, None => break },
         };
+        if packet.value.is_null() {
+            shared.fail(packet.stop_after.as_deref().unwrap_or("app-server stopped"));
+            break;
+        }
         let result = async {
             shared.record(&packet.value)?;
             let mut bytes = serde_json::to_vec(&packet.value)?;
@@ -591,10 +655,29 @@ fn route(value: Value, shared: &Arc<Shared>, handler: &ToolHandler, slots: &Arc<
             }
             && let Some(thread) = value["result"]["thread"]["id"].as_str()
         {
+            shared.unconfirmed_analysis_threads.lock().unwrap().insert(thread.into());
             if shared.pending.lock().unwrap().contains_key(&id) && shared.analysis_starting.load(Ordering::SeqCst) {
                 shared.analysis_threads.lock().unwrap().insert(thread.into(), true);
             } else {
                 shared.retired_analysis_threads.lock().unwrap().insert(thread.into());
+            }
+        }
+        if let Some(id) = value["id"].as_u64()
+            && let Some(thread) = shared.analysis_turn_requests.lock().unwrap().remove(&id)
+            && let Some(turn) = value["result"]["turn"]["id"].as_str()
+        {
+            shared.remember_analysis_turn(&thread, turn);
+        }
+        // Register authorization on the reader, before any batched tool traffic.
+        if let Some(id) = value["id"].as_u64()
+            && let Some(method) = shared.main_requests.lock().unwrap().remove(&id)
+            && value.get("error").is_none()
+        {
+            let mut main = shared.main.lock().unwrap();
+            if method == "turn/start" {
+                main.1 = value["result"]["turn"]["id"].as_str().map(str::to_owned);
+            } else {
+                *main = (value["result"]["thread"]["id"].as_str().map(str::to_owned), None);
             }
         }
         if let Some(id) = value["id"].as_u64()
@@ -618,7 +701,36 @@ fn route(value: Value, shared: &Arc<Shared>, handler: &ToolHandler, slots: &Arc<
             .get(id)
             .copied()
             .or_else(|| shared.retired_analysis_threads.lock().unwrap().contains(id).then_some(false))
+            .or_else(|| shared.unconfirmed_analysis_threads.lock().unwrap().contains(id).then_some(false))
+            .or_else(|| (shared.main.lock().unwrap().0.as_deref() != Some(id)).then_some(false))
     });
+    // Startup sends this outside the ordinary notification catalogue.
+    if method == "remoteControl/status/changed" && value.get("id").is_none() {
+        if params["status"] != "disabled" {
+            shared.violation(&params, "remote control is not disabled".into());
+            return false;
+        }
+        return true;
+    }
+    if method == "turn/completed"
+        && let Some(thread) = params["threadId"].as_str()
+    {
+        shared.unconfirmed_analysis_threads.lock().unwrap().remove(thread);
+    }
+    if method == "turn/started"
+        && analysis == Some(true)
+        && let (Some(thread), Some(turn)) = (params["threadId"].as_str(), params["turn"]["id"].as_str())
+    {
+        shared.remember_analysis_turn(thread, turn);
+    }
+    if method == "turn/started" {
+        let mut main = shared.main.lock().unwrap();
+        if params["threadId"].as_str().is_some_and(|id| Some(id) == main.0.as_deref())
+            && shared.main_requests.lock().unwrap().values().any(|method| method == "turn/start")
+        {
+            main.1 = params["turn"]["id"].as_str().map(str::to_owned);
+        }
+    }
     // Review notifications before any analysis-specific early return. Requests
     // retain the stricter approval/server-request checks below.
     if value.get("id").is_none() && !ALLOWED_NOTIFICATIONS.contains(&method) {
@@ -626,13 +738,18 @@ fn route(value: Value, shared: &Arc<Shared>, handler: &ToolHandler, slots: &Arc<
         return false;
     }
     let tool = method == "item/tool/call" || params["item"]["type"] == "dynamicToolCall";
-    if tool && (analysis.is_some() || shared.analysis_starting.load(Ordering::SeqCst)) {
+    let main_tool = {
+        let main = shared.main.lock().unwrap();
+        params["threadId"].as_str().is_some_and(|id| Some(id) == main.0.as_deref())
+            && params["turnId"].as_str().is_some_and(|id| Some(id) == main.1.as_deref())
+    };
+    if tool && (!main_tool || shared.analysis_starting.load(Ordering::SeqCst)) {
         if let Some(id) = value.get("id") {
             shared.security_reply(json!({"id":id,"result":{"success":false,"contentItems":[{"type":"inputText","text":"Tools are disabled for story analysis"}]}}));
         }
         // A refused dynamic call executed nothing. Fail only the active
         // analysis subscription; genuine execution evidence is handled above.
-        if analysis != Some(false) {
+        if analysis != Some(false) || shared.analysis_starting.load(Ordering::SeqCst) {
             let mut denied = params.clone();
             denied["item"] = json!({"type":"dynamicToolCall"});
             shared.emit_scoped(WireEvent::Notification { method: "item/started".into(), params: denied }, true);
@@ -696,15 +813,6 @@ fn route(value: Value, shared: &Arc<Shared>, handler: &ToolHandler, slots: &Arc<
             };
             let _ = shared.enqueue(json!({"id": id, "result": result}), None);
         });
-        return true;
-    }
-    // Codex announces remote control at startup; only the disabled state is acceptable,
-    // since an enabled or paired state lets a remote client drive this app-server.
-    if method == "remoteControl/status/changed" {
-        if params["status"].as_str() != Some("disabled") {
-            shared.violation(&params, "remote control is not disabled".to_owned());
-            return false;
-        }
         return true;
     }
     if !ALLOWED_NOTIFICATIONS.contains(&method) {
@@ -982,10 +1090,9 @@ pub(crate) mod tests {
             json!({}),
             json!(null),
         ] {
-            let (client, mut read, mut write, killed) = fake(no_tools());
+            let (client, _read, mut write, killed) = fake(no_tools());
             let mut events = client.events();
             send(&mut write, message).await;
-            assert_eq!(receive(&mut read).await["method"], "turn/interrupt");
             assert!(matches!(events.recv().await, Some(WireEvent::Error(_))));
             assert!(client.is_unsafe() && killed.load(Ordering::SeqCst));
         }
@@ -1002,7 +1109,9 @@ pub(crate) mod tests {
     async fn handler_invocation_panic_does_not_end_the_turn() {
         let handler: ToolHandler = Arc::new(|_| panic!("synchronous handler invocation panic"));
         let (client, mut read, mut write, killed) = fake(handler);
-        send(&mut write, json!({"id":11,"method":"item/tool/call","params":{}})).await;
+        client.register_test_main();
+        send(&mut write, json!({"id":11,"method":"item/tool/call","params":{"threadId":"main","turnId":"main-turn"}}))
+            .await;
         assert_eq!(receive(&mut read).await["result"]["success"], false);
         let server = async {
             let request = receive(&mut read).await;
@@ -1084,8 +1193,9 @@ pub(crate) mod tests {
                 ]}))
             })
         });
-        let (_client, mut read, mut write, _) = fake(handler);
-        send(&mut write, json!({"id":"rpc-42","method":"item/tool/call","params":{"callId":"different"}})).await;
+        let (client, mut read, mut write, _) = fake(handler);
+        client.register_test_main();
+        send(&mut write, json!({"id":"rpc-42","method":"item/tool/call","params":{"threadId":"main","turnId":"main-turn","callId":"different"}})).await;
         let reply = receive(&mut read).await;
         assert_eq!(reply["id"], "rpc-42");
         assert_eq!(reply["result"]["contentItems"][1]["type"], "inputImage");
@@ -1159,12 +1269,90 @@ pub(crate) mod tests {
             })
         });
         let (client, mut read, mut write, _) = fake(handler);
-        send(&mut write, json!({"id":7,"method":"item/tool/call","params":{}})).await;
+        client.register_test_main();
+        send(&mut write, json!({"id":7,"method":"item/tool/call","params":{"threadId":"main","turnId":"main-turn"}}))
+            .await;
         observed.recv().await.unwrap();
         client.cancel_tools();
         let reply = receive(&mut read).await;
         assert_eq!(reply["id"], 7);
         assert_eq!(reply["result"]["success"], false);
+    }
+
+    #[tokio::test]
+    async fn remote_control_disabled_is_accepted_but_every_other_status_trips() {
+        for status in ["disabled", "enabled", "paired", "unknown"] {
+            let (client, mut read, mut write, killed) = fake(no_tools());
+            send(&mut write, json!({"method":"remoteControl/status/changed","params":{"status":status}})).await;
+            if status == "disabled" {
+                let server = async {
+                    let request = receive(&mut read).await;
+                    send(&mut write, json!({"id":request["id"],"result":"still running"})).await;
+                };
+                let (result, ()) = tokio::join!(client.request("model/list", json!({})), server);
+                assert_eq!(result.unwrap(), "still running");
+                assert!(!client.is_unsafe() && !killed.load(Ordering::SeqCst));
+            } else {
+                let mut events = client.events();
+                assert!(matches!(events.recv().await, Some(WireEvent::Error(_))));
+                assert!(client.is_unsafe() && killed.load(Ordering::SeqCst));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_require_the_registered_main_thread_and_turn_even_after_tombstone_eviction() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let count = calls.clone();
+        let handler: ToolHandler = Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(json!({"success":true,"contentItems":[]})) })
+        });
+        let (client, mut read, mut write, _) = fake(handler);
+        client.register_test_main();
+        for index in 0..1000 {
+            client.shared.retired_analysis_threads.lock().unwrap().insert(format!("story-{index}"));
+        }
+        assert!(!client.shared.retired_analysis_threads.lock().unwrap().contains("story-0"));
+        for params in [
+            json!({}),
+            json!({"threadId":"story-0","turnId":"main-turn"}),
+            json!({"threadId":"unknown","turnId":"main-turn"}),
+            json!({"threadId":"main","turnId":"old-turn"}),
+            json!({"threadId":"main"}),
+            json!({"threadId":"main","turnId":"main-turn"}),
+        ] {
+            let allowed = params == json!({"threadId":"main","turnId":"main-turn"});
+            send(&mut write, json!({"id":"tool","method":"item/tool/call","params":params})).await;
+            assert_eq!(receive(&mut read).await["result"]["success"], allowed);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_analysis_threads_survive_retirement_until_completed() {
+        let (client, mut read, mut write, _) = fake(no_tools());
+        let _events = client.begin_analysis();
+        let server = async {
+            let start = receive(&mut read).await;
+            send(&mut write, json!({"id":start["id"],"result":{"thread":{"id":"unconfirmed"}}})).await;
+        };
+        let (result, ()) = tokio::join!(client.request("thread/start", json!({})), server);
+        result.unwrap();
+        client.retire_analysis();
+        for index in 0..1000 {
+            client.shared.retired_analysis_threads.lock().unwrap().insert(format!("finished-{index}"));
+        }
+        assert!(client.shared.unconfirmed_analysis_threads.lock().unwrap().contains("unconfirmed"));
+        send(&mut write, json!({"method":"turn/completed","params":{"threadId":"unconfirmed","turn":{"id":"t","status":"completed"}}})).await;
+        // A following RPC response is a reader barrier.
+        let server = async {
+            let request = receive(&mut read).await;
+            send(&mut write, json!({"id":request["id"],"result":{}})).await;
+        };
+        let (result, ()) = tokio::join!(client.request("model/list", json!({})), server);
+        result.unwrap();
+        assert!(!client.shared.unconfirmed_analysis_threads.lock().unwrap().contains("unconfirmed"));
     }
 
     #[tokio::test]

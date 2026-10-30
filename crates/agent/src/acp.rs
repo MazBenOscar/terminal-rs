@@ -50,6 +50,42 @@ struct PendingRequest {
 }
 type Pending = HashMap<u64, PendingRequest>;
 type Cleanup = watch::Receiver<Option<std::result::Result<(), String>>>;
+struct ChildCleanup {
+    done: Cleanup,
+    task: tokio::task::JoinHandle<()>,
+}
+type ChildCleanups = Arc<Mutex<Vec<ChildCleanup>>>;
+
+async fn cleanup_result(mut cleaned: Cleanup) -> Result<()> {
+    loop {
+        if let Some(result) = cleaned.borrow_and_update().clone() {
+            return result.map_err(anyhow::Error::msg);
+        }
+        cleaned.changed().await.context("mimo cleanup supervisor exited")?;
+    }
+}
+
+/// Retain the receiver independently of the child slot and analyze future.
+/// This task survives idle expiry, cancellation, and a dropped startup future.
+fn observe_child_cleanup(rpc: &Arc<Rpc>, tasks: &ChildCleanups, child: &AcpBackend) {
+    let Some(cleaned) = child.cleaned.clone() else { return };
+    let rpc = rpc.clone();
+    let (finished, done) = watch::channel(None);
+    let task = tokio::spawn(async move {
+        let result = cleanup_result(cleaned).await.map_err(|error| error.to_string());
+        if let Err(error) = &result {
+            rpc.unsafe_backend.store(true, Ordering::SeqCst);
+            let reason = scrub_text(&format!("mimo analysis cleanup findings: {error}"));
+            rpc.stop(&reason);
+            rpc.closed.send_replace(Some(reason.clone()));
+            rpc.emit(AgentEvent::Error(reason));
+        }
+        finished.send_replace(Some(result));
+    });
+    let mut tasks = tasks.lock().unwrap();
+    tasks.retain(|cleanup| !cleanup.task.is_finished());
+    tasks.push(ChildCleanup { done, task });
+}
 struct Rpc {
     output: mpsc::Sender<Value>,
     pending: Mutex<Pending>,
@@ -123,8 +159,9 @@ impl Rpc {
         result.context("mimo ACP exited")?
     }
     fn notify_cancel(&self) {
-        let session = self.session.lock().unwrap().clone();
-        let _ = self.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}}));
+        if let Some(session) = self.session.lock().unwrap().clone() {
+            let _ = self.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}}));
+        }
     }
     fn provider_retry(&self, part: &Value) {
         let attempt = part["attempt"].as_u64().unwrap_or(1);
@@ -277,9 +314,20 @@ impl Rpc {
             return Ok(());
         };
         let params = &value["params"];
+        let tool_traffic = method == "session/request_permission"
+            || matches!(params["update"]["sessionUpdate"].as_str(), Some("tool_call" | "tool_call_update"));
+        let registered_session =
+            params["sessionId"].as_str().is_some_and(|id| self.session.lock().unwrap().as_deref() == Some(id));
+        if tool_traffic && !registered_session {
+            if let Some(id) = value.get("id") {
+                self.send(crate::mcp::error(id.clone(), -32602, "Unexpected ACP session"))?;
+            }
+            self.violation("mimo isolation tripwire: tool traffic outside the registered session").await;
+            return Ok(());
+        }
         let wrong_session = params
             .get("sessionId")
-            .is_some_and(|id| self.session.lock().unwrap().as_ref().is_some_and(|current| id != current));
+            .is_some_and(|id| self.session.lock().unwrap().as_ref().is_none_or(|current| id != current));
         if wrong_session {
             // A canary turn cancelled for a retry may still be running: any tool
             // activity from it fails closed instead of being dropped as late noise.
@@ -503,7 +551,9 @@ pub struct AcpBackend {
     analysis_launch: Option<AnalysisLaunch>,
     analysis_child: Arc<Mutex<Option<Arc<AcpBackend>>>>,
     analysis_generation: Arc<AtomicU64>,
-    analysis_cancelled: AtomicBool,
+    analysis_cancelled: watch::Sender<bool>,
+    child_cleanups: ChildCleanups,
+    analysis_ready: watch::Sender<bool>,
     #[cfg(test)]
     analysis_factory: Option<AnalysisFactory>,
 }
@@ -514,7 +564,6 @@ type AnalysisFactory =
 struct AnalysisLaunch {
     data: PathBuf,
     profile: MimoProfile,
-    load_plugins: bool,
 }
 struct Workspace(PathBuf);
 impl Drop for Workspace {
@@ -635,7 +684,9 @@ impl AcpBackend {
             analysis_launch: None,
             analysis_child: Default::default(),
             analysis_generation: Arc::new(AtomicU64::new(0)),
-            analysis_cancelled: AtomicBool::new(false),
+            analysis_cancelled: watch::channel(false).0,
+            child_cleanups: Default::default(),
+            analysis_ready: watch::channel(false).0,
             #[cfg(test)]
             analysis_factory: None,
         }
@@ -719,15 +770,19 @@ impl AcpBackend {
         Ok(())
     }
     pub async fn wait_cleanup(&self) -> Result<()> {
-        if let Some(mut cleaned) = self.cleaned.clone() {
-            loop {
-                if let Some(result) = cleaned.borrow_and_update().clone() {
-                    return result.map_err(anyhow::Error::msg);
-                }
-                cleaned.changed().await.context("mimo cleanup supervisor exited")?;
-            }
+        // Clone completion receivers rather than taking tasks: a bounded/cancelled
+        // waiter must not detach cleanup from the next owner shutdown.
+        let tasks: Vec<_> = self.child_cleanups.lock().unwrap().iter().map(|cleanup| cleanup.done.clone()).collect();
+        let mut child_result = Ok(());
+        for done in tasks {
+            child_result = cleanup_result(done).await.and(child_result);
         }
-        Ok(())
+        let result = if let Some(cleaned) = self.cleaned.clone() { cleanup_result(cleaned).await } else { Ok(()) };
+        let result = child_result.and(result);
+        if self.is_unsafe() {
+            bail!("mimo cleanup findings; backend is unsafe");
+        }
+        result
     }
     pub fn is_closed(&self) -> bool {
         self.rpc.closed.borrow().is_some()
@@ -737,26 +792,31 @@ impl AcpBackend {
     }
     pub fn shutdown(&self) {
         if let Some(child) = self.analysis_child.lock().unwrap().take() {
+            observe_child_cleanup(&self.rpc, &self.child_cleanups, &child);
             child.shutdown();
         }
         self.rpc.stop("mimo backend shut down");
     }
     /// Cancellation targets the dedicated child, never the user's conversation.
     pub async fn interrupt_analysis(&self) {
-        self.analysis_cancelled.store(true, Ordering::SeqCst);
+        self.analysis_cancelled.send_replace(true);
         let child = self.analysis_child.lock().unwrap().clone();
         if let Some(child) = child {
             child.rpc.notify_cancel();
         }
     }
     pub async fn launch(data: &Path, profile: MimoProfile, load_plugins: bool) -> Result<Self> {
-        Self::launch_mode(data, profile, load_plugins, false).await
+        Self::launch_mode(data, profile, load_plugins, None).await
     }
-    async fn launch_mode(data: &Path, profile: MimoProfile, load_plugins: bool, analysis: bool) -> Result<Self> {
+    async fn launch_mode(data: &Path, profile: MimoProfile, load_plugins: bool, owner: Option<&Self>) -> Result<Self> {
+        let analysis = owner.is_some();
         let mut previous_port = None;
         for attempt in 0..2 {
             let port = free_loopback_port(previous_port)?;
             let backend = Self::launch_once(data, profile, load_plugins, port, analysis)?;
+            if let Some(owner) = owner {
+                observe_child_cleanup(&owner.rpc, &owner.child_cleanups, &backend);
+            }
             match backend.initialize().await {
                 Ok(_) => return Ok(backend),
                 Err(error) => {
@@ -830,8 +890,16 @@ impl AcpBackend {
         // needs the real absolute path the kernel will see for the MCP shim exec.
         let exe = std::env::current_exe()?.canonicalize()?;
         let mut command = if cfg!(target_os = "macos") {
-            let profile =
-                sandbox_profile(&private, &roots, &binary, &exe, &crate::mcp::socket_path(data), &user_home, port)?;
+            let profile = sandbox_profile_with_mode(
+                &private,
+                &roots,
+                &binary,
+                &exe,
+                &crate::mcp::socket_path(data),
+                &user_home,
+                port,
+                analysis,
+            )?;
             let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
             command.args(["-p", &profile]).arg(&binary);
             command
@@ -840,15 +908,18 @@ impl AcpBackend {
         };
         let mcp_label = (!analysis).then(crate::mcp::MimoClientLabel::register);
         let config = process_config(&exe, data, mcp_label.as_ref().map(|label| label.token()));
-        command.args(acp_arguments(profile, load_plugins, port));
+        command.args(if analysis {
+            analysis_arguments(profile, port)
+        } else {
+            acp_arguments(profile, load_plugins, port)
+        });
         command
             .env_clear()
-            .envs(mimo_environment(std::env::vars_os(), &private, &home, profile))
-            // Configure MCP before mimo builds its startup reminder/tool catalogue.
-            .env("MIMOCODE_CONFIG_CONTENT", config.to_string())
-            // This is a host-selected path, not an inherited secret. The shim must
-            // locate precisely the app instance that launched this backend.
-            .env("TR_DATA_DIR", data)
+            .envs(process_environment(
+                mimo_environment(std::env::vars_os(), &private, &home, profile),
+                config,
+                (!analysis).then_some(data),
+            ))
             .current_dir(&cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -869,7 +940,7 @@ impl AcpBackend {
         if analysis {
             backend.rpc.analysis.store(true, Ordering::SeqCst);
         } else {
-            backend.analysis_launch = Some(AnalysisLaunch { data: data.to_path_buf(), profile, load_plugins });
+            backend.analysis_launch = Some(AnalysisLaunch { data: data.to_path_buf(), profile });
         }
         let rpc = backend.rpc.clone();
         std::thread::spawn(move || {
@@ -908,6 +979,10 @@ impl AcpBackend {
         });
         Ok(backend)
     }
+    pub fn analysis_readiness(&self) -> watch::Receiver<bool> {
+        self.analysis_ready.subscribe()
+    }
+
     /// The host FIFO serializes this with main-session work. No analysis RPC
     /// ever reaches the main process, even when launching the child fails.
     pub async fn analyze(&self, input: TurnInput) -> std::result::Result<String, crate::AnalysisError> {
@@ -924,42 +999,72 @@ impl AcpBackend {
                 if !self.keep
                     && let Some(child) = self.owner.analysis_child.lock().unwrap().take()
                 {
+                    observe_child_cleanup(&self.owner.rpc, &self.owner.child_cleanups, &child);
                     child.shutdown();
                 }
                 self.owner.busy.store(false, Ordering::SeqCst);
             }
         }
         let mut guard = Guard { owner: self, keep: false };
-        self.analysis_cancelled.store(false, Ordering::SeqCst);
+        self.analysis_cancelled.send_replace(false);
+        let mut cancelled = self.analysis_cancelled.subscribe();
         self.analysis_generation.fetch_add(1, Ordering::SeqCst);
         let existing = self.analysis_child.lock().unwrap().clone().filter(|child| !child.is_closed());
-        let child = if let Some(child) = existing {
-            child
-        } else {
-            let child = Arc::new(self.launch_analysis().await.map_err(|error| {
-                if error.is::<AnalysisTripwire>() { AnalysisError::ToolAttempt } else { AnalysisError::NotReady }
-            })?);
-            child.rpc.analysis.store(true, Ordering::SeqCst);
-            *self.analysis_child.lock().unwrap() = Some(child.clone());
-            child.remember_model(input.model.clone());
-            if child.canary().await.is_err() {
-                return Err(if child.is_unsafe() { AnalysisError::ToolAttempt } else { AnalysisError::NotReady });
+        let first_run = existing.is_none();
+        self.analysis_ready.send_replace(!first_run);
+        let run = async {
+            let startup = async {
+                let child = if let Some(child) = existing {
+                    child
+                } else {
+                    let child = Arc::new(self.launch_analysis().await.map_err(|error| {
+                        if error.is::<AnalysisTripwire>() {
+                            AnalysisError::ToolAttempt
+                        } else {
+                            AnalysisError::NotReady
+                        }
+                    })?);
+                    child.rpc.analysis.store(true, Ordering::SeqCst);
+                    observe_child_cleanup(&self.rpc, &self.child_cleanups, &child);
+                    *self.analysis_child.lock().unwrap() = Some(child.clone());
+                    child.remember_model(input.model.clone());
+                    if child.canary().await.is_err() {
+                        return Err(if child.is_unsafe() {
+                            AnalysisError::ToolAttempt
+                        } else {
+                            AnalysisError::NotReady
+                        });
+                    }
+                    child
+                };
+                Ok(child)
+            };
+            let child = tokio::select! {
+                biased;
+                _ = cancelled.changed() => return Err(AnalysisError::Cancelled),
+                child = startup => child?,
+            };
+            if *self.analysis_cancelled.borrow() {
+                return Err(AnalysisError::Cancelled);
             }
-            child
+            self.analysis_ready.send_replace(true);
+            let result = child.analyze_session(input, cancelled).await;
+            guard.keep = !child.is_closed()
+                && !matches!(
+                    result,
+                    Err(AnalysisError::TimedOut | AnalysisError::NotReady | AnalysisError::NoAnswerTooLong)
+                );
+            if guard.keep {
+                self.schedule_analysis_idle();
+            }
+            result
         };
-        if self.analysis_cancelled.load(Ordering::SeqCst) {
-            return Err(AnalysisError::Cancelled);
-        }
-        let result = child.analyze_session(input).await;
-        guard.keep = !child.is_closed()
-            && !matches!(
-                result,
-                Err(AnalysisError::TimedOut | AnalysisError::NotReady | AnalysisError::NoAnswerTooLong)
-            );
-        if guard.keep {
-            self.schedule_analysis_idle();
-        }
-        result
+        let budget = Duration::from_secs(if first_run { 240 } else { 90 });
+        tokio::time::timeout(budget, run).await.unwrap_or(Err(if first_run {
+            AnalysisError::StartTimedOut
+        } else {
+            AnalysisError::TimedOut
+        }))
     }
     async fn launch_analysis(&self) -> Result<Self> {
         #[cfg(test)]
@@ -967,12 +1072,14 @@ impl AcpBackend {
             return factory(process_config(Path::new("/app/terminal-rs"), Path::new("/data"), None)).await;
         }
         let settings = self.analysis_launch.as_ref().context("Analysis process launch settings unavailable")?;
-        Self::launch_mode(&settings.data, settings.profile, settings.load_plugins, true).await
+        Self::launch_mode(&settings.data, settings.profile, false, Some(self)).await
     }
     fn schedule_analysis_idle(&self) {
         let generation = self.analysis_generation.clone();
         let expected = generation.load(Ordering::SeqCst);
         let slot = Arc::downgrade(&self.analysis_child);
+        let rpc = self.rpc.clone();
+        let cleanups = self.child_cleanups.clone();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10 * 60);
         tokio::spawn(async move {
             tokio::time::sleep_until(deadline).await;
@@ -981,12 +1088,17 @@ impl AcpBackend {
                 if generation.load(Ordering::SeqCst) == expected
                     && let Some(child) = slot.take()
                 {
+                    observe_child_cleanup(&rpc, &cleanups, &child);
                     child.shutdown();
                 }
             }
         });
     }
-    async fn analyze_session(&self, input: TurnInput) -> std::result::Result<String, crate::AnalysisError> {
+    async fn analyze_session(
+        &self,
+        input: TurnInput,
+        mut cancelled: watch::Receiver<bool>,
+    ) -> std::result::Result<String, crate::AnalysisError> {
         use crate::AnalysisError;
         if self.is_closed() || self.is_unsafe() || self.busy.swap(true, Ordering::SeqCst) {
             return Err(AnalysisError::NotReady);
@@ -1027,13 +1139,24 @@ impl AcpBackend {
         self.rpc.analysis.store(true, Ordering::SeqCst);
         let mut events = self.events();
         let run = async {
-            let result = self
-                .rpc
-                .request("session/new", json!({"cwd":self.workspace,"mcpServers":[]}), Duration::from_secs(30))
-                .await
-                .map_err(|_| AnalysisError::NotReady)?;
-            let session = result["sessionId"].as_str().ok_or(AnalysisError::NotReady)?;
-            self.apply_model(&input.model).await.map_err(|_| AnalysisError::NotReady)?;
+            let startup = async {
+                let result = self
+                    .rpc
+                    .request("session/new", json!({"cwd":self.workspace,"mcpServers":[]}), Duration::from_secs(30))
+                    .await
+                    .map_err(|_| AnalysisError::NotReady)?;
+                let session = result["sessionId"].as_str().ok_or(AnalysisError::NotReady)?.to_owned();
+                self.apply_model(&input.model).await.map_err(|_| AnalysisError::NotReady)?;
+                Ok::<_, AnalysisError>(session)
+            };
+            let session = tokio::select! {
+                biased;
+                _ = cancelled.changed() => return Err(AnalysisError::Cancelled),
+                result = startup => result?,
+            };
+            if *cancelled.borrow() {
+                return Err(AnalysisError::Cancelled);
+            }
             *self.rpc.turn.lock().unwrap() = format!("story-{}", self.turns.fetch_add(1, Ordering::Relaxed));
             let prompt = self.rpc.request_inner(
                 "session/prompt",
@@ -1236,6 +1359,24 @@ fn own_shadow_home(private: &Path, user_home: &Path) -> Result<(PathBuf, Sandbox
     Ok((home, SandboxRoots::own(directories, user_home)))
 }
 
+fn analysis_arguments(profile: MimoProfile, port: u16) -> Vec<String> {
+    acp_arguments(profile, false, port)
+}
+
+fn process_environment(
+    mut env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    config: Value,
+    data: Option<&Path>,
+) -> std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    env.remove(std::ffi::OsStr::new("TR_DATA_DIR"));
+    env.remove(std::ffi::OsStr::new("TR_MCP_CLIENT"));
+    if let Some(data) = data {
+        env.insert("TR_DATA_DIR".into(), data.as_os_str().to_owned());
+    }
+    env.insert("MIMOCODE_CONFIG_CONTENT".into(), config.to_string().into());
+    env
+}
+
 fn acp_arguments(profile: MimoProfile, load_plugins: bool, port: u16) -> Vec<String> {
     let mut args = vec!["acp".into(), "--port".into(), port.to_string()];
     if profile == MimoProfile::Own || !load_plugins {
@@ -1342,6 +1483,7 @@ fn terminal_mcp_config(executable: &Path, data: &Path, client: &str) -> Value {
     })
 }
 
+#[cfg(test)]
 fn sandbox_profile(
     private: &Path,
     roots: &SandboxRoots,
@@ -1351,9 +1493,31 @@ fn sandbox_profile(
     user_home: &Path,
     port: u16,
 ) -> Result<String> {
+    sandbox_profile_with_mode(private, roots, binary, executable, socket, user_home, port, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sandbox_profile_with_mode(
+    private: &Path,
+    roots: &SandboxRoots,
+    binary: &Path,
+    executable: &Path,
+    socket: &Path,
+    user_home: &Path,
+    port: u16,
+    analysis: bool,
+) -> Result<String> {
     use crate::isolation::quote;
     if port == 0 {
         bail!("mimo loopback port must be nonzero");
+    }
+    if analysis
+        && (binary == executable
+            || std::iter::once(private)
+                .chain(roots.readable.iter().chain(&roots.writable).map(PathBuf::as_path))
+                .any(|root| socket.starts_with(root)))
+    {
+        bail!("mimo analysis sandbox roots would expose the terminal-rs bridge");
     }
     let install = binary.parent().context("mimo binary has no install directory")?;
     // Include the per-launch workspace: its implicit write grant must not
@@ -1431,20 +1595,29 @@ fn sandbox_profile(
     let binary = quote(binary)?;
     let executable = quote(executable)?;
     let socket = quote(socket)?;
+    let (shim, socket_files, socket_network) = if analysis {
+        (String::new(), String::new(), String::new())
+    } else {
+        (
+            format!("(literal {executable})"),
+            format!("(allow file-read* file-write* (literal {socket}))"),
+            format!("(literal {socket})"),
+        )
+    };
     Ok(format!(
         r#"(version 1)
 (deny default)
-(allow file-read* (subpath {private}) {readable} (subpath {install}) (literal {executable})
+(allow file-read* (subpath {private}) {readable} (subpath {install}) {shim}
     (subpath "/System/Library") (subpath "/usr/lib") (subpath "/usr/share") (subpath "/Library/Apple/System/Library")
     (literal "/") (literal "/dev/null") (literal "/dev/urandom") (literal "/private/etc/hosts") (literal "/private/etc/resolv.conf") (subpath "/private/etc/ssl"))
 (allow file-read-metadata {ancestors})
 (allow file-write* (subpath {private}) {writable})
-(allow file-read* file-write* (literal {socket}))
-(allow network-outbound (literal {socket}) (literal "/private/var/run/mDNSResponder") (remote tcp "*:443"))
+{socket_files}
+(allow network-outbound {socket_network} (literal "/private/var/run/mDNSResponder") (remote tcp "*:443"))
 (allow network-bind (local ip "localhost:{port}"))
 (allow network-inbound (local ip "localhost:{port}"))
 (allow network-outbound (remote ip "localhost:{port}"))
-(allow process-exec (literal {binary}) (literal {executable}))
+(allow process-exec (literal {binary}) {shim})
 (allow process-fork)
 (allow sysctl-read)
 (allow mach-lookup (global-name "com.apple.dnssd.service") (global-name "com.apple.trustd") (global-name "com.apple.trustd.agent"))

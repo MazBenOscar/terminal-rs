@@ -23,7 +23,15 @@ use tr_data::{news_intelligence::Cluster, news_store::StoryAnalysis};
 
 const DETAILS_LIMIT: usize = 128;
 const DETAILS_DELAY: Duration = Duration::from_millis(250);
-const ANALYSIS_START_TIMEOUT: Duration = Duration::from_secs(150);
+const ANALYSIS_START_TIMEOUT: Duration = Duration::from_secs(240);
+
+fn analysis_starting_phase(waiting: Duration) -> &'static str {
+    if waiting >= ANALYSIS_START_TIMEOUT {
+        "Analysis agent didn't start — Retry"
+    } else {
+        "Starting analysis agent (one-time safety check)…"
+    }
+}
 
 fn analysis_phase(state: &Onboarding, mimo: bool, has_turn: bool, waiting: Duration) -> &'static str {
     if has_turn {
@@ -121,6 +129,7 @@ struct Job {
     agent: PaneId,
     created_at: Instant,
     model: String,
+    analysis_starting: bool,
 }
 impl Desk {
     pub(super) fn reset_workspace(&mut self) {
@@ -280,7 +289,13 @@ impl TerminalApp {
         let Some(agent) = self.story_agent(pane, Some(previous_agent)) else { return true };
         self.story_desk.jobs.insert(
             prompt.id.clone(),
-            Job { story_id: story_id.clone(), agent, created_at: Instant::now(), model: String::new() },
+            Job {
+                story_id: story_id.clone(),
+                agent,
+                created_at: Instant::now(),
+                model: String::new(),
+                analysis_starting: false,
+            },
         );
         let details = self.story_desk.details.entry(story_id).or_default();
         details.agent = Some(agent);
@@ -311,7 +326,13 @@ impl TerminalApp {
         self.story_desk.readonly_prompts.insert(prompt.id.clone(), (story.lead.id.clone(), agent));
         self.story_desk.jobs.insert(
             prompt.id.clone(),
-            Job { story_id: story.lead.id.clone(), agent, created_at: Instant::now(), model: String::new() },
+            Job {
+                story_id: story.lead.id.clone(),
+                agent,
+                created_at: Instant::now(),
+                model: String::new(),
+                analysis_starting: false,
+            },
         );
         // Share the existing backend owner and FIFO, never its conversation.
         // Analysis output is delivered separately to this Story's cache.
@@ -327,6 +348,12 @@ impl TerminalApp {
             job.model = model.into();
         }
     }
+    pub(super) fn story_analysis_starting(&mut self, prompt: &PromptId, starting: bool) {
+        if let Some(job) = self.story_desk.jobs.get_mut(prompt) {
+            job.analysis_starting = starting;
+        }
+    }
+
     pub(super) fn finish_story_analysis(&mut self, prompt: PromptId, result: Result<String, tr_agent::AnalysisError>) {
         let Some(job) = self.story_desk.jobs.remove(&prompt) else { return };
         if self.agent_pane.starting_prompt.as_ref() == Some(&prompt) {
@@ -555,12 +582,16 @@ impl TerminalApp {
                 let running = self.agent_pane.running && self.agent_pane.starting_prompt.as_ref() == Some(prompt);
                 let waiting = job.created_at.elapsed();
                 let timed_out = !running && waiting > ANALYSIS_START_TIMEOUT;
-                let phase = analysis_phase(
-                    &self.agent_pane.state,
-                    self.agent_config.backend == crate::agent_mcp::Backend::Mimo,
-                    running,
-                    waiting,
-                );
+                let phase = if job.analysis_starting {
+                    analysis_starting_phase(waiting)
+                } else {
+                    analysis_phase(
+                        &self.agent_pane.state,
+                        self.agent_config.backend == crate::agent_mcp::Backend::Mimo,
+                        running,
+                        waiting,
+                    )
+                };
                 let elapsed = waiting.as_secs();
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{phase} · {elapsed}s")).font(mono(10.5)).color(theme::muted()));
@@ -1093,6 +1124,20 @@ mod tests {
     }
 
     #[test]
+    fn dedicated_analysis_startup_status_keeps_elapsed_time_and_four_minute_retry_boundary() {
+        for elapsed in [0, 60, 150, 239] {
+            let phase = analysis_starting_phase(Duration::from_secs(elapsed));
+            assert_eq!(phase, "Starting analysis agent (one-time safety check)…");
+            assert_eq!(
+                format!("{phase} · {elapsed}s"),
+                format!("Starting analysis agent (one-time safety check)… · {elapsed}s")
+            );
+        }
+        assert_eq!(analysis_starting_phase(Duration::from_secs(240)), "Analysis agent didn't start — Retry");
+        assert_eq!(analysis_starting_phase(Duration::from_secs(300)), "Analysis agent didn't start — Retry");
+    }
+
+    #[test]
     fn analysis_status_tracks_startup_signin_stop_timeout_and_active_turn() {
         for (state, expected) in [
             (Onboarding::Checking, "Starting mimo (one-time safety check)…"),
@@ -1104,7 +1149,7 @@ mod tests {
             ),
         ] {
             assert_eq!(analysis_phase(&state, true, false, Duration::from_secs(60)), expected);
-            assert_eq!(analysis_phase(&state, true, false, Duration::from_secs(151)), "Agent didn't start — Retry");
+            assert_eq!(analysis_phase(&state, true, false, Duration::from_secs(241)), "Agent didn't start — Retry");
             assert_eq!(analysis_phase(&state, true, true, Duration::from_secs(151)), "Analyzing…");
         }
         assert_eq!(analysis_phase(&Onboarding::Ready, false, false, Duration::ZERO), "Queued");
@@ -1276,11 +1321,23 @@ mod tests {
         assert!(!desk.queued_read_only(&second), "policy must not be inferred from prompt text");
         desk.jobs.insert(
             first.id.clone(),
-            Job { story_id: "first".into(), agent: 0, created_at: Instant::now(), model: String::new() },
+            Job {
+                story_id: "first".into(),
+                agent: 0,
+                created_at: Instant::now(),
+                model: String::new(),
+                analysis_starting: false,
+            },
         );
         desk.jobs.insert(
             second.id,
-            Job { story_id: "second".into(), agent: 0, created_at: Instant::now(), model: String::new() },
+            Job {
+                story_id: "second".into(),
+                agent: 0,
+                created_at: Instant::now(),
+                model: String::new(),
+                analysis_starting: false,
+            },
         );
         assert_eq!(desk.jobs.len(), 2);
     }

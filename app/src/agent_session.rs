@@ -34,6 +34,7 @@ pub enum Event {
     Limits(serde_json::Value),
     Bridge(BridgeEvent),
     Analysis { id: crate::agent_pane::PromptId, result: std::result::Result<String, tr_agent::AnalysisError> },
+    AnalysisStarting { id: crate::agent_pane::PromptId, starting: bool },
     Notice(String),
 }
 struct Inbox {
@@ -507,7 +508,21 @@ async fn owner_acp(
                 }
                 command = queued_command(&mut receive, &mut deferred) => match command {
                     Some(Command::Analysis { id, input }) => {
-                        let (result, _) = isolated_analysis(client.analyze(input), client.interrupt_analysis(), &mut receive, &mut deferred).await;
+                        let run = async {
+                            let mut readiness = client.analysis_readiness();
+                            let analysis = client.analyze(input);
+                            tokio::pin!(analysis);
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    result = &mut analysis => break result,
+                                    _ = readiness.changed() => inbox.push(Event::AnalysisStarting {
+                                        id: id.clone(), starting: !*readiness.borrow_and_update(),
+                                    }),
+                                }
+                            }
+                        };
+                        let (result, _) = isolated_analysis(run, client.interrupt_analysis(), &mut receive, &mut deferred).await;
                         // The dedicated child is stopped on every unconfirmed
                         // ending (including a dropped analyze future). The main
                         // backend and its subscriptions remain untouched.
@@ -549,9 +564,12 @@ async fn owner_acp(
     // Leave Checking immediately, even while bounded child cleanup is still running.
     report_acp_failure(inbox, &result, client.is_unsafe());
     client.shutdown();
-    tokio::time::timeout(Duration::from_secs(10), client.wait_cleanup())
+    let cleanup = tokio::time::timeout(Duration::from_secs(10), client.wait_cleanup())
         .await
-        .context("mimo cleanup timed out; restart the app")??;
+        .context("mimo cleanup timed out; restart the app")
+        .and_then(|result| result);
+    let result = cleanup.and(result);
+    report_acp_failure(inbox, &result, client.is_unsafe());
     classify(result, client.is_unsafe())
 }
 
@@ -650,7 +668,7 @@ async fn isolated_analysis(
         tokio::select! {
             biased;
             result = &mut run => {
-                let confirmed = !matches!(result, Err(AnalysisError::TimedOut | AnalysisError::NotReady | AnalysisError::NoAnswerTooLong));
+                let confirmed = !matches!(result, Err(AnalysisError::TimedOut | AnalysisError::StartTimedOut | AnalysisError::NotReady | AnalysisError::NoAnswerTooLong));
                 let result = if cancelling && matches!(result, Ok(_) | Err(AnalysisError::NoAnswer)) {
                     Err(AnalysisError::Cancelled)
                 } else { result };
@@ -1459,8 +1477,10 @@ mod tests {
                         .unwrap()["result"]
                         .clone(),
                     "account/read" => json!({"account":{"type":"chatgpt"}}),
-                    "thread/start" => json!({"thread":{"id":"thread"}}),
-                    "turn/start" => json!({"turn":{"id":"turn"}}),
+                    // Match the replay's redacted identities: tool authorization
+                    // now requires the explicitly registered main thread/turn.
+                    "thread/start" => json!({"thread":{"id":"[REDACTED]"}}),
+                    "turn/start" => json!({"turn":{"id":"[REDACTED]"}}),
                     _ => continue,
                 };
                 write.write_all(format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes()).await.unwrap();
