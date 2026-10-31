@@ -774,6 +774,9 @@ pub struct Prefs {
     /// N7b: app-wide tape; dashboard builders may enable this.
     #[serde(default)]
     pub headline_tape: bool,
+    /// App-wide cross-asset quote strip; dashboards can turn it on, never off.
+    #[serde(default)]
+    pub quote_strip: bool,
     /// Use static headline rotation even when the OS allows animation.
     #[serde(default)]
     pub reduce_motion: bool,
@@ -803,6 +806,7 @@ impl Default for Prefs {
             // N1b
             keyword_watches: vec![],
             headline_tape: false,
+            quote_strip: false,
             reduce_motion: false,
             feed_notifications: Default::default(),
             // N1b
@@ -895,6 +899,16 @@ impl Prefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_strip_defaults_off_in_old_prefs_and_round_trips() {
+        for old in ["{}", r#"{"headline_tape":true}"#, r#"{"version":2}"#] {
+            assert!(!serde_json::from_str::<Prefs>(old).unwrap().quote_strip);
+        }
+        let prefs = Prefs { quote_strip: true, ..Default::default() };
+        let restored: Prefs = serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert!(restored.quote_strip);
+    }
 
     #[test]
     fn study_favorites_load_deduplicates_and_drops_unknown_codes() {

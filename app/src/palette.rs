@@ -58,6 +58,8 @@ pub enum Target {
     Theme(String),
     /// Toggle the app-level news headline strip.
     HeadlineTape,
+    /// Toggle the app-level cross-asset quote strip.
+    QuoteStrip,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -59,6 +59,22 @@ that is in progress. RESEARCH reduces to a preset of News, Story and Agent, buil
 - **Review.** An independent review per builder, then a fix pass and full checks. The user tests in the app,
   and then I merge locally.
 
+### A2 implementation notes
+
+- Chrome order, top to bottom: dock → quote strip → headline tape → status bar.
+  Each strip reserves zero height when disabled. View and the palette expose **Quote strip**;
+  the preference defaults off, and dashboard chrome flags are on-only. NEWS leaves it unchanged;
+  A1 will enable the new `Dashboard.quote_strip` flag for BRIEF during integration.
+- One existing 20-second overview gate requests the full Wei universe when Wei is visible,
+  otherwise just the six strip keys when enabled. The active-watchlist gate is also enabled
+  by the strip so breadth remains refreshed when the sidebar/watchlist panes are hidden.
+- Breadth ignores missing, invalid, future-dated and at-least-five-minute-old observations.
+  Its percentage is advancers divided by all eligible active-watchlist quotes (including unchanged).
+  The bar uses an up-role fill over a neutral track; the remainder is not labelled as decliners.
+- Text layouts are cached by quote revision, palette, mono font and density; watchlist changes
+  and the earliest breadth expiry also invalidate them. Narrow windows horizontally scroll the
+  six quotes while keeping breadth visible. No new feed, dependency or layout format is added.
+
 ### Wave B: one decision per item
 
 | Item | Size | Notes |

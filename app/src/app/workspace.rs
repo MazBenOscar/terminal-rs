@@ -997,7 +997,11 @@ impl TerminalApp {
             .iter()
             .find(|d| d.id.eq_ignore_ascii_case(id.trim()) || d.name.eq_ignore_ascii_case(id.trim()))
         else {
-            self.status = format!("Unknown dashboard {id:?}");
+            // A bare or unknown DASH lists the presets instead of failing.
+            self.palette.open_scoped(crate::palette::Kind::Layout, "dashboard");
+            if !id.trim().is_empty() {
+                self.status = format!("Unknown dashboard {:?}; pick one below", id.trim());
+            }
             return;
         };
         // Save current edits to their existing name, then instantiate a fresh template.
@@ -1010,8 +1014,7 @@ impl TerminalApp {
             return;
         }
         self.apply_doc(doc);
-        if dashboard.headline_tape && !self.prefs.headline_tape {
-            self.prefs.headline_tape = true;
+        if dashboard.enable_strips(&mut self.prefs) {
             self.save_prefs();
         }
         self.save_layout();
@@ -1857,6 +1860,27 @@ mod tests {
     }
 
     #[test]
+    fn bare_or_unknown_dash_opens_the_dashboard_picker_without_changing_the_workspace() {
+        let (mut app, _root) = fixture("dash-picker");
+        let before = app.layout_name.clone();
+        for id in ["", "  ", "nonsense"] {
+            app.palette.close();
+            app.open_dashboard(id);
+            assert_eq!(app.layout_name, before, "{id:?} must not switch workspace");
+            assert!(app.palette.open, "{id:?} opens the picker");
+            assert_eq!(app.palette.query, "dashboard");
+            let shown: Vec<_> = crate::palette::rank(&app.palette_items(), &[], &app.palette.query)
+                .into_iter()
+                .filter(|i| i.kind == crate::palette::Kind::Layout)
+                .map(|i| i.title)
+                .collect();
+            for dashboard in crate::dashboards::ALL {
+                assert!(shown.iter().any(|t| t == dashboard.name), "{} missing for {id:?}", dashboard.name);
+            }
+        }
+    }
+
+    #[test]
     fn news_dashboard_opens_pristine_unique_workspace_without_replacing_current() {
         let (mut app, root) = fixture("n7-dashboard");
         let chart = app
@@ -1883,6 +1907,79 @@ mod tests {
         assert!(app.panes.iter().any(|p| p.kind.symbol() == Some("SPY US Equity")));
         assert!(app.store.load("News desk 2").is_ok());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn every_dashboard_opens_saves_and_reopens_without_overwriting_current_workspace() {
+        use crate::layouts::PaneSettings;
+        for dashboard in crate::dashboards::ALL {
+            let (mut app, root) = fixture(&format!("dash-a1-{}", dashboard.id));
+            app.apply_doc(LayoutDoc::default_workspace("My working desk", &app.prefs.panels));
+            // Include an unsaved edit: opening a dashboard must save it to the old name.
+            app.panes[0].title = Some("Keep my working chart".into());
+            let original = app.current_doc();
+            app.prefs.headline_tape = false;
+            app.open_dashboard(&dashboard.id.to_ascii_lowercase());
+            assert_eq!(app.layout_name, dashboard.name, "{} open", dashboard.id);
+            assert_eq!(app.store.load(&original.name).unwrap(), original, "{} overwrote current", dashboard.id);
+            assert_eq!(app.prefs.headline_tape, dashboard.headline_tape, "{} tape opt-in", dashboard.id);
+
+            let mut expected = (dashboard.build)(&app.prefs.panels);
+            expected.watchlists = original.watchlists.clone();
+            expected.active_watchlist = original.active_watchlist;
+            expected.sidebar_side = original.sidebar_side;
+            expected.focus = expected.focus.or(Some(1));
+            let first = app.current_doc();
+            // Separately built templates allocate fresh chart uids, and runtime saving
+            // materializes default indicator settings/ids. Canonicalize those defaults;
+            // all settings, dock shares, links and focus must otherwise match exactly.
+            for (built, opened) in expected.panes.iter_mut().zip(&first.panes) {
+                if let (PaneSettings::Chart { uid, indicators, .. }, PaneSettings::Chart { uid: opened_uid, .. }) =
+                    (&mut built.settings, &opened.settings)
+                {
+                    *uid = *opened_uid;
+                    tr_core::indicators::study::assign_ids(indicators);
+                }
+            }
+            assert_eq!(first, expected, "{} template apply", dashboard.id);
+            app.save_layout();
+            assert_eq!(app.store.load(dashboard.name).unwrap(), first, "{} save", dashboard.id);
+            let runtime_ids: Vec<_> = app.panes.iter().map(|p| p.id).collect();
+            app.switch_layout(&original.name);
+            app.switch_layout(dashboard.name);
+            assert!(app.panes.iter().all(|p| !runtime_ids.contains(&p.id)));
+            assert_eq!(app.current_doc(), first, "{} reopen", dashboard.id);
+            app.save_layout();
+            assert_eq!(app.store.load(dashboard.name).unwrap(), first, "{} resave", dashboard.id);
+
+            // An edited copy stays saved; opening by name creates a pristine unique copy.
+            app.panes[0].title = Some("Edited dashboard copy".into());
+            let edited = app.current_doc();
+            app.prefs.headline_tape = true;
+            app.open_dashboard(dashboard.name);
+            assert_eq!(app.layout_name, format!("{} 2", dashboard.name));
+            assert_eq!(app.store.load(dashboard.name).unwrap(), edited);
+            assert_eq!(app.store.load(&original.name).unwrap(), original);
+            assert!(app.prefs.headline_tape, "{} must not turn the user's tape off", dashboard.id);
+            let second = app.current_doc();
+            expected.name = second.name.clone();
+            for (built, opened) in expected.panes.iter_mut().zip(&second.panes) {
+                if let (PaneSettings::Chart { uid, .. }, PaneSettings::Chart { uid: opened_uid, .. }) =
+                    (&mut built.settings, &opened.settings)
+                {
+                    *uid = *opened_uid;
+                }
+            }
+            assert_eq!(second, expected, "{} fresh second copy", dashboard.id);
+            assert_eq!(app.store.load(&second.name).unwrap(), second);
+            app.switch_layout(&original.name);
+            app.switch_layout(&second.name);
+            assert_eq!(app.current_doc(), second, "{} second reopen", dashboard.id);
+            assert_eq!(app.store.list().len(), 3, "{} unique workspace names", dashboard.id);
+            app.finish_save();
+            drop(app);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

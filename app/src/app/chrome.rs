@@ -18,6 +18,488 @@ use crate::markets_view;
 use crate::theme::{self, amber, mono, muted, text, ui_font};
 use crate::widgets::{self, Icon};
 
+/// Breadth expires five minutes after receipt, independent of the provider's bar/session timestamp.
+const BREADTH_MAX_AGE: i64 = 300;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Breadth {
+    up: usize,
+    down: usize,
+    unchanged: usize,
+}
+impl Breadth {
+    fn total(self) -> usize {
+        self.up + self.down + self.unchanged
+    }
+    fn percent(self) -> Option<f32> {
+        (self.total() > 0).then(|| 100.0 * self.up as f32 / self.total() as f32)
+    }
+}
+
+fn fresh_breadth_quote(q: &tr_data::Quote, received_at: i64, now: i64) -> bool {
+    received_at <= now
+        && received_at > now.saturating_sub(BREADTH_MAX_AGE)
+        && q.last.is_finite()
+        && q.last > 0.0
+        && q.prev_close.is_finite()
+        && q.prev_close > 0.0
+        && q.change().is_finite()
+}
+
+fn watchlist_breadth(
+    watchlist: &[String],
+    quotes: &std::collections::HashMap<String, tr_data::Quote>,
+    received: &std::collections::HashMap<String, i64>,
+    now: i64,
+) -> (Breadth, Option<i64>) {
+    let mut counts = Breadth::default();
+    let mut expiry: Option<i64> = None;
+    for (q, received_at) in watchlist
+        .iter()
+        .filter_map(|key| Some((quotes.get(key)?, *received.get(key)?)))
+        .filter(|(q, received_at)| fresh_breadth_quote(q, *received_at, now))
+    {
+        if q.change() > 0.0 {
+            counts.up += 1;
+        } else if q.change() < 0.0 {
+            counts.down += 1;
+        } else {
+            counts.unchanged += 1;
+        }
+        let at = received_at.saturating_add(BREADTH_MAX_AGE);
+        expiry = Some(expiry.map_or(at, |old| old.min(at)));
+    }
+    (counts, expiry)
+}
+
+/// Last and signed change (bp for yields, percent otherwise); invalid quotes keep a placeholder.
+fn strip_quote_text(key: &str, quote: Option<&tr_data::Quote>) -> (String, String, Color32) {
+    let Some(q) = quote.filter(|q| q.last.is_finite() && q.last > 0.0) else {
+        return ("—".into(), String::new(), muted());
+    };
+    let security = tr_core::Security::parse(key);
+    let decimals = security.as_ref().map_or(2, |s| s.decimals(q.last));
+    let last = format!("{:.decimals$}", q.last);
+    if !q.prev_close.is_finite() || q.prev_close <= 0.0 || !q.change_pct().is_finite() {
+        return (last, "—".into(), muted());
+    }
+    let color = if q.change() > 0.0 {
+        theme::up()
+    } else if q.change() < 0.0 {
+        theme::down()
+    } else {
+        muted()
+    };
+    let change = match security {
+        Some(sec) if sec.class == tr_core::AssetClass::Govt => markets_view::change_text(&sec, q),
+        _ => format!("{:+.2}%", q.change_pct()),
+    };
+    (last, change, color)
+}
+
+#[derive(Default)]
+pub(super) struct QuoteStrip {
+    text_key: Option<(u64, theme::Palette, egui::FontId, f32)>,
+    watchlist: Vec<String>,
+    expiry: Option<i64>,
+    galleys: Vec<std::sync::Arc<egui::Galley>>,
+    breadth: Option<std::sync::Arc<egui::Galley>>,
+    percent: Option<f32>,
+}
+
+fn strip_append(job: &mut egui::text::LayoutJob, value: &str, color: Color32) {
+    job.append(value, theme::dp(0.0), egui::TextFormat { font_id: mono(10.5), color, ..Default::default() });
+}
+
+impl TerminalApp {
+    pub(super) fn toggle_quote_strip(&mut self) {
+        self.prefs.quote_strip = !self.prefs.quote_strip;
+        self.save_prefs();
+    }
+
+    /// Above the headline tape (which remains immediately above status). Off reserves no space.
+    pub(super) fn show_quote_strip(&mut self, ui: &mut Ui, available: Rect) -> (f32, Option<Action>) {
+        if !self.prefs.quote_strip {
+            return (theme::dp(0.0), None);
+        }
+        let height = theme::dp(24.0);
+        let rect = Rect::from_min_max(pos2(available.left(), available.bottom() - height), available.max);
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        let now = chrono::Utc::now().timestamp();
+        let key = (self.quotes_revision, theme::palette(), mono(10.5), theme::density());
+        let strip = &mut self.quote_strip;
+        if strip.text_key.as_ref() != Some(&key)
+            || strip.watchlist != self.watchlist
+            || strip.expiry.is_some_and(|at| now >= at)
+        {
+            strip.galleys.clear();
+            for (symbol, label) in markets_view::QUOTE_STRIP_KEYS {
+                let (last, change, color) = strip_quote_text(symbol, self.quotes.get(symbol));
+                let mut job = egui::text::LayoutJob::default();
+                strip_append(&mut job, label, amber());
+                strip_append(&mut job, &format!(" {last} "), text());
+                strip_append(&mut job, &change, color);
+                strip.galleys.push(painter.layout_job(job));
+            }
+            let (counts, expiry) = watchlist_breadth(&self.watchlist, &self.quotes, &self.quote_received, now);
+            let mut job = egui::text::LayoutJob::default();
+            strip_append(&mut job, "Breadth ", muted());
+            if counts.total() == 0 {
+                strip_append(&mut job, "—", muted());
+            } else {
+                strip_append(&mut job, &format!("{}▲ ", counts.up), theme::up());
+                strip_append(&mut job, &format!("{}▼ ", counts.down), theme::down());
+                strip_append(&mut job, &format!("{}■", counts.unchanged), muted());
+            }
+            strip.breadth = Some(painter.layout_job(job));
+            strip.percent = counts.percent();
+            strip.expiry = expiry;
+            strip.watchlist.clone_from(&self.watchlist);
+            strip.text_key = Some(key);
+        }
+        if let Some(at) = strip.expiry {
+            ui.ctx().request_repaint_after(Duration::from_secs(at.saturating_sub(now).max(1) as u64));
+        }
+        painter.rect_filled(rect, theme::dp(0.0), theme::header());
+        painter.hline(rect.x_range(), rect.top(), Stroke::new(theme::dp(1.0), theme::border()));
+        let breadth = strip.breadth.as_ref().expect("strip cache initialized");
+        let breadth_width = breadth.size().x + theme::dp(76.0);
+        let breadth_rect =
+            Rect::from_min_max(pos2((rect.right() - breadth_width).max(rect.left()), rect.top()), rect.max);
+        let bp = painter.with_clip_rect(breadth_rect.intersect(ui.clip_rect()));
+        bp.galley(
+            pos2(breadth_rect.left() + theme::dp(6.0), rect.center().y - breadth.size().y / 2.0),
+            breadth.clone(),
+            text(),
+        );
+        let bar = Rect::from_center_size(
+            pos2(rect.right() - theme::dp(34.0), rect.center().y),
+            vec2(theme::dp(52.0), theme::dp(5.0)),
+        );
+        widgets::percent_meter(&bp, bar, strip.percent);
+        ui.interact(breadth_rect, ui.id().with("quote-strip-breadth"), Sense::hover())
+            .on_hover_text("share of watchlist symbols up today\nAdvancers / all fresh quotes in the active watchlist; missing, invalid and quotes older than 5 minutes are excluded.");
+
+        // Keep all six entries reachable on narrow windows without rebuilding text layouts.
+        let quotes_rect = Rect::from_min_max(rect.min, pos2(breadth_rect.left(), rect.bottom()));
+        let mut picked = None;
+        if quotes_rect.width() > 0.0 {
+            let mut child = ui.new_child(UiBuilder::new().max_rect(quotes_rect).id_salt("quote-strip"));
+            child.set_clip_rect(quotes_rect.intersect(ui.clip_rect()));
+            egui::ScrollArea::horizontal()
+                .id_salt("quote-strip-scroll")
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(&mut child, |ui| {
+                    ui.spacing_mut().item_spacing.x = theme::dp(0.0);
+                    ui.horizontal(|ui| {
+                        for ((symbol, _), galley) in markets_view::QUOTE_STRIP_KEYS.iter().zip(&strip.galleys) {
+                            let (entry, response) =
+                                ui.allocate_exact_size(vec2(galley.size().x + theme::dp(16.0), height), Sense::click());
+                            if response.hovered() {
+                                ui.painter().rect_filled(entry, theme::dp(0.0), theme::control_hover());
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            ui.painter().galley(
+                                pos2(entry.left() + theme::dp(8.0), entry.center().y - galley.size().y / 2.0),
+                                galley.clone(),
+                                text(),
+                            );
+                            if response.clicked() {
+                                picked = Some(Action::OpenChart((*symbol).to_owned()));
+                            }
+                        }
+                    });
+                });
+        }
+        (height, picked)
+    }
+}
+
+#[cfg(test)]
+mod quote_strip_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn quote(symbol: &str, last: f64, ts: i64) -> tr_data::Quote {
+        tr_data::Quote {
+            symbol: symbol.into(),
+            last,
+            prev_close: 100.0,
+            ts,
+            spark: vec![],
+            crypto_source: None,
+            simulated: None,
+        }
+    }
+
+    #[test]
+    fn strip_ui_zero_height_placeholder_and_layout_cache() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/a2-strip-ui");
+        let (worker, mut requests) = crate::worker::Worker::recording();
+        let mut app = TerminalApp::isolated_workspace(&root, worker);
+        let ctx = egui::Context::default();
+        let frame = |app: &mut TerminalApp, width| {
+            let mut height = -1.0;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(width, 200.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    height = app.show_quote_strip(ui, ui.max_rect()).0;
+                },
+            );
+            output.textures_delta.clear();
+            height
+        };
+        assert_eq!(frame(&mut app, 1_200.0), 0.0);
+        assert!(app.quote_strip.galleys.is_empty());
+        app.prefs.quote_strip = true;
+        assert_eq!(frame(&mut app, 1_200.0), theme::dp(24.0));
+        assert_eq!(app.quote_strip.galleys.len(), 6);
+        assert!(app.quote_strip.galleys.iter().all(|g| g.text().contains('—')));
+        assert_eq!(app.quote_strip.breadth.as_ref().unwrap().text(), "Breadth —");
+        let galley = app.quote_strip.galleys[0].clone();
+        frame(&mut app, 500.0);
+        assert!(std::sync::Arc::ptr_eq(&galley, &app.quote_strip.galleys[0]));
+        let now = chrono::Utc::now().timestamp();
+        app.quotes.insert("VIX Index".into(), quote("VIX Index", 101.0, now));
+        app.quote_received.insert("VIX Index".into(), now);
+        app.quotes_revision += 1;
+        frame(&mut app, 1_200.0);
+        assert!(!std::sync::Arc::ptr_eq(&galley, &app.quote_strip.galleys[0]));
+        assert!(app.quote_strip.galleys[0].text().contains("+1.00%"));
+        app.watchlist = vec!["VIX Index".into()];
+        frame(&mut app, 1_200.0);
+        assert_eq!(app.quote_strip.percent, Some(100.0));
+        assert_eq!(app.quote_strip.breadth.as_ref().unwrap().text(), "Breadth 1▲ 0▼ 0■");
+        app.prefs.quote_strip = false;
+        assert_eq!(frame(&mut app, 1_200.0), 0.0);
+        assert!(requests.try_recv().is_err(), "painting never starts a second poll");
+    }
+
+    #[test]
+    fn periodic_uses_one_overview_gate_and_refreshes_hidden_watchlist_for_breadth() {
+        use crate::worker::{Request, Worker};
+        for strip in [false, true] {
+            for wei in [false, true] {
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("../target/test-data/a2-strip-poll-{strip}-{wei}"));
+                let (worker, mut requests) = Worker::recording();
+                let mut app = TerminalApp::isolated_workspace(&root, worker);
+                app.sidebar_open = false;
+                app.prefs.quote_strip = strip;
+                app.watchlist = vec!["AAPL US Equity".into()];
+                if wei {
+                    let id = app.new_pane(PaneKind::Wei);
+                    app.dock = crate::dock::Node::leaf(id);
+                }
+                app.periodic();
+                let mut quote_requests = Vec::new();
+                while let Ok(request) = requests.try_recv() {
+                    if let Request::Quotes(keys) = request {
+                        quote_requests.push(keys);
+                    }
+                }
+                let expected = markets_view::overview_poll_keys(strip, wei, true);
+                let overview: Vec<_> =
+                    quote_requests.iter().filter(|keys| keys.iter().any(|key| key == "VIX Index")).collect();
+                assert_eq!(overview.len(), usize::from(strip || wei));
+                if let Some(keys) = expected {
+                    assert_eq!(overview[0], &keys);
+                }
+                assert_eq!(
+                    quote_requests.iter().filter(|keys| keys.as_slice() == ["AAPL US Equity"]).count(),
+                    usize::from(strip)
+                );
+                app.periodic();
+                while let Ok(request) = requests.try_recv() {
+                    assert!(!matches!(request, Request::Quotes(_)), "no second request before 20 seconds");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_dash_breadth_yahoo_daily_ts() {
+        // Real Yahoo spark payload: the last daily timestamp is the session open (13:30 UTC),
+        // even for a quote fetched seconds ago. One hour into the session the quotes are fresh.
+        let json = include_str!("../../../crates/data/tests/fixtures/yahoo_spark.json");
+        let parsed = tr_data::yahoo::parse_spark(json).unwrap();
+        let session_open = parsed.iter().map(|q| q.ts).max().unwrap();
+        let quotes: HashMap<_, _> = parsed.into_iter().map(|q| (q.symbol.clone(), q)).collect();
+        let watchlist: Vec<String> = quotes.keys().cloned().collect();
+        let now = session_open + 3_600;
+        let received = watchlist.iter().map(|key| (key.clone(), now)).collect();
+        let (counts, _) = watchlist_breadth(&watchlist, &quotes, &received, now);
+        assert!(counts.total() > 0, "a just-polled watchlist renders breadth as '—'");
+    }
+
+    #[test]
+    fn review_dash_wei_shown_after_strip_poll() {
+        use crate::worker::{Request, Worker};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/review-dash-wei-gate");
+        let (worker, mut requests) = Worker::recording();
+        let mut app = TerminalApp::isolated_workspace(&root, worker);
+        app.prefs.quote_strip = true;
+        app.periodic();
+        while requests.try_recv().is_ok() {}
+        let id = app.new_pane(PaneKind::Wei);
+        app.dock = crate::dock::Node::leaf(id);
+        app.periodic();
+        let mut full = false;
+        while let Ok(request) = requests.try_recv() {
+            if let Request::Quotes(keys) = request {
+                full |= keys == markets_view::overview_keys();
+            }
+        }
+        assert!(full, "Wei shown after a strip-only poll gets no overview request until the gate expires");
+        app.periodic();
+        while let Ok(request) = requests.try_recv() {
+            assert!(!matches!(request, Request::Quotes(_)), "both visible still share one full poll per window");
+        }
+        // Hiding Wei must not immediately start another strip-only poll either.
+        app.dock = crate::dock::Node::default();
+        app.periodic();
+        while let Ok(request) = requests.try_recv() {
+            assert!(!matches!(request, Request::Quotes(_)), "the full poll also covers the strip");
+        }
+        app.dock = crate::dock::Node::leaf(id);
+        app.last_wei = Some(Instant::now() - Duration::from_secs(21));
+        app.last_strip_poll = app.last_wei;
+        app.periodic();
+        let mut overview_requests = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            if let Request::Quotes(keys) = request {
+                overview_requests.push(keys);
+            }
+        }
+        assert_eq!(overview_requests, vec![markets_view::overview_keys()]);
+    }
+
+    #[test]
+    fn missing_keys_never_blank_strip_and_changes_are_signed() {
+        for (key, _) in markets_view::QUOTE_STRIP_KEYS {
+            assert_eq!(strip_quote_text(key, None).0, "—");
+            let yield_key = tr_core::Security::parse(key).unwrap().class == tr_core::AssetClass::Govt;
+            let q = quote(key, 101.0, 1_000);
+            assert_eq!(strip_quote_text(key, Some(&q)).1, if yield_key { "+100.0bp" } else { "+1.00%" });
+            let q = quote(key, 99.0, 1_000);
+            assert_eq!(strip_quote_text(key, Some(&q)).1, if yield_key { "-100.0bp" } else { "-1.00%" });
+            let q = quote(key, f64::NAN, 1_000);
+            assert_eq!(strip_quote_text(key, Some(&q)).0, "—");
+        }
+    }
+
+    #[test]
+    fn strip_yield_changes_match_wei_basis_points() {
+        let yield_keys: Vec<_> = markets_view::overview_keys()
+            .into_iter()
+            .filter(|key| tr_core::Security::parse(key).unwrap().class == tr_core::AssetClass::Govt)
+            .collect();
+        assert!(yield_keys.iter().any(|key| key == "US10Y Govt"));
+        for key in yield_keys {
+            let sec = tr_core::Security::parse(&key).unwrap();
+            for (last, expected) in [(4.28, "+3.0bp"), (4.22, "-3.0bp"), (4.25, "+0.0bp")] {
+                let q = tr_data::Quote { prev_close: 4.25, ..quote(&key, last, 1_000) };
+                let (_, change, color) = strip_quote_text(&key, Some(&q));
+                assert_eq!(change, expected, "{key}");
+                assert_eq!(change, markets_view::change_text(&sec, &q));
+                assert_eq!(
+                    color,
+                    if last > 4.25 {
+                        theme::up()
+                    } else if last < 4.25 {
+                        theme::down()
+                    } else {
+                        muted()
+                    }
+                );
+            }
+            let q = tr_data::Quote { prev_close: 0.0, ..quote(&key, 4.25, 1_000) };
+            assert_eq!(strip_quote_text(&key, Some(&q)).1, "—");
+        }
+    }
+
+    #[test]
+    fn breadth_uses_receipt_age_not_the_1330_bar_timestamp() {
+        let bar_ts = 13 * 3_600 + 30 * 60;
+        let now = bar_ts + 3_600;
+        let quotes = [quote("fresh", 101.0, bar_ts), quote("stale", 99.0, bar_ts)]
+            .into_iter()
+            .map(|q| (q.symbol.clone(), q))
+            .collect();
+        let received = HashMap::from([("fresh".into(), now - 10), ("stale".into(), now - 6 * 60)]);
+        let (counts, expiry) = watchlist_breadth(&["fresh".into(), "stale".into()], &quotes, &received, now);
+        assert_eq!(counts, Breadth { up: 1, down: 0, unchanged: 0 });
+        assert_eq!(expiry, Some(now - 10 + BREADTH_MAX_AGE));
+        assert_eq!(
+            watchlist_breadth(&["fresh".into(), "stale".into()], &quotes, &received, expiry.unwrap()),
+            (Breadth::default(), None)
+        );
+    }
+
+    #[test]
+    fn quotes_response_records_receipt_for_updated_keys_and_bounds_metadata() {
+        use crate::worker::Response;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/test-data/a2-strip-receipt");
+        let mut app = TerminalApp::test_workspace(&root);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.worker.rx = rx;
+        app.quotes.insert("untouched".into(), quote("untouched", 101.0, 1));
+        app.quote_received.insert("untouched".into(), 2);
+        app.quote_received.insert("removed".into(), 2);
+        let before = chrono::Utc::now().timestamp();
+        tx.send(Response::Quotes(vec![quote("updated", 101.0, 1)])).unwrap();
+        app.drain();
+        let first_receipt = app.quote_received["updated"];
+        assert!((before..=chrono::Utc::now().timestamp()).contains(&first_receipt));
+        assert_eq!(app.quotes["updated"].ts, 1, "provider timestamp is preserved");
+        assert_eq!(app.quote_received["untouched"], 2, "a partial response must not refresh other keys");
+        assert_eq!(app.quote_received.len(), app.quotes.len());
+        assert!(!app.quote_received.contains_key("removed"));
+        let revision = app.quotes_revision;
+        app.quote_received.insert("updated".into(), before - 360);
+        tx.send(Response::Quotes(vec![quote("updated", 101.0, 1)])).unwrap();
+        app.drain();
+        assert!(app.quote_received["updated"] >= first_receipt, "repeated bar timestamps still refresh receipt");
+        assert_ne!(app.quotes_revision, revision, "receipt refresh invalidates the layout cache");
+    }
+
+    #[test]
+    fn breadth_counts_active_list_only_and_excludes_stale_missing_invalid() {
+        let now = 1_000;
+        let quotes: HashMap<_, _> = [
+            quote("up", 101.0, now),
+            quote("down", 99.0, now),
+            quote("flat", 100.0, now - 10),
+            quote("stale", 101.0, now - BREADTH_MAX_AGE),
+            quote("future", 101.0, now + 1),
+            quote("invalid", f64::NAN, now),
+            quote("other-list", 101.0, now),
+        ]
+        .into_iter()
+        .map(|q| (q.symbol.clone(), q))
+        .collect();
+        let received = quotes.iter().map(|(key, q)| (key.clone(), q.ts)).collect();
+        let watchlist = ["up", "down", "flat", "stale", "missing", "future", "invalid"].map(str::to_owned);
+        let (counts, expiry) = watchlist_breadth(&watchlist, &quotes, &received, now);
+        assert_eq!(counts, Breadth { up: 1, down: 1, unchanged: 1 });
+        assert!((counts.percent().unwrap() - 100.0 / 3.0).abs() < 0.001);
+        assert_eq!(expiry, Some(now - 10 + BREADTH_MAX_AGE));
+        assert_eq!(watchlist_breadth(&[], &quotes, &received, now), (Breadth::default(), None));
+        assert_eq!(watchlist_breadth(&watchlist, &HashMap::new(), &received, now).0.percent(), None);
+        assert_eq!(watchlist_breadth(&watchlist, &quotes, &HashMap::new(), now).0.percent(), None);
+        // Cached observations become ineligible even without a new quote revision.
+        assert_eq!(watchlist_breadth(&["flat".into()], &quotes, &received, expiry.unwrap()).0.percent(), None);
+        for prev_close in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let invalid_close = tr_data::Quote { prev_close, ..quote("bad", 100.0, now) };
+            assert!(!fresh_breadth_quote(&invalid_close, now, now));
+        }
+    }
+}
+
 /// Default toolbar height; on macOS it matches a unified `NSToolbar` so the traffic lights
 /// centre in it. The live value comes from [`TerminalApp::toolbar_h`].
 pub const TOOLBAR_H: f32 = if cfg!(target_os = "macos") { tr_macos::TITLEBAR_HEIGHT } else { 34.0 };
@@ -254,6 +736,9 @@ impl TerminalApp {
             ui.close();
         }
         if ui.checkbox(&mut self.prefs.headline_tape, "Headline tape").changed() {
+            changed = true;
+        }
+        if ui.checkbox(&mut self.prefs.quote_strip, "Quote strip").changed() {
             changed = true;
         }
         if ui.checkbox(&mut self.prefs.reduce_motion, "Reduce motion").changed() {
@@ -785,6 +1270,7 @@ impl TerminalApp {
                 }
             }
 
+            self.sidebar_dashboards(ui, &mut out);
             self.sidebar_layouts(ui, &mut out);
 
             section(ui, "More");
@@ -800,6 +1286,27 @@ impl TerminalApp {
     }
 
     // ---- layouts and status --------------------------------------------------------------
+
+    /// Dashboard presets: a collapsed row that expands to the preset list.
+    fn sidebar_dashboards(&mut self, ui: &mut Ui, out: &mut Vec<SidebarCmd>) {
+        section(ui, "Dashboards");
+        let id = ui.id().with("sidebar-dashboards-open");
+        let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, false));
+        if nav_row(ui, Icon::Grid, if open { "Hide presets" } else { "Show presets" }, Some("DASH"), false)
+            .on_hover_text("Open a preset as a new workspace")
+            .clicked()
+        {
+            open = !open;
+            ui.data_mut(|d| d.insert_persisted(id, open));
+        }
+        if open {
+            for dashboard in crate::dashboards::ALL {
+                if nav_row(ui, Icon::Grid, dashboard.name, None, false).on_hover_text(dashboard.description).clicked() {
+                    out.push(SidebarCmd::Function(Function::Dashboard(dashboard.id.into())));
+                }
+            }
+        }
+    }
 
     /// Saved layouts: click to switch, double-click or context menu to rename, ⌘1…⌘9 hints.
     fn sidebar_layouts(&mut self, ui: &mut Ui, out: &mut Vec<SidebarCmd>) {
