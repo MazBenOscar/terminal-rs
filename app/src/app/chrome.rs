@@ -1270,6 +1270,7 @@ impl TerminalApp {
                 }
             }
 
+            self.sidebar_dashboards(ui, &mut out);
             self.sidebar_layouts(ui, &mut out);
 
             section(ui, "More");
@@ -1285,6 +1286,27 @@ impl TerminalApp {
     }
 
     // ---- layouts and status --------------------------------------------------------------
+
+    /// Dashboard presets: a collapsed row that expands to the preset list.
+    fn sidebar_dashboards(&mut self, ui: &mut Ui, out: &mut Vec<SidebarCmd>) {
+        section(ui, "Dashboards");
+        let id = ui.id().with("sidebar-dashboards-open");
+        let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, false));
+        if nav_row(ui, Icon::Grid, if open { "Hide presets" } else { "Show presets" }, Some("DASH"), false)
+            .on_hover_text("Open a preset as a new workspace")
+            .clicked()
+        {
+            open = !open;
+            ui.data_mut(|d| d.insert_persisted(id, open));
+        }
+        if open {
+            for dashboard in crate::dashboards::ALL {
+                if nav_row(ui, Icon::Grid, dashboard.name, None, false).on_hover_text(dashboard.description).clicked() {
+                    out.push(SidebarCmd::Function(Function::Dashboard(dashboard.id.into())));
+                }
+            }
+        }
+    }
 
     /// Saved layouts: click to switch, double-click or context menu to rename, ⌘1…⌘9 hints.
     fn sidebar_layouts(&mut self, ui: &mut Ui, out: &mut Vec<SidebarCmd>) {
