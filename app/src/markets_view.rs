@@ -16,6 +16,66 @@ pub fn overview_keys() -> Vec<String> {
     Group::OVERVIEW.iter().flat_map(|g| catalog::group(*g).map(Listing::key)).collect()
 }
 
+/// Fixed cross-asset universe shared by the app-level strip and the overview poll.
+pub const QUOTE_STRIP_KEYS: [(&str, &str); 6] = [
+    ("VIX Index", "VIX"),
+    ("US10Y Govt", "US10Y"),
+    ("DXY Index", "DXY"),
+    ("GC1 Comdty", "GC1"),
+    ("CL1 Comdty", "CL1"),
+    ("BTCUSD Curncy", "BTCUSD"),
+];
+
+/// One shared 20-second gate: Wei already includes every strip key.
+pub fn overview_poll_keys(strip: bool, wei_visible: bool, due: bool) -> Option<Vec<String>> {
+    if !due {
+        None
+    } else if wei_visible {
+        Some(overview_keys())
+    } else if strip {
+        Some(QUOTE_STRIP_KEYS.iter().map(|(key, _)| (*key).to_owned()).collect())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod quote_strip_poll_tests {
+    use super::*;
+
+    #[test]
+    fn strip_keys_resolve_and_are_in_wei() {
+        let overview = overview_keys();
+        for (key, _) in QUOTE_STRIP_KEYS {
+            let security = Security::parse(key).unwrap();
+            assert_eq!(security.key(), key);
+            assert!(catalog::by_security(&security).is_some(), "{key}");
+            assert_eq!(overview.iter().filter(|s| *s == key).count(), 1, "{key}");
+        }
+    }
+
+    #[test]
+    fn shared_gate_requests_strip_only_when_on_without_wei() {
+        for strip in [false, true] {
+            for wei in [false, true] {
+                assert!(overview_poll_keys(strip, wei, false).is_none());
+                let keys = overview_poll_keys(strip, wei, true);
+                match (strip, wei) {
+                    (_, true) => {
+                        let keys = keys.unwrap();
+                        assert_eq!(keys, overview_keys());
+                        for (key, _) in QUOTE_STRIP_KEYS {
+                            assert_eq!(keys.iter().filter(|s| *s == key).count(), 1);
+                        }
+                    }
+                    (true, false) => assert_eq!(keys.unwrap(), QUOTE_STRIP_KEYS.map(|(key, _)| key.to_owned())),
+                    (false, false) => assert!(keys.is_none()),
+                }
+            }
+        }
+    }
+}
+
 /// Net change text: basis points for yields, price units otherwise.
 pub fn change_text(sec: &Security, q: &Quote) -> String {
     if sec.class == AssetClass::Govt {

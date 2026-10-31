@@ -1064,6 +1064,8 @@ pub struct TerminalApp {
     watch_sort: Option<(usize, bool)>,
     watch_drag: Option<watchlist_drag::WatchDrag>,
     quotes: HashMap<String, Quote>,
+    quotes_revision: u64,
+    quote_strip: chrome::QuoteStrip,
     last_quotes: Option<Instant>,
     last_feed: Option<Instant>,
     last_save: Instant,
@@ -1308,6 +1310,8 @@ impl TerminalApp {
             watch_sort: None,
             watch_drag: None,
             quotes: HashMap::new(),
+            quotes_revision: 0,
+            quote_strip: Default::default(),
             last_quotes: None,
             last_feed: None,
             last_save: Instant::now(),
@@ -2452,6 +2456,7 @@ impl TerminalApp {
                     }
                 }
                 Response::Quotes(q) => {
+                    self.quotes_revision = self.quotes_revision.wrapping_add(1);
                     if q.len() > 20 {
                         self.wei_updated = Some(format!("updated {}", chrono::Local::now().format("%H:%M:%S")));
                     }
@@ -3113,14 +3118,18 @@ impl TerminalApp {
         self.price_alerts.periodic(&self.worker);
         let visible = self.visible_panes();
         let shown = |f: &dyn Fn(&PaneKind) -> bool| visible.iter().any(|&i| f(&self.panes[i].kind));
-        let visible_wl = self.sidebar_open || shown(&|k| matches!(k, PaneKind::Watchlist));
+        // Breadth needs the active watchlist even with the sidebar and WL panes hidden.
+        let visible_wl = self.prefs.quote_strip || self.sidebar_open || shown(&|k| matches!(k, PaneKind::Watchlist));
         if visible_wl && self.last_quotes.is_none_or(|t| t.elapsed() > Duration::from_secs(20)) {
             self.worker.send(Request::Quotes(self.watchlist.clone()));
             self.last_quotes = Some(Instant::now());
         }
-        if shown(&|k| matches!(k, PaneKind::Wei)) && self.last_wei.is_none_or(|t| t.elapsed() > Duration::from_secs(20))
-        {
-            self.worker.send(Request::Quotes(markets_view::overview_keys()));
+        if let Some(keys) = markets_view::overview_poll_keys(
+            self.prefs.quote_strip,
+            shown(&|k| matches!(k, PaneKind::Wei)),
+            self.last_wei.is_none_or(|t| t.elapsed() > Duration::from_secs(20)),
+        ) {
+            self.worker.send(Request::Quotes(keys));
             self.last_wei = Some(Instant::now());
         }
         if shown(&|k| matches!(k, PaneKind::Curve))
@@ -3447,6 +3456,8 @@ impl eframe::App for TerminalApp {
         let ti = self.active_theme_index(&ctx);
         if self.applied_theme.as_ref() != Some(&self.themes[ti]) {
             theme::configure(&ctx, &self.themes[ti], self.system_accent);
+            // Font-family contents may change without changing FontId or palette.
+            self.quote_strip = Default::default();
             self.applied_theme = Some(self.themes[ti].clone());
         }
         theme::refresh(&ctx, &self.themes[ti], self.system_accent);
@@ -3477,10 +3488,13 @@ impl eframe::App for TerminalApp {
         let toolbar = Rect::from_min_size(main.min, vec2(main.width(), self.toolbar_h()));
         let status = Rect::from_min_max(pos2(main.left(), main.bottom() - STATUS_H), main.max);
         let tape_height = self.show_headline_tape(ui, Rect::from_min_max(main.min, pos2(main.right(), status.top())));
+        // Bottom-up: status bar, headline tape, quote strip, then the dock.
+        let (quote_height, quote_action) =
+            self.show_quote_strip(ui, Rect::from_min_max(main.min, pos2(main.right(), status.top() - tape_height)));
         let gap = theme::dp(6.0);
         let area = Rect::from_min_max(
             pos2(main.left() + gap, toolbar.bottom() + gap),
-            pos2(main.right() - gap, status.top() - tape_height - gap * 0.5),
+            pos2(main.right() - gap, status.top() - tape_height - quote_height - gap * 0.5),
         );
 
         if self.symbol_search.is_none() {
@@ -3508,6 +3522,7 @@ impl eframe::App for TerminalApp {
         self.status_bar(ui, status);
 
         let mut actions = Vec::new();
+        actions.extend(quote_action);
         for c in sidebar_cmds {
             match c {
                 SidebarCmd::Action(a) => actions.push(a),
@@ -3726,6 +3741,8 @@ impl TerminalApp {
             watch_sort: None,
             watch_drag: None,
             quotes: HashMap::new(),
+            quotes_revision: 0,
+            quote_strip: Default::default(),
             last_quotes: None,
             last_feed: None,
             last_save: Instant::now(),

@@ -13,6 +13,18 @@ pub struct Dashboard {
     pub build: fn(&PanelDefaults) -> LayoutDoc,
     /// Turn the app-level headline tape on when this dashboard opens.
     pub headline_tape: bool,
+    /// Turn the app-level quote strip on; false preserves the user's choice.
+    pub quote_strip: bool,
+}
+
+impl Dashboard {
+    /// Dashboard chrome preferences are deliberately on-only.
+    pub fn enable_strips(&self, prefs: &mut crate::prefs::Prefs) -> bool {
+        let changed = (self.headline_tape && !prefs.headline_tape) || (self.quote_strip && !prefs.quote_strip);
+        prefs.headline_tape |= self.headline_tape;
+        prefs.quote_strip |= self.quote_strip;
+        changed
+    }
 }
 pub const ALL: &[Dashboard] = &[Dashboard {
     id: "NEWS",
@@ -20,6 +32,7 @@ pub const ALL: &[Dashboard] = &[Dashboard {
     description: "Market headlines, story inspector and linked SPY chart",
     build: news_desk,
     headline_tape: true,
+    quote_strip: false,
 }];
 fn news_desk(defaults: &PanelDefaults) -> LayoutDoc {
     let news = NewsSettings {
@@ -51,6 +64,19 @@ fn news_desk(defaults: &PanelDefaults) -> LayoutDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dashboard_strips_are_on_only() {
+        assert!(!ALL[0].quote_strip, "NEWS must not enable the quote strip");
+        let brief = Dashboard { quote_strip: true, ..ALL[0] };
+        for initial in [false, true] {
+            let mut prefs = crate::prefs::Prefs { quote_strip: initial, headline_tape: true, ..Default::default() };
+            assert_eq!(brief.enable_strips(&mut prefs), !initial);
+            assert!(prefs.quote_strip);
+            assert!(!ALL[0].enable_strips(&mut prefs));
+            assert!(prefs.quote_strip, "NEWS preserves an enabled strip");
+        }
+    }
+
     #[test]
     fn news_desk_has_expected_shares_links_and_legacy_defaults() {
         let doc = (ALL[0].build)(&Default::default());

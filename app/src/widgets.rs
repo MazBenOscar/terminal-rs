@@ -9,6 +9,46 @@ use egui::{
 use crate::anim;
 use crate::theme::{self, ui_font};
 
+/// Normalize a percentage, including non-finite provider values, to a safe 0–1 fill.
+fn meter_fraction(percent: f32) -> f32 {
+    if percent.is_nan() { 0.0 } else { percent.clamp(0.0, 100.0) / 100.0 }
+}
+
+/// Compact directional 0–100 meter. `None` is unknown, not a zero reading.
+/// The caller supplies its density-scaled rectangle; all stroke/rounding uses dp().
+pub fn percent_meter(painter: &egui::Painter, rect: Rect, percent: Option<f32>) {
+    painter.rect_filled(rect, theme::dp(1.0), theme::control());
+    if let Some(percent) = percent {
+        let fraction = meter_fraction(percent);
+        if fraction > 0.0 {
+            let fill = Rect::from_min_size(rect.min, vec2(rect.width() * fraction, rect.height()));
+            painter.rect_filled(fill, theme::dp(1.0), theme::up());
+        }
+    }
+    painter.rect_stroke(rect, theme::dp(1.0), Stroke::new(theme::dp(0.5), theme::border()), StrokeKind::Inside);
+}
+
+#[cfg(test)]
+mod percent_meter_tests {
+    use super::*;
+
+    #[test]
+    fn clamps_percentages_and_handles_nonfinite_values() {
+        for (input, expected) in [
+            (-10.0, 0.0),
+            (0.0, 0.0),
+            (25.0, 0.25),
+            (100.0, 1.0),
+            (150.0, 1.0),
+            (f32::NAN, 0.0),
+            (f32::NEG_INFINITY, 0.0),
+            (f32::INFINITY, 1.0),
+        ] {
+            assert_eq!(meter_fraction(input), expected);
+        }
+    }
+}
+
 /// macOS-style segmented control. Returns the index clicked this frame.
 pub fn segmented(
     ui: &mut Ui,

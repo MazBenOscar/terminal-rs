@@ -197,6 +197,10 @@ pub(super) fn static_items() -> Vec<Item> {
         Item::new(Kind::Action, "Headline tape", "Toggle the bottom news strip", Target::HeadlineTape)
             .keywords("news ticker scroll headlines"),
     );
+    v.push(
+        Item::new(Kind::Action, "Quote strip", "Toggle cross-asset quotes and watchlist breadth", Target::QuoteStrip)
+            .keywords("morning brief vix rates dollar gold oil bitcoin breadth"),
+    );
     for &(a, words) in ACTIONS {
         v.push(Item::new(Kind::Action, a.label(), a.category(), Target::Hotkey(a)).keywords(words).hotkey(a));
     }
@@ -379,6 +383,7 @@ impl TerminalApp {
     fn run_palette_target(&mut self, t: Target) {
         match t {
             Target::HeadlineTape => self.toggle_headline_tape(),
+            Target::QuoteStrip => self.toggle_quote_strip(),
             Target::Run(line) => self.execute(&line),
             Target::Hotkey(a) => self.run_hotkey(a),
             Target::Settings(label) => {

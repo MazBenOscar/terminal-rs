@@ -1010,8 +1010,7 @@ impl TerminalApp {
             return;
         }
         self.apply_doc(doc);
-        if dashboard.headline_tape && !self.prefs.headline_tape {
-            self.prefs.headline_tape = true;
+        if dashboard.enable_strips(&mut self.prefs) {
             self.save_prefs();
         }
         self.save_layout();
