@@ -1,0 +1,13 @@
+{
+  "input": {"input":"headline_only","summaries":0,"publishers":["Synthetic Wire"],"authors":[],"tickers":[]},
+  "note": {
+    "verdict":{"direction":"none","asset":"","horizon":"","conviction":1},
+    "invalidation":"nothing in the supplied data undercuts this read",
+    "sentiment":0.00,"sentiment_subject":"none","intensity":0.10,"confidence":0.50,
+    "urgency":"low","outlook":"no signal","summary":"",
+    "hashtags":[],"key_points":[],"risks":[],
+    "not_addressed":["Regulatory","Geopolitical","Operational","Market"],
+    "topics":["Policy Calendar"],
+    "entities":[{"type":"ORG","name":"Fictional Policy Council","descriptor":"Government"}]
+  }
+}

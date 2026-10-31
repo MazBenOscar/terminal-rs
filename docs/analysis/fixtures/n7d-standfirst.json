@@ -1,0 +1,16 @@
+{
+  "input":{"input":"standfirst","summaries":1,"publishers":["Synthetic Wire"],"authors":[],"tickers":["NOVA US Equity"]},
+  "note":{
+    "verdict":{"direction":"bearish","asset":"NOVA","horizon":"days","conviction":6},
+    "invalidation":"the company restores its prior delivery guidance",
+    "sentiment":-0.42,"sentiment_subject":"NOVA","intensity":0.75,"confidence":0.78,
+    "urgency":"high","outlook":"moderate negative",
+    "summary":"A fictional manufacturer reduces its delivery outlook as equipment repairs interrupt output. Lower expected shipments weaken the near-term earnings read.",
+    "hashtags":["Factory Repairs"],
+    "key_points":["Management schedules an operations update next week."],
+    "risks":[{"category":"Operational","level":"high","note":"Equipment downtime constrains shipments until repairs finish."}],
+    "not_addressed":["Regulatory","Geopolitical","Market"],
+    "topics":["Delivery Guidance"],
+    "entities":[{"type":"ORG","name":"Nova Fabrication","ticker":"NOVA US Equity","descriptor":"Industrial Manufacturing"}]
+  }
+}

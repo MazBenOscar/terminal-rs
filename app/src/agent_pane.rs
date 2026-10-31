@@ -465,6 +465,8 @@ pub struct AgentPane {
     pub backend: &'static str,
     pub settings: Settings,
     pub workflows: crate::agent_bridge::Workflows,
+    pub(crate) story_tools: std::sync::Arc<std::sync::Mutex<crate::agent_bridge::StoryToolPolicy>>,
+    story_turn: bool,
     pub proposal_focus: HashMap<egui::Id, String>,
     /// Only buttons have an Enter action; other card controls only own Escape.
     pub proposal_buttons: HashMap<egui::Id, bool>,
@@ -515,6 +517,8 @@ impl Default for AgentPane {
             backend: "Codex",
             settings: Settings::default(),
             workflows: Default::default(),
+            story_tools: Default::default(),
+            story_turn: false,
             proposal_focus: Default::default(),
             proposal_buttons: Default::default(),
             proposal_seen: Default::default(),
@@ -664,7 +668,33 @@ impl AgentPane {
         }
     }
 
+    pub(crate) fn set_story_turn(&mut self, analysis: bool) {
+        self.story_turn = analysis;
+        self.story_tools.lock().unwrap().begin(analysis);
+    }
+
+    /// Called only for a confirmed isolated reply/end, never on interrupt.
+    pub(crate) fn story_analysis_ended(&mut self) {
+        self.story_turn = false;
+        let mut policy = self.story_tools.lock().unwrap();
+        policy.active = false;
+        policy.noticed_turns.clear();
+        policy.begin(false);
+    }
+
+    fn remember_story_turn(&mut self, turn: &str) {
+        if self.story_turn {
+            self.story_tools.lock().unwrap().remember(turn);
+        }
+    }
+
     fn finish_turn(&mut self) {
+        self.story_turn = false;
+        {
+            let mut policy = self.story_tools.lock().unwrap();
+            policy.active = false;
+            policy.noticed_turns.clear();
+        }
         if let Some(index) = self.active_turn.take() {
             let turn = &mut self.turns[index];
             turn.duration = Some(turn.started_at.elapsed());
@@ -756,7 +786,11 @@ impl AgentPane {
     }
 
     pub fn interrupt(&mut self) {
-        self.retryable = true;
+        // Cancellation is not completion: keep denial until the owner confirms
+        // completion/retirement or reports a stopped backend.
+        if !self.story_turn {
+            self.retryable = true;
+        }
         self.queue_paused = true;
         self.interrupt_tools();
     }
@@ -793,6 +827,7 @@ impl AgentPane {
         self.starting_prompt = Some(prompt.id.clone());
         Some(prompt)
     }
+    #[cfg(test)]
     pub fn next_prompt(&mut self) -> Option<Prompt> {
         let prompt = self.dequeue_prompt()?;
         self.start_prompt(prompt)
@@ -866,15 +901,31 @@ impl AgentPane {
     }
 
     pub fn event(&mut self, event: BridgeEvent) {
+        if self.story_turn && matches!(&event, BridgeEvent::Recovered(_)) {
+            return;
+        }
+        // Isolated analysis never produces ordinary Started/Completed events.
+        // A delayed main-thread ack must not release its denial or running slot.
+        if self.story_turn
+            && self.active_turn.is_none()
+            && matches!(
+                &event,
+                BridgeEvent::Started { .. } | BridgeEvent::Completed { .. } | BridgeEvent::ToolsUnavailable { .. }
+            )
+        {
+            return;
+        }
         match event {
             BridgeEvent::Wire(WireEvent::Notification { method, params }) => self.wire(&method, &params),
             BridgeEvent::Wire(WireEvent::Error(reason)) => self.error_notice(&reason),
             BridgeEvent::Started { turn } => {
+                self.remember_story_turn(&turn);
                 if let Some(index) = self.active_turn {
                     self.turns[index].id.get_or_insert(turn);
                 }
             }
             BridgeEvent::Completed { turn, status, .. } => {
+                self.remember_story_turn(&turn);
                 // Completion also supplies the canonical id if Started was absent.
                 if let Some(index) = self.active_turn {
                     self.turns[index].id.get_or_insert(turn);
@@ -4379,6 +4430,94 @@ mod polish_tests {
     }
 
     #[test]
+    fn isolated_analysis_denial_survives_interrupt_and_unrelated_main_completion() {
+        let mut pane = AgentPane::default();
+        pane.set_story_turn(true);
+        pane.running = true;
+        pane.interrupt();
+        pane.event(BridgeEvent::Completed {
+            turn: "main".into(),
+            status: "completed".into(),
+            calls: 0,
+            interrupt_elapsed: None,
+        });
+        assert!(pane.running);
+        assert!(pane.story_tools.lock().unwrap().active);
+        assert!(pane.turns.is_empty());
+        pane.story_tools.lock().unwrap().begin(false);
+        assert!(pane.story_tools.lock().unwrap().active, "ordinary start cannot confirm isolated end");
+        pane.story_analysis_ended();
+        assert!(!pane.story_tools.lock().unwrap().active);
+    }
+
+    #[test]
+    fn isolated_interrupt_never_retries_earlier_prompt_and_recovery_never_releases_denial() {
+        for active_main in [false, true] {
+            let mut pane = AgentPane::default();
+            pane.transition(Onboarding::Ready);
+            pane.start_prompt(Prompt {
+                id: Default::default(),
+                text: "earlier main prompt".into(),
+                requires_tools: false,
+            })
+            .unwrap();
+            if !active_main {
+                pane.event(BridgeEvent::Completed {
+                    turn: "main".into(),
+                    status: "completed".into(),
+                    calls: 0,
+                    interrupt_elapsed: None,
+                });
+            }
+            pane.set_story_turn(true);
+            pane.running = true;
+            pane.story_tools.lock().unwrap().noticed_turns.insert("analysis-notice".into());
+            let blocks = pane.blocks.len();
+            pane.interrupt();
+            assert!(!pane.retryable, "Escape must not expose Retry for the earlier user prompt");
+            assert_eq!(pane.last_prompt.as_ref().unwrap().text, "earlier main prompt");
+            pane.event(BridgeEvent::Recovered(Recovery::Resumed));
+            assert!(pane.story_turn);
+            assert!(pane.running);
+            assert!(pane.story_tools.lock().unwrap().active);
+            assert_eq!(pane.blocks.len(), blocks);
+            pane.story_analysis_ended();
+            let policy = pane.story_tools.lock().unwrap();
+            assert!(!policy.active);
+            assert!(policy.noticed_turns.is_empty());
+        }
+    }
+
+    #[test]
+    fn story_tool_flag_releases_only_on_confirmed_end_and_keeps_attributed_calls_denied() {
+        for ending in ["completed", "cancelled", "failed", "interrupt", "stopped", "unavailable", "recovered"] {
+            let mut pane = AgentPane::default();
+            pane.transition(Onboarding::Ready);
+            pane.start_prompt(Prompt { id: Default::default(), text: "analysis".into(), requires_tools: false })
+                .unwrap();
+            pane.set_story_turn(true);
+            pane.event(BridgeEvent::Started { turn: "story-turn".into() });
+            match ending {
+                "interrupt" => pane.interrupt(),
+                "stopped" => pane.transition(Onboarding::Stopped { reason: "fixture".into(), unsafe_backend: true }),
+                "unavailable" => pane.event(BridgeEvent::ToolsUnavailable { reason: "fixture".into() }),
+                "recovered" => pane.event(BridgeEvent::Recovered(Recovery::Resumed)),
+                status => pane.event(BridgeEvent::Completed {
+                    turn: "story-turn".into(),
+                    status: status.into(),
+                    calls: 0,
+                    interrupt_elapsed: None,
+                }),
+            }
+            let mut policy = pane.story_tools.lock().unwrap();
+            let still_active = matches!(ending, "interrupt" | "recovered");
+            assert_eq!(policy.active, still_active, "{ending}");
+            assert!(policy.denies("story-turn"), "{ending}");
+            assert_eq!(policy.denies("ordinary-turn"), still_active, "{ending}");
+        }
+    }
+
+    #[test]
     fn story_analysis_turn_never_hides_host_notices() {
         let ctx = egui::Context::default();
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
@@ -4390,9 +4529,11 @@ mod polish_tests {
         })
         .unwrap();
         pane.notice("Agent stopped for safety — fixture tripwire");
+        pane.notice(crate::agent_bridge::STORY_TOOLS_DISABLED);
         let output = render(&ctx, dp(900.0), vec![], |ui| pane.conversation(ui, &mut Vec::new()));
         let text = texts(&output);
         assert!(text.iter().any(|(s, _)| s.contains("fixture tripwire")), "{text:?}");
+        assert!(text.iter().any(|(s, _)| s == crate::agent_bridge::STORY_TOOLS_DISABLED), "{text:?}");
         assert!(!text.iter().any(|(s, _)| s.contains("STORY_DATA")));
     }
 

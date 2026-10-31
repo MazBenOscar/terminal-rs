@@ -16,6 +16,8 @@ fn fake() -> (AcpBackend, BufReader<ReadHalf<DuplexStream>>, WriteHalf<DuplexStr
             flag.store(true, Ordering::SeqCst);
         }),
     );
+    // Tool-policy unit tests start with an explicitly registered main session.
+    *backend.rpc.session.lock().unwrap() = Some("fake-session".into());
     let (r, w) = tokio::io::split(server);
     (backend, BufReader::new(r), w, killed)
 }
@@ -58,6 +60,319 @@ async fn handshake(
     };
     let (session, ()) = tokio::join!(backend.start_thread(options()), server);
     assert_eq!(session.unwrap(), "fake-session");
+}
+
+async fn attach_analysis(
+    backend: &AcpBackend,
+) -> (Arc<AcpBackend>, BufReader<ReadHalf<DuplexStream>>, WriteHalf<DuplexStream>, Arc<AtomicBool>) {
+    let (mut child, mut read, mut write, killed) = fake();
+    handshake(&child, &mut read, &mut write).await;
+    child.workspace = PathBuf::from("/private/analysis-empty");
+    child.rpc.analysis.store(true, Ordering::SeqCst);
+    let child = Arc::new(child);
+    *backend.analysis_child.lock().unwrap() = Some(child.clone());
+    (child, read, write, killed)
+}
+
+#[tokio::test]
+async fn story_analysis_is_history_free_restores_main_and_rejects_retired_tools() {
+    let (backend, mut read, mut write, killed) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let instructions = backend.instructions.lock().unwrap().clone();
+    let (child, mut read, mut write, child_killed) = attach_analysis(&backend).await;
+    let server = async {
+        let new = receive(&mut read).await;
+        assert_eq!(new["method"], "session/new");
+        assert_eq!(new["params"]["mcpServers"], json!([]));
+        send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"story"}))).await;
+        let prompt = receive(&mut read).await;
+        assert_eq!(prompt["params"]["sessionId"], "story");
+        assert_eq!(prompt["params"]["prompt"][0]["text"], "untrusted news");
+        send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"story","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Isolated answer\n"}}}})).await;
+        send(&mut write, crate::mcp::success(prompt["id"].clone(), json!({"stopReason":"end_turn"}))).await;
+    };
+    let (result, ()) =
+        tokio::join!(backend.analyze(TurnInput { text: "untrusted news".into(), ..Default::default() }), server);
+    assert_eq!(result.unwrap(), "Isolated answer\n");
+    assert_eq!(backend.rpc.session.lock().unwrap().as_deref(), Some("fake-session"));
+    assert_eq!(*backend.instructions.lock().unwrap(), instructions);
+    assert!(!killed.load(Ordering::SeqCst));
+    let mut events = backend.events();
+    child.rpc.route(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"story","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"late injection"}}}})).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(10), events.recv()).await.is_err());
+    child.rpc.route(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"story","update":{"sessionUpdate":"tool_call_update","toolCallId":"late"}}})).await.unwrap();
+    assert!(child.is_unsafe());
+    assert!(child_killed.load(Ordering::SeqCst));
+    assert!(!backend.is_unsafe());
+    assert!(!killed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn story_analysis_drains_final_chunk_after_prompt_response_before_retiring_session() {
+    for close_after_chunk in [false, true] {
+        let (backend, _main_read, _main_write, _) = fake();
+        let (child, mut read, mut write, _) = attach_analysis(&backend).await;
+        let server = async {
+            let new = receive(&mut read).await;
+            send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"draining-story"}))).await;
+            let prompt = receive(&mut read).await;
+            send(
+                &mut write,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"draining-story","update":{"sessionUpdate":"agent_message_chunk",
+            "content":{"type":"text","text":"{\"entities\":[]"}}}}),
+            )
+            .await;
+            send(&mut write, crate::mcp::success(prompt["id"].clone(), json!({"stopReason":"end_turn"}))).await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert_eq!(child.rpc.session.lock().unwrap().as_deref(), Some("draining-story"));
+            // No newline: this also checks that the final scrubber tail is flushed.
+            send(
+                &mut write,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"draining-story","update":{"sessionUpdate":"agent_message_chunk",
+            "content":{"type":"text","text":"}"}}}}),
+            )
+            .await;
+            if close_after_chunk {
+                write.shutdown().await.unwrap();
+            }
+        };
+        let (result, ()) = tokio::join!(backend.analyze(TurnInput::default()), server);
+        assert_eq!(result.unwrap(), "{\"entities\":[]}");
+        assert_eq!(child.rpc.session.lock().unwrap().as_deref(), Some("fake-session"));
+    }
+}
+
+#[tokio::test]
+async fn story_analysis_tool_call_is_a_tripwire_even_for_terminal_tools() {
+    let (backend, mut read, mut write, killed) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let (child, mut read, mut write, child_killed) = attach_analysis(&backend).await;
+    let server = async {
+        let new = receive(&mut read).await;
+        send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"story"}))).await;
+        let _prompt = receive(&mut read).await;
+        send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"story","update":{"sessionUpdate":"tool_call","toolCallId":"x","title":"terminal-rs_read_chart","kind":"other"}}})).await;
+    };
+    let (result, ()) = tokio::join!(backend.analyze(TurnInput::default()), server);
+    assert_eq!(result, Err(crate::AnalysisError::ToolAttempt));
+    assert!(child.is_unsafe());
+    assert!(child_killed.load(Ordering::SeqCst));
+    assert!(!backend.is_unsafe());
+    assert!(!killed.load(Ordering::SeqCst));
+    assert_eq!(backend.rpc.session.lock().unwrap().as_deref(), Some("fake-session"));
+    // The same main connection still accepts the user's next prompt.
+    backend.send_turn(TurnInput { text: "continue main".into(), ..Default::default() }).await.unwrap();
+}
+
+/// The process-wide MIMOCODE_CONFIG_CONTENT registers terminal-rs for every
+/// session, and the tool-enabled main session is also created with
+/// `mcpServers: []`. An analysis session/new identical to the main one is
+/// therefore not tool-less: isolation would rest solely on tripwires.
+#[tokio::test]
+async fn review_iso_mimo_analysis_session_inherits_process_terminal_mcp() {
+    let config = terminal_mcp_config(Path::new("/app/terminal-rs"), Path::new("/data"), "label");
+    let global_terminal_mcp = config["mcp"].get("terminal-rs").is_some() && config["tools"]["terminal-rs_*"] == true;
+    let (backend, mut read, mut write, _) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let main_params = json!({"cwd":"/private/empty","mcpServers":[]});
+    let (_, mut read, mut write, _) = attach_analysis(&backend).await;
+    // This is the exact config selected by launch_once for a child without an
+    // MCP client label. Unlike session/new, it is process-wide.
+    let analysis_config = process_config(Path::new("/app/terminal-rs"), Path::new("/data"), None);
+    assert!(analysis_config.get("mcp").is_none());
+    assert!(analysis_config["tools"].as_object().unwrap().values().all(|value| value == false));
+    assert_eq!(analysis_config["permission"], config["permission"]);
+    let server = async {
+        let new = receive(&mut read).await;
+        assert_eq!(new["method"], "session/new");
+        send(&mut write, json!({"jsonrpc":"2.0","id":new["id"],"error":{"code":-32000,"message":"stop here"}})).await;
+        new["params"].clone()
+    };
+    let (_, analysis_params) = tokio::join!(backend.analyze(TurnInput::default()), server);
+    assert!(
+        !(global_terminal_mcp && analysis_params == main_params),
+        "analysis session/new {analysis_params} equals the tool-enabled main session's request while the process config injects terminal-rs"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn story_analysis_timeout_cancels_retires_and_restores_main() {
+    let (backend, mut read, mut write, killed) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let (child, mut read, mut write, child_killed) = attach_analysis(&backend).await;
+    let server = async {
+        let new = receive(&mut read).await;
+        send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"slow-story"}))).await;
+        let _prompt = receive(&mut read).await;
+        tokio::time::sleep(Duration::from_secs(91)).await;
+        // An unconfirmed timeout now kills the dedicated process, rather than
+        // depending on delivery of a best-effort cancellation notification.
+        assert!(child_killed.load(Ordering::SeqCst));
+    };
+    let (result, ()) = tokio::join!(backend.analyze(TurnInput::default()), server);
+    assert_eq!(result, Err(crate::AnalysisError::TimedOut));
+    assert!(child.rpc.cancelled_sessions.lock().unwrap().contains("slow-story"));
+    assert!(child.is_closed());
+    assert!(!killed.load(Ordering::SeqCst));
+    assert_eq!(backend.rpc.session.lock().unwrap().as_deref(), Some("fake-session"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn analysis_child_is_lazy_no_mcp_canary_once_reused_and_expires_after_ten_idle_minutes() {
+    let (mut backend, mut main_read, mut main_write, main_killed) = fake();
+    handshake(&backend, &mut main_read, &mut main_write).await;
+    let (mut child, mut read, mut write, killed) = fake();
+    child.workspace = PathBuf::from("/private/analysis-empty");
+    let child = Arc::new(Mutex::new(Some(child)));
+    let launches = Arc::new(AtomicU64::new(0));
+    let count = launches.clone();
+    backend.analysis_factory = Some(Arc::new(move |config| {
+        assert!(config.get("mcp").is_none(), "analysis process must register no MCP servers");
+        assert!(config["tools"].as_object().unwrap().values().all(|value| value == false));
+        count.fetch_add(1, Ordering::SeqCst);
+        let child = child.lock().unwrap().take().unwrap();
+        Box::pin(async move { Ok(child) })
+    }));
+    assert!(backend.analysis_child.lock().unwrap().is_none());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    let canaries = Arc::new(AtomicU64::new(0));
+    let checks = canaries.clone();
+    let server = tokio::spawn(async move {
+        let mut sessions = 0;
+        loop {
+            let Some(line) = crate::mcp::read_line(&mut read).await.unwrap() else { break };
+            let request: Value = serde_json::from_slice(&line).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion":1}),
+                "session/new" => {
+                    sessions += 1;
+                    assert_eq!(request["params"]["cwd"], "/private/analysis-empty");
+                    assert_eq!(request["params"]["mcpServers"], json!([]));
+                    json!({"sessionId":format!("analysis-{sessions}")})
+                }
+                "session/cancel" => continue,
+                "session/prompt" => {
+                    let text = request["params"]["prompt"][0]["text"].as_str().unwrap();
+                    if text.contains("Isolation self-test") {
+                        checks.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        assert_eq!(text, "story data");
+                        send(
+                            &mut write,
+                            json!({"jsonrpc":"2.0","method":"session/update","params":{
+                            "sessionId":request["params"]["sessionId"],"update":{"sessionUpdate":"agent_message_chunk",
+                            "content":{"type":"text","text":"Answer\n"}}}}),
+                        )
+                        .await;
+                    }
+                    json!({"stopReason":"end_turn"})
+                }
+                method => panic!("unexpected analysis method {method}"),
+            };
+            send(&mut write, crate::mcp::success(request["id"].clone(), result)).await;
+        }
+    });
+    let input = || TurnInput { text: "story data".into(), ..Default::default() };
+    assert_eq!(backend.analyze(input()).await, Ok("Answer\n".into()));
+    tokio::time::advance(Duration::from_secs(500)).await;
+    assert!(!killed.load(Ordering::SeqCst));
+    assert_eq!(backend.analyze(input()).await, Ok("Answer\n".into()));
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert_eq!(canaries.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(599)).await;
+    tokio::task::yield_now().await;
+    assert!(!killed.load(Ordering::SeqCst), "old idle timer must not stop a reused process");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(killed.load(Ordering::SeqCst));
+    assert!(backend.analysis_child.lock().unwrap().is_none());
+    assert!(!main_killed.load(Ordering::SeqCst));
+    assert!(!backend.is_closed());
+    assert_eq!(backend.rpc.session.lock().unwrap().as_deref(), Some("fake-session"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), crate::mcp::read_line(&mut main_read)).await.is_err(),
+        "analysis must never send an RPC to main"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn analysis_canary_tripwire_stops_only_child_and_never_runs_story() {
+    let (mut backend, _main_read, _main_write, main_killed) = fake();
+    let (child, mut read, mut write, child_killed) = fake();
+    let child = Arc::new(Mutex::new(Some(child)));
+    backend.analysis_factory = Some(Arc::new(move |_| {
+        let child = child.lock().unwrap().take().unwrap();
+        Box::pin(async { Ok(child) })
+    }));
+    let server = async {
+        let init = receive(&mut read).await;
+        send(&mut write, crate::mcp::success(init["id"].clone(), json!({"protocolVersion":1}))).await;
+        let new = receive(&mut read).await;
+        send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"canary"}))).await;
+        let prompt = receive(&mut read).await;
+        assert!(prompt["params"]["prompt"][0]["text"].as_str().unwrap().contains("Isolation self-test"));
+        send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"canary","update":{"sessionUpdate":"tool_call","toolCallId":"attempt","title":"terminal-rs_read_chart","kind":"other"}}})).await;
+    };
+    let (result, ()) =
+        tokio::join!(backend.analyze(TurnInput { text: "story must not run".into(), ..Default::default() }), server);
+    assert_eq!(result, Err(crate::AnalysisError::ToolAttempt));
+    assert!(child_killed.load(Ordering::SeqCst));
+    assert!(!main_killed.load(Ordering::SeqCst));
+    assert!(!backend.is_closed());
+    assert!(!backend.is_unsafe());
+    assert!(backend.analysis_child.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn analysis_owner_shutdown_stops_both_processes() {
+    let (backend, _read, _write, killed) = fake();
+    let (child, _read, _write, child_killed) = attach_analysis(&backend).await;
+    backend.shutdown();
+    assert!(killed.load(Ordering::SeqCst));
+    assert!(child_killed.load(Ordering::SeqCst));
+    assert!(child.is_closed());
+}
+
+#[tokio::test]
+async fn analysis_confirmed_cancel_reuses_child_and_preserves_main() {
+    let (backend, mut read, mut write, killed) = fake();
+    handshake(&backend, &mut read, &mut write).await;
+    let (child, mut read, mut write, child_killed) = attach_analysis(&backend).await;
+    let server = async {
+        let new = receive(&mut read).await;
+        send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"cancel-story"}))).await;
+        let prompt = receive(&mut read).await;
+        backend.interrupt_analysis().await;
+        let cancel = receive(&mut read).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        assert_eq!(cancel["params"]["sessionId"], "cancel-story");
+        send(&mut write, crate::mcp::success(prompt["id"].clone(), json!({"stopReason":"cancelled"}))).await;
+    };
+    let (result, ()) = tokio::join!(backend.analyze(TurnInput::default()), server);
+    assert_eq!(result, Err(crate::AnalysisError::Cancelled));
+    assert!(!killed.load(Ordering::SeqCst));
+    assert!(!child_killed.load(Ordering::SeqCst));
+    assert!(Arc::ptr_eq(backend.analysis_child.lock().unwrap().as_ref().unwrap(), &child));
+    assert_eq!(backend.rpc.session.lock().unwrap().as_deref(), Some("fake-session"));
+}
+
+#[tokio::test]
+async fn acp_session_tombstones_are_bounded() {
+    let (backend, _read, _write, _) = fake();
+    for index in 0..1000 {
+        let id = format!("session-{index}");
+        backend.rpc.retired_sessions.lock().unwrap().insert(id.clone());
+        backend.rpc.cancelled_sessions.lock().unwrap().insert(id);
+    }
+    for ids in [&backend.rpc.retired_sessions, &backend.rpc.cancelled_sessions] {
+        let ids = ids.lock().unwrap();
+        assert!(!ids.contains("session-935"));
+        assert!(ids.contains("session-936"));
+        assert!(ids.contains("session-999"));
+    }
 }
 
 #[tokio::test]
@@ -111,7 +426,7 @@ async fn echoed_user_chunks_are_ignored_and_tool_boundaries_split_text_without_f
         json!({"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"terminal-rs_read_chart","kind":"other"}),
         json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Verdict: up\n80,799.51"}}),
     ] {
-        backend.rpc.route(json!({"jsonrpc":"2.0","method":"session/update","params":{"update":update}})).await.unwrap();
+        backend.rpc.route(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":update}})).await.unwrap();
     }
     backend.rpc.finish_chunks();
     backend.rpc.finish_chunks(); // A second flush must emit nothing.
@@ -668,7 +983,7 @@ async fn model_category_wins_over_legacy_models_and_modes_never_become_models() 
 async fn foreign_permission_rejected_once_cancelled_and_killed() {
     let (backend, mut read, mut write, killed) = fake();
     let mut events = backend.events();
-    send(&mut write,json!({"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"toolCall":{"title":"bash"},"options":[{"kind":"allow_once","optionId":"yes"},{"kind":"reject_once","optionId":"no"}]}})).await;
+    send(&mut write,json!({"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"fake-session","toolCall":{"title":"bash"},"options":[{"kind":"allow_once","optionId":"yes"},{"kind":"reject_once","optionId":"no"}]}})).await;
     let response = receive(&mut read).await;
     assert_eq!(response["id"], 99);
     assert_eq!(response["result"]["outcome"], json!({"outcome":"selected","optionId":"no"}));
@@ -680,7 +995,7 @@ async fn foreign_permission_rejected_once_cancelled_and_killed() {
 #[tokio::test]
 async fn terminal_rs_permission_allows_once_never_always() {
     let (backend, mut read, mut write, killed) = fake();
-    send(&mut write,json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{"toolCall":{"title":"terminal-rs/read_chart"},"options":[{"kind":"allow_always","optionId":"forever"},{"kind":"allow_once","optionId":"once"},{"kind":"reject_once","optionId":"no"}]}})).await;
+    send(&mut write,json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{"sessionId":"fake-session","toolCall":{"title":"terminal-rs/read_chart"},"options":[{"kind":"allow_always","optionId":"forever"},{"kind":"allow_once","optionId":"once"},{"kind":"reject_once","optionId":"no"}]}})).await;
     assert_eq!(receive(&mut read).await["result"]["outcome"]["optionId"], "once");
     assert!(!backend.is_unsafe() && !killed.load(Ordering::SeqCst));
 }
@@ -694,12 +1009,12 @@ async fn unsafe_kinds_cannot_be_disguised_as_terminal_rs_permissions_or_tools() 
             let mut call = json!({"toolCallId":"spoofed","title":"terminal-rs/read_chart","kind":kind,
                 "rawInput":{"serverName":"terminal-rs","name":"read_chart"}});
             let frame = if permission {
-                json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{
+                json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{"sessionId":"fake-session",
                     "toolCall":call,"options":[{"kind":"allow_once","optionId":"yes"},{"kind":"reject_once","optionId":"no"}]
                 }})
             } else {
                 call["sessionUpdate"] = json!("tool_call");
-                json!({"jsonrpc":"2.0","method":"session/update","params":{"update":call}})
+                json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":call}})
             };
             send(&mut write, frame).await;
             if permission {
@@ -724,15 +1039,19 @@ async fn safe_kinds_with_agreeing_structured_identity_allow_once_and_complete() 
             if let Some(kind) = kind {
                 call["kind"] = json!(kind);
             }
-            send(&mut write, json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{
+            send(&mut write, json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{"sessionId":"fake-session",
                 "toolCall":call,"options":[{"kind":"allow_always","optionId":"forever"},{"kind":"allow_once","optionId":"once"},{"kind":"reject_once","optionId":"no"}]
             }})).await;
             assert_eq!(receive(&mut read).await["result"]["outcome"]["optionId"], "once");
             call["sessionUpdate"] = json!("tool_call");
-            send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"update":call}})).await;
             send(
                 &mut write,
-                json!({"jsonrpc":"2.0","method":"session/update","params":{"update":{
+                json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":call}}),
+            )
+            .await;
+            send(
+                &mut write,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":{
                     "sessionUpdate":"tool_call_update","toolCallId":"safe","status":"completed"}
                 }}),
             )
@@ -767,7 +1086,11 @@ async fn foreign_tool_update_and_unknown_notifications_trip() {
     ] {
         let (backend, mut read, mut write, killed) = fake();
         let mut events = backend.events();
-        send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"update":update}})).await;
+        send(
+            &mut write,
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":update}}),
+        )
+        .await;
         assert_eq!(receive(&mut read).await["method"], "session/cancel");
         assert!(matches!(events.recv().await, Some(AgentEvent::Error(_))));
         assert!(backend.is_unsafe() && killed.load(Ordering::SeqCst));
@@ -845,6 +1168,8 @@ fn tool_provenance_is_exact_and_sandbox_has_no_foreign_exec() {
         session: Default::default(),
         retired_sessions: Default::default(),
         cancelled_sessions: Default::default(),
+        analysis: AtomicBool::new(false),
+        analysis_done: Default::default(),
         turn: Default::default(),
         text: Default::default(),
         message_segment: AtomicU64::new(0),
@@ -1273,7 +1598,7 @@ async fn contradictory_tool_provenance_is_rejected_even_with_a_valid_title() {
             let (backend, mut read, mut write, killed) = fake();
             let mut events = backend.events();
             if permission {
-                send(&mut write, json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{
+                send(&mut write, json!({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{"sessionId":"fake-session",
                     "toolCall":call,"options":[{"kind":"allow_once","optionId":"yes"},{"kind":"reject_once","optionId":"no"}]
                 }})).await;
                 assert_eq!(receive(&mut read).await["result"]["outcome"]["optionId"], "no");
@@ -1281,7 +1606,7 @@ async fn contradictory_tool_provenance_is_rejected_even_with_a_valid_title() {
                 let mut update = call.clone();
                 update["sessionUpdate"] = json!("tool_call");
                 update["toolCallId"] = json!("spoofed");
-                send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"update":update}})).await;
+                send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":update}})).await;
             }
             assert_eq!(receive(&mut read).await["method"], "session/cancel");
             assert!(matches!(events.recv().await, Some(AgentEvent::Error(_))));
@@ -1348,11 +1673,19 @@ async fn approved_tool_updates_cannot_change_kind_or_structured_identity() {
         let mut events = backend.events();
         let call =
             json!({"sessionUpdate":"tool_call","toolCallId":"known","title":"terminal-rs/read_chart","kind":"other"});
-        send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"update":call}})).await;
+        send(
+            &mut write,
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":call}}),
+        )
+        .await;
         assert!(matches!(events.recv().await, Some(AgentEvent::ToolStarted(_))));
         let mut update = json!({"sessionUpdate":"tool_call_update","toolCallId":"known","status":"completed"});
         update.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
-        send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"update":update}})).await;
+        send(
+            &mut write,
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":update}}),
+        )
+        .await;
         assert_eq!(receive(&mut read).await["method"], "session/cancel");
         assert!(matches!(events.recv().await, Some(AgentEvent::Error(_))));
         assert!(backend.is_unsafe() && killed.load(Ordering::SeqCst));
@@ -1367,7 +1700,11 @@ async fn approved_tool_id_does_not_allow_a_foreign_tool_update() {
         json!({"sessionUpdate":"tool_call","toolCallId":"known","title":"terminal-rs/read_chart"}),
         json!({"sessionUpdate":"tool_call_update","toolCallId":"known","rawInput":{"name":"bash"},"status":"completed"}),
     ] {
-        send(&mut write, json!({"jsonrpc":"2.0","method":"session/update","params":{"update":update}})).await;
+        send(
+            &mut write,
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":update}}),
+        )
+        .await;
     }
     assert_eq!(receive(&mut read).await["method"], "session/cancel");
     // The error is sticky and may supersede the queued ToolStarted event.
@@ -1518,5 +1855,279 @@ async fn permission_approval_announces_tool_id_but_foreign_update_still_trips() 
             assert!(matches!(event, Some(AgentEvent::ToolFinished(_))));
             assert!(!backend.is_unsafe());
         }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn owner_cleanup_waits_for_child_even_after_main_cleanup_and_a_cancelled_waiter() {
+    let (mut backend, _read, _write, _) = fake();
+    let (_finished, cleaned) = watch::channel(Some(Ok(())));
+    backend.cleaned = Some(cleaned);
+    let (mut child, _child_read, _child_write, child_killed) = fake();
+    let (finished, cleaned) = watch::channel(None);
+    child.cleaned = Some(cleaned);
+    *backend.analysis_child.lock().unwrap() = Some(Arc::new(child));
+    backend.shutdown();
+    assert!(child_killed.load(Ordering::SeqCst));
+    assert!(tokio::time::timeout(Duration::from_secs(1), backend.wait_cleanup()).await.is_err());
+    let complete = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        finished.send_replace(Some(Ok(())));
+    };
+    let began = tokio::time::Instant::now();
+    let (result, ()) = tokio::join!(backend.wait_cleanup(), complete);
+    result.unwrap();
+    assert_eq!(began.elapsed(), Duration::from_secs(2));
+    assert!(!backend.is_unsafe());
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_unconfirmed_analysis_stop_retains_and_observes_delayed_cleanup_findings() {
+    for ending in ["NotReady", "TimedOut", "NoAnswerTooLong", "drop"] {
+        let (backend, _main_read, _main_write, main_killed) = fake();
+        let (mut child, mut read, mut write, child_killed) = fake();
+        handshake(&child, &mut read, &mut write).await;
+        child.rpc.analysis.store(true, Ordering::SeqCst);
+        let (finished, cleaned) = watch::channel(None);
+        child.cleaned = Some(cleaned);
+        let child = Arc::new(child);
+        *backend.analysis_child.lock().unwrap() = Some(child.clone());
+        if ending == "drop" {
+            let mut run = Box::pin(backend.analyze(TurnInput::default()));
+            tokio::select! {
+                result = &mut run => panic!("unexpected early result: {result:?}"),
+                new = receive(&mut read) => assert_eq!(new["method"], "session/new"),
+            }
+            drop(run);
+        } else {
+            let server = async {
+                let new = receive(&mut read).await;
+                if ending == "NotReady" {
+                    send(&mut write, crate::mcp::error(new["id"].clone(), -32000, "not ready")).await;
+                } else {
+                    send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"story"}))).await;
+                    let _prompt = receive(&mut read).await;
+                    if ending == "NoAnswerTooLong" {
+                        child.rpc.emit(AgentEvent::TextDelta(json!({"delta":"x".repeat(65537)})));
+                    }
+                }
+            };
+            let (result, ()) = tokio::join!(backend.analyze(TurnInput::default()), server);
+            let expected = match ending {
+                "NotReady" => crate::AnalysisError::NotReady,
+                "TimedOut" => crate::AnalysisError::TimedOut,
+                _ => crate::AnalysisError::NoAnswerTooLong,
+            };
+            assert_eq!(result, Err(expected));
+        }
+        assert!(child_killed.load(Ordering::SeqCst), "{ending}");
+        assert!(backend.analysis_child.lock().unwrap().is_none());
+        assert!(!main_killed.load(Ordering::SeqCst));
+        assert!(tokio::time::timeout(Duration::from_millis(1), backend.wait_cleanup()).await.is_err());
+        finished.send_replace(Some(Err(format!("escaped descendant after {ending}"))));
+        // The first wait was cancelled: the parent observer must still own the receiver.
+        tokio::task::yield_now().await;
+        assert!(backend.is_unsafe(), "{ending}");
+        assert!(main_killed.load(Ordering::SeqCst));
+        assert!(backend.wait_cleanup().await.is_err());
+    }
+}
+
+#[test]
+fn analysis_launch_is_pure_has_no_bridge_environment_or_sandbox_grants() {
+    for profile in [MimoProfile::Own, MimoProfile::Private] {
+        assert_eq!(analysis_arguments(profile, 12345), ["acp", "--port", "12345", "--pure"]);
+        let config = process_config(Path::new("/app/terminal-rs"), Path::new("/data"), None);
+        let env = process_environment(
+            [("TR_DATA_DIR".into(), "/inherited".into()), ("TR_MCP_CLIENT".into(), "inherited-label".into())].into(),
+            config.clone(),
+            None,
+        );
+        assert!(!env.contains_key(std::ffi::OsStr::new("TR_DATA_DIR")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("TR_MCP_CLIENT")));
+        assert!(config.get("mcp").is_none());
+        assert!(config["tools"].as_object().unwrap().values().all(|value| value == false));
+    }
+    let roots = SandboxRoots {
+        readable: vec!["/private/provider-home".into()],
+        writable: vec!["/private/provider-home".into()],
+    };
+    let profile = sandbox_profile_with_mode(
+        Path::new("/private/data/agent/analysis"),
+        &roots,
+        Path::new("/opt/mimo/bin/mimo"),
+        Path::new("/app/terminal-rs"),
+        Path::new("/private/data/agent/mcp.sock"),
+        Path::new("/Users/test"),
+        12345,
+        true,
+    )
+    .unwrap();
+    assert!(!profile.contains("mcp.sock"));
+    assert!(!profile.contains("/app/terminal-rs"));
+    assert!(profile.contains("(allow process-exec (literal \"/opt/mimo/bin/mimo\") )"));
+    assert!(profile.contains("(remote tcp \"*:443\")"));
+    assert!(profile.contains("localhost:12345"));
+    let overlapping = SandboxRoots { readable: vec!["/private/data".into()], writable: vec![] };
+    assert!(
+        sandbox_profile_with_mode(
+            Path::new("/private/data/agent/analysis"),
+            &overlapping,
+            Path::new("/opt/mimo/bin/mimo"),
+            Path::new("/app/terminal-rs"),
+            Path::new("/private/data/agent/mcp.sock"),
+            Path::new("/Users/test"),
+            12345,
+            true,
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn tools_fail_closed_without_a_registered_main_session_or_after_retirement_eviction() {
+    for session in [Value::Null, json!("old-0"), json!("unknown"), json!("fake-session")] {
+        for registered in [false, true] {
+            let (backend, _read, _write, _) = fake();
+            if !registered {
+                *backend.rpc.session.lock().unwrap() = None;
+            }
+            for index in 0..1000 {
+                backend.rpc.retired_sessions.lock().unwrap().insert(format!("old-{index}"));
+            }
+            backend.rpc.route(json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":session,"update":{"sessionUpdate":"tool_call","toolCallId":"x","title":"terminal-rs/read_chart"}
+            }})).await.unwrap();
+            assert_eq!(backend.is_unsafe(), !(registered && session == "fake-session"));
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn analysis_cancel_aborts_launch_canary_and_session_creation_without_touching_main() {
+    for phase in ["launch", "canary", "canary-turn", "session/new"] {
+        let (mut backend, _main_read, _main_write, main_killed) = fake();
+        let (child, mut read, mut write, child_killed) = fake();
+        let launch_started = Arc::new(AtomicBool::new(false));
+        let started = launch_started.clone();
+        if phase == "session/new" {
+            // A reused child has already completed its one-time canary.
+            handshake(&child, &mut read, &mut write).await;
+            *backend.analysis_child.lock().unwrap() = Some(Arc::new(child));
+        } else {
+            let child = Arc::new(Mutex::new(Some(child)));
+            backend.analysis_factory = Some(Arc::new(move |_| {
+                let child = child.lock().unwrap().take().unwrap();
+                let started = started.clone();
+                Box::pin(async move {
+                    started.store(true, Ordering::SeqCst);
+                    if phase == "launch" {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(child)
+                })
+            }));
+        }
+        let server = async {
+            if phase == "launch" {
+                while !launch_started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            } else if matches!(phase, "canary" | "canary-turn") {
+                let init = receive(&mut read).await;
+                send(&mut write, crate::mcp::success(init["id"].clone(), json!({"protocolVersion":1}))).await;
+                let new = receive(&mut read).await;
+                assert_eq!(new["method"], "session/new");
+                if phase == "canary-turn" {
+                    send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"canary"}))).await;
+                    let prompt = receive(&mut read).await;
+                    assert_eq!(prompt["method"], "session/prompt");
+                }
+                // Escape both before the session acknowledgement and during the canary.
+            } else {
+                let new = receive(&mut read).await;
+                assert_eq!(new["method"], "session/new");
+            }
+            backend.interrupt_analysis().await;
+        };
+        let (result, ()) = tokio::join!(backend.analyze(TurnInput::default()), server);
+        assert_eq!(result, Err(crate::AnalysisError::Cancelled), "{phase}");
+        assert!(!main_killed.load(Ordering::SeqCst));
+        assert!(!backend.is_closed() && !backend.is_unsafe());
+        if phase != "session/new" {
+            assert!(child_killed.load(Ordering::SeqCst));
+        }
+        // A cancelled startup must never send a story prompt after a delayed ack.
+        if phase == "session/new" {
+            let cancel = receive(&mut read).await;
+            assert_eq!(cancel["method"], "session/cancel");
+            assert!(cancel["params"]["sessionId"].is_string());
+            assert!(tokio::time::timeout(Duration::from_millis(10), receive(&mut read)).await.is_err());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_analysis_budget_includes_launch_and_canary_and_expires_at_four_minutes() {
+    let (mut backend, _main_read, _main_write, main_killed) = fake();
+    let (child, mut read, mut write, child_killed) = fake();
+    let child = Arc::new(Mutex::new(Some(child)));
+    backend.analysis_factory = Some(Arc::new(move |_| {
+        let child = child.lock().unwrap().take().unwrap();
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(200)).await;
+            Ok(child)
+        })
+    }));
+    let server = async {
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        let init = receive(&mut read).await;
+        send(&mut write, crate::mcp::success(init["id"].clone(), json!({"protocolVersion":1}))).await;
+        let new = receive(&mut read).await;
+        send(&mut write, crate::mcp::success(new["id"].clone(), json!({"sessionId":"canary"}))).await;
+        let prompt = receive(&mut read).await;
+        assert_eq!(prompt["method"], "session/prompt");
+        // No answer: launch consumed 200s, leaving only 40s of the total cap.
+    };
+    let began = tokio::time::Instant::now();
+    let (result, ()) = tokio::join!(backend.analyze(TurnInput::default()), server);
+    assert_eq!(result, Err(crate::AnalysisError::StartTimedOut));
+    assert_eq!(began.elapsed(), Duration::from_secs(240));
+    assert_eq!(result.unwrap_err().to_string(), "Analysis agent didn't start — Retry");
+    assert!(child_killed.load(Ordering::SeqCst));
+    assert!(!main_killed.load(Ordering::SeqCst));
+}
+
+/// The dedicated analysis child runs under its own supervisor, which reports
+/// process-group/workspace cleanup findings (e.g. an escaped descendant) only
+/// on the child's `cleaned` channel. The owner's `wait_cleanup` (awaited by
+/// the agent session on stop/restart) looks only at the main process, and a
+/// child stopped earlier by the idle timer or an unconfirmed ending is never
+/// awaited at all, so its cleanup findings are silently lost instead of
+/// marking the session unsafe as they do for the main process.
+#[tokio::test(start_paused = true)]
+async fn review_final_analysis_child_cleanup_findings_are_unobserved() {
+    for idle_first in [false, true] {
+        let (mut backend, _read, _write, _) = fake();
+        let (_main_done, main_cleaned) = watch::channel(Some(Ok(())));
+        backend.cleaned = Some(main_cleaned);
+        let (mut child, _child_read, _child_write, child_killed) = fake();
+        let (_child_done, child_cleaned) =
+            watch::channel(Some(Err("mimo cleanup findings: escaped descendant 4242".to_string())));
+        child.cleaned = Some(child_cleaned);
+        *backend.analysis_child.lock().unwrap() = Some(Arc::new(child));
+        if idle_first {
+            backend.schedule_analysis_idle();
+            tokio::time::advance(Duration::from_secs(10 * 60)).await;
+            tokio::task::yield_now().await;
+            assert!(child_killed.load(Ordering::SeqCst));
+            assert!(backend.analysis_child.lock().unwrap().is_none());
+        }
+        backend.shutdown();
+        assert!(child_killed.load(Ordering::SeqCst));
+        assert!(
+            backend.wait_cleanup().await.is_err() || backend.is_unsafe(),
+            "analysis child cleanup findings were dropped (idle_first={idle_first})"
+        );
     }
 }

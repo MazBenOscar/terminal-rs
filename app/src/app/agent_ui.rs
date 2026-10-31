@@ -43,23 +43,6 @@ fn alert_configuration(alert: &tr_core::price_alerts::Alert) -> serde_json::Valu
     value
 }
 
-/// No backend side effects until an existing session reaches an idle Ready
-/// boundary. Check both directions: cancellation during startup also needs a
-/// deferred restore, even when the read-only policy flag is already cleared.
-fn story_policy_change(
-    running: bool,
-    ready: bool,
-    session_tools: Option<tr_agent_tools::ToolSet>,
-    desired: bool,
-    current: bool,
-    ordinary: tr_agent_tools::ToolSet,
-) -> bool {
-    let target = if desired { tr_agent_tools::ToolSet::ReadOnly } else { ordinary };
-    !running
-        && (session_tools.is_none() || ready)
-        && (desired != current || session_tools.is_some_and(|tools| tools != target))
-}
-
 fn pane_id(id: PaneId) -> egui::Id {
     egui::Id::new(("agent-pane", id))
 }
@@ -152,7 +135,7 @@ impl TerminalApp {
                 data,
                 AppExecutor::new(self),
                 pin,
-                self.agent_config.allow_external_edits && !self.story_desk.read_only,
+                self.agent_config.allow_external_edits,
             ) {
                 Ok(server) => self.external_agent = Some(server),
                 Err(error) => {
@@ -933,6 +916,15 @@ impl TerminalApp {
                     self.agent_pane.models = models;
                 }
                 Event::Limits(limits) => self.agent_pane.set_limits(&limits),
+                Event::AnalysisStarting { id, starting } => {
+                    self.story_analysis_starting(&id, starting);
+                }
+                Event::Analysis { id, result } => {
+                    // The queue owner has confirmed the end or stopped the
+                    // relevant process before posting this event.
+                    self.agent_pane.story_analysis_ended();
+                    self.finish_story_analysis(id, result);
+                }
                 Event::Bridge(event) => self.agent_pane.event(event),
                 Event::Notice(reason) => self.agent_pane.error_notice(&reason),
             }
@@ -1030,7 +1022,7 @@ impl TerminalApp {
         let Some(tools) = self.agent_pane.prepare_session_start() else { return };
         // Codex's per-pane preset is not mimo's policy: its tools are served by
         // the external socket. Keep the instructions/schema aligned with it.
-        let tools = self.story_desk.effective_tools(self.agent_config.session_tools(tools));
+        let tools = self.agent_config.session_tools(tools);
         self.agent_pane.session_tools = Some(tools);
         self.agent_pane.workflows.reset();
         self.agent_pane.session = None;
@@ -1173,53 +1165,55 @@ impl TerminalApp {
         }
     }
 
-    /// Analysis uses a fresh read-only session, not a natural-language promise.
-    /// Session inventories are immutable in both backends; restart at an idle
-    /// queue boundary and leave the user's saved tools mode untouched.
+    /// Only the first start is needed. Analysis never changes a session's
+    /// inventory, the user's mode, or the external listener.
     fn prepare_story_agent(&mut self, ctx: &egui::Context) {
-        let desired = self.agent_pane.starting_prompt.as_ref().map_or_else(
-            || self.agent_pane.queue.front().is_some_and(|p| self.story_desk.queued_read_only(p)),
-            |id| self.story_desk.read_only_prompt_id(id),
-        );
-        let ordinary = self.agent_config.session_tools(self.agent_pane.tool_set());
-        let session_tools = self.agent_pane.session.as_ref().map(|_| self.agent_pane.session_tools.unwrap_or(ordinary));
-        if !story_policy_change(
-            self.agent_pane.running,
-            self.agent_pane.state == Onboarding::Ready,
-            session_tools,
-            desired,
-            self.story_desk.read_only,
-            ordinary,
-        ) {
-            return;
-        }
-        self.story_desk.read_only = desired;
-        // mimo serves tools through the external listener. Replace that registry
-        // too; old accepted peers and queued calls are cancelled on drop.
-        self.external_agent = None;
-        self.external_attempted = false;
-        self.external_agent_logic();
-        if self.agent_pane.session.is_some() && self.agent_pane.state == Onboarding::Ready {
-            let paused = self.agent_pane.queue_paused;
+        if self.agent_pane.session.is_none()
+            && self.agent_pane.state == Onboarding::Dormant
+            && self.agent_pane.queue.front().is_some_and(|p| self.story_desk.queued_read_only(p))
+        {
             self.start_agent_session(ctx);
-            self.agent_pane.queue_paused = paused;
         }
     }
 
     fn send_next_agent_prompt(&mut self) {
-        if self.agent_pane.queue.front().is_some_and(|p| self.story_desk.queued_read_only(p))
-            && (!self.story_desk.read_only || self.agent_pane.session_tools != Some(tr_agent_tools::ToolSet::ReadOnly))
-        {
-            return;
-        }
         if self.agent_pane.session.is_none() || self.agent_pane.models.is_empty() {
             return;
         }
-        let Some(prompt) = self.agent_pane.next_prompt() else { return };
-        self.send_agent_prompt(prompt);
+        let Some(prompt) = self.agent_pane.dequeue_prompt() else { return };
+        if self.story_desk.read_only_prompt_id(&prompt.id) {
+            self.send_story_analysis(prompt);
+        } else if let Some(prompt) = self.agent_pane.start_prompt(prompt) {
+            self.send_agent_prompt(prompt);
+        }
+    }
+
+    fn send_story_analysis(&mut self, prompt: agent_pane::Prompt) {
+        let model = self
+            .agent_pane
+            .models
+            .iter()
+            .find(|m| m.id == *self.agent_pane.settings.model(self.agent_pane.backend))
+            .map_or_else(|| self.agent_pane.settings.model(self.agent_pane.backend).clone(), |m| m.model.clone());
+        self.story_prompt_started(&prompt, &model);
+        self.agent_pane.running = true;
+        // No start_prompt: preserve turns, replies, last_prompt and workflow context.
+        self.agent_command(Command::Analysis {
+            id: prompt.id,
+            input: TurnInput {
+                model,
+                effort: self.agent_pane.settings.effort.clone(),
+                text: prompt.text,
+                ..Default::default()
+            },
+        });
     }
 
     fn send_agent_prompt(&mut self, prompt: agent_pane::Prompt) {
+        if self.story_desk.read_only_prompt_id(&prompt.id) {
+            self.send_story_analysis(prompt);
+            return;
+        }
         // Without a valid pin, pin the chart the user last focused (else the visible chart) so
         // the turn's chart and later Pinned lookups agree; the header shows the pin.
         let pinned_valid = self
@@ -1270,23 +1264,6 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn story_policy_waits_during_startup_and_restores_cancelled_analysis_once_ready() {
-        use tr_agent_tools::ToolSet::{ReadOnly, Workflows};
-        // A queued analysis cannot replace either listener or starting session.
-        assert!(!story_policy_change(false, false, Some(Workflows), true, false, Workflows));
-        assert!(story_policy_change(false, true, Some(Workflows), true, false, Workflows));
-        // Cancel while the read-only session is starting; defer restoration.
-        assert!(!story_policy_change(false, false, Some(ReadOnly), false, true, Workflows));
-        assert!(story_policy_change(false, true, Some(ReadOnly), false, true, Workflows));
-        // Also repair a mismatched session when the policy flag was cleared.
-        assert!(story_policy_change(false, true, Some(ReadOnly), false, false, Workflows));
-        // The restart records the ordinary inventory; no second restart/notice.
-        assert!(!story_policy_change(false, false, Some(Workflows), false, false, Workflows));
-        assert!(!story_policy_change(false, true, Some(Workflows), false, false, Workflows));
-        assert!(!story_policy_change(true, true, Some(ReadOnly), false, true, Workflows));
-    }
 
     fn workflow(app: &mut TerminalApp, turn: &str, name: &str, value: serde_json::Value) -> tr_agent_tools::ToolResult {
         use tr_agent_tools::args::*;

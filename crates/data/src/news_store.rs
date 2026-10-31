@@ -119,6 +119,29 @@ fn story_body_hash(url: &str) -> String {
     Sha1::digest(url.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+impl StoryAnalysis {
+    /// Versioned JSON in the existing column; no database migration or v1 rewrite.
+    /// Keep the original reply for prose fallback and validation on load.
+    pub fn v2(story_id: String, model: String, created_at: i64, reply: String, input: serde_json::Value) -> Self {
+        Self {
+            story_id,
+            model,
+            created_at,
+            json: serde_json::json!({"schema":2,"input":input,"reply":reply}).to_string(),
+        }
+    }
+    pub fn v2_payload(&self) -> Option<(String, serde_json::Value)> {
+        let value: serde_json::Value = serde_json::from_str(&self.json).ok()?;
+        if value.get("schema")?.as_u64()? != 2 {
+            return None;
+        }
+        Some((value.get("reply")?.as_str()?.to_owned(), value.get("input")?.clone()))
+    }
+    pub fn reply(&self) -> String {
+        self.v2_payload().map_or_else(|| self.json.clone(), |(reply, _)| reply)
+    }
+}
+
 /// Local, deterministic related selection. Prefer shared tickers; use event/category
 /// only if no ticker-related stories exist, never the selected cluster itself.
 pub fn related_stories(

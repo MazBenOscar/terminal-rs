@@ -47,6 +47,11 @@ pub struct ToolCall {
 }
 
 pub trait ToolExecutor: Send + Sync + 'static {
+    /// Host per-turn policy runs before inventory/argument validation, so a
+    /// disabled turn also refuses tools absent from its immutable inventory.
+    fn tool_denial(&self, _turn: String) -> BridgeFuture<'_, Option<ToolResult>> {
+        Box::pin(async { None })
+    }
     fn execute(&self, registry: Arc<Registry>, call: ToolCall) -> BridgeFuture<'_, ToolResult>;
     fn cancel(&self, _turn: &str) {}
 }
@@ -439,9 +444,6 @@ impl Dispatch {
                 turn.direct_calls += 1;
             }
             let arguments = params["arguments"].to_string();
-            if let Err(result) = self.registry.validate_call(name, &arguments) {
-                return failure(&reason(&result));
-            }
             ToolCall {
                 turn: turn.key.clone(),
                 pin: turn.pin.clone(),
@@ -453,7 +455,15 @@ impl Dispatch {
         let key = call.turn.clone();
         let timeout = if call.name == "run_scan" { self.run_scan_timeout } else { self.timeout };
         let this = self.clone();
-        let task = tokio::spawn(async move { this.executor.execute(this.registry.clone(), call).await });
+        let task = tokio::spawn(async move {
+            if let Some(result) = this.executor.tool_denial(call.turn.clone()).await {
+                return result;
+            }
+            if let Err(result) = this.registry.validate_call(&call.name, &call.arguments) {
+                return result;
+            }
+            this.executor.execute(this.registry.clone(), call).await
+        });
         let abort = AbortExecution(task.abort_handle());
         let result = tokio::time::timeout(timeout, task).await;
         drop(abort);
@@ -1295,6 +1305,40 @@ mod tests {
         bridge.send(turn()).await.unwrap();
         assert!(matches!(finish(&mut bridge).await, BridgeEvent::Completed { calls: 3, .. }));
         assert!(connector.replies.lock().unwrap().iter().all(|reply| reply["success"] == true));
+    }
+
+    #[tokio::test]
+    async fn host_turn_denial_precedes_dynamic_tool_inventory_and_argument_validation() {
+        struct Denied;
+        impl ToolExecutor for Denied {
+            fn tool_denial(&self, _: String) -> BridgeFuture<'_, Option<ToolResult>> {
+                Box::pin(async {
+                    Some(ToolResult::error("tools_disabled", "Tools are disabled for story analysis", None))
+                })
+            }
+            fn execute(&self, _: Arc<Registry>, _: ToolCall) -> BridgeFuture<'_, ToolResult> {
+                panic!("a denied tool must never execute")
+            }
+        }
+        let calls = vec![
+            call("list_watchlists", json!({})),
+            call("create_watchlist", json!({"name":"Denied"})),
+            call("read_chart", json!({"invalid":true})),
+            call("unknown_tool", json!({})),
+        ];
+        let connector = FakeConnector::new(vec![(Script::Calls(calls), false)]);
+        let mut bridge = bridge(connector.clone(), Arc::new(Denied)).await;
+        let mut input = turn();
+        input.requires_tools = false;
+        bridge.send(input).await.unwrap();
+        let _ = finish(&mut bridge).await;
+        let replies = connector.replies.lock().unwrap();
+        assert_eq!(replies.len(), 4);
+        assert!(
+            replies.iter().all(|reply| reply["success"] == false
+                && reply.to_string().contains("Tools are disabled for story analysis")),
+            "{replies:?}"
+        );
     }
 
     #[tokio::test]

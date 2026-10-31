@@ -1,5 +1,38 @@
 # External agents (MCP) and mimo (ACP)
 
+## Story analysis isolation
+
+Story **Analyze** shares the Agent's FIFO scheduler, not its conversation. It
+waits for the ordinary backend session to exist and become Ready, and runs only
+while that conversation is idle. Serialisation avoids concurrent use of the
+backends' active-session/model state. A dormant backend starts through the same
+Agent startup/canary path; a healthy process is not restarted or rechecked for
+each analysis.
+
+Each request creates a fresh ephemeral session on that verified process:
+mimo uses `session/new` with `mcpServers: []`; Codex uses `thread/start` with
+`ephemeral: true`, an empty dynamic-tool inventory and minimal instructions.
+Neither ordinary history, chart context nor pending workflow results accompanies
+it. The owner restores the main session identity afterward. Only the Story pane
+receives/caches the reply; Agent conversation turns and prompt/reply blocks are
+unchanged (a single muted host notice may record that analysis ran separately).
+
+An analysis session is retired on every exit, including dropped/cancelled futures.
+Late text is dropped. Any active or retired analysis-session tool traffic trips
+the protocol safety boundary before execution. The external MCP connection has
+no trustworthy per-session attribution, so **all** external calls are denied while
+analysis is active. Denial survives an interrupt request until a confirmed end;
+connection budgets are consumed before denial notices and repeated refusals queue
+no additional notice jobs for that connection turn.
+
+The reply budget is 90 seconds (including isolated-session startup). Story errors
+explicitly distinguish tool attempts, empty replies, cancellation, timeout and
+readiness failure. For an unconfirmed cancellation/timeout or startup failure,
+the owner conservatively stops the backend process rather than release the MCP
+denial while a model might still be running. Restart in the Agent pane before
+retrying in that case; no prompt is automatically replayed. Tool violations stop
+unsafe backends through the existing isolation tripwire.
+
 ## Enable access deliberately
 
 The normal app defaults to **Codex**, with both external-access switches **off**.

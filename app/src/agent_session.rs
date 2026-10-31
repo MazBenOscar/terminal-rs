@@ -22,6 +22,7 @@ pub enum Command {
     RefreshLimits,
     SelectModel(String),
     Turn(Box<BridgeTurn>),
+    Analysis { id: crate::agent_pane::PromptId, input: tr_agent::TurnInput },
     WorkflowResults(Vec<tr_agent::codex::WorkflowResult>),
     Interrupt,
 }
@@ -32,6 +33,8 @@ pub enum Event {
     Models(Vec<Model>),
     Limits(serde_json::Value),
     Bridge(BridgeEvent),
+    Analysis { id: crate::agent_pane::PromptId, result: std::result::Result<String, tr_agent::AnalysisError> },
+    AnalysisStarting { id: crate::agent_pane::PromptId, starting: bool },
     Notice(String),
 }
 struct Inbox {
@@ -153,6 +156,29 @@ impl Drop for Session {
     }
 }
 impl Session {
+    /// Command-only fixture: never creates a runtime, process, or private home.
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, mpsc::UnboundedReceiver<Command>) {
+        let (sender, receive) = mpsc::unbounded_channel();
+        let (shutdown, _) = watch::channel(());
+        let (_, finished) = std::sync::mpsc::channel();
+        (
+            Self {
+                sender: Some(sender),
+                inbox: Arc::new(Inbox {
+                    events: Mutex::new(Vec::new()),
+                    visible: AtomicBool::new(true),
+                    ctx: egui::Context::default(),
+                    last_text_wake: Mutex::new(None),
+                }),
+                shutdown,
+                finished,
+                owner: None,
+            },
+            receive,
+        )
+    }
+
     pub fn start(
         ctx: egui::Context,
         executor: AppExecutor,
@@ -453,6 +479,7 @@ async fn owner_acp(
         let mut calls = 0;
         let mut interrupted = false;
         let mut workflow_results = Vec::new();
+        let mut deferred = std::collections::VecDeque::new();
         loop {
             tokio::select! {
                 event = events.recv() => {
@@ -479,7 +506,33 @@ async fn owner_acp(
                         if let Some(event) = project(event) { inbox.push(Event::Bridge(event)); }
                     }
                 }
-                command = receive.recv() => match command {
+                command = queued_command(&mut receive, &mut deferred) => match command {
+                    Some(Command::Analysis { id, input }) => {
+                        let run = async {
+                            let mut readiness = client.analysis_readiness();
+                            let analysis = client.analyze(input);
+                            tokio::pin!(analysis);
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    result = &mut analysis => break result,
+                                    _ = readiness.changed() => inbox.push(Event::AnalysisStarting {
+                                        id: id.clone(), starting: !*readiness.borrow_and_update(),
+                                    }),
+                                }
+                            }
+                        };
+                        let (result, _) = isolated_analysis(run, client.interrupt_analysis(), &mut receive, &mut deferred).await;
+                        // The dedicated child is stopped on every unconfirmed
+                        // ending (including a dropped analyze future). The main
+                        // backend and its subscriptions remain untouched.
+                        inbox.push(Event::Analysis { id, result });
+                        if client.is_unsafe() {
+                            client.shutdown();
+                            dropped_analysis_actions(inbox, &mut deferred);
+                            bail!("Main backend stopped for safety");
+                        }
+                    }
                     Some(Command::Turn(mut turn)) => {
                         workflow_results.append(&mut turn.input.workflow_results);
                         turn.input.workflow_results = workflow_results.clone();
@@ -511,9 +564,12 @@ async fn owner_acp(
     // Leave Checking immediately, even while bounded child cleanup is still running.
     report_acp_failure(inbox, &result, client.is_unsafe());
     client.shutdown();
-    tokio::time::timeout(Duration::from_secs(10), client.wait_cleanup())
+    let cleanup = tokio::time::timeout(Duration::from_secs(10), client.wait_cleanup())
         .await
-        .context("mimo cleanup timed out; restart the app")??;
+        .context("mimo cleanup timed out; restart the app")
+        .and_then(|result| result);
+    let result = cleanup.and(result);
+    report_acp_failure(inbox, &result, client.is_unsafe());
     classify(result, client.is_unsafe())
 }
 
@@ -585,6 +641,76 @@ async fn deliver_workflow_results(
     }
 }
 
+async fn queued_command(
+    receive: &mut mpsc::UnboundedReceiver<Command>,
+    deferred: &mut std::collections::VecDeque<Command>,
+) -> Option<Command> {
+    if let Some(command) = deferred.pop_front() { Some(command) } else { receive.recv().await }
+}
+
+/// The same FIFO owns both kinds of work. Non-interrupt commands arriving
+/// during analysis are deferred, not lost or steered into the isolated thread.
+async fn isolated_analysis(
+    run: impl std::future::Future<Output = std::result::Result<String, tr_agent::AnalysisError>>,
+    cancel: impl std::future::Future<Output = ()>,
+    receive: &mut mpsc::UnboundedReceiver<Command>,
+    deferred: &mut std::collections::VecDeque<Command>,
+) -> (std::result::Result<String, tr_agent::AnalysisError>, bool) {
+    use tr_agent::AnalysisError;
+    tokio::pin!(run);
+    tokio::pin!(cancel);
+    let mut cancelling = false;
+    let mut cancel_sent = false;
+    let mut receive_open = true;
+    let deadline = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut run => {
+                let confirmed = !matches!(result, Err(AnalysisError::TimedOut | AnalysisError::StartTimedOut | AnalysisError::NotReady | AnalysisError::NoAnswerTooLong));
+                let result = if cancelling && matches!(result, Ok(_) | Err(AnalysisError::NoAnswer)) {
+                    Err(AnalysisError::Cancelled)
+                } else { result };
+                return (result, confirmed);
+            },
+            () = &mut cancel, if cancelling && !cancel_sent => cancel_sent = true,
+            () = &mut deadline, if cancelling => return (Err(AnalysisError::Cancelled), false),
+            command = receive.recv(), if receive_open => match command {
+                Some(Command::Interrupt) | None => {
+                    if command.is_none() { receive_open = false; }
+                    if !cancelling {
+                        cancelling = true;
+                        deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(3));
+                    }
+                },
+                Some(command) => deferred.push_back(command),
+            }
+        }
+    }
+}
+
+fn dropped_analysis_actions(inbox: &Inbox, deferred: &mut std::collections::VecDeque<Command>) {
+    if deferred.is_empty() {
+        return;
+    }
+    let actions = deferred
+        .drain(..)
+        .map(|command| match command {
+            Command::Turn(_) => "prompt",
+            Command::Analysis { .. } => "story analysis",
+            Command::WorkflowResults(_) => "workflow outcomes",
+            Command::SelectModel(_) => "model selection",
+            Command::RefreshLimits => "limits refresh",
+            _ => "agent action",
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    inbox.push(Event::Notice(format!(
+        "Backend stopped for safety; deferred actions dropped: {actions}. Nothing was replayed."
+    )));
+}
+
 async fn run_bridge(
     receive: &mut mpsc::UnboundedReceiver<Command>,
     inbox: &Inbox,
@@ -601,13 +727,24 @@ async fn run_bridge(
     // The owner serializes steers and turn starts. Only failed/no-active-turn
     // deliveries carry over; a successful steer is never repeated next turn.
     let mut undelivered = Vec::new();
+    let mut deferred = std::collections::VecDeque::new();
     loop {
         tokio::select! {
             event = bridge.next_event() => {
                 let event = event?;
                 if let Some(event) = project(event) { inbox.push(Event::Bridge(event)); }
             }
-            command = receive.recv() => match command {
+            command = queued_command(receive, &mut deferred) => match command {
+                Some(Command::Analysis { id, input }) => {
+                    let (result, confirmed) = isolated_analysis(bridge.client().analyze(input), bridge.client().interrupt_analysis(), receive, &mut deferred).await;
+                    if !confirmed || bridge.is_unsafe() {
+                        bridge.shutdown();
+                        dropped_analysis_actions(inbox, &mut deferred);
+                        inbox.push(Event::Analysis { id, result });
+                        bail!("Analysis session retired; backend stopped for safety");
+                    }
+                    inbox.push(Event::Analysis { id, result });
+                }
                 Some(Command::Turn(mut turn)) => {
                     undelivered.append(&mut turn.input.workflow_results);
                     turn.input.workflow_results = undelivered.clone();
@@ -699,6 +836,90 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tr_agent::transport::{Transport, WireEvent};
+
+    #[tokio::test(start_paused = true)]
+    async fn isolated_owner_defers_workflow_and_model_commands_and_cancels_without_replay() {
+        let (send, mut receive) = mpsc::unbounded_channel();
+        send.send(Command::WorkflowResults(vec![tr_agent::codex::WorkflowResult::Undo {
+            turn: "main".into(),
+            reverted: 1,
+            kept: vec![],
+        }]))
+        .unwrap();
+        send.send(Command::SelectModel("next-model".into())).unwrap();
+        send.send(Command::Interrupt).unwrap();
+        let mut deferred = std::collections::VecDeque::new();
+        let result = isolated_analysis(std::future::pending(), async {}, &mut receive, &mut deferred).await;
+        assert_eq!(result, (Err(tr_agent::AnalysisError::Cancelled), false));
+        assert!(matches!(deferred.pop_front(), Some(Command::WorkflowResults(results)) if results.len() == 1));
+        assert!(matches!(deferred.pop_front(), Some(Command::SelectModel(model)) if model == "next-model"));
+        assert!(deferred.is_empty());
+        assert!(receive.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn confirmed_analysis_end_replays_deferred_actions_before_new_commands() {
+        for outcome in [
+            Ok("answer".into()),
+            Err(tr_agent::AnalysisError::Cancelled),
+            Err(tr_agent::AnalysisError::NoAnswer),
+            Err(tr_agent::AnalysisError::ToolAttempt),
+        ] {
+            let (send, mut receive) = mpsc::unbounded_channel();
+            send.send(Command::WorkflowResults(vec![])).unwrap();
+            send.send(Command::SelectModel("deferred".into())).unwrap();
+            send.send(Command::Interrupt).unwrap();
+            let (end, ended) = tokio::sync::oneshot::channel();
+            let mut deferred = std::collections::VecDeque::new();
+            let expected = outcome.clone();
+            let (result, confirmed) = isolated_analysis(
+                async { ended.await.unwrap() },
+                async {
+                    end.send(outcome).unwrap();
+                },
+                &mut receive,
+                &mut deferred,
+            )
+            .await;
+            assert!(confirmed, "a confirmed cancellation or refused tool never stops main");
+            assert_eq!(
+                result,
+                if matches!(expected, Ok(_) | Err(tr_agent::AnalysisError::NoAnswer)) {
+                    Err(tr_agent::AnalysisError::Cancelled)
+                } else {
+                    expected
+                }
+            );
+            send.send(Command::RefreshLimits).unwrap();
+            assert!(matches!(queued_command(&mut receive, &mut deferred).await, Some(Command::WorkflowResults(_))));
+            assert!(
+                matches!(queued_command(&mut receive, &mut deferred).await, Some(Command::SelectModel(model)) if model == "deferred")
+            );
+            assert!(matches!(queued_command(&mut receive, &mut deferred).await, Some(Command::RefreshLimits)));
+            assert!(deferred.is_empty());
+        }
+    }
+
+    #[test]
+    fn stopped_analysis_reports_which_deferred_actions_were_dropped() {
+        let inbox = Inbox {
+            events: Mutex::new(Vec::new()),
+            visible: AtomicBool::new(false),
+            ctx: egui::Context::default(),
+            last_text_wake: Mutex::new(None),
+        };
+        let mut deferred = std::collections::VecDeque::from([
+            Command::WorkflowResults(vec![]),
+            Command::SelectModel("sensitive-model-value".into()),
+            Command::RefreshLimits,
+        ]);
+        dropped_analysis_actions(&inbox, &mut deferred);
+        assert!(deferred.is_empty());
+        let posted = inbox.events.lock().unwrap();
+        assert!(
+            matches!(&posted[..], [Event::Notice(text)] if text.contains("workflow outcomes, model selection, limits refresh") && text.contains("Nothing was replayed") && !text.contains("sensitive-model-value"))
+        );
+    }
 
     #[tokio::test]
     async fn mimo_echo_and_segmented_stream_render_one_prompt_and_two_replies() {
@@ -1256,8 +1477,10 @@ mod tests {
                         .unwrap()["result"]
                         .clone(),
                     "account/read" => json!({"account":{"type":"chatgpt"}}),
-                    "thread/start" => json!({"thread":{"id":"thread"}}),
-                    "turn/start" => json!({"turn":{"id":"turn"}}),
+                    // Match the replay's redacted identities: tool authorization
+                    // now requires the explicitly registered main thread/turn.
+                    "thread/start" => json!({"thread":{"id":"[REDACTED]"}}),
+                    "turn/start" => json!({"turn":{"id":"[REDACTED]"}}),
                     _ => continue,
                 };
                 write.write_all(format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes()).await.unwrap();

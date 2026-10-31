@@ -41,9 +41,41 @@ fn loading_timeout(mut view: Value) -> ToolResult {
 }
 static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) const STORY_TOOLS_DISABLED: &str = "Tools are disabled for story analysis";
+
+/// Defence in depth shared with both executors, in addition to protocol-level
+/// session isolation. Unattributable external calls fail closed while analysis
+/// is active. Only confirmed completion/retirement releases the active denial;
+/// canonical attributed ids remain denied for late traffic.
+#[derive(Default)]
+pub(crate) struct StoryToolPolicy {
+    pub active: bool,
+    blocked_turns: std::collections::HashSet<String>,
+    pub(crate) noticed_turns: std::collections::HashSet<String>,
+}
+impl StoryToolPolicy {
+    pub fn begin(&mut self, analysis: bool) {
+        // Starting an ordinary prompt is not proof the analysis ended.
+        self.active |= analysis;
+        if !self.active {
+            self.blocked_turns.retain(|turn| !turn.starts_with("external-"));
+        }
+    }
+    pub fn remember(&mut self, turn: &str) {
+        self.blocked_turns.insert(turn.into());
+    }
+    pub fn denies(&mut self, turn: &str) -> bool {
+        if self.active {
+            self.remember(turn);
+        }
+        self.active || self.blocked_turns.contains(turn)
+    }
+}
+
 #[derive(Clone)]
 pub struct AppExecutor {
     queue: AgentToolQueue,
+    story_tools: Arc<Mutex<StoryToolPolicy>>,
     worker: mpsc::UnboundedSender<Request>,
     edits: Arc<Mutex<tr_agent_tools::edits::Session>>,
     expected: Arc<Mutex<HashMap<String, (String, String)>>>,
@@ -610,6 +642,41 @@ impl TerminalApp {
     }
 }
 impl AppExecutor {
+    /// Check before registry validation/execution, including the MCP-only tool.
+    /// The notice is host-owned, not part of the folded tool transcript.
+    pub(crate) async fn story_tool_error(&self, turn: &str) -> Option<ToolResult> {
+        {
+            let mut policy = self.story_tools.lock().unwrap();
+            if !policy.denies(turn) {
+                return None;
+            }
+            // Reserve before queuing a UI job. Repeated denials never enqueue
+            // work, including while the first notice is waiting on the UI.
+            if !policy.noticed_turns.insert(turn.into()) {
+                return Some(ToolResult::error("tools_disabled", STORY_TOOLS_DISABLED, None));
+            }
+        }
+        let host = ScopedHost {
+            app: self.clone(),
+            call: ToolCall {
+                turn: turn.into(),
+                pin: ChartPin { uid: 0, symbol: String::new(), timeframe: String::new(), visible_range: None },
+                name: String::new(),
+                arguments: String::new(),
+                confirmed: false,
+            },
+        };
+        // Even if the turn ends before this UI job runs, the captured refusal
+        // must not turn into an allowed call.
+        let _ = host
+            .job(ChartTarget::Application, |app| {
+                app.agent_pane.notice(STORY_TOOLS_DISABLED);
+                AgentReply { success: true, value: Value::Null }
+            })
+            .await;
+        Some(ToolResult::error("tools_disabled", STORY_TOOLS_DISABLED, None))
+    }
+
     pub async fn external_outcomes(&self, turn: &str, proposal_id: Option<u64>) -> ToolResult {
         let prefix = format!("{}:", turn.split(':').next().unwrap_or(turn));
         let host = ScopedHost {
@@ -648,6 +715,7 @@ impl AppExecutor {
     pub fn new(app: &TerminalApp) -> Self {
         Self {
             queue: app.agent_queue.clone(),
+            story_tools: app.agent_pane.story_tools.clone(),
             worker: app.worker.sender(),
             edits: Default::default(),
             expected: Default::default(),
@@ -678,8 +746,15 @@ impl AppExecutor {
     }
 }
 impl ToolExecutor for AppExecutor {
+    fn tool_denial(&self, turn: String) -> BridgeFuture<'_, Option<ToolResult>> {
+        Box::pin(async move { self.story_tool_error(&turn).await })
+    }
+
     fn execute(&self, registry: Arc<Registry>, call: ToolCall) -> BridgeFuture<'_, ToolResult> {
         Box::pin(async move {
+            if let Some(error) = self.story_tool_error(&call.turn).await {
+                return error;
+            }
             let host = ScopedHost { app: self.clone(), call };
             let mut budget = CallBudget::new(1);
             let mut ctx = CallContext::new(&host, &host, &mut budget);
@@ -747,7 +822,15 @@ impl ScopedHost {
                     .strip_prefix("external-")
                     .filter(|_| !tr_agent::mcp::is_mimo_turn(&self.call.turn))
                     .map(|id| format!("external-{}", id.split(':').next().unwrap_or(id)));
+                let policy = self.app.story_tools.clone();
+                let turn = self.call.turn.clone();
+                let is_tool = !self.call.name.is_empty();
                 move |app| {
+                    // Recheck queued UI work at execution, not just acceptance.
+                    if is_tool && policy.lock().unwrap().denies(&turn) {
+                        app.agent_pane.notice(STORY_TOOLS_DISABLED);
+                        return AgentReply { success: false, value: json!({"error":STORY_TOOLS_DISABLED}) };
+                    }
                     if let Some(connection) = connection {
                         app.agent_pane.external_notice(&connection, Instant::now());
                     }
@@ -1342,6 +1425,7 @@ mod tests {
         ScopedHost {
             app: AppExecutor {
                 queue,
+                story_tools: Default::default(),
                 worker,
                 edits: Default::default(),
                 expected: Default::default(),
@@ -1665,6 +1749,34 @@ mod tests {
         assert_eq!(result["unavailable"], 0);
     }
     // End A5b-SCAN bridge tests.
+
+    #[test]
+    fn story_analysis_rechecks_tool_work_already_queued_on_ui() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/story-tool-queue");
+        let mut app = TerminalApp::test_workspace(&root);
+        let executor = AppExecutor::new(&app);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut result = executor.execute(
+                Arc::new(Registry::new(tr_agent_tools::ToolSet::Workflows)),
+                ToolCall {
+                    turn: "external-mimo-queued:0".into(),
+                    pin: ChartPin { uid: 0, symbol: String::new(), timeframe: String::new(), visible_range: None },
+                    name: "create_watchlist".into(),
+                    arguments: r#"{"name":"Must not be proposed"}"#.into(),
+                    confirmed: false,
+                },
+            );
+            assert!(futures::poll!(result.as_mut()).is_pending());
+            app.agent_pane.set_story_turn(true);
+            app.process_logic();
+            let result = result.await;
+            assert!(!result.success);
+            assert!(format!("{:?}", result.content).contains(STORY_TOOLS_DISABLED));
+            assert!(app.agent_pane.workflows.proposals.is_empty());
+            assert!(app.agent_pane.blocks.iter().any(|block| matches!(block,
+                crate::agent_pane::RenderedBlock::Notice(text) if text == STORY_TOOLS_DISABLED)));
+        });
+    }
 
     #[test]
     fn workflow_reads_and_confirmed_calls_work_without_a_chart_but_never_auto_apply() {

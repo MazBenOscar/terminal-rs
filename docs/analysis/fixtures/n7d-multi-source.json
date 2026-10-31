@@ -1,0 +1,16 @@
+{
+  "input":{"input":"multi_source","summaries":2,"publishers":["Synthetic Wire","Imaginary Desk"],"authors":[],"tickers":[]},
+  "note":{
+    "verdict":{"direction":"bullish","asset":"CRUDE","horizon":"hours","conviction":7},
+    "invalidation":"the port authority reopens the loading channel",
+    "sentiment":0.58,"sentiment_subject":"CRUDE","intensity":0.86,"confidence":0.88,
+    "urgency":"breaking","outlook":"moderate positive",
+    "summary":"A fictional export terminal suspends loading after a channel obstruction. Supply uncertainty supports crude while authorities assess access.",
+    "hashtags":["Port Access"],
+    "key_points":["The harbour authority schedules an inspection before deciding whether to resume traffic.","A second publisher reports tankers waiting outside the terminal."],
+    "risks":[{"category":"Operational","level":"critical","note":"The obstruction prevents loading and leaves restart timing unresolved."},{"category":"Market","level":"medium","note":"A rapid reopening could reverse the supply-risk premium."}],
+    "not_addressed":["Regulatory","Geopolitical"],
+    "topics":["Crude Supply","Port Access"],
+    "entities":[{"type":"ORG","name":"Fictional Harbour Authority","descriptor":"Port Administration"},{"type":"LOC","name":"Example Channel"}]
+  }
+}

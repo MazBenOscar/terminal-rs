@@ -51,6 +51,25 @@ async fn send<W: AsyncWrite + Unpin>(write: &mut W, value: Value) {
     write.write_all(format!("{value}\n").as_bytes()).await.unwrap();
 }
 
+/// Exercise result validation on authorized traffic, not on an earlier identity denial.
+async fn register_tool_turn(
+    client: &Transport,
+    read: &mut BufReader<ReadHalf<DuplexStream>>,
+    write: &mut WriteHalf<DuplexStream>,
+) {
+    for (method, params, result) in [
+        ("thread/start", json!({}), json!({"thread":{"id":"t"}})),
+        ("turn/start", json!({"threadId":"t"}), json!({"turn":{"id":"u"}})),
+    ] {
+        let server = async {
+            let request = receive(read).await;
+            send(write, json!({"id":request["id"],"result":result})).await;
+        };
+        let (result, ()) = tokio::join!(client.request(method, params), server);
+        result.unwrap();
+    }
+}
+
 async fn settle() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
@@ -77,7 +96,16 @@ async fn item_type_casing_missing_and_malformed_items_trip() {
     ] {
         let (client, mut read, mut write, killed) = fake(no_tools());
         send(&mut write, json!({"method":"item/started","params":params})).await;
-        assert_eq!(receive(&mut read).await["method"], "turn/interrupt", "{params}");
+        if params["turnId"].is_string() {
+            assert_eq!(receive(&mut read).await["method"], "turn/interrupt", "{params}");
+        } else {
+            // Missing identity still stops the backend, but must not produce a null interrupt.
+            let mut line = String::new();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), read.read_line(&mut line)).await.unwrap().unwrap(),
+                0
+            );
+        }
         settle().await;
         assert!(client.is_unsafe() && killed.load(Ordering::SeqCst), "{params}");
     }
@@ -174,7 +202,9 @@ async fn unknown_server_requests_get_error_reply_and_do_not_hang() {
         let reply = receive(&mut read).await;
         assert_eq!(reply["id"], index);
         assert_eq!(reply["error"]["code"], -32601);
-        assert_eq!(receive(&mut read).await["method"], "turn/interrupt");
+        // No turn is active, so the trip kills the backend without a null interrupt.
+        let mut line = String::new();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), read.read_line(&mut line)).await.unwrap().unwrap(), 0);
         settle().await;
         // A0-FIX requires default-deny, not continued usability. Auth-token
         // refresh belongs to external-token auth, not our managed OAuth login.
@@ -274,8 +304,13 @@ async fn shutdown_and_drop_kill_and_fail_pending() {
 
 #[tokio::test]
 async fn tool_reply_keyed_by_request_id_not_call_id_and_bad_shapes_fail() {
-    let (_client, mut read, mut write, _) = fake(tool(json!({"success":true,"contentItems":[{"type":"inputAudio"}]})));
-    send(&mut write, json!({"id":{"weird":1},"method":"item/tool/call","params":{"callId":"c1"}})).await;
+    let (client, mut read, mut write, _) = fake(tool(json!({"success":true,"contentItems":[{"type":"inputAudio"}]})));
+    register_tool_turn(&client, &mut read, &mut write).await;
+    send(
+        &mut write,
+        json!({"id":{"weird":1},"method":"item/tool/call","params":{"threadId":"t","turnId":"u","callId":"c1"}}),
+    )
+    .await;
     let reply = receive(&mut read).await;
     assert_eq!(reply["id"], json!({"weird":1}));
     assert_eq!(reply["result"]["success"], false);
@@ -284,8 +319,10 @@ async fn tool_reply_keyed_by_request_id_not_call_id_and_bad_shapes_fail() {
 #[tokio::test]
 async fn panicking_tool_handler_replies_failure() {
     let handler: ToolHandler = Arc::new(|_| Box::pin(async { panic!("handler bug") }));
-    let (_client, mut read, mut write, _) = fake(handler);
-    send(&mut write, json!({"id":11,"method":"item/tool/call","params":{"callId":"c"}})).await;
+    let (client, mut read, mut write, _) = fake(handler);
+    register_tool_turn(&client, &mut read, &mut write).await;
+    send(&mut write, json!({"id":11,"method":"item/tool/call","params":{"threadId":"t","turnId":"u","callId":"c"}}))
+        .await;
     let reply = receive(&mut read).await;
     assert_eq!(reply["id"], 11);
     assert_eq!(reply["result"]["success"], false);
@@ -294,9 +331,11 @@ async fn panicking_tool_handler_replies_failure() {
 #[tokio::test]
 async fn tool_image_must_be_data_url() {
     for url in ["https://attacker.example/x.png?leak=1", "file:///etc/passwd", "data:text/html;base64,PGh0bWw+"] {
-        let (_client, mut read, mut write, _) =
+        let (client, mut read, mut write, _) =
             fake(tool(json!({"success":true,"contentItems":[{"type":"inputImage","imageUrl":url}]})));
-        send(&mut write, json!({"id":1,"method":"item/tool/call","params":{}})).await;
+        register_tool_turn(&client, &mut read, &mut write).await;
+        send(&mut write, json!({"id":1,"method":"item/tool/call","params":{"threadId":"t","turnId":"u","callId":"c"}}))
+            .await;
         assert_eq!(receive(&mut read).await["result"]["success"], false, "{url} accepted");
     }
 }
@@ -305,9 +344,11 @@ async fn tool_image_must_be_data_url() {
 async fn realistic_chart_png_is_deliverable() {
     // A modest 40 KB PNG, base64-encoded.
     let url = format!("data:image/png;base64,{}", "A".repeat(54_000));
-    let (_client, mut read, mut write, _) =
+    let (client, mut read, mut write, _) =
         fake(tool(json!({"success":true,"contentItems":[{"type":"inputImage","imageUrl":url}]})));
-    send(&mut write, json!({"id":1,"method":"item/tool/call","params":{}})).await;
+    register_tool_turn(&client, &mut read, &mut write).await;
+    send(&mut write, json!({"id":1,"method":"item/tool/call","params":{"threadId":"t","turnId":"u","callId":"c"}}))
+        .await;
     assert_eq!(receive(&mut read).await["result"]["success"], true);
 }
 
