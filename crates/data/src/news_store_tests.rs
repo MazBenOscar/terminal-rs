@@ -40,6 +40,17 @@ fn n7_analysis_cache_migrates_old_database_preserves_news_and_round_trips() {
     let store = NewsStore::open(&path).unwrap();
     assert_eq!(store.story_analysis(&["lead".into()]).unwrap(), Some(lead));
     assert_eq!(store.story_analysis(&["old".into()]).unwrap(), Some(member));
+    assert!(store.story_analysis(&["lead".into()]).unwrap().unwrap().v2_payload().is_none());
+    let input = serde_json::json!({"input":"multi_source","summaries":2,"publishers":["A","B"],"authors":[]});
+    for reply in ["{\"verdict\":{\"direction\":\"none\"}}", "Prose fallback\n\n preserved"] {
+        let v2 = StoryAnalysis::v2("v2".into(), "fixture-v2".into(), now, reply.into(), input.clone());
+        store.save_story_analysis(&v2).unwrap();
+        let loaded = store.story_analysis(&["v2".into()]).unwrap().unwrap();
+        assert_eq!(loaded, v2);
+        assert_eq!(loaded.reply(), reply);
+        assert_eq!(loaded.v2_payload(), Some((reply.to_owned(), input.clone())));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&loaded.json).unwrap()["schema"], 2);
+    }
     drop(store);
     std::fs::remove_file(path).unwrap();
 }

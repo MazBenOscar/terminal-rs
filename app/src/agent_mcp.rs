@@ -157,6 +157,11 @@ impl ExternalServer {
                             "Per-turn tool budget exhausted; external connection turns last 60 seconds",
                         ));
                     }
+                    // Budget is consumed before any denial notice can queue.
+                    // The shared policy emits at most one notice per connection turn.
+                    if let Some(error) = state.executor.story_tool_error(&state.turn).await {
+                        return Ok(tr_agent::mcp::tool_result(error));
+                    }
                     if name == "read_proposal_outcomes" {
                         #[derive(Deserialize)]
                         #[serde(deny_unknown_fields)]
