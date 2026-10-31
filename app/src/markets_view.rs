@@ -26,7 +26,7 @@ pub const QUOTE_STRIP_KEYS: [(&str, &str); 6] = [
     ("BTCUSD Curncy", "BTCUSD"),
 ];
 
-/// One shared 20-second gate: Wei already includes every strip key.
+/// Select one poll universe: Wei includes every strip key. The caller tracks when each universe is due.
 pub fn overview_poll_keys(strip: bool, wei_visible: bool, due: bool) -> Option<Vec<String>> {
     if !due {
         None

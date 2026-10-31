@@ -1007,7 +1007,10 @@ pub struct TerminalApp {
     io_path: String,
 
     curves: Option<Box<YieldCurves>>,
+    /// Last full overview poll; strip-only polls must not delay a newly visible Wei pane.
     last_wei: Option<Instant>,
+    /// Last poll covering the strip (including full overview polls).
+    last_strip_poll: Option<Instant>,
     last_curve: Option<Instant>,
     wei_updated: Option<String>,
     /// Latest network search results and the query they answer.
@@ -1064,6 +1067,8 @@ pub struct TerminalApp {
     watch_sort: Option<(usize, bool)>,
     watch_drag: Option<watchlist_drag::WatchDrag>,
     quotes: HashMap<String, Quote>,
+    /// Wall-clock receipt time per cached key; Quote::ts may instead be a session/bar timestamp.
+    quote_received: HashMap<String, i64>,
     quotes_revision: u64,
     quote_strip: chrome::QuoteStrip,
     last_quotes: Option<Instant>,
@@ -1263,6 +1268,7 @@ impl TerminalApp {
             io_path: String::new(),
             curves: None,
             last_wei: None,
+            last_strip_poll: None,
             last_curve: None,
             wei_updated: None,
             symbol_search: None,
@@ -1310,6 +1316,7 @@ impl TerminalApp {
             watch_sort: None,
             watch_drag: None,
             quotes: HashMap::new(),
+            quote_received: HashMap::new(),
             quotes_revision: 0,
             quote_strip: Default::default(),
             last_quotes: None,
@@ -2064,10 +2071,7 @@ impl TerminalApp {
             }
             Function::Help => self.open_panel(PaneKind::Help),
             Function::Agent => self.open_panel(PaneKind::Agent(crate::agent_pane::Settings::default())),
-            Function::Wei => {
-                self.last_wei = None;
-                self.open_panel(PaneKind::Wei);
-            }
+            Function::Wei => self.open_panel(PaneKind::Wei),
             Function::Curve => {
                 self.worker.send(Request::YieldCurves);
                 self.last_curve = Some(Instant::now());
@@ -2461,9 +2465,12 @@ impl TerminalApp {
                         self.wei_updated = Some(format!("updated {}", chrono::Local::now().format("%H:%M:%S")));
                     }
                     let keys: Vec<String> = q.iter().map(|x| x.symbol.clone()).collect();
+                    let received_at = chrono::Utc::now().timestamp();
                     for x in q {
+                        self.quote_received.insert(x.symbol.clone(), received_at);
                         self.quotes.insert(x.symbol.clone(), x);
                     }
+                    self.quote_received.retain(|key, _| self.quotes.contains_key(key));
                     self.demo_on_quotes(&keys);
                 }
                 Response::Latest(t) => self.latest = t,
@@ -3124,13 +3131,19 @@ impl TerminalApp {
             self.worker.send(Request::Quotes(self.watchlist.clone()));
             self.last_quotes = Some(Instant::now());
         }
+        let wei_visible = shown(&|k| matches!(k, PaneKind::Wei));
+        let last_poll = if wei_visible { self.last_wei } else { self.last_strip_poll };
         if let Some(keys) = markets_view::overview_poll_keys(
             self.prefs.quote_strip,
-            shown(&|k| matches!(k, PaneKind::Wei)),
-            self.last_wei.is_none_or(|t| t.elapsed() > Duration::from_secs(20)),
+            wei_visible,
+            last_poll.is_none_or(|t| t.elapsed() > Duration::from_secs(20)),
         ) {
             self.worker.send(Request::Quotes(keys));
-            self.last_wei = Some(Instant::now());
+            let now = Instant::now();
+            self.last_strip_poll = Some(now);
+            if wei_visible {
+                self.last_wei = Some(now);
+            }
         }
         if shown(&|k| matches!(k, PaneKind::Curve))
             && self.last_curve.is_none_or(|t| t.elapsed() > Duration::from_secs(600))
@@ -3694,6 +3707,7 @@ impl TerminalApp {
             io_path: String::new(),
             curves: None,
             last_wei: None,
+            last_strip_poll: None,
             last_curve: None,
             wei_updated: None,
             symbol_search: None,
@@ -3741,6 +3755,7 @@ impl TerminalApp {
             watch_sort: None,
             watch_drag: None,
             quotes: HashMap::new(),
+            quote_received: HashMap::new(),
             quotes_revision: 0,
             quote_strip: Default::default(),
             last_quotes: None,
