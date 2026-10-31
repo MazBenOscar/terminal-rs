@@ -2416,6 +2416,33 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn research_dashboard_analyze_uses_its_linked_agent_then_most_recent_fallback() {
+        let (mut app, root) = fixture("dash-a1-research-analysis");
+        app.open_dashboard("RESEARCH");
+        let story_pane = app.panes.iter().find(|p| matches!(p.kind, PaneKind::Story { .. })).unwrap().id;
+        let preset_agent = app.panes.iter().find(|p| matches!(p.kind, PaneKind::Agent(_))).unwrap().id;
+        let other = app.new_pane(PaneKind::Agent(Default::default()));
+        app.dock_pane(other, Some(preset_agent), crate::dock::Zone::Right);
+        app.set_link(other, Some(Link::Blue));
+        app.focus = other;
+        app.note_story_focus();
+        let count = app.panes.len();
+        app.analyze_story(story_pane, &cluster("Research linked"));
+        assert_eq!(app.agent_pane_owner, Some(preset_agent), "the preset's link beats a more recent Agent");
+        assert_eq!(app.panes.len(), count, "Analyze must reuse the existing Agent");
+        assert!(app.dock.visible().contains(&preset_agent));
+        assert!(app.dock.visible().contains(&story_pane));
+        app.set_link(preset_agent, None);
+        app.analyze_story(story_pane, &cluster("Research recent fallback"));
+        assert_eq!(app.agent_pane_owner, Some(other), "without a matching link, use the most recent Agent");
+        assert_eq!(app.panes.len(), count);
+        assert_eq!(app.agent_pane.queue.len(), 2);
+        assert!(app.agent_pane.queue.iter().all(|prompt| app.story_desk.queued_read_only(prompt)));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn analyze_selects_linked_agent_and_removed_queue_is_retryable() {
         let (mut app, root) = fixture("queue");
         let story_pane = app.new_pane(PaneKind::Story { link_follow: true });

@@ -22,6 +22,7 @@ const VISIBLE_ROWS: usize = 10;
 /// line's own hint), extra search words, and the action whose shortcut is shown.
 const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("PORT", "", "portfolio prtu brokerage holdings value", Some(Action::Portfolio)),
+    ("DASH", "Pick a dashboard preset", "dashboard preset workspace desk brief", None),
     ("ACCT", "", "accounts balances brokerage", None),
     ("POS", "", "positions holdings brokerage", Some(Action::Positions)),
     ("ORD", "", "orders blotter brokerage", Some(Action::Orders)),
@@ -38,7 +39,6 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("SCAN", "Watchlist scanner", "easyscan screener conditions filter", None),
     ("N", "", "news headlines", None),
     ("STORY", "Story inspector", "news selected headline", None),
-    ("DASH NEWS", "News desk", "dashboard workspace", None),
     ("OB", "", "order book depth dom", None),
     ("WEI", "", "world equity indices markets", None),
     ("GC", "", "yield curve treasury rates", None),
@@ -197,6 +197,10 @@ pub(super) fn static_items() -> Vec<Item> {
         Item::new(Kind::Action, "Headline tape", "Toggle the bottom news strip", Target::HeadlineTape)
             .keywords("news ticker scroll headlines"),
     );
+    v.push(
+        Item::new(Kind::Action, "Quote strip", "Toggle cross-asset quotes and watchlist breadth", Target::QuoteStrip)
+            .keywords("morning brief vix rates dollar gold oil bitcoin breadth"),
+    );
     for &(a, words) in ACTIONS {
         v.push(Item::new(Kind::Action, a.label(), a.category(), Target::Hotkey(a)).keywords(words).hotkey(a));
     }
@@ -208,7 +212,7 @@ pub(super) fn static_items() -> Vec<Item> {
                 dashboard.description,
                 Target::Run(format!("DASH {}", dashboard.id)),
             )
-            .keywords("dashboard new workspace"),
+            .keywords(format!("dashboard new workspace DASH {} {}", dashboard.id, dashboard.name)),
         );
     }
     for l in Layout::ALL {
@@ -379,6 +383,7 @@ impl TerminalApp {
     fn run_palette_target(&mut self, t: Target) {
         match t {
             Target::HeadlineTape => self.toggle_headline_tape(),
+            Target::QuoteStrip => self.toggle_quote_strip(),
             Target::Run(line) => self.execute(&line),
             Target::Hotkey(a) => self.run_hotkey(a),
             Target::Settings(label) => {
@@ -674,6 +679,30 @@ mod tests {
         let pos = items.iter().find(|i| i.title == "POS").unwrap();
         assert_eq!(pos.hotkey, Some(Action::Positions));
         assert!(pos.subtitle.contains("positions"), "{}", pos.subtitle);
+    }
+
+    #[test]
+    fn every_dashboard_is_described_and_searchable_by_dash_id_and_name() {
+        let items = static_items();
+        let dashboards: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == Kind::Layout && matches!(&i.target, Target::Run(line) if line.starts_with("DASH ")))
+            .collect();
+        assert_eq!(dashboards.len(), crate::dashboards::ALL.len());
+        for (item, dashboard) in dashboards.iter().zip(crate::dashboards::ALL) {
+            assert_eq!(item.title, dashboard.name);
+            assert_eq!(item.subtitle, dashboard.description);
+            assert!(item.keywords.contains(dashboard.id));
+            assert!(item.keywords.contains(dashboard.name));
+            let target = Target::Run(format!("DASH {}", dashboard.id));
+            for query in [format!("DASH {}", dashboard.id), dashboard.name.to_string()] {
+                assert!(
+                    rank(&items, &[], &query).iter().any(|i| i.kind == Kind::Layout && i.target == target),
+                    "{} missing from {query:?}",
+                    dashboard.id
+                );
+            }
+        }
     }
 
     #[test]

@@ -141,6 +141,7 @@ impl SettingsTab {
 
 pub enum SettingsCmd {
     Layout(LayoutOp),
+    Dashboard(&'static str),
     SavePrefs,
 }
 
@@ -234,6 +235,7 @@ impl TerminalApp {
         for c in cmds {
             match c {
                 SettingsCmd::Layout(op) => self.layout_op(op),
+                SettingsCmd::Dashboard(id) => self.open_dashboard(id),
                 SettingsCmd::SavePrefs => self.save_prefs(),
             }
         }
@@ -843,6 +845,22 @@ impl TerminalApp {
             }
             if ui.button("Open Layouts Folder").clicked() {
                 cmds.push(SettingsCmd::Layout(LayoutOp::OpenFolder));
+            }
+        });
+        section(ui, "Dashboards");
+        ui.label(
+            RichText::new("Each opens as a new saved workspace; your current layout is saved first.")
+                .font(ui_font(11.5))
+                .color(muted()),
+        );
+        egui::Grid::new("dashboards").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
+            for dashboard in crate::dashboards::ALL {
+                ui.label(RichText::new(dashboard.name).font(ui_font(12.5)).color(text()));
+                ui.label(RichText::new(dashboard.description).font(ui_font(11.5)).color(muted()));
+                if ui.small_button("Open").clicked() {
+                    cmds.push(SettingsCmd::Dashboard(dashboard.id));
+                }
+                ui.end_row();
             }
         });
         section(ui, "Import / export");
