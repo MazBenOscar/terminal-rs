@@ -45,6 +45,29 @@ where
     (label, time.format("%a %b %d %Y %H:%M (UTC%:z)").to_string())
 }
 
+/// Story headers retain the date and an explicit age beyond twelve hours.
+/// Unlike a feed row, an inferred timestamp must never look like a real time.
+pub(crate) fn story_time(ts: i64, now: i64, inferred: bool) -> (String, String) {
+    story_time_in(ts, now, inferred, &chrono::Local)
+}
+fn story_time_in<Tz: TimeZone>(ts: i64, now: i64, inferred: bool, tz: &Tz) -> (String, String)
+where
+    Tz::Offset: std::fmt::Display,
+{
+    if inferred {
+        return ("time unknown".into(), "time unknown".into());
+    }
+    let (label, hover) = feed_time_in(ts, now, false, tz);
+    let age = now.saturating_sub(ts);
+    if age <= 12 * 3600 {
+        return (label, hover);
+    }
+    let Some(time) = DateTime::from_timestamp(ts, 0) else { return (label, hover) };
+    let time = time.with_timezone(tz);
+    let age = if age >= 86400 { format!("{}d", age / 86400) } else { format!("{}h", age / 3600) };
+    (format!("{} · {age} old", time.format("%b %d")), hover)
+}
+
 /// Feed controls are vector-drawn, density-scaled and input-driven (no animation timer).
 pub(crate) fn icon_button(ui: &mut egui::Ui, icon: crate::widgets::Icon, label: &str) -> egui::Response {
     let (rect, response) =
@@ -147,6 +170,16 @@ mod tests {
     // 2026-10-27 13:00 UTC = 09:00 EDT.
     const NOW: i64 = 1_793_106_000;
 
+    #[test]
+    fn story_header_age_and_hover_use_real_time_only() {
+        for (hours, expected) in [(1, "12:00"), (12, "01:00"), (13, "Oct 27 · 13h old"), (120, "Oct 22 · 5d old")] {
+            let (label, hover) = story_time_in(NOW - hours * 3600, NOW, false, &chrono::Utc);
+            assert_eq!(label, expected);
+            assert!(hover.contains("2026"));
+            assert!(hover.contains("UTC+00:00"));
+        }
+        assert_eq!(story_time_in(NOW, NOW, true, &chrono::Utc), ("time unknown".into(), "time unknown".into()));
+    }
     #[test]
     fn labels_follow_age_then_local_day_then_year() {
         let edt = FixedOffset::west_opt(4 * 3600).unwrap();

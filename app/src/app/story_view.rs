@@ -492,15 +492,7 @@ impl TerminalApp {
             ui.spacing_mut().item_spacing = egui::vec2(dp(6.0), dp(3.0));
             ui.add(egui::Label::new(RichText::new(&story.lead.item.title).font(ui_font(16.0)).strong()).wrap());
             ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {}",
-                        story.lead.source,
-                        crate::feed_time::feed_time(story.newest, now, false).0
-                    ))
-                    .font(mono(10.5))
-                    .color(theme::muted()),
-                );
+                story_header_time(ui, &story, now);
                 if let Some((priority, event, _)) = story.classification() {
                     ui.label(
                         RichText::new(format!("{} · {}", event.label(), priority.label())).font(mono(10.5)).color(
@@ -805,6 +797,11 @@ fn analysis_section(ui: &mut Ui, title: &str, r: &theme::AnalysisRoles) {
     ));
     ui.add_space(dp(4.0));
 }
+fn story_header_time(ui: &mut Ui, story: &Cluster, now: i64) -> egui::Response {
+    let (label, hover) = crate::feed_time::story_time(story.lead.item.ts, now, story.lead.inferred_ts);
+    ui.label(RichText::new(format!("{} · {label}", story.lead.source)).font(mono(10.5)).color(theme::muted()))
+        .on_hover_text(hover)
+}
 fn analysis_badge(ui: &mut Ui, urgency: Urgency, r: &theme::AnalysisRoles) {
     let (ink, fill, stroke) = match urgency {
         Urgency::Low => (r.secondary, egui::Color32::TRANSPARENT, egui::Stroke::NONE),
@@ -883,6 +880,9 @@ fn analysis_inspector(ui: &mut Ui, a: &Analysis, r: &theme::AnalysisRoles) -> Ve
             dp(0.0),
             egui::TextFormat::simple(ui_font(12.0), r.secondary),
         );
+        if let Some(tag) = a.subject_kind.and_then(analysis_v2::SubjectKind::tag) {
+            job.append(&format!("  {tag}"), dp(0.0), egui::TextFormat::simple(mono(10.5), r.secondary));
+        }
         ui.add(egui::Label::new(job).wrap());
     }));
     rows.push(inspector_row(ui, "Intensity", r, |ui| {
@@ -891,7 +891,14 @@ fn analysis_inspector(ui: &mut Ui, a: &Analysis, r: &theme::AnalysisRoles) -> Ve
     rows.push(inspector_row(ui, "Confidence", r, |ui| {
         ui.label(RichText::new(format!("{:.0}%", a.confidence * 100.0)).font(mono(12.0)).color(r.secondary));
     }));
-    rows.push(inspector_row(ui, "Urgency", r, |ui| analysis_badge(ui, a.urgency, r)));
+    rows.push(inspector_row(ui, "Urgency", r, |ui| {
+        ui.horizontal(|ui| {
+            analysis_badge(ui, a.urgency, r);
+            if a.urgency_capped {
+                ui.label(RichText::new("aged").font(mono(10.5)).color(r.secondary));
+            }
+        });
+    }));
     rows.push(inspector_row(ui, "Outlook", r, |ui| {
         ui.add(egui::Label::new(RichText::new(&a.outlook).font(ui_font(13.0)).color(r.text)).wrap());
     }));
@@ -1502,9 +1509,22 @@ mod tests {
                 "Write about the news and its market consequence only",
                 "say less and lower confidence instead of explaining why",
                 "Key points must be facts from the story, not observations about it",
+                "The condition to watch belongs ONLY in invalidation",
+                "event + important number + mechanism only",
+                "summary contains no watch/confirm condition",
+                "breaking/critical only if age_hours <= 6",
+                "high only if age_hours <= 24",
+                "older stories at most medium unless supplied facts describe a still-developing event",
+                "If age unknown, do not use breaking",
+                "Outlook is exactly one of \"strong upside\",\"moderate upside\",\"mild upside\",\"mild downside\",\"moderate downside\",\"strong downside\",\"two-sided\",\"no signal\"",
+                "If the subject company is not publicly listed",
+                "most exposed listed peer set as sentiment_subject",
+                "Set \"private\" only when no sector anchor fits",
+                "\"subject_kind\":\"listed|private|sector|macro\"",
             ] {
                 assert!(prompt.text.contains(rule), "missing rule: {rule}");
             }
+            assert!(!prompt.text.contains("then condition to watch"));
             assert!(!prompt.text.contains("https://"));
             assert_eq!(prompt.text.matches("<STORY_DATA>").count(), 1);
             assert_eq!(prompt.text.matches("</STORY_DATA>").count(), 1);
@@ -1520,6 +1540,160 @@ mod tests {
         // Two deliveries from the same publisher are not multi-source evidence.
         story.members[1].source = story.members[0].source.clone();
         assert_eq!(Input::from_story(&story).input, Basis::Standfirst);
+    }
+
+    #[test]
+    fn prompt_has_iso_times_injected_now_and_newest_real_member_age() {
+        const NOW: i64 = 1_793_106_000;
+        let mut story = cluster("A story");
+        story.lead.item.ts = NOW - 5 * 86400;
+        story.members[0] = story.lead.clone();
+        let mut newest = story.lead.clone();
+        newest.item.ts = NOW - 3600;
+        story.members.push(newest.clone());
+        newest.item.ts = NOW;
+        newest.inferred_ts = true;
+        story.members.push(newest);
+        let data = |story: &Cluster| {
+            let p = analysis_v2::prompt_at(story, NOW);
+            serde_json::from_str::<serde_json::Value>(
+                p.text.split("<STORY_DATA>\n").nth(1).unwrap().split("\n</STORY_DATA>").next().unwrap(),
+            )
+            .unwrap()
+        };
+        let value = data(&story);
+        assert_eq!(value["analyzed_at"], "2026-10-27T13:00:00Z");
+        assert_eq!(value["age_hours"], 1.0);
+        assert_eq!(value["members"][0]["published"], "2026-10-22T13:00:00Z");
+        assert_eq!(value["members"][1]["published"], "2026-10-27T12:00:00Z");
+        assert_eq!(value["members"][2]["published"], "unknown");
+        story.lead.inferred_ts = true;
+        for member in &mut story.members {
+            member.inferred_ts = true;
+        }
+        let value = data(&story);
+        assert!(value["age_hours"].is_null());
+        assert!(value["members"].as_array().unwrap().iter().all(|m| m["published"] == "unknown"));
+        story.lead.summary = "The incident remains ongoing.".into();
+        assert!(Input::from_story(&story).still_developing);
+        story.lead.summary = "A completed incident.".into();
+        assert!(!Input::from_story(&story).still_developing);
+    }
+    #[test]
+    fn headless_analysis_keeps_watch_in_its_slot_and_renders_deduped_points_and_canonical_outlook() {
+        let (input, json) = analysis_v2::sample(2);
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let summary = "An AI startup accessed Anthropic employee details and internal messages.";
+        let duplicate = "An AI startup gained access to Anthropic employee details and internal messages.";
+        let distinct = "The regulator schedules a hearing for November.";
+        let invalidation = "The company completes its announced access review.";
+        value["summary"] = summary.into();
+        value["invalidation"] = invalidation.into();
+        value["key_points"] = serde_json::json!([duplicate, distinct]);
+        value["outlook"] = "  MODERATE   POSITIVE ".into();
+        let a = analysis_v2::parse(&value.to_string(), &input).unwrap();
+        assert_eq!(a.invalidation, invalidation);
+        assert_eq!(a.summary, summary);
+        assert_eq!(a.key_points, [distinct]);
+        let ctx = egui::Context::default();
+        let r = theme::analysis_roles(&theme::palette());
+        for width in [320.0, 600.0] {
+            let mut out = ctx.run_ui(raw_size(dp(width)), |ui| {
+                show_analysis(ui, &a, &r);
+            });
+            out.textures_delta.clear();
+            let mut text = vec![];
+            for shape in &out.shapes {
+                text_shapes(&shape.shape, &mut text);
+            }
+            for expected in [summary, invalidation, distinct, "moderate upside"] {
+                assert_eq!(text.iter().filter(|s| s.galley.text().contains(expected)).count(), 1, "{expected}");
+            }
+            assert!(!text.iter().any(|s| s.galley.text().contains(duplicate)));
+            let watch = text.iter().find(|s| s.galley.text() == invalidation).unwrap();
+            let summary_shape = text.iter().find(|s| s.galley.text() == summary).unwrap();
+            assert!(watch.pos.y < summary_shape.pos.y, "invalidation retains its own slot before the summary");
+        }
+    }
+    #[test]
+    fn headless_header_uses_lead_date_age_and_muted_mono_not_cluster_newest() {
+        const NOW: i64 = 1_793_106_000;
+        let ctx = egui::Context::default();
+        let mut story = cluster("Header story");
+        story.newest = NOW;
+        for (hours, inferred) in [(1, false), (13, false), (120, false), (1, true)] {
+            story.lead.item.ts = NOW - hours * 3600;
+            story.lead.inferred_ts = inferred;
+            let expected = crate::feed_time::story_time(story.lead.item.ts, NOW, inferred).0;
+            let mut out = ctx.run_ui(raw_size(dp(600.0)), |ui| {
+                story_header_time(ui, &story, NOW);
+            });
+            let mut text = vec![];
+            for shape in &out.shapes {
+                text_shapes(&shape.shape, &mut text);
+            }
+            let shape = text.iter().find(|s| s.galley.text() == format!("Fixture · {expected}")).unwrap();
+            for section in &shape.galley.job.sections {
+                assert_eq!(section.format.font_id, mono(10.5));
+                assert_eq!(section.format.color, theme::muted());
+            }
+            if hours > 12 && !inferred {
+                assert!(shape.galley.text().contains(" old"));
+            }
+            if inferred {
+                assert!(shape.galley.text().contains("time unknown"));
+            }
+            out.textures_delta.clear();
+        }
+    }
+    #[test]
+    fn headless_inspector_subject_tags_and_aged_note_are_small_muted_and_adjacent() {
+        use analysis_v2::SubjectKind;
+        let (mut input, json) = analysis_v2::sample(2);
+        input.published_ts = Some(1_793_106_000 - 5 * 86400);
+        let mut a = analysis_v2::parse_at(&json, &input, 1_793_106_000).unwrap();
+        a.sentiment_subject = "AI software".into();
+        let ctx = egui::Context::default();
+        let r = theme::analysis_roles(&theme::palette());
+        for (kind, tag) in [
+            (None, None),
+            (Some(SubjectKind::Listed), None),
+            (Some(SubjectKind::Private), Some("private")),
+            (Some(SubjectKind::Sector), Some("sector")),
+            (Some(SubjectKind::Macro), Some("macro")),
+        ] {
+            a.subject_kind = kind;
+            for capped in [false, true] {
+                a.urgency_capped = capped;
+                let mut out = ctx.run_ui(raw_size(dp(600.0)), |ui| {
+                    analysis_inspector(ui, &a, &r);
+                });
+                let mut text = vec![];
+                for shape in &out.shapes {
+                    text_shapes(&shape.shape, &mut text);
+                }
+                out.textures_delta.clear();
+                let sentiment = text.iter().find(|s| s.galley.text().contains("AI software")).unwrap();
+                let expected =
+                    format!("{:+.2}  AI software{}", a.sentiment, tag.map(|t| format!("  {t}")).unwrap_or_default());
+                assert_eq!(sentiment.galley.text(), expected);
+                if tag.is_some() {
+                    let format = &sentiment.galley.job.sections.last().unwrap().format;
+                    assert_eq!(format.font_id, mono(10.5));
+                    assert_eq!(format.color, r.secondary);
+                }
+                let aged = text.iter().find(|s| s.galley.text() == "aged");
+                assert_eq!(aged.is_some(), capped);
+                if let Some(aged) = aged {
+                    let badge = text.iter().find(|s| s.galley.text() == a.urgency.label()).unwrap();
+                    assert!(aged.pos.x > badge.pos.x);
+                    assert!((aged.pos.y - badge.pos.y).abs() < dp(5.0));
+                    assert_eq!(aged.galley.job.sections[0].format.color, r.secondary);
+                    assert_eq!(aged.galley.job.sections[0].format.font_id, mono(10.5));
+                }
+                out.textures_delta.clear();
+            }
+        }
     }
 
     fn rendered_text(shape: &egui::epaint::Shape, text: &mut Vec<(String, egui::Pos2)>) {

@@ -27,6 +27,12 @@ pub(super) struct Input {
     pub authors: Vec<String>,
     #[serde(default)]
     pub tickers: Vec<String>,
+    /// Newest real member time; absent in older schema-2 envelopes.
+    #[serde(default)]
+    pub published_ts: Option<i64>,
+    /// Derived from supplied facts, never from the model's requested urgency.
+    #[serde(default)]
+    pub still_developing: bool,
 }
 impl Input {
     pub fn from_story(story: &Cluster) -> Self {
@@ -67,7 +73,23 @@ impl Input {
             publishers,
             authors: vec![],
             tickers: story.tickers.clone(),
+            published_ts: std::iter::once(&story.lead)
+                .chain(story.members.iter())
+                .filter(|m| !m.inferred_ts && iso_utc(m.item.ts).is_some())
+                .map(|m| m.item.ts)
+                .max(),
+            still_developing: std::iter::once(&story.lead).chain(story.members.iter()).any(|m| {
+                // Conservative, explicit evidence only. A model assertion cannot
+                // bypass the age ceiling. Unmarked events retain the ceiling.
+                let facts = format!("{} {}", m.item.title, m.summary).to_lowercase();
+                ["still developing", "still-developing", "remains ongoing", "is ongoing"]
+                    .iter()
+                    .any(|phrase| facts.contains(phrase))
+            }),
         }
+    }
+    fn age_hours(&self, now: i64) -> Option<f64> {
+        self.published_ts.map(|ts| now.saturating_sub(ts).max(0) as f64 / 3600.0)
     }
     pub fn label(&self) -> String {
         match self.summaries {
@@ -197,12 +219,38 @@ pub(super) struct Entity {
     #[serde(default)]
     pub code: String,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum SubjectKind {
+    Listed,
+    Private,
+    Sector,
+    Macro,
+}
+impl SubjectKind {
+    pub fn tag(self) -> Option<&'static str> {
+        match self {
+            Self::Listed => None,
+            Self::Private => Some("private"),
+            Self::Sector => Some("sector"),
+            Self::Macro => Some("macro"),
+        }
+    }
+}
+fn subject_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<SubjectKind>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).ok())
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct Analysis {
     pub verdict: Verdict,
     pub invalidation: String,
     pub sentiment: f64,
     pub sentiment_subject: String,
+    #[serde(default, deserialize_with = "subject_kind")]
+    pub subject_kind: Option<SubjectKind>,
+    #[serde(default)]
+    pub urgency_capped: bool,
     pub intensity: f64,
     pub confidence: f64,
     pub urgency: Urgency,
@@ -270,6 +318,9 @@ thread_local! {
 /// First complete object only: a malformed first object must not be skipped in
 /// favour of a later object. Strings, escaped quotes and fences are respected.
 pub(super) fn parse(reply: &str, input: &Input) -> Option<Analysis> {
+    parse_at(reply, input, chrono::Utc::now().timestamp())
+}
+pub(super) fn parse_at(reply: &str, input: &Input, now: i64) -> Option<Analysis> {
     #[cfg(test)]
     PARSE_COUNT.with(|n| n.set(n.get() + 1));
     let start = reply.find('{')?;
@@ -295,7 +346,7 @@ pub(super) fn parse(reply: &str, input: &Input) -> Option<Analysis> {
                     }
                     if closers.is_empty() {
                         let a = serde_json::from_str(&reply[start..=start + offset]).ok()?;
-                        return validate(a, input);
+                        return validate(a, input, now);
                     }
                 }
                 _ => {}
@@ -312,11 +363,82 @@ pub(super) fn parse(reply: &str, input: &Input) -> Option<Analysis> {
         return None;
     }
     let repaired: String = tail.chars().chain(closers.into_iter().rev()).collect();
-    let mut a = validate(serde_json::from_str(&repaired).ok()?, input)?;
+    let mut a = validate(serde_json::from_str(&repaired).ok()?, input, now)?;
     a.cut_off = true;
     Some(a)
 }
-fn validate(mut a: Analysis, input: &Input) -> Option<Analysis> {
+fn iso_utc(ts: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(ts, 0).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+fn content_words(s: &str) -> std::collections::HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "with", "from", "that", "this", "those", "these", "are", "was", "were", "has", "have",
+        "had", "its", "their", "they", "into", "will", "would", "could", "should", "not", "but", "about", "after",
+        "before", "been", "being", "than", "then", "also", "which", "who", "why", "how", "can", "may", "might", "our",
+        "out", "over", "under", "through",
+    ];
+    s.split_whitespace()
+        .map(|w| w.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect::<String>())
+        .filter(|w| w.chars().count() >= 3 && !STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+fn dedup_points(summary: &str, points: &mut Vec<String>) {
+    let mut seen: Vec<_> = summary.split(['.', '!', '?']).map(content_words).filter(|s| !s.is_empty()).collect();
+    points.retain(|point| {
+        let words = content_words(point);
+        let repeated = seen.iter().any(|prior| {
+            let size = words.len().min(prior.len());
+            size > 0 && words.intersection(prior).count() as f64 / size as f64 >= 0.6
+        });
+        if !repeated && !words.is_empty() {
+            seen.push(words);
+        }
+        !repeated
+    });
+}
+fn outlook_sign(s: &str) -> i8 {
+    let words: Vec<_> = s.split(|c: char| !c.is_alphabetic()).collect();
+    let up = words.iter().any(|w| matches!(*w, "upside" | "positive" | "bullish" | "strength" | "gains"));
+    let down = words.iter().any(|w| matches!(*w, "downside" | "negative" | "bearish" | "weakness" | "losses"));
+    match (up, down) {
+        (true, false) => 1,
+        (false, true) => -1,
+        _ => 0,
+    }
+}
+fn normalize_outlook(raw: &str, sentiment: f64) -> (String, bool) {
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let sign = outlook_sign(&normalized);
+    let contradicted = (sign > 0 && sentiment < 0.0) || (sign < 0 && sentiment > 0.0);
+    if matches!(
+        normalized.as_str(),
+        "strong upside"
+            | "moderate upside"
+            | "mild upside"
+            | "mild downside"
+            | "moderate downside"
+            | "strong downside"
+            | "two-sided"
+            | "no signal"
+    ) {
+        return (normalized, contradicted);
+    }
+    let magnitude = sentiment.abs();
+    let strength = if magnitude >= 0.6 {
+        "strong"
+    } else if magnitude >= 0.3 {
+        "moderate"
+    } else {
+        "mild"
+    };
+    let outlook = if magnitude <= 0.05 {
+        "no signal".to_owned()
+    } else {
+        format!("{strength} {}", if sentiment > 0.0 { "upside" } else { "downside" })
+    };
+    (outlook, contradicted)
+}
+fn validate(mut a: Analysis, input: &Input, now: i64) -> Option<Analysis> {
     if [a.sentiment, a.intensity, a.confidence, a.verdict.conviction].iter().any(|v| !v.is_finite()) {
         return None;
     }
@@ -335,16 +457,28 @@ fn validate(mut a: Analysis, input: &Input) -> Option<Analysis> {
     a.verdict.conviction = a.verdict.conviction.clamp(1.0, 10.0).round();
     a.verdict.asset = chars(&a.verdict.asset.to_uppercase(), 16);
     a.sentiment_subject = chars(&a.sentiment_subject, 16);
-    a.outlook = chars(&a.outlook, 32);
+    let (outlook, outlook_inconsistent) = normalize_outlook(&a.outlook, a.sentiment);
+    a.outlook = outlook;
+    let original_urgency = a.urgency;
+    // Unknown age cannot establish the <=24h ceiling either. Be conservative.
+    a.urgency = match (input.age_hours(now), a.urgency) {
+        (Some(age), _) if age <= 6.0 => a.urgency,
+        (_, Urgency::Low | Urgency::Medium) => a.urgency,
+        (None, _) => Urgency::Medium,
+        (Some(age), _) if age > 24.0 && !input.still_developing => Urgency::Medium,
+        _ => Urgency::High,
+    };
+    a.urgency_capped = a.urgency != original_urgency;
     if !matches!(a.verdict.horizon.as_str(), "hours" | "days" | "weeks" | "months") {
         a.verdict.horizon.clear();
     }
     a.invalidation = words(&a.invalidation, 20);
     a.summary = words(&a.summary, summary);
-    a.key_points.truncate(points);
     for p in &mut a.key_points {
         *p = words(p, 35);
     }
+    dedup_points(&a.summary, &mut a.key_points);
+    a.key_points.truncate(points);
     a.risks.sort_by_key(|r| r.category);
     a.risks.dedup_by_key(|r| r.category);
     for r in &mut a.risks {
@@ -399,15 +533,23 @@ fn validate(mut a: Analysis, input: &Input) -> Option<Analysis> {
     }
     a.entities.sort_by_key(|e| e.kind);
     a.entities.truncate(entities);
-    a.inconsistent = match a.verdict.direction {
-        Direction::Bullish => a.sentiment < 0.0,
-        Direction::Bearish => a.sentiment > 0.0,
-        Direction::Neutral | Direction::None => a.sentiment.abs() >= 0.15,
-    };
+    let outlook_direction = outlook_sign(&a.outlook);
+    let verdict_outlook_inconsistent =
+        matches!((a.verdict.direction, outlook_direction), (Direction::Bullish, -1) | (Direction::Bearish, 1));
+    a.inconsistent = outlook_inconsistent
+        || verdict_outlook_inconsistent
+        || match a.verdict.direction {
+            Direction::Bullish => a.sentiment < 0.0,
+            Direction::Bearish => a.sentiment > 0.0,
+            Direction::Neutral | Direction::None => a.sentiment.abs() >= 0.15,
+        };
     Some(a)
 }
 
 pub(super) fn prompt(story: &Cluster) -> crate::agent_pane::Prompt {
+    prompt_at(story, chrono::Utc::now().timestamp())
+}
+pub(super) fn prompt_at(story: &Cluster, now: i64) -> crate::agent_pane::Prompt {
     let input = Input::from_story(story);
     let (summary, points, topics, entities, confidence) = input.input.caps();
     let members: Vec<_> = story
@@ -416,11 +558,14 @@ pub(super) fn prompt(story: &Cluster) -> crate::agent_pane::Prompt {
         .map(|m| {
             serde_json::json!({
                 "publisher": m.source, "publishers": m.sources, "headline": m.item.title, "summary": m.summary,
-                "published": m.item.ts
+                "published": if m.inferred_ts { "unknown".to_owned() } else {
+                    iso_utc(m.item.ts).unwrap_or_else(|| "unknown".to_owned())
+                }
             })
         })
         .collect();
     let data = serde_json::json!({"story_id":story.lead.id,"headline":story.lead.item.title,
+        "analyzed_at":iso_utc(now),"age_hours":input.age_hours(now),
         "input":input.input,"publishers":input.publishers,"members":members,"tickers":story.tickers,
         "category":story.lead.category,"event":story.classification().map(|(_,e,_)| e.label())})
     .to_string()
@@ -437,13 +582,13 @@ Only the headline and supplied feed summaries are available, never the article b
 Common knowledge (company function, geography) is allowed; numbers, dates and events are not. If a figure is missing, omit it rather than estimate. Distinguish uncertainty from facts.
 The explicit input basis is {basis}. All counts are MAXIMA, never quotas: summary <= {summary} words (omit for headline_only); key_points <= {points}; combined topics + hashtags <= {topics}; entities <= {entities}; confidence is a fraction in 0..1, capped at {confidence:.2}. Empty beats padded.
 OUTPUT JSON SHAPE
-{{"verdict":{{"direction":"bullish|bearish|neutral|none","asset":"","horizon":"hours|days|weeks|months","conviction":1}},"invalidation":"","sentiment":0.00,"sentiment_subject":"","intensity":0.00,"confidence":0.00,"urgency":"low|medium|high|breaking|critical","outlook":"","summary":"","hashtags":[],"key_points":[],"risks":[{{"category":"Regulatory|Geopolitical|Operational|Market","level":"low|medium|high|critical","note":""}}],"not_addressed":[],"topics":[],"entities":[{{"type":"ORG|PER|LOC","name":"","ticker":"","alias":"","descriptor":"","code":""}}]}}
+{{"verdict":{{"direction":"bullish|bearish|neutral|none","asset":"","horizon":"hours|days|weeks|months","conviction":1}},"invalidation":"","sentiment":0.00,"sentiment_subject":"","subject_kind":"listed|private|sector|macro","intensity":0.00,"confidence":0.00,"urgency":"low|medium|high|breaking|critical","outlook":"","summary":"","hashtags":[],"key_points":[],"risks":[{{"category":"Regulatory|Geopolitical|Operational|Market","level":"low|medium|high|critical","note":""}}],"not_addressed":[],"topics":[],"entities":[{{"type":"ORG|PER|LOC","name":"","ticker":"","alias":"","descriptor":"","code":""}}]}}
 CONTENT RULES
 1. Verdict asset is what the news moves, not just its subject. Direction none means no tradable signal. Conviction 1-10: 8-10 only with fact AND market reaction, 5-7 if one missing, <=4 if mostly interpretation.
-2. Invalidation: one concrete event, release or decision, <=20 words, drawn from supplied facts. Never invent a price trigger. If absent, use an empty string.
-3. Summary: present tense, third person, open with event and important number, then mechanism, then condition to watch. Never restate headline. Omit if headline_only.
-4. Sentiment [-1,+1], two decimals, scores effect on sentiment_subject asset, not writing tone. A tanker disruption can be bullish crude, bearish airlines. 0 only for two-sided/no-signal news. Intensity [0,1] is how much input bears on that market read. Confidence is a fraction subject to the basis cap, not a target.
-5. Urgency: breaking for happening now/accelerating, high for session-moving, medium for developing without immediate impact, low for background/scheduled; critical for top alarm. Outlook: two or three lowercase words, same polarity as sentiment.
+2. Invalidation: one concrete event, release or decision, <=20 words, drawn from supplied facts. The condition to watch belongs ONLY in invalidation. Never invent a price trigger. If absent, use an empty string.
+3. Summary: present tense, third person, event + important number + mechanism only. Never restate headline. Omit if headline_only.
+4. Sentiment [-1,+1], two decimals, scores effect on sentiment_subject asset, not writing tone. A tanker disruption can be bullish crude, bearish airlines. 0 only for two-sided/no-signal news. If the subject company is not publicly listed, score its listed sector or most exposed listed peer set as sentiment_subject (e.g. "AI software") and set subject_kind to "sector". Set "private" only when no sector anchor fits; otherwise subject_kind is "listed" or "macro" as appropriate. Intensity [0,1] is how much input bears on that market read. Confidence is a fraction subject to the basis cap, not a target.
+5. Urgency reflects age_hours: breaking/critical only if age_hours <= 6; high only if age_hours <= 24; older stories at most medium unless supplied facts describe a still-developing event (then at most high). If age unknown, do not use breaking or critical; at most medium because freshness is unproven. Never raise urgency solely for freshness. Low for background/scheduled. Outlook is exactly one of "strong upside","moderate upside","mild upside","mild downside","moderate downside","strong downside","two-sided","no signal", same polarity as sentiment and verdict.
 6. Tags/topics: searchable entities, instruments, policies or themes; no adjectives or slogans; no duplicates. Topics Title Case, 1-4 words, no trailing punctuation. They render as one merged Topics row.
 7. Key points: distinct one-fact sentences ending in a period, <=35 words, figures only where supplied; no minimum length/count. Order benchmark move, instruments, macro backdrop, forward risk where supported.
 8. Risk categories always Regulatory, Geopolitical, Operational, Market in that order, only when supported. Each note <=18 words, specific evidence. Remaining categories in not_addressed. Severity combines centrality and impact: barely touched cannot be high. Market high for benchmark move >=2% or commodity >=5%, only if supplied.
@@ -451,7 +596,7 @@ CONTENT RULES
 10. ONE FACT, ONE PLACE: every number, name and claim once. Risk can characterise but not repeat figures from summary/bullets. Preserve supplied precision. No invented winners/losers, tickers, price levels, dates, events or historical percentiles/comparisons.
 11. Terse terminal register, at most one qualifier per sentence, no chains like could potentially remain, no emoji or exclamation marks. Character maxima: verdict.asset and sentiment_subject 16; outlook and each topic 32; entity name/alias/descriptor 60; code 8.
 12. Never describe the input, the feed, the data supplied, or attached tickers. Write about the news and its market consequence only. When information is thin, say less and lower confidence instead of explaining why. Key points must be facts from the story, not observations about it. No meta-commentary such as "The feed supplies no operating mechanism" or "NVDA US Equity is the only ticker attached to the story".
-SELF-CHECK silently: verdict agrees with sentiment and outlook; invalidation concrete or absent; sentiment names asset; no repetition or invented facts; caps respected; risks <=18 words with omissions once; no publisher/author entities. Output only JSON.
+SELF-CHECK silently: verdict agrees with sentiment and outlook; invalidation concrete or absent; summary contains no watch/confirm condition; sentiment names asset; no repetition or invented facts; caps respected; risks <=18 words with omissions once; no publisher/author entities. Output only JSON.
 <STORY_DATA>
 {data}
 </STORY_DATA>"#,
@@ -603,6 +748,7 @@ mod tests {
             assert_eq!(a.not_addressed, [Category::Regulatory, Category::Geopolitical]);
         }
         v["sentiment"] = 0.126.into();
+        v["outlook"] = "mild upside".into();
         v["intensity"] = (-2).into();
         for invalid in [-1.0, 100.01] {
             v["confidence"] = invalid.into();
@@ -649,7 +795,7 @@ mod tests {
         let a = parse(&v.to_string(), &input).unwrap();
         assert_eq!(a.verdict.asset.chars().count(), 16);
         assert_eq!(a.sentiment_subject.chars().count(), 16);
-        assert_eq!(a.outlook.chars().count(), 32);
+        assert_eq!(a.outlook, "moderate upside");
         assert_eq!(a.topics[0].chars().count(), 32);
         assert_eq!(a.entities.len(), 1);
         let e = &a.entities[0];
@@ -664,6 +810,7 @@ mod tests {
     fn neutral_and_no_signal_allow_small_sentiment() {
         let (input, json) = sample(1);
         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["outlook"] = "two-sided".into();
         for direction in ["neutral", "none"] {
             v["verdict"]["direction"] = direction.into();
             for (sentiment, inconsistent) in [(0.0, false), (0.14, false), (-0.14, false), (0.15, true), (-0.15, true)]
@@ -671,6 +818,133 @@ mod tests {
                 v["sentiment"] = sentiment.into();
                 assert_eq!(parse(&v.to_string(), &input).unwrap().inconsistent, inconsistent);
             }
+        }
+    }
+    #[test]
+    fn urgency_age_ceilings_never_raise_and_old_envelopes_default_safely() {
+        const NOW: i64 = 1_793_106_000;
+        let (mut input, json) = sample(2);
+        assert_eq!(input.published_ts, None);
+        assert!(!input.still_developing);
+        let old = parse_at(&json, &input, NOW).unwrap();
+        assert_eq!(old.subject_kind, None);
+        assert!(old.urgency_capped);
+        assert_eq!(old.urgency, Urgency::Medium);
+        let decoded: Analysis = serde_json::from_str(&json).unwrap();
+        assert!(!decoded.urgency_capped);
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for (hours, requested, expected, capped) in [
+            (1, "breaking", Urgency::Breaking, false),
+            (6, "critical", Urgency::Critical, false),
+            (7, "critical", Urgency::High, true),
+            (13, "breaking", Urgency::High, true),
+            (24, "high", Urgency::High, false),
+            (25, "high", Urgency::Medium, true),
+            (120, "critical", Urgency::Medium, true),
+            (120, "low", Urgency::Low, false),
+            (1, "medium", Urgency::Medium, false),
+        ] {
+            input.published_ts = Some(NOW - hours * 3600);
+            v["urgency"] = requested.into();
+            // Do not trust a model-supplied flag.
+            v["urgency_capped"] = (!capped).into();
+            let a = parse_at(&v.to_string(), &input, NOW).unwrap();
+            assert_eq!((a.urgency, a.urgency_capped), (expected, capped), "{hours} {requested}");
+        }
+        input.published_ts = None;
+        for requested in ["high", "breaking", "critical"] {
+            v["urgency"] = requested.into();
+            let a = parse_at(&v.to_string(), &input, NOW).unwrap();
+            assert_eq!(a.urgency, Urgency::Medium);
+            assert!(a.urgency_capped);
+        }
+        input.published_ts = Some(NOW - 120 * 3600);
+        input.still_developing = true;
+        v["urgency"] = "breaking".into();
+        assert_eq!(parse_at(&v.to_string(), &input, NOW).unwrap().urgency, Urgency::High);
+    }
+    #[test]
+    fn repeated_content_is_dropped_against_each_summary_sentence_and_prior_point() {
+        let (input, json) = sample(2);
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["summary"] =
+            "Investigators opened a probe. An AI startup accessed Anthropic employee details and internal messages."
+                .into();
+        let distinct = "The regulator schedules a hearing for November.";
+        v["key_points"] = serde_json::json!([
+            "An AI startup gained access to Anthropic employee details and internal messages.",
+            distinct,
+            "THE REGULATOR schedules a hearing for November!"
+        ]);
+        assert_eq!(parse(&v.to_string(), &input).unwrap().key_points, [distinct]);
+        let mut points = vec!["Red green blue yellow white.".into(), "Red green blue black orange.".into()];
+        dedup_points("", &mut points);
+        assert_eq!(points.len(), 1, "overlap exactly 0.6 is dropped");
+        assert!(content_words("An AI, the AND a to is of").is_empty());
+    }
+    #[test]
+    fn outlook_vocabulary_normalization_mapping_and_contradictions() {
+        for value in [
+            "strong upside",
+            "moderate upside",
+            "mild upside",
+            "mild downside",
+            "moderate downside",
+            "strong downside",
+            "two-sided",
+            "no signal",
+        ] {
+            let sentiment = if value.contains("downside") { -0.4 } else { 0.4 };
+            assert_eq!(
+                normalize_outlook(&format!("  {}  ", value.to_uppercase().replace(' ', "  \n")), sentiment),
+                (value.to_owned(), false)
+            );
+        }
+        for (score, expected) in [
+            (0.6, "strong upside"),
+            (0.3, "moderate upside"),
+            (0.06, "mild upside"),
+            (0.05, "no signal"),
+            (0.0, "no signal"),
+            (-0.05, "no signal"),
+            (-0.06, "mild downside"),
+            (-0.3, "moderate downside"),
+            (-0.6, "strong downside"),
+        ] {
+            assert_eq!(normalize_outlook("unrecognized words", score), (expected.into(), false));
+        }
+        let (input, json) = sample(2);
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["sentiment"] = 0.4.into();
+        for (raw, expected, inconsistent) in [
+            ("moderate positive", "moderate upside", false),
+            ("near-term weakness", "moderate upside", true),
+            ("mild downside", "mild downside", true),
+            ("unrecognized", "moderate upside", false),
+        ] {
+            v["outlook"] = raw.into();
+            let a = parse(&v.to_string(), &input).unwrap();
+            assert_eq!((a.outlook.as_str(), a.inconsistent), (expected, inconsistent));
+        }
+        v["sentiment"] = 0.0.into();
+        v["outlook"] = "mild downside".into();
+        assert!(parse(&v.to_string(), &input).unwrap().inconsistent, "outlook must agree with bullish verdict");
+    }
+    #[test]
+    fn subject_kind_is_optional_and_unknown_values_are_missing() {
+        let (input, json) = sample(2);
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for (raw, expected) in [
+            (serde_json::json!("listed"), Some(SubjectKind::Listed)),
+            (serde_json::json!("private"), Some(SubjectKind::Private)),
+            (serde_json::json!("sector"), Some(SubjectKind::Sector)),
+            (serde_json::json!("macro"), Some(SubjectKind::Macro)),
+            (serde_json::json!("unknown"), None),
+            (serde_json::Value::Null, None),
+            (serde_json::json!(42), None),
+        ] {
+            v["subject_kind"] = raw;
+            assert_eq!(parse(&v.to_string(), &input).unwrap().subject_kind, expected);
         }
     }
     #[test]
