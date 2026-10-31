@@ -776,7 +776,8 @@ impl NewsStore {
     /// `noarchive = article.noarchive || fetched.noarchive` before saving. Keyed URLs and
     /// KeyedLink refusals are never stored at all (including their URL or failure status).
     pub fn save_story_body(&self, body: &StoryBody) -> Result<()> {
-        if !body.cacheable()
+        // A noarchive signal always reaches the redacting write, even on an uncacheable status.
+        if !(body.cacheable() || body.noarchive)
             || reqwest::Url::parse(&body.url).ok().is_some_and(|url| tr_net::publisher::is_keyed_url(&url))
             || body.status == tr_net::publisher::Reason::KeyedLink.to_string()
             || matches!(body.status.to_ascii_lowercase().as_str(), "keyedlink" | "keyed_link")
@@ -795,8 +796,8 @@ impl NewsStore {
         let text = if store_text { body.text.as_str() } else { "" };
         let chars = if store_text { body.chars } else { 0 };
         let truncated = store_text && body.truncated;
-        // Atomically preserve a successful article against late failures. A newly successful
-        // noarchive response still redacts old text, even though its stored status is noarchive.
+        // Atomically preserve a successful article against late failures. Any noarchive signal,
+        // success or failure, replaces the row so previously stored text is redacted.
         self.db.execute(
             "INSERT OR REPLACE INTO story_body(url_hash,url,fetched_at,published_at,chars,truncated,etag,text,status)
              SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9
@@ -811,7 +812,7 @@ impl NewsStore {
                 if noarchive { None } else { body.etag.as_deref() },
                 text,
                 status,
-                body.status == "ok"
+                body.status == "ok" || noarchive
             ],
         )?;
         Ok(())

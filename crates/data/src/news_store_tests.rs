@@ -1425,11 +1425,25 @@ fn n8_story_body_failures_cannot_overwrite_ok() {
         "publisher refused (HTTP 403)",
         "offline",
         "fetch failed",
-        "noarchive",
     ] {
         store.save_story_body(&StoryBody::of(url, now + 1, status)).unwrap();
         assert_eq!(store.story_body(url, now + 2).unwrap().unwrap(), body, "{status}");
     }
+    // A later noarchive signal, even on a failed fetch, redacts the stored text.
+    let redacted = "https://fixture.invalid/redacted";
+    let mut kept = body.clone();
+    kept.url = redacted.into();
+    kept.url_hash = StoryBody::of(redacted, now, "ok").url_hash;
+    store.save_story_body(&kept).unwrap();
+    let mut failed = StoryBody::of(redacted, now + 1, "fetch failed");
+    failed.noarchive = true;
+    store.save_story_body(&failed).unwrap();
+    let cached = store.story_body(redacted, now + 2).unwrap().unwrap();
+    assert_eq!(cached.status, "noarchive");
+    assert!(cached.text.is_empty() && cached.etag.is_none());
+    store.save_story_body(&kept).unwrap();
+    store.save_story_body(&StoryBody::of(redacted, now + 3, "noarchive")).unwrap();
+    assert!(store.story_body(redacted, now + 4).unwrap().unwrap().text.is_empty());
     body.text = "New successful article".into();
     body.chars = body.text.len();
     body.fetched_at += 3;
