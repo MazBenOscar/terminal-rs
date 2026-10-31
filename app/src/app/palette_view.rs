@@ -38,7 +38,6 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("SCAN", "Watchlist scanner", "easyscan screener conditions filter", None),
     ("N", "", "news headlines", None),
     ("STORY", "Story inspector", "news selected headline", None),
-    ("DASH NEWS", "News desk", "dashboard workspace", None),
     ("OB", "", "order book depth dom", None),
     ("WEI", "", "world equity indices markets", None),
     ("GC", "", "yield curve treasury rates", None),
@@ -212,7 +211,7 @@ pub(super) fn static_items() -> Vec<Item> {
                 dashboard.description,
                 Target::Run(format!("DASH {}", dashboard.id)),
             )
-            .keywords("dashboard new workspace"),
+            .keywords(format!("dashboard new workspace DASH {} {}", dashboard.id, dashboard.name)),
         );
     }
     for l in Layout::ALL {
@@ -679,6 +678,30 @@ mod tests {
         let pos = items.iter().find(|i| i.title == "POS").unwrap();
         assert_eq!(pos.hotkey, Some(Action::Positions));
         assert!(pos.subtitle.contains("positions"), "{}", pos.subtitle);
+    }
+
+    #[test]
+    fn every_dashboard_is_described_and_searchable_by_dash_id_and_name() {
+        let items = static_items();
+        let dashboards: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == Kind::Layout && matches!(&i.target, Target::Run(line) if line.starts_with("DASH ")))
+            .collect();
+        assert_eq!(dashboards.len(), crate::dashboards::ALL.len());
+        for (item, dashboard) in dashboards.iter().zip(crate::dashboards::ALL) {
+            assert_eq!(item.title, dashboard.name);
+            assert_eq!(item.subtitle, dashboard.description);
+            assert!(item.keywords.contains(dashboard.id));
+            assert!(item.keywords.contains(dashboard.name));
+            let target = Target::Run(format!("DASH {}", dashboard.id));
+            for query in [format!("DASH {}", dashboard.id), dashboard.name.to_string()] {
+                assert!(
+                    rank(&items, &[], &query).iter().any(|i| i.kind == Kind::Layout && i.target == target),
+                    "{} missing from {query:?}",
+                    dashboard.id
+                );
+            }
+        }
     }
 
     #[test]
