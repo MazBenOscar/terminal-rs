@@ -2528,6 +2528,7 @@ impl TerminalApp {
                     }
                 }
                 Response::StoryDetails { id, result } => self.story_details_reply(id, result),
+                Response::StoryArticle { prompt, body } => self.story_article_reply(prompt, body),
                 Response::StoryAnalysisSaved { error } => {
                     if let Some(error) = error {
                         self.status = format!("Analysis cache: {error}");

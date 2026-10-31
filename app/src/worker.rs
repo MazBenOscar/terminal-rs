@@ -362,6 +362,11 @@ pub enum Request {
     },
     NewsSeen(Vec<String>),
     StoryDetails(Box<tr_data::news_intelligence::Cluster>),
+    PrepareStoryArticle {
+        prompt: crate::agent_pane::PromptId,
+        url: String,
+        enabled: bool,
+    },
     SaveStoryAnalysis(tr_data::news_store::StoryAnalysis),
     FeedConfig {
         settings: tr_data::news_store::local::Notifications,
@@ -738,6 +743,10 @@ pub enum Response {
     StoryDetails {
         id: String,
         result: Result<(Option<tr_data::news_store::StoryAnalysis>, Vec<tr_data::news_intelligence::Cluster>), String>,
+    },
+    StoryArticle {
+        prompt: crate::agent_pane::PromptId,
+        body: tr_data::news_store::StoryBody,
     },
     StoryAnalysisSaved {
         error: Option<String>,
@@ -2688,6 +2697,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             tokio::spawn(async move { news::bookmark(&s, ids, saved).await });
         }
         Request::NewsSeen(ids) => news::mark_seen(s, ids).await,
+        Request::PrepareStoryArticle { prompt, url, enabled } => {
+            let s = Arc::clone(s);
+            tokio::spawn(async move { news::prepare_article(&s, prompt, url, enabled).await });
+        }
         Request::StoryDetails(story) => news::story_details(s, *story).await,
         Request::SaveStoryAnalysis(analysis) => news::save_analysis(s, analysis).await,
         Request::FeedConfig { settings, watches, watched } => {
