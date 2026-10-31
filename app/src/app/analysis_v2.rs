@@ -88,8 +88,11 @@ impl Input {
             }),
         }
     }
+    /// A timestamp more than five minutes in the future is untrusted, so the age is unknown.
     fn age_hours(&self, now: i64) -> Option<f64> {
-        self.published_ts.map(|ts| now.saturating_sub(ts).max(0) as f64 / 3600.0)
+        self.published_ts
+            .filter(|&ts| ts <= now.saturating_add(300))
+            .map(|ts| now.saturating_sub(ts).max(0) as f64 / 3600.0)
     }
     pub fn label(&self) -> String {
         match self.summaries {
@@ -858,6 +861,12 @@ mod tests {
             assert_eq!(a.urgency, Urgency::Medium);
             assert!(a.urgency_capped);
         }
+        // A future feed time must not read as brand new.
+        input.published_ts = Some(NOW + 2 * 86400);
+        v["urgency"] = "breaking".into();
+        assert_eq!(parse_at(&v.to_string(), &input, NOW).unwrap().urgency, Urgency::Medium);
+        input.published_ts = Some(NOW + 60);
+        assert_eq!(parse_at(&v.to_string(), &input, NOW).unwrap().urgency, Urgency::Breaking);
         input.published_ts = Some(NOW - 120 * 3600);
         input.still_developing = true;
         v["urgency"] = "breaking".into();
