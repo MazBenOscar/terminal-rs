@@ -22,6 +22,7 @@ const VISIBLE_ROWS: usize = 10;
 /// line's own hint), extra search words, and the action whose shortcut is shown.
 const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("PORT", "", "portfolio prtu brokerage holdings value", Some(Action::Portfolio)),
+    ("DASH", "Pick a dashboard preset", "dashboard preset workspace desk brief", None),
     ("ACCT", "", "accounts balances brokerage", None),
     ("POS", "", "positions holdings brokerage", Some(Action::Positions)),
     ("ORD", "", "orders blotter brokerage", Some(Action::Orders)),

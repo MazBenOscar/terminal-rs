@@ -997,7 +997,11 @@ impl TerminalApp {
             .iter()
             .find(|d| d.id.eq_ignore_ascii_case(id.trim()) || d.name.eq_ignore_ascii_case(id.trim()))
         else {
-            self.status = format!("Unknown dashboard {id:?}");
+            // A bare or unknown DASH lists the presets instead of failing.
+            self.palette.open_scoped(crate::palette::Kind::Layout, "dashboard");
+            if !id.trim().is_empty() {
+                self.status = format!("Unknown dashboard {:?}; pick one below", id.trim());
+            }
             return;
         };
         // Save current edits to their existing name, then instantiate a fresh template.
@@ -1853,6 +1857,27 @@ mod tests {
         assert_eq!(app.agent_chart_uid(ChartTarget::Pinned), app.peek_chart().map(|c| c.uid));
         assert_ne!(app.agent_chart_uid(ChartTarget::Pinned), Some(uid));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bare_or_unknown_dash_opens_the_dashboard_picker_without_changing_the_workspace() {
+        let (mut app, _root) = fixture("dash-picker");
+        let before = app.layout_name.clone();
+        for id in ["", "  ", "nonsense"] {
+            app.palette.close();
+            app.open_dashboard(id);
+            assert_eq!(app.layout_name, before, "{id:?} must not switch workspace");
+            assert!(app.palette.open, "{id:?} opens the picker");
+            assert_eq!(app.palette.query, "dashboard");
+            let shown: Vec<_> = crate::palette::rank(&app.palette_items(), &[], &app.palette.query)
+                .into_iter()
+                .filter(|i| i.kind == crate::palette::Kind::Layout)
+                .map(|i| i.title)
+                .collect();
+            for dashboard in crate::dashboards::ALL {
+                assert!(shown.iter().any(|t| t == dashboard.name), "{} missing for {id:?}", dashboard.name);
+            }
+        }
     }
 
     #[test]
