@@ -2427,13 +2427,13 @@ mod tests {
         app.focus = other;
         app.note_story_focus();
         let count = app.panes.len();
-        app.analyze_story(story_pane, &cluster("Research linked"));
+        analyze(&mut app, story_pane, &cluster("Research linked"));
         assert_eq!(app.agent_pane_owner, Some(preset_agent), "the preset's link beats a more recent Agent");
         assert_eq!(app.panes.len(), count, "Analyze must reuse the existing Agent");
         assert!(app.dock.visible().contains(&preset_agent));
         assert!(app.dock.visible().contains(&story_pane));
         app.set_link(preset_agent, None);
-        app.analyze_story(story_pane, &cluster("Research recent fallback"));
+        analyze(&mut app, story_pane, &cluster("Research recent fallback"));
         assert_eq!(app.agent_pane_owner, Some(other), "without a matching link, use the most recent Agent");
         assert_eq!(app.panes.len(), count);
         assert_eq!(app.agent_pane.queue.len(), 2);
