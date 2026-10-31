@@ -1,4 +1,5 @@
 //! Conservative, machine-wide budgets for news and filings, with guarded redirects and local caching.
+pub mod publisher;
 #[cfg(test)]
 mod tests;
 use chrono::Utc;
@@ -186,6 +187,8 @@ pub struct Settings {
     pub house_disclosures: bool,
     pub house_roster: bool,
     pub bargo: bool,
+    /// Publisher pages for Analyze. On by default; one explicit fetch per Analyze click.
+    pub publisher: bool,
     /// Explicit opt-in: legacy `bargo: true` alone must not enable keyless traffic.
     pub bargo_keyless: bool,
     pub sec_contact: String,
@@ -207,6 +210,7 @@ impl Default for Settings {
             house_disclosures: true,
             house_roster: true,
             bargo: false,
+            publisher: true,
             bargo_keyless: false,
             sec_contact: String::new(),
             settings_error: false,
@@ -224,6 +228,7 @@ impl Settings {
             house_disclosures: false,
             house_roster: false,
             bargo: false,
+            publisher: false,
             settings_error: true,
             ..Self::default()
         }
@@ -405,6 +410,8 @@ pub struct Guard {
     policies: RwLock<Vec<HostPolicy>>,
     cache: Mutex<HashMap<(String, String), Arc<CacheSlot>>>,
     cooldowns: RwLock<HashMap<String, LocalCooldown>>,
+    /// Bounded robots bodies (24 h) and unavailable results (1 h), keyed by canonical host.
+    publisher_robots: Mutex<HashMap<String, publisher::RobotsCache>>,
     #[cfg(any(test, feature = "test-support"))]
     fixture: Option<reqwest::Url>,
 }
@@ -503,6 +510,7 @@ impl Guard {
             policies: RwLock::new(policies()),
             cache: Mutex::new(HashMap::new()),
             cooldowns: RwLock::new(HashMap::new()),
+            publisher_robots: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-support"))]
             fixture: None,
         };
@@ -828,8 +836,32 @@ impl Guard {
     pub fn configure(&self, settings: Settings) {
         *self.settings.write().expect("settings lock") = settings;
     }
-    fn offline(&self) -> bool {
+    pub(crate) fn offline(&self) -> bool {
         self.config.data_dir.is_some() && !self.config.allow_external
+    }
+    /// Publisher fetching is opt-out per Analyze click; a paused or corrupt configuration never fetches.
+    pub(crate) fn publisher_enabled(&self) -> bool {
+        let settings = self.settings.read().expect("settings lock");
+        !settings.settings_error && !settings.pause_all && settings.publisher
+    }
+    pub(crate) fn robots_cached(&self, host: &str) -> Option<publisher::RobotsCache> {
+        self.publisher_robots.lock().expect("robots lock").get(host).cloned()
+    }
+    pub(crate) fn cache_robots(&self, host: &str, entry: publisher::RobotsCache) {
+        let mut cache = self.publisher_robots.lock().expect("robots lock");
+        if cache.len() >= 256 {
+            cache.retain(|_, entry| entry.expires_at > Utc::now().timestamp());
+            if cache.len() >= 256
+                && let Some(key) = cache.keys().next().cloned()
+            {
+                cache.remove(&key);
+            }
+        }
+        cache.insert(host.to_owned(), entry);
+    }
+    /// Latest durable slot boundary for a consumer key; publisher pacing and cooldowns use slots.
+    pub(crate) fn slot_until(&self, key: &str) -> Result<Option<i64>, Refused> {
+        Ok(self.db()?.query_row("SELECT until FROM slots WHERE key=?1", [key], |r| r.get(0)).optional()?)
     }
     fn bargo_mode_allowed(&self, keyed: bool) -> Result<(), Refused> {
         if !keyed && !self.settings.read().expect("settings lock").bargo_keyless {

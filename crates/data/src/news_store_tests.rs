@@ -1348,3 +1348,242 @@ fn review_n5a_pruned_undated_story_is_not_fresh_again_on_reingest() {
         && !store.notification_claimed("keyword", &undated.id).unwrap();
     assert!(!would_notify, "same undated story is fresh and unclaimed again (published={published}, now={now})");
 }
+
+#[test]
+fn n8_keyed_story_body_refusals_never_create_rows() {
+    let store = NewsStore::memory().unwrap();
+    for key in [
+        "token",
+        "apikey",
+        "api-key",
+        "api_key",
+        "access_token",
+        "x-finnhub-token",
+        "x-amz-signature",
+        "x-amz-credential",
+        "signature",
+        "sig",
+        "client_secret",
+        "auth",
+        "key",
+        "secret",
+        "password",
+    ] {
+        let url = format!("https://fixture.invalid/story?{}=must-not-persist", key.to_ascii_uppercase());
+        for status in ["ok", "publisher not fetched (provider key)"] {
+            let mut body = StoryBody::of(&url, 1_800_000_000, status);
+            body.text = "must not persist".into();
+            store.save_story_body(&body).unwrap();
+        }
+    }
+    let refused = StoryBody::of(
+        "https://fixture.invalid/redacted",
+        1_800_000_000,
+        &tr_net::publisher::Reason::KeyedLink.to_string(),
+    );
+    store.save_story_body(&refused).unwrap();
+    let count: i64 = store.db.query_row("SELECT count(*) FROM story_body", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 0, "even negative-cache URLs must not retain credentials");
+}
+
+#[test]
+fn n8_noarchive_flag_overrides_ok_and_removes_previously_stored_text() {
+    let store = NewsStore::memory().unwrap();
+    for (html_flag, header_flag) in [(true, false), (false, true), (true, true)] {
+        let mut body = StoryBody::of("https://fixture.invalid/story", 1_800_000_000, "ok");
+        body.text = "must not persist".into();
+        body.chars = 16;
+        body.truncated = true;
+        body.etag = Some("private-validator".into());
+        store.save_story_body(&body).unwrap();
+        body.noarchive = html_flag || header_flag;
+        store.save_story_body(&body).unwrap();
+        let cached = store.story_body(&body.url, body.fetched_at + 1).unwrap().unwrap();
+        assert!(cached.noarchive);
+        assert_eq!(cached.status, "noarchive");
+        assert!(cached.text.is_empty());
+        assert_eq!(cached.chars, 0);
+        assert!(!cached.truncated);
+        assert!(cached.etag.is_none());
+    }
+}
+
+#[test]
+fn n8_story_body_failures_cannot_overwrite_ok() {
+    let now = 1_800_000_000;
+    let store = NewsStore::memory().unwrap();
+    let url = "https://fixture.invalid/preserved";
+    let mut body = StoryBody::of(url, now, "ok");
+    body.text = "Preserved article".into();
+    body.chars = body.text.len();
+    body.etag = Some("preserved-validator".into());
+    store.save_story_body(&body).unwrap();
+    for status in [
+        "paywalled",
+        "no article text",
+        "robots.txt disallows",
+        "publisher refused (HTTP 403)",
+        "offline",
+        "fetch failed",
+    ] {
+        store.save_story_body(&StoryBody::of(url, now + 1, status)).unwrap();
+        assert_eq!(store.story_body(url, now + 2).unwrap().unwrap(), body, "{status}");
+    }
+    // A later noarchive signal, even on a failed fetch, redacts the stored text.
+    let redacted = "https://fixture.invalid/redacted";
+    let mut kept = body.clone();
+    kept.url = redacted.into();
+    kept.url_hash = StoryBody::of(redacted, now, "ok").url_hash;
+    store.save_story_body(&kept).unwrap();
+    let mut failed = StoryBody::of(redacted, now + 1, "fetch failed");
+    failed.noarchive = true;
+    store.save_story_body(&failed).unwrap();
+    let cached = store.story_body(redacted, now + 2).unwrap().unwrap();
+    assert_eq!(cached.status, "noarchive");
+    assert!(cached.text.is_empty() && cached.etag.is_none());
+    store.save_story_body(&kept).unwrap();
+    store.save_story_body(&StoryBody::of(redacted, now + 3, "noarchive")).unwrap();
+    assert!(store.story_body(redacted, now + 4).unwrap().unwrap().text.is_empty());
+    body.text = "New successful article".into();
+    body.chars = body.text.len();
+    body.fetched_at += 3;
+    store.save_story_body(&body).unwrap();
+    assert_eq!(store.story_body(url, now + 4).unwrap().unwrap(), body);
+
+    let url = "https://fixture.invalid/negative-replaced";
+    for status in ["paywalled", "no article text", "ok"] {
+        let row = StoryBody::of(url, now, status);
+        store.save_story_body(&row).unwrap();
+        assert_eq!(store.story_body(url, now).unwrap().unwrap(), row);
+    }
+}
+
+#[test]
+fn n8_story_body_only_stable_failures_are_cached_including_legacy_rows() {
+    use tr_net::publisher::Reason;
+    let now = 1_800_000_000;
+    let store = NewsStore::memory().unwrap();
+    for (i, reason) in [
+        Reason::Offline,
+        Reason::Disabled,
+        Reason::Pacing,
+        Reason::Budget,
+        Reason::Cooldown,
+        Reason::Transport,
+        Reason::Ledger,
+        Reason::RobotsUnavailable,
+        Reason::Refused(429),
+        Reason::Http(503),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let url = format!("https://fixture.invalid/transient-{i}");
+        let body = StoryBody::of(&url, now, &reason.to_string());
+        store.save_story_body(&body).unwrap();
+        let count: i64 = store.db.query_row("SELECT count(*) FROM story_body", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "{reason}");
+    }
+    let legacy = StoryBody::of("https://fixture.invalid/legacy", now, "publisher rate limited");
+    store
+        .db
+        .execute(
+            "INSERT INTO story_body(url_hash,url,fetched_at,chars,truncated,text,status) VALUES(?1,?2,?3,0,0,'',?4)",
+            params![legacy.url_hash, legacy.url, now, legacy.status],
+        )
+        .unwrap();
+    assert!(store.story_body(&legacy.url, now).unwrap().is_none());
+
+    for (i, reason) in [
+        Reason::Skipped,
+        Reason::NotHtml,
+        Reason::TooLarge,
+        Reason::Robots,
+        Reason::Refused(403),
+        Reason::Refused(451),
+        Reason::Refused(404),
+        Reason::Refused(410),
+        Reason::Http(404),
+        Reason::Http(410),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let url = format!("https://fixture.invalid/stable-{i}");
+        let body = StoryBody::of(&url, now, &reason.to_string());
+        store.save_story_body(&body).unwrap();
+        assert_eq!(store.story_body(&url, now).unwrap().unwrap(), body);
+    }
+}
+
+#[test]
+fn n8_story_body_round_trips_and_failure_rows_expire_after_a_day() {
+    let now = 1_800_000_000;
+    let store = NewsStore::memory().unwrap();
+    let mut body = StoryBody::of("https://fixture.invalid/story?utm_source=feed", now, "ok");
+    body.published_at = Some(now - 3_600);
+    body.chars = 42;
+    body.truncated = true;
+    body.etag = Some("\"fixture\"".into());
+    body.text = "Article body".into();
+    store.save_story_body(&body).unwrap();
+
+    let cached = store.story_body("https://fixture.invalid/story", now + 10).unwrap().unwrap();
+    assert_eq!(cached.url, "https://fixture.invalid/story");
+    assert_eq!(cached.text, "Article body");
+    assert_eq!(cached.chars, 42);
+    assert!(cached.truncated);
+    assert_eq!(cached.etag.as_deref(), Some("\"fixture\""));
+    assert_eq!(cached.published_at, Some(now - 3_600));
+
+    let failure = StoryBody::of("https://fixture.invalid/failed", now, "no article text");
+    store.save_story_body(&failure).unwrap();
+    assert!(store.story_body("https://fixture.invalid/failed", now + 3_600).unwrap().is_some());
+    assert!(store.story_body("https://fixture.invalid/failed", now + STORY_BODY_NEGATIVE_TTL + 1).unwrap().is_none());
+}
+
+#[test]
+fn n8_story_body_never_stores_noarchive_text() {
+    let now = 1_800_000_000;
+    let store = NewsStore::memory().unwrap();
+    let mut body = StoryBody::of("https://fixture.invalid/noarchive", now, "noarchive");
+    body.text = "must not persist".into();
+    body.chars = 16;
+    store.save_story_body(&body).unwrap();
+
+    let cached = store.story_body("https://fixture.invalid/noarchive", now + 60).unwrap().unwrap();
+    assert_eq!(cached.status, "noarchive");
+    assert_eq!(cached.text, "");
+    assert_eq!(cached.chars, 0);
+}
+
+#[test]
+fn n8_story_body_failure_rows_never_store_text() {
+    let now = 1_800_000_000;
+    let store = NewsStore::memory().unwrap();
+    let mut body = StoryBody::of("https://fixture.invalid/paywalled", now, "paywalled");
+    body.text = "teaser".into();
+    body.chars = 6;
+    body.truncated = true;
+    store.save_story_body(&body).unwrap();
+
+    let cached = store.story_body("https://fixture.invalid/paywalled", now + 60).unwrap().unwrap();
+    assert_eq!(cached.status, "paywalled");
+    assert_eq!(cached.text, "");
+    assert_eq!(cached.chars, 0);
+    assert!(!cached.truncated);
+}
+
+#[test]
+fn n8_story_body_prune_matches_ninety_day_headline_retention() {
+    let now = 1_800_000_000;
+    let store = NewsStore::memory().unwrap();
+    let old = StoryBody::of("https://fixture.invalid/old-body", now - STORY_BODY_RETENTION - 1, "ok");
+    let fresh = StoryBody::of("https://fixture.invalid/fresh-body", now - STORY_BODY_RETENTION + 1, "ok");
+    store.save_story_body(&old).unwrap();
+    store.save_story_body(&fresh).unwrap();
+    store.prune(now).unwrap();
+
+    assert!(store.story_body("https://fixture.invalid/old-body", now).unwrap().is_none());
+    assert!(store.story_body("https://fixture.invalid/fresh-body", now).unwrap().is_some());
+}

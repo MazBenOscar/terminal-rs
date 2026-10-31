@@ -467,6 +467,13 @@ impl TerminalApp {
                 changed |= ui.checkbox(enabled, label).changed();
             }
         });
+        changed |= ui
+            .checkbox(&mut self.data_sources.settings.publisher, "Fetch article text when analyzing")
+            .on_hover_text("One request to the publisher per Analyze click.")
+            .changed();
+        ui.label(
+            RichText::new("One request to the publisher per Analyze click.").font(ui_font(11.0)).color(theme::muted()),
+        );
         let mut resume = None;
         ui.horizontal_wrapped(|ui| {
             changed |= ui.checkbox(&mut self.data_sources.settings.sec, "SEC EDGAR").changed();

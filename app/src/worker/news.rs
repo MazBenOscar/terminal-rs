@@ -678,6 +678,111 @@ pub(super) async fn story_details(s: &Arc<Shared>, story: tr_data::news_intellig
     .map_err(|e| e.to_string());
     s.send(Response::StoryDetails { id, result });
 }
+/// Only the explicit Analyze request reaches this path. No store lock spans network IO.
+pub(super) async fn prepare_article(s: &Arc<Shared>, prompt: crate::agent_pane::PromptId, url: String, enabled: bool) {
+    let body = bounded_article(s, url, enabled, Duration::from_secs(8), |url| async move {
+        tr_net::publisher::fetch_article(&url).await
+    })
+    .await;
+    s.send(Response::StoryArticle { prompt, body });
+}
+
+/// Bound the whole preparation, including a busy cache, robots/redirects, extraction and save.
+async fn bounded_article<F, Fut>(
+    s: &Arc<Shared>,
+    url: String,
+    enabled: bool,
+    deadline: Duration,
+    fetch: F,
+) -> tr_data::news_store::StoryBody
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<tr_net::publisher::Fetched, tr_net::publisher::Reason>>,
+{
+    let failure = tr_data::news_store::StoryBody::of(&url, chrono::Utc::now().timestamp(), "fetch failed");
+    // Timeouts are transient: do not launch a detached negative-cache write. Any save already
+    // in flight independently obeys the store's cacheability and successful-row guards.
+    let mut body = tokio::time::timeout(deadline, article_body(s, url, enabled, fetch)).await.unwrap_or(failure);
+    // No URL or response validators need to cross back to the UI, even on cache hits.
+    body.url.clear();
+    body.etag = None;
+    body
+}
+
+async fn article_body<F, Fut>(s: &Arc<Shared>, url: String, enabled: bool, fetch: F) -> tr_data::news_store::StoryBody
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<tr_net::publisher::Fetched, tr_net::publisher::Reason>>,
+{
+    use tr_data::{
+        article,
+        news_store::{STORY_BODY_RETENTION, StoryBody},
+    };
+    use tr_net::publisher::Reason;
+    let now = chrono::Utc::now().timestamp();
+    let failure = |status: &str| StoryBody::of(&url, now, status);
+    if !enabled {
+        return failure("disabled");
+    }
+    // Check the original link before normalization, including on a cache hit.
+    if reqwest::Url::parse(&url).ok().is_some_and(|url| tr_net::publisher::is_keyed_url(&url)) {
+        return failure(&Reason::KeyedLink.to_string());
+    }
+    let lookup = url.clone();
+    let cached = blocking(s, move |s| {
+        s.news.store.blocking_lock().as_ref().and_then(|store| store.story_body(&lookup, now).ok().flatten())
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(body) = cached.filter(|body| {
+        body.fetched_at <= now.saturating_add(300) && now.saturating_sub(body.fetched_at) < STORY_BODY_RETENTION
+    }) {
+        return body;
+    }
+    let fetched = fetch(url.clone()).await;
+    let body = match fetched {
+        Ok(fetched) => {
+            let extracted = tokio::task::spawn_blocking(move || {
+                let extracted = article::extract(&fetched.html, &fetched.url);
+                (fetched, extracted)
+            })
+            .await;
+            match extracted {
+                Ok((fetched, Ok(article))) => {
+                    let mut body = StoryBody::of(&url, fetched.fetched_at, "ok");
+                    body.text = article.text;
+                    body.chars = article.chars;
+                    body.truncated = article.truncated;
+                    body.published_at = article.published_at;
+                    body.noarchive = article.noarchive || fetched.noarchive;
+                    body.etag = fetched.etag;
+                    body
+                }
+                Ok((fetched, Err(reason))) => {
+                    let mut body = failure(&reason.to_string());
+                    body.noarchive = fetched.noarchive;
+                    body
+                }
+                Err(_) => failure("fetch failed"),
+            }
+        }
+        Err(reason) => failure(&reason.to_string()),
+    };
+    // Cache only stable article/policy outcomes, never transient refusals or credentials.
+    // The store independently enforces this, including for saves that outlive the deadline.
+    if body.cacheable() {
+        let saved = body.clone();
+        let _ = blocking(s, move |s| {
+            if let Some(store) = s.news.store.blocking_lock().as_ref() {
+                let _ = store.save_story_body(&saved);
+            }
+        })
+        .await;
+    }
+    body
+}
+
 pub(super) async fn save_analysis(s: &Arc<Shared>, analysis: tr_data::news_store::StoryAnalysis) {
     let result = blocking(s, move |s| -> anyhow::Result<()> {
         s.news
@@ -1320,6 +1425,216 @@ mod tests {
     fn fixture_shared() -> (Arc<Shared>, mpsc::Receiver<Response>) {
         super::super::tests::backfill_shared(Arc::new(tr_data::sample::SampleProvider::at(1_790_000_000, 100)))
     }
+    #[tokio::test]
+    async fn n8_analyze_cached_ok_negative_expiry_disabled_and_keyed_never_fetch() {
+        use tr_data::news_store::StoryBody;
+        let (s, _) = fixture_shared();
+        let now = chrono::Utc::now().timestamp();
+        let url = "https://fixture.invalid/article?utm_source=feed";
+        let store = NewsStore::memory().unwrap();
+        let mut ok = StoryBody::of(url, now, "ok");
+        ok.text = "Cached article".into();
+        ok.chars = ok.text.len();
+        store.save_story_body(&ok).unwrap();
+        *s.news.store.lock().await = Some(store);
+        let forbidden = |_| async { panic!("publisher must not be called") };
+        let body = article_body(&s, url.into(), true, forbidden).await;
+        assert_eq!(body.text, "Cached article");
+        assert_eq!(article_body(&s, url.into(), false, forbidden).await.status, "disabled");
+        for (i, status) in ["paywalled", "robots.txt disallows", "no article text"].into_iter().enumerate() {
+            let url = format!("https://fixture.invalid/negative-{i}");
+            let negative = StoryBody::of(&url, now - 23 * 3600, status);
+            s.news.store.lock().await.as_ref().unwrap().save_story_body(&negative).unwrap();
+            assert_eq!(article_body(&s, url, true, forbidden).await.status, status);
+        }
+        let url = "https://fixture.invalid/expired";
+        let negative = StoryBody::of(url, now - 86400, "paywalled");
+        s.news.store.lock().await.as_ref().unwrap().save_story_body(&negative).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let body = article_body(&s, url.into(), true, |_| async {
+            calls.set(calls.get() + 1);
+            Err(tr_net::publisher::Reason::Robots)
+        })
+        .await;
+        assert_eq!(calls.get(), 1);
+        assert_eq!(body.status, "robots.txt disallows");
+        let keyed = "https://fixture.invalid/keyed?token=never-store";
+        let body = article_body(&s, keyed.into(), true, forbidden).await;
+        assert_eq!(body.status, tr_net::publisher::Reason::KeyedLink.to_string());
+        assert!(s.news.store.lock().await.as_ref().unwrap().story_body(keyed, now).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn n8_fetch_extract_save_and_both_noarchive_sources_use_once_without_storing_text() {
+        let (s, _) = fixture_shared();
+        *s.news.store.lock().await = Some(NewsStore::memory().unwrap());
+        let paragraph =
+            "Synthetic reporting describes production and delivery schedules at a fictional factory. ".repeat(4);
+        for (i, meta, header) in [(0, false, false), (1, true, false), (2, false, true)] {
+            let url = format!("https://fixture.invalid/body-{i}");
+            let robots = if meta { "<meta name='robots' content='noarchive'>" } else { "" };
+            let html = format!("{robots}<article><p>{paragraph}</p><p>{paragraph}</p><p>{paragraph}</p></article>");
+            let now = chrono::Utc::now().timestamp();
+            let body = article_body(&s, url.clone(), true, |url| async move {
+                Ok(tr_net::publisher::Fetched {
+                    url,
+                    html,
+                    etag: Some("fixture".into()),
+                    noarchive: header,
+                    fetched_at: now,
+                })
+            })
+            .await;
+            assert_eq!(body.status, "ok");
+            assert!(body.chars >= 600);
+            assert!(!body.text.is_empty(), "noarchive may be used for this analysis");
+            let stored = s.news.store.lock().await.as_ref().unwrap().story_body(&url, now).unwrap().unwrap();
+            if meta || header {
+                assert_eq!(stored.status, "noarchive");
+                assert!(stored.text.is_empty());
+                assert!(stored.etag.is_none());
+                assert_eq!(stored.chars, 0);
+            } else {
+                assert_eq!(stored.text, body.text);
+                assert_eq!(stored.status, "ok");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn review_n8s4_transient_refusal_not_negative_cached() {
+        use tr_net::publisher::Reason;
+        let (s, _) = fixture_shared();
+        *s.news.store.lock().await = Some(NewsStore::memory().unwrap());
+        for (i, reason) in [
+            Reason::Pacing,
+            Reason::Offline,
+            Reason::Disabled,
+            Reason::Budget,
+            Reason::Cooldown,
+            Reason::Transport,
+            Reason::Ledger,
+            Reason::RobotsUnavailable,
+            Reason::Refused(429),
+            Reason::Http(503),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let url = format!("https://fixture.invalid/transient-{i}");
+            let first = article_body(&s, url.clone(), true, |_| async move { Err(reason) }).await;
+            assert_ne!(first.status, "ok");
+            let now = chrono::Utc::now().timestamp();
+            assert!(s.news.store.lock().await.as_ref().unwrap().story_body(&url, now).unwrap().is_none());
+            // The user retries a moment later (host slot free / back online): success is allowed.
+            let calls = std::cell::Cell::new(0);
+            let paragraph =
+                "Synthetic reporting describes production and delivery schedules at a fictional factory. ".repeat(4);
+            let body = article_body(&s, url.clone(), true, |url| async {
+                calls.set(calls.get() + 1);
+                Ok(tr_net::publisher::Fetched {
+                    url,
+                    html: format!("<article><p>{paragraph}</p><p>{paragraph}</p><p>{paragraph}</p></article>"),
+                    etag: None,
+                    noarchive: false,
+                    fetched_at: now,
+                })
+            })
+            .await;
+            assert_eq!(calls.get(), 1, "transient refusal must not block re-fetch for 24 h");
+            assert_eq!(body.status, "ok");
+            assert!(!body.text.is_empty());
+            assert_eq!(s.news.store.lock().await.as_ref().unwrap().story_body(&url, now).unwrap().unwrap(), body);
+        }
+    }
+
+    #[tokio::test]
+    async fn n8_total_deadline_bounds_stalled_fetch_and_busy_cache() {
+        let (s, _) = fixture_shared();
+        *s.news.store.lock().await = Some(NewsStore::memory().unwrap());
+        let body =
+            bounded_article(&s, "https://fixture.invalid/stalled".into(), true, Duration::from_millis(20), |_| {
+                std::future::pending()
+            })
+            .await;
+        assert_eq!(body.status, "fetch failed");
+        assert!(body.url.is_empty());
+        let lock = s.news.store.lock().await;
+        let body =
+            bounded_article(&s, "https://fixture.invalid/busy".into(), true, Duration::from_millis(20), |_| async {
+                panic!("busy cache must time out before fetch")
+            })
+            .await;
+        assert_eq!(body.status, "fetch failed");
+        drop(lock); // Let the cancelled lookup finish without delaying either response.
+        let now = chrono::Utc::now().timestamp();
+        let store = s.news.store.lock().await;
+        let store = store.as_ref().unwrap();
+        for url in ["https://fixture.invalid/stalled", "https://fixture.invalid/busy"] {
+            assert!(store.story_body(url, now).unwrap().is_none(), "timeouts must never be negative-cached");
+        }
+    }
+
+    #[tokio::test]
+    async fn n8_analyze_obeys_real_publisher_offline_and_disabled_gates_without_io() {
+        let (s, _) = fixture_shared();
+        *s.news.store.lock().await = Some(NewsStore::memory().unwrap());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/n8-publisher-gates").join(format!(
+            "{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for (external, publisher, expected) in [(false, true, "offline"), (true, false, "publisher fetching disabled")]
+        {
+            let guard = tr_net::Guard::new(
+                tr_net::Config {
+                    ledger: root.join(format!("{external}.sqlite3")),
+                    data_dir: Some(root.clone()),
+                    allow_external: external,
+                    max_wait: Duration::ZERO,
+                },
+                tr_net::Settings { publisher, ..Default::default() },
+            )
+            .unwrap();
+            let guard_ref = &guard;
+            let body = article_body(&s, format!("https://fixture.invalid/gated-{external}"), true, |url| async move {
+                tr_net::publisher::Publisher::new(guard_ref).unwrap().fetch(&url).await
+            })
+            .await;
+            assert_eq!(body.status, expected);
+            assert!(guard.status().unwrap().iter().all(|status| status.requests_today == 0));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn n8_article_dispatch_leaves_worker_free_while_cache_is_locked() {
+        let (s, rx) = fixture_shared();
+        let lock = s.news.store.lock().await;
+        super::super::handle(
+            &s,
+            Request::PrepareStoryArticle {
+                prompt: Default::default(),
+                url: "https://fixture.invalid/article".into(),
+                enabled: false,
+            },
+        )
+        .await;
+        drop(lock);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(Response::StoryArticle { body, .. }) = rx.try_recv() {
+                    assert_eq!(body.status, "disabled");
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn n5_tick_is_gated_on_visibility_or_enabled_notification_types() {
         let mut settings = tr_data::news_store::local::Notifications::default();

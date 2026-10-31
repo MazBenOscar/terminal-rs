@@ -69,6 +69,79 @@ pub struct StoryAnalysis {
     pub json: String,
 }
 
+/// Publisher article text for one canonical URL. `status` is "ok" or a failure reason; failure
+/// rows are negative-cache entries with no text and expire after 24 hours.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoryBody {
+    pub url_hash: String,
+    pub url: String,
+    pub fetched_at: i64,
+    pub published_at: Option<i64>,
+    pub chars: usize,
+    pub truncated: bool,
+    pub etag: Option<String>,
+    pub text: String,
+    pub status: String,
+    /// Set to `article.noarchive || fetched.noarchive`. The save path never stores text or
+    /// response validators when true, regardless of `status`; it records "noarchive" instead.
+    #[serde(default)]
+    pub noarchive: bool,
+}
+
+impl StoryBody {
+    /// Only successful articles and stable article/publisher policy outcomes are cacheable.
+    /// Transient network/guard failures must remain retryable, including in older databases.
+    pub fn cacheable(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "ok" | "noarchive"
+                | "paywalled"
+                | "no article text"
+                | "not an article page"
+                | "not HTML"
+                | "robots.txt"
+                | "robots.txt disallows"
+                | "publisher refused (HTTP 403)"
+                | "publisher refused (HTTP 451)"
+                | "publisher refused (HTTP 404)"
+                | "publisher refused (HTTP 410)"
+                | "publisher error (HTTP 404)"
+                | "publisher error (HTTP 410)"
+                | "page too large"
+                | "publisher not fetched"
+        )
+    }
+
+    /// Start from a canonical URL and a status. Tracking parameters are removed exactly as the
+    /// story normalizer removes them, so the same article cannot be fetched under two keys.
+    /// Keyed URLs and `Reason::KeyedLink` refusals must never be saved, even as negative-cache
+    /// rows. `save_story_body` enforces this policy independently of the supplied status.
+    pub fn of(url: &str, fetched_at: i64, status: &str) -> Self {
+        let url = normalize_link(url);
+        Self {
+            url_hash: story_body_hash(&url),
+            url,
+            fetched_at,
+            published_at: None,
+            chars: 0,
+            truncated: false,
+            etag: None,
+            text: String::new(),
+            status: status.into(),
+            noarchive: status == "noarchive",
+        }
+    }
+}
+
+/// Failures are negative cache entries: the same URL is not fetched again for a day.
+pub const STORY_BODY_NEGATIVE_TTL: i64 = 24 * 3600;
+/// Article text follows the same 90-day retention as headlines.
+pub const STORY_BODY_RETENTION: i64 = 90 * 86400;
+
+fn story_body_hash(url: &str) -> String {
+    Sha1::digest(url.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 impl StoryAnalysis {
     /// Versioned JSON in the existing column; no database migration or v1 rewrite.
     /// Keep the original reply for prose fallback and validation on load.
@@ -666,6 +739,84 @@ impl NewsStore {
         )?;
         Ok(())
     }
+    /// Cached article text, or a failure row younger than 24 hours. Successful rows stay until
+    /// the 90-day prune; failures are retried once the negative cache expires.
+    pub fn story_body(&self, url: &str, now: i64) -> Result<Option<StoryBody>> {
+        let url = normalize_link(url);
+        if url.is_empty() {
+            return Ok(None);
+        }
+        let body = self
+            .db
+            .query_row(
+                "SELECT url_hash,url,fetched_at,published_at,chars,truncated,etag,text,status FROM story_body WHERE url_hash=?1",
+                [story_body_hash(&url)],
+                |row| {
+                    Ok(StoryBody {
+                        url_hash: row.get(0)?,
+                        url: row.get(1)?,
+                        fetched_at: row.get(2)?,
+                        published_at: row.get(3)?,
+                        chars: row.get::<_, i64>(4)? as usize,
+                        truncated: row.get::<_, i64>(5)? != 0,
+                        etag: row.get(6)?,
+                        text: row.get(7)?,
+                        status: row.get(8)?,
+                        noarchive: row.get::<_, String>(8)? == "noarchive",
+                    })
+                },
+            )
+            .optional()?;
+        Ok(body.filter(|body| {
+            body.cacheable() && (body.status == "ok" || now.saturating_sub(body.fetched_at) < STORY_BODY_NEGATIVE_TTL)
+        }))
+    }
+    /// Store an article or a failure status. Pages marked noarchive never persist their text,
+    /// but the row still records why so the URL is not fetched again today. Callers must set
+    /// `noarchive = article.noarchive || fetched.noarchive` before saving. Keyed URLs and
+    /// KeyedLink refusals are never stored at all (including their URL or failure status).
+    pub fn save_story_body(&self, body: &StoryBody) -> Result<()> {
+        // A noarchive signal always reaches the redacting write, even on an uncacheable status.
+        if !(body.cacheable() || body.noarchive)
+            || reqwest::Url::parse(&body.url).ok().is_some_and(|url| tr_net::publisher::is_keyed_url(&url))
+            || body.status == tr_net::publisher::Reason::KeyedLink.to_string()
+            || matches!(body.status.to_ascii_lowercase().as_str(), "keyedlink" | "keyed_link")
+        {
+            return Ok(());
+        }
+        let url = normalize_link(&body.url);
+        if url.is_empty() {
+            return Ok(());
+        }
+        // Always derive the primary key from the stored URL, never from a caller-supplied hash.
+        let url_hash = story_body_hash(&url);
+        let noarchive = body.noarchive || body.status == "noarchive";
+        let status = if noarchive { "noarchive" } else { body.status.as_str() };
+        let store_text = body.status == "ok" && !noarchive;
+        let text = if store_text { body.text.as_str() } else { "" };
+        let chars = if store_text { body.chars } else { 0 };
+        let truncated = store_text && body.truncated;
+        // Atomically preserve a successful article against late failures. Any noarchive signal,
+        // success or failure, replaces the row so previously stored text is redacted.
+        self.db.execute(
+            "INSERT OR REPLACE INTO story_body(url_hash,url,fetched_at,published_at,chars,truncated,etag,text,status)
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9
+             WHERE ?10 OR NOT EXISTS(SELECT 1 FROM story_body WHERE url_hash=?1 AND status='ok')",
+            params![
+                url_hash,
+                url,
+                body.fetched_at,
+                body.published_at,
+                chars as i64,
+                i64::from(truncated),
+                if noarchive { None } else { body.etag.as_deref() },
+                text,
+                status,
+                body.status == "ok" || noarchive
+            ],
+        )?;
+        Ok(())
+    }
     pub fn related_stories(
         &self,
         selected: &crate::news_intelligence::Cluster,
@@ -745,6 +896,8 @@ impl NewsStore {
             CREATE INDEX IF NOT EXISTS news_published ON items(published DESC);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS story_analysis(story_id TEXT PRIMARY KEY,model TEXT NOT NULL,created_at INTEGER NOT NULL,json TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS story_body(url_hash TEXT PRIMARY KEY,url TEXT NOT NULL,fetched_at INTEGER NOT NULL,published_at INTEGER,chars INTEGER NOT NULL,truncated INTEGER NOT NULL,etag TEXT,text TEXT NOT NULL,status TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS story_body_fetched ON story_body(fetched_at);
             CREATE TABLE IF NOT EXISTS notification_seen(kind TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(kind,id));
             CREATE TABLE IF NOT EXISTS notification_history(at INTEGER NOT NULL,body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS notification_slots(at INTEGER NOT NULL);
@@ -918,6 +1071,7 @@ impl NewsStore {
         let cutoff = now - 90 * 86400;
         let tx = self.db.unchecked_transaction()?;
         let removed = tx.execute("DELETE FROM items WHERE published < ?1 AND bookmark=0", [cutoff])?;
+        tx.execute("DELETE FROM story_body WHERE fetched_at < ?1", [now - STORY_BODY_RETENTION])?;
         tx.execute("DELETE FROM item_sources WHERE id NOT IN (SELECT id FROM items)", [])?;
         tx.execute(
             "DELETE FROM notification_seen WHERE (kind,id) IN (SELECT kind,id FROM notification_seen_at WHERE at < ?1)",

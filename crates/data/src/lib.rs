@@ -13,6 +13,7 @@
 //! history surface provider failures; simulated chart history requires sample mode.
 
 pub mod alpaca;
+pub mod article;
 pub mod cache;
 pub mod crypto;
 pub mod crypto_catalog;
