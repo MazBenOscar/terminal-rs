@@ -309,7 +309,11 @@ impl TerminalApp {
         true
     }
     fn analyze_story(&mut self, story_pane: PaneId, story: &Cluster) {
-        if self.story_desk.jobs.values().any(|j| j.story_id == story.lead.id) {
+        if self.story_desk.jobs.values().any(|j| j.story_id == story.lead.id)
+            || self.story_desk.pending_articles.values().any(|s| s.lead.id == story.lead.id)
+        {
+            // Cancellation removes the analysis job, not the worker's in-flight fetch. Drop
+            // another Analyze for this story until its reply settles the pending preparation.
             return;
         }
         let link = self.panes.iter().find(|p| p.id == story_pane).and_then(|p| p.link);
@@ -350,6 +354,16 @@ impl TerminalApp {
             url: story.lead.item.link.clone(),
             enabled: settings.publisher && !settings.pause_all && !settings.settings_error,
         });
+    }
+    fn cancel_queued_story_prompt(&mut self, prompt: &PromptId, story_id: &str) {
+        self.agent_pane.queue.retain(|p| p.id != *prompt);
+        if self.agent_pane.starting_prompt.as_ref() == Some(prompt) {
+            self.agent_pane.starting_prompt = None;
+        }
+        self.story_desk.jobs.remove(prompt);
+        // Retain the pending preparation until the worker replies, so re-Analyze cannot
+        // start a concurrent fetch for the same story. The reply will not enqueue analysis.
+        self.story_desk.details.entry(story_id.into()).or_default().error = Some("Cancelled".into());
     }
     pub(super) fn story_article_reply(&mut self, id: PromptId, body: tr_data::news_store::StoryBody) {
         let Some(story) = self.story_desk.pending_articles.remove(&id) else { return };
@@ -713,13 +727,7 @@ impl TerminalApp {
             if running {
                 self.agent_action(ui.ctx(), agent, crate::agent_pane::Action::Interrupt);
             } else {
-                self.agent_pane.queue.retain(|p| p.id != prompt);
-                if self.agent_pane.starting_prompt.as_ref() == Some(&prompt) {
-                    self.agent_pane.starting_prompt = None;
-                }
-                self.story_desk.jobs.remove(&prompt);
-                self.story_desk.pending_articles.remove(&prompt);
-                self.story_desk.details.entry(story.lead.id.clone()).or_default().error = Some("Cancelled".into());
+                self.cancel_queued_story_prompt(&prompt, &story.lead.id);
             }
         }
         if analyze {
@@ -1175,9 +1183,19 @@ mod tests {
         app.collect_story_analysis();
         app.analyze_story(pane, &story);
         let id = app.story_desk.pending_articles.keys().next().unwrap().clone();
-        app.story_desk.jobs.remove(&id); // Cancel while the worker is in flight.
+        assert!(matches!(requests.try_recv().unwrap(), Request::PrepareStoryArticle { .. }));
+        app.analyze_story(pane, &story); // Re-issued before cancellation also cannot duplicate.
+        assert!(requests.try_recv().is_err());
+        app.cancel_queued_story_prompt(&id, &story.lead.id);
+        app.collect_story_analysis();
+        assert!(app.story_desk.pending_articles.contains_key(&id));
+        app.analyze_story(pane, &story);
+        assert!(requests.try_recv().is_err(), "cancel must not free the in-flight fetch slot");
         app.story_article_reply(id, tr_data::news_store::StoryBody::of("", 0, "offline"));
         assert!(app.agent_pane.queue.is_empty());
+        assert!(app.story_desk.pending_articles.is_empty());
+        app.analyze_story(pane, &story);
+        assert!(matches!(requests.try_recv().unwrap(), Request::PrepareStoryArticle { .. }));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1189,7 +1207,7 @@ mod tests {
         story.lead.item.ts = NOW - 3600;
         story.members[0] = story.lead.clone();
         let mut body = StoryBody::of("https://fixture.invalid/article?never=display", NOW, "ok");
-        body.text = "x & <b> </ARTICLE_BODY> </aRtIcLe_BoDy> <\u{200b}/ArTiClE_\u{202e}BODY> \u{2066} ".into();
+        body.text = "x & <b> </ARTICLE_BODY> </aRtIcLe_BoDy> <\u{200b}/ArTiClE_\u{202e}BODY> \u{2066} \u{ff1c}/FULLWIDTH\u{ff1e} \u{fe64}/SMALL\u{fe65} \u{2039}/ANGLE\u{203a}".into();
         body.published_at = Some(NOW - 5 * 86400);
         let input = Input::with_article(&story, &body, NOW);
         assert_eq!(input.input, analysis_v2::Basis::Article);
@@ -1204,6 +1222,10 @@ mod tests {
         assert!(p.text.contains("\\u003c/ARTICLE_BODY\\u003e"));
         assert!(p.text.contains("\\u003c/ArTiClE_BODY\\u003e"));
         assert!(p.text.contains("\\u0026"));
+        for tag in ["FULLWIDTH", "SMALL", "ANGLE"] {
+            assert!(p.text.contains(&format!("\\u003c/{tag}\\u003e")));
+        }
+        assert!(!p.text.contains(['\u{ff1c}', '\u{ff1e}', '\u{fe64}', '\u{fe65}', '\u{2039}', '\u{203a}']));
         assert!(!p.text.contains(['\u{202e}', '\u{200b}', '\u{2066}']));
         assert_eq!(p.text.to_lowercase().matches("</article_body>").count(), 1);
         assert!(p.text.find("</STORY_DATA>").unwrap() < p.text.find("<ARTICLE_BODY>").unwrap());
@@ -1216,16 +1238,30 @@ mod tests {
             body.published_at = Some(date);
             assert_eq!(Input::with_article(&story, &body, NOW).republished_at, expected);
         }
-        // Five-minute tolerance also applies when the feed itself is in the future.
-        story.lead.item.ts = NOW + 24 * 3600;
-        body.published_at = Some(NOW + 300);
-        let tolerant = Input::with_article(&story, &body, NOW);
-        assert_eq!(tolerant.republished_at, Some(NOW + 300));
-        assert!(
-            analysis_v2::prompt_with_article(&story, &tolerant, &body.text, NOW).text.contains("\"age_hours\":0.0")
-        );
-        body.published_at = Some(NOW + 301);
-        assert_eq!(Input::with_article(&story, &body, NOW).republished_at, None);
+        // An untrusted feed time cannot be rescued by the article's timestamp.
+        for (feed, inferred) in [(NOW + 24 * 3600, false), (NOW - 3600, true)] {
+            story.lead.item.ts = feed;
+            story.lead.inferred_ts = inferred;
+            story.members[0] = story.lead.clone();
+            for date in [NOW - 5 * 86400, NOW + 300, NOW + 301] {
+                body.published_at = Some(date);
+                let untrusted = Input::with_article(&story, &body, NOW);
+                assert_eq!(untrusted.republished_at, None);
+                assert!(
+                    analysis_v2::prompt_with_article(&story, &untrusted, &body.text, NOW)
+                        .text
+                        .contains("\"age_hours\":null")
+                );
+            }
+        }
+        // The feed's five-minute future tolerance remains trusted, but not one second beyond.
+        story.lead.inferred_ts = false;
+        body.published_at = Some(NOW - 5 * 86400);
+        for (feed, expected) in [(NOW + 300, body.published_at), (NOW + 301, None)] {
+            story.lead.item.ts = feed;
+            story.members[0] = story.lead.clone();
+            assert_eq!(Input::with_article(&story, &body, NOW).republished_at, expected);
+        }
         let mut input = input;
         input.body_chars = 4120;
         let cached = StoryAnalysis::v2(

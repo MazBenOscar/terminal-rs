@@ -1409,6 +1409,100 @@ fn n8_noarchive_flag_overrides_ok_and_removes_previously_stored_text() {
 }
 
 #[test]
+fn n8_story_body_failures_cannot_overwrite_ok() {
+    let now = 1_800_000_000;
+    let store = NewsStore::memory().unwrap();
+    let url = "https://fixture.invalid/preserved";
+    let mut body = StoryBody::of(url, now, "ok");
+    body.text = "Preserved article".into();
+    body.chars = body.text.len();
+    body.etag = Some("preserved-validator".into());
+    store.save_story_body(&body).unwrap();
+    for status in [
+        "paywalled",
+        "no article text",
+        "robots.txt disallows",
+        "publisher refused (HTTP 403)",
+        "offline",
+        "fetch failed",
+        "noarchive",
+    ] {
+        store.save_story_body(&StoryBody::of(url, now + 1, status)).unwrap();
+        assert_eq!(store.story_body(url, now + 2).unwrap().unwrap(), body, "{status}");
+    }
+    body.text = "New successful article".into();
+    body.chars = body.text.len();
+    body.fetched_at += 3;
+    store.save_story_body(&body).unwrap();
+    assert_eq!(store.story_body(url, now + 4).unwrap().unwrap(), body);
+
+    let url = "https://fixture.invalid/negative-replaced";
+    for status in ["paywalled", "no article text", "ok"] {
+        let row = StoryBody::of(url, now, status);
+        store.save_story_body(&row).unwrap();
+        assert_eq!(store.story_body(url, now).unwrap().unwrap(), row);
+    }
+}
+
+#[test]
+fn n8_story_body_only_stable_failures_are_cached_including_legacy_rows() {
+    use tr_net::publisher::Reason;
+    let now = 1_800_000_000;
+    let store = NewsStore::memory().unwrap();
+    for (i, reason) in [
+        Reason::Offline,
+        Reason::Disabled,
+        Reason::Pacing,
+        Reason::Budget,
+        Reason::Cooldown,
+        Reason::Transport,
+        Reason::Ledger,
+        Reason::RobotsUnavailable,
+        Reason::Refused(429),
+        Reason::Http(503),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let url = format!("https://fixture.invalid/transient-{i}");
+        let body = StoryBody::of(&url, now, &reason.to_string());
+        store.save_story_body(&body).unwrap();
+        let count: i64 = store.db.query_row("SELECT count(*) FROM story_body", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "{reason}");
+    }
+    let legacy = StoryBody::of("https://fixture.invalid/legacy", now, "publisher rate limited");
+    store
+        .db
+        .execute(
+            "INSERT INTO story_body(url_hash,url,fetched_at,chars,truncated,text,status) VALUES(?1,?2,?3,0,0,'',?4)",
+            params![legacy.url_hash, legacy.url, now, legacy.status],
+        )
+        .unwrap();
+    assert!(store.story_body(&legacy.url, now).unwrap().is_none());
+
+    for (i, reason) in [
+        Reason::Skipped,
+        Reason::NotHtml,
+        Reason::TooLarge,
+        Reason::Robots,
+        Reason::Refused(403),
+        Reason::Refused(451),
+        Reason::Refused(404),
+        Reason::Refused(410),
+        Reason::Http(404),
+        Reason::Http(410),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let url = format!("https://fixture.invalid/stable-{i}");
+        let body = StoryBody::of(&url, now, &reason.to_string());
+        store.save_story_body(&body).unwrap();
+        assert_eq!(store.story_body(&url, now).unwrap().unwrap(), body);
+    }
+}
+
+#[test]
 fn n8_story_body_round_trips_and_failure_rows_expire_after_a_day() {
     let now = 1_800_000_000;
     let store = NewsStore::memory().unwrap();

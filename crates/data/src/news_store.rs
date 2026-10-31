@@ -89,6 +89,29 @@ pub struct StoryBody {
 }
 
 impl StoryBody {
+    /// Only successful articles and stable article/publisher policy outcomes are cacheable.
+    /// Transient network/guard failures must remain retryable, including in older databases.
+    pub fn cacheable(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "ok" | "noarchive"
+                | "paywalled"
+                | "no article text"
+                | "not an article page"
+                | "not HTML"
+                | "robots.txt"
+                | "robots.txt disallows"
+                | "publisher refused (HTTP 403)"
+                | "publisher refused (HTTP 451)"
+                | "publisher refused (HTTP 404)"
+                | "publisher refused (HTTP 410)"
+                | "publisher error (HTTP 404)"
+                | "publisher error (HTTP 410)"
+                | "page too large"
+                | "publisher not fetched"
+        )
+    }
+
     /// Start from a canonical URL and a status. Tracking parameters are removed exactly as the
     /// story normalizer removes them, so the same article cannot be fetched under two keys.
     /// Keyed URLs and `Reason::KeyedLink` refusals must never be saved, even as negative-cache
@@ -744,14 +767,17 @@ impl NewsStore {
                 },
             )
             .optional()?;
-        Ok(body.filter(|body| body.status == "ok" || now.saturating_sub(body.fetched_at) < STORY_BODY_NEGATIVE_TTL))
+        Ok(body.filter(|body| {
+            body.cacheable() && (body.status == "ok" || now.saturating_sub(body.fetched_at) < STORY_BODY_NEGATIVE_TTL)
+        }))
     }
     /// Store an article or a failure status. Pages marked noarchive never persist their text,
     /// but the row still records why so the URL is not fetched again today. Callers must set
     /// `noarchive = article.noarchive || fetched.noarchive` before saving. Keyed URLs and
     /// KeyedLink refusals are never stored at all (including their URL or failure status).
     pub fn save_story_body(&self, body: &StoryBody) -> Result<()> {
-        if reqwest::Url::parse(&body.url).ok().is_some_and(|url| tr_net::publisher::is_keyed_url(&url))
+        if !body.cacheable()
+            || reqwest::Url::parse(&body.url).ok().is_some_and(|url| tr_net::publisher::is_keyed_url(&url))
             || body.status == tr_net::publisher::Reason::KeyedLink.to_string()
             || matches!(body.status.to_ascii_lowercase().as_str(), "keyedlink" | "keyed_link")
         {
@@ -769,8 +795,12 @@ impl NewsStore {
         let text = if store_text { body.text.as_str() } else { "" };
         let chars = if store_text { body.chars } else { 0 };
         let truncated = store_text && body.truncated;
+        // Atomically preserve a successful article against late failures. A newly successful
+        // noarchive response still redacts old text, even though its stored status is noarchive.
         self.db.execute(
-            "INSERT OR REPLACE INTO story_body(url_hash,url,fetched_at,published_at,chars,truncated,etag,text,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT OR REPLACE INTO story_body(url_hash,url,fetched_at,published_at,chars,truncated,etag,text,status)
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9
+             WHERE ?10 OR NOT EXISTS(SELECT 1 FROM story_body WHERE url_hash=?1 AND status='ok')",
             params![
                 url_hash,
                 url,
@@ -780,7 +810,8 @@ impl NewsStore {
                 i64::from(truncated),
                 if noarchive { None } else { body.etag.as_deref() },
                 text,
-                status
+                status,
+                body.status == "ok"
             ],
         )?;
         Ok(())

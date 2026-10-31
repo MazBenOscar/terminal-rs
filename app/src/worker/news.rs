@@ -700,17 +700,9 @@ where
     Fut: std::future::Future<Output = Result<tr_net::publisher::Fetched, tr_net::publisher::Reason>>,
 {
     let failure = tr_data::news_store::StoryBody::of(&url, chrono::Utc::now().timestamp(), "fetch failed");
-    let mut body = tokio::time::timeout(deadline, article_body(s, url, enabled, fetch)).await.unwrap_or_else(|_| {
-        // Recording a timeout must not extend the UI's deadline on a busy database.
-        let saved = failure.clone();
-        let s = Arc::clone(s);
-        tokio::task::spawn_blocking(move || {
-            if let Some(store) = s.news.store.blocking_lock().as_ref() {
-                let _ = store.save_story_body(&saved);
-            }
-        });
-        failure
-    });
+    // Timeouts are transient: do not launch a detached negative-cache write. Any save already
+    // in flight independently obeys the store's cacheability and successful-row guards.
+    let mut body = tokio::time::timeout(deadline, article_body(s, url, enabled, fetch)).await.unwrap_or(failure);
     // No URL or response validators need to cross back to the UI, even on cache hits.
     body.url.clear();
     body.etag = None;
@@ -777,8 +769,9 @@ where
         }
         Err(reason) => failure(&reason.to_string()),
     };
-    // Never persist credentials, even as a negative row. The store independently enforces this.
-    if body.status != Reason::KeyedLink.to_string() {
+    // Cache only stable article/policy outcomes, never transient refusals or credentials.
+    // The store independently enforces this, including for saves that outlive the deadline.
+    if body.cacheable() {
         let saved = body.clone();
         let _ = blocking(s, move |s| {
             if let Some(store) = s.news.store.blocking_lock().as_ref() {
@@ -1448,11 +1441,13 @@ mod tests {
         let body = article_body(&s, url.into(), true, forbidden).await;
         assert_eq!(body.text, "Cached article");
         assert_eq!(article_body(&s, url.into(), false, forbidden).await.status, "disabled");
-        for status in ["paywalled", "robots.txt disallows", "publisher rate limited", "no article text"] {
-            let negative = StoryBody::of(url, now - 23 * 3600, status);
+        for (i, status) in ["paywalled", "robots.txt disallows", "no article text"].into_iter().enumerate() {
+            let url = format!("https://fixture.invalid/negative-{i}");
+            let negative = StoryBody::of(&url, now - 23 * 3600, status);
             s.news.store.lock().await.as_ref().unwrap().save_story_body(&negative).unwrap();
-            assert_eq!(article_body(&s, url.into(), true, forbidden).await.status, status);
+            assert_eq!(article_body(&s, url, true, forbidden).await.status, status);
         }
+        let url = "https://fixture.invalid/expired";
         let negative = StoryBody::of(url, now - 86400, "paywalled");
         s.news.store.lock().await.as_ref().unwrap().save_story_body(&negative).unwrap();
         let calls = std::cell::Cell::new(0);
@@ -1507,6 +1502,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_n8s4_transient_refusal_not_negative_cached() {
+        use tr_net::publisher::Reason;
+        let (s, _) = fixture_shared();
+        *s.news.store.lock().await = Some(NewsStore::memory().unwrap());
+        for (i, reason) in [
+            Reason::Pacing,
+            Reason::Offline,
+            Reason::Disabled,
+            Reason::Budget,
+            Reason::Cooldown,
+            Reason::Transport,
+            Reason::Ledger,
+            Reason::RobotsUnavailable,
+            Reason::Refused(429),
+            Reason::Http(503),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let url = format!("https://fixture.invalid/transient-{i}");
+            let first = article_body(&s, url.clone(), true, |_| async move { Err(reason) }).await;
+            assert_ne!(first.status, "ok");
+            let now = chrono::Utc::now().timestamp();
+            assert!(s.news.store.lock().await.as_ref().unwrap().story_body(&url, now).unwrap().is_none());
+            // The user retries a moment later (host slot free / back online): success is allowed.
+            let calls = std::cell::Cell::new(0);
+            let paragraph =
+                "Synthetic reporting describes production and delivery schedules at a fictional factory. ".repeat(4);
+            let body = article_body(&s, url.clone(), true, |url| async {
+                calls.set(calls.get() + 1);
+                Ok(tr_net::publisher::Fetched {
+                    url,
+                    html: format!("<article><p>{paragraph}</p><p>{paragraph}</p><p>{paragraph}</p></article>"),
+                    etag: None,
+                    noarchive: false,
+                    fetched_at: now,
+                })
+            })
+            .await;
+            assert_eq!(calls.get(), 1, "transient refusal must not block re-fetch for 24 h");
+            assert_eq!(body.status, "ok");
+            assert!(!body.text.is_empty());
+            assert_eq!(s.news.store.lock().await.as_ref().unwrap().story_body(&url, now).unwrap().unwrap(), body);
+        }
+    }
+
+    #[tokio::test]
     async fn n8_total_deadline_bounds_stalled_fetch_and_busy_cache() {
         let (s, _) = fixture_shared();
         *s.news.store.lock().await = Some(NewsStore::memory().unwrap());
@@ -1524,7 +1566,13 @@ mod tests {
             })
             .await;
         assert_eq!(body.status, "fetch failed");
-        drop(lock); // Let detached cache work finish without delaying either response.
+        drop(lock); // Let the cancelled lookup finish without delaying either response.
+        let now = chrono::Utc::now().timestamp();
+        let store = s.news.store.lock().await;
+        let store = store.as_ref().unwrap();
+        for url in ["https://fixture.invalid/stalled", "https://fixture.invalid/busy"] {
+            assert!(store.story_body(url, now).unwrap().is_none(), "timeouts must never be negative-cached");
+        }
     }
 
     #[tokio::test]
