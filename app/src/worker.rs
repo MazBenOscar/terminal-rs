@@ -381,6 +381,11 @@ pub enum Request {
         symbol: String,
         depth: usize,
     },
+    /// Company profile for one symbol (`/stock/profile2`), fetched on demand.
+    CompanyProfile {
+        pane: PaneId,
+        symbol: String,
+    },
     History {
         pane: PaneId,
         generation: u64,
@@ -772,6 +777,14 @@ pub enum Response {
         symbol: String,
         book: Result<tr_data::OrderBook, String>,
     },
+    /// The profile to show with its fetch time (stale when a refresh failed), and the
+    /// state explaining anything missing.
+    CompanyProfile {
+        pane: PaneId,
+        symbol: String,
+        profile: Option<(tr_data::finnhub::CompanyProfile, i64)>,
+        state: crate::app::company_view::CompanyState,
+    },
     History {
         pane: PaneId,
         generation: u64,
@@ -925,6 +938,9 @@ fn study_history_fresh(c: &StudyHistory, end: i64, start: i64, limit: usize, now
 }
 
 type StudyFetches = HashMap<(String, Timeframe), Arc<Mutex<()>>>;
+
+/// One company-profile fetch per symbol; later panes wait for it instead of refetching.
+type ProfileFetches = HashMap<String, Arc<Mutex<()>>>;
 
 type StudyLines = HashMap<(usize, String), tr_chart::gpu::LineRef>;
 
@@ -1147,6 +1163,7 @@ struct Shared {
     study_outputs: std::sync::Mutex<HashMap<PaneId, Arc<std::sync::Mutex<StudyPaneCache>>>>,
     compare_outputs: std::sync::Mutex<HashMap<(PaneId, String), CompareCache>>,
     study_fetches: std::sync::Mutex<StudyFetches>,
+    profile_fetches: std::sync::Mutex<ProfileFetches>,
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
     /// tagged with the pane's load generation.
     series: std::sync::Mutex<SeriesMap>,
@@ -1233,6 +1250,7 @@ impl Worker {
             study_outputs: Default::default(),
             compare_outputs: Default::default(),
             study_fetches: Default::default(),
+            profile_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(cache),
@@ -2736,6 +2754,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let book = s.provider.order_book(&symbol, depth).await.map_err(|e| format!("{e:#}"));
             s.send(Response::OrderBook { pane, symbol, book });
         }
+        Request::CompanyProfile { pane, symbol } => news::company_profile(s, pane, symbol, tr_net::shared()).await,
         Request::SymbolCatalog(venue) => {
             let result = s.provider.crypto_catalog(venue).await.map(|c| c.products).map_err(|e| format!("{e:#}"));
             s.send(Response::SymbolCatalog { venue, result });
@@ -3557,6 +3576,7 @@ mod tests {
                 study_outputs: Default::default(),
                 compare_outputs: Default::default(),
                 study_fetches: Default::default(),
+                profile_fetches: Default::default(),
                 names: Mutex::new(None),
                 series: Default::default(),
                 cache: std::sync::Mutex::new(None),
@@ -4736,6 +4756,7 @@ mod tests {
             study_outputs: Default::default(),
             compare_outputs: Default::default(),
             study_fetches: Default::default(),
+            profile_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
@@ -4886,6 +4907,7 @@ mod tests {
             study_outputs: Default::default(),
             compare_outputs: Default::default(),
             study_fetches: Default::default(),
+            profile_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
@@ -4973,6 +4995,7 @@ mod tests {
             study_outputs: Default::default(),
             compare_outputs: Default::default(),
             study_fetches: Default::default(),
+            profile_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
@@ -5055,6 +5078,7 @@ mod tests {
             study_outputs: Default::default(),
             compare_outputs: Default::default(),
             study_fetches: Default::default(),
+            profile_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),
@@ -5144,6 +5168,7 @@ mod tests {
             study_outputs: Default::default(),
             compare_outputs: Default::default(),
             study_fetches: Default::default(),
+            profile_fetches: Default::default(),
             names: Mutex::new(None),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),

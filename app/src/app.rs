@@ -10,6 +10,7 @@ mod agent_ui;
 mod broker;
 mod chrome;
 mod columns_view;
+pub(crate) mod company_view;
 pub(crate) mod data_sources;
 // SENATE-BARGO
 pub(crate) mod bargo;
@@ -128,6 +129,8 @@ pub enum PaneKind {
     Filings(crate::filings_view::Settings),
     OrderBook(Box<BookPane>),
     Options(Box<OptionsPane>),
+    /// Company profile for one symbol (Finnhub `/stock/profile2`, `DES`).
+    Company(Box<company_view::CompanyPane>),
     /// Brokerage accounts through SnapTrade (`PORT`, `ACCT`, `POS`, `ORD`, `ACTV`).
     Portfolio(Box<broker::PortfolioPane>),
     Settings,
@@ -386,6 +389,7 @@ impl PaneKind {
             }
             PaneKind::OrderBook(b) => format!("{} Depth", short(&b.symbol)),
             PaneKind::Options(o) => format!("{} Options", short(&o.symbol)),
+            PaneKind::Company(c) => format!("{} Company", short(&c.symbol)),
             PaneKind::Portfolio(p) => p.title(),
             PaneKind::Settings => "Settings".into(),
             PaneKind::Agent(_) => "Agent".into(),
@@ -412,6 +416,7 @@ impl PaneKind {
             PaneKind::Filings(_) => "CF",
             PaneKind::OrderBook(_) => "OB",
             PaneKind::Options(_) => "OMON",
+            PaneKind::Company(_) => "DES",
             PaneKind::Portfolio(p) => p.view.code(),
             PaneKind::Settings => "PDF",
             PaneKind::Agent(_) => "AGENT",
@@ -428,6 +433,7 @@ impl PaneKind {
             PaneKind::Filings(f) => f.symbol.as_deref(),
             PaneKind::OrderBook(b) => Some(&b.symbol),
             PaneKind::Options(o) => Some(&o.symbol),
+            PaneKind::Company(c) => Some(&c.symbol),
             _ => None,
         }
     }
@@ -442,6 +448,7 @@ impl PaneKind {
                 | PaneKind::Filings(_)
                 | PaneKind::OrderBook(_)
                 | PaneKind::Options(_)
+                | PaneKind::Company(_)
         )
     }
 
@@ -505,6 +512,7 @@ impl PaneKind {
             PaneKind::OrderBook(b) => {
                 PaneSettings::OrderBook { symbol: b.symbol.clone(), depth: b.depth, group: b.group }
             }
+            PaneKind::Company(c) => PaneSettings::Company(c.symbol.clone()),
             PaneKind::Settings => PaneSettings::Settings,
             PaneKind::Agent(settings) => PaneSettings::Agent(settings.clone()),
             PaneKind::Story { link_follow } => PaneSettings::Story { link_follow: *link_follow },
@@ -595,6 +603,7 @@ impl PaneKind {
             PaneSettings::OrderBook { symbol, depth, group } => {
                 PaneKind::OrderBook(Box::new(BookPane::new(&symbol, depth, group)))
             }
+            PaneSettings::Company(symbol) => PaneKind::Company(Box::new(company_view::CompanyPane::new(&symbol))),
             PaneSettings::Settings => PaneKind::Settings,
             PaneSettings::Options { symbol, strikes, greeks } => {
                 PaneKind::Options(Box::new(OptionsPane::new(&symbol, strikes, greeks)))
@@ -1868,6 +1877,10 @@ impl TerminalApp {
                 self.open_panel(PaneKind::Options(Box::new(OptionsPane::new(&s, 12, true))));
                 self.status = format!("{s}: option chain");
             }
+            Command::SymbolFunction(s, Function::Company) => {
+                self.open_panel(PaneKind::Company(Box::new(company_view::CompanyPane::new(&s))));
+                self.status = format!("{s}: company profile");
+            }
             Command::SymbolFunction(s, Function::Portfolio(view, arg)) => self.portfolio_command(view, &arg, Some(s)),
             Command::SymbolFunction(s, Function::Trade(mut t)) => {
                 t.symbol = Some(s);
@@ -2046,6 +2059,10 @@ impl TerminalApp {
             Function::Options => {
                 let sym = self.optionable_symbol();
                 self.open_panel(PaneKind::Options(Box::new(OptionsPane::new(&sym, 12, true))));
+            }
+            Function::Company => {
+                let sym = self.focused_symbol().unwrap_or_else(|| "AAPL US Equity".into());
+                self.open_panel(PaneKind::Company(Box::new(company_view::CompanyPane::new(&sym))));
             }
             Function::Sidebar(arg) => {
                 let side = &mut self.prefs.appearance.sidebar_side;
@@ -2596,6 +2613,17 @@ impl TerminalApp {
                             }
                             Err(e) => b.error = Some(e),
                         }
+                    }
+                }
+                Response::CompanyProfile { pane, symbol, profile, state } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::Company(c) = &mut p.kind
+                        && c.symbol == symbol
+                    {
+                        // The reply is authoritative: a failed refresh keeps the stale
+                        // profile it carries, and the state says why.
+                        c.profile = profile;
+                        c.state = state;
                     }
                 }
                 Response::Portfolio(result) => {

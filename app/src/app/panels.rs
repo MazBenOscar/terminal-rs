@@ -246,6 +246,12 @@ impl TerminalApp {
                     actions.push(a);
                 }
             }
+            PaneKind::Company(c) => {
+                actions.extend(super::company_view::show(ui, id, c));
+                if std::mem::take(&mut c.open_data_sources) {
+                    self.settings_tab = super::SettingsTab::DataSources;
+                }
+            }
             PaneKind::Scanner(s) => {
                 ui.data_mut(|d| d.insert_temp(egui::Id::new("security-names"), self.security_names.clone()));
                 let market = s.universe != tr_data::universe::Universe::Watchlist;

@@ -280,3 +280,127 @@ fn review_parse_bad_items_null_strings_dates_and_catalog_chips() {
     assert!(items[0].summary.is_empty());
     assert_eq!(parse(body, Some("TSLA US Equity")).unwrap()[1].item.tickers, vec!["TSLA US Equity"]);
 }
+
+const PROFILE_FULL: &[u8] = br#"{"country":"US","currency":"USD","exchange":"NASDAQ NMS - GLOBAL MARKET","finnhubIndustry":"Technology","ipo":"1980-12-12","logo":"https://ignored.invalid/logo.png","marketCapitalization":3120000,"name":"Apple Inc.","phone":"14089961010","shareOutstanding":15500.0,"ticker":"AAPL","weburl":"https://www.apple.com"}"#;
+#[test]
+fn profile_parsing_full_empty_partial_and_malformed() {
+    let profile = parse_profile(PROFILE_FULL).unwrap().unwrap();
+    assert_eq!(profile.name, "Apple Inc.");
+    assert_eq!(profile.ticker, "AAPL");
+    assert_eq!(profile.exchange, "NASDAQ NMS - GLOBAL MARKET");
+    assert_eq!(profile.currency, "USD");
+    assert_eq!(profile.country, "US");
+    assert_eq!(profile.industry, "Technology");
+    assert_eq!(profile.ipo, "1980-12-12");
+    assert_eq!(profile.weburl, "https://www.apple.com");
+    assert_eq!(profile.market_cap, 3_120_000.0);
+    assert_eq!(profile.shares_out, 15_500.0);
+    // An unknown symbol answers an empty object, and a body of only ignored fields too.
+    assert_eq!(parse_profile(b"{}").unwrap(), None);
+    assert_eq!(parse_profile(br#"{"logo":"https://ignored.invalid/logo.png"}"#).unwrap(), None);
+    // Missing fields default instead of failing the row.
+    let partial = parse_profile(br#"{"name":"Partial Corp","marketCapitalization":2500.5}"#).unwrap().unwrap();
+    assert_eq!(partial.name, "Partial Corp");
+    assert_eq!(partial.ticker, "");
+    assert_eq!(partial.industry, "");
+    assert_eq!(partial.market_cap, 2500.5);
+    assert_eq!(partial.shares_out, 0.0);
+    let malformed: &[&[u8]] =
+        &[b"", b"{bad", b"[1,2,3]", b"null", br#"{"name":5}"#, br#"{"marketCapitalization":"n/a"}"#];
+    for bad in malformed {
+        assert!(parse_profile(bad).is_err(), "{bad:?} must not parse");
+    }
+}
+#[tokio::test]
+async fn guarded_profile_request_hides_key_and_skips_non_equities() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data").join(format!(
+        "finnhub-profile-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap()).parse().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = vec![];
+        for body in [PROFILE_FULL, b"{}" as &[u8]] {
+            let (mut stream, _) =
+                tokio::time::timeout(Duration::from_secs(10), listener.accept()).await.unwrap().unwrap();
+            let mut bytes = vec![];
+            loop {
+                let mut buf = [0; 2048];
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            requests.push(String::from_utf8(bytes).unwrap());
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        }
+        requests
+    });
+    let config = tr_net::Config {
+        ledger: root.join("ledger.sqlite3"),
+        data_dir: Some(root.join("instance")),
+        allow_external: true,
+        max_wait: Duration::from_secs(5),
+    };
+    let guard = Guard::for_fixture(config, tr_net::Settings::default(), base).unwrap();
+    let client = Client::default();
+    // Keys that are not US equities never reach the network.
+    for key in ["BTCUSD Curncy", "SPX Index", "US10Y Govt", "AAPL", "VOD LN Equity"] {
+        assert_eq!(client.company_profile(&guard, "fixture-secret", key).await, Ok(None), "{key}");
+    }
+    let profile = client.company_profile(&guard, "fixture-secret", "AAPL US Equity").await.unwrap().unwrap();
+    assert_eq!(profile.name, "Apple Inc.");
+    assert_eq!(profile.market_cap, 3_120_000.0);
+    // `{}` is a miss, not an error.
+    assert_eq!(client.company_profile(&guard, "fixture-secret", "MSFT US Equity").await, Ok(None));
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2, "non-equities must not request");
+    assert!(requests[0].starts_with("GET /api/v1/stock/profile2?symbol=AAPL "), "{}", requests[0]);
+    assert!(requests[1].starts_with("GET /api/v1/stock/profile2?symbol=MSFT "), "{}", requests[1]);
+    for request in requests {
+        assert!(!request.lines().next().unwrap().contains("secret"), "the key must stay out of the URL");
+        assert!(request.to_lowercase().contains("x-finnhub-token: fixture-secret"));
+    }
+    drop(guard);
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn company_profile_cache_hit_ttl_expiry_and_miss_caching() {
+    use crate::news_store::{COMPANY_PROFILE_MISS_TTL, COMPANY_PROFILE_TTL, CachedProfile};
+    let store = NewsStore::memory().unwrap();
+    let now = 1793016000;
+    let profile = CompanyProfile { name: "Apple Inc.".into(), ticker: "AAPL".into(), ..Default::default() };
+    assert!(store.company_profile("AAPL US Equity").unwrap().is_none());
+    store.save_company_profile("AAPL US Equity", Some(&profile), now).unwrap();
+    let hit = store.company_profile("AAPL US Equity").unwrap().unwrap();
+    assert_eq!(hit.profile, Some(profile));
+    assert_eq!(hit.fetched_at, now);
+    assert!(hit.fresh(now + 60), "a reopening pane reuses the stored profile");
+    assert!(!hit.fresh(now + COMPANY_PROFILE_TTL), "profiles expire after 7 days");
+    // Unknown symbols are remembered for a day only.
+    store.save_company_profile("NOSUCH US Equity", None, now).unwrap();
+    let miss = store.company_profile("NOSUCH US Equity").unwrap().unwrap();
+    assert_eq!(miss, CachedProfile { profile: None, fetched_at: now });
+    assert!(miss.fresh(now + COMPANY_PROFILE_MISS_TTL - 1));
+    assert!(!miss.fresh(now + COMPANY_PROFILE_MISS_TTL));
+    // Re-saving refreshes the clock; a refused request never calls save at all.
+    store.save_company_profile("NOSUCH US Equity", None, now + 100).unwrap();
+    assert!(
+        store.company_profile("NOSUCH US Equity").unwrap().unwrap().fresh(now + 100 + COMPANY_PROFILE_MISS_TTL - 1)
+    );
+    assert_eq!(store.company_profile("AAPL US Equity").unwrap().unwrap().fetched_at, now);
+}

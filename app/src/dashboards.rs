@@ -46,7 +46,7 @@ pub const ALL: &[Dashboard] = &[
     Dashboard {
         id: "NAME",
         name: "Single-name desk",
-        description: "Linked AAPL chart, options with greeks, symbol news and congressional trades",
+        description: "Linked AAPL chart, options with greeks, symbol news, company profile and congressional trades",
         build: single_name,
         headline_tape: false,
         quote_strip: false,
@@ -171,21 +171,30 @@ fn single_name(defaults: &PanelDefaults) -> LayoutDoc {
             chart_settings("AAPL US Equity", defaults),
             PaneSettings::Options { symbol: "AAPL US Equity".into(), strikes: 10, greeks: true },
             PaneSettings::News(Some(news)),
+            PaneSettings::Company("AAPL US Equity".into()),
             PaneSettings::Ticker("AAPL US Equity".into()),
         ],
     );
-    // Chart dominates at 60% width; right 40% stacks options/news/congress trades 40:35:25.
+    // Chart dominates at 60% width; the right 40% stacks options/news 36:32:32 and keeps
+    // the company profile in front of the congress trades behind the same tab group.
     doc.dock = Node::split_with(
         Dir::Row,
         vec![
             Node::leaf(1),
-            Node::split_with(Dir::Column, vec![Node::leaf(2), Node::leaf(3), Node::leaf(4)], vec![0.40, 0.35, 0.25]),
+            Node::split_with(
+                Dir::Column,
+                vec![Node::leaf(2), Node::leaf(3), Node::Tabs { panes: vec![4, 5], active: 0 }],
+                vec![0.36, 0.32, 0.32],
+            ),
         ],
         vec![0.60, 0.40],
     );
     for pane in &mut doc.panes {
         pane.link = Some(Link::Orange);
     }
+    // Company and its congress tab share one group, where a shared link would hide the
+    // two linked panes from each other.
+    doc.panes[4].link = None;
     doc.focus = Some(1);
     doc
 }
@@ -434,21 +443,27 @@ mod tests {
     #[test]
     fn name_has_four_visible_aapl_panes_and_a_dominant_focused_chart() {
         let doc = build("NAME");
-        assert_eq!(doc.panes.len(), 4);
+        assert_eq!(doc.panes.len(), 5);
         assert_chart(&doc, 0, "AAPL US Equity");
         assert!(matches!(&doc.panes[1].settings,
             PaneSettings::Options { symbol, strikes: 10, greeks: true } if symbol == "AAPL US Equity"));
         let n = news(&doc, 2);
         assert_eq!(n.symbol.as_deref(), Some("AAPL US Equity"));
         assert_eq!(n.filters.scope, Scope::Symbol);
-        assert_eq!(doc.panes[3].settings, PaneSettings::Ticker("AAPL US Equity".into()));
-        assert_links(&doc, &[Some(Link::Orange); 4]);
+        assert_eq!(doc.panes[3].settings, PaneSettings::Company("AAPL US Equity".into()));
+        assert_eq!(doc.panes[4].settings, PaneSettings::Ticker("AAPL US Equity".into()));
+        // Company and its congress tab share a group, so the tab cannot share its link.
+        assert_links(&doc, &[Some(Link::Orange), Some(Link::Orange), Some(Link::Orange), Some(Link::Orange), None]);
         assert_eq!(doc.focus, Some(1));
         assert_eq!(doc.dock.visible(), [1, 2, 3, 4]);
         let Node::Split { dir: Dir::Row, shares, children } = &doc.dock else { panic!() };
         assert_eq!(shares, &[0.60, 0.40]);
         assert_eq!(children[0], Node::leaf(1));
-        assert!(matches!(&children[1], Node::Split { shares, .. } if shares == &[0.40, 0.35, 0.25]));
+        let Node::Split { dir: Dir::Column, shares, children } = &children[1] else { panic!() };
+        assert_eq!(shares, &[0.36, 0.32, 0.32]);
+        assert_eq!(children[0], Node::leaf(2));
+        assert_eq!(children[1], Node::leaf(3));
+        assert_eq!(children[2], Node::Tabs { panes: vec![4, 5], active: 0 });
     }
 
     #[test]

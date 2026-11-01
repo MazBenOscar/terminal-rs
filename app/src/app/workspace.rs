@@ -394,6 +394,10 @@ impl TerminalApp {
                 self.worker.send(Request::Profile { pane: id, query: query.clone() });
                 PaneKind::Profile { query, data: None, loading: true }
             }
+            PaneKind::Company(mut c) => {
+                c.request(id, &self.worker);
+                PaneKind::Company(c)
+            }
             k => k,
         }
     }
@@ -551,6 +555,12 @@ impl TerminalApp {
             PaneKind::Options(o) => {
                 if o.symbol != key {
                     **o = super::OptionsPane::new(&key, o.strikes, o.show_greeks);
+                }
+            }
+            PaneKind::Company(c) => {
+                if c.symbol != key {
+                    **c = super::company_view::CompanyPane::new(&key);
+                    c.request(id, &self.worker);
                 }
             }
             _ => return false,
@@ -2186,6 +2196,32 @@ mod tests {
             assert_eq!(c.symbol, "MSFT US Equity");
         }
         assert_eq!(app.current_doc().panes.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_company_pane_follows_the_group_and_asks_once_per_symbol() {
+        let (mut app, root) = fixture("company-link");
+        let (worker, mut requests) = Worker::recording();
+        app.worker = worker;
+        let company =
+            app.new_pane(PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity"))));
+        app.dock_pane(company, None, Zone::Right);
+        app.panes[0].link = Some(Link::Orange);
+        // Opening the pane asks the worker for its symbol.
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::CompanyProfile { symbol, .. }) if symbol == "AAPL US Equity")
+        );
+        app.broadcast(Link::Orange, "MSFT US Equity", None);
+        assert_eq!(app.panes[0].kind.symbol(), Some("MSFT US Equity"));
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::CompanyProfile { symbol, .. }) if symbol == "MSFT US Equity")
+        );
+        // Following the same symbol again asks for nothing more.
+        app.broadcast(Link::Orange, "MSFT US Equity", None);
+        assert!(requests.try_recv().is_err());
+        assert_eq!(app.panes[0].kind.settings(), crate::layouts::PaneSettings::Company("MSFT US Equity".into()));
+        assert!(app.dock.contains(company));
         std::fs::remove_dir_all(root).unwrap();
     }
 

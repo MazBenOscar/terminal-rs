@@ -79,7 +79,7 @@ that is in progress. RESEARCH reduces to a preset of News, Story and Agent, buil
 
 | Item | Size | Notes |
 |---|---|---|
-| G7 company-profile pane (NAME) | medium | Finnhub `/stock/profile2` is on the free tier and uses the user's key, through the guard. It shows name, sector, market cap and links. It would replace the politician-profile slot in NAME. |
+| G7 company-profile pane (NAME) | medium | Finnhub `/stock/profile2` is on the free tier and uses the user's key, through the guard. It shows name, sector, market cap and links. It would replace the politician-profile slot in NAME. **Built (G7): `DES`/`COMPANY` pane, on-demand `/stock/profile2` through the guard with a 7-day profile cache; NAME keeps chart, options, news and this profile in front of congress trades.** |
 | G5 empty-pane collapse | small | Changes the dock model, so it needs a deliberate design |
 | G4 dockable order ticket | medium | Touches `trading.rs`, which the plan forbids in phase 1. Needs an explicit go-ahead. |
 | G3 economic calendar | large | Needs a free event source through the guard. Most free calendars are scraped or premium, so research first. |

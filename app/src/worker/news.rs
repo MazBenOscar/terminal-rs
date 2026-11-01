@@ -783,6 +783,101 @@ where
     body
 }
 
+/// One company profile per symbol: a fresh cache row answers without a request, panes
+/// arriving during a fetch wait for it instead of refetching, and a refused request
+/// caches nothing but keeps the stored (stale) profile for the pane to show.
+pub(super) async fn company_profile(
+    s: &Arc<Shared>,
+    pane: PaneId,
+    symbol: String,
+    net: Result<&tr_net::Guard, tr_net::Refused>,
+) {
+    let fetch = {
+        let mut fetches = s.profile_fetches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        fetches.entry(symbol.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+    };
+    let fetch_guard = fetch.lock().await;
+    let now = chrono::Utc::now().timestamp();
+    let (profile, state) = profile_reply(s, &symbol, now, net).await;
+    drop(fetch_guard);
+    {
+        let mut fetches = s.profile_fetches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The map lock keeps a new waiter from racing the count check.
+        if Arc::strong_count(&fetch) == 2 {
+            fetches.remove(&symbol);
+        }
+    }
+    s.send(Response::CompanyProfile { pane, symbol, profile, state });
+}
+/// The stored profile inside its TTL, else one guarded fetch. Only an answer caches;
+/// the stale row travels back so a failure keeps the profile on screen.
+async fn profile_reply(
+    s: &Arc<Shared>,
+    symbol: &str,
+    now: i64,
+    net: Result<&tr_net::Guard, tr_net::Refused>,
+) -> (Option<(tr_data::finnhub::CompanyProfile, i64)>, crate::app::company_view::CompanyState) {
+    use crate::app::company_view::CompanyState;
+    let lookup = symbol.to_string();
+    let cached = blocking(s, move |s| {
+        s.news.store.blocking_lock().as_ref().and_then(|store| store.company_profile(&lookup).ok().flatten())
+    })
+    .await
+    .ok()
+    .flatten();
+    // Old data is kept for display, marked stale, when the refresh cannot run.
+    let stale = cached.as_ref().and_then(|c| c.profile.clone().map(|profile| (profile, c.fetched_at)));
+    if let Some(cached) = &cached
+        && cached.fresh(now)
+    {
+        return match &cached.profile {
+            Some(profile) => (Some((profile.clone(), cached.fetched_at)), CompanyState::Ready),
+            None => (None, CompanyState::Missing),
+        };
+    }
+    // Finnhub covers US equities; anything else is a state, never a request.
+    if finnhub::symbol(symbol).is_none() {
+        return (stale, CompanyState::NotEquity);
+    }
+    // Nothing is fetched without the Finnhub key from Settings › Data sources.
+    let key = s.news.key.lock().await.clone();
+    let Some(key) = key.filter(|key| !key.trim().is_empty()) else {
+        return (stale, CompanyState::NoKey);
+    };
+    let result = match net {
+        Ok(guard) => finnhub::Client::default().company_profile(guard, &key, symbol).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(profile) => {
+            // Only an answer is cached: a miss row for a day, a profile for a week.
+            let saved = profile.clone();
+            let lookup = symbol.to_string();
+            let _ = blocking(s, move |s| {
+                if let Some(store) = s.news.store.blocking_lock().as_ref() {
+                    let _ = store.save_company_profile(&lookup, saved.as_ref(), now);
+                }
+            })
+            .await;
+            match profile {
+                Some(profile) => (Some((profile, now)), CompanyState::Ready),
+                None => (None, CompanyState::Missing),
+            }
+        }
+        Err(error) => (stale, refusal_state(&error)),
+    }
+}
+/// A refusal becomes a pane state; the pane never retries one on its own.
+fn refusal_state(error: &tr_net::Refused) -> crate::app::company_view::CompanyState {
+    use crate::app::company_view::CompanyState;
+    match error {
+        tr_net::Refused::Disabled => CompanyState::SourcesOff,
+        tr_net::Refused::Budget | tr_net::Refused::Busy | tr_net::Refused::Paused { .. } => {
+            CompanyState::Failed(format!("Rate limited · {error}"))
+        }
+        _ => CompanyState::Failed(error.to_string()),
+    }
+}
 pub(super) async fn save_analysis(s: &Arc<Shared>, analysis: tr_data::news_store::StoryAnalysis) {
     let result = blocking(s, move |s| -> anyhow::Result<()> {
         s.news
@@ -2469,6 +2564,96 @@ mod tests {
         let limited = store.as_ref().unwrap().query(&q).unwrap();
         assert_eq!(limited.len(), 1, "Saved retains the usual query limit");
         assert_eq!(limited[0].id, old.id);
+    }
+    #[tokio::test]
+    async fn g7_company_profile_answers_from_cache_and_a_refusal_keeps_the_stale_row() {
+        use crate::app::company_view::CompanyState;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tr_data::finnhub::CompanyProfile;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data").join(format!(
+            "company-profile-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: reqwest::Url = format!("http://{}", listener.local_addr().unwrap()).parse().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) =
+                tokio::time::timeout(Duration::from_secs(10), listener.accept()).await.unwrap().unwrap();
+            let mut bytes = vec![];
+            loop {
+                let mut buf = [0; 2048];
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        let guard = tr_net::Guard::for_fixture(
+            tr_net::Config {
+                ledger: root.join("ledger.sqlite3"),
+                data_dir: Some(root.join("instance")),
+                allow_external: true,
+                max_wait: Duration::from_secs(5),
+            },
+            tr_net::Settings::default(),
+            base,
+        )
+        .unwrap();
+        let (s, rx) = fixture_shared();
+        let store = NewsStore::memory().unwrap();
+        let profile = CompanyProfile { name: "Apple Inc.".into(), ticker: "AAPL".into(), ..Default::default() };
+        let now = chrono::Utc::now().timestamp();
+        store.save_company_profile("AAPL US Equity", Some(&profile), now).unwrap();
+        *s.news.store.lock().await = Some(store);
+        *s.news.key.lock().await = Some("fixture-secret".into());
+        // A fresh row answers the pane without a request, so reopening costs nothing.
+        company_profile(&s, 1, "AAPL US Equity".into(), Ok(&guard)).await;
+        let Response::CompanyProfile { profile: shown, state, .. } = rx.try_recv().unwrap() else { panic!("reply") };
+        assert_eq!(state, CompanyState::Ready);
+        assert_eq!(shown, Some((profile.clone(), now)));
+        // Non-equities and keyless setups never reach the network.
+        company_profile(&s, 2, "BTCUSD Curncy".into(), Ok(&guard)).await;
+        let Response::CompanyProfile { profile: shown, state, .. } = rx.try_recv().unwrap() else { panic!("reply") };
+        assert_eq!((shown, state), (None, CompanyState::NotEquity));
+        *s.news.key.lock().await = None;
+        company_profile(&s, 3, "NVDA US Equity".into(), Ok(&guard)).await;
+        let Response::CompanyProfile { profile: shown, state, .. } = rx.try_recv().unwrap() else { panic!("reply") };
+        assert_eq!((shown, state), (None, CompanyState::NoKey));
+        *s.news.key.lock().await = Some("fixture-secret".into());
+        // A stale row is refreshed through the guard; a refusal keeps it on screen, stale,
+        // and caches nothing.
+        let stale_at = now - 8 * 86400;
+        s.news
+            .store
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .save_company_profile("MSFT US Equity", Some(&profile), stale_at)
+            .unwrap();
+        company_profile(&s, 4, "MSFT US Equity".into(), Ok(&guard)).await;
+        let Response::CompanyProfile { profile: shown, state, .. } = rx.try_recv().unwrap() else { panic!("reply") };
+        assert_eq!(state, CompanyState::Failed("HTTP 500".into()));
+        assert_eq!(shown, Some((profile, stale_at)), "the stale profile stays on screen");
+        let row = s.news.store.lock().await.as_ref().unwrap().company_profile("MSFT US Equity").unwrap().unwrap();
+        assert_eq!(row.fetched_at, stale_at, "a refused request caches nothing");
+        assert!(!row.fresh(now));
+        // The one request carried the key as a sensitive header, never in the URL.
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /api/v1/stock/profile2?symbol=MSFT "), "{request}");
+        assert!(!request.lines().next().unwrap().contains("secret"));
+        assert!(request.to_lowercase().contains("x-finnhub-token: fixture-secret"));
+        drop(guard);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

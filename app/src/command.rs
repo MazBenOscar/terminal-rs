@@ -270,6 +270,8 @@ pub enum Function {
     OrderBook(Option<usize>),
     /// Option chain monitor (Bloomberg OMON).
     Options,
+    /// Company profile (Bloomberg DES).
+    Company,
     /// `SIDEBAR LEFT|RIGHT|TOGGLE|SHOW|HIDE|SWAP`.
     Sidebar(String),
     Settings,
@@ -469,6 +471,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "CF" | "FILINGS" => Function::Filings,
         "OB" | "BOOK" | "DEPTH" | "DOM" => Function::OrderBook(num(rest.first())),
         "OMON" | "OMST" | "OPT" | "OPTIONS" | "CHAIN" => Function::Options,
+        "DES" | "COMPANY" => Function::Company,
         "SIDEBAR" | "SB" => Function::Sidebar(words().join(" ")),
         "PREFS" | "SETTINGS" | "PDF" | "CONFIG" => Function::Settings,
         "UPDATE" | "UPDATES" => Function::Update,
@@ -642,6 +645,7 @@ fn describe(f: &Function) -> String {
         Function::Filings => "SEC EDGAR filings (watchlist only)".into(),
         Function::OrderBook(_) => "Order book (depth)".into(),
         Function::Options => "Option chain: calls and puts by strike, IV and greeks".into(),
+        Function::Company => "Company profile: exchange, industry, market cap and website".into(),
         Function::Sidebar(s) if s.is_empty() => "Toggle the sidebar".into(),
         Function::Sidebar(s) => format!("Sidebar {}", s.to_lowercase()),
         Function::Settings => "Settings: theme, fonts, density, hotkeys, panels, layouts".into(),
@@ -874,6 +878,23 @@ mod tests {
         assert_eq!(parse("SPX INDEX OMON"), Some(Command::SymbolFunction("SPX Index".into(), Function::Options)));
         assert_eq!(parse("OMON"), Some(Command::Function(Function::Options)));
         assert_eq!(parse("SIDEBAR RIGHT"), Some(Command::Function(Function::Sidebar("RIGHT".into()))));
+    }
+
+    #[test]
+    fn company_profile_is_des_or_company_without_collisions() {
+        assert_eq!(parse("DES"), Some(Command::Function(Function::Company)));
+        assert_eq!(parse("COMPANY"), Some(Command::Function(Function::Company)));
+        assert_eq!(parse("des"), Some(Command::Function(Function::Company)));
+        assert_eq!(parse("AAPL DES"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Company)));
+        assert_eq!(
+            parse("MSFT US EQUITY COMPANY"),
+            Some(Command::SymbolFunction("MSFT US Equity".into(), Function::Company))
+        );
+        // Neither name collides with a timeframe, range or the indicator catalog.
+        assert!(matches!(parse("DES"), Some(Command::Function(Function::Company))));
+        assert!(tr_core::indicators::registry::find("DES").is_none());
+        assert!(tr_core::indicators::registry::find("COMPANY").is_none());
+        assert!(hint("AAPL DES").contains("Company profile"));
     }
 
     #[test]
