@@ -83,4 +83,4 @@ that is in progress. RESEARCH reduces to a preset of News, Story and Agent, buil
 | G5 empty-pane collapse | small | Changes the dock model, so it needs a deliberate design |
 | G4 dockable order ticket | medium | Touches `trading.rs`, which the plan forbids in phase 1. Needs an explicit go-ahead. |
 | G3 economic calendar | large | Needs a free event source through the guard. Most free calendars are scraped or premium, so research first. |
-| Crypto desk | small | A crypto chart, the real crypto order book, crypto news and a scanner. This is the "Crypto dashboard" the user asked for earlier. |
+| Crypto desk | small | **Built** as the `CRYPTO` preset in `dashboards.rs` (Wave B). A crypto chart, the real crypto order book, crypto news and a scanner. This is the "Crypto dashboard" the user asked for earlier. |
