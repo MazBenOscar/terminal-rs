@@ -246,6 +246,12 @@ impl TerminalApp {
                     actions.push(a);
                 }
             }
+            PaneKind::Company(c) => {
+                actions.extend(super::company_view::show(ui, id, c));
+                if std::mem::take(&mut c.open_data_sources) {
+                    self.settings_tab = super::SettingsTab::DataSources;
+                }
+            }
             PaneKind::Scanner(s) => {
                 ui.data_mut(|d| d.insert_temp(egui::Id::new("security-names"), self.security_names.clone()));
                 let market = s.universe != tr_data::universe::Universe::Watchlist;
@@ -2244,5 +2250,29 @@ mod tests {
             app.watchlist.iter().filter(|s| **s == key("MSFT")).count() <= 1,
             "a repeated add must never duplicate the row"
         );
+    }
+
+    #[test]
+    fn simulated_order_books_are_badged_and_real_books_are_not() {
+        let ctx = egui::Context::default();
+        let badged = |book: OrderBook| {
+            let mut pane = super::super::BookPane::new(&book.symbol, 25, 10.0);
+            pane.book = Some(book);
+            let output = ui_frame(&ctx, Vec::new(), &mut |ui| {
+                order_book(ui, &mut pane);
+            });
+            labels(&output).iter().any(|text| text.contains("SIMULATED"))
+        };
+        assert!(
+            badged(tr_data::sample::simulated_book("AAPL US Equity", 190.0, 25, 1)),
+            "equity depth falls back to sample levels and must say so"
+        );
+        assert!(!badged(OrderBook {
+            symbol: "BTCUSD Curncy".into(),
+            bids: vec![(65_000.0, 1.5)],
+            asks: vec![(65_010.0, 2.0)],
+            source: "Binance".into(),
+            simulated: false,
+        }));
     }
 }

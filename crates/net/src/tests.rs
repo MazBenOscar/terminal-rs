@@ -629,12 +629,12 @@ async fn bounded_wait_uses_persisted_spacing() {
     let temp = Temp::new();
     let guard = temp.guard(false);
     let mut policy = policies()[0].clone();
-    policy.min_interval = Duration::from_millis(30);
+    policy.min_interval = Duration::from_millis(400);
     policy.per_minute = 2000;
     assert!(guard.reserve(&policy).unwrap().is_none());
     guard.db().unwrap().execute("DELETE FROM inflight", []).unwrap();
     assert!(guard.reserve(&policy).unwrap().is_some());
-    tokio::time::sleep(Duration::from_millis(35)).await;
+    tokio::time::sleep(Duration::from_millis(420)).await;
     assert!(guard.reserve(&policy).unwrap().is_none());
 }
 

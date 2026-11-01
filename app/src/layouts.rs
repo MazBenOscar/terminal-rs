@@ -178,6 +178,8 @@ pub enum PaneSettings {
         #[serde(default)]
         group: f64,
     },
+    /// Company profile for one symbol (Finnhub `/stock/profile2`, `DES`).
+    Company(String),
     Settings,
     Agent(crate::agent_pane::Settings),
     /// Option chain monitor.
@@ -822,8 +824,16 @@ mod tests {
             title: None,
             window: None,
         });
+        doc.panes.push(SavedPane {
+            id: 8,
+            settings: PaneSettings::Company("NVDA US Equity".into()),
+            link: Some(Link::Green),
+            title: None,
+            window: None,
+        });
         doc.dock.insert(1, Zone::Right, 5);
         doc.dock.insert(5, Zone::Center, 7);
+        doc.dock.insert(7, Zone::Center, 8);
         doc.panes[0].link = Some(Link::Blue);
         doc.focus = Some(5);
         doc.sidebar_side = Some(crate::prefs::SidebarSide::Right);
@@ -883,6 +893,22 @@ mod tests {
             let back: PaneSettings = serde_json::from_slice(&serde_json::to_vec(&pane).unwrap()).unwrap();
             assert_eq!(pane, back);
         }
+    }
+
+    #[test]
+    fn company_settings_round_trip_and_pre_company_layouts_load() {
+        let mut doc = LayoutDoc::preset("Company", Layout::One, vec![PaneSettings::Company("AAPL US Equity".into())]);
+        doc.panes[0].link = Some(Link::Orange);
+        let back = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(back.panes[0].settings, PaneSettings::Company("AAPL US Equity".into()));
+        assert_eq!(back.panes[0].link, Some(Link::Orange));
+        // A layout written before the company pane exists still loads unchanged.
+        let old = LayoutDoc::preset("Old", Layout::One, vec![PaneSettings::Ticker("AAPL US Equity".into())]);
+        let json = String::from_utf8(old.to_json()).unwrap();
+        assert!(!json.contains("Company"));
+        let loaded = LayoutDoc::from_json(json.as_bytes()).unwrap();
+        assert_eq!(loaded.panes[0].settings, PaneSettings::Ticker("AAPL US Equity".into()));
+        assert_eq!(loaded.version, FORMAT_VERSION);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::{
     news_store::{NewsStore, Story},
 };
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tr_net::{Guard, Refused};
 
 pub const CATEGORIES: [&str; 4] = ["general", "forex", "crypto", "merger"];
@@ -32,6 +32,74 @@ struct Wire {
     source: Option<String>,
     summary: Option<String>,
     url: Option<String>,
+}
+/// The company behind one US equity, from `/stock/profile2`. Fields Finnhub omits keep
+/// their defaults; `logo` is ignored and never fetched.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompanyProfile {
+    pub name: String,
+    pub ticker: String,
+    pub exchange: String,
+    pub currency: String,
+    pub country: String,
+    pub industry: String,
+    pub ipo: String,
+    pub weburl: String,
+    /// Market cap in millions of `currency`, as Finnhub reports it.
+    pub market_cap: f64,
+    /// Shares outstanding, millions.
+    pub shares_out: f64,
+}
+#[derive(Deserialize)]
+struct ProfileWire {
+    name: Option<String>,
+    ticker: Option<String>,
+    exchange: Option<String>,
+    currency: Option<String>,
+    country: Option<String>,
+    #[serde(rename = "finnhubIndustry")]
+    industry: Option<String>,
+    ipo: Option<String>,
+    weburl: Option<String>,
+    #[serde(rename = "marketCapitalization")]
+    market_cap: Option<f64>,
+    #[serde(rename = "shareOutstanding")]
+    shares_out: Option<f64>,
+}
+impl ProfileWire {
+    /// Finnhub answers `{}` (or nothing but ignored fields) for a symbol it does not know.
+    fn empty(&self) -> bool {
+        self.name.is_none()
+            && self.ticker.is_none()
+            && self.exchange.is_none()
+            && self.currency.is_none()
+            && self.country.is_none()
+            && self.industry.is_none()
+            && self.ipo.is_none()
+            && self.weburl.is_none()
+            && self.market_cap.is_none()
+            && self.shares_out.is_none()
+    }
+}
+/// A `/stock/profile2` body: `{}` is a miss, a partial object fills defaults, and
+/// anything malformed is an error.
+pub fn parse_profile(bytes: &[u8]) -> anyhow::Result<Option<CompanyProfile>> {
+    let wire: ProfileWire = serde_json::from_slice(bytes)?;
+    if wire.empty() {
+        return Ok(None);
+    }
+    Ok(Some(CompanyProfile {
+        name: wire.name.unwrap_or_default(),
+        ticker: wire.ticker.unwrap_or_default(),
+        exchange: wire.exchange.unwrap_or_default(),
+        currency: wire.currency.unwrap_or_default(),
+        country: wire.country.unwrap_or_default(),
+        industry: wire.industry.unwrap_or_default(),
+        ipo: wire.ipo.unwrap_or_default(),
+        weburl: wire.weburl.unwrap_or_default(),
+        market_cap: wire.market_cap.unwrap_or_default(),
+        shares_out: wire.shares_out.unwrap_or_default(),
+    }))
 }
 pub fn parse(bytes: &[u8], company: Option<&str>) -> anyhow::Result<Vec<Story>> {
     let items: Vec<serde_json::Value> = serde_json::from_slice(bytes)?;
@@ -85,6 +153,13 @@ impl Default for Client {
     }
 }
 impl Client {
+    /// GET through the guard with the credential as a sensitive header, never a query.
+    async fn get(&self, guard: &Guard, key: &str, path: &str, query: &[(&str, String)]) -> Result<Vec<u8>, Refused> {
+        let mut token = reqwest::header::HeaderValue::from_str(key.trim()).map_err(|_| Refused::InvalidRequest)?;
+        token.set_sensitive(true);
+        let req = self.client.get(format!("{}{path}", self.base)).query(query).header("X-Finnhub-Token", token);
+        guard.send("finnhub", req).await
+    }
     async fn fetch(
         &self,
         guard: &Guard,
@@ -93,11 +168,20 @@ impl Client {
         query: &[(&str, String)],
         company: Option<&str>,
     ) -> Result<Vec<Story>, Refused> {
-        let mut token = reqwest::header::HeaderValue::from_str(key.trim()).map_err(|_| Refused::InvalidRequest)?;
-        token.set_sensitive(true);
-        let req = self.client.get(format!("{}{path}", self.base)).query(query).header("X-Finnhub-Token", token);
-        let body = guard.send("finnhub", req).await?;
+        let body = self.get(guard, key, path, query).await?;
         parse(&body, company).map_err(|_| Refused::InvalidRequest)
+    }
+    /// `/stock/profile2` for one symbol. `Ok(None)` is a symbol Finnhub has no profile
+    /// for (or a key that is not an equity at all, which is never requested).
+    pub async fn company_profile(
+        &self,
+        guard: &Guard,
+        key: &str,
+        market_key: &str,
+    ) -> Result<Option<CompanyProfile>, Refused> {
+        let Some(ticker) = symbol(market_key) else { return Ok(None) };
+        let body = self.get(guard, key, "/stock/profile2", &[("symbol", ticker.to_string())]).await?;
+        parse_profile(&body).map_err(|_| Refused::InvalidRequest)
     }
     pub async fn company(
         &self,

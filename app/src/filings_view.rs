@@ -144,12 +144,13 @@ pub struct State {
     pub flags: tr_edgar::scheduler::StatusFlags,
 }
 pub fn safe_url(url: &str) -> bool {
-    reqwest::Url::parse(url).is_ok_and(|u| {
-        matches!(u.scheme(), "http" | "https")
-            && u.host_str().is_some()
-            && u.username().is_empty()
-            && u.password().is_none()
-    })
+    crate::app::external_url(url)
+        && reqwest::Url::parse(url).is_ok_and(|u| {
+            matches!(u.scheme(), "http" | "https")
+                && u.host_str().is_some()
+                && u.username().is_empty()
+                && u.password().is_none()
+        })
 }
 fn haystack(f: &Filing) -> String {
     format!(

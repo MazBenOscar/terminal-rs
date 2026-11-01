@@ -46,7 +46,7 @@ pub const ALL: &[Dashboard] = &[
     Dashboard {
         id: "NAME",
         name: "Single-name desk",
-        description: "Linked AAPL chart, options with greeks, symbol news and congressional trades",
+        description: "Linked AAPL chart, options with greeks, symbol news, company profile and congressional trades",
         build: single_name,
         headline_tape: false,
         quote_strip: false,
@@ -97,6 +97,14 @@ pub const ALL: &[Dashboard] = &[
         description: "Market stories and linked Story inspector; Analyze uses the linked Agent pane",
         build: research,
         headline_tape: true,
+        quote_strip: false,
+    },
+    Dashboard {
+        id: "CRYPTO",
+        name: "Crypto desk",
+        description: "Linked BTCUSD chart and book, crypto stories and a Binance spot scanner",
+        build: crypto_desk,
+        headline_tape: false,
         quote_strip: false,
     },
 ];
@@ -171,15 +179,16 @@ fn single_name(defaults: &PanelDefaults) -> LayoutDoc {
             chart_settings("AAPL US Equity", defaults),
             PaneSettings::Options { symbol: "AAPL US Equity".into(), strikes: 10, greeks: true },
             PaneSettings::News(Some(news)),
+            PaneSettings::Company("AAPL US Equity".into()),
             PaneSettings::Ticker("AAPL US Equity".into()),
         ],
     );
-    // Chart dominates at 60% width; right 40% stacks options/news/congress trades 40:35:25.
+    // Left 60%: chart/congress trades 72:28; right 40%: company/options/news 24:40:36, all visible.
     doc.dock = Node::split_with(
         Dir::Row,
         vec![
-            Node::leaf(1),
-            Node::split_with(Dir::Column, vec![Node::leaf(2), Node::leaf(3), Node::leaf(4)], vec![0.40, 0.35, 0.25]),
+            Node::split_with(Dir::Column, vec![Node::leaf(1), Node::leaf(5)], vec![0.72, 0.28]),
+            Node::split_with(Dir::Column, vec![Node::leaf(4), Node::leaf(2), Node::leaf(3)], vec![0.24, 0.40, 0.36]),
         ],
         vec![0.60, 0.40],
     );
@@ -340,6 +349,50 @@ fn research(_: &PanelDefaults) -> LayoutDoc {
     doc
 }
 
+fn crypto_desk(defaults: &PanelDefaults) -> LayoutDoc {
+    // Finnhub's crypto market job and CoinDesk stories both store the "crypto" category.
+    let news = NewsSettings {
+        filters: tr_data::news_store::Filters {
+            scope: tr_data::news_store::Scope::All,
+            categories: vec!["crypto".into()],
+            ..Default::default()
+        },
+        flash_high: true,
+        ..Default::default()
+    };
+    // Refresh stays off: a schedule runs the universe scan on the first frame instead of
+    // waiting for Run scan.
+    let scan = ScanSettings {
+        universe: tr_data::universe::Universe::BinanceSpot,
+        ..ScanSettings::from(tr_core::scanner::ScanDefinition::default())
+    };
+    let mut doc = LayoutDoc::preset(
+        "Crypto desk",
+        Layout::Grid2x2,
+        vec![
+            chart_settings("BTCUSD Curncy", defaults),
+            PaneSettings::OrderBook { symbol: "BTCUSD Curncy".into(), depth: 20, group: 10.0 },
+            PaneSettings::News(Some(news)),
+            PaneSettings::Scanner(scan),
+        ],
+    );
+    // Chart dominates at 60% width; left chart/scanner 68:32, right book/news 55:45.
+    doc.dock = Node::split_with(
+        Dir::Row,
+        vec![
+            Node::split_with(Dir::Column, vec![Node::leaf(1), Node::leaf(4)], vec![0.68, 0.32]),
+            Node::split_with(Dir::Column, vec![Node::leaf(2), Node::leaf(3)], vec![0.55, 0.45]),
+        ],
+        vec![0.60, 0.40],
+    );
+    doc.panes[0].link = Some(Link::Orange);
+    doc.panes[1].link = Some(Link::Orange);
+    // Scope::All news ignores incoming symbols, so it stays unlinked.
+    doc.panes[3].link = Some(Link::Orange);
+    doc.focus = Some(1);
+    doc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,7 +420,7 @@ mod tests {
         use std::collections::HashSet;
         assert_eq!(
             ALL.iter().map(|d| d.id).collect::<Vec<_>>(),
-            ["NEWS", "BRIEF", "NAME", "FLOW", "MACRO", "SCAN", "RISK", "WALL", "RESEARCH"]
+            ["NEWS", "BRIEF", "NAME", "FLOW", "MACRO", "SCAN", "RISK", "WALL", "RESEARCH", "CRYPTO"]
         );
         let mut names = HashSet::new();
         for dashboard in ALL {
@@ -432,23 +485,28 @@ mod tests {
     }
 
     #[test]
-    fn name_has_four_visible_aapl_panes_and_a_dominant_focused_chart() {
+    fn name_shows_all_five_linked_aapl_panes_and_a_dominant_focused_chart() {
         let doc = build("NAME");
-        assert_eq!(doc.panes.len(), 4);
+        assert_eq!(doc.panes.len(), 5);
         assert_chart(&doc, 0, "AAPL US Equity");
         assert!(matches!(&doc.panes[1].settings,
             PaneSettings::Options { symbol, strikes: 10, greeks: true } if symbol == "AAPL US Equity"));
         let n = news(&doc, 2);
         assert_eq!(n.symbol.as_deref(), Some("AAPL US Equity"));
         assert_eq!(n.filters.scope, Scope::Symbol);
-        assert_eq!(doc.panes[3].settings, PaneSettings::Ticker("AAPL US Equity".into()));
-        assert_links(&doc, &[Some(Link::Orange); 4]);
+        assert_eq!(doc.panes[3].settings, PaneSettings::Company("AAPL US Equity".into()));
+        assert_eq!(doc.panes[4].settings, PaneSettings::Ticker("AAPL US Equity".into()));
+        assert!(doc.panes.iter().all(|pane| pane.link == Some(Link::Orange)));
         assert_eq!(doc.focus, Some(1));
-        assert_eq!(doc.dock.visible(), [1, 2, 3, 4]);
+        assert_eq!(doc.dock.visible(), [1, 5, 4, 2, 3]);
         let Node::Split { dir: Dir::Row, shares, children } = &doc.dock else { panic!() };
         assert_eq!(shares, &[0.60, 0.40]);
-        assert_eq!(children[0], Node::leaf(1));
-        assert!(matches!(&children[1], Node::Split { shares, .. } if shares == &[0.40, 0.35, 0.25]));
+        let Node::Split { dir: Dir::Column, shares, children: left } = &children[0] else { panic!() };
+        assert_eq!(shares, &[0.72, 0.28]);
+        assert_eq!(left, &[Node::leaf(1), Node::leaf(5)]);
+        let Node::Split { dir: Dir::Column, shares, children: right } = &children[1] else { panic!() };
+        assert_eq!(shares, &[0.24, 0.40, 0.36]);
+        assert_eq!(right, &[Node::leaf(4), Node::leaf(2), Node::leaf(3)]);
     }
 
     #[test]
@@ -537,6 +595,57 @@ mod tests {
         assert_chart(&doc, 1, "SPY US Equity");
         assert_eq!(doc.panes[2].settings, PaneSettings::Alerts);
         assert_links(&doc, &[Some(Link::Orange), Some(Link::Orange), None]);
+    }
+
+    #[test]
+    fn crypto_desk_links_the_btc_chart_book_and_scanner_and_scopes_news_to_crypto() {
+        let doc = build("CRYPTO");
+        assert_eq!(doc.panes.len(), 4);
+        assert_chart(&doc, 0, "BTCUSD Curncy");
+        assert_eq!(
+            doc.panes[1].settings,
+            PaneSettings::OrderBook { symbol: "BTCUSD Curncy".into(), depth: 20, group: 10.0 }
+        );
+        let n = news(&doc, 2);
+        assert_eq!(n.filters.scope, Scope::All);
+        assert_eq!(n.filters.categories, ["crypto"]);
+        assert!(n.symbol.is_none() && n.flash_high);
+        let PaneSettings::Scanner(scan) = &doc.panes[3].settings else { panic!("expected scanner") };
+        assert_eq!(scan.definition, tr_core::scanner::ScanDefinition::default());
+        assert_eq!(scan.universe, tr_data::universe::Universe::BinanceSpot);
+        // A refresh schedule runs the market-wide scan on the first frame; the desk waits
+        // for the user to press Run scan.
+        assert!(scan.refresh.is_none());
+        assert_links(&doc, &[Some(Link::Orange), Some(Link::Orange), None, Some(Link::Orange)]);
+        assert_eq!(doc.focus, Some(1));
+        // Dock order is left column (chart, scanner) then right (book, news); all four visible.
+        assert_eq!(doc.dock.visible(), [1, 4, 2, 3]);
+        let Node::Split { dir: Dir::Row, shares, children } = &doc.dock else { panic!() };
+        assert_eq!(shares, &[0.60, 0.40]);
+        assert!(matches!(&children[0], Node::Split { dir: Dir::Column, shares, .. } if shares == &[0.68, 0.32]));
+        assert!(matches!(&children[1], Node::Split { dir: Dir::Column, shares, .. } if shares == &[0.55, 0.45]));
+        let dashboard = ALL.iter().find(|d| d.id == "CRYPTO").unwrap();
+        assert!(!dashboard.headline_tape, "CRYPTO must not enable the headline tape");
+        assert!(!dashboard.quote_strip, "CRYPTO must not enable the quote strip");
+        assert_eq!(LayoutDoc::from_json(&doc.to_json()).unwrap(), doc, "open > save > reopen");
+    }
+
+    #[test]
+    fn crypto_news_categories_match_the_stored_crypto_category() {
+        let filters = news(&build("CRYPTO"), 2).filters.clone();
+        let item = tr_data::NewsItem {
+            title: "Bitcoin ticks higher".into(),
+            publisher: String::new(),
+            link: String::new(),
+            ts: 1,
+            tickers: Vec::new(),
+        };
+        let mut story = tr_data::news_store::Story::new(item, "CoinDesk");
+        story.category = "crypto".into();
+        let query = tr_data::news_store::Query { filters, ..Default::default() };
+        assert!(tr_data::news_store::matches(&story, &query));
+        story.category = "general".into();
+        assert!(!tr_data::news_store::matches(&story, &query));
     }
 
     #[test]

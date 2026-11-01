@@ -41,6 +41,8 @@ pub struct State {
     feeds: Vec<FeedStatus>,
     message: Option<Result<String, String>>,
     status_revision: u64,
+    /// Last observed key presence and source availability, for one-shot pane recovery.
+    pub(super) company_access: (bool, bool),
 }
 #[derive(Clone, PartialEq)]
 pub(super) struct NewsSourceKey {
@@ -218,6 +220,10 @@ impl State {
         if reply.message.is_some() {
             self.message = reply.message;
         }
+        let enabled = self.settings.enabled("finnhub")
+            && !self.settings.pause_all
+            && self.status.iter().filter(|s| s.group == "finnhub").all(|s| s.enabled && !s.offline);
+        self.company_access = (!self.masked_key.is_empty(), enabled);
     }
 }
 
@@ -591,6 +597,9 @@ impl TerminalApp {
             self.data_sources.settings.settings_error = false;
             // Apply switches immediately, even while a Save & Test is running.
             tr_net::configure_shared(self.data_sources.settings.clone());
+            if self.data_sources.settings.pause_all || !self.data_sources.settings.enabled("finnhub") {
+                self.data_sources.company_access.1 = false;
+            }
             self.data_sources.refreshed = None;
             self.save_settings();
         }
@@ -1093,5 +1102,93 @@ mod tests {
         assert!(reply.masked_key.is_empty());
         assert!(store.load_text().unwrap().is_none());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A Company pane parked in `state`, then the Data sources reply that should revive it.
+    fn company_pane_after_reply(tag: &str, state: crate::app::company_view::CompanyState, reply: Reply) -> bool {
+        use crate::worker::{Request, Response, Worker};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/workspace-audit")
+            .join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = TerminalApp::test_workspace(&root);
+        let (mut worker, mut requests) = Worker::recording();
+        let (out, rx) = std::sync::mpsc::channel();
+        worker.rx = rx;
+        app.worker = worker;
+        let kind =
+            crate::app::PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity")));
+        let pane = app.new_pane(kind);
+        app.dock_pane(pane, None, crate::dock::Zone::Right);
+        let ctx = egui::Context::default();
+        let settled = Instant::now() + Duration::from_millis(401);
+        app.request_company_profiles(&ctx, settled);
+        assert!(matches!(requests.try_recv(), Ok(Request::CompanyProfile { .. })));
+        out.send(Response::CompanyProfile {
+            pane,
+            symbol: "AAPL US Equity".into(),
+            profile: None,
+            state: state.clone(),
+        })
+        .unwrap();
+        out.send(Response::DataSources(reply)).unwrap();
+        app.drain();
+        app.request_company_profiles(&ctx, settled);
+        let asked = matches!(requests.try_recv(), Ok(Request::CompanyProfile { .. }));
+        out.send(Response::CompanyProfile { pane, symbol: "AAPL US Equity".into(), profile: None, state }).unwrap();
+        out.send(Response::DataSources(Reply {
+            status: Ok(vec![]),
+            masked_key: "••••cret".into(),
+            feeds: vec![],
+            message: None,
+            status_only: true,
+        }))
+        .unwrap();
+        app.drain();
+        app.request_company_profiles(&ctx, settled);
+        assert!(requests.try_recv().is_err(), "status polls must not re-request the profile");
+        std::fs::remove_dir_all(root).unwrap();
+        asked
+    }
+
+    #[test]
+    fn a_company_failure_requires_user_retry_even_when_sources_change() {
+        let reply = Reply {
+            status: Ok(vec![]),
+            masked_key: "••••cret".into(),
+            feeds: vec![],
+            message: None,
+            status_only: true,
+        };
+        let state = crate::app::company_view::CompanyState::Failed("HTTP 500".into());
+        assert!(!company_pane_after_reply("company-failed-status", state, reply));
+    }
+
+    #[test]
+    fn review_g7_saving_a_key_recovers_a_no_key_company_pane() {
+        let reply = Reply {
+            status: Ok(vec![]),
+            masked_key: "••••cret".into(),
+            feeds: vec![],
+            message: Some(Ok("Saved".into())),
+            status_only: false,
+        };
+        let state = crate::app::company_view::CompanyState::NoKey;
+        assert!(company_pane_after_reply("review-g7-key", state, reply));
+    }
+
+    #[test]
+    fn review_g7_enabling_sources_recovers_a_sources_off_company_pane() {
+        // Default settings are enabled: this is the status poll after the switch was turned on.
+        let reply = Reply {
+            status: Ok(vec![]),
+            masked_key: "••••cret".into(),
+            feeds: vec![],
+            message: None,
+            status_only: true,
+        };
+        let state = crate::app::company_view::CompanyState::SourcesOff;
+        assert!(company_pane_after_reply("review-g7-sources", state, reply));
     }
 }

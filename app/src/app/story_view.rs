@@ -897,7 +897,12 @@ fn analysis_chip(ui: &mut Ui, label: &str, ticker: bool, r: &theme::AnalysisRole
 }
 /// Each row owns its full height; the value column is sized from the pane, not
 /// from a preceding cell's intrinsic width (as it was in Grid).
-fn inspector_row(ui: &mut Ui, label: &str, r: &theme::AnalysisRoles, value: impl FnOnce(&mut Ui)) -> egui::Rect {
+pub(super) fn inspector_row(
+    ui: &mut Ui,
+    label: &str,
+    r: &theme::AnalysisRoles,
+    value: impl FnOnce(&mut Ui),
+) -> egui::Rect {
     ui.horizontal_top(|ui| {
         ui.allocate_ui_with_layout(
             egui::vec2(dp(84.0), dp(18.0)),

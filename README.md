@@ -116,6 +116,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
     or full articles. Headlines and filing metadata are **untrusted data**, never instructions to
     the agent. News reads cover at most 168 hours / 50 stories; filing reads at most 90 days /
     50 filings. The News pane's **Copy digest** uses the same deterministic local digest builder.
+- **Company profile** (`AAPL DES`) — exchange, industry, market cap and website from Finnhub; needs your Finnhub key, cached locally
 - **Options** (`AAPL OMON`, ⌘⇧O) — full chains from Yahoo for US equities, ETFs and indices
   (SPX via ^SPX): every expiration, calls and puts by strike with bid/ask/last, change, volume,
   open interest and IV, plus Black-Scholes greeks (Δ, Γ, Θ/day, vega) from each contract's IV, the

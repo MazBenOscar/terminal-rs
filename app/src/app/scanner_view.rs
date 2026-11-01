@@ -2153,6 +2153,25 @@ mod tests {
     }
 
     #[test]
+    fn a_manual_snapshot_market_pane_waits_for_the_user_before_scanning() {
+        // Presets such as the Crypto desk ship without a refresh schedule: opening the
+        // pane must not kick off a market-wide scan on the first frame.
+        let ctx = egui::Context::default();
+        let mut settings = ScanSettings::from(ScanDefinition::default());
+        settings.universe = Universe::BinanceSpot;
+        let mut pane = ScannerPane::from_settings(settings);
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                show(ui, &mut pane, 1, &[], false, |request| requests.push(request));
+            });
+            output.textures_delta.clear();
+        }
+        assert!(requests.is_empty(), "a manual snapshot must wait for Run scan");
+        assert!(!pane.running && pane.refresh.is_none());
+    }
+
+    #[test]
     fn refresh_due_time_waits_after_completion_with_backpressure() {
         let completed = chrono::DateTime::from_timestamp(1_000, 0).unwrap();
         assert_eq!(due_at(completed, 5, chrono::Duration::seconds(10)), completed + chrono::Duration::minutes(5));

@@ -40,6 +40,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("N", "", "news headlines", None),
     ("STORY", "Story inspector", "news selected headline", None),
     ("OB", "", "order book depth dom", None),
+    ("DES", "", "company profile description exchange market cap website", None),
     ("WEI", "", "world equity indices markets", None),
     ("GC", "", "yield curve treasury rates", None),
     ("SECF", "Security search", "search find", None),

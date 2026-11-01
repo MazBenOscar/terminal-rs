@@ -138,6 +138,25 @@ pub const STORY_BODY_NEGATIVE_TTL: i64 = 24 * 3600;
 /// Article text follows the same 90-day retention as headlines.
 pub const STORY_BODY_RETENTION: i64 = 90 * 86400;
 
+/// A company profile is reused for a week; a symbol Finnhub has none for is retried daily.
+pub const COMPANY_PROFILE_TTL: i64 = 7 * 86400;
+pub const COMPANY_PROFILE_MISS_TTL: i64 = 24 * 3600;
+
+/// A stored company profile, or the record that the provider has none (`profile: None`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CachedProfile {
+    pub profile: Option<crate::finnhub::CompanyProfile>,
+    pub fetched_at: i64,
+}
+
+impl CachedProfile {
+    /// Whether this row can still be shown without a new request.
+    pub fn fresh(&self, now: i64) -> bool {
+        let ttl = if self.profile.is_some() { COMPANY_PROFILE_TTL } else { COMPANY_PROFILE_MISS_TTL };
+        now.saturating_sub(self.fetched_at) < ttl
+    }
+}
+
 fn story_body_hash(url: &str) -> String {
     Sha1::digest(url.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -817,6 +836,35 @@ impl NewsStore {
         )?;
         Ok(())
     }
+    /// The stored company profile for one symbol, fresh or stale. A row that no longer
+    /// parses reads as a miss rather than failing the pane.
+    pub fn company_profile(&self, symbol: &str) -> Result<Option<CachedProfile>> {
+        let row: Option<(Option<String>, i64)> = self
+            .db
+            .query_row("SELECT profile,fetched_at FROM company_profiles WHERE symbol=?1", [symbol], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        Ok(row.map(|(profile, fetched_at)| CachedProfile {
+            profile: profile.and_then(|json| serde_json::from_str(&json).ok()),
+            fetched_at,
+        }))
+    }
+    /// Store a profile, or record that the provider has none. Only successful replies
+    /// reach this: a refused request keeps whatever row is stored.
+    pub fn save_company_profile(
+        &self,
+        symbol: &str,
+        profile: Option<&crate::finnhub::CompanyProfile>,
+        now: i64,
+    ) -> Result<()> {
+        let json = profile.map(serde_json::to_string).transpose()?;
+        self.db.execute(
+            "INSERT OR REPLACE INTO company_profiles(symbol,fetched_at,profile) VALUES(?1,?2,?3)",
+            params![symbol, now, json],
+        )?;
+        Ok(())
+    }
     pub fn related_stories(
         &self,
         selected: &crate::news_intelligence::Cluster,
@@ -905,6 +953,7 @@ impl NewsStore {
             CREATE TABLE IF NOT EXISTS feed_state(id TEXT PRIMARY KEY,etag TEXT,last_modified TEXT,last_success_at INTEGER,last_item_at INTEGER,last_status TEXT NOT NULL DEFAULT '',items_today INTEGER NOT NULL DEFAULT 0,day INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS item_sources(id TEXT NOT NULL,source TEXT NOT NULL,feed_id TEXT NOT NULL,PRIMARY KEY(id,source,feed_id));
             CREATE INDEX IF NOT EXISTS item_sources_feed ON item_sources(feed_id);
+            CREATE TABLE IF NOT EXISTS company_profiles(symbol TEXT PRIMARY KEY,fetched_at INTEGER NOT NULL,profile TEXT);
             INSERT OR IGNORE INTO item_sources SELECT id,source,provider_id FROM items;
             INSERT OR IGNORE INTO news_fetches SELECT DISTINCT fetched FROM items;",
             )?;

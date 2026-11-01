@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, Id, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, ViewportBuilder,
@@ -20,7 +21,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 18] = [
+pub const PANELS: [(&str, &str); 19] = [
     // N2
     ("Filings", "CF"),
     ("Chart", "CHART"),
@@ -30,6 +31,7 @@ pub const PANELS: [(&str, &str); 18] = [
     ("Story", "STORY"),
     ("Order Book", "BOOK"),
     ("Options", "OMON"),
+    ("Company Profile", "DES"),
     ("Portfolio", "PORT"),
     ("World Markets", "WEI"),
     ("Yield Curve", "GC"),
@@ -339,6 +341,17 @@ impl TerminalApp {
         ids.into_iter().filter_map(|id| self.idx(id)).collect()
     }
 
+    pub(super) fn request_company_profiles(&mut self, ctx: &egui::Context, now: Instant) {
+        for i in self.visible_panes() {
+            let pane = &mut self.panes[i];
+            if let PaneKind::Company(c) = &mut pane.kind
+                && let Some(delay) = c.request(pane.id, &self.worker, now)
+            {
+                ctx.request_repaint_after(delay);
+            }
+        }
+    }
+
     fn focus_order(&self) -> Vec<PaneId> {
         let mut ids = self.dock.visible();
         ids.extend(self.panes.iter().filter(|p| p.window.is_some()).map(|p| p.id));
@@ -551,6 +564,11 @@ impl TerminalApp {
             PaneKind::Options(o) => {
                 if o.symbol != key {
                     **o = super::OptionsPane::new(&key, o.strikes, o.show_greeks);
+                }
+            }
+            PaneKind::Company(c) => {
+                if c.symbol != key {
+                    **c = super::company_view::CompanyPane::new(&key);
                 }
             }
             _ => return false,
@@ -779,6 +797,9 @@ impl TerminalApp {
                 current.as_deref().unwrap_or("AAPL US Equity"),
                 d,
             )),
+            "DES" | "COMPANY" => PaneKind::Company(Box::new(super::company_view::CompanyPane::new(
+                current.as_deref().unwrap_or("AAPL US Equity"),
+            ))),
             "STORY" => PaneKind::Story { link_follow: true },
             "WL" | "WATCHLIST" | "W" => PaneKind::Watchlist,
             "SCAN" | "SCANNER" | "EASYSCAN" => PaneKind::Scanner(Box::default()),
@@ -2189,6 +2210,38 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn linked_company_pane_follows_the_group_and_asks_once_per_symbol() {
+        let (mut app, root) = fixture("company-link");
+        let (worker, mut requests) = Worker::recording();
+        app.worker = worker;
+        let company =
+            app.new_pane(PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity"))));
+        app.dock_pane(company, None, Zone::Right);
+        app.panes[0].link = Some(Link::Orange);
+        let ctx = egui::Context::default();
+        assert!(requests.try_recv().is_err());
+        app.request_company_profiles(&ctx, Instant::now() + std::time::Duration::from_millis(401));
+        // A visible pane asks the worker once its symbol settles.
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::CompanyProfile { symbol, .. }) if symbol == "AAPL US Equity")
+        );
+        app.broadcast(Link::Orange, "MSFT US Equity", None);
+        assert_eq!(app.panes[0].kind.symbol(), Some("MSFT US Equity"));
+        assert!(requests.try_recv().is_err());
+        app.request_company_profiles(&ctx, Instant::now() + std::time::Duration::from_millis(401));
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::CompanyProfile { symbol, .. }) if symbol == "MSFT US Equity")
+        );
+        // Following the same symbol again asks for nothing more.
+        app.broadcast(Link::Orange, "MSFT US Equity", None);
+        app.request_company_profiles(&ctx, Instant::now() + std::time::Duration::from_millis(401));
+        assert!(requests.try_recv().is_err());
+        assert_eq!(app.panes[0].kind.settings(), crate::layouts::PaneSettings::Company("MSFT US Equity".into()));
+        assert!(app.dock.contains(company));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn groups(n: &Node) -> (Rect, Vec<crate::dock::Group>) {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 600.0));
         (area, n.layout(area, 6.0).0)
@@ -2274,5 +2327,104 @@ mod tests {
         let dragged = Node::split_with(Dir::Column, vec![Node::leaf(2), Node::leaf(1)], vec![0.3, 0.7]);
         let (shown, target, _) = step(&dragged, 6.1, 900.0);
         assert_eq!(shown, target);
+    }
+
+    #[test]
+    fn review_g7_every_add_panel_entry_builds_a_pane() {
+        let (app, root) = fixture("review-g7-panels");
+        for (label, spec) in PANELS {
+            assert!(app.panel_from_spec(spec, Some("AAPL US Equity")).is_some(), "{label} ({spec}) builds nothing");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn company_requests(requests: &mut tokio::sync::mpsc::UnboundedReceiver<Request>) -> Vec<String> {
+        let mut symbols = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            if let Request::CompanyProfile { symbol, .. } = request {
+                symbols.push(symbol);
+            }
+        }
+        symbols
+    }
+
+    #[test]
+    fn company_debounce_schedules_a_repaint_without_input() {
+        let (mut app, root) = fixture("company-repaint");
+        let (worker, mut requests) = Worker::recording();
+        app.worker = worker;
+        let company =
+            app.new_pane(PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity"))));
+        app.dock_pane(company, None, Zone::Right);
+        let ctx = egui::Context::default();
+        let now = Instant::now();
+        let mut frame = || {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.request_company_profiles(ui.ctx(), now);
+            })
+        };
+        frame().textures_delta.clear();
+        frame().textures_delta.clear();
+        let mut output = frame();
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(delay > std::time::Duration::ZERO && delay <= std::time::Duration::from_millis(400), "{delay:?}");
+        assert!(company_requests(&mut requests).is_empty());
+        output.textures_delta.clear();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_g7_link_sweep_does_not_queue_a_request_per_passed_symbol() {
+        let (mut app, root) = fixture("review-g7-sweep");
+        let (worker, mut requests) = Worker::recording();
+        app.worker = worker;
+        let company =
+            app.new_pane(PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity"))));
+        app.dock_pane(company, None, Zone::Right);
+        app.panes[0].link = Some(Link::Orange);
+        company_requests(&mut requests);
+        let ctx = egui::Context::default();
+        for symbol in ["MSFT", "NVDA", "AMZN", "META", "GOOG", "TSLA"] {
+            app.broadcast(Link::Orange, symbol, None);
+            app.request_company_profiles(&ctx, Instant::now());
+        }
+        assert!(company_requests(&mut requests).is_empty());
+        app.request_company_profiles(&ctx, Instant::now() + std::time::Duration::from_millis(401));
+        let sent = company_requests(&mut requests);
+        assert!(sent.len() <= 2, "the guard spaces finnhub 3 s apart with a 5 s wait: {sent:?}");
+        assert_eq!(sent, ["TSLA US Equity"]);
+        app.request_company_profiles(&ctx, Instant::now() + std::time::Duration::from_secs(1));
+        assert!(company_requests(&mut requests).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_g7_hidden_tab_company_pane_does_not_request() {
+        let (mut app, root) = fixture("review-g7-hidden");
+        let (worker, mut requests) = Worker::recording();
+        app.worker = worker;
+        let chart = app
+            .new_pane(PaneKind::from_settings(crate::layouts::chart_settings("AAPL US Equity", &Default::default())));
+        app.dock_pane(chart, None, Zone::Right);
+        let company =
+            app.new_pane(PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity"))));
+        app.dock_pane(company, Some(chart), Zone::Center);
+        app.reveal(chart);
+        assert!(!app.dock.visible().contains(&company), "fixture: the company pane is a background tab");
+        for pane in &mut app.panes {
+            pane.link = Some(Link::Orange);
+        }
+        company_requests(&mut requests);
+        app.broadcast(Link::Orange, "MSFT", None);
+        let ctx = egui::Context::default();
+        let settled = Instant::now() + std::time::Duration::from_millis(401);
+        app.request_company_profiles(&ctx, settled);
+        assert_eq!(company_requests(&mut requests), Vec::<String>::new());
+        app.reveal(company);
+        app.request_company_profiles(&ctx, settled);
+        assert_eq!(company_requests(&mut requests), ["MSFT US Equity"]);
+        app.request_company_profiles(&ctx, settled);
+        assert!(company_requests(&mut requests).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
