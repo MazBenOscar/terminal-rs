@@ -20,7 +20,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 18] = [
+pub const PANELS: [(&str, &str); 19] = [
     // N2
     ("Filings", "CF"),
     ("Chart", "CHART"),
@@ -30,6 +30,7 @@ pub const PANELS: [(&str, &str); 18] = [
     ("Story", "STORY"),
     ("Order Book", "BOOK"),
     ("Options", "OMON"),
+    ("Company Profile", "DES"),
     ("Portfolio", "PORT"),
     ("World Markets", "WEI"),
     ("Yield Curve", "GC"),
@@ -2310,5 +2311,67 @@ mod tests {
         let dragged = Node::split_with(Dir::Column, vec![Node::leaf(2), Node::leaf(1)], vec![0.3, 0.7]);
         let (shown, target, _) = step(&dragged, 6.1, 900.0);
         assert_eq!(shown, target);
+    }
+
+    #[test]
+    #[ignore = "BUG: PANELS offers DES but panel_from_spec has no DES arm, so the menu item does nothing"]
+    fn review_g7_every_add_panel_entry_builds_a_pane() {
+        let (app, root) = fixture("review-g7-panels");
+        for (label, spec) in PANELS {
+            assert!(app.panel_from_spec(spec, Some("AAPL US Equity")).is_some(), "{label} ({spec}) builds nothing");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn company_requests(requests: &mut tokio::sync::mpsc::UnboundedReceiver<Request>) -> Vec<String> {
+        let mut symbols = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            if let Request::CompanyProfile { symbol, .. } = request {
+                symbols.push(symbol);
+            }
+        }
+        symbols
+    }
+
+    #[test]
+    #[ignore = "BUG: every symbol in a link sweep spends a guarded Finnhub call, superseded ones included"]
+    fn review_g7_link_sweep_does_not_queue_a_request_per_passed_symbol() {
+        let (mut app, root) = fixture("review-g7-sweep");
+        let (worker, mut requests) = Worker::recording();
+        app.worker = worker;
+        let company =
+            app.new_pane(PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity"))));
+        app.dock_pane(company, None, Zone::Right);
+        app.panes[0].link = Some(Link::Orange);
+        company_requests(&mut requests);
+        for symbol in ["MSFT", "NVDA", "AMZN", "META", "GOOG", "TSLA"] {
+            app.broadcast(Link::Orange, symbol, None);
+        }
+        let sent = company_requests(&mut requests);
+        assert!(sent.len() <= 2, "the guard spaces finnhub 3 s apart with a 5 s wait: {sent:?}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "BUG: a Company pane in a background tab spends Finnhub budget following its link group"]
+    fn review_g7_hidden_tab_company_pane_does_not_request() {
+        let (mut app, root) = fixture("review-g7-hidden");
+        let (worker, mut requests) = Worker::recording();
+        app.worker = worker;
+        let chart =
+            app.new_pane(PaneKind::from_settings(crate::layouts::chart_settings("AAPL US Equity", &Default::default())));
+        app.dock_pane(chart, None, Zone::Right);
+        let company =
+            app.new_pane(PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity"))));
+        app.dock_pane(company, Some(chart), Zone::Center);
+        app.reveal(chart);
+        assert!(!app.dock.visible().contains(&company), "fixture: the company pane is a background tab");
+        for pane in &mut app.panes {
+            pane.link = Some(Link::Orange);
+        }
+        company_requests(&mut requests);
+        app.broadcast(Link::Orange, "MSFT", None);
+        assert_eq!(company_requests(&mut requests), Vec::<String>::new());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1094,4 +1094,57 @@ mod tests {
         assert!(store.load_text().unwrap().is_none());
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// A Company pane parked in `state`, then the Data sources reply that should revive it.
+    fn company_pane_after_reply(tag: &str, state: crate::app::company_view::CompanyState, reply: Reply) -> bool {
+        use crate::worker::{Request, Response, Worker};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/workspace-audit")
+            .join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = TerminalApp::test_workspace(&root);
+        let (mut worker, mut requests) = Worker::recording();
+        let (out, rx) = std::sync::mpsc::channel();
+        worker.rx = rx;
+        app.worker = worker;
+        let kind = crate::app::PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity")));
+        let pane = app.new_pane(kind);
+        assert!(matches!(requests.try_recv(), Ok(Request::CompanyProfile { .. })));
+        out.send(Response::CompanyProfile { pane, symbol: "AAPL US Equity".into(), profile: None, state }).unwrap();
+        out.send(Response::DataSources(reply)).unwrap();
+        app.drain();
+        let asked = matches!(requests.try_recv(), Ok(Request::CompanyProfile { .. }));
+        std::fs::remove_dir_all(root).unwrap();
+        asked
+    }
+
+    #[test]
+    #[ignore = "BUG: NoKey is terminal; saving a Finnhub key leaves the pane stuck until DES is rerun"]
+    fn review_g7_saving_a_key_recovers_a_no_key_company_pane() {
+        let reply = Reply {
+            status: Ok(vec![]),
+            masked_key: "••••cret".into(),
+            feeds: vec![],
+            message: Some(Ok("Saved".into())),
+            status_only: false,
+        };
+        let state = crate::app::company_view::CompanyState::NoKey;
+        assert!(company_pane_after_reply("review-g7-key", state, reply));
+    }
+
+    #[test]
+    #[ignore = "BUG: SourcesOff is terminal; switching sources back on leaves the pane stuck until DES is rerun"]
+    fn review_g7_enabling_sources_recovers_a_sources_off_company_pane() {
+        // Default settings are enabled: this is the status poll after the switch was turned on.
+        let reply = Reply {
+            status: Ok(vec![]),
+            masked_key: "••••cret".into(),
+            feeds: vec![],
+            message: None,
+            status_only: true,
+        };
+        let state = crate::app::company_view::CompanyState::SourcesOff;
+        assert!(company_pane_after_reply("review-g7-sources", state, reply));
+    }
 }

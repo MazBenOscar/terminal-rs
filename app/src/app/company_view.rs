@@ -331,4 +331,21 @@ mod tests {
         assert!(text.iter().any(|t| t.contains("Apple Inc.")), "{text:?}");
         assert!(text.iter().any(|t| t.contains("AAPL")), "{text:?}");
     }
+
+    #[test]
+    #[ignore = "BUG: a Failed state is terminal; rate-limited panes show no way to retry"]
+    fn review_g7_failed_state_offers_a_retry() {
+        let mut pane = CompanyPane::new("AAPL US Equity");
+        pane.state = CompanyState::Failed("Rate limited · Source busy (spacing wait exceeded)".into());
+        let text = text_of(&mut pane);
+        assert!(text.iter().any(|t| t.contains("Retry")), "{text:?}");
+    }
+
+    #[test]
+    #[ignore = "BUG: Open hands the raw weburl to the OS opener, not the URL that was validated and displayed"]
+    fn review_g7_website_opens_the_parsed_url_not_the_raw_text() {
+        // WHATWG parsing reads the backslash as a path separator, so the validated (and
+        // displayed) host is evil.test; the raw text goes to `open` unnormalised.
+        assert_eq!(website(r"https://evil.test\@apple.com").as_deref(), Some("https://evil.test/@apple.com"));
+    }
 }

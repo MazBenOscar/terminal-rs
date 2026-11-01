@@ -2655,6 +2655,59 @@ mod tests {
         drop(guard);
         let _ = std::fs::remove_dir_all(root);
     }
+    #[tokio::test]
+    #[ignore = "BUG: panes waiting on one symbol each repeat a failed fetch, one guarded send per pane"]
+    async fn review_g7_panes_waiting_on_a_failed_fetch_share_its_failure() {
+        use crate::app::company_view::CompanyState;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data").join(format!(
+            "company-profile-failure-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: reqwest::Url = format!("http://{}", listener.local_addr().unwrap()).parse().unwrap();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let counter = sends.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0; 2048];
+                let _ = stream.read(&mut buf).await.unwrap();
+                let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let guard = tr_net::Guard::for_fixture(
+            tr_net::Config {
+                ledger: root.join("ledger.sqlite3"),
+                data_dir: Some(root.join("instance")),
+                allow_external: true,
+                max_wait: Duration::from_secs(10),
+            },
+            tr_net::Settings::default(),
+            base,
+        )
+        .unwrap();
+        let (s, rx) = fixture_shared();
+        *s.news.store.lock().await = Some(NewsStore::memory().unwrap());
+        *s.news.key.lock().await = Some("fixture-secret".into());
+        tokio::join!(
+            company_profile(&s, 1, "AAPL US Equity".into(), Ok(&guard)),
+            company_profile(&s, 2, "AAPL US Equity".into(), Ok(&guard)),
+        );
+        for _ in 0..2 {
+            let Response::CompanyProfile { state, .. } = rx.try_recv().unwrap() else { panic!("reply") };
+            assert_eq!(state, CompanyState::Failed("HTTP 500".into()));
+        }
+        server.abort();
+        assert_eq!(sends.load(Ordering::SeqCst), 1, "two panes, one symbol, one failed send");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]

@@ -183,26 +183,18 @@ fn single_name(defaults: &PanelDefaults) -> LayoutDoc {
             PaneSettings::Ticker("AAPL US Equity".into()),
         ],
     );
-    // Chart dominates at 60% width; the right 40% stacks options/news 36:32:32 and keeps
-    // the company profile in front of the congress trades behind the same tab group.
+    // Left 60%: chart/congress trades 72:28; right 40%: company/options/news 24:40:36, all visible.
     doc.dock = Node::split_with(
         Dir::Row,
         vec![
-            Node::leaf(1),
-            Node::split_with(
-                Dir::Column,
-                vec![Node::leaf(2), Node::leaf(3), Node::Tabs { panes: vec![4, 5], active: 0 }],
-                vec![0.36, 0.32, 0.32],
-            ),
+            Node::split_with(Dir::Column, vec![Node::leaf(1), Node::leaf(5)], vec![0.72, 0.28]),
+            Node::split_with(Dir::Column, vec![Node::leaf(4), Node::leaf(2), Node::leaf(3)], vec![0.24, 0.40, 0.36]),
         ],
         vec![0.60, 0.40],
     );
     for pane in &mut doc.panes {
         pane.link = Some(Link::Orange);
     }
-    // Company and its congress tab share one group, where a shared link would hide the
-    // two linked panes from each other.
-    doc.panes[4].link = None;
     doc.focus = Some(1);
     doc
 }
@@ -493,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn name_has_four_visible_aapl_panes_and_a_dominant_focused_chart() {
+    fn name_shows_all_five_linked_aapl_panes_and_a_dominant_focused_chart() {
         let doc = build("NAME");
         assert_eq!(doc.panes.len(), 5);
         assert_chart(&doc, 0, "AAPL US Equity");
@@ -504,18 +496,17 @@ mod tests {
         assert_eq!(n.filters.scope, Scope::Symbol);
         assert_eq!(doc.panes[3].settings, PaneSettings::Company("AAPL US Equity".into()));
         assert_eq!(doc.panes[4].settings, PaneSettings::Ticker("AAPL US Equity".into()));
-        // Company and its congress tab share a group, so the tab cannot share its link.
-        assert_links(&doc, &[Some(Link::Orange), Some(Link::Orange), Some(Link::Orange), Some(Link::Orange), None]);
+        assert!(doc.panes.iter().all(|pane| pane.link == Some(Link::Orange)));
         assert_eq!(doc.focus, Some(1));
-        assert_eq!(doc.dock.visible(), [1, 2, 3, 4]);
+        assert_eq!(doc.dock.visible(), [1, 5, 4, 2, 3]);
         let Node::Split { dir: Dir::Row, shares, children } = &doc.dock else { panic!() };
         assert_eq!(shares, &[0.60, 0.40]);
-        assert_eq!(children[0], Node::leaf(1));
-        let Node::Split { dir: Dir::Column, shares, children } = &children[1] else { panic!() };
-        assert_eq!(shares, &[0.36, 0.32, 0.32]);
-        assert_eq!(children[0], Node::leaf(2));
-        assert_eq!(children[1], Node::leaf(3));
-        assert_eq!(children[2], Node::Tabs { panes: vec![4, 5], active: 0 });
+        let Node::Split { dir: Dir::Column, shares, children: left } = &children[0] else { panic!() };
+        assert_eq!(shares, &[0.72, 0.28]);
+        assert_eq!(left, &[Node::leaf(1), Node::leaf(5)]);
+        let Node::Split { dir: Dir::Column, shares, children: right } = &children[1] else { panic!() };
+        assert_eq!(shares, &[0.24, 0.40, 0.36]);
+        assert_eq!(right, &[Node::leaf(4), Node::leaf(2), Node::leaf(3)]);
     }
 
     #[test]
