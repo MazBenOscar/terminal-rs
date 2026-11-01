@@ -2358,8 +2358,8 @@ mod tests {
         let (mut app, root) = fixture("review-g7-hidden");
         let (worker, mut requests) = Worker::recording();
         app.worker = worker;
-        let chart =
-            app.new_pane(PaneKind::from_settings(crate::layouts::chart_settings("AAPL US Equity", &Default::default())));
+        let chart = app
+            .new_pane(PaneKind::from_settings(crate::layouts::chart_settings("AAPL US Equity", &Default::default())));
         app.dock_pane(chart, None, Zone::Right);
         let company =
             app.new_pane(PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity"))));

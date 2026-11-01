@@ -1108,7 +1108,8 @@ mod tests {
         let (out, rx) = std::sync::mpsc::channel();
         worker.rx = rx;
         app.worker = worker;
-        let kind = crate::app::PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity")));
+        let kind =
+            crate::app::PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity")));
         let pane = app.new_pane(kind);
         assert!(matches!(requests.try_recv(), Ok(Request::CompanyProfile { .. })));
         out.send(Response::CompanyProfile { pane, symbol: "AAPL US Equity".into(), profile: None, state }).unwrap();
