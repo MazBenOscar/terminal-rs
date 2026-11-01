@@ -370,7 +370,7 @@ fn crypto_desk(defaults: &PanelDefaults) -> LayoutDoc {
         Layout::Grid2x2,
         vec![
             chart_settings("BTCUSD Curncy", defaults),
-            PaneSettings::OrderBook { symbol: "BTCUSD Curncy".into(), depth: 25, group: 10.0 },
+            PaneSettings::OrderBook { symbol: "BTCUSD Curncy".into(), depth: 20, group: 10.0 },
             PaneSettings::News(Some(news)),
             PaneSettings::Scanner(scan),
         ],
@@ -598,7 +598,7 @@ mod tests {
         assert_chart(&doc, 0, "BTCUSD Curncy");
         assert_eq!(
             doc.panes[1].settings,
-            PaneSettings::OrderBook { symbol: "BTCUSD Curncy".into(), depth: 25, group: 10.0 }
+            PaneSettings::OrderBook { symbol: "BTCUSD Curncy".into(), depth: 20, group: 10.0 }
         );
         let n = news(&doc, 2);
         assert_eq!(n.filters.scope, Scope::All);
