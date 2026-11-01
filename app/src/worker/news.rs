@@ -783,9 +783,18 @@ where
     body
 }
 
-/// One company profile per symbol: a fresh cache row answers without a request, panes
-/// arriving during a fetch wait for it instead of refetching, and a refused request
-/// caches nothing but keeps the stored (stale) profile for the pane to show.
+type ProfileReply = (Option<(tr_data::finnhub::CompanyProfile, i64)>, crate::app::company_view::CompanyState);
+
+#[derive(Default)]
+pub(super) struct ProfileFetch {
+    failure: Option<(Instant, ProfileReply)>,
+}
+
+const PROFILE_FAILURE_TTL: Duration = Duration::from_secs(30);
+const PROFILE_FAILURE_LIMIT: usize = 128;
+
+/// One company profile per symbol: waiters share transient failures briefly in memory,
+/// never in the persistent cache. A stored stale profile stays on screen on failure.
 pub(super) async fn company_profile(
     s: &Arc<Shared>,
     pane: PaneId,
@@ -794,16 +803,36 @@ pub(super) async fn company_profile(
 ) {
     let fetch = {
         let mut fetches = s.profile_fetches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        fetches.entry(symbol.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+        fetches.retain(|_, fetch| {
+            Arc::strong_count(fetch) > 1
+                || fetch
+                    .try_lock()
+                    .is_ok_and(|f| f.failure.as_ref().is_some_and(|(at, _)| at.elapsed() < PROFILE_FAILURE_TTL))
+        });
+        while fetches.len() >= PROFILE_FAILURE_LIMIT {
+            let idle = fetches.iter().find(|(_, fetch)| Arc::strong_count(fetch) == 1).map(|(key, _)| key.clone());
+            let Some(idle) = idle else { break };
+            fetches.remove(&idle);
+        }
+        fetches.entry(symbol.clone()).or_insert_with(|| Arc::new(Mutex::new(ProfileFetch::default()))).clone()
     };
-    let fetch_guard = fetch.lock().await;
-    let now = chrono::Utc::now().timestamp();
-    let (profile, state) = profile_reply(s, &symbol, now, net).await;
+    let mut fetch_guard = fetch.lock().await;
+    let (profile, state) = if let Some((at, reply)) = &fetch_guard.failure
+        && at.elapsed() < PROFILE_FAILURE_TTL
+    {
+        reply.clone()
+    } else {
+        let reply = profile_reply(s, &symbol, chrono::Utc::now().timestamp(), net).await;
+        fetch_guard.failure = matches!(reply.1, crate::app::company_view::CompanyState::Failed(_))
+            .then(|| (Instant::now(), reply.clone()));
+        reply
+    };
+    let failed = fetch_guard.failure.is_some();
     drop(fetch_guard);
     {
         let mut fetches = s.profile_fetches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // The map lock keeps a new waiter from racing the count check.
-        if Arc::strong_count(&fetch) == 2 {
+        if Arc::strong_count(&fetch) == 2 && (!failed || fetches.len() > PROFILE_FAILURE_LIMIT) {
             fetches.remove(&symbol);
         }
     }
@@ -816,7 +845,7 @@ async fn profile_reply(
     symbol: &str,
     now: i64,
     net: Result<&tr_net::Guard, tr_net::Refused>,
-) -> (Option<(tr_data::finnhub::CompanyProfile, i64)>, crate::app::company_view::CompanyState) {
+) -> ProfileReply {
     use crate::app::company_view::CompanyState;
     let lookup = symbol.to_string();
     let cached = blocking(s, move |s| {
@@ -2570,7 +2599,7 @@ mod tests {
         use crate::app::company_view::CompanyState;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tr_data::finnhub::CompanyProfile;
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data").join(format!(
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data").join(format!(
             "company-profile-{}-{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap()
@@ -2656,12 +2685,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
     #[tokio::test]
-    #[ignore = "BUG: panes waiting on one symbol each repeat a failed fetch, one guarded send per pane"]
+    async fn profile_failures_expire_and_stay_bounded_in_memory() {
+        use crate::app::company_view::CompanyState;
+        let (s, rx) = fixture_shared();
+        *s.news.store.lock().await = Some(NewsStore::memory().unwrap());
+        *s.news.key.lock().await = Some("fixture-secret".into());
+        company_profile(&s, 1, "AAPL US Equity".into(), Err(tr_net::Refused::Budget)).await;
+        let Response::CompanyProfile { state: failure, .. } = rx.try_recv().unwrap() else { panic!("reply") };
+        assert!(matches!(failure, CompanyState::Failed(_)));
+        company_profile(&s, 2, "AAPL US Equity".into(), Err(tr_net::Refused::Disabled)).await;
+        let Response::CompanyProfile { state, .. } = rx.try_recv().unwrap() else { panic!("reply") };
+        assert_eq!(state, failure, "a later pane shares the recent failure");
+        let fetch = s.profile_fetches.lock().unwrap()["AAPL US Equity"].clone();
+        fetch.lock().await.failure.as_mut().unwrap().0 = Instant::now() - PROFILE_FAILURE_TTL;
+        drop(fetch);
+        company_profile(&s, 3, "AAPL US Equity".into(), Err(tr_net::Refused::Disabled)).await;
+        let Response::CompanyProfile { state, .. } = rx.try_recv().unwrap() else { panic!("reply") };
+        assert_eq!(state, CompanyState::SourcesOff, "expired failures allow a new attempt");
+        {
+            let mut fetches = s.profile_fetches.lock().unwrap();
+            assert!(fetches.is_empty(), "source recovery is not held behind a failure TTL");
+            for i in 0..PROFILE_FAILURE_LIMIT {
+                fetches.insert(
+                    format!("fixture-{i}"),
+                    Arc::new(Mutex::new(ProfileFetch { failure: Some((Instant::now(), (None, failure.clone()))) })),
+                );
+            }
+        }
+        company_profile(&s, 4, "MSFT US Equity".into(), Err(tr_net::Refused::Budget)).await;
+        assert!(s.profile_fetches.lock().unwrap().len() <= PROFILE_FAILURE_LIMIT);
+        assert!(s.news.store.lock().await.as_ref().unwrap().company_profile("MSFT US Equity").unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn review_g7_panes_waiting_on_a_failed_fetch_share_its_failure() {
         use crate::app::company_view::CompanyState;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-data").join(format!(
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-data").join(format!(
             "company-profile-failure-{}-{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap()

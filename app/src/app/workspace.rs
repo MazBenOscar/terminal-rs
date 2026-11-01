@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, Id, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, ViewportBuilder,
@@ -340,6 +341,17 @@ impl TerminalApp {
         ids.into_iter().filter_map(|id| self.idx(id)).collect()
     }
 
+    pub(super) fn request_company_profiles(&mut self, ctx: &egui::Context, now: Instant) {
+        for i in self.visible_panes() {
+            let pane = &mut self.panes[i];
+            if let PaneKind::Company(c) = &mut pane.kind
+                && let Some(delay) = c.request(pane.id, &self.worker, now)
+            {
+                ctx.request_repaint_after(delay);
+            }
+        }
+    }
+
     fn focus_order(&self) -> Vec<PaneId> {
         let mut ids = self.dock.visible();
         ids.extend(self.panes.iter().filter(|p| p.window.is_some()).map(|p| p.id));
@@ -394,10 +406,6 @@ impl TerminalApp {
             PaneKind::Profile { query, .. } => {
                 self.worker.send(Request::Profile { pane: id, query: query.clone() });
                 PaneKind::Profile { query, data: None, loading: true }
-            }
-            PaneKind::Company(mut c) => {
-                c.request(id, &self.worker);
-                PaneKind::Company(c)
             }
             k => k,
         }
@@ -561,7 +569,6 @@ impl TerminalApp {
             PaneKind::Company(c) => {
                 if c.symbol != key {
                     **c = super::company_view::CompanyPane::new(&key);
-                    c.request(id, &self.worker);
                 }
             }
             _ => return false,
@@ -790,6 +797,9 @@ impl TerminalApp {
                 current.as_deref().unwrap_or("AAPL US Equity"),
                 d,
             )),
+            "DES" | "COMPANY" => PaneKind::Company(Box::new(super::company_view::CompanyPane::new(
+                current.as_deref().unwrap_or("AAPL US Equity"),
+            ))),
             "STORY" => PaneKind::Story { link_follow: true },
             "WL" | "WATCHLIST" | "W" => PaneKind::Watchlist,
             "SCAN" | "SCANNER" | "EASYSCAN" => PaneKind::Scanner(Box::default()),
@@ -2209,17 +2219,23 @@ mod tests {
             app.new_pane(PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity"))));
         app.dock_pane(company, None, Zone::Right);
         app.panes[0].link = Some(Link::Orange);
-        // Opening the pane asks the worker for its symbol.
+        let ctx = egui::Context::default();
+        assert!(requests.try_recv().is_err());
+        app.request_company_profiles(&ctx, Instant::now() + std::time::Duration::from_millis(401));
+        // A visible pane asks the worker once its symbol settles.
         assert!(
             matches!(requests.try_recv(), Ok(Request::CompanyProfile { symbol, .. }) if symbol == "AAPL US Equity")
         );
         app.broadcast(Link::Orange, "MSFT US Equity", None);
         assert_eq!(app.panes[0].kind.symbol(), Some("MSFT US Equity"));
+        assert!(requests.try_recv().is_err());
+        app.request_company_profiles(&ctx, Instant::now() + std::time::Duration::from_millis(401));
         assert!(
             matches!(requests.try_recv(), Ok(Request::CompanyProfile { symbol, .. }) if symbol == "MSFT US Equity")
         );
         // Following the same symbol again asks for nothing more.
         app.broadcast(Link::Orange, "MSFT US Equity", None);
+        app.request_company_profiles(&ctx, Instant::now() + std::time::Duration::from_millis(401));
         assert!(requests.try_recv().is_err());
         assert_eq!(app.panes[0].kind.settings(), crate::layouts::PaneSettings::Company("MSFT US Equity".into()));
         assert!(app.dock.contains(company));
@@ -2314,7 +2330,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: PANELS offers DES but panel_from_spec has no DES arm, so the menu item does nothing"]
     fn review_g7_every_add_panel_entry_builds_a_pane() {
         let (app, root) = fixture("review-g7-panels");
         for (label, spec) in PANELS {
@@ -2334,7 +2349,31 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: every symbol in a link sweep spends a guarded Finnhub call, superseded ones included"]
+    fn company_debounce_schedules_a_repaint_without_input() {
+        let (mut app, root) = fixture("company-repaint");
+        let (worker, mut requests) = Worker::recording();
+        app.worker = worker;
+        let company =
+            app.new_pane(PaneKind::Company(Box::new(crate::app::company_view::CompanyPane::new("AAPL US Equity"))));
+        app.dock_pane(company, None, Zone::Right);
+        let ctx = egui::Context::default();
+        let now = Instant::now();
+        let mut frame = || {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.request_company_profiles(ui.ctx(), now);
+            })
+        };
+        frame().textures_delta.clear();
+        frame().textures_delta.clear();
+        let mut output = frame();
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(delay > std::time::Duration::ZERO && delay <= std::time::Duration::from_millis(400), "{delay:?}");
+        assert!(company_requests(&mut requests).is_empty());
+        output.textures_delta.clear();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn review_g7_link_sweep_does_not_queue_a_request_per_passed_symbol() {
         let (mut app, root) = fixture("review-g7-sweep");
         let (worker, mut requests) = Worker::recording();
@@ -2344,16 +2383,22 @@ mod tests {
         app.dock_pane(company, None, Zone::Right);
         app.panes[0].link = Some(Link::Orange);
         company_requests(&mut requests);
+        let ctx = egui::Context::default();
         for symbol in ["MSFT", "NVDA", "AMZN", "META", "GOOG", "TSLA"] {
             app.broadcast(Link::Orange, symbol, None);
+            app.request_company_profiles(&ctx, Instant::now());
         }
+        assert!(company_requests(&mut requests).is_empty());
+        app.request_company_profiles(&ctx, Instant::now() + std::time::Duration::from_millis(401));
         let sent = company_requests(&mut requests);
         assert!(sent.len() <= 2, "the guard spaces finnhub 3 s apart with a 5 s wait: {sent:?}");
+        assert_eq!(sent, ["TSLA US Equity"]);
+        app.request_company_profiles(&ctx, Instant::now() + std::time::Duration::from_secs(1));
+        assert!(company_requests(&mut requests).is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    #[ignore = "BUG: a Company pane in a background tab spends Finnhub budget following its link group"]
     fn review_g7_hidden_tab_company_pane_does_not_request() {
         let (mut app, root) = fixture("review-g7-hidden");
         let (worker, mut requests) = Worker::recording();
@@ -2371,7 +2416,15 @@ mod tests {
         }
         company_requests(&mut requests);
         app.broadcast(Link::Orange, "MSFT", None);
+        let ctx = egui::Context::default();
+        let settled = Instant::now() + std::time::Duration::from_millis(401);
+        app.request_company_profiles(&ctx, settled);
         assert_eq!(company_requests(&mut requests), Vec::<String>::new());
+        app.reveal(company);
+        app.request_company_profiles(&ctx, settled);
+        assert_eq!(company_requests(&mut requests), ["MSFT US Equity"]);
+        app.request_company_profiles(&ctx, settled);
+        assert!(company_requests(&mut requests).is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

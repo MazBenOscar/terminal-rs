@@ -940,7 +940,7 @@ fn study_history_fresh(c: &StudyHistory, end: i64, start: i64, limit: usize, now
 type StudyFetches = HashMap<(String, Timeframe), Arc<Mutex<()>>>;
 
 /// One company-profile fetch per symbol; later panes wait for it instead of refetching.
-type ProfileFetches = HashMap<String, Arc<Mutex<()>>>;
+type ProfileFetches = HashMap<String, Arc<Mutex<news::ProfileFetch>>>;
 
 type StudyLines = HashMap<(usize, String), tr_chart::gpu::LineRef>;
 

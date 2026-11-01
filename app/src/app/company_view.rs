@@ -1,6 +1,8 @@
 //! Company profile (DES): the company behind one symbol, from Finnhub
 //! `/stock/profile2` through the shared request guard.
 
+use std::time::{Duration, Instant};
+
 use egui::{RichText, Ui};
 use tr_data::finnhub::CompanyProfile;
 
@@ -37,6 +39,7 @@ pub struct CompanyPane {
     pub state: CompanyState,
     /// The symbol the one request was made for.
     requested: Option<String>,
+    settled_since: Instant,
     /// Set by "Open Data sources"; the pane owner switches settings tabs.
     pub open_data_sources: bool,
 }
@@ -48,19 +51,29 @@ impl CompanyPane {
             profile: None,
             state: CompanyState::Loading,
             requested: None,
+            settled_since: Instant::now(),
             open_data_sources: false,
         }
     }
 
-    /// Ask the worker for this symbol, once per symbol. A fresh cache row answers
-    /// without a request; a refusal is a state, so nothing retries on its own.
-    pub fn request(&mut self, pane: PaneId, worker: &Worker) {
+    /// Visible panes ask once after the symbol settles, or schedule the remaining wait.
+    pub fn request(&mut self, pane: PaneId, worker: &Worker, now: Instant) -> Option<Duration> {
         if self.requested.as_deref() == Some(self.symbol.as_str()) {
-            return;
+            return None;
+        }
+        let remaining = Duration::from_millis(400).saturating_sub(now.duration_since(self.settled_since));
+        if !remaining.is_zero() {
+            return Some(remaining);
         }
         self.requested = Some(self.symbol.clone());
         self.state = CompanyState::Loading;
         worker.send(Request::CompanyProfile { pane, symbol: self.symbol.clone() });
+        None
+    }
+
+    pub fn retry(&mut self) {
+        self.requested = None;
+        self.state = CompanyState::Loading;
     }
 
     /// Old data kept upright after a failed refresh.
@@ -96,8 +109,10 @@ fn compact(millions: f64) -> Option<String> {
 
 /// Finnhub's website field is free text; only real web links open.
 fn website(url: &str) -> Option<String> {
-    let url = url.trim();
-    crate::filings_view::safe_url(url).then(|| url.to_string())
+    if !crate::filings_view::safe_url(url) {
+        return None;
+    }
+    reqwest::Url::parse(url).ok().map(|url| url.to_string())
 }
 
 fn shown(value: &str) -> &str {
@@ -163,7 +178,18 @@ pub(super) fn show(ui: &mut Ui, id: PaneId, pane: &mut CompanyPane) -> Vec<Actio
             header(ui, &pane.symbol, profile, pane.stale());
         }
         match &pane.state {
-            CompanyState::Ready => {}
+            CompanyState::Ready => {
+                if let Some((_, fetched_at)) = &pane.profile
+                    && chrono::Utc::now().timestamp().saturating_sub(*fetched_at) > 86400
+                    && let Some(date) = chrono::DateTime::from_timestamp(*fetched_at, 0)
+                {
+                    ui.label(
+                        RichText::new(format!("Profile from {}", date.format("%Y-%m-%d")))
+                            .font(mono(10.5))
+                            .color(muted()),
+                    );
+                }
+            }
             CompanyState::Loading => {
                 ui.label(RichText::new("Loading…").color(muted()));
             }
@@ -189,6 +215,10 @@ pub(super) fn show(ui: &mut Ui, id: PaneId, pane: &mut CompanyPane) -> Vec<Actio
             }
             CompanyState::Failed(error) => {
                 ui.label(RichText::new(format!("Could not load the profile · {error}")).color(muted()));
+                if ui.small_button("Retry").clicked() {
+                    pane.retry();
+                    ui.ctx().request_repaint();
+                }
             }
         }
         if let Some((profile, _)) = &pane.profile {
@@ -265,7 +295,7 @@ mod tests {
 
     #[test]
     fn website_only_reaches_http_links() {
-        assert_eq!(website("https://www.apple.com").as_deref(), Some("https://www.apple.com"));
+        assert_eq!(website("https://www.apple.com").as_deref(), Some("https://www.apple.com/"));
         assert_eq!(website(" http://example.test/ir ").as_deref(), Some("http://example.test/ir"));
         for rejected in [
             "",
@@ -275,6 +305,10 @@ mod tests {
             "data:text/html,x",
             "ftp://example.test",
             "https://user:pass@evil.test/",
+            "https:example.test",
+            "https:/example.test",
+            "https://example.test/\npath",
+            "https://example.test/\tpath",
         ] {
             assert_eq!(website(rejected), None, "{rejected:?}");
         }
@@ -333,7 +367,76 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: a Failed state is terminal; rate-limited panes show no way to retry"]
+    fn visible_requests_debounce_and_failures_wait_for_retry() {
+        let (worker, mut requests) = Worker::recording();
+        let mut pane = CompanyPane::new("AAPL US Equity");
+        let start = pane.settled_since;
+        assert_eq!(pane.request(1, &worker, start), Some(Duration::from_millis(400)));
+        assert_eq!(pane.request(1, &worker, start + Duration::from_millis(399)), Some(Duration::from_millis(1)));
+        assert!(requests.try_recv().is_err());
+        assert_eq!(pane.request(1, &worker, start + Duration::from_millis(400)), None);
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::CompanyProfile { pane: 1, symbol }) if symbol == pane.symbol)
+        );
+        pane.state = CompanyState::Failed("HTTP 500".into());
+        pane.profile = Some((profile(), 0));
+        assert_eq!(pane.request(1, &worker, start + Duration::from_secs(60)), None);
+        assert!(requests.try_recv().is_err());
+        pane.retry();
+        assert_eq!(pane.request(1, &worker, start + Duration::from_secs(60)), None);
+        assert!(matches!(requests.try_recv(), Ok(Request::CompanyProfile { pane: 1, .. })));
+        assert_eq!(pane.state, CompanyState::Loading);
+        assert!(pane.profile.is_some(), "retry keeps the stored profile on screen");
+        pane.request(1, &worker, start + Duration::from_secs(61));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn retry_button_clears_the_request_without_discarding_the_profile() {
+        let mut pane = CompanyPane::new("AAPL US Equity");
+        pane.requested = Some(pane.symbol.clone());
+        pane.profile = Some((profile(), 0));
+        pane.state = CompanyState::Failed("HTTP 500".into());
+        let ctx = egui::Context::default();
+        let frame = |pane: &mut CompanyPane, events| {
+            let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                show(ui, 1, pane);
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let output = frame(&mut pane, vec![]);
+        let mut text = Vec::new();
+        for shape in &output.shapes {
+            rendered_text(&shape.shape, &mut text);
+        }
+        let position = text.iter().find(|(s, _)| s == "Retry").unwrap().1;
+        let click = |pressed| egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut pane, vec![egui::Event::PointerMoved(position), click(true)]);
+        frame(&mut pane, vec![click(false)]);
+        assert_eq!(pane.requested, None);
+        assert_eq!(pane.state, CompanyState::Loading);
+        assert!(pane.profile.is_some());
+    }
+
+    #[test]
+    fn ready_profiles_show_the_fetch_date_only_when_older_than_a_day() {
+        let mut pane = CompanyPane::new("AAPL US Equity");
+        pane.profile = Some((profile(), 0));
+        pane.state = CompanyState::Ready;
+        let text = text_of(&mut pane);
+        assert!(text.iter().any(|t| t == "Profile from 1970-01-01"), "{text:?}");
+        pane.profile = Some((profile(), chrono::Utc::now().timestamp()));
+        let text = text_of(&mut pane);
+        assert!(!text.iter().any(|t| t.starts_with("Profile from")), "{text:?}");
+    }
+
+    #[test]
     fn review_g7_failed_state_offers_a_retry() {
         let mut pane = CompanyPane::new("AAPL US Equity");
         pane.state = CompanyState::Failed("Rate limited · Source busy (spacing wait exceeded)".into());
@@ -342,7 +445,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: Open hands the raw weburl to the OS opener, not the URL that was validated and displayed"]
     fn review_g7_website_opens_the_parsed_url_not_the_raw_text() {
         // WHATWG parsing reads the backslash as a path separator, so the validated (and
         // displayed) host is evil.test; the raw text goes to `open` unnormalised.

@@ -2061,7 +2061,7 @@ impl TerminalApp {
                 self.open_panel(PaneKind::Options(Box::new(OptionsPane::new(&sym, 12, true))));
             }
             Function::Company => {
-                let sym = self.focused_symbol().unwrap_or_else(|| "AAPL US Equity".into());
+                let sym = tr_data::security(&self.focused_symbol().unwrap_or_else(|| "AAPL US Equity".into())).key();
                 self.open_panel(PaneKind::Company(Box::new(company_view::CompanyPane::new(&sym))));
             }
             Function::Sidebar(arg) => {
@@ -2631,7 +2631,21 @@ impl TerminalApp {
                     self.on_portfolio(result)
                 }
                 Response::BrokerRegistered(result) => self.on_broker_registered(result),
-                Response::DataSources(reply) => self.data_sources.receive(reply),
+                Response::DataSources(reply) => {
+                    let (had_key, sources_were_on) = self.data_sources.company_access;
+                    self.data_sources.receive(reply);
+                    let (has_key, sources_on) = self.data_sources.company_access;
+                    for p in &mut self.panes {
+                        if let PaneKind::Company(c) = &mut p.kind
+                            && (matches!(c.state, company_view::CompanyState::NoKey) && has_key && !had_key
+                                || matches!(c.state, company_view::CompanyState::SourcesOff)
+                                    && sources_on
+                                    && !sources_were_on)
+                        {
+                            c.retry();
+                        }
+                    }
+                }
                 // SENATE-BARGO
                 Response::BargoSettings(reply) => self.data_sources.bargo.receive(reply),
                 Response::BargoUpdated { status, changed } => {
@@ -3402,7 +3416,7 @@ fn take_open_urls(ctx: &egui::Context) -> Vec<String> {
     urls.into_iter().filter(|u| external_url(u)).collect()
 }
 
-fn external_url(url: &str) -> bool {
+pub(crate) fn external_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     (lower.starts_with("https://") || lower.starts_with("http://")) && !url.chars().any(char::is_control)
 }
@@ -3509,6 +3523,7 @@ impl eframe::App for TerminalApp {
         self.news_periodic(&self.visible_panes(), news_hidden);
         // N1a
         self.periodic();
+        self.request_company_profiles(&ctx, Instant::now());
         self.sync_chart_navigation();
 
         let screen = ui.max_rect();
